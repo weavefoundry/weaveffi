@@ -20,7 +20,7 @@ default-members = [
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["WeaveFFI Contributors"]
-repository = "https://github.com/your-org/weaveffi"
+repository = "https://github.com/weavefoundry/weave-ffi"
 description = "WeaveFFI: Rust core with stable C ABI and multi-language bindings"
 
 [workspace.dependencies]
