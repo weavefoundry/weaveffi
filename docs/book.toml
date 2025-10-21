@@ -10,5 +10,5 @@ create-missing = true
 [output.html]
 default-theme = "ayu"
 preferred-dark-theme = "ayu"
-git-repository-url = "https://github.com/weavefoundry/weave-ffi"
+git-repository-url = "https://github.com/weavefoundry/weaveffi"
 site-url = "https://docs.weaveffi.com/"
