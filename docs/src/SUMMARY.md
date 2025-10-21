@@ -7,6 +7,7 @@
 - [Reference](reference/README.md)
   - [IDL Schema](reference/idl.md)
   - [Memory & Error Model](reference/memory-error.md)
+  - [Naming and Package Conventions](reference/naming.md)
 - [Generators](generators/README.md)
   - [Android](generators/android.md)
   - [C](generators/c.md)
