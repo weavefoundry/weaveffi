@@ -2,7 +2,7 @@ use anyhow::Result;
 use camino::Utf8Path;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::utils::c_symbol_name;
-use weaveffi_ir::ir::{Api, Module, Param, TypeRef};
+use weaveffi_ir::ir::{Api, Module, Param, StructDef, TypeRef};
 
 pub struct CGenerator;
 
@@ -86,8 +86,43 @@ fn render_c_header(api: &Api) -> String {
     out
 }
 
+fn render_struct_header(out: &mut String, module_name: &str, s: &StructDef) {
+    let prefix = format!("weaveffi_{}_{}", module_name, s.name);
+
+    out.push_str(&format!("typedef struct {prefix} {prefix};\n"));
+
+    let mut params: Vec<String> = s
+        .fields
+        .iter()
+        .map(|f| c_type_for_param(&f.ty, &f.name))
+        .collect();
+    params.push("weaveffi_error* out_err".to_string());
+    out.push_str(&format!(
+        "{prefix}* {prefix}_create({});\n",
+        params.join(", ")
+    ));
+
+    out.push_str(&format!("void {prefix}_destroy({prefix}* ptr);\n"));
+
+    for field in &s.fields {
+        let (ret_ty, needs_len) = c_ret_type(&field.ty);
+        let getter = format!("{prefix}_get_{}", field.name);
+        if needs_len {
+            out.push_str(&format!(
+                "{ret_ty} {getter}(const {prefix}* ptr, size_t* out_len);\n"
+            ));
+        } else {
+            out.push_str(&format!("{ret_ty} {getter}(const {prefix}* ptr);\n"));
+        }
+    }
+    out.push('\n');
+}
+
 fn render_module_header(out: &mut String, module: &Module) {
     out.push_str(&format!("// Module: {}\n", module.name));
+    for s in &module.structs {
+        render_struct_header(out, &module.name, s);
+    }
     for f in &module.functions {
         let mut params_sig = c_params_sig(&f.params);
         let ret_sig = if let Some(ret) = &f.returns {
@@ -120,7 +155,7 @@ mod tests {
     use super::*;
     use camino::Utf8Path;
     use weaveffi_core::codegen::Generator;
-    use weaveffi_ir::ir::{Api, Function, Module, Param, TypeRef};
+    use weaveffi_ir::ir::{Api, Function, Module, Param, StructDef, StructField, TypeRef};
 
     #[test]
     fn generate_c_header_contains_expected_symbols() {
@@ -186,5 +221,76 @@ mod tests {
         assert!(header.contains("const char*"), "missing string return type");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn generate_c_header_with_structs() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "contacts".to_string(),
+                functions: vec![],
+                structs: vec![StructDef {
+                    name: "Contact".to_string(),
+                    doc: None,
+                    fields: vec![
+                        StructField {
+                            name: "name".to_string(),
+                            ty: TypeRef::StringUtf8,
+                            doc: None,
+                        },
+                        StructField {
+                            name: "age".to_string(),
+                            ty: TypeRef::I32,
+                            doc: None,
+                        },
+                    ],
+                }],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+
+        let header = render_c_header(&api);
+
+        assert!(
+            header.contains("typedef struct weaveffi_contacts_Contact weaveffi_contacts_Contact;"),
+            "missing opaque typedef"
+        );
+        assert!(
+            header.contains("weaveffi_contacts_Contact* weaveffi_contacts_Contact_create("),
+            "missing create function"
+        );
+        assert!(
+            header.contains("weaveffi_error* out_err"),
+            "create missing out_err param"
+        );
+        assert!(
+            header.contains(
+                "void weaveffi_contacts_Contact_destroy(weaveffi_contacts_Contact* ptr);"
+            ),
+            "missing destroy function"
+        );
+        assert!(
+            header.contains(
+                "const char* weaveffi_contacts_Contact_get_name(const weaveffi_contacts_Contact* ptr);"
+            ),
+            "missing name getter"
+        );
+        assert!(
+            header.contains(
+                "int32_t weaveffi_contacts_Contact_get_age(const weaveffi_contacts_Contact* ptr);"
+            ),
+            "missing age getter"
+        );
+
+        let typedef_pos = header
+            .find("typedef struct weaveffi_contacts_Contact")
+            .unwrap();
+        let endif_pos = header.find("#ifdef __cplusplus\n}\n#endif").unwrap();
+        assert!(
+            typedef_pos < endif_pos,
+            "struct declarations must appear before closing guard"
+        );
     }
 }
