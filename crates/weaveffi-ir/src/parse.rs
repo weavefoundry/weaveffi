@@ -164,4 +164,156 @@ modules:
         let err = parse_api_str("{}", "xml").unwrap_err();
         assert!(matches!(err, ParseError::UnsupportedFormat(f) if f == "xml"));
     }
+
+    #[test]
+    fn parse_struct_definitions() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: contacts
+    functions: []
+    structs:
+      - name: Person
+        fields:
+          - name: name
+            type: string
+          - name: age
+            type: i32
+          - name: active
+            type: bool
+"#;
+        let api = parse_api_str(yaml, "yaml").unwrap();
+        let s = &api.modules[0].structs[0];
+        assert_eq!(s.name, "Person");
+        assert_eq!(s.fields.len(), 3);
+        assert_eq!(s.fields[0].name, "name");
+        assert_eq!(s.fields[0].ty, TypeRef::StringUtf8);
+        assert_eq!(s.fields[1].name, "age");
+        assert_eq!(s.fields[1].ty, TypeRef::I32);
+        assert_eq!(s.fields[2].name, "active");
+        assert_eq!(s.fields[2].ty, TypeRef::Bool);
+    }
+
+    #[test]
+    fn parse_enum_definitions() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: colors
+    functions: []
+    enums:
+      - name: Color
+        variants:
+          - name: Red
+            value: 0
+          - name: Green
+            value: 1
+          - name: Blue
+            value: 2
+"#;
+        let api = parse_api_str(yaml, "yaml").unwrap();
+        let e = &api.modules[0].enums[0];
+        assert_eq!(e.name, "Color");
+        assert_eq!(e.variants.len(), 3);
+        assert_eq!(e.variants[0].name, "Red");
+        assert_eq!(e.variants[0].value, 0);
+        assert_eq!(e.variants[1].name, "Green");
+        assert_eq!(e.variants[1].value, 1);
+        assert_eq!(e.variants[2].name, "Blue");
+        assert_eq!(e.variants[2].value, 2);
+    }
+
+    #[test]
+    fn parse_optional_types() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: ops
+    functions:
+      - name: maybe
+        params:
+          - name: label
+            type: "string?"
+          - name: count
+            type: "i32?"
+"#;
+        let api = parse_api_str(yaml, "yaml").unwrap();
+        let params = &api.modules[0].functions[0].params;
+        assert_eq!(
+            params[0].ty,
+            TypeRef::Optional(Box::new(TypeRef::StringUtf8))
+        );
+        assert_eq!(params[1].ty, TypeRef::Optional(Box::new(TypeRef::I32)));
+    }
+
+    #[test]
+    fn parse_list_types() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: ops
+    functions:
+      - name: batch
+        params:
+          - name: ids
+            type: "[i32]"
+          - name: names
+            type: "[string]"
+"#;
+        let api = parse_api_str(yaml, "yaml").unwrap();
+        let params = &api.modules[0].functions[0].params;
+        assert_eq!(params[0].ty, TypeRef::List(Box::new(TypeRef::I32)));
+        assert_eq!(params[1].ty, TypeRef::List(Box::new(TypeRef::StringUtf8)));
+    }
+
+    #[test]
+    fn parse_struct_ref_in_function() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: contacts
+    functions:
+      - name: save
+        params:
+          - name: contact
+            type: Contact
+    structs:
+      - name: Contact
+        fields:
+          - name: name
+            type: string
+"#;
+        let api = parse_api_str(yaml, "yaml").unwrap();
+        let param = &api.modules[0].functions[0].params[0];
+        assert_eq!(param.name, "contact");
+        assert_eq!(param.ty, TypeRef::Struct("Contact".to_string()));
+    }
+
+    #[test]
+    fn parse_complex_nested_types() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: ops
+    functions:
+      - name: complex
+        params:
+          - name: opt_contacts
+            type: "[Contact?]"
+          - name: maybe_ids
+            type: "[i32]?"
+"#;
+        let api = parse_api_str(yaml, "yaml").unwrap();
+        let params = &api.modules[0].functions[0].params;
+        assert_eq!(
+            params[0].ty,
+            TypeRef::List(Box::new(TypeRef::Optional(Box::new(TypeRef::Struct(
+                "Contact".to_string()
+            )))))
+        );
+        assert_eq!(
+            params[1].ty,
+            TypeRef::Optional(Box::new(TypeRef::List(Box::new(TypeRef::I32))))
+        );
+    }
 }
