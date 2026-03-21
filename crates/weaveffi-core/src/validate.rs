@@ -33,6 +33,12 @@ pub enum ValidationError {
     InvalidErrorCode { module: String, name: String },
     #[error("function name collides with error domain name in module '{module}': {name}")]
     NameCollisionWithErrorDomain { module: String, name: String },
+    #[error("duplicate struct name in module '{module}': {name}")]
+    DuplicateStructName { module: String, name: String },
+    #[error("duplicate field name in struct '{struct_name}': {field}")]
+    DuplicateStructField { struct_name: String, field: String },
+    #[error("empty struct in module '{module}': {name}")]
+    EmptyStruct { module: String, name: String },
 }
 
 const RESERVED: &[&str] = &[
@@ -96,6 +102,33 @@ fn validate_module(module: &Module) -> Result<(), ValidationError> {
             });
         }
         validate_function(module, f)?;
+    }
+
+    let mut struct_names = BTreeSet::new();
+    for s in &module.structs {
+        check_identifier(&s.name)?;
+        if !struct_names.insert(s.name.clone()) {
+            return Err(ValidationError::DuplicateStructName {
+                module: module.name.clone(),
+                name: s.name.clone(),
+            });
+        }
+        if s.fields.is_empty() {
+            return Err(ValidationError::EmptyStruct {
+                module: module.name.clone(),
+                name: s.name.clone(),
+            });
+        }
+        let mut field_names = BTreeSet::new();
+        for f in &s.fields {
+            check_identifier(&f.name)?;
+            if !field_names.insert(f.name.clone()) {
+                return Err(ValidationError::DuplicateStructField {
+                    struct_name: s.name.clone(),
+                    field: f.name.clone(),
+                });
+            }
+        }
     }
 
     if let Some(errors) = &module.errors {
@@ -177,7 +210,9 @@ fn validate_error_domain(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weaveffi_ir::ir::{Api, ErrorCode, ErrorDomain, Function, Module, Param, TypeRef};
+    use weaveffi_ir::ir::{
+        Api, ErrorCode, ErrorDomain, Function, Module, Param, StructDef, StructField, TypeRef,
+    };
 
     fn simple_function(name: &str) -> Function {
         Function {
@@ -355,6 +390,94 @@ mod tests {
         assert!(matches!(
             validate_api(&api).unwrap_err(),
             ValidationError::DuplicateErrorCode { .. }
+        ));
+    }
+
+    fn simple_struct(name: &str) -> StructDef {
+        StructDef {
+            name: name.to_string(),
+            doc: None,
+            fields: vec![StructField {
+                name: "x".to_string(),
+                ty: TypeRef::I32,
+                doc: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn duplicate_struct_names_rejected() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![simple_function("ok_fn")],
+                structs: vec![simple_struct("Point"), simple_struct("Point")],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        assert!(matches!(
+            validate_api(&api).unwrap_err(),
+            ValidationError::DuplicateStructName { module, name }
+                if module == "mymod" && name == "Point"
+        ));
+    }
+
+    #[test]
+    fn empty_struct_rejected() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![simple_function("ok_fn")],
+                structs: vec![StructDef {
+                    name: "Empty".to_string(),
+                    doc: None,
+                    fields: vec![],
+                }],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        assert!(matches!(
+            validate_api(&api).unwrap_err(),
+            ValidationError::EmptyStruct { module, name }
+                if module == "mymod" && name == "Empty"
+        ));
+    }
+
+    #[test]
+    fn duplicate_struct_field_names_rejected() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![simple_function("ok_fn")],
+                structs: vec![StructDef {
+                    name: "Point".to_string(),
+                    doc: None,
+                    fields: vec![
+                        StructField {
+                            name: "x".to_string(),
+                            ty: TypeRef::I32,
+                            doc: None,
+                        },
+                        StructField {
+                            name: "x".to_string(),
+                            ty: TypeRef::F64,
+                            doc: None,
+                        },
+                    ],
+                }],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        assert!(matches!(
+            validate_api(&api).unwrap_err(),
+            ValidationError::DuplicateStructField { struct_name, field }
+                if struct_name == "Point" && field == "x"
         ));
     }
 }
