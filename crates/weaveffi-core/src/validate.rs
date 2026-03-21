@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use weaveffi_ir::ir::{Api, ErrorDomain, Function, Module, Param};
+use weaveffi_ir::ir::{Api, ErrorDomain, Function, Module, Param, TypeRef};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
@@ -39,6 +39,16 @@ pub enum ValidationError {
     DuplicateStructField { struct_name: String, field: String },
     #[error("empty struct in module '{module}': {name}")]
     EmptyStruct { module: String, name: String },
+    #[error("duplicate enum name in module '{module}': {name}")]
+    DuplicateEnumName { module: String, name: String },
+    #[error("empty enum in module '{module}': {name}")]
+    EmptyEnum { module: String, name: String },
+    #[error("duplicate enum variant in enum '{enum_name}': {variant}")]
+    DuplicateEnumVariant { enum_name: String, variant: String },
+    #[error("duplicate enum value in enum '{enum_name}': {value}")]
+    DuplicateEnumValue { enum_name: String, value: i32 },
+    #[error("unknown type reference: {name}")]
+    UnknownTypeRef { name: String },
 }
 
 const RESERVED: &[&str] = &[
@@ -131,6 +141,54 @@ fn validate_module(module: &Module) -> Result<(), ValidationError> {
         }
     }
 
+    let mut enum_names = BTreeSet::new();
+    for e in &module.enums {
+        check_identifier(&e.name)?;
+        if !enum_names.insert(e.name.clone()) {
+            return Err(ValidationError::DuplicateEnumName {
+                module: module.name.clone(),
+                name: e.name.clone(),
+            });
+        }
+        if e.variants.is_empty() {
+            return Err(ValidationError::EmptyEnum {
+                module: module.name.clone(),
+                name: e.name.clone(),
+            });
+        }
+        let mut variant_names = BTreeSet::new();
+        let mut variant_values = BTreeMap::new();
+        for v in &e.variants {
+            check_identifier(&v.name)?;
+            if !variant_names.insert(v.name.clone()) {
+                return Err(ValidationError::DuplicateEnumVariant {
+                    enum_name: e.name.clone(),
+                    variant: v.name.clone(),
+                });
+            }
+            if variant_values.insert(v.value, v.name.clone()).is_some() {
+                return Err(ValidationError::DuplicateEnumValue {
+                    enum_name: e.name.clone(),
+                    value: v.value,
+                });
+            }
+        }
+    }
+
+    let known_types: BTreeSet<&str> = struct_names
+        .iter()
+        .map(|s| s.as_str())
+        .chain(enum_names.iter().map(|s| s.as_str()))
+        .collect();
+    for f in &module.functions {
+        for p in &f.params {
+            validate_type_ref(&p.ty, &known_types)?;
+        }
+        if let Some(ret) = &f.returns {
+            validate_type_ref(ret, &known_types)?;
+        }
+    }
+
     if let Some(errors) = &module.errors {
         validate_error_domain(module, errors, &function_names)?;
     }
@@ -165,6 +223,19 @@ fn validate_function(module: &Module, f: &Function) -> Result<(), ValidationErro
 fn validate_param(p: &Param) -> Result<(), ValidationError> {
     check_identifier(&p.name)?;
     Ok(())
+}
+
+fn validate_type_ref(ty: &TypeRef, known: &BTreeSet<&str>) -> Result<(), ValidationError> {
+    match ty {
+        TypeRef::Struct(name) | TypeRef::Enum(name) => {
+            if !known.contains(name.as_str()) {
+                return Err(ValidationError::UnknownTypeRef { name: name.clone() });
+            }
+            Ok(())
+        }
+        TypeRef::Optional(inner) | TypeRef::List(inner) => validate_type_ref(inner, known),
+        _ => Ok(()),
+    }
 }
 
 fn validate_error_domain(
@@ -211,7 +282,8 @@ fn validate_error_domain(
 mod tests {
     use super::*;
     use weaveffi_ir::ir::{
-        Api, ErrorCode, ErrorDomain, Function, Module, Param, StructDef, StructField, TypeRef,
+        Api, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param, StructDef,
+        StructField, TypeRef,
     };
 
     fn simple_function(name: &str) -> Function {
@@ -479,5 +551,257 @@ mod tests {
             ValidationError::DuplicateStructField { struct_name, field }
                 if struct_name == "Point" && field == "x"
         ));
+    }
+
+    fn simple_enum(name: &str) -> EnumDef {
+        EnumDef {
+            name: name.to_string(),
+            doc: None,
+            variants: vec![
+                EnumVariant {
+                    name: "A".to_string(),
+                    value: 0,
+                    doc: None,
+                },
+                EnumVariant {
+                    name: "B".to_string(),
+                    value: 1,
+                    doc: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn duplicate_enum_names_rejected() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![simple_function("ok_fn")],
+                structs: vec![],
+                enums: vec![simple_enum("Color"), simple_enum("Color")],
+                errors: None,
+            }],
+        };
+        assert!(matches!(
+            validate_api(&api).unwrap_err(),
+            ValidationError::DuplicateEnumName { module, name }
+                if module == "mymod" && name == "Color"
+        ));
+    }
+
+    #[test]
+    fn empty_enum_rejected() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![simple_function("ok_fn")],
+                structs: vec![],
+                enums: vec![EnumDef {
+                    name: "Empty".to_string(),
+                    doc: None,
+                    variants: vec![],
+                }],
+                errors: None,
+            }],
+        };
+        assert!(matches!(
+            validate_api(&api).unwrap_err(),
+            ValidationError::EmptyEnum { module, name }
+                if module == "mymod" && name == "Empty"
+        ));
+    }
+
+    #[test]
+    fn duplicate_enum_variant_rejected() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![simple_function("ok_fn")],
+                structs: vec![],
+                enums: vec![EnumDef {
+                    name: "Color".to_string(),
+                    doc: None,
+                    variants: vec![
+                        EnumVariant {
+                            name: "Red".to_string(),
+                            value: 0,
+                            doc: None,
+                        },
+                        EnumVariant {
+                            name: "Red".to_string(),
+                            value: 1,
+                            doc: None,
+                        },
+                    ],
+                }],
+                errors: None,
+            }],
+        };
+        assert!(matches!(
+            validate_api(&api).unwrap_err(),
+            ValidationError::DuplicateEnumVariant { enum_name, variant }
+                if enum_name == "Color" && variant == "Red"
+        ));
+    }
+
+    #[test]
+    fn duplicate_enum_value_rejected() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![simple_function("ok_fn")],
+                structs: vec![],
+                enums: vec![EnumDef {
+                    name: "Color".to_string(),
+                    doc: None,
+                    variants: vec![
+                        EnumVariant {
+                            name: "Red".to_string(),
+                            value: 0,
+                            doc: None,
+                        },
+                        EnumVariant {
+                            name: "Green".to_string(),
+                            value: 0,
+                            doc: None,
+                        },
+                    ],
+                }],
+                errors: None,
+            }],
+        };
+        assert!(matches!(
+            validate_api(&api).unwrap_err(),
+            ValidationError::DuplicateEnumValue { enum_name, value }
+                if enum_name == "Color" && value == 0
+        ));
+    }
+
+    #[test]
+    fn unknown_type_ref_rejected() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "do_stuff".to_string(),
+                    params: vec![Param {
+                        name: "x".to_string(),
+                        ty: TypeRef::Struct("Foo".to_string()),
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        assert!(matches!(
+            validate_api(&api).unwrap_err(),
+            ValidationError::UnknownTypeRef { name } if name == "Foo"
+        ));
+    }
+
+    #[test]
+    fn valid_struct_ref_passes() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "do_stuff".to_string(),
+                    params: vec![Param {
+                        name: "p".to_string(),
+                        ty: TypeRef::Struct("Point".to_string()),
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![simple_struct("Point")],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        assert!(validate_api(&api).is_ok());
+    }
+
+    #[test]
+    fn unknown_type_ref_in_optional_rejected() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "do_stuff".to_string(),
+                    params: vec![Param {
+                        name: "x".to_string(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::Struct("Bar".to_string()))),
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        assert!(matches!(
+            validate_api(&api).unwrap_err(),
+            ValidationError::UnknownTypeRef { name } if name == "Bar"
+        ));
+    }
+
+    #[test]
+    fn unknown_type_ref_in_list_rejected() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "do_stuff".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Baz".to_string())))),
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        assert!(matches!(
+            validate_api(&api).unwrap_err(),
+            ValidationError::UnknownTypeRef { name } if name == "Baz"
+        ));
+    }
+
+    #[test]
+    fn valid_enum_ref_passes() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "get_color".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::Enum("Color".to_string())),
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![simple_enum("Color")],
+                errors: None,
+            }],
+        };
+        assert!(validate_api(&api).is_ok());
     }
 }
