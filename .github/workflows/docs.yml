@@ -28,7 +28,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install mdBook
-        run: cargo install mdbook --version ^0.4
+        uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: 'latest'
 
       - name: Build mdBook
         run: mdbook build docs --dest-dir site

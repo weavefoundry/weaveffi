@@ -1,11 +1,13 @@
 [package]
 name = "calculator"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
 
 [lib]
 crate-type = ["cdylib", "rlib"]
-path = "src/lib.rs"
 
 [dependencies]
-weaveffi-core = { path = "../../crates/weaveffi-core" }
+weaveffi-abi = { path = "../../crates/weaveffi-abi" }
+
+[lints]
+workspace = true

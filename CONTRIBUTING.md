@@ -1,8 +1,37 @@
-### Contributing to WeaveFFI
+# Contributing to WeaveFFI
+
+## Development environment
+
+1. Install the [Rust toolchain](https://rustup.rs/) (stable channel).
+2. Clone the repository:
+
+```bash
+git clone https://github.com/weavefoundry/weaveffi.git
+cd weaveffi
+```
+
+3. Build the workspace:
+
+```bash
+cargo build --workspace
+```
+
+4. Run all tests:
+
+```bash
+cargo test --workspace
+```
+
+## Running specific tests
+
+```bash
+cargo test -p weaveffi-core
+cargo test -p weaveffi-ir
+```
+
+## Commit conventions
 
 This repo uses Conventional Commits for all commits. Keep it simple: we do not use scopes.
-
-## Conventional Commits
 
 Use the form:
 
@@ -41,10 +70,10 @@ fix: correct C string ownership in Kotlin generator
 docs: document memory management and error mapping
 style: format generated TypeScript definitions
 chore: update Gradle wrapper and Android build scripts
-ci: add workflow to build WASM and publish npm package
+ci: add workflow to build WASM target
 perf: speed up header parser for large C APIs
 refactor: extract template engine from codegen core
-test: add fixtures for async callback-to-Promise mapping
+test: add fixtures for calculator sample
 revert: revert "perf: speed up header parser for large C APIs"
 ```
 

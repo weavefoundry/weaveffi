@@ -20,6 +20,8 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -29,10 +31,16 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: '22'
+
+      - name: Check formatting
+        run: cargo fmt --all --check
 
       - name: Build workspace (debug)
         run: cargo build --workspace --all-targets
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Run unit tests
         run: cargo test --workspace --all-features --no-fail-fast
@@ -41,7 +49,7 @@ jobs:
         run: cargo build -p weaveffi-cli --release
 
       - name: Generate bindings from calculator IDL
-        run: target/release/weaveffi-cli generate samples/calculator/calculator.yml -o generated
+        run: target/release/weaveffi generate samples/calculator/calculator.yml -o generated
 
       - name: Build calculator cdylib (debug)
         run: cargo build -p calculator
@@ -83,6 +91,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: weaveffi-cli-${{ runner.os }}
-          path: target/release/weaveffi-cli
+          path: target/release/weaveffi
           if-no-files-found: error
           retention-days: 7

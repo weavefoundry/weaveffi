@@ -1,14 +1,16 @@
 [workspace]
 members = [
     "crates/weaveffi-ir",
+    "crates/weaveffi-abi",
     "crates/weaveffi-core",
     "crates/weaveffi-gen-c",
     "crates/weaveffi-gen-swift",
     "crates/weaveffi-gen-android",
     "crates/weaveffi-gen-node",
-    "crates/weaveffi-node-addon",
+    "crates/weaveffi-gen-wasm",
     "crates/weaveffi-cli",
     "samples/calculator",
+    "samples/node-addon",
 ]
 resolver = "2"
 
@@ -32,21 +34,9 @@ thiserror = "1.0"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 camino = "1.1"
-indoc = "2"
-semver = "1.0"
-rayon = "1.8"
-convert_case = "0.6"
 heck = "0.5"
-tera = "1.19"
-walkdir = "2.5"
-fs_err = "3.0"
 color-eyre = "0.6"
-tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
-
-[workspace.metadata.weaveffi]
-# placeholder for generator templates path
-

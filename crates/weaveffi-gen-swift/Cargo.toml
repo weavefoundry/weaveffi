@@ -1,17 +1,18 @@
 [package]
 name = "weaveffi-gen-swift"
 version = "0.1.0"
-edition = "2021"
-
-[lib]
-path = "src/lib.rs"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "WeaveFFI Swift/SwiftPM generator"
 
 [dependencies]
 weaveffi-core = { path = "../weaveffi-core" }
 weaveffi-ir = { path = "../weaveffi-ir" }
-tera = { workspace = true }
 anyhow = { workspace = true }
 camino = { workspace = true }
-convert_case = { workspace = true }
 heck = { workspace = true }
-tracing = { workspace = true }
+
+[lints]
+workspace = true

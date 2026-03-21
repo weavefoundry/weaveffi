@@ -1,22 +1,21 @@
 [package]
 name = "weaveffi-node-addon"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
 
 [lib]
 crate-type = ["cdylib"]
 name = "index"
-path = "src/lib.rs"
 
 [dependencies]
 napi = { version = "3", features = ["napi4"] }
 napi-derive = "3"
 once_cell = "1"
-libc = "0.2"
 libloading = "0.8"
-
-[dependencies.calculator]
-path = "../../samples/calculator"
+weaveffi-abi = { path = "../../crates/weaveffi-abi" }
 
 [build-dependencies]
 napi-build = "2"
+
+[lints]
+workspace = true

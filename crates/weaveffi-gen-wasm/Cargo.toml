@@ -1,11 +1,11 @@
 [package]
-name = "weaveffi-gen-c"
+name = "weaveffi-gen-wasm"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "WeaveFFI C header generator"
+description = "WeaveFFI WASM stub generator"
 
 [dependencies]
 weaveffi-core = { path = "../weaveffi-core" }

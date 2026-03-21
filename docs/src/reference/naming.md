@@ -10,15 +10,17 @@ This guide standardizes how we name the Weave projects, repositories, packages, 
 
 ### Repository and package slugs (URLs and registries)
 
-- Use condensed lowercase slugs for top-level repositories and published packages:
+- Use condensed lowercase slugs for top-level repositories:
   - GitHub: `weaveffi`, `weaveheap` (repos: `weavefoundry/weaveffi`, `weavefoundry/weaveheap`)
-  - crates.io (top-level crates): `weaveffi`, `weaveheap`
-  - npm: `@weavefoundry/weaveffi`, `@weavefoundry/weaveheap`
-  - PyPI: `weaveffi`, `weaveheap`
-  - SPM (repo slug): `weaveffi`, `weaveheap`
 
 - Use hyphenated slugs for subpackages and components, prefixed with the top-level slug:
   - Examples: `weaveffi-core`, `weaveffi-ir`, `weaveheap-core`
+
+- **Planned package names** (not yet published):
+  - crates.io: `weaveffi`, `weaveffi-core`, `weaveffi-ir`, etc.
+  - npm: `@weavefoundry/weaveffi`
+  - PyPI: `weaveffi`
+  - SPM (repo slug): `weaveffi`
 
 Rationale: condensed top-level slugs unify handles across registries and are ergonomic to type; hyphenated subpackages remain idiomatic and map cleanly to ecosystems that normalize to underscores or CamelCase.
 
@@ -58,10 +60,9 @@ Rationale: condensed top-level slugs unify handles across registries and are erg
 
 ### Migration guidance
 
-- Rename existing repositories to `weaveffi` and `weaveheap` (GitHub will auto-redirect; update docs/badges).
 - New crates and packages should follow the condensed top-level + hyphenated subpackage pattern:
   - Rust crates: `weaveffi-*`, `weaveheap-*`.
-  - npm packages: `@weavefoundry/weaveffi-*`, `@weavefoundry/weaveheap-*`.
+  - npm packages (planned): `@weavefoundry/weaveffi-*`, `@weavefoundry/weaveheap-*`.
   - Swift products: UpperCamelCase (e.g., `WeaveFFICore`).
 - Prefer condensed top-level slugs. Avoid hyphenated top-level slugs like `weave-ffi`, `weave-heap` going forward.
 
@@ -76,10 +77,10 @@ Rationale: condensed top-level slugs unify handles across registries and are erg
   - Package product: `WeaveFFI`
   - Import: `import WeaveFFI`
 
-- Python
+- Python (planned)
   - Package: `weaveffi`
   - Import: `import weaveffi as ffi`
 
-- Node
+- Node (planned)
   - Package: `@weavefoundry/weaveffi`
   - Import: `import { WeaveFFI } from '@weavefoundry/weaveffi'`

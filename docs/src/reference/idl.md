@@ -19,7 +19,7 @@ Function:
 - params: array of { name, type }
 - return: optional type
 - doc: optional string
-- async: boolean (present for forward-compat; not supported in 0.1.0)
+- async: boolean (reserved field; not supported — rejected at validation time)
 
 Types (primitive set for 0.1.0): `i32`, `u32`, `i64`, `f64`, `bool`, `string` (UTF-8), `bytes`, `handle` (opaque 64-bit id)
 
@@ -55,7 +55,7 @@ modules:
 
 - Module, function, and parameter names must be unique within their scopes.
 - Reserved keywords are rejected (e.g., `async`, `fn`, `struct`, etc.).
-- `async` functions are not supported in 0.1.0 and will fail validation.
+- `async` functions are not supported and will fail validation.
 - Error domain names must not collide with function names.
 
 ## ABI mapping (0.1.0)

@@ -1,18 +1,33 @@
 [package]
 name = "weaveffi-cli"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "WeaveFFI command-line interface"
+
+[[bin]]
+name = "weaveffi"
+path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true }
 anyhow = { workspace = true }
-tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+color-eyre = { workspace = true }
+camino = { workspace = true }
 weaveffi-core = { path = "../weaveffi-core" }
 weaveffi-ir = { path = "../weaveffi-ir" }
-camino = { workspace = true }
-color-eyre = { workspace = true }
 weaveffi-gen-c = { path = "../weaveffi-gen-c" }
 weaveffi-gen-swift = { path = "../weaveffi-gen-swift" }
 weaveffi-gen-android = { path = "../weaveffi-gen-android" }
 weaveffi-gen-node = { path = "../weaveffi-gen-node" }
+weaveffi-gen-wasm = { path = "../weaveffi-gen-wasm" }
+
+[dev-dependencies]
+assert_cmd = "2"
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,7 +1,4 @@
-import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 // Require the built N-API addon via generated loader (CommonJS)
 const require = createRequire(import.meta.url)

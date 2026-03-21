@@ -1,36 +1,72 @@
 # Getting Started
 
-## Prerequisites
-- Rust stable toolchain and `cargo`
-- mdBook for local docs
+## Install WeaveFFI
 
-Install mdBook:
+Install the CLI from source via Cargo:
+
 ```bash
-cargo install mdbook
+cargo install weaveffi-cli
 ```
+
+This installs the `weaveffi` binary on your `PATH`.
+
+## Create a new project
+
+Scaffold a starter project with an example IR file:
+
+```bash
+weaveffi new my-library
+cd my-library
+```
+
+## Define your IR
+
+Edit the generated YAML file to describe your functions:
+
+```yaml
+version: "0.1.0"
+modules:
+  - name: math
+    functions:
+      - name: add
+        params:
+          - { name: a, type: i32 }
+          - { name: b, type: i32 }
+        return: i32
+```
+
+## Generate bindings
+
+```bash
+weaveffi generate my-library.yml -o generated
+```
+
+This produces target-specific output under `generated/`:
+
+- `c/` — C header and convenience stubs
+- `swift/` — SwiftPM System Library (`CWeaveFFI`) and Swift wrapper (`WeaveFFI`)
+- `android/` — Kotlin JNI wrapper + Gradle skeleton
+- `node/` — N-API addon loader + TypeScript type definitions
+- `wasm/` — minimal WASM loader stub
+
+## Check your toolchain
+
+Run the doctor command to verify prerequisites:
+
+```bash
+weaveffi doctor
+```
+
+This checks for Rust, Xcode (macOS), Android NDK, and Node.js toolchains
+and reports actionable guidance for anything missing.
 
 ## Local docs preview
-Run a live-reloading dev server:
+
+If you want to preview or contribute to the documentation:
+
 ```bash
+cargo install mdbook
 mdbook serve docs -p 3000 -n 127.0.0.1
 ```
-Open http://127.0.0.1:3000
 
-## Build full site locally (docs + Rust API)
-```bash
-# Build mdBook into ./site
-mdbook build docs --dest-dir site
-
-# Build Rust API docs
-cargo doc --workspace --all-features --no-deps
-
-# Assemble into the site
-mkdir -p site/api/rust
-cp -r target/doc/* site/api/rust/
-# Prevent Jekyll processing on GitHub Pages
-touch site/.nojekyll
-```
-Open `site/index.html` in your browser.
-
-## CI/CD
-A GitHub Actions workflow publishes the site to GitHub Pages on pushes to `main`.
+Open <http://127.0.0.1:3000>.

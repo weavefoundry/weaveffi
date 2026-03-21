@@ -1,7 +1,5 @@
-//! Core logic: validation, codegen orchestration, and templates.
+//! Core logic: Generator trait, codegen orchestration, validation, and shared utilities.
 
-pub mod validate;
 pub mod codegen;
-pub mod abi;
-pub mod templates;
-pub mod wasm;
+pub mod utils;
+pub mod validate;
