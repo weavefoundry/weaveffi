@@ -33,18 +33,15 @@ jobs:
           mdbook-version: 'latest'
 
       - name: Build mdBook
-        run: mdbook build docs --dest-dir site
+        run: mdbook build docs
 
       - name: Build Rust API docs
         run: cargo doc --workspace --all-features --no-deps
 
       - name: Assemble site
         run: |
-          # Ensure root site dir exists and include mdBook output (built to docs/site)
           mkdir -p site
-          cp -r docs/site/* site/
-
-          # Copy Rust API docs under /api/rust
+          cp -r docs/book/* site/
           mkdir -p site/api/rust
           cp -r target/doc/* site/api/rust/
           touch site/.nojekyll
