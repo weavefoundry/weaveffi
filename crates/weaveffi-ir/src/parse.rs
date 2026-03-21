@@ -72,6 +72,7 @@ mod tests {
                     r#async: false,
                 }],
                 structs: vec![],
+                enums: vec![],
                 errors: None,
             }],
         }

@@ -66,6 +66,7 @@ fn kotlin_type(t: &TypeRef) -> &'static str {
         TypeRef::Bytes => "ByteArray",
         TypeRef::Handle => "Long",
         TypeRef::Struct(_) => todo!("struct codegen"),
+        TypeRef::Enum(_) => todo!("enum codegen"),
     }
 }
 
@@ -79,6 +80,7 @@ fn jni_param_type(t: &TypeRef) -> &'static str {
         TypeRef::StringUtf8 => "jstring",
         TypeRef::Bytes => "jbyteArray",
         TypeRef::Struct(_) => todo!("struct codegen"),
+        TypeRef::Enum(_) => todo!("enum codegen"),
     }
 }
 
@@ -93,6 +95,7 @@ fn jni_ret_type(t: Option<&TypeRef>) -> &'static str {
         Some(TypeRef::StringUtf8) => "jstring",
         Some(TypeRef::Bytes) => "jbyteArray",
         Some(TypeRef::Struct(_)) => todo!("struct codegen"),
+        Some(TypeRef::Enum(_)) => todo!("enum codegen"),
     }
 }
 
@@ -107,6 +110,7 @@ fn c_type_for_return(t: &TypeRef) -> &'static str {
         TypeRef::StringUtf8 => "const char*",
         TypeRef::Bytes => "const uint8_t*",
         TypeRef::Struct(_) => todo!("struct codegen"),
+        TypeRef::Enum(_) => todo!("enum codegen"),
     }
 }
 
@@ -120,6 +124,7 @@ fn jni_default_return(t: Option<&TypeRef>) -> &'static str {
         Some(TypeRef::StringUtf8) => "return NULL;",
         Some(TypeRef::Bytes) => "return NULL;",
         Some(TypeRef::Struct(_)) => todo!("struct codegen"),
+        Some(TypeRef::Enum(_)) => todo!("enum codegen"),
     }
 }
 
@@ -217,6 +222,7 @@ fn render_jni_c(api: &Api) -> String {
                     TypeRef::F64 => call_args.push(format!("(double){}", p.name)),
                     TypeRef::Handle => call_args.push(format!("(weaveffi_handle_t){}", p.name)),
                     TypeRef::Struct(_) => todo!("struct codegen"),
+                    TypeRef::Enum(_) => todo!("enum codegen"),
                 }
             }
 
