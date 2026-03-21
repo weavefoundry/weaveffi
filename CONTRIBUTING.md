@@ -86,3 +86,64 @@ feat!: switch JS generator from callbacks to Promises
 
 BREAKING CHANGE: JS bindings now return Promises instead of using callbacks; update call sites.
 ```
+
+## Versioning and releases
+
+- All crates are versioned in lockstep. Versions are tracked in each `crates/*/Cargo.toml` and updated automatically by [semantic-release](https://semantic-release.gitbook.io/) via `scripts/update-cargo-versions.sh`.
+- **Automated release pipeline** (on every merge to `main`):
+  1. `semantic-release` scans Conventional Commit messages since the last tag.
+  2. It determines the next SemVer bump: `feat` → **minor**, `fix`/`perf` → **patch**, `BREAKING CHANGE` → **minor** (while version < 1.0; see note below).
+  3. `CHANGELOG.md` is generated, `Cargo.toml` versions are updated, and a tagged release commit (`chore(release): vX.Y.Z`) is pushed.
+  4. All publishable crates are published to [crates.io](https://crates.io) in dependency order.
+  5. A GitHub Release is created with auto-generated release notes.
+- Commit types that trigger a release: `feat` (minor), `fix` and `perf` (patch), `BREAKING CHANGE` (minor while pre-1.0). All other types (`build`, `chore`, `ci`, `docs`, `refactor`, `revert`, `style`, `test`) are recorded in the changelog but do **not** trigger a release on their own.
+- **Pre-1.0 breaking changes**: The `{ "breaking": true, "release": "minor" }` rule in `.releaserc.json` caps breaking changes to a minor bump. When the project is ready for 1.0.0, remove that rule so breaking changes bump major as normal.
+- Tag format: `v`-prefixed (e.g., `v0.1.0`).
+- Manual version bumps are no longer needed — just merge PRs with valid Conventional Commit titles. For ad-hoc runs, use the workflow's **Run workflow** button (`workflow_dispatch`).
+
+### Branching rules
+
+- `main`: default branch.
+- Feature branches: `feature/...` from `main`; hotfixes: `hotfix/...` from `main`.
+
+#### Branch naming
+
+- Use lowercase kebab-case; no spaces; keep names concise (aim ≤ 40 chars).
+- Suggested prefixes (align with Conventional Commit categories):
+  - `feature/<short-desc>`
+  - `fix/<short-desc>`
+  - `chore/<short-desc>`
+  - `docs/<short-desc>`
+  - `ci/<short-desc>`
+  - `refactor/<short-desc>`
+  - `test/<short-desc>`
+  - `perf/<short-desc>`
+  - `build/<short-desc>`
+  - `hotfix/<short-desc>`
+
+Examples:
+
+```text
+feature/struct-codegen
+fix/swift-string-ownership
+docs/contributing-guidelines
+ci/add-wasm-workflow
+build/update-clap
+refactor/extract-template-engine
+test/calculator-fixtures
+hotfix/android-jni-crash
+```
+
+## CI
+
+- **CI** (`ci.yml`): runs `cargo fmt --check`, `cargo clippy`, `cargo test`, and build verification on macOS and Linux for every push and PR.
+- **PR Lint** (`pr-lint.yml`): validates the PR title against Conventional Commits format (protects squash merges) and checks individual commit messages via commitlint (protects rebase merges).
+- **Release** (`release.yml`): runs on merge to `main`; computes version, generates changelog, tags, creates GitHub Release, and publishes all workspace crates to crates.io.
+
+## Security
+
+- Do not commit secrets or credentials.
+
+## License
+
+By contributing, you agree that your contributions are licensed under the repository's MIT OR Apache-2.0 License.
