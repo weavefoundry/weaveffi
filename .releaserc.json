@@ -1,0 +1,55 @@
+{
+  "branches": ["main"],
+  "tagFormat": "v${version}",
+  "plugins": [
+    [
+      "@semantic-release/commit-analyzer",
+      {
+        "preset": "conventionalcommits",
+        "releaseRules": [
+          { "type": "feat", "release": "minor" },
+          { "type": "fix", "release": "patch" },
+          { "type": "perf", "release": "patch" },
+          { "breaking": true, "release": "minor" }
+        ]
+      }
+    ],
+    [
+      "@semantic-release/release-notes-generator",
+      {
+        "preset": "conventionalcommits",
+        "presetConfig": {
+          "types": [
+            { "type": "feat", "section": "Features" },
+            { "type": "fix", "section": "Bug Fixes" },
+            { "type": "perf", "section": "Performance" },
+            { "type": "revert", "section": "Reverts" },
+            { "type": "refactor", "section": "Code Refactoring", "hidden": true },
+            { "type": "docs", "section": "Documentation", "hidden": true },
+            { "type": "style", "section": "Styles", "hidden": true },
+            { "type": "chore", "section": "Miscellaneous", "hidden": true },
+            { "type": "ci", "section": "CI", "hidden": true },
+            { "type": "build", "section": "Build", "hidden": true },
+            { "type": "test", "section": "Tests", "hidden": true }
+          ]
+        }
+      }
+    ],
+    "@semantic-release/changelog",
+    [
+      "@semantic-release/exec",
+      {
+        "prepareCmd": "bash scripts/update-cargo-versions.sh ${nextRelease.version}",
+        "publishCmd": "bash scripts/publish-crates.sh"
+      }
+    ],
+    [
+      "@semantic-release/git",
+      {
+        "assets": ["CHANGELOG.md", "crates/*/Cargo.toml", "Cargo.lock"],
+        "message": "chore(release): v${nextRelease.version}"
+      }
+    ],
+    "@semantic-release/github"
+  ]
+}
