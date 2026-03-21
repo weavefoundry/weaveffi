@@ -196,6 +196,7 @@ mod tests {
         Module {
             name: name.to_string(),
             functions: vec![simple_function("do_stuff")],
+            structs: vec![],
             errors: None,
         }
     }
@@ -231,6 +232,7 @@ mod tests {
             modules: vec![Module {
                 name: "mymod".to_string(),
                 functions: vec![simple_function("same"), simple_function("same")],
+                structs: vec![],
                 errors: None,
             }],
         };
@@ -248,6 +250,7 @@ mod tests {
                 modules: vec![Module {
                     name: kw.to_string(),
                     functions: vec![simple_function("ok_fn")],
+                    structs: vec![],
                     errors: None,
                 }],
             };
@@ -266,6 +269,7 @@ mod tests {
                 modules: vec![Module {
                     name: bad.to_string(),
                     functions: vec![simple_function("ok_fn")],
+                    structs: vec![],
                     errors: None,
                 }],
             };
@@ -289,6 +293,7 @@ mod tests {
                     doc: None,
                     r#async: true,
                 }],
+                structs: vec![],
                 errors: None,
             }],
         };
@@ -305,6 +310,7 @@ mod tests {
             modules: vec![Module {
                 name: "".to_string(),
                 functions: vec![simple_function("ok_fn")],
+                structs: vec![],
                 errors: None,
             }],
         };
@@ -321,6 +327,7 @@ mod tests {
             modules: vec![Module {
                 name: "mymod".to_string(),
                 functions: vec![simple_function("ok_fn")],
+                structs: vec![],
                 errors: Some(ErrorDomain {
                     name: "MyErrors".to_string(),
                     codes: vec![

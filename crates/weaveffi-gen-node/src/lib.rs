@@ -33,6 +33,7 @@ fn ts_type_for(ty: &TypeRef) -> &'static str {
         TypeRef::StringUtf8 => "string",
         TypeRef::Bytes => "Buffer",
         TypeRef::Handle => "bigint",
+        TypeRef::Struct(_) => todo!("struct codegen"),
     }
 }
 
