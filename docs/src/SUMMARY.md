@@ -15,6 +15,6 @@
   - [Swift](generators/swift.md)
   - [WASM](generators/wasm.md)
 - [API](api/README.md)
-  - [Rust API (cargo doc)](../api/rust/index.html)
+  - [Rust API (cargo doc)](api/rust.md)
 - [Tutorials](tutorials/README.md)
   - [Calculator](tutorials/calculator.md)
