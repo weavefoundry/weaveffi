@@ -11,13 +11,33 @@ fn generate_produces_expected_files() {
 
     assert_cmd::Command::cargo_bin("weaveffi")
         .expect("binary not found")
-        .args(["generate", input.to_str().unwrap(), "-o", out_path.to_str().unwrap()])
+        .args([
+            "generate",
+            input.to_str().unwrap(),
+            "-o",
+            out_path.to_str().unwrap(),
+        ])
         .assert()
         .success();
 
-    assert!(out_path.join("c/weaveffi.h").exists(), "missing c/weaveffi.h");
-    assert!(out_path.join("swift/Package.swift").exists(), "missing swift/Package.swift");
-    assert!(out_path.join("android/build.gradle").exists(), "missing android/build.gradle");
-    assert!(out_path.join("node/types.d.ts").exists(), "missing node/types.d.ts");
-    assert!(out_path.join("wasm/README.md").exists(), "missing wasm/README.md");
+    assert!(
+        out_path.join("c/weaveffi.h").exists(),
+        "missing c/weaveffi.h"
+    );
+    assert!(
+        out_path.join("swift/Package.swift").exists(),
+        "missing swift/Package.swift"
+    );
+    assert!(
+        out_path.join("android/build.gradle").exists(),
+        "missing android/build.gradle"
+    );
+    assert!(
+        out_path.join("node/types.d.ts").exists(),
+        "missing node/types.d.ts"
+    );
+    assert!(
+        out_path.join("wasm/README.md").exists(),
+        "missing wasm/README.md"
+    );
 }
