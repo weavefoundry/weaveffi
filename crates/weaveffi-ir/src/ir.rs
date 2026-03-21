@@ -37,26 +37,80 @@ pub struct Param {
     pub ty: TypeRef,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeRef {
-    #[serde(rename = "i32")]
     I32,
-    #[serde(rename = "u32")]
     U32,
-    #[serde(rename = "i64")]
     I64,
-    #[serde(rename = "f64")]
     F64,
-    #[serde(rename = "bool")]
     Bool,
-    #[serde(rename = "string")]
     StringUtf8,
-    #[serde(rename = "bytes")]
     Bytes,
-    #[serde(rename = "handle")]
     Handle,
     Struct(String),
     Enum(String),
+    Optional(Box<TypeRef>),
+    List(Box<TypeRef>),
+}
+
+pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty type reference".to_string());
+    }
+    if s.starts_with('[') && s.ends_with(']') {
+        let inner = &s[1..s.len() - 1];
+        return parse_type_ref(inner).map(|t| TypeRef::List(Box::new(t)));
+    }
+    if let Some(inner) = s.strip_suffix('?') {
+        return parse_type_ref(inner).map(|t| TypeRef::Optional(Box::new(t)));
+    }
+    match s {
+        "i32" => Ok(TypeRef::I32),
+        "u32" => Ok(TypeRef::U32),
+        "i64" => Ok(TypeRef::I64),
+        "f64" => Ok(TypeRef::F64),
+        "bool" => Ok(TypeRef::Bool),
+        "string" => Ok(TypeRef::StringUtf8),
+        "bytes" => Ok(TypeRef::Bytes),
+        "handle" => Ok(TypeRef::Handle),
+        name => Ok(TypeRef::Struct(name.to_string())),
+    }
+}
+
+fn type_ref_to_string(ty: &TypeRef) -> String {
+    match ty {
+        TypeRef::I32 => "i32".to_string(),
+        TypeRef::U32 => "u32".to_string(),
+        TypeRef::I64 => "i64".to_string(),
+        TypeRef::F64 => "f64".to_string(),
+        TypeRef::Bool => "bool".to_string(),
+        TypeRef::StringUtf8 => "string".to_string(),
+        TypeRef::Bytes => "bytes".to_string(),
+        TypeRef::Handle => "handle".to_string(),
+        TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
+        TypeRef::Optional(inner) => format!("{}?", type_ref_to_string(inner)),
+        TypeRef::List(inner) => format!("[{}]", type_ref_to_string(inner)),
+    }
+}
+
+impl Serialize for TypeRef {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&type_ref_to_string(self))
+    }
+}
+
+impl<'de> Deserialize<'de> for TypeRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        parse_type_ref(&s).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,7 +233,7 @@ modules:
     fn typeref_struct_variant_serializes() {
         let ty = TypeRef::Struct("Point".to_string());
         let json = serde_json::to_string(&ty).unwrap();
-        assert_eq!(json, r#"{"Struct":"Point"}"#);
+        assert_eq!(json, r#""Point""#);
         let back: TypeRef = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ty);
     }
@@ -276,12 +330,10 @@ modules:
     }
 
     #[test]
-    fn typeref_enum_variant_serializes() {
+    fn typeref_enum_variant_serializes_as_name() {
         let ty = TypeRef::Enum("Color".to_string());
         let json = serde_json::to_string(&ty).unwrap();
-        assert_eq!(json, r#"{"Enum":"Color"}"#);
-        let back: TypeRef = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, ty);
+        assert_eq!(json, r#""Color""#);
     }
 
     #[test]
@@ -329,5 +381,192 @@ modules:
             ],
         };
         assert_eq!(s, s.clone());
+    }
+
+    #[test]
+    fn parse_type_ref_primitives() {
+        assert_eq!(parse_type_ref("i32"), Ok(TypeRef::I32));
+        assert_eq!(parse_type_ref("u32"), Ok(TypeRef::U32));
+        assert_eq!(parse_type_ref("i64"), Ok(TypeRef::I64));
+        assert_eq!(parse_type_ref("f64"), Ok(TypeRef::F64));
+        assert_eq!(parse_type_ref("bool"), Ok(TypeRef::Bool));
+        assert_eq!(parse_type_ref("string"), Ok(TypeRef::StringUtf8));
+        assert_eq!(parse_type_ref("bytes"), Ok(TypeRef::Bytes));
+        assert_eq!(parse_type_ref("handle"), Ok(TypeRef::Handle));
+    }
+
+    #[test]
+    fn parse_type_ref_struct() {
+        assert_eq!(
+            parse_type_ref("Contact"),
+            Ok(TypeRef::Struct("Contact".into()))
+        );
+        assert_eq!(
+            parse_type_ref("MyWidget"),
+            Ok(TypeRef::Struct("MyWidget".into()))
+        );
+    }
+
+    #[test]
+    fn parse_type_ref_optional() {
+        assert_eq!(
+            parse_type_ref("string?"),
+            Ok(TypeRef::Optional(Box::new(TypeRef::StringUtf8)))
+        );
+        assert_eq!(
+            parse_type_ref("i32?"),
+            Ok(TypeRef::Optional(Box::new(TypeRef::I32)))
+        );
+        assert_eq!(
+            parse_type_ref("Contact?"),
+            Ok(TypeRef::Optional(Box::new(TypeRef::Struct(
+                "Contact".into()
+            ))))
+        );
+    }
+
+    #[test]
+    fn parse_type_ref_list() {
+        assert_eq!(
+            parse_type_ref("[i32]"),
+            Ok(TypeRef::List(Box::new(TypeRef::I32)))
+        );
+        assert_eq!(
+            parse_type_ref("[string]"),
+            Ok(TypeRef::List(Box::new(TypeRef::StringUtf8)))
+        );
+        assert_eq!(
+            parse_type_ref("[Contact]"),
+            Ok(TypeRef::List(Box::new(TypeRef::Struct("Contact".into()))))
+        );
+    }
+
+    #[test]
+    fn parse_type_ref_nested() {
+        assert_eq!(
+            parse_type_ref("[i32?]"),
+            Ok(TypeRef::List(Box::new(TypeRef::Optional(Box::new(
+                TypeRef::I32
+            )))))
+        );
+        assert_eq!(
+            parse_type_ref("[Contact]?"),
+            Ok(TypeRef::Optional(Box::new(TypeRef::List(Box::new(
+                TypeRef::Struct("Contact".into())
+            )))))
+        );
+    }
+
+    #[test]
+    fn parse_type_ref_empty_is_error() {
+        assert!(parse_type_ref("").is_err());
+        assert!(parse_type_ref("  ").is_err());
+    }
+
+    #[test]
+    fn typeref_primitive_round_trips() {
+        for ty in [
+            TypeRef::I32,
+            TypeRef::U32,
+            TypeRef::I64,
+            TypeRef::F64,
+            TypeRef::Bool,
+            TypeRef::StringUtf8,
+            TypeRef::Bytes,
+            TypeRef::Handle,
+        ] {
+            let json = serde_json::to_string(&ty).unwrap();
+            let back: TypeRef = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, ty);
+        }
+    }
+
+    #[test]
+    fn typeref_optional_round_trip() {
+        let ty = TypeRef::Optional(Box::new(TypeRef::StringUtf8));
+        let json = serde_json::to_string(&ty).unwrap();
+        assert_eq!(json, r#""string?""#);
+        let back: TypeRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ty);
+    }
+
+    #[test]
+    fn typeref_list_round_trip() {
+        let ty = TypeRef::List(Box::new(TypeRef::I32));
+        let json = serde_json::to_string(&ty).unwrap();
+        assert_eq!(json, r#""[i32]""#);
+        let back: TypeRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ty);
+    }
+
+    #[test]
+    fn typeref_optional_struct_round_trip() {
+        let ty = TypeRef::Optional(Box::new(TypeRef::Struct("Contact".into())));
+        let json = serde_json::to_string(&ty).unwrap();
+        assert_eq!(json, r#""Contact?""#);
+        let back: TypeRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ty);
+    }
+
+    #[test]
+    fn typeref_list_struct_round_trip() {
+        let ty = TypeRef::List(Box::new(TypeRef::Struct("Contact".into())));
+        let json = serde_json::to_string(&ty).unwrap();
+        assert_eq!(json, r#""[Contact]""#);
+        let back: TypeRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ty);
+    }
+
+    #[test]
+    fn typeref_optional_yaml_deser() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: contacts
+    functions:
+      - name: find
+        params:
+          - name: id
+            type: i32
+        return: "Contact?"
+"#;
+        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert_eq!(
+            f.returns,
+            Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                "Contact".into()
+            ))))
+        );
+    }
+
+    #[test]
+    fn typeref_list_yaml_deser() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: contacts
+    functions:
+      - name: list_all
+        params: []
+        return: "[Contact]"
+"#;
+        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert_eq!(
+            f.returns,
+            Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into()))))
+        );
+    }
+
+    #[test]
+    fn typeref_hash_works_with_box_variants() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(TypeRef::I32);
+        set.insert(TypeRef::Optional(Box::new(TypeRef::I32)));
+        set.insert(TypeRef::List(Box::new(TypeRef::I32)));
+        set.insert(TypeRef::Optional(Box::new(TypeRef::Struct("Foo".into()))));
+        assert_eq!(set.len(), 4);
     }
 }

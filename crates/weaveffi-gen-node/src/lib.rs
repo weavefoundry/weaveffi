@@ -35,6 +35,8 @@ fn ts_type_for(ty: &TypeRef) -> &'static str {
         TypeRef::Handle => "bigint",
         TypeRef::Struct(_) => todo!("struct codegen"),
         TypeRef::Enum(_) => todo!("enum codegen"),
+        TypeRef::Optional(_) => todo!("optional codegen"),
+        TypeRef::List(_) => todo!("list codegen"),
     }
 }
 

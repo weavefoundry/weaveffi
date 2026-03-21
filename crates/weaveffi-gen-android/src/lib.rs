@@ -67,6 +67,8 @@ fn kotlin_type(t: &TypeRef) -> &'static str {
         TypeRef::Handle => "Long",
         TypeRef::Struct(_) => todo!("struct codegen"),
         TypeRef::Enum(_) => todo!("enum codegen"),
+        TypeRef::Optional(_) => todo!("optional codegen"),
+        TypeRef::List(_) => todo!("list codegen"),
     }
 }
 
@@ -81,6 +83,8 @@ fn jni_param_type(t: &TypeRef) -> &'static str {
         TypeRef::Bytes => "jbyteArray",
         TypeRef::Struct(_) => todo!("struct codegen"),
         TypeRef::Enum(_) => todo!("enum codegen"),
+        TypeRef::Optional(_) => todo!("optional codegen"),
+        TypeRef::List(_) => todo!("list codegen"),
     }
 }
 
@@ -96,6 +100,8 @@ fn jni_ret_type(t: Option<&TypeRef>) -> &'static str {
         Some(TypeRef::Bytes) => "jbyteArray",
         Some(TypeRef::Struct(_)) => todo!("struct codegen"),
         Some(TypeRef::Enum(_)) => todo!("enum codegen"),
+        Some(TypeRef::Optional(_)) => todo!("optional codegen"),
+        Some(TypeRef::List(_)) => todo!("list codegen"),
     }
 }
 
@@ -111,6 +117,8 @@ fn c_type_for_return(t: &TypeRef) -> &'static str {
         TypeRef::Bytes => "const uint8_t*",
         TypeRef::Struct(_) => todo!("struct codegen"),
         TypeRef::Enum(_) => todo!("enum codegen"),
+        TypeRef::Optional(_) => todo!("optional codegen"),
+        TypeRef::List(_) => todo!("list codegen"),
     }
 }
 
@@ -125,6 +133,8 @@ fn jni_default_return(t: Option<&TypeRef>) -> &'static str {
         Some(TypeRef::Bytes) => "return NULL;",
         Some(TypeRef::Struct(_)) => todo!("struct codegen"),
         Some(TypeRef::Enum(_)) => todo!("enum codegen"),
+        Some(TypeRef::Optional(_)) => todo!("optional codegen"),
+        Some(TypeRef::List(_)) => todo!("list codegen"),
     }
 }
 
@@ -223,6 +233,8 @@ fn render_jni_c(api: &Api) -> String {
                     TypeRef::Handle => call_args.push(format!("(weaveffi_handle_t){}", p.name)),
                     TypeRef::Struct(_) => todo!("struct codegen"),
                     TypeRef::Enum(_) => todo!("enum codegen"),
+                    TypeRef::Optional(_) => todo!("optional codegen"),
+                    TypeRef::List(_) => todo!("list codegen"),
                 }
             }
 
