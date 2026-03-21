@@ -53,6 +53,7 @@ fn swift_type_for(t: &TypeRef) -> &'static str {
         TypeRef::StringUtf8 => "String",
         TypeRef::Bytes => "Data",
         TypeRef::Handle => "UInt64",
+        TypeRef::Struct(_) => todo!("struct codegen"),
     }
 }
 

@@ -71,6 +71,7 @@ mod tests {
                     doc: Some("Adds two numbers".to_string()),
                     r#async: false,
                 }],
+                structs: vec![],
                 errors: None,
             }],
         }

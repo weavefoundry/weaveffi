@@ -30,6 +30,7 @@ fn c_type_for_param(ty: &TypeRef, name: &str) -> String {
         TypeRef::StringUtf8 => format!("const uint8_t* {}_ptr, size_t {}_len", name, name),
         TypeRef::Bytes => format!("const uint8_t* {}_ptr, size_t {}_len", name, name),
         TypeRef::Handle => format!("weaveffi_handle_t {}", name),
+        TypeRef::Struct(_) => todo!("struct codegen"),
     }
 }
 
@@ -43,6 +44,7 @@ fn c_ret_type(ty: &TypeRef) -> (&'static str, bool) {
         TypeRef::StringUtf8 => ("const char*", false),
         TypeRef::Bytes => ("const uint8_t*", true),
         TypeRef::Handle => ("weaveffi_handle_t", false),
+        TypeRef::Struct(_) => todo!("struct codegen"),
     }
 }
 
@@ -149,6 +151,7 @@ mod tests {
                     },
                 ],
                 errors: None,
+                structs: vec![],
             }],
         };
 
