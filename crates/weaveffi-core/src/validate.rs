@@ -197,6 +197,7 @@ mod tests {
             name: name.to_string(),
             functions: vec![simple_function("do_stuff")],
             structs: vec![],
+            enums: vec![],
             errors: None,
         }
     }
@@ -233,6 +234,7 @@ mod tests {
                 name: "mymod".to_string(),
                 functions: vec![simple_function("same"), simple_function("same")],
                 structs: vec![],
+                enums: vec![],
                 errors: None,
             }],
         };
@@ -251,6 +253,7 @@ mod tests {
                     name: kw.to_string(),
                     functions: vec![simple_function("ok_fn")],
                     structs: vec![],
+                    enums: vec![],
                     errors: None,
                 }],
             };
@@ -270,6 +273,7 @@ mod tests {
                     name: bad.to_string(),
                     functions: vec![simple_function("ok_fn")],
                     structs: vec![],
+                    enums: vec![],
                     errors: None,
                 }],
             };
@@ -294,6 +298,7 @@ mod tests {
                     r#async: true,
                 }],
                 structs: vec![],
+                enums: vec![],
                 errors: None,
             }],
         };
@@ -311,6 +316,7 @@ mod tests {
                 name: "".to_string(),
                 functions: vec![simple_function("ok_fn")],
                 structs: vec![],
+                enums: vec![],
                 errors: None,
             }],
         };
@@ -328,6 +334,7 @@ mod tests {
                 name: "mymod".to_string(),
                 functions: vec![simple_function("ok_fn")],
                 structs: vec![],
+                enums: vec![],
                 errors: Some(ErrorDomain {
                     name: "MyErrors".to_string(),
                     codes: vec![

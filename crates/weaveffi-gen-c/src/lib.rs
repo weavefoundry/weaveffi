@@ -31,6 +31,7 @@ fn c_type_for_param(ty: &TypeRef, name: &str) -> String {
         TypeRef::Bytes => format!("const uint8_t* {}_ptr, size_t {}_len", name, name),
         TypeRef::Handle => format!("weaveffi_handle_t {}", name),
         TypeRef::Struct(_) => todo!("struct codegen"),
+        TypeRef::Enum(_) => todo!("enum codegen"),
     }
 }
 
@@ -45,6 +46,7 @@ fn c_ret_type(ty: &TypeRef) -> (&'static str, bool) {
         TypeRef::Bytes => ("const uint8_t*", true),
         TypeRef::Handle => ("weaveffi_handle_t", false),
         TypeRef::Struct(_) => todo!("struct codegen"),
+        TypeRef::Enum(_) => todo!("enum codegen"),
     }
 }
 
@@ -152,6 +154,7 @@ mod tests {
                 ],
                 errors: None,
                 structs: vec![],
+                enums: vec![],
             }],
         };
 

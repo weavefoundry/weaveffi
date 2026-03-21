@@ -54,6 +54,7 @@ fn swift_type_for(t: &TypeRef) -> &'static str {
         TypeRef::Bytes => "Data",
         TypeRef::Handle => "UInt64",
         TypeRef::Struct(_) => todo!("struct codegen"),
+        TypeRef::Enum(_) => todo!("enum codegen"),
     }
 }
 
