@@ -283,6 +283,41 @@ fn doc_wasm_readme_type_conventions() {
     assert!(readme.contains("### Lists"), "lists section missing");
 }
 
+#[test]
+fn summary_md_all_links_resolve() {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let docs_src = workspace_root.join("docs/src");
+    let summary = std::fs::read_to_string(docs_src.join("SUMMARY.md"))
+        .expect("docs/src/SUMMARY.md must exist");
+
+    let mut missing = Vec::new();
+    for line in summary.lines() {
+        // Extract path from markdown links like [Title](path.md)
+        if let Some(start) = line.find("](") {
+            let rest = &line[start + 2..];
+            if let Some(end) = rest.find(')') {
+                let target = &rest[..end];
+                if target.is_empty() || !target.ends_with(".md") {
+                    continue;
+                }
+                let full = docs_src.join(target);
+                if !full.exists() {
+                    missing.push(target.to_string());
+                }
+            }
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "SUMMARY.md references missing files: {missing:?}"
+    );
+}
+
 const GETTING_STARTED_YAML: &str = r#"
 version: "0.1.0"
 modules:
