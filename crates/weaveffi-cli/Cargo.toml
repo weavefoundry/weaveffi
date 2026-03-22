@@ -1,6 +1,6 @@
 [package]
 name = "weaveffi-cli"
-version = "0.0.0"
+version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -18,13 +18,13 @@ clap = { workspace = true }
 tracing-subscriber = { workspace = true }
 color-eyre = { workspace = true }
 camino = { workspace = true }
-weaveffi-core = { path = "../weaveffi-core", version = "0.0.0" }
-weaveffi-ir = { path = "../weaveffi-ir", version = "0.0.0" }
-weaveffi-gen-c = { path = "../weaveffi-gen-c", version = "0.0.0" }
-weaveffi-gen-swift = { path = "../weaveffi-gen-swift", version = "0.0.0" }
-weaveffi-gen-android = { path = "../weaveffi-gen-android", version = "0.0.0" }
-weaveffi-gen-node = { path = "../weaveffi-gen-node", version = "0.0.0" }
-weaveffi-gen-wasm = { path = "../weaveffi-gen-wasm", version = "0.0.0" }
+weaveffi-core = { path = "../weaveffi-core", version = "0.1.0" }
+weaveffi-ir = { path = "../weaveffi-ir", version = "0.1.0" }
+weaveffi-gen-c = { path = "../weaveffi-gen-c", version = "0.1.0" }
+weaveffi-gen-swift = { path = "../weaveffi-gen-swift", version = "0.1.0" }
+weaveffi-gen-android = { path = "../weaveffi-gen-android", version = "0.1.0" }
+weaveffi-gen-node = { path = "../weaveffi-gen-node", version = "0.1.0" }
+weaveffi-gen-wasm = { path = "../weaveffi-gen-wasm", version = "0.1.0" }
 
 [dev-dependencies]
 assert_cmd = "2"

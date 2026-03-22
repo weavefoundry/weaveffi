@@ -1165,11 +1165,11 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-abi"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "weaveffi-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "camino",
@@ -1189,7 +1189,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -1199,7 +1199,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-android"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -1209,7 +1209,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-c"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -1219,7 +1219,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-node"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -1229,7 +1229,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-swift"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -1240,7 +1240,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-wasm"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -1250,7 +1250,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-ir"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
