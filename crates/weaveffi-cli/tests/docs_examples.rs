@@ -318,6 +318,95 @@ fn summary_md_all_links_resolve() {
     );
 }
 
+const README_QUICKSTART_YAML: &str = r#"
+version: "0.1.0"
+modules:
+  - name: contacts
+    structs:
+      - name: Contact
+        fields:
+          - name: id
+            type: i64
+          - name: name
+            type: string
+          - name: email
+            type: "string?"
+    functions:
+      - name: create_contact
+        params:
+          - name: name
+            type: string
+          - name: email
+            type: "string?"
+        return: Contact
+      - name: list_contacts
+        params: []
+        return: "[Contact]"
+"#;
+
+#[test]
+fn readme_quickstart_yaml_parses_and_validates() {
+    let api = weaveffi_ir::parse::parse_api_str(README_QUICKSTART_YAML, "yaml")
+        .expect("README quickstart YAML should parse");
+    weaveffi_core::validate::validate_api(&api).expect("README quickstart YAML should validate");
+
+    assert_eq!(api.modules.len(), 1);
+    let m = &api.modules[0];
+    assert_eq!(m.name, "contacts");
+    assert_eq!(m.structs.len(), 1);
+    assert_eq!(m.structs[0].name, "Contact");
+    assert_eq!(m.structs[0].fields.len(), 3);
+    assert_eq!(m.functions.len(), 2);
+    assert_eq!(m.functions[0].name, "create_contact");
+    assert_eq!(m.functions[1].name, "list_contacts");
+}
+
+#[test]
+fn readme_quickstart_generates_c_header() {
+    let out_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let out_path = out_dir.path();
+    let yml_path = out_path.join("contacts.yml");
+    std::fs::write(&yml_path, README_QUICKSTART_YAML).unwrap();
+
+    assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args([
+            "generate",
+            yml_path.to_str().unwrap(),
+            "-o",
+            out_path.join("generated").to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let header = std::fs::read_to_string(out_path.join("generated/c/weaveffi.h")).unwrap();
+
+    assert!(
+        header.contains("typedef struct weaveffi_contacts_Contact weaveffi_contacts_Contact;"),
+        "opaque struct typedef missing: {header}"
+    );
+    assert!(
+        header.contains("weaveffi_contacts_Contact_create("),
+        "Contact_create missing: {header}"
+    );
+    assert!(
+        header.contains("weaveffi_contacts_Contact_destroy("),
+        "Contact_destroy missing: {header}"
+    );
+    assert!(
+        header.contains("weaveffi_contacts_Contact_get_name("),
+        "Contact_get_name missing: {header}"
+    );
+    assert!(
+        header.contains("weaveffi_contacts_create_contact("),
+        "create_contact missing: {header}"
+    );
+    assert!(
+        header.contains("weaveffi_contacts_list_contacts("),
+        "list_contacts missing: {header}"
+    );
+}
+
 const GETTING_STARTED_YAML: &str = r#"
 version: "0.1.0"
 modules:
