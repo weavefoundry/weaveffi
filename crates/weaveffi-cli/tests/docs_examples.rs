@@ -1,3 +1,288 @@
+const GENERATOR_DOCS_YAML: &str = r#"
+version: "0.1.0"
+modules:
+  - name: contacts
+    enums:
+      - name: ContactType
+        variants:
+          - { name: Personal, value: 0 }
+          - { name: Work, value: 1 }
+          - { name: Other, value: 2 }
+
+    structs:
+      - name: Contact
+        fields:
+          - { name: name, type: string }
+          - { name: email, type: "string?" }
+          - { name: age, type: i32 }
+
+    functions:
+      - name: create_contact
+        params:
+          - { name: first_name, type: string }
+          - { name: last_name, type: string }
+        return: Contact
+
+      - name: find_contact
+        params:
+          - { name: id, type: "i32?" }
+        return: "Contact?"
+
+      - name: list_contacts
+        params: []
+        return: "[Contact]"
+
+      - name: count_contacts
+        params: []
+        return: i32
+"#;
+
+fn generate_all_for_docs() -> (tempfile::TempDir, std::path::PathBuf) {
+    let out_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let out_path = out_dir.path().to_path_buf();
+    let yml_path = out_path.join("weaveffi.yml");
+    std::fs::write(&yml_path, GENERATOR_DOCS_YAML).unwrap();
+
+    assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args([
+            "generate",
+            yml_path.to_str().unwrap(),
+            "-o",
+            out_path.join("generated").to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    (out_dir, out_path)
+}
+
+#[test]
+fn doc_swift_contains_enum_declaration() {
+    let (_dir, out) = generate_all_for_docs();
+    let swift =
+        std::fs::read_to_string(out.join("generated/swift/Sources/WeaveFFI/WeaveFFI.swift"))
+            .unwrap();
+
+    assert!(
+        swift.contains("public enum ContactType: Int32 {"),
+        "Swift enum declaration missing: {swift}"
+    );
+    assert!(
+        swift.contains("case personal = 0"),
+        "Swift enum variant lowerCamelCase missing: {swift}"
+    );
+}
+
+#[test]
+fn doc_swift_contains_struct_class() {
+    let (_dir, out) = generate_all_for_docs();
+    let swift =
+        std::fs::read_to_string(out.join("generated/swift/Sources/WeaveFFI/WeaveFFI.swift"))
+            .unwrap();
+
+    assert!(
+        swift.contains("public class Contact {"),
+        "Swift struct class missing: {swift}"
+    );
+    assert!(
+        swift.contains("let ptr: OpaquePointer"),
+        "OpaquePointer property missing: {swift}"
+    );
+    assert!(
+        swift.contains("weaveffi_contacts_Contact_destroy(ptr)"),
+        "deinit destroy missing: {swift}"
+    );
+    assert!(
+        swift.contains("public var name: String {"),
+        "name getter missing: {swift}"
+    );
+    assert!(
+        swift.contains("public var age: Int32 {"),
+        "age getter missing: {swift}"
+    );
+}
+
+#[test]
+fn doc_swift_optional_and_list_returns() {
+    let (_dir, out) = generate_all_for_docs();
+    let swift =
+        std::fs::read_to_string(out.join("generated/swift/Sources/WeaveFFI/WeaveFFI.swift"))
+            .unwrap();
+
+    assert!(
+        swift.contains("-> Contact? {"),
+        "optional return missing: {swift}"
+    );
+    assert!(
+        swift.contains("-> [Contact] {"),
+        "list return missing: {swift}"
+    );
+}
+
+#[test]
+fn doc_c_header_opaque_struct_and_enum() {
+    let (_dir, out) = generate_all_for_docs();
+    let header = std::fs::read_to_string(out.join("generated/c/weaveffi.h")).unwrap();
+
+    assert!(
+        header.contains("typedef struct weaveffi_contacts_Contact weaveffi_contacts_Contact;"),
+        "opaque struct typedef missing: {header}"
+    );
+    assert!(
+        header.contains("weaveffi_contacts_ContactType_Personal = 0"),
+        "enum variant missing: {header}"
+    );
+    assert!(
+        header.contains("void weaveffi_contacts_Contact_destroy("),
+        "destroy prototype missing: {header}"
+    );
+    assert!(
+        header.contains("weaveffi_contacts_Contact_get_name("),
+        "getter missing: {header}"
+    );
+}
+
+#[test]
+fn doc_c_header_naming_convention() {
+    let (_dir, out) = generate_all_for_docs();
+    let header = std::fs::read_to_string(out.join("generated/c/weaveffi.h")).unwrap();
+
+    assert!(
+        header.contains("weaveffi_contacts_create_contact("),
+        "function naming convention wrong: {header}"
+    );
+    assert!(
+        header.contains("weaveffi_contacts_list_contacts("),
+        "list_contacts missing: {header}"
+    );
+    assert!(
+        header.contains("weaveffi_contacts_count_contacts("),
+        "count_contacts missing: {header}"
+    );
+}
+
+#[test]
+fn doc_node_dts_interface_and_enum() {
+    let (_dir, out) = generate_all_for_docs();
+    let dts = std::fs::read_to_string(out.join("generated/node/types.d.ts")).unwrap();
+
+    assert!(
+        dts.contains("export interface Contact {"),
+        "TS interface missing: {dts}"
+    );
+    assert!(dts.contains("  name: string;"), "name field missing: {dts}");
+    assert!(
+        dts.contains("  email: string | null;"),
+        "optional field missing: {dts}"
+    );
+    assert!(
+        dts.contains("export enum ContactType {"),
+        "TS enum missing: {dts}"
+    );
+    assert!(
+        dts.contains("  Personal = 0,"),
+        "enum variant missing: {dts}"
+    );
+}
+
+#[test]
+fn doc_node_dts_optional_and_list_return() {
+    let (_dir, out) = generate_all_for_docs();
+    let dts = std::fs::read_to_string(out.join("generated/node/types.d.ts")).unwrap();
+
+    assert!(
+        dts.contains("Contact | null"),
+        "optional return missing: {dts}"
+    );
+    assert!(dts.contains("Contact[]"), "list return missing: {dts}");
+}
+
+#[test]
+fn doc_android_kotlin_wrapper() {
+    let (_dir, out) = generate_all_for_docs();
+    let kt = std::fs::read_to_string(
+        out.join("generated/android/src/main/kotlin/com/weaveffi/WeaveFFI.kt"),
+    )
+    .unwrap();
+
+    assert!(
+        kt.contains("System.loadLibrary(\"weaveffi\")"),
+        "loadLibrary missing: {kt}"
+    );
+    assert!(
+        kt.contains("@JvmStatic external fun"),
+        "external fun missing: {kt}"
+    );
+    assert!(
+        kt.contains("enum class ContactType(val value: Int) {"),
+        "enum class missing: {kt}"
+    );
+    assert!(
+        kt.contains("class Contact internal constructor(private var handle: Long)"),
+        "struct class missing: {kt}"
+    );
+}
+
+#[test]
+fn doc_android_jni_shim() {
+    let (_dir, out) = generate_all_for_docs();
+    let jni =
+        std::fs::read_to_string(out.join("generated/android/src/main/cpp/weaveffi_jni.c")).unwrap();
+
+    assert!(
+        jni.contains("#include \"weaveffi.h\""),
+        "missing weaveffi.h include: {jni}"
+    );
+    assert!(
+        jni.contains("JNIEXPORT"),
+        "missing JNIEXPORT declarations: {jni}"
+    );
+    assert!(
+        jni.contains("weaveffi_error err = {0, NULL};"),
+        "missing error init: {jni}"
+    );
+}
+
+#[test]
+fn doc_android_cmake_exists() {
+    let (_dir, out) = generate_all_for_docs();
+    let cmake =
+        std::fs::read_to_string(out.join("generated/android/src/main/cpp/CMakeLists.txt")).unwrap();
+
+    assert!(cmake.contains("add_library(weaveffi SHARED weaveffi_jni.c)"));
+    assert!(cmake.contains("target_include_directories(weaveffi PRIVATE ../../../../c)"));
+}
+
+#[test]
+fn doc_wasm_loader_generated() {
+    let (_dir, out) = generate_all_for_docs();
+    let js = std::fs::read_to_string(out.join("generated/wasm/weaveffi_wasm.js")).unwrap();
+
+    assert!(
+        js.contains("export async function loadWeaveFFI(url)"),
+        "loader function missing: {js}"
+    );
+    assert!(
+        js.contains("WebAssembly.instantiate"),
+        "instantiate call missing: {js}"
+    );
+}
+
+#[test]
+fn doc_wasm_readme_type_conventions() {
+    let (_dir, out) = generate_all_for_docs();
+    let readme = std::fs::read_to_string(out.join("generated/wasm/README.md")).unwrap();
+
+    assert!(readme.contains("### Structs"), "structs section missing");
+    assert!(readme.contains("### Enums"), "enums section missing");
+    assert!(
+        readme.contains("### Optionals"),
+        "optionals section missing"
+    );
+    assert!(readme.contains("### Lists"), "lists section missing");
+}
+
 const GETTING_STARTED_YAML: &str = r#"
 version: "0.1.0"
 modules:
