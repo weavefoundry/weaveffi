@@ -62,7 +62,7 @@ fn render_wasm_js_stub() -> String {
         "//   Optionals -> 0/null for absent; for numerics a separate _is_present i32 flag\n",
     );
     out.push_str("//   Lists     -> (i32 pointer, i32 length) pair into linear memory\n");
-    out.push_str("\n");
+    out.push('\n');
     out.push_str("/**\n");
     out.push_str(" * Load a WeaveFFI WASM module from the given URL.\n");
     out.push_str(" *\n");
