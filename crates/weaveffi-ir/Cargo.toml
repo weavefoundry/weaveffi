@@ -5,7 +5,9 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "WeaveFFI intermediate representation and parsing"
+description = "Intermediate representation model and multi-format parser for WeaveFFI API definitions"
+keywords = ["ffi", "codegen", "bindings", "intermediate-representation", "parser"]
+categories = ["development-tools::ffi"]
 
 [dependencies]
 serde = { workspace = true }

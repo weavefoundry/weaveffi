@@ -5,7 +5,9 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "WeaveFFI WASM stub generator"
+description = "WebAssembly binding generator for WeaveFFI"
+keywords = ["ffi", "codegen", "bindings", "wasm", "webassembly"]
+categories = ["development-tools::ffi"]
 
 [dependencies]
 weaveffi-core = { path = "../weaveffi-core" }

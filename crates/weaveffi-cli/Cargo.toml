@@ -5,7 +5,9 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "WeaveFFI command-line interface"
+description = "Command-line tool for generating multi-language FFI bindings from API definitions"
+keywords = ["ffi", "codegen", "bindings", "cli", "code-generation"]
+categories = ["development-tools::ffi", "command-line-utilities"]
 
 [[bin]]
 name = "weaveffi"

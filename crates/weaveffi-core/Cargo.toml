@@ -5,7 +5,9 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "WeaveFFI core: Generator trait, orchestration, validation, and shared utilities"
+description = "Generator trait, orchestrator, validation, and shared utilities for WeaveFFI"
+keywords = ["ffi", "codegen", "bindings", "code-generation", "validation"]
+categories = ["development-tools::ffi"]
 
 [dependencies]
 weaveffi-ir = { path = "../weaveffi-ir" }
