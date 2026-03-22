@@ -10,8 +10,8 @@ keywords = ["ffi", "codegen", "bindings", "nodejs", "typescript"]
 categories = ["development-tools::ffi"]
 
 [dependencies]
-weaveffi-core = { path = "../weaveffi-core" }
-weaveffi-ir = { path = "../weaveffi-ir" }
+weaveffi-core = { path = "../weaveffi-core", version = "0.0.0" }
+weaveffi-ir = { path = "../weaveffi-ir", version = "0.0.0" }
 anyhow = { workspace = true }
 camino = { workspace = true }
 

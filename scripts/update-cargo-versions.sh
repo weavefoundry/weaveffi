@@ -11,8 +11,10 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 for toml in "$REPO_ROOT"/crates/*/Cargo.toml; do
   crate="$(basename "$(dirname "$toml")")"
-  # Portable in-place sed (works on both macOS and Linux)
+  # Update package version
   sed "s/^version = \"[^\"]*\"/version = \"$VERSION\"/" "$toml" > "$toml.tmp" && mv "$toml.tmp" "$toml"
+  # Update inter-crate dependency versions (lines containing path = ".*weaveffi")
+  sed '/path = ".*weaveffi/s/version = "[^"]*"/version = "'"$VERSION"'"/' "$toml" > "$toml.tmp" && mv "$toml.tmp" "$toml"
   echo "  $crate -> $VERSION"
 done
 
