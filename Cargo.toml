@@ -11,6 +11,7 @@ members = [
     "crates/weaveffi-cli",
     "samples/calculator",
     "samples/node-addon",
+    "samples/contacts",
 ]
 resolver = "2"
 
