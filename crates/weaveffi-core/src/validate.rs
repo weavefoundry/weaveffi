@@ -180,6 +180,11 @@ fn validate_module(module: &Module) -> Result<(), ValidationError> {
         .map(|s| s.as_str())
         .chain(enum_names.iter().map(|s| s.as_str()))
         .collect();
+    for s in &module.structs {
+        for f in &s.fields {
+            validate_type_ref(&f.ty, &known_types)?;
+        }
+    }
     for f in &module.functions {
         for p in &f.params {
             validate_type_ref(&p.ty, &known_types)?;
@@ -782,6 +787,149 @@ mod tests {
             validate_api(&api).unwrap_err(),
             ValidationError::UnknownTypeRef { name } if name == "Baz"
         ));
+    }
+
+    #[test]
+    fn struct_field_referencing_unknown_type() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![simple_function("ok_fn")],
+                structs: vec![StructDef {
+                    name: "Wrapper".to_string(),
+                    doc: None,
+                    fields: vec![StructField {
+                        name: "inner".to_string(),
+                        ty: TypeRef::Struct("Nonexistent".to_string()),
+                        doc: None,
+                    }],
+                }],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        assert!(matches!(
+            validate_api(&api).unwrap_err(),
+            ValidationError::UnknownTypeRef { name } if name == "Nonexistent"
+        ));
+    }
+
+    #[test]
+    fn function_param_with_optional_struct() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "save".to_string(),
+                    params: vec![Param {
+                        name: "c".to_string(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::Struct("Contact".to_string()))),
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![StructDef {
+                    name: "Contact".to_string(),
+                    doc: None,
+                    fields: vec![StructField {
+                        name: "name".to_string(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    }],
+                }],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        assert!(validate_api(&api).is_ok());
+    }
+
+    #[test]
+    fn function_param_with_list_of_enums() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "paint".to_string(),
+                    params: vec![Param {
+                        name: "colors".to_string(),
+                        ty: TypeRef::List(Box::new(TypeRef::Enum("Color".to_string()))),
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![simple_enum("Color")],
+                errors: None,
+            }],
+        };
+        assert!(validate_api(&api).is_ok());
+    }
+
+    #[test]
+    fn nested_optional_list_validates() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "list_contacts".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::List(Box::new(TypeRef::Optional(Box::new(
+                        TypeRef::Struct("Contact".to_string()),
+                    ))))),
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![StructDef {
+                    name: "Contact".to_string(),
+                    doc: None,
+                    fields: vec![StructField {
+                        name: "name".to_string(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    }],
+                }],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        assert!(validate_api(&api).is_ok());
+    }
+
+    #[test]
+    fn enum_variant_value_zero_allowed() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![simple_function("ok_fn")],
+                structs: vec![],
+                enums: vec![EnumDef {
+                    name: "Status".to_string(),
+                    doc: None,
+                    variants: vec![
+                        EnumVariant {
+                            name: "Unknown".to_string(),
+                            value: 0,
+                            doc: None,
+                        },
+                        EnumVariant {
+                            name: "Active".to_string(),
+                            value: 1,
+                            doc: None,
+                        },
+                    ],
+                }],
+                errors: None,
+            }],
+        };
+        assert!(validate_api(&api).is_ok());
     }
 
     #[test]
