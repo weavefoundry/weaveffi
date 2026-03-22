@@ -233,4 +233,162 @@ mod tests {
         );
         assert!(enum_pos < fn_pos, "enum should appear before functions");
     }
+
+    #[test]
+    fn generate_node_dts_with_structs_and_enums() {
+        let api = make_api(vec![Module {
+            name: "contacts".to_string(),
+            functions: vec![
+                Function {
+                    name: "get_contact".to_string(),
+                    params: vec![Param {
+                        name: "id".to_string(),
+                        ty: TypeRef::I32,
+                    }],
+                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                        "Contact".into(),
+                    )))),
+                    doc: None,
+                    r#async: false,
+                },
+                Function {
+                    name: "list_contacts".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
+                    doc: None,
+                    r#async: false,
+                },
+                Function {
+                    name: "set_favorite_color".to_string(),
+                    params: vec![
+                        Param {
+                            name: "contact_id".to_string(),
+                            ty: TypeRef::I32,
+                        },
+                        Param {
+                            name: "color".to_string(),
+                            ty: TypeRef::Optional(Box::new(TypeRef::Enum("Color".into()))),
+                        },
+                    ],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                },
+                Function {
+                    name: "get_tags".to_string(),
+                    params: vec![Param {
+                        name: "contact_id".to_string(),
+                        ty: TypeRef::I32,
+                    }],
+                    returns: Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
+                    doc: None,
+                    r#async: false,
+                },
+            ],
+            structs: vec![StructDef {
+                name: "Contact".to_string(),
+                doc: None,
+                fields: vec![
+                    StructField {
+                        name: "name".to_string(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "email".to_string(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                        doc: None,
+                    },
+                    StructField {
+                        name: "tags".to_string(),
+                        ty: TypeRef::List(Box::new(TypeRef::StringUtf8)),
+                        doc: None,
+                    },
+                ],
+            }],
+            enums: vec![EnumDef {
+                name: "Color".to_string(),
+                doc: None,
+                variants: vec![
+                    EnumVariant {
+                        name: "Red".to_string(),
+                        value: 0,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Green".to_string(),
+                        value: 1,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Blue".to_string(),
+                        value: 2,
+                        doc: None,
+                    },
+                ],
+            }],
+            errors: None,
+        }]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_node_structs_and_enums");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        NodeGenerator.generate(&api, out_dir).unwrap();
+
+        let dts = std::fs::read_to_string(tmp.join("node").join("types.d.ts")).unwrap();
+
+        assert!(
+            dts.contains("export interface Contact {"),
+            "missing Contact interface: {dts}"
+        );
+        assert!(dts.contains("  name: string;"), "missing name field: {dts}");
+        assert!(
+            dts.contains("  email: string | null;"),
+            "missing optional email field: {dts}"
+        );
+        assert!(
+            dts.contains("  tags: string[];"),
+            "missing list tags field: {dts}"
+        );
+
+        assert!(
+            dts.contains("export enum Color {"),
+            "missing Color enum: {dts}"
+        );
+        assert!(dts.contains("  Red = 0,"), "missing Red variant: {dts}");
+        assert!(dts.contains("  Green = 1,"), "missing Green variant: {dts}");
+        assert!(dts.contains("  Blue = 2,"), "missing Blue variant: {dts}");
+
+        assert!(
+            dts.contains("export function get_contact(id: number): Contact | null"),
+            "missing get_contact with optional return: {dts}"
+        );
+        assert!(
+            dts.contains("export function list_contacts(): Contact[]"),
+            "missing list_contacts with list return: {dts}"
+        );
+        assert!(
+            dts.contains(
+                "export function set_favorite_color(contact_id: number, color: Color | null): void"
+            ),
+            "missing set_favorite_color with optional enum param: {dts}"
+        );
+        assert!(
+            dts.contains("export function get_tags(contact_id: number): string[]"),
+            "missing get_tags with list return: {dts}"
+        );
+
+        let iface_pos = dts.find("export interface Contact").unwrap();
+        let enum_pos = dts.find("export enum Color").unwrap();
+        let fn_pos = dts.find("export function get_contact").unwrap();
+        assert!(
+            iface_pos < fn_pos,
+            "interface should appear before functions"
+        );
+        assert!(enum_pos < fn_pos, "enum should appear before functions");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
