@@ -2134,4 +2134,147 @@ mod tests {
             "jlongArray"
         );
     }
+
+    #[test]
+    fn generate_android_with_structs_and_enums() {
+        let api = make_api(vec![Module {
+            name: "contacts".to_string(),
+            functions: vec![Function {
+                name: "get_contact".to_string(),
+                params: vec![Param {
+                    name: "id".to_string(),
+                    ty: TypeRef::I32,
+                }],
+                returns: Some(TypeRef::Struct("Contact".into())),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![StructDef {
+                name: "Contact".to_string(),
+                doc: None,
+                fields: vec![
+                    StructField {
+                        name: "name".to_string(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "email".to_string(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "age".to_string(),
+                        ty: TypeRef::I32,
+                        doc: None,
+                    },
+                ],
+            }],
+            enums: vec![EnumDef {
+                name: "Color".to_string(),
+                doc: None,
+                variants: vec![
+                    EnumVariant {
+                        name: "Red".to_string(),
+                        value: 0,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Green".to_string(),
+                        value: 1,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Blue".to_string(),
+                        value: 2,
+                        doc: None,
+                    },
+                ],
+            }],
+            errors: None,
+        }]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_android_structs_and_enums");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        AndroidGenerator.generate(&api, out_dir).unwrap();
+
+        let kotlin =
+            std::fs::read_to_string(tmp.join("android/src/main/kotlin/com/weaveffi/WeaveFFI.kt"))
+                .unwrap();
+
+        assert!(
+            kotlin.contains("enum class Color(val value: Int) {"),
+            "missing enum class: {kotlin}"
+        );
+        assert!(kotlin.contains("Red(0),"), "missing Red variant: {kotlin}");
+        assert!(
+            kotlin.contains("Green(1),"),
+            "missing Green variant: {kotlin}"
+        );
+        assert!(
+            kotlin.contains("Blue(2);"),
+            "missing Blue variant with semicolon: {kotlin}"
+        );
+        assert!(
+            kotlin.contains("fun fromValue(value: Int): Color"),
+            "missing fromValue: {kotlin}"
+        );
+
+        assert!(
+            kotlin.contains(
+                "class Contact internal constructor(private var handle: Long) : java.io.Closeable {"
+            ),
+            "missing struct class: {kotlin}"
+        );
+        assert!(
+            kotlin.contains(
+                "@JvmStatic external fun nativeCreate(name: String, email: String, age: Int): Long"
+            ),
+            "missing nativeCreate: {kotlin}"
+        );
+        assert!(
+            kotlin.contains("val name: String get() = nativeGetName(handle)"),
+            "missing name getter: {kotlin}"
+        );
+        assert!(
+            kotlin.contains("val email: String get() = nativeGetEmail(handle)"),
+            "missing email getter: {kotlin}"
+        );
+        assert!(
+            kotlin.contains("val age: Int get() = nativeGetAge(handle)"),
+            "missing age getter: {kotlin}"
+        );
+
+        let jni = std::fs::read_to_string(tmp.join("android/src/main/cpp/weaveffi_jni.c")).unwrap();
+
+        assert!(
+            jni.contains("Java_com_weaveffi_Contact_nativeGetName"),
+            "missing JNI nativeGetName: {jni}"
+        );
+        assert!(
+            jni.contains("weaveffi_contacts_Contact_get_name("),
+            "missing C get_name call: {jni}"
+        );
+        assert!(
+            jni.contains("Java_com_weaveffi_Contact_nativeGetEmail"),
+            "missing JNI nativeGetEmail: {jni}"
+        );
+        assert!(
+            jni.contains("weaveffi_contacts_Contact_get_email("),
+            "missing C get_email call: {jni}"
+        );
+        assert!(
+            jni.contains("Java_com_weaveffi_Contact_nativeGetAge"),
+            "missing JNI nativeGetAge: {jni}"
+        );
+        assert!(
+            jni.contains("weaveffi_contacts_Contact_get_age("),
+            "missing C get_age call: {jni}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
