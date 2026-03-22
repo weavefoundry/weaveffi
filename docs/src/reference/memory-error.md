@@ -34,7 +34,7 @@ Notes:
 Returned strings are owned by Rust and must be freed by the caller:
 
 ```c
-const char* s = weaveffi_calculator_echo((const uint8_t*)msg, strlen(msg), &err);
+const char* s = weaveffi_calculator_echo(msg, &err);
 // ... use s ...
 weaveffi_free_string(s);
 ```

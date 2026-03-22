@@ -99,8 +99,8 @@ fields directly:
 typedef struct weaveffi_contacts_Contact weaveffi_contacts_Contact;
 
 weaveffi_contacts_Contact* weaveffi_contacts_Contact_create(
-    const uint8_t* name_ptr, size_t name_len,
-    const uint8_t* email_ptr, size_t email_len,
+    const char* name,
+    const char* email,
     int32_t age,
     weaveffi_error* out_err);
 

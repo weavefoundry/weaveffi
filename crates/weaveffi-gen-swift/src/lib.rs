@@ -238,7 +238,7 @@ fn build_c_call_args(params: &[Param], module_name: &str) -> String {
             }
             TypeRef::Struct(_) => args.push(format!("{}.ptr", p.name)),
             TypeRef::Enum(enum_name) => args.push(format!(
-                "weaveffi_{}_{}(UInt32(bitPattern: {}.rawValue))",
+                "weaveffi_{}_{}({}.rawValue)",
                 module_name, enum_name, p.name
             )),
             TypeRef::Optional(inner) => match inner.as_ref() {
@@ -293,7 +293,7 @@ fn render_direct_call(out: &mut String, f: &Function, call_with_err: &str) {
             out.push_str(&format!("        let rv = {}\n", call_with_err));
             out.push_str("        try check(&err)\n");
             out.push_str(&format!(
-                "        return {}(rawValue: Int32(bitPattern: rv.rawValue))!\n",
+                "        return {}(rawValue: rv.rawValue)!\n",
                 name
             ));
         }
@@ -329,7 +329,7 @@ fn render_optional_return(out: &mut String, call_with_err: &str, inner: &TypeRef
             out.push_str(&format!("        let rv = {}\n", call_with_err));
             out.push_str("        try check(&err)\n");
             out.push_str(&format!(
-                "        return rv.map {{ {}(rawValue: Int32(bitPattern: $0.pointee.rawValue))! }}\n",
+                "        return rv.map {{ {}(rawValue: $0.pointee.rawValue)! }}\n",
                 name
             ));
         }
@@ -355,7 +355,7 @@ fn render_list_return(out: &mut String, call_with_err: &str, inner: &TypeRef) {
     match inner {
         TypeRef::Enum(name) => {
             out.push_str(&format!(
-                "        return (0..<outLen).map {{ {}(rawValue: Int32(bitPattern: rv[$0].rawValue))! }}\n",
+                "        return (0..<outLen).map {{ {}(rawValue: rv[$0].rawValue)! }}\n",
                 name
             ));
         }
@@ -398,7 +398,7 @@ fn render_optional_return_inner(out: &mut String, call: &str, inner: &TypeRef, i
             out.push_str(&format!("{}    let rv = {}\n", indent, call));
             out.push_str(&format!("{}    try check(&err)\n", indent));
             out.push_str(&format!(
-                "{}    return rv.map {{ {}(rawValue: Int32(bitPattern: $0.pointee.rawValue))! }}\n",
+                "{}    return rv.map {{ {}(rawValue: $0.pointee.rawValue)! }}\n",
                 indent, name
             ));
         }
@@ -425,7 +425,7 @@ fn render_list_return_inner(out: &mut String, call: &str, inner: &TypeRef, inden
     match inner {
         TypeRef::Enum(name) => {
             out.push_str(&format!(
-                "{}    return (0..<outLen).map {{ {}(rawValue: Int32(bitPattern: rv[$0].rawValue))! }}\n",
+                "{}    return (0..<outLen).map {{ {}(rawValue: rv[$0].rawValue)! }}\n",
                 indent, name
             ));
         }
@@ -459,7 +459,7 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
             TypeRef::Optional(inner) => {
                 if let TypeRef::Enum(enum_name) = inner.as_ref() {
                     out.push_str(&format!(
-                        "        let {n}_c: weaveffi_{m}_{e}? = {n}.map {{ weaveffi_{m}_{e}(UInt32(bitPattern: $0.rawValue)) }}\n",
+                        "        let {n}_c: weaveffi_{m}_{e}? = {n}.map {{ weaveffi_{m}_{e}($0.rawValue) }}\n",
                         n = p.name, m = module_name, e = enum_name
                     ));
                 }
@@ -467,8 +467,10 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
             TypeRef::List(inner) => match inner.as_ref() {
                 TypeRef::Enum(enum_name) => {
                     out.push_str(&format!(
-                        "        let {n}_raw = {n}.map {{ weaveffi_{m}_{e}(UInt32(bitPattern: $0.rawValue)) }}\n",
-                        n = p.name, m = module_name, e = enum_name
+                        "        let {n}_raw = {n}.map {{ weaveffi_{m}_{e}($0.rawValue) }}\n",
+                        n = p.name,
+                        m = module_name,
+                        e = enum_name
                     ));
                 }
                 TypeRef::Struct(_) => {
@@ -610,7 +612,7 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
             out.push_str(&format!("{}    let rv = {}\n", inner_indent, call_with_err));
             out.push_str(&format!("{}    try check(&err)\n", inner_indent));
             out.push_str(&format!(
-                "{}    return {}(rawValue: Int32(bitPattern: rv.rawValue))!\n",
+                "{}    return {}(rawValue: rv.rawValue)!\n",
                 inner_indent, name
             ));
         }
@@ -800,11 +802,11 @@ mod tests {
             "missing enum return type: {out}"
         );
         assert!(
-            out.contains("weaveffi_paint_Color(UInt32(bitPattern: a.rawValue))"),
+            out.contains("weaveffi_paint_Color(a.rawValue)"),
             "missing enum-to-C conversion: {out}"
         );
         assert!(
-            out.contains("Color(rawValue: Int32(bitPattern: rv.rawValue))!"),
+            out.contains("Color(rawValue: rv.rawValue)!"),
             "missing C-to-enum conversion: {out}"
         );
     }

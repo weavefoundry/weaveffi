@@ -28,21 +28,18 @@ pub extern "C" fn weaveffi_calculator_div(a: i32, b: i32, out_err: *mut weaveffi
 
 #[no_mangle]
 pub extern "C" fn weaveffi_calculator_echo(
-    ptr: *const u8,
-    len: usize,
+    s: *const c_char,
     out_err: *mut weaveffi_error,
 ) -> *const c_char {
-    // SAFETY: caller guarantees ptr is valid for len bytes
-    let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-    let s = match String::from_utf8(slice.to_vec()) {
-        Ok(v) => v,
-        Err(e) => {
-            abi::error_set(out_err, 1, &format!("invalid UTF-8: {}", e));
+    let input = match abi::c_ptr_to_string(s) {
+        Some(v) => v,
+        None => {
+            abi::error_set(out_err, 1, "s is null or invalid UTF-8");
             return std::ptr::null();
         }
     };
     abi::error_set_ok(out_err);
-    abi::string_to_c_ptr(s)
+    abi::string_to_c_ptr(&input)
 }
 
 #[no_mangle]

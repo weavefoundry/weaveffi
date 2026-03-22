@@ -51,7 +51,7 @@ fn c_type_for_param(ty: &TypeRef, name: &str, module: &str) -> String {
         TypeRef::I64 => format!("int64_t {name}"),
         TypeRef::F64 => format!("double {name}"),
         TypeRef::Bool => format!("bool {name}"),
-        TypeRef::StringUtf8 => format!("const uint8_t* {name}_ptr, size_t {name}_len"),
+        TypeRef::StringUtf8 => format!("const char* {name}"),
         TypeRef::Bytes => format!("const uint8_t* {name}_ptr, size_t {name}_len"),
         TypeRef::Handle => format!("weaveffi_handle_t {name}"),
         TypeRef::Struct(s) => format!("const weaveffi_{module}_{s}* {name}"),
@@ -472,10 +472,7 @@ mod tests {
     #[test]
     fn c_type_optional_pointer_param() {
         let ty = TypeRef::Optional(Box::new(TypeRef::StringUtf8));
-        assert_eq!(
-            c_type_for_param(&ty, "name", "m"),
-            "const uint8_t* name_ptr, size_t name_len"
-        );
+        assert_eq!(c_type_for_param(&ty, "name", "m"), "const char* name");
     }
 
     #[test]
