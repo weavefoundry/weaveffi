@@ -607,6 +607,227 @@ mod tests {
     }
 
     #[test]
+    fn generate_c_header_with_contacts() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "contacts".to_string(),
+                enums: vec![EnumDef {
+                    name: "ContactType".to_string(),
+                    doc: None,
+                    variants: vec![
+                        EnumVariant {
+                            name: "Personal".to_string(),
+                            value: 0,
+                            doc: None,
+                        },
+                        EnumVariant {
+                            name: "Work".to_string(),
+                            value: 1,
+                            doc: None,
+                        },
+                        EnumVariant {
+                            name: "Other".to_string(),
+                            value: 2,
+                            doc: None,
+                        },
+                    ],
+                }],
+                structs: vec![StructDef {
+                    name: "Contact".to_string(),
+                    doc: None,
+                    fields: vec![
+                        StructField {
+                            name: "id".to_string(),
+                            ty: TypeRef::I64,
+                            doc: None,
+                        },
+                        StructField {
+                            name: "first_name".to_string(),
+                            ty: TypeRef::StringUtf8,
+                            doc: None,
+                        },
+                        StructField {
+                            name: "last_name".to_string(),
+                            ty: TypeRef::StringUtf8,
+                            doc: None,
+                        },
+                        StructField {
+                            name: "email".to_string(),
+                            ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                            doc: None,
+                        },
+                        StructField {
+                            name: "contact_type".to_string(),
+                            ty: TypeRef::Enum("ContactType".to_string()),
+                            doc: None,
+                        },
+                    ],
+                }],
+                functions: vec![
+                    Function {
+                        name: "create_contact".to_string(),
+                        params: vec![
+                            Param {
+                                name: "first_name".to_string(),
+                                ty: TypeRef::StringUtf8,
+                            },
+                            Param {
+                                name: "last_name".to_string(),
+                                ty: TypeRef::StringUtf8,
+                            },
+                            Param {
+                                name: "email".to_string(),
+                                ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                            },
+                            Param {
+                                name: "contact_type".to_string(),
+                                ty: TypeRef::Enum("ContactType".to_string()),
+                            },
+                        ],
+                        returns: Some(TypeRef::Handle),
+                        doc: None,
+                        r#async: false,
+                    },
+                    Function {
+                        name: "get_contact".to_string(),
+                        params: vec![Param {
+                            name: "id".to_string(),
+                            ty: TypeRef::Handle,
+                        }],
+                        returns: Some(TypeRef::Struct("Contact".to_string())),
+                        doc: None,
+                        r#async: false,
+                    },
+                    Function {
+                        name: "list_contacts".to_string(),
+                        params: vec![],
+                        returns: Some(TypeRef::List(Box::new(TypeRef::Struct(
+                            "Contact".to_string(),
+                        )))),
+                        doc: None,
+                        r#async: false,
+                    },
+                    Function {
+                        name: "delete_contact".to_string(),
+                        params: vec![Param {
+                            name: "id".to_string(),
+                            ty: TypeRef::Handle,
+                        }],
+                        returns: Some(TypeRef::Bool),
+                        doc: None,
+                        r#async: false,
+                    },
+                    Function {
+                        name: "count_contacts".to_string(),
+                        params: vec![],
+                        returns: Some(TypeRef::I32),
+                        doc: None,
+                        r#async: false,
+                    },
+                ],
+                errors: None,
+            }],
+        };
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_c_gen_contacts");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        CGenerator.generate(&api, out_dir).unwrap();
+
+        let header = std::fs::read_to_string(tmp.join("c").join("weaveffi.h")).unwrap();
+
+        assert!(
+            header.contains("weaveffi_contacts_ContactType_Personal = 0"),
+            "missing Personal variant"
+        );
+        assert!(
+            header.contains("weaveffi_contacts_ContactType_Work = 1"),
+            "missing Work variant"
+        );
+        assert!(
+            header.contains("weaveffi_contacts_ContactType_Other = 2"),
+            "missing Other variant"
+        );
+        assert!(
+            header.contains("} weaveffi_contacts_ContactType;"),
+            "missing ContactType enum typedef"
+        );
+
+        assert!(
+            header.contains("typedef struct weaveffi_contacts_Contact weaveffi_contacts_Contact;"),
+            "missing opaque struct typedef"
+        );
+
+        assert!(
+            header.contains("weaveffi_contacts_Contact* weaveffi_contacts_Contact_create("),
+            "missing Contact create prototype"
+        );
+        assert!(
+            header.contains(
+                "void weaveffi_contacts_Contact_destroy(weaveffi_contacts_Contact* ptr);"
+            ),
+            "missing Contact destroy prototype"
+        );
+
+        assert!(
+            header.contains(
+                "int64_t weaveffi_contacts_Contact_get_id(const weaveffi_contacts_Contact* ptr);"
+            ),
+            "missing id getter"
+        );
+        assert!(
+            header.contains(
+                "const char* weaveffi_contacts_Contact_get_first_name(const weaveffi_contacts_Contact* ptr);"
+            ),
+            "missing first_name getter"
+        );
+        assert!(
+            header.contains(
+                "const char* weaveffi_contacts_Contact_get_last_name(const weaveffi_contacts_Contact* ptr);"
+            ),
+            "missing last_name getter"
+        );
+        assert!(
+            header.contains(
+                "const char* weaveffi_contacts_Contact_get_email(const weaveffi_contacts_Contact* ptr);"
+            ),
+            "missing email getter"
+        );
+        assert!(
+            header.contains(
+                "weaveffi_contacts_ContactType weaveffi_contacts_Contact_get_contact_type(const weaveffi_contacts_Contact* ptr);"
+            ),
+            "missing contact_type getter"
+        );
+
+        assert!(
+            header.contains("weaveffi_handle_t weaveffi_contacts_create_contact("),
+            "missing create_contact declaration"
+        );
+        assert!(
+            header.contains("weaveffi_contacts_Contact* weaveffi_contacts_get_contact("),
+            "missing get_contact declaration"
+        );
+        assert!(
+            header.contains("weaveffi_contacts_Contact** weaveffi_contacts_list_contacts("),
+            "missing list_contacts declaration"
+        );
+        assert!(
+            header.contains("bool weaveffi_contacts_delete_contact("),
+            "missing delete_contact declaration"
+        );
+        assert!(
+            header.contains("int32_t weaveffi_contacts_count_contacts("),
+            "missing count_contacts declaration"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn generate_c_header_with_enum_param_and_return() {
         let api = Api {
             version: "0.1.0".to_string(),
