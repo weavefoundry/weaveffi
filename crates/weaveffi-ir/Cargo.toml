@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Intermediate representation model and multi-format parser for WeaveFFI API definitions"
-keywords = ["ffi", "codegen", "bindings", "intermediate-representation", "parser"]
+keywords = ["ffi", "codegen", "bindings", "ir", "parser"]
 categories = ["development-tools::ffi"]
 
 [dependencies]
