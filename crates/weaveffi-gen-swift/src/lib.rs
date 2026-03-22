@@ -1256,4 +1256,125 @@ mod tests {
             "missing struct wrapping after buffered call: {out}"
         );
     }
+
+    #[test]
+    fn generate_swift_with_structs_and_enums() {
+        let api = make_api(vec![Module {
+            name: "contacts".to_string(),
+            functions: vec![Function {
+                name: "get_contact".to_string(),
+                params: vec![Param {
+                    name: "id".to_string(),
+                    ty: TypeRef::I32,
+                }],
+                returns: Some(TypeRef::Struct("Contact".into())),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![StructDef {
+                name: "Contact".to_string(),
+                doc: None,
+                fields: vec![
+                    StructField {
+                        name: "name".to_string(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "email".to_string(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "age".to_string(),
+                        ty: TypeRef::I32,
+                        doc: None,
+                    },
+                ],
+            }],
+            enums: vec![EnumDef {
+                name: "Color".to_string(),
+                doc: None,
+                variants: vec![
+                    EnumVariant {
+                        name: "Red".to_string(),
+                        value: 0,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Green".to_string(),
+                        value: 1,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Blue".to_string(),
+                        value: 2,
+                        doc: None,
+                    },
+                ],
+            }],
+            errors: None,
+        }]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_swift_structs_and_enums");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        SwiftGenerator.generate(&api, out_dir).unwrap();
+
+        let swift = std::fs::read_to_string(
+            tmp.join("swift")
+                .join("Sources")
+                .join("WeaveFFI")
+                .join("WeaveFFI.swift"),
+        )
+        .unwrap();
+
+        assert!(
+            swift.contains("public enum Color: Int32 {"),
+            "missing enum declaration: {swift}"
+        );
+        assert!(swift.contains("case red = 0"), "missing red case: {swift}");
+        assert!(
+            swift.contains("case green = 1"),
+            "missing green case: {swift}"
+        );
+        assert!(
+            swift.contains("case blue = 2"),
+            "missing blue case: {swift}"
+        );
+
+        assert!(
+            swift.contains("public class Contact {"),
+            "missing class declaration: {swift}"
+        );
+        assert!(
+            swift.contains("let ptr: OpaquePointer"),
+            "missing ptr property: {swift}"
+        );
+        assert!(
+            swift.contains("public var name: String {"),
+            "missing name getter: {swift}"
+        );
+        assert!(
+            swift.contains("public var email: String {"),
+            "missing email getter: {swift}"
+        );
+        assert!(
+            swift.contains("public var age: Int32 {"),
+            "missing age getter: {swift}"
+        );
+
+        assert!(
+            swift.contains("public static func get_contact(_ id: Int32) throws -> Contact {"),
+            "missing function signature: {swift}"
+        );
+        assert!(
+            swift.contains("Contact(ptr: rv)"),
+            "missing struct wrapping: {swift}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
