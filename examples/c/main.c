@@ -1,6 +1,4 @@
 #include <stdio.h>
-#include <stdint.h>
-#include <string.h>
 #include "../../generated/c/weaveffi.h"
 
 int main() {
@@ -19,7 +17,7 @@ int main() {
     printf("div(10,2) = %d\n", q);
 
     const char* msg = "hello";
-    const char* echoed = weaveffi_calculator_echo((const uint8_t*)msg, strlen(msg), &err);
+    const char* echoed = weaveffi_calculator_echo(msg, &err);
     if (err.code) { printf("echo error: %s\n", err.message ? err.message : ""); weaveffi_error_clear(&err); return 1; }
     printf("echo(hello) = %s\n", echoed);
     weaveffi_free_string(echoed);

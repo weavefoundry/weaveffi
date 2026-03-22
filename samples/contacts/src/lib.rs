@@ -268,7 +268,7 @@ pub extern "C" fn weaveffi_contacts_ContactType_to_i32(ct: i32) -> i32 {
 // --- Free functions ---
 
 #[no_mangle]
-pub extern "C" fn weaveffi_contacts_Contact_free(contact: *mut Contact) {
+pub extern "C" fn weaveffi_contacts_Contact_destroy(contact: *mut Contact) {
     if contact.is_null() {
         return;
     }
@@ -344,7 +344,7 @@ mod tests {
         assert_eq!(c.email, Some("alice@example.com".to_string()));
         assert_eq!(c.contact_type, ContactType::Work);
 
-        weaveffi_contacts_Contact_free(contact);
+        weaveffi_contacts_Contact_destroy(contact);
     }
 
     #[test]
@@ -366,7 +366,7 @@ mod tests {
         let contact = weaveffi_contacts_get_contact(handle, &mut err);
         assert!(!contact.is_null());
         assert_eq!(unsafe { &*contact }.email, None);
-        weaveffi_contacts_Contact_free(contact);
+        weaveffi_contacts_Contact_destroy(contact);
     }
 
     #[test]
@@ -530,7 +530,7 @@ mod tests {
         weaveffi_contacts_Contact_set_email(contact, std::ptr::null());
         assert!(weaveffi_contacts_Contact_get_email(contact).is_null());
 
-        weaveffi_contacts_Contact_free(contact);
+        weaveffi_contacts_Contact_destroy(contact);
     }
 
     #[test]
@@ -552,7 +552,7 @@ mod tests {
 
     #[test]
     fn free_null_contact_is_safe() {
-        weaveffi_contacts_Contact_free(std::ptr::null_mut());
+        weaveffi_contacts_Contact_destroy(std::ptr::null_mut());
     }
 
     #[test]

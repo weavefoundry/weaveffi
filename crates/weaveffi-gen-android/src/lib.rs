@@ -1183,13 +1183,23 @@ fn write_struct_optional_getter(out: &mut String, inner: &TypeRef, getter_c: &st
                 "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jint)*rv);"
             );
         }
+        TypeRef::Struct(_) | TypeRef::Handle => {
+            let _ = writeln!(
+                out,
+                "    const void* rv = {}((const {}*)(intptr_t)handle);",
+                getter_c, prefix
+            );
+            let _ = writeln!(out, "    if (!rv) {{ return 0; }}");
+            let _ = writeln!(out, "    return (jlong)(intptr_t)rv;");
+        }
         _ => {
             let _ = writeln!(
                 out,
                 "    const void* rv = {}((const {}*)(intptr_t)handle);",
                 getter_c, prefix
             );
-            let _ = writeln!(out, "    return (jobject)rv;");
+            let _ = writeln!(out, "    if (!rv) {{ return 0; }}");
+            let _ = writeln!(out, "    return (jlong)(intptr_t)rv;");
         }
     }
 }
@@ -1224,11 +1234,54 @@ fn write_struct_list_getter(out: &mut String, inner: &TypeRef, getter_c: &str, p
             let _ = writeln!(out, "    if (jout && rv) {{ (*env)->SetLongArrayRegion(env, jout, 0, (jsize)out_len, (const jlong*)rv); }}");
             let _ = writeln!(out, "    return jout;");
         }
-        _ => {
+        TypeRef::F64 => {
+            let _ = writeln!(out, "    size_t out_len = 0;");
             let _ = writeln!(
                 out,
-                "    return NULL; /* unsupported list element type in getter */"
+                "    const double* rv = (const double*){}((const {}*)(intptr_t)handle, &out_len);",
+                getter_c, prefix
             );
+            let _ = writeln!(
+                out,
+                "    jdoubleArray jout = (*env)->NewDoubleArray(env, (jsize)out_len);"
+            );
+            let _ = writeln!(out, "    if (jout && rv) {{ (*env)->SetDoubleArrayRegion(env, jout, 0, (jsize)out_len, (const jdouble*)rv); }}");
+            let _ = writeln!(out, "    return jout;");
+        }
+        TypeRef::Bool => {
+            let _ = writeln!(out, "    size_t out_len = 0;");
+            let _ = writeln!(
+                out,
+                "    const int32_t* rv = (const int32_t*){}((const {}*)(intptr_t)handle, &out_len);",
+                getter_c, prefix
+            );
+            let _ = writeln!(
+                out,
+                "    jbooleanArray jout = (*env)->NewBooleanArray(env, (jsize)out_len);"
+            );
+            let _ = writeln!(out, "    if (jout && rv) {{");
+            let _ = writeln!(out, "        for (jsize i = 0; i < (jsize)out_len; i++) {{");
+            let _ = writeln!(
+                out,
+                "            jboolean val = rv[i] ? JNI_TRUE : JNI_FALSE;"
+            );
+            let _ = writeln!(
+                out,
+                "            (*env)->SetBooleanArrayRegion(env, jout, i, 1, &val);"
+            );
+            let _ = writeln!(out, "        }}");
+            let _ = writeln!(out, "    }}");
+            let _ = writeln!(out, "    return jout;");
+        }
+        _ => {
+            let _ = writeln!(out, "    size_t out_len = 0;");
+            let _ = writeln!(
+                out,
+                "    const void* rv = {}((const {}*)(intptr_t)handle, &out_len);",
+                getter_c, prefix
+            );
+            let _ = writeln!(out, "    (void)rv; (void)out_len;");
+            let _ = writeln!(out, "    return NULL;");
         }
     }
 }

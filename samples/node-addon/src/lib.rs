@@ -11,7 +11,7 @@ use weaveffi_abi::weaveffi_error;
 type AddFn = unsafe extern "C" fn(i32, i32, *mut weaveffi_error) -> i32;
 type MulFn = unsafe extern "C" fn(i32, i32, *mut weaveffi_error) -> i32;
 type DivFn = unsafe extern "C" fn(i32, i32, *mut weaveffi_error) -> i32;
-type EchoFn = unsafe extern "C" fn(*const u8, usize, *mut weaveffi_error) -> *const c_char;
+type EchoFn = unsafe extern "C" fn(*const c_char, *mut weaveffi_error) -> *const c_char;
 type FreeStringFn = unsafe extern "C" fn(*const c_char);
 type ErrorClearFn = unsafe extern "C" fn(*mut weaveffi_error);
 
@@ -136,8 +136,9 @@ pub fn div(a: i32, b: i32) -> napi::Result<i32> {
 pub fn echo(s: String) -> napi::Result<String> {
     let mut err = weaveffi_error::default();
     let (_, api) = load_api()?;
-    let bytes = s.into_bytes();
-    let c_ptr = unsafe { (api.echo)(bytes.as_ptr(), bytes.len(), &mut err) };
+    let c_str =
+        std::ffi::CString::new(s).map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
+    let c_ptr = unsafe { (api.echo)(c_str.as_ptr(), &mut err) };
     if let Some((code, msg)) = take_error(api, &mut err) {
         return Err(Error::new(
             Status::GenericFailure,
