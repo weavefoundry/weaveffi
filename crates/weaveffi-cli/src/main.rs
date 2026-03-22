@@ -1,18 +1,19 @@
-use anyhow::{bail, Context, Result};
 use camino::Utf8Path;
 use clap::{Parser, Subcommand};
+use color_eyre::eyre::{bail, eyre, Report, Result, WrapErr};
+use color_eyre::Section;
 use std::env;
 use std::ffi::OsStr;
 use std::process::Command;
 use tracing_subscriber::EnvFilter;
 use weaveffi_core::codegen::{Generator, Orchestrator};
-use weaveffi_core::validate::validate_api;
+use weaveffi_core::validate::{validate_api, ValidationError};
 use weaveffi_gen_android::AndroidGenerator;
 use weaveffi_gen_c::CGenerator;
 use weaveffi_gen_node::NodeGenerator;
 use weaveffi_gen_swift::SwiftGenerator;
 use weaveffi_gen_wasm::WasmGenerator;
-use weaveffi_ir::parse::parse_api_str;
+use weaveffi_ir::parse::{parse_api_str, ParseError};
 
 #[derive(Parser, Debug)]
 #[command(name = "weaveffi", version, about = "WeaveFFI CLI")]
@@ -69,7 +70,7 @@ fn cmd_new(name: &str) -> Result<()> {
         );
     }
     std::fs::create_dir_all(project_dir.as_std_path())
-        .with_context(|| format!("failed to create project directory: {}", name))?;
+        .wrap_err_with(|| format!("failed to create project directory: {}", name))?;
 
     let module_name = sanitize_module_name(name);
     let idl_path = project_dir.join("weaveffi.yml");
@@ -97,7 +98,7 @@ fn cmd_new(name: &str) -> Result<()> {
         module = module_name
     );
     std::fs::write(idl_path.as_std_path(), idl_contents)
-        .with_context(|| format!("failed to write {}", idl_path))?;
+        .wrap_err_with(|| format!("failed to write {}", idl_path))?;
 
     let readme_path = project_dir.join("README.md");
     let readme = format!(
@@ -111,7 +112,7 @@ fn cmd_new(name: &str) -> Result<()> {
         name = name
     );
     std::fs::write(readme_path.as_std_path(), readme)
-        .with_context(|| format!("failed to write {}", readme_path))?;
+        .wrap_err_with(|| format!("failed to write {}", readme_path))?;
 
     println!("Initialized WeaveFFI project at {}", project_dir);
     println!("- IDL: {}", idl_path);
@@ -138,14 +139,13 @@ fn cmd_generate(input: &str, out: &str, targets: Option<&str>) -> Result<()> {
         ),
     };
     let contents = std::fs::read_to_string(in_path.as_std_path())
-        .with_context(|| format!("failed to read input file: {}", input))?;
-    let api = parse_api_str(&contents, format)
-        .with_context(|| format!("failed to parse {} as {}", input, format))?;
-    validate_api(&api).context("IR validation failed")?;
+        .wrap_err_with(|| format!("failed to read input file: {}", input))?;
+    let api = parse_api_str(&contents, format).map_err(|e| format_parse_error(input, e))?;
+    validate_api(&api).map_err(format_validation_error)?;
 
     let out_dir = Utf8Path::new(out);
     std::fs::create_dir_all(out_dir.as_std_path())
-        .with_context(|| format!("failed to create output directory: {}", out))?;
+        .wrap_err_with(|| format!("failed to create output directory: {}", out))?;
 
     let c = CGenerator;
     let swift = SwiftGenerator;
@@ -163,7 +163,9 @@ fn cmd_generate(input: &str, out: &str, targets: Option<&str>) -> Result<()> {
         }
     }
 
-    orchestrator.run(&api, out_dir)?;
+    orchestrator
+        .run(&api, out_dir)
+        .map_err(|e| eyre!("{:#}", e))?;
     println!("Generated artifacts in {}", out);
     Ok(())
 }
@@ -184,9 +186,8 @@ fn cmd_validate(input: &str) -> Result<()> {
         ),
     };
     let contents = std::fs::read_to_string(in_path.as_std_path())
-        .with_context(|| format!("failed to read input file: {}", input))?;
-    let api = parse_api_str(&contents, format)
-        .with_context(|| format!("failed to parse {} as {}", input, format))?;
+        .wrap_err_with(|| format!("failed to read input file: {}", input))?;
+    let api = parse_api_str(&contents, format).map_err(|e| format_parse_error(input, e))?;
 
     match validate_api(&api) {
         Ok(()) => {
@@ -201,8 +202,101 @@ fn cmd_validate(input: &str) -> Result<()> {
             );
             Ok(())
         }
-        Err(e) => {
-            bail!("Validation failed: {}", e);
+        Err(e) => Err(format_validation_error(e)),
+    }
+}
+
+fn format_parse_error(filename: &str, err: ParseError) -> Report {
+    let suggestion = match &err {
+        ParseError::Yaml { .. } => {
+            "check YAML syntax: ensure correct indentation, quoting, and key-value formatting"
+        }
+        ParseError::Json { .. } => {
+            "check JSON syntax: ensure all brackets, braces, and commas are correct"
+        }
+        ParseError::Toml { .. } => {
+            "check TOML syntax: ensure correct table headers, key-value pairs, and quoting"
+        }
+        ParseError::UnsupportedFormat(_) => "use a supported format: yml, yaml, json, or toml",
+    };
+
+    let location = match &err {
+        ParseError::Yaml { line, column, .. } | ParseError::Json { line, column, .. } => {
+            format!("{}:{}:{}", filename, line, column)
+        }
+        _ => filename.to_string(),
+    };
+
+    eyre!(err).note(location).suggestion(suggestion)
+}
+
+fn format_validation_error(err: ValidationError) -> Report {
+    let suggestion = validation_suggestion(&err);
+    eyre!(err).suggestion(suggestion)
+}
+
+fn validation_suggestion(err: &ValidationError) -> &'static str {
+    match err {
+        ValidationError::NoModuleName => "every module must have a non-empty 'name' field",
+        ValidationError::DuplicateModuleName(_) => {
+            "module names must be unique within an API definition; rename or merge the duplicate"
+        }
+        ValidationError::InvalidModuleName(_, _) => {
+            "choose a valid identifier (a-z, A-Z, 0-9, _) that is not a reserved word"
+        }
+        ValidationError::DuplicateFunctionName { .. } => {
+            "function names must be unique within a module; rename the duplicate"
+        }
+        ValidationError::DuplicateParamName { .. } => {
+            "parameter names must be unique within a function; rename the duplicate"
+        }
+        ValidationError::ReservedKeyword(_) => {
+            "choose a different name that is not a language reserved word"
+        }
+        ValidationError::InvalidIdentifier(_, _) => {
+            "identifiers must start with a letter or underscore and contain only alphanumeric or underscore characters"
+        }
+        ValidationError::AsyncNotSupported { .. } => {
+            "remove 'async: true' from the function definition; async is not supported in version 0.1.0"
+        }
+        ValidationError::ErrorDomainMissingName(_) => {
+            "add a non-empty 'name' field to the error domain"
+        }
+        ValidationError::DuplicateErrorName { .. } => {
+            "error code names must be unique within a module; rename the duplicate"
+        }
+        ValidationError::DuplicateErrorCode { .. } => {
+            "numeric error codes must be unique within a module; assign a different value"
+        }
+        ValidationError::InvalidErrorCode { .. } => {
+            "error codes must be non-zero; use a positive or negative integer"
+        }
+        ValidationError::NameCollisionWithErrorDomain { .. } => {
+            "function and error domain names share a namespace; rename one to avoid the collision"
+        }
+        ValidationError::DuplicateStructName { .. } => {
+            "struct names must be unique within a module; rename the duplicate"
+        }
+        ValidationError::DuplicateStructField { .. } => {
+            "field names must be unique within a struct; rename the duplicate"
+        }
+        ValidationError::EmptyStruct { .. } => {
+            "structs must have at least one field; add a field or remove the struct"
+        }
+        ValidationError::DuplicateEnumName { .. } => {
+            "enum names must be unique within a module; rename the duplicate"
+        }
+        ValidationError::EmptyEnum { .. } => {
+            "enums must have at least one variant; add a variant or remove the enum"
+        }
+        ValidationError::DuplicateEnumVariant { .. } => {
+            "variant names must be unique within an enum; rename the duplicate"
+        }
+        ValidationError::DuplicateEnumValue { .. } => {
+            "variant numeric values must be unique within an enum; assign a different value"
+        }
+        ValidationError::UnknownTypeRef { .. } => {
+            "define a struct or enum with this name in the same module, or check for typos"
         }
     }
 }
@@ -317,5 +411,149 @@ fn check_tool<S: AsRef<OsStr>>(cmd: &str, args: &[S], label: &str, hint: Option<
             }
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use weaveffi_core::validate::ValidationError;
+    use weaveffi_ir::parse::ParseError;
+
+    #[test]
+    fn validation_suggestion_covers_all_variants() {
+        let cases: Vec<ValidationError> = vec![
+            ValidationError::NoModuleName,
+            ValidationError::DuplicateModuleName("m".into()),
+            ValidationError::InvalidModuleName("123".into(), "bad"),
+            ValidationError::DuplicateFunctionName {
+                module: "m".into(),
+                function: "f".into(),
+            },
+            ValidationError::DuplicateParamName {
+                module: "m".into(),
+                function: "f".into(),
+                param: "p".into(),
+            },
+            ValidationError::ReservedKeyword("type".into()),
+            ValidationError::InvalidIdentifier("123".into(), "bad"),
+            ValidationError::AsyncNotSupported {
+                module: "m".into(),
+                function: "f".into(),
+            },
+            ValidationError::ErrorDomainMissingName("m".into()),
+            ValidationError::DuplicateErrorName {
+                module: "m".into(),
+                name: "e".into(),
+            },
+            ValidationError::DuplicateErrorCode {
+                module: "m".into(),
+                code: 1,
+            },
+            ValidationError::InvalidErrorCode {
+                module: "m".into(),
+                name: "e".into(),
+            },
+            ValidationError::NameCollisionWithErrorDomain {
+                module: "m".into(),
+                name: "e".into(),
+            },
+            ValidationError::DuplicateStructName {
+                module: "m".into(),
+                name: "S".into(),
+            },
+            ValidationError::DuplicateStructField {
+                struct_name: "S".into(),
+                field: "f".into(),
+            },
+            ValidationError::EmptyStruct {
+                module: "m".into(),
+                name: "S".into(),
+            },
+            ValidationError::DuplicateEnumName {
+                module: "m".into(),
+                name: "E".into(),
+            },
+            ValidationError::EmptyEnum {
+                module: "m".into(),
+                name: "E".into(),
+            },
+            ValidationError::DuplicateEnumVariant {
+                enum_name: "E".into(),
+                variant: "V".into(),
+            },
+            ValidationError::DuplicateEnumValue {
+                enum_name: "E".into(),
+                value: 0,
+            },
+            ValidationError::UnknownTypeRef { name: "Foo".into() },
+        ];
+
+        for err in &cases {
+            let suggestion = validation_suggestion(err);
+            assert!(!suggestion.is_empty(), "empty suggestion for {:?}", err);
+        }
+    }
+
+    #[test]
+    fn format_parse_error_preserves_yaml_error() {
+        let _ = color_eyre::install();
+        let err = ParseError::Yaml {
+            line: 5,
+            column: 3,
+            message: "test error".into(),
+        };
+        let report = format_parse_error("input.yml", err);
+        let msg = report.to_string();
+        assert!(
+            msg.contains("YAML parse error"),
+            "missing error type in: {msg}"
+        );
+        assert!(msg.contains("line 5"), "missing line number in: {msg}");
+        assert!(msg.contains("column 3"), "missing column number in: {msg}");
+    }
+
+    #[test]
+    fn format_parse_error_preserves_json_error() {
+        let _ = color_eyre::install();
+        let err = ParseError::Json {
+            line: 10,
+            column: 1,
+            message: "test error".into(),
+        };
+        let report = format_parse_error("data.json", err);
+        let msg = report.to_string();
+        assert!(
+            msg.contains("JSON parse error"),
+            "missing error type in: {msg}"
+        );
+        assert!(msg.contains("line 10"), "missing line in: {msg}");
+    }
+
+    #[test]
+    fn format_parse_error_preserves_toml_error() {
+        let _ = color_eyre::install();
+        let err = ParseError::Toml {
+            message: "test error".into(),
+        };
+        let report = format_parse_error("config.toml", err);
+        let msg = report.to_string();
+        assert!(
+            msg.contains("TOML parse error"),
+            "missing error type in: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_validation_error_preserves_message() {
+        let _ = color_eyre::install();
+        let err = ValidationError::DuplicateModuleName("foo".into());
+        let report = format_validation_error(err);
+        let msg = report.to_string();
+        assert!(
+            msg.contains("duplicate module name"),
+            "missing error message in: {msg}"
+        );
+        assert!(msg.contains("foo"), "missing module name in: {msg}");
     }
 }
