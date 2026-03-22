@@ -8,7 +8,7 @@ pub struct CGenerator;
 
 impl Generator for CGenerator {
     fn name(&self) -> &'static str {
-        "c-header"
+        "c"
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
