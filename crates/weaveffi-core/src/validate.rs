@@ -439,6 +439,152 @@ mod tests {
     }
 
     #[test]
+    fn doc_example_error_domain_validates() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "contacts".to_string(),
+                functions: vec![
+                    Function {
+                        name: "create_contact".to_string(),
+                        params: vec![
+                            Param {
+                                name: "name".to_string(),
+                                ty: TypeRef::StringUtf8,
+                            },
+                            Param {
+                                name: "email".to_string(),
+                                ty: TypeRef::StringUtf8,
+                            },
+                        ],
+                        returns: Some(TypeRef::Handle),
+                        doc: None,
+                        r#async: false,
+                    },
+                    Function {
+                        name: "get_contact".to_string(),
+                        params: vec![Param {
+                            name: "id".to_string(),
+                            ty: TypeRef::Handle,
+                        }],
+                        returns: Some(TypeRef::StringUtf8),
+                        doc: None,
+                        r#async: false,
+                    },
+                ],
+                structs: vec![],
+                enums: vec![],
+                errors: Some(ErrorDomain {
+                    name: "ContactErrors".to_string(),
+                    codes: vec![
+                        ErrorCode {
+                            name: "not_found".to_string(),
+                            code: 1,
+                            message: "Contact not found".to_string(),
+                        },
+                        ErrorCode {
+                            name: "duplicate".to_string(),
+                            code: 2,
+                            message: "Contact already exists".to_string(),
+                        },
+                        ErrorCode {
+                            name: "invalid_email".to_string(),
+                            code: 3,
+                            message: "Email address is invalid".to_string(),
+                        },
+                    ],
+                }),
+            }],
+        };
+        assert!(validate_api(&api).is_ok());
+    }
+
+    #[test]
+    fn error_code_zero_rejected() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![simple_function("ok_fn")],
+                structs: vec![],
+                enums: vec![],
+                errors: Some(ErrorDomain {
+                    name: "MyErrors".to_string(),
+                    codes: vec![ErrorCode {
+                        name: "success".to_string(),
+                        code: 0,
+                        message: "should fail".to_string(),
+                    }],
+                }),
+            }],
+        };
+        assert!(matches!(
+            validate_api(&api).unwrap_err(),
+            ValidationError::InvalidErrorCode { module, name }
+                if module == "mymod" && name == "success"
+        ));
+    }
+
+    #[test]
+    fn error_domain_name_collision_rejected() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![simple_function("do_stuff")],
+                structs: vec![],
+                enums: vec![],
+                errors: Some(ErrorDomain {
+                    name: "do_stuff".to_string(),
+                    codes: vec![ErrorCode {
+                        name: "fail".to_string(),
+                        code: 1,
+                        message: "failed".to_string(),
+                    }],
+                }),
+            }],
+        };
+        assert!(matches!(
+            validate_api(&api).unwrap_err(),
+            ValidationError::NameCollisionWithErrorDomain { module, name }
+                if module == "mymod" && name == "do_stuff"
+        ));
+    }
+
+    #[test]
+    fn duplicate_error_names_rejected() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![simple_function("ok_fn")],
+                structs: vec![],
+                enums: vec![],
+                errors: Some(ErrorDomain {
+                    name: "MyErrors".to_string(),
+                    codes: vec![
+                        ErrorCode {
+                            name: "fail".to_string(),
+                            code: 1,
+                            message: "failed".to_string(),
+                        },
+                        ErrorCode {
+                            name: "fail".to_string(),
+                            code: 2,
+                            message: "also failed".to_string(),
+                        },
+                    ],
+                }),
+            }],
+        };
+        assert!(matches!(
+            validate_api(&api).unwrap_err(),
+            ValidationError::DuplicateErrorName { module, name }
+                if module == "mymod" && name == "fail"
+        ));
+    }
+
+    #[test]
     fn duplicate_error_codes_rejected() {
         let api = Api {
             version: "0.1.0".to_string(),

@@ -18,5 +18,6 @@
   - [Rust API (cargo doc)](api/rust.md)
 - [Guides]()
   - [Memory Ownership](guides/memory.md)
+  - [Error Handling](guides/errors.md)
 - [Tutorials](tutorials/README.md)
   - [Calculator](tutorials/calculator.md)
