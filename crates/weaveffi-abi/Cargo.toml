@@ -5,7 +5,9 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "C ABI runtime types and helpers for WeaveFFI"
+description = "Stable C ABI runtime types and helpers for WeaveFFI"
+keywords = ["ffi", "abi", "c-abi", "bindings", "codegen"]
+categories = ["development-tools::ffi"]
 
 [lints]
 workspace = true

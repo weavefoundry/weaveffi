@@ -5,7 +5,9 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "WeaveFFI Android JNI + Kotlin generator"
+description = "Android JNI and Kotlin binding generator for WeaveFFI"
+keywords = ["ffi", "codegen", "bindings", "android", "kotlin"]
+categories = ["development-tools::ffi"]
 
 [dependencies]
 weaveffi-core = { path = "../weaveffi-core" }

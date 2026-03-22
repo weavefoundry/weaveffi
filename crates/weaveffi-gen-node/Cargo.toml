@@ -5,7 +5,9 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "WeaveFFI Node.js TypeScript generator"
+description = "Node.js N-API and TypeScript binding generator for WeaveFFI"
+keywords = ["ffi", "codegen", "bindings", "nodejs", "typescript"]
+categories = ["development-tools::ffi"]
 
 [dependencies]
 weaveffi-core = { path = "../weaveffi-core" }

@@ -5,7 +5,9 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "WeaveFFI C header generator"
+description = "C header and source file generator for WeaveFFI"
+keywords = ["ffi", "codegen", "bindings", "c", "header"]
+categories = ["development-tools::ffi"]
 
 [dependencies]
 weaveffi-core = { path = "../weaveffi-core" }
