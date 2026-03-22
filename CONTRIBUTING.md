@@ -22,6 +22,15 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+5. (Optional) Preview the documentation locally:
+
+```bash
+cargo install mdbook
+mdbook serve docs -p 3000 -n 127.0.0.1
+```
+
+Open <http://127.0.0.1:3000>.
+
 ## Running specific tests
 
 ```bash
