@@ -5,7 +5,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::process::Command;
 use tracing_subscriber::EnvFilter;
-use weaveffi_core::codegen::Orchestrator;
+use weaveffi_core::codegen::{Generator, Orchestrator};
 use weaveffi_core::validate::validate_api;
 use weaveffi_gen_android::AndroidGenerator;
 use weaveffi_gen_c::CGenerator;
@@ -32,6 +32,9 @@ enum Commands {
         /// Output directory for generated artifacts
         #[arg(short, long, default_value = "./generated")]
         out: String,
+        /// Comma-separated list of targets to generate (c, swift, android, node, wasm)
+        #[arg(short, long)]
+        target: Option<String>,
     },
     Doctor,
 }
@@ -46,7 +49,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::New { name } => cmd_new(&name)?,
-        Commands::Generate { input, out } => cmd_generate(&input, &out)?,
+        Commands::Generate { input, out, target } => cmd_generate(&input, &out, target.as_deref())?,
         Commands::Doctor => cmd_doctor()?,
     }
     Ok(())
@@ -114,7 +117,7 @@ fn cmd_new(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_generate(input: &str, out: &str) -> Result<()> {
+fn cmd_generate(input: &str, out: &str, targets: Option<&str>) -> Result<()> {
     let in_path = Utf8Path::new(input);
     let ext = in_path.extension().unwrap_or("");
     if ext.is_empty() {
@@ -139,12 +142,21 @@ fn cmd_generate(input: &str, out: &str) -> Result<()> {
     std::fs::create_dir_all(out_dir.as_std_path())
         .with_context(|| format!("failed to create output directory: {}", out))?;
 
-    let orchestrator = Orchestrator::new()
-        .with_generator(&CGenerator)
-        .with_generator(&SwiftGenerator)
-        .with_generator(&AndroidGenerator)
-        .with_generator(&NodeGenerator)
-        .with_generator(&WasmGenerator);
+    let c = CGenerator;
+    let swift = SwiftGenerator;
+    let android = AndroidGenerator;
+    let node = NodeGenerator;
+    let wasm = WasmGenerator;
+    let all: Vec<&dyn Generator> = vec![&c, &swift, &android, &node, &wasm];
+
+    let filter: Option<Vec<&str>> = targets.map(|t| t.split(',').map(str::trim).collect());
+
+    let mut orchestrator = Orchestrator::new();
+    for &gen in &all {
+        if filter.as_ref().is_none_or(|ts| ts.contains(&gen.name())) {
+            orchestrator = orchestrator.with_generator(gen);
+        }
+    }
 
     orchestrator.run(&api, out_dir)?;
     println!("Generated artifacts in {}", out);
