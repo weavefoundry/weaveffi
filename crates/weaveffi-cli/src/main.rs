@@ -36,6 +36,10 @@ enum Commands {
         #[arg(short, long)]
         target: Option<String>,
     },
+    Validate {
+        /// Input IDL/IR file (yaml|yml|json|toml)
+        input: String,
+    },
     Doctor,
 }
 
@@ -50,6 +54,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::New { name } => cmd_new(&name)?,
         Commands::Generate { input, out, target } => cmd_generate(&input, &out, target.as_deref())?,
+        Commands::Validate { input } => cmd_validate(&input)?,
         Commands::Doctor => cmd_doctor()?,
     }
     Ok(())
@@ -161,6 +166,45 @@ fn cmd_generate(input: &str, out: &str, targets: Option<&str>) -> Result<()> {
     orchestrator.run(&api, out_dir)?;
     println!("Generated artifacts in {}", out);
     Ok(())
+}
+
+fn cmd_validate(input: &str) -> Result<()> {
+    let in_path = Utf8Path::new(input);
+    let ext = in_path.extension().unwrap_or("");
+    if ext.is_empty() {
+        bail!("input file has no extension (expected yml|yaml|json|toml)");
+    }
+    let format = match ext {
+        "yml" | "yaml" => "yaml",
+        "json" => "json",
+        "toml" => "toml",
+        other => bail!(
+            "unsupported input format: {} (expected yml|yaml|json|toml)",
+            other
+        ),
+    };
+    let contents = std::fs::read_to_string(in_path.as_std_path())
+        .with_context(|| format!("failed to read input file: {}", input))?;
+    let api = parse_api_str(&contents, format)
+        .with_context(|| format!("failed to parse {} as {}", input, format))?;
+
+    match validate_api(&api) {
+        Ok(()) => {
+            let n_modules = api.modules.len();
+            let n_functions: usize = api.modules.iter().map(|m| m.functions.len()).sum();
+            let n_structs: usize = api.modules.iter().map(|m| m.structs.len()).sum();
+            let n_enums: usize = api.modules.iter().map(|m| m.enums.len()).sum();
+            println!("Validation passed");
+            println!(
+                "  {} modules, {} functions, {} structs, {} enums",
+                n_modules, n_functions, n_structs, n_enums
+            );
+            Ok(())
+        }
+        Err(e) => {
+            bail!("Validation failed: {}", e);
+        }
+    }
 }
 
 fn cmd_doctor() -> Result<()> {
