@@ -16,5 +16,7 @@
   - [WASM](generators/wasm.md)
 - [API](api/README.md)
   - [Rust API (cargo doc)](api/rust.md)
+- [Guides]()
+  - [Memory Ownership](guides/memory.md)
 - [Tutorials](tutorials/README.md)
   - [Calculator](tutorials/calculator.md)

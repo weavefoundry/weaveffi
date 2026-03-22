@@ -129,3 +129,116 @@ pub fn c_ptr_to_string(ptr: *const c_char) -> Option<String> {
     let c = unsafe { CStr::from_ptr(ptr) };
     c.to_str().ok().map(|s| s.to_owned())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn string_roundtrip_and_free() {
+        let ptr = string_to_c_ptr("hello world");
+        assert!(!ptr.is_null());
+        let recovered = c_ptr_to_string(ptr).unwrap();
+        assert_eq!(recovered, "hello world");
+        free_string(ptr);
+    }
+
+    #[test]
+    fn free_string_null_is_safe() {
+        free_string(ptr::null());
+    }
+
+    #[test]
+    fn free_bytes_null_is_safe() {
+        free_bytes(ptr::null_mut(), 0);
+    }
+
+    #[test]
+    fn bytes_alloc_and_free() {
+        let data: Vec<u8> = vec![1, 2, 3, 4, 5];
+        let len = data.len();
+        let boxed = data.into_boxed_slice();
+        let ptr = Box::into_raw(boxed) as *mut u8;
+        free_bytes(ptr, len);
+    }
+
+    #[test]
+    fn error_default_is_ok() {
+        let err = weaveffi_error::default();
+        assert_eq!(err.code, 0);
+        assert!(err.message.is_null());
+    }
+
+    #[test]
+    fn error_set_and_clear() {
+        let mut err = weaveffi_error::default();
+        error_set(&mut err, -1, "something went wrong");
+        assert_eq!(err.code, -1);
+        assert!(!err.message.is_null());
+        let msg = c_ptr_to_string(err.message).unwrap();
+        assert_eq!(msg, "something went wrong");
+        error_clear(&mut err);
+        assert_eq!(err.code, 0);
+        assert!(err.message.is_null());
+    }
+
+    #[test]
+    fn error_clear_null_is_safe() {
+        error_clear(ptr::null_mut());
+    }
+
+    #[test]
+    fn error_set_ok_frees_prior_message() {
+        let mut err = weaveffi_error::default();
+        error_set(&mut err, 1, "first");
+        error_set_ok(&mut err);
+        assert_eq!(err.code, 0);
+        assert!(err.message.is_null());
+    }
+
+    #[test]
+    fn error_set_replaces_prior_message() {
+        let mut err = weaveffi_error::default();
+        error_set(&mut err, 1, "first");
+        error_set(&mut err, 2, "second");
+        assert_eq!(err.code, 2);
+        let msg = c_ptr_to_string(err.message).unwrap();
+        assert_eq!(msg, "second");
+        error_clear(&mut err);
+    }
+
+    #[test]
+    fn result_to_out_err_ok_path() {
+        let mut err = weaveffi_error::default();
+        let val: Result<i32, String> = Ok(42);
+        let opt = result_to_out_err(val, &mut err);
+        assert_eq!(opt, Some(42));
+        assert_eq!(err.code, 0);
+        assert!(err.message.is_null());
+    }
+
+    #[test]
+    fn result_to_out_err_error_path() {
+        let mut err = weaveffi_error::default();
+        let val: Result<i32, String> = Err("bad input".to_string());
+        let opt = result_to_out_err(val, &mut err);
+        assert_eq!(opt, None);
+        assert_eq!(err.code, -1);
+        let msg = c_ptr_to_string(err.message).unwrap();
+        assert_eq!(msg, "bad input");
+        error_clear(&mut err);
+    }
+
+    #[test]
+    fn string_with_interior_nul_is_sanitized() {
+        let ptr = string_to_c_ptr("hel\0lo");
+        let recovered = c_ptr_to_string(ptr).unwrap();
+        assert_eq!(recovered, "hello");
+        free_string(ptr);
+    }
+
+    #[test]
+    fn c_ptr_to_string_null_returns_none() {
+        assert_eq!(c_ptr_to_string(ptr::null()), None);
+    }
+}
