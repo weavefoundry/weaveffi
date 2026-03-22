@@ -3,7 +3,7 @@ use camino::Utf8Path;
 use std::fmt::Write as _;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::utils::c_symbol_name;
-use weaveffi_ir::ir::{Api, StructDef, TypeRef};
+use weaveffi_ir::ir::{Api, EnumDef, StructDef, TypeRef};
 
 pub struct AndroidGenerator;
 
@@ -55,59 +55,76 @@ add_library(weaveffi SHARED weaveffi_jni.c)
 target_include_directories(weaveffi PRIVATE ../../../../c)
 "#;
 
-fn kotlin_type(t: &TypeRef) -> &'static str {
+fn kotlin_type(t: &TypeRef) -> String {
     match t {
-        TypeRef::I32 => "Int",
-        TypeRef::U32 => "Long",
-        TypeRef::I64 => "Long",
-        TypeRef::F64 => "Double",
-        TypeRef::Bool => "Boolean",
-        TypeRef::StringUtf8 => "String",
-        TypeRef::Bytes => "ByteArray",
-        TypeRef::Handle => "Long",
-        TypeRef::Struct(_) => "Long",
-        TypeRef::Enum(_) => todo!("enum codegen"),
-        TypeRef::Optional(_) => todo!("optional codegen"),
-        TypeRef::List(_) => todo!("list codegen"),
+        TypeRef::I32 => "Int".to_string(),
+        TypeRef::U32 => "Long".to_string(),
+        TypeRef::I64 => "Long".to_string(),
+        TypeRef::F64 => "Double".to_string(),
+        TypeRef::Bool => "Boolean".to_string(),
+        TypeRef::StringUtf8 => "String".to_string(),
+        TypeRef::Bytes => "ByteArray".to_string(),
+        TypeRef::Handle => "Long".to_string(),
+        TypeRef::Struct(_) => "Long".to_string(),
+        TypeRef::Enum(_) => "Int".to_string(),
+        TypeRef::Optional(inner) => format!("{}?", kotlin_type(inner)),
+        TypeRef::List(inner) => kotlin_list_type(inner),
     }
 }
 
-fn jni_param_type(t: &TypeRef) -> &'static str {
-    match t {
-        TypeRef::I32 => "jint",
-        TypeRef::U32 => "jlong",
-        TypeRef::I64 | TypeRef::Handle => "jlong",
-        TypeRef::F64 => "jdouble",
-        TypeRef::Bool => "jboolean",
-        TypeRef::StringUtf8 => "jstring",
-        TypeRef::Bytes => "jbyteArray",
-        TypeRef::Struct(_) => "jlong",
-        TypeRef::Enum(_) => todo!("enum codegen"),
-        TypeRef::Optional(_) => todo!("optional codegen"),
-        TypeRef::List(_) => todo!("list codegen"),
+fn kotlin_list_type(inner: &TypeRef) -> String {
+    match inner {
+        TypeRef::I32 | TypeRef::Enum(_) => "IntArray".to_string(),
+        TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::Struct(_) => {
+            "LongArray".to_string()
+        }
+        TypeRef::F64 => "DoubleArray".to_string(),
+        TypeRef::Bool => "BooleanArray".to_string(),
+        TypeRef::StringUtf8 => "Array<String>".to_string(),
+        TypeRef::Bytes => "Array<ByteArray>".to_string(),
+        TypeRef::Optional(_) | TypeRef::List(_) => "LongArray".to_string(),
     }
 }
 
-fn jni_ret_type(t: Option<&TypeRef>) -> &'static str {
+fn jni_param_type(t: &TypeRef) -> String {
     match t {
-        None => "void",
-        Some(TypeRef::I32) => "jint",
-        Some(TypeRef::U32) => "jlong",
-        Some(TypeRef::I64 | TypeRef::Handle) => "jlong",
-        Some(TypeRef::F64) => "jdouble",
-        Some(TypeRef::Bool) => "jboolean",
-        Some(TypeRef::StringUtf8) => "jstring",
-        Some(TypeRef::Bytes) => "jbyteArray",
-        Some(TypeRef::Struct(_)) => "jlong",
-        Some(TypeRef::Enum(_)) => todo!("enum codegen"),
-        Some(TypeRef::Optional(_)) => todo!("optional codegen"),
-        Some(TypeRef::List(_)) => todo!("list codegen"),
+        TypeRef::I32 | TypeRef::Enum(_) => "jint".to_string(),
+        TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::Struct(_) => "jlong".to_string(),
+        TypeRef::F64 => "jdouble".to_string(),
+        TypeRef::Bool => "jboolean".to_string(),
+        TypeRef::StringUtf8 => "jstring".to_string(),
+        TypeRef::Bytes => "jbyteArray".to_string(),
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::StringUtf8 => "jstring".to_string(),
+            TypeRef::Bytes => "jbyteArray".to_string(),
+            _ => "jobject".to_string(),
+        },
+        TypeRef::List(inner) => jni_array_type(inner),
+    }
+}
+
+fn jni_array_type(inner: &TypeRef) -> String {
+    match inner {
+        TypeRef::I32 | TypeRef::Enum(_) => "jintArray".to_string(),
+        TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::Struct(_) => {
+            "jlongArray".to_string()
+        }
+        TypeRef::F64 => "jdoubleArray".to_string(),
+        TypeRef::Bool => "jbooleanArray".to_string(),
+        _ => "jobjectArray".to_string(),
+    }
+}
+
+fn jni_ret_type(t: Option<&TypeRef>) -> String {
+    match t {
+        None => "void".to_string(),
+        Some(t) => jni_param_type(t),
     }
 }
 
 fn c_type_for_return(t: &TypeRef) -> &'static str {
     match t {
-        TypeRef::I32 => "int32_t",
+        TypeRef::I32 | TypeRef::Enum(_) => "int32_t",
         TypeRef::U32 => "uint32_t",
         TypeRef::I64 => "int64_t",
         TypeRef::F64 => "double",
@@ -115,32 +132,27 @@ fn c_type_for_return(t: &TypeRef) -> &'static str {
         TypeRef::Handle => "weaveffi_handle_t",
         TypeRef::StringUtf8 => "const char*",
         TypeRef::Bytes => "const uint8_t*",
-        TypeRef::Struct(_) => "void*",
-        TypeRef::Enum(_) => todo!("enum codegen"),
-        TypeRef::Optional(_) => todo!("optional codegen"),
-        TypeRef::List(_) => todo!("list codegen"),
+        TypeRef::Struct(_) | TypeRef::Optional(_) | TypeRef::List(_) => "void*",
     }
 }
 
 fn jni_default_return(t: Option<&TypeRef>) -> &'static str {
     match t {
         None => "",
-        Some(TypeRef::I32) => "return 0;",
+        Some(TypeRef::I32 | TypeRef::Enum(_)) => "return 0;",
         Some(TypeRef::U32 | TypeRef::I64 | TypeRef::Handle) => "return 0;",
         Some(TypeRef::F64) => "return 0.0;",
         Some(TypeRef::Bool) => "return JNI_FALSE;",
         Some(TypeRef::StringUtf8) => "return NULL;",
         Some(TypeRef::Bytes) => "return NULL;",
         Some(TypeRef::Struct(_)) => "return 0;",
-        Some(TypeRef::Enum(_)) => todo!("enum codegen"),
-        Some(TypeRef::Optional(_)) => todo!("optional codegen"),
-        Some(TypeRef::List(_)) => todo!("list codegen"),
+        Some(TypeRef::Optional(_) | TypeRef::List(_)) => "return NULL;",
     }
 }
 
 fn jni_cast_for(t: &TypeRef) -> &'static str {
     match t {
-        TypeRef::I32 => "(jint)",
+        TypeRef::I32 | TypeRef::Enum(_) => "(jint)",
         TypeRef::U32 | TypeRef::I64 | TypeRef::Handle => "(jlong)",
         TypeRef::F64 => "(jdouble)",
         TypeRef::Struct(_) => "(jlong)(intptr_t)",
@@ -157,7 +169,11 @@ fn render_kotlin(api: &Api) -> String {
                 .iter()
                 .map(|p| format!("{}: {}", p.name, kotlin_type(&p.ty)))
                 .collect();
-            let ret = f.returns.as_ref().map(kotlin_type).unwrap_or("Unit");
+            let ret = f
+                .returns
+                .as_ref()
+                .map(kotlin_type)
+                .unwrap_or_else(|| "Unit".to_string());
             let _ = writeln!(
                 kotlin,
                 "        @JvmStatic external fun {}({}): {}",
@@ -169,11 +185,32 @@ fn render_kotlin(api: &Api) -> String {
     }
     kotlin.push_str("    }\n}\n");
     for m in &api.modules {
+        for e in &m.enums {
+            render_kotlin_enum(&mut kotlin, e);
+        }
         for s in &m.structs {
             render_kotlin_struct(&mut kotlin, s);
         }
     }
     kotlin
+}
+
+fn render_kotlin_enum(out: &mut String, e: &EnumDef) {
+    let _ = writeln!(out);
+    let _ = writeln!(out, "enum class {}(val value: Int) {{", e.name);
+    for (i, v) in e.variants.iter().enumerate() {
+        let comma = if i < e.variants.len() - 1 { "," } else { ";" };
+        let _ = writeln!(out, "    {}({}){}", v.name, v.value, comma);
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out, "    companion object {{");
+    let _ = writeln!(
+        out,
+        "        fun fromValue(value: Int): {} = entries.first {{ it.value == value }}",
+        e.name
+    );
+    let _ = writeln!(out, "    }}");
+    let _ = writeln!(out, "}}");
 }
 
 fn render_jni_c(api: &Api) -> String {
@@ -194,143 +231,31 @@ fn render_jni_c(api: &Api) -> String {
             );
             let _ = writeln!(jni_c, "    weaveffi_error err = {{0, NULL}};");
 
-            // Acquire JNI resources
             for p in &f.params {
-                match p.ty {
-                    TypeRef::StringUtf8 => {
-                        let _ = writeln!(jni_c, "    const char* {n}_chars = (*env)->GetStringUTFChars(env, {n}, NULL);", n = p.name);
-                        let _ = writeln!(
-                            jni_c,
-                            "    jsize {n}_len = (*env)->GetStringUTFLength(env, {n});",
-                            n = p.name
-                        );
-                    }
-                    TypeRef::Bytes => {
-                        let _ = writeln!(jni_c, "    jboolean {n}_is_copy = 0;", n = p.name);
-                        let _ = writeln!(jni_c, "    jbyte* {n}_elems = (*env)->GetByteArrayElements(env, {n}, &{n}_is_copy);", n = p.name);
-                        let _ = writeln!(
-                            jni_c,
-                            "    jsize {n}_len = (*env)->GetArrayLength(env, {n});",
-                            n = p.name
-                        );
-                    }
-                    _ => {}
-                }
+                write_param_acquire(&mut jni_c, &p.name, &p.ty);
             }
 
-            // Build C call args
             let c_sym = c_symbol_name(&m.name, &f.name);
             let mut call_args: Vec<String> = Vec::new();
             for p in &f.params {
-                match &p.ty {
-                    TypeRef::StringUtf8 => {
-                        call_args.push(format!("(const uint8_t*){n}_chars", n = p.name));
-                        call_args.push(format!("(size_t){n}_len", n = p.name));
-                    }
-                    TypeRef::Bytes => {
-                        call_args.push(format!("(const uint8_t*){n}_elems", n = p.name));
-                        call_args.push(format!("(size_t){n}_len", n = p.name));
-                    }
-                    TypeRef::Bool => call_args.push(format!("(bool)({} == JNI_TRUE)", p.name)),
-                    TypeRef::I32 => call_args.push(format!("(int32_t){}", p.name)),
-                    TypeRef::U32 => call_args.push(format!("(uint32_t){}", p.name)),
-                    TypeRef::I64 => call_args.push(format!("(int64_t){}", p.name)),
-                    TypeRef::F64 => call_args.push(format!("(double){}", p.name)),
-                    TypeRef::Handle => call_args.push(format!("(weaveffi_handle_t){}", p.name)),
-                    TypeRef::Struct(name) => {
-                        call_args.push(format!(
-                            "(const weaveffi_{}_{}*)(intptr_t){}",
-                            m.name, name, p.name
-                        ));
-                    }
-                    TypeRef::Enum(_) => todo!("enum codegen"),
-                    TypeRef::Optional(_) => todo!("optional codegen"),
-                    TypeRef::List(_) => todo!("list codegen"),
-                }
+                build_c_call_args(&mut call_args, &p.name, &p.ty, &m.name);
             }
 
-            let needs_out_len = matches!(f.returns, Some(TypeRef::Bytes));
+            let needs_out_len = matches!(f.returns, Some(TypeRef::Bytes) | Some(TypeRef::List(_)));
             if needs_out_len {
                 let _ = writeln!(jni_c, "    size_t out_len = 0;");
             }
 
-            // Call and handle return
             if let Some(ret_type) = f.returns.as_ref() {
-                match ret_type {
-                    TypeRef::StringUtf8 => {
-                        let _ = writeln!(
-                            jni_c,
-                            "    const char* rv = {}({}, &err);",
-                            c_sym,
-                            call_args.join(", ")
-                        );
-                        write_error_check(&mut jni_c, f.returns.as_ref());
-                        let _ = writeln!(jni_c, "    jstring out = rv ? (*env)->NewStringUTF(env, rv) : (*env)->NewStringUTF(env, \"\");");
-                        let _ = writeln!(jni_c, "    weaveffi_free_string(rv);");
-                        release_jni_resources(&mut jni_c, &f.params);
-                        let _ = writeln!(jni_c, "    return out;");
-                    }
-                    TypeRef::Bytes => {
-                        let mut args = call_args.clone();
-                        args.push("&out_len".into());
-                        let _ = writeln!(
-                            jni_c,
-                            "    const uint8_t* rv = {}({}, &err);",
-                            c_sym,
-                            args.join(", ")
-                        );
-                        write_error_check(&mut jni_c, f.returns.as_ref());
-                        let _ = writeln!(
-                            jni_c,
-                            "    jbyteArray out = (*env)->NewByteArray(env, (jsize)out_len);"
-                        );
-                        let _ = writeln!(jni_c, "    if (out && rv) {{ (*env)->SetByteArrayRegion(env, out, 0, (jsize)out_len, (const jbyte*)rv); }}");
-                        let _ = writeln!(
-                            jni_c,
-                            "    weaveffi_free_bytes((uint8_t*)rv, (size_t)out_len);"
-                        );
-                        release_jni_resources(&mut jni_c, &f.params);
-                        let _ = writeln!(jni_c, "    return out;");
-                    }
-                    TypeRef::Bool => {
-                        let _ = writeln!(
-                            jni_c,
-                            "    bool rv = {}({}, &err);",
-                            c_sym,
-                            call_args.join(", ")
-                        );
-                        write_error_check(&mut jni_c, f.returns.as_ref());
-                        release_jni_resources(&mut jni_c, &f.params);
-                        let _ = writeln!(jni_c, "    return rv ? JNI_TRUE : JNI_FALSE;");
-                    }
-                    TypeRef::Struct(name) => {
-                        let c_ty = format!("weaveffi_{}_{}", m.name, name);
-                        let _ = writeln!(
-                            jni_c,
-                            "    {}* rv = {}({}, &err);",
-                            c_ty,
-                            c_sym,
-                            call_args.join(", ")
-                        );
-                        write_error_check(&mut jni_c, f.returns.as_ref());
-                        release_jni_resources(&mut jni_c, &f.params);
-                        let _ = writeln!(jni_c, "    return (jlong)(intptr_t)rv;");
-                    }
-                    ret_type => {
-                        let c_ty = c_type_for_return(ret_type);
-                        let jcast = jni_cast_for(ret_type);
-                        let _ = writeln!(
-                            jni_c,
-                            "    {} rv = {}({}, &err);",
-                            c_ty,
-                            c_sym,
-                            call_args.join(", ")
-                        );
-                        write_error_check(&mut jni_c, f.returns.as_ref());
-                        release_jni_resources(&mut jni_c, &f.params);
-                        let _ = writeln!(jni_c, "    return {} rv;", jcast);
-                    }
-                }
+                write_return_handling(
+                    &mut jni_c,
+                    ret_type,
+                    &c_sym,
+                    &call_args,
+                    f.returns.as_ref(),
+                    &f.params,
+                    &m.name,
+                );
             } else {
                 let _ = writeln!(jni_c, "    {}({}, &err);", c_sym, call_args.join(", "));
                 write_error_check(&mut jni_c, f.returns.as_ref());
@@ -347,6 +272,547 @@ fn render_jni_c(api: &Api) -> String {
         }
     }
     jni_c
+}
+
+fn write_param_acquire(out: &mut String, name: &str, ty: &TypeRef) {
+    match ty {
+        TypeRef::StringUtf8 => {
+            let _ = writeln!(
+                out,
+                "    const char* {n}_chars = (*env)->GetStringUTFChars(env, {n}, NULL);",
+                n = name
+            );
+            let _ = writeln!(
+                out,
+                "    jsize {n}_len = (*env)->GetStringUTFLength(env, {n});",
+                n = name
+            );
+        }
+        TypeRef::Bytes => {
+            let _ = writeln!(out, "    jboolean {n}_is_copy = 0;", n = name);
+            let _ = writeln!(
+                out,
+                "    jbyte* {n}_elems = (*env)->GetByteArrayElements(env, {n}, &{n}_is_copy);",
+                n = name
+            );
+            let _ = writeln!(
+                out,
+                "    jsize {n}_len = (*env)->GetArrayLength(env, {n});",
+                n = name
+            );
+        }
+        TypeRef::Optional(inner) => write_optional_acquire(out, name, inner),
+        TypeRef::List(inner) => write_list_acquire(out, name, inner),
+        _ => {}
+    }
+}
+
+fn write_optional_acquire(out: &mut String, name: &str, inner: &TypeRef) {
+    match inner {
+        TypeRef::StringUtf8 => {
+            let _ = writeln!(out, "    const char* {n}_chars = NULL;", n = name);
+            let _ = writeln!(out, "    jsize {n}_len = 0;", n = name);
+            let _ = writeln!(out, "    if ({n} != NULL) {{", n = name);
+            let _ = writeln!(
+                out,
+                "        {n}_chars = (*env)->GetStringUTFChars(env, {n}, NULL);",
+                n = name
+            );
+            let _ = writeln!(
+                out,
+                "        {n}_len = (*env)->GetStringUTFLength(env, {n});",
+                n = name
+            );
+            let _ = writeln!(out, "    }}");
+        }
+        TypeRef::Bytes => {
+            let _ = writeln!(out, "    jbyte* {n}_elems = NULL;", n = name);
+            let _ = writeln!(out, "    jsize {n}_len = 0;", n = name);
+            let _ = writeln!(out, "    if ({n} != NULL) {{", n = name);
+            let _ = writeln!(
+                out,
+                "        {n}_elems = (*env)->GetByteArrayElements(env, {n}, NULL);",
+                n = name
+            );
+            let _ = writeln!(
+                out,
+                "        {n}_len = (*env)->GetArrayLength(env, {n});",
+                n = name
+            );
+            let _ = writeln!(out, "    }}");
+        }
+        TypeRef::I32 | TypeRef::Enum(_) => {
+            let _ = writeln!(out, "    int32_t {n}_val = 0;", n = name);
+            let _ = writeln!(out, "    const int32_t* {n}_ptr = NULL;", n = name);
+            let _ = writeln!(out, "    if ({n} != NULL) {{", n = name);
+            let _ = writeln!(
+                out,
+                "        jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Integer\");",
+                n = name
+            );
+            let _ = writeln!(
+                out,
+                "        jmethodID {n}_mid = (*env)->GetMethodID(env, {n}_cls, \"intValue\", \"()I\");",
+                n = name
+            );
+            let _ = writeln!(
+                out,
+                "        {n}_val = (int32_t)(*env)->CallIntMethod(env, {n}, {n}_mid);",
+                n = name
+            );
+            let _ = writeln!(out, "        {n}_ptr = &{n}_val;", n = name);
+            let _ = writeln!(out, "    }}");
+        }
+        TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::Struct(_) => {
+            let _ = writeln!(out, "    int64_t {n}_val = 0;", n = name);
+            let _ = writeln!(out, "    const int64_t* {n}_ptr = NULL;", n = name);
+            let _ = writeln!(out, "    if ({n} != NULL) {{", n = name);
+            let _ = writeln!(
+                out,
+                "        jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Long\");",
+                n = name
+            );
+            let _ = writeln!(
+                out,
+                "        jmethodID {n}_mid = (*env)->GetMethodID(env, {n}_cls, \"longValue\", \"()J\");",
+                n = name
+            );
+            let _ = writeln!(
+                out,
+                "        {n}_val = (int64_t)(*env)->CallLongMethod(env, {n}, {n}_mid);",
+                n = name
+            );
+            let _ = writeln!(out, "        {n}_ptr = &{n}_val;", n = name);
+            let _ = writeln!(out, "    }}");
+        }
+        TypeRef::F64 => {
+            let _ = writeln!(out, "    double {n}_val = 0.0;", n = name);
+            let _ = writeln!(out, "    const double* {n}_ptr = NULL;", n = name);
+            let _ = writeln!(out, "    if ({n} != NULL) {{", n = name);
+            let _ = writeln!(
+                out,
+                "        jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Double\");",
+                n = name
+            );
+            let _ = writeln!(
+                out,
+                "        jmethodID {n}_mid = (*env)->GetMethodID(env, {n}_cls, \"doubleValue\", \"()D\");",
+                n = name
+            );
+            let _ = writeln!(
+                out,
+                "        {n}_val = (*env)->CallDoubleMethod(env, {n}, {n}_mid);",
+                n = name
+            );
+            let _ = writeln!(out, "        {n}_ptr = &{n}_val;", n = name);
+            let _ = writeln!(out, "    }}");
+        }
+        TypeRef::Bool => {
+            let _ = writeln!(out, "    bool {n}_val = false;", n = name);
+            let _ = writeln!(out, "    const bool* {n}_ptr = NULL;", n = name);
+            let _ = writeln!(out, "    if ({n} != NULL) {{", n = name);
+            let _ = writeln!(
+                out,
+                "        jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Boolean\");",
+                n = name
+            );
+            let _ = writeln!(
+                out,
+                "        jmethodID {n}_mid = (*env)->GetMethodID(env, {n}_cls, \"booleanValue\", \"()Z\");",
+                n = name
+            );
+            let _ = writeln!(
+                out,
+                "        {n}_val = (bool)(*env)->CallBooleanMethod(env, {n}, {n}_mid);",
+                n = name
+            );
+            let _ = writeln!(out, "        {n}_ptr = &{n}_val;", n = name);
+            let _ = writeln!(out, "    }}");
+        }
+        TypeRef::Optional(_) | TypeRef::List(_) => {}
+    }
+}
+
+fn write_list_acquire(out: &mut String, name: &str, inner: &TypeRef) {
+    match inner {
+        TypeRef::I32 | TypeRef::Enum(_) => {
+            let _ = writeln!(
+                out,
+                "    jint* {n}_elems = (*env)->GetIntArrayElements(env, {n}, NULL);",
+                n = name
+            );
+            let _ = writeln!(
+                out,
+                "    jsize {n}_len = (*env)->GetArrayLength(env, {n});",
+                n = name
+            );
+        }
+        TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::Struct(_) => {
+            let _ = writeln!(
+                out,
+                "    jlong* {n}_elems = (*env)->GetLongArrayElements(env, {n}, NULL);",
+                n = name
+            );
+            let _ = writeln!(
+                out,
+                "    jsize {n}_len = (*env)->GetArrayLength(env, {n});",
+                n = name
+            );
+        }
+        TypeRef::F64 => {
+            let _ = writeln!(
+                out,
+                "    jdouble* {n}_elems = (*env)->GetDoubleArrayElements(env, {n}, NULL);",
+                n = name
+            );
+            let _ = writeln!(
+                out,
+                "    jsize {n}_len = (*env)->GetArrayLength(env, {n});",
+                n = name
+            );
+        }
+        TypeRef::Bool => {
+            let _ = writeln!(
+                out,
+                "    jboolean* {n}_elems = (*env)->GetBooleanArrayElements(env, {n}, NULL);",
+                n = name
+            );
+            let _ = writeln!(
+                out,
+                "    jsize {n}_len = (*env)->GetArrayLength(env, {n});",
+                n = name
+            );
+        }
+        _ => {
+            let _ = writeln!(
+                out,
+                "    jsize {n}_len = (*env)->GetArrayLength(env, {n});",
+                n = name
+            );
+        }
+    }
+}
+
+fn build_c_call_args(args: &mut Vec<String>, name: &str, ty: &TypeRef, module: &str) {
+    match ty {
+        TypeRef::StringUtf8 => {
+            args.push(format!("(const uint8_t*){n}_chars", n = name));
+            args.push(format!("(size_t){n}_len", n = name));
+        }
+        TypeRef::Bytes => {
+            args.push(format!("(const uint8_t*){n}_elems", n = name));
+            args.push(format!("(size_t){n}_len", n = name));
+        }
+        TypeRef::Bool => args.push(format!("(bool)({} == JNI_TRUE)", name)),
+        TypeRef::I32 => args.push(format!("(int32_t){}", name)),
+        TypeRef::U32 => args.push(format!("(uint32_t){}", name)),
+        TypeRef::I64 => args.push(format!("(int64_t){}", name)),
+        TypeRef::F64 => args.push(format!("(double){}", name)),
+        TypeRef::Handle => args.push(format!("(weaveffi_handle_t){}", name)),
+        TypeRef::Struct(sname) => {
+            args.push(format!(
+                "(const weaveffi_{}_{}*)(intptr_t){}",
+                module, sname, name
+            ));
+        }
+        TypeRef::Enum(_) => args.push(format!("(int32_t){}", name)),
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::StringUtf8 => {
+                args.push(format!("(const uint8_t*){n}_chars", n = name));
+                args.push(format!("(size_t){n}_len", n = name));
+            }
+            TypeRef::Bytes => {
+                args.push(format!("(const uint8_t*){n}_elems", n = name));
+                args.push(format!("(size_t){n}_len", n = name));
+            }
+            _ => args.push(format!("{}_ptr", name)),
+        },
+        TypeRef::List(inner) => {
+            match inner.as_ref() {
+                TypeRef::I32 | TypeRef::Enum(_) => {
+                    args.push(format!("(const int32_t*){n}_elems", n = name));
+                }
+                TypeRef::U32 => {
+                    args.push(format!("(const uint32_t*){n}_elems", n = name));
+                }
+                TypeRef::I64 => {
+                    args.push(format!("(const int64_t*){n}_elems", n = name));
+                }
+                TypeRef::F64 => {
+                    args.push(format!("(const double*){n}_elems", n = name));
+                }
+                TypeRef::Bool => {
+                    args.push(format!("(const bool*){n}_elems", n = name));
+                }
+                TypeRef::Handle => {
+                    args.push(format!("(const weaveffi_handle_t*){n}_elems", n = name));
+                }
+                _ => {
+                    args.push(format!("(const void*){n}_elems", n = name));
+                }
+            }
+            args.push(format!("(size_t){n}_len", n = name));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_return_handling(
+    jni_c: &mut String,
+    ret_type: &TypeRef,
+    c_sym: &str,
+    call_args: &[String],
+    returns: Option<&TypeRef>,
+    params: &[weaveffi_ir::ir::Param],
+    module: &str,
+) {
+    let args_str = call_args.join(", ");
+    match ret_type {
+        TypeRef::StringUtf8 => {
+            let _ = writeln!(jni_c, "    const char* rv = {}({}, &err);", c_sym, args_str);
+            write_error_check(jni_c, returns);
+            let _ = writeln!(jni_c, "    jstring out = rv ? (*env)->NewStringUTF(env, rv) : (*env)->NewStringUTF(env, \"\");");
+            let _ = writeln!(jni_c, "    weaveffi_free_string(rv);");
+            release_jni_resources(jni_c, params);
+            let _ = writeln!(jni_c, "    return out;");
+        }
+        TypeRef::Bytes => {
+            let _ = writeln!(
+                jni_c,
+                "    const uint8_t* rv = {}({}, &out_len, &err);",
+                c_sym, args_str
+            );
+            write_error_check(jni_c, returns);
+            let _ = writeln!(
+                jni_c,
+                "    jbyteArray out = (*env)->NewByteArray(env, (jsize)out_len);"
+            );
+            let _ = writeln!(jni_c, "    if (out && rv) {{ (*env)->SetByteArrayRegion(env, out, 0, (jsize)out_len, (const jbyte*)rv); }}");
+            let _ = writeln!(
+                jni_c,
+                "    weaveffi_free_bytes((uint8_t*)rv, (size_t)out_len);"
+            );
+            release_jni_resources(jni_c, params);
+            let _ = writeln!(jni_c, "    return out;");
+        }
+        TypeRef::Bool => {
+            let _ = writeln!(jni_c, "    bool rv = {}({}, &err);", c_sym, args_str);
+            write_error_check(jni_c, returns);
+            release_jni_resources(jni_c, params);
+            let _ = writeln!(jni_c, "    return rv ? JNI_TRUE : JNI_FALSE;");
+        }
+        TypeRef::Struct(name) => {
+            let c_ty = format!("weaveffi_{}_{}", module, name);
+            let _ = writeln!(jni_c, "    {}* rv = {}({}, &err);", c_ty, c_sym, args_str);
+            write_error_check(jni_c, returns);
+            release_jni_resources(jni_c, params);
+            let _ = writeln!(jni_c, "    return (jlong)(intptr_t)rv;");
+        }
+        TypeRef::Optional(inner) => {
+            write_optional_return(jni_c, inner, c_sym, &args_str, returns, params, module);
+        }
+        TypeRef::List(inner) => {
+            write_list_return(jni_c, inner, c_sym, &args_str, returns, params);
+        }
+        ret_type => {
+            let c_ty = c_type_for_return(ret_type);
+            let jcast = jni_cast_for(ret_type);
+            let _ = writeln!(jni_c, "    {} rv = {}({}, &err);", c_ty, c_sym, args_str);
+            write_error_check(jni_c, returns);
+            release_jni_resources(jni_c, params);
+            let _ = writeln!(jni_c, "    return {} rv;", jcast);
+        }
+    }
+}
+
+fn write_optional_return(
+    out: &mut String,
+    inner: &TypeRef,
+    c_sym: &str,
+    args_str: &str,
+    returns: Option<&TypeRef>,
+    params: &[weaveffi_ir::ir::Param],
+    _module: &str,
+) {
+    match inner {
+        TypeRef::StringUtf8 => {
+            let _ = writeln!(out, "    const char* rv = {}({}, &err);", c_sym, args_str);
+            write_error_check(out, returns);
+            release_jni_resources(out, params);
+            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
+            let _ = writeln!(out, "    jstring result = (*env)->NewStringUTF(env, rv);");
+            let _ = writeln!(out, "    weaveffi_free_string(rv);");
+            let _ = writeln!(out, "    return result;");
+        }
+        TypeRef::I32 | TypeRef::Enum(_) => {
+            let _ = writeln!(
+                out,
+                "    const int32_t* rv = {}({}, &err);",
+                c_sym, args_str
+            );
+            write_error_check(out, returns);
+            release_jni_resources(out, params);
+            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
+            let _ = writeln!(
+                out,
+                "    jclass cls = (*env)->FindClass(env, \"java/lang/Integer\");"
+            );
+            let _ = writeln!(
+                out,
+                "    jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(I)Ljava/lang/Integer;\");"
+            );
+            let _ = writeln!(
+                out,
+                "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jint)*rv);"
+            );
+        }
+        TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::Struct(_) => {
+            let _ = writeln!(
+                out,
+                "    const int64_t* rv = (const int64_t*){}({}, &err);",
+                c_sym, args_str
+            );
+            write_error_check(out, returns);
+            release_jni_resources(out, params);
+            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
+            let _ = writeln!(
+                out,
+                "    jclass cls = (*env)->FindClass(env, \"java/lang/Long\");"
+            );
+            let _ = writeln!(
+                out,
+                "    jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(J)Ljava/lang/Long;\");"
+            );
+            let _ = writeln!(
+                out,
+                "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jlong)*rv);"
+            );
+        }
+        TypeRef::F64 => {
+            let _ = writeln!(out, "    const double* rv = {}({}, &err);", c_sym, args_str);
+            write_error_check(out, returns);
+            release_jni_resources(out, params);
+            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
+            let _ = writeln!(
+                out,
+                "    jclass cls = (*env)->FindClass(env, \"java/lang/Double\");"
+            );
+            let _ = writeln!(
+                out,
+                "    jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(D)Ljava/lang/Double;\");"
+            );
+            let _ = writeln!(
+                out,
+                "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jdouble)*rv);"
+            );
+        }
+        TypeRef::Bool => {
+            let _ = writeln!(out, "    const bool* rv = {}({}, &err);", c_sym, args_str);
+            write_error_check(out, returns);
+            release_jni_resources(out, params);
+            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
+            let _ = writeln!(
+                out,
+                "    jclass cls = (*env)->FindClass(env, \"java/lang/Boolean\");"
+            );
+            let _ = writeln!(
+                out,
+                "    jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(Z)Ljava/lang/Boolean;\");"
+            );
+            let _ = writeln!(
+                out,
+                "    return (*env)->CallStaticObjectMethod(env, cls, mid, *rv ? JNI_TRUE : JNI_FALSE);"
+            );
+        }
+        _ => {
+            let _ = writeln!(out, "    void* rv = {}({}, &err);", c_sym, args_str);
+            write_error_check(out, returns);
+            release_jni_resources(out, params);
+            let _ = writeln!(out, "    return (jobject)rv;");
+        }
+    }
+}
+
+fn write_list_return(
+    out: &mut String,
+    inner: &TypeRef,
+    c_sym: &str,
+    args_str: &str,
+    returns: Option<&TypeRef>,
+    params: &[weaveffi_ir::ir::Param],
+) {
+    match inner {
+        TypeRef::I32 | TypeRef::Enum(_) => {
+            let _ = writeln!(
+                out,
+                "    const int32_t* rv = {}({}, &out_len, &err);",
+                c_sym, args_str
+            );
+            write_error_check(out, returns);
+            release_jni_resources(out, params);
+            let _ = writeln!(
+                out,
+                "    jintArray result = (*env)->NewIntArray(env, (jsize)out_len);"
+            );
+            let _ = writeln!(out, "    if (result && rv) {{ (*env)->SetIntArrayRegion(env, result, 0, (jsize)out_len, (const jint*)rv); }}");
+            let _ = writeln!(out, "    return result;");
+        }
+        TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::Struct(_) => {
+            let _ = writeln!(
+                out,
+                "    const int64_t* rv = (const int64_t*){}({}, &out_len, &err);",
+                c_sym, args_str
+            );
+            write_error_check(out, returns);
+            release_jni_resources(out, params);
+            let _ = writeln!(
+                out,
+                "    jlongArray result = (*env)->NewLongArray(env, (jsize)out_len);"
+            );
+            let _ = writeln!(out, "    if (result && rv) {{ (*env)->SetLongArrayRegion(env, result, 0, (jsize)out_len, (const jlong*)rv); }}");
+            let _ = writeln!(out, "    return result;");
+        }
+        TypeRef::F64 => {
+            let _ = writeln!(
+                out,
+                "    const double* rv = {}({}, &out_len, &err);",
+                c_sym, args_str
+            );
+            write_error_check(out, returns);
+            release_jni_resources(out, params);
+            let _ = writeln!(
+                out,
+                "    jdoubleArray result = (*env)->NewDoubleArray(env, (jsize)out_len);"
+            );
+            let _ = writeln!(out, "    if (result && rv) {{ (*env)->SetDoubleArrayRegion(env, result, 0, (jsize)out_len, (const jdouble*)rv); }}");
+            let _ = writeln!(out, "    return result;");
+        }
+        TypeRef::Bool => {
+            let _ = writeln!(
+                out,
+                "    const bool* rv = {}({}, &out_len, &err);",
+                c_sym, args_str
+            );
+            write_error_check(out, returns);
+            release_jni_resources(out, params);
+            let _ = writeln!(
+                out,
+                "    jbooleanArray result = (*env)->NewBooleanArray(env, (jsize)out_len);"
+            );
+            let _ = writeln!(out, "    if (result && rv) {{ (*env)->SetBooleanArrayRegion(env, result, 0, (jsize)out_len, (const jboolean*)rv); }}");
+            let _ = writeln!(out, "    return result;");
+        }
+        _ => {
+            let _ = writeln!(
+                out,
+                "    const void* rv = {}({}, &out_len, &err);",
+                c_sym, args_str
+            );
+            write_error_check(out, returns);
+            release_jni_resources(out, params);
+            let _ = writeln!(out, "    return NULL;");
+        }
+    }
 }
 
 fn write_error_check(out: &mut String, ret_type: Option<&TypeRef>) {
@@ -367,7 +833,7 @@ fn write_error_check(out: &mut String, ret_type: Option<&TypeRef>) {
 
 fn release_jni_resources(out: &mut String, params: &[weaveffi_ir::ir::Param]) {
     for p in params {
-        match p.ty {
+        match &p.ty {
             TypeRef::StringUtf8 => {
                 let _ = writeln!(
                     out,
@@ -382,6 +848,54 @@ fn release_jni_resources(out: &mut String, params: &[weaveffi_ir::ir::Param]) {
                     n = p.name
                 );
             }
+            TypeRef::Optional(inner) => match inner.as_ref() {
+                TypeRef::StringUtf8 => {
+                    let _ = writeln!(
+                        out,
+                        "    if ({n} != NULL) {{ (*env)->ReleaseStringUTFChars(env, {n}, {n}_chars); }}",
+                        n = p.name
+                    );
+                }
+                TypeRef::Bytes => {
+                    let _ = writeln!(
+                        out,
+                        "    if ({n} != NULL && {n}_elems != NULL) {{ (*env)->ReleaseByteArrayElements(env, {n}, {n}_elems, 0); }}",
+                        n = p.name
+                    );
+                }
+                _ => {}
+            },
+            TypeRef::List(inner) => match inner.as_ref() {
+                TypeRef::I32 | TypeRef::Enum(_) => {
+                    let _ = writeln!(
+                        out,
+                        "    (*env)->ReleaseIntArrayElements(env, {n}, {n}_elems, 0);",
+                        n = p.name
+                    );
+                }
+                TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::Struct(_) => {
+                    let _ = writeln!(
+                        out,
+                        "    (*env)->ReleaseLongArrayElements(env, {n}, {n}_elems, 0);",
+                        n = p.name
+                    );
+                }
+                TypeRef::F64 => {
+                    let _ = writeln!(
+                        out,
+                        "    (*env)->ReleaseDoubleArrayElements(env, {n}, {n}_elems, 0);",
+                        n = p.name
+                    );
+                }
+                TypeRef::Bool => {
+                    let _ = writeln!(
+                        out,
+                        "    (*env)->ReleaseBooleanArrayElements(env, {n}, {n}_elems, 0);",
+                        n = p.name
+                    );
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -401,8 +915,8 @@ fn to_pascal_case(s: &str) -> String {
 
 fn kotlin_getter_type(t: &TypeRef) -> String {
     match t {
-        TypeRef::Struct(name) => name.clone(),
-        other => kotlin_type(other).to_string(),
+        TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
+        other => kotlin_type(other),
     }
 }
 
@@ -507,63 +1021,12 @@ fn render_jni_struct(out: &mut String, module_name: &str, s: &StructDef) {
         let _ = writeln!(out, "    weaveffi_error err = {{0, NULL}};");
 
         for f in &s.fields {
-            match f.ty {
-                TypeRef::StringUtf8 => {
-                    let _ = writeln!(
-                        out,
-                        "    const char* {n}_chars = (*env)->GetStringUTFChars(env, {n}, NULL);",
-                        n = f.name
-                    );
-                    let _ = writeln!(
-                        out,
-                        "    jsize {n}_len = (*env)->GetStringUTFLength(env, {n});",
-                        n = f.name
-                    );
-                }
-                TypeRef::Bytes => {
-                    let _ = writeln!(out, "    jboolean {n}_is_copy = 0;", n = f.name);
-                    let _ = writeln!(
-                        out,
-                        "    jbyte* {n}_elems = (*env)->GetByteArrayElements(env, {n}, &{n}_is_copy);",
-                        n = f.name
-                    );
-                    let _ = writeln!(
-                        out,
-                        "    jsize {n}_len = (*env)->GetArrayLength(env, {n});",
-                        n = f.name
-                    );
-                }
-                _ => {}
-            }
+            write_param_acquire(out, &f.name, &f.ty);
         }
 
         let mut call_args: Vec<String> = Vec::new();
         for f in &s.fields {
-            match &f.ty {
-                TypeRef::StringUtf8 => {
-                    call_args.push(format!("(const uint8_t*){n}_chars", n = f.name));
-                    call_args.push(format!("(size_t){n}_len", n = f.name));
-                }
-                TypeRef::Bytes => {
-                    call_args.push(format!("(const uint8_t*){n}_elems", n = f.name));
-                    call_args.push(format!("(size_t){n}_len", n = f.name));
-                }
-                TypeRef::Bool => {
-                    call_args.push(format!("(bool)({} == JNI_TRUE)", f.name));
-                }
-                TypeRef::I32 => call_args.push(format!("(int32_t){}", f.name)),
-                TypeRef::U32 => call_args.push(format!("(uint32_t){}", f.name)),
-                TypeRef::I64 => call_args.push(format!("(int64_t){}", f.name)),
-                TypeRef::F64 => call_args.push(format!("(double){}", f.name)),
-                TypeRef::Handle => call_args.push(format!("(weaveffi_handle_t){}", f.name)),
-                TypeRef::Struct(name) => {
-                    call_args.push(format!(
-                        "(const weaveffi_{}_{}*)(intptr_t){}",
-                        module_name, name, f.name
-                    ));
-                }
-                TypeRef::Enum(_) | TypeRef::Optional(_) | TypeRef::List(_) => {}
-            }
+            build_c_call_args(&mut call_args, &f.name, &f.ty, module_name);
         }
 
         if call_args.is_empty() {
@@ -580,23 +1043,7 @@ fn render_jni_struct(out: &mut String, module_name: &str, s: &StructDef) {
         write_error_check(out, Some(&TypeRef::Handle));
 
         for f in &s.fields {
-            match f.ty {
-                TypeRef::StringUtf8 => {
-                    let _ = writeln!(
-                        out,
-                        "    (*env)->ReleaseStringUTFChars(env, {n}, {n}_chars);",
-                        n = f.name
-                    );
-                }
-                TypeRef::Bytes => {
-                    let _ = writeln!(
-                        out,
-                        "    (*env)->ReleaseByteArrayElements(env, {n}, {n}_elems, 0);",
-                        n = f.name
-                    );
-                }
-                _ => {}
-            }
+            release_jni_resources_single(out, &f.name, &f.ty);
         }
 
         let _ = writeln!(out, "    return (jlong)(intptr_t)rv;");
@@ -681,6 +1128,12 @@ fn render_jni_struct(out: &mut String, module_name: &str, s: &StructDef) {
                 );
                 let _ = writeln!(out, "    return (jlong)(intptr_t)rv;");
             }
+            TypeRef::Optional(inner) => {
+                write_struct_optional_getter(out, inner, &getter_c, &prefix);
+            }
+            TypeRef::List(inner) => {
+                write_struct_list_getter(out, inner, &getter_c, &prefix);
+            }
             other => {
                 let c_ty = c_type_for_return(other);
                 let jcast = jni_cast_for(other);
@@ -697,10 +1150,161 @@ fn render_jni_struct(out: &mut String, module_name: &str, s: &StructDef) {
     }
 }
 
+fn write_struct_optional_getter(out: &mut String, inner: &TypeRef, getter_c: &str, prefix: &str) {
+    match inner {
+        TypeRef::StringUtf8 => {
+            let _ = writeln!(
+                out,
+                "    const char* rv = {}((const {}*)(intptr_t)handle);",
+                getter_c, prefix
+            );
+            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
+            let _ = writeln!(out, "    jstring jout = (*env)->NewStringUTF(env, rv);");
+            let _ = writeln!(out, "    weaveffi_free_string(rv);");
+            let _ = writeln!(out, "    return jout;");
+        }
+        TypeRef::I32 | TypeRef::Enum(_) => {
+            let _ = writeln!(
+                out,
+                "    const int32_t* rv = {}((const {}*)(intptr_t)handle);",
+                getter_c, prefix
+            );
+            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
+            let _ = writeln!(
+                out,
+                "    jclass cls = (*env)->FindClass(env, \"java/lang/Integer\");"
+            );
+            let _ = writeln!(
+                out,
+                "    jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(I)Ljava/lang/Integer;\");"
+            );
+            let _ = writeln!(
+                out,
+                "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jint)*rv);"
+            );
+        }
+        _ => {
+            let _ = writeln!(
+                out,
+                "    const void* rv = {}((const {}*)(intptr_t)handle);",
+                getter_c, prefix
+            );
+            let _ = writeln!(out, "    return (jobject)rv;");
+        }
+    }
+}
+
+fn write_struct_list_getter(out: &mut String, inner: &TypeRef, getter_c: &str, prefix: &str) {
+    match inner {
+        TypeRef::I32 | TypeRef::Enum(_) => {
+            let _ = writeln!(out, "    size_t out_len = 0;");
+            let _ = writeln!(
+                out,
+                "    const int32_t* rv = {}((const {}*)(intptr_t)handle, &out_len);",
+                getter_c, prefix
+            );
+            let _ = writeln!(
+                out,
+                "    jintArray jout = (*env)->NewIntArray(env, (jsize)out_len);"
+            );
+            let _ = writeln!(out, "    if (jout && rv) {{ (*env)->SetIntArrayRegion(env, jout, 0, (jsize)out_len, (const jint*)rv); }}");
+            let _ = writeln!(out, "    return jout;");
+        }
+        TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::Struct(_) => {
+            let _ = writeln!(out, "    size_t out_len = 0;");
+            let _ = writeln!(
+                out,
+                "    const int64_t* rv = (const int64_t*){}((const {}*)(intptr_t)handle, &out_len);",
+                getter_c, prefix
+            );
+            let _ = writeln!(
+                out,
+                "    jlongArray jout = (*env)->NewLongArray(env, (jsize)out_len);"
+            );
+            let _ = writeln!(out, "    if (jout && rv) {{ (*env)->SetLongArrayRegion(env, jout, 0, (jsize)out_len, (const jlong*)rv); }}");
+            let _ = writeln!(out, "    return jout;");
+        }
+        _ => {
+            let _ = writeln!(
+                out,
+                "    return NULL; /* unsupported list element type in getter */"
+            );
+        }
+    }
+}
+
+fn release_jni_resources_single(out: &mut String, name: &str, ty: &TypeRef) {
+    match ty {
+        TypeRef::StringUtf8 => {
+            let _ = writeln!(
+                out,
+                "    (*env)->ReleaseStringUTFChars(env, {n}, {n}_chars);",
+                n = name
+            );
+        }
+        TypeRef::Bytes => {
+            let _ = writeln!(
+                out,
+                "    (*env)->ReleaseByteArrayElements(env, {n}, {n}_elems, 0);",
+                n = name
+            );
+        }
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::StringUtf8 => {
+                let _ = writeln!(
+                    out,
+                    "    if ({n} != NULL) {{ (*env)->ReleaseStringUTFChars(env, {n}, {n}_chars); }}",
+                    n = name
+                );
+            }
+            TypeRef::Bytes => {
+                let _ = writeln!(
+                    out,
+                    "    if ({n} != NULL && {n}_elems != NULL) {{ (*env)->ReleaseByteArrayElements(env, {n}, {n}_elems, 0); }}",
+                    n = name
+                );
+            }
+            _ => {}
+        },
+        TypeRef::List(inner) => match inner.as_ref() {
+            TypeRef::I32 | TypeRef::Enum(_) => {
+                let _ = writeln!(
+                    out,
+                    "    (*env)->ReleaseIntArrayElements(env, {n}, {n}_elems, 0);",
+                    n = name
+                );
+            }
+            TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::Struct(_) => {
+                let _ = writeln!(
+                    out,
+                    "    (*env)->ReleaseLongArrayElements(env, {n}, {n}_elems, 0);",
+                    n = name
+                );
+            }
+            TypeRef::F64 => {
+                let _ = writeln!(
+                    out,
+                    "    (*env)->ReleaseDoubleArrayElements(env, {n}, {n}_elems, 0);",
+                    n = name
+                );
+            }
+            TypeRef::Bool => {
+                let _ = writeln!(
+                    out,
+                    "    (*env)->ReleaseBooleanArrayElements(env, {n}, {n}_elems, 0);",
+                    n = name
+                );
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weaveffi_ir::ir::{Function, Module, Param, StructDef, StructField};
+    use weaveffi_ir::ir::{EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField};
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
@@ -1073,6 +1677,461 @@ mod tests {
         assert!(
             jni.contains("return (jlong)(intptr_t)rv;"),
             "missing struct return cast: {jni}"
+        );
+    }
+
+    // --- Enum tests ---
+
+    #[test]
+    fn kotlin_enum_class_generated() {
+        let api = make_api(vec![Module {
+            name: "paint".to_string(),
+            functions: vec![],
+            structs: vec![],
+            enums: vec![EnumDef {
+                name: "Color".to_string(),
+                doc: None,
+                variants: vec![
+                    EnumVariant {
+                        name: "Red".to_string(),
+                        value: 0,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Green".to_string(),
+                        value: 1,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Blue".to_string(),
+                        value: 2,
+                        doc: None,
+                    },
+                ],
+            }],
+            errors: None,
+        }]);
+
+        let kt = render_kotlin(&api);
+        assert!(
+            kt.contains("enum class Color(val value: Int) {"),
+            "missing enum class: {kt}"
+        );
+        assert!(kt.contains("Red(0),"), "missing Red variant: {kt}");
+        assert!(kt.contains("Green(1),"), "missing Green variant: {kt}");
+        assert!(
+            kt.contains("Blue(2);"),
+            "missing Blue variant (with semicolon): {kt}"
+        );
+        assert!(
+            kt.contains("companion object {"),
+            "missing companion object: {kt}"
+        );
+        assert!(
+            kt.contains("fun fromValue(value: Int): Color"),
+            "missing fromValue: {kt}"
+        );
+    }
+
+    #[test]
+    fn kotlin_type_for_enum_is_int() {
+        assert_eq!(kotlin_type(&TypeRef::Enum("Color".into())), "Int");
+    }
+
+    #[test]
+    fn kotlin_getter_type_for_enum_returns_name() {
+        assert_eq!(kotlin_getter_type(&TypeRef::Enum("Color".into())), "Color");
+    }
+
+    #[test]
+    fn function_with_enum_param_kotlin() {
+        let api = make_api(vec![Module {
+            name: "paint".to_string(),
+            functions: vec![Function {
+                name: "set_color".to_string(),
+                params: vec![Param {
+                    name: "color".to_string(),
+                    ty: TypeRef::Enum("Color".into()),
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let kt = render_kotlin(&api);
+        assert!(kt.contains("color: Int"), "missing enum param as Int: {kt}");
+    }
+
+    #[test]
+    fn function_with_enum_param_jni() {
+        let api = make_api(vec![Module {
+            name: "paint".to_string(),
+            functions: vec![Function {
+                name: "set_color".to_string(),
+                params: vec![Param {
+                    name: "color".to_string(),
+                    ty: TypeRef::Enum("Color".into()),
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let jni = render_jni_c(&api);
+        assert!(
+            jni.contains("jint color"),
+            "missing jint param in JNI: {jni}"
+        );
+        assert!(
+            jni.contains("(int32_t)color"),
+            "missing int32_t cast: {jni}"
+        );
+    }
+
+    #[test]
+    fn function_returning_enum_jni() {
+        let api = make_api(vec![Module {
+            name: "paint".to_string(),
+            functions: vec![Function {
+                name: "get_color".to_string(),
+                params: vec![],
+                returns: Some(TypeRef::Enum("Color".into())),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let jni = render_jni_c(&api);
+        assert!(
+            jni.contains("JNIEXPORT jint JNICALL"),
+            "missing jint return in JNI: {jni}"
+        );
+        assert!(jni.contains("(jint)"), "missing jint cast: {jni}");
+    }
+
+    // --- Optional tests ---
+
+    #[test]
+    fn kotlin_type_for_optional_int() {
+        assert_eq!(
+            kotlin_type(&TypeRef::Optional(Box::new(TypeRef::I32))),
+            "Int?"
+        );
+    }
+
+    #[test]
+    fn kotlin_type_for_optional_string() {
+        assert_eq!(
+            kotlin_type(&TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
+            "String?"
+        );
+    }
+
+    #[test]
+    fn function_with_optional_int_param_kotlin() {
+        let api = make_api(vec![Module {
+            name: "store".to_string(),
+            functions: vec![Function {
+                name: "find".to_string(),
+                params: vec![Param {
+                    name: "id".to_string(),
+                    ty: TypeRef::Optional(Box::new(TypeRef::I32)),
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let kt = render_kotlin(&api);
+        assert!(kt.contains("id: Int?"), "missing optional Int? param: {kt}");
+    }
+
+    #[test]
+    fn function_with_optional_int_param_jni() {
+        let api = make_api(vec![Module {
+            name: "store".to_string(),
+            functions: vec![Function {
+                name: "find".to_string(),
+                params: vec![Param {
+                    name: "id".to_string(),
+                    ty: TypeRef::Optional(Box::new(TypeRef::I32)),
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let jni = render_jni_c(&api);
+        assert!(jni.contains("jobject id"), "missing jobject param: {jni}");
+        assert!(
+            jni.contains("java/lang/Integer"),
+            "missing Integer class lookup: {jni}"
+        );
+        assert!(
+            jni.contains("intValue"),
+            "missing intValue unbox call: {jni}"
+        );
+        assert!(jni.contains("id_ptr"), "missing id_ptr in C call: {jni}");
+    }
+
+    #[test]
+    fn function_with_optional_string_param_jni() {
+        let api = make_api(vec![Module {
+            name: "store".to_string(),
+            functions: vec![Function {
+                name: "find_name".to_string(),
+                params: vec![Param {
+                    name: "query".to_string(),
+                    ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let jni = render_jni_c(&api);
+        assert!(
+            jni.contains("jstring query"),
+            "missing jstring param: {jni}"
+        );
+        assert!(
+            jni.contains("if (query != NULL)"),
+            "missing null check for optional string: {jni}"
+        );
+    }
+
+    #[test]
+    fn function_returning_optional_int_jni() {
+        let api = make_api(vec![Module {
+            name: "store".to_string(),
+            functions: vec![Function {
+                name: "lookup".to_string(),
+                params: vec![],
+                returns: Some(TypeRef::Optional(Box::new(TypeRef::I32))),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let jni = render_jni_c(&api);
+        assert!(
+            jni.contains("JNIEXPORT jobject JNICALL"),
+            "missing jobject return: {jni}"
+        );
+        assert!(
+            jni.contains("if (rv == NULL) { return NULL; }"),
+            "missing NULL check: {jni}"
+        );
+        assert!(
+            jni.contains("java/lang/Integer"),
+            "missing Integer boxing: {jni}"
+        );
+        assert!(
+            jni.contains("valueOf"),
+            "missing valueOf boxing call: {jni}"
+        );
+    }
+
+    #[test]
+    fn function_returning_optional_string_jni() {
+        let api = make_api(vec![Module {
+            name: "store".to_string(),
+            functions: vec![Function {
+                name: "get_name".to_string(),
+                params: vec![],
+                returns: Some(TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let jni = render_jni_c(&api);
+        assert!(
+            jni.contains("JNIEXPORT jstring JNICALL"),
+            "missing jstring return: {jni}"
+        );
+        assert!(
+            jni.contains("if (rv == NULL) { return NULL; }"),
+            "missing NULL check: {jni}"
+        );
+        assert!(jni.contains("NewStringUTF"), "missing NewStringUTF: {jni}");
+    }
+
+    // --- List tests ---
+
+    #[test]
+    fn kotlin_type_for_list_int() {
+        assert_eq!(
+            kotlin_type(&TypeRef::List(Box::new(TypeRef::I32))),
+            "IntArray"
+        );
+    }
+
+    #[test]
+    fn kotlin_type_for_list_string() {
+        assert_eq!(
+            kotlin_type(&TypeRef::List(Box::new(TypeRef::StringUtf8))),
+            "Array<String>"
+        );
+    }
+
+    #[test]
+    fn kotlin_type_for_list_enum() {
+        assert_eq!(
+            kotlin_type(&TypeRef::List(Box::new(TypeRef::Enum("Color".into())))),
+            "IntArray"
+        );
+    }
+
+    #[test]
+    fn function_with_list_int_param_kotlin() {
+        let api = make_api(vec![Module {
+            name: "batch".to_string(),
+            functions: vec![Function {
+                name: "process".to_string(),
+                params: vec![Param {
+                    name: "ids".to_string(),
+                    ty: TypeRef::List(Box::new(TypeRef::I32)),
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let kt = render_kotlin(&api);
+        assert!(kt.contains("ids: IntArray"), "missing IntArray param: {kt}");
+    }
+
+    #[test]
+    fn function_with_list_int_param_jni() {
+        let api = make_api(vec![Module {
+            name: "batch".to_string(),
+            functions: vec![Function {
+                name: "process".to_string(),
+                params: vec![Param {
+                    name: "ids".to_string(),
+                    ty: TypeRef::List(Box::new(TypeRef::I32)),
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let jni = render_jni_c(&api);
+        assert!(
+            jni.contains("jintArray ids"),
+            "missing jintArray param: {jni}"
+        );
+        assert!(
+            jni.contains("GetIntArrayElements(env, ids, NULL)"),
+            "missing GetIntArrayElements: {jni}"
+        );
+        assert!(
+            jni.contains("ReleaseIntArrayElements(env, ids, ids_elems, 0)"),
+            "missing ReleaseIntArrayElements: {jni}"
+        );
+    }
+
+    #[test]
+    fn function_returning_list_int_jni() {
+        let api = make_api(vec![Module {
+            name: "batch".to_string(),
+            functions: vec![Function {
+                name: "get_ids".to_string(),
+                params: vec![],
+                returns: Some(TypeRef::List(Box::new(TypeRef::I32))),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let jni = render_jni_c(&api);
+        assert!(
+            jni.contains("JNIEXPORT jintArray JNICALL"),
+            "missing jintArray return: {jni}"
+        );
+        assert!(jni.contains("NewIntArray"), "missing NewIntArray: {jni}");
+        assert!(
+            jni.contains("SetIntArrayRegion"),
+            "missing SetIntArrayRegion: {jni}"
+        );
+        assert!(jni.contains("out_len"), "missing out_len: {jni}");
+    }
+
+    #[test]
+    fn jni_param_type_enum_is_jint() {
+        assert_eq!(jni_param_type(&TypeRef::Enum("Color".into())), "jint");
+    }
+
+    #[test]
+    fn jni_param_type_optional_int_is_jobject() {
+        assert_eq!(
+            jni_param_type(&TypeRef::Optional(Box::new(TypeRef::I32))),
+            "jobject"
+        );
+    }
+
+    #[test]
+    fn jni_param_type_optional_string_is_jstring() {
+        assert_eq!(
+            jni_param_type(&TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
+            "jstring"
+        );
+    }
+
+    #[test]
+    fn jni_param_type_list_int_is_jintarray() {
+        assert_eq!(
+            jni_param_type(&TypeRef::List(Box::new(TypeRef::I32))),
+            "jintArray"
+        );
+    }
+
+    #[test]
+    fn jni_param_type_list_long_is_jlongarray() {
+        assert_eq!(
+            jni_param_type(&TypeRef::List(Box::new(TypeRef::I64))),
+            "jlongArray"
         );
     }
 }
