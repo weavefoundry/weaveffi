@@ -160,6 +160,59 @@ modules:
     }
 
     #[test]
+    fn parse_contacts_sample() {
+        let yaml = std::fs::read_to_string("../../samples/contacts/contacts.yml").unwrap();
+        let api = parse_api_str(&yaml, "yml").unwrap();
+        assert_eq!(api.version, "0.1.0");
+        assert_eq!(api.modules.len(), 1);
+
+        let m = &api.modules[0];
+        assert_eq!(m.name, "contacts");
+
+        assert_eq!(m.enums.len(), 1);
+        let e = &m.enums[0];
+        assert_eq!(e.name, "ContactType");
+        assert_eq!(e.variants.len(), 3);
+        assert_eq!(e.variants[0].name, "Personal");
+        assert_eq!(e.variants[0].value, 0);
+        assert_eq!(e.variants[1].name, "Work");
+        assert_eq!(e.variants[1].value, 1);
+        assert_eq!(e.variants[2].name, "Other");
+        assert_eq!(e.variants[2].value, 2);
+
+        assert_eq!(m.structs.len(), 1);
+        let s = &m.structs[0];
+        assert_eq!(s.name, "Contact");
+        assert_eq!(s.fields.len(), 5);
+        assert_eq!(s.fields[0].ty, TypeRef::I64);
+        assert_eq!(
+            s.fields[3].ty,
+            TypeRef::Optional(Box::new(TypeRef::StringUtf8))
+        );
+        assert_eq!(s.fields[4].ty, TypeRef::Struct("ContactType".to_string()));
+
+        assert_eq!(m.functions.len(), 5);
+        assert_eq!(m.functions[0].name, "create_contact");
+        assert_eq!(m.functions[0].returns, Some(TypeRef::Handle));
+        assert_eq!(m.functions[1].name, "get_contact");
+        assert_eq!(
+            m.functions[1].returns,
+            Some(TypeRef::Struct("Contact".to_string()))
+        );
+        assert_eq!(m.functions[2].name, "list_contacts");
+        assert_eq!(
+            m.functions[2].returns,
+            Some(TypeRef::List(Box::new(TypeRef::Struct(
+                "Contact".to_string()
+            ))))
+        );
+        assert_eq!(m.functions[3].name, "delete_contact");
+        assert_eq!(m.functions[3].returns, Some(TypeRef::Bool));
+        assert_eq!(m.functions[4].name, "count_contacts");
+        assert_eq!(m.functions[4].returns, Some(TypeRef::I32));
+    }
+
+    #[test]
     fn unsupported_format_returns_error() {
         let err = parse_api_str("{}", "xml").unwrap_err();
         assert!(matches!(err, ParseError::UnsupportedFormat(f) if f == "xml"));
