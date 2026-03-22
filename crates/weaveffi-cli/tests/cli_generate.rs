@@ -73,3 +73,17 @@ fn generate_with_target_filter() {
         "swift/ should not exist when --target c is used"
     );
 }
+
+#[test]
+fn validate_command_succeeds() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
+    let input = repo_root.join("samples/calculator/calculator.yml");
+
+    assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args(["validate", input.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Validation passed"));
+}
