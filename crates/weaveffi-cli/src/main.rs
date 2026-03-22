@@ -1,3 +1,5 @@
+mod scaffold;
+
 use camino::Utf8Path;
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::{bail, eyre, Report, Result, WrapErr};
@@ -36,6 +38,9 @@ enum Commands {
         /// Comma-separated list of targets to generate (c, swift, android, node, wasm)
         #[arg(short, long)]
         target: Option<String>,
+        /// Also generate a scaffold.rs with Rust FFI function stubs
+        #[arg(long)]
+        scaffold: bool,
     },
     Validate {
         /// Input IDL/IR file (yaml|yml|json|toml)
@@ -54,7 +59,12 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::New { name } => cmd_new(&name)?,
-        Commands::Generate { input, out, target } => cmd_generate(&input, &out, target.as_deref())?,
+        Commands::Generate {
+            input,
+            out,
+            target,
+            scaffold,
+        } => cmd_generate(&input, &out, target.as_deref(), scaffold)?,
         Commands::Validate { input } => cmd_validate(&input)?,
         Commands::Doctor => cmd_doctor()?,
     }
@@ -123,7 +133,7 @@ fn cmd_new(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_generate(input: &str, out: &str, targets: Option<&str>) -> Result<()> {
+fn cmd_generate(input: &str, out: &str, targets: Option<&str>, emit_scaffold: bool) -> Result<()> {
     let in_path = Utf8Path::new(input);
     let ext = in_path.extension().unwrap_or("");
     if ext.is_empty() {
@@ -166,6 +176,15 @@ fn cmd_generate(input: &str, out: &str, targets: Option<&str>) -> Result<()> {
     orchestrator
         .run(&api, out_dir)
         .map_err(|e| eyre!("{:#}", e))?;
+
+    if emit_scaffold {
+        let scaffold_path = out_dir.join("scaffold.rs");
+        let contents = scaffold::render_scaffold(&api);
+        std::fs::write(scaffold_path.as_std_path(), contents)
+            .wrap_err_with(|| format!("failed to write {}", scaffold_path))?;
+        println!("Scaffold written to {}", scaffold_path);
+    }
+
     println!("Generated artifacts in {}", out);
     Ok(())
 }

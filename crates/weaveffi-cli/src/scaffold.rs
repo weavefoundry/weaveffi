@@ -1,0 +1,553 @@
+use weaveffi_ir::ir::{Api, Module, StructDef, TypeRef};
+
+fn is_pointer_type(ty: &TypeRef) -> bool {
+    matches!(
+        ty,
+        TypeRef::StringUtf8 | TypeRef::Bytes | TypeRef::Struct(_) | TypeRef::List(_)
+    )
+}
+
+fn rust_scalar_type(ty: &TypeRef, module: &str) -> String {
+    match ty {
+        TypeRef::I32 => "i32".into(),
+        TypeRef::U32 => "u32".into(),
+        TypeRef::I64 => "i64".into(),
+        TypeRef::F64 => "f64".into(),
+        TypeRef::Bool => "bool".into(),
+        TypeRef::StringUtf8 => "c_char".into(),
+        TypeRef::Bytes => "u8".into(),
+        TypeRef::Handle => "u64".into(),
+        TypeRef::Struct(s) => format!("weaveffi_{module}_{s}"),
+        TypeRef::Enum(_) => "i32".into(),
+        TypeRef::Optional(inner) | TypeRef::List(inner) => rust_scalar_type(inner, module),
+    }
+}
+
+fn rust_param_fragments(name: &str, ty: &TypeRef, module: &str) -> Vec<String> {
+    match ty {
+        TypeRef::I32 => vec![format!("{name}: i32")],
+        TypeRef::U32 => vec![format!("{name}: u32")],
+        TypeRef::I64 => vec![format!("{name}: i64")],
+        TypeRef::F64 => vec![format!("{name}: f64")],
+        TypeRef::Bool => vec![format!("{name}: bool")],
+        TypeRef::StringUtf8 | TypeRef::Bytes => vec![
+            format!("{name}_ptr: *const u8"),
+            format!("{name}_len: usize"),
+        ],
+        TypeRef::Handle => vec![format!("{name}: u64")],
+        TypeRef::Struct(s) => vec![format!("{name}: *const weaveffi_{module}_{s}")],
+        TypeRef::Enum(_) => vec![format!("{name}: i32")],
+        TypeRef::Optional(inner) => {
+            if is_pointer_type(inner) {
+                rust_param_fragments(name, inner, module)
+            } else {
+                let scalar = rust_scalar_type(inner, module);
+                vec![format!("{name}: *const {scalar}")]
+            }
+        }
+        TypeRef::List(inner) => {
+            let elem = rust_scalar_type(inner, module);
+            if is_pointer_type(inner) {
+                vec![
+                    format!("{name}: *const *const {elem}"),
+                    format!("{name}_len: usize"),
+                ]
+            } else {
+                vec![
+                    format!("{name}: *const {elem}"),
+                    format!("{name}_len: usize"),
+                ]
+            }
+        }
+    }
+}
+
+fn rust_return_type(ty: &TypeRef, module: &str) -> (String, bool) {
+    match ty {
+        TypeRef::I32 => ("i32".into(), false),
+        TypeRef::U32 => ("u32".into(), false),
+        TypeRef::I64 => ("i64".into(), false),
+        TypeRef::F64 => ("f64".into(), false),
+        TypeRef::Bool => ("bool".into(), false),
+        TypeRef::StringUtf8 => ("*const c_char".into(), false),
+        TypeRef::Bytes => ("*mut u8".into(), true),
+        TypeRef::Handle => ("u64".into(), false),
+        TypeRef::Struct(s) => (format!("*mut weaveffi_{module}_{s}"), false),
+        TypeRef::Enum(_) => ("i32".into(), false),
+        TypeRef::Optional(inner) => {
+            if is_pointer_type(inner) {
+                rust_return_type(inner, module)
+            } else {
+                let scalar = rust_scalar_type(inner, module);
+                (format!("*mut {scalar}"), false)
+            }
+        }
+        TypeRef::List(inner) => {
+            let elem = rust_scalar_type(inner, module);
+            if is_pointer_type(inner) {
+                (format!("*mut *mut {elem}"), true)
+            } else {
+                (format!("*mut {elem}"), true)
+            }
+        }
+    }
+}
+
+pub fn render_scaffold(api: &Api) -> String {
+    let mut out = String::new();
+    out.push_str("#![allow(unsafe_code)]\n");
+    out.push_str("#![allow(clippy::not_unsafe_ptr_arg_deref)]\n\n");
+    out.push_str("use std::os::raw::c_char;\n");
+    out.push_str("use weaveffi_abi::{self as abi, weaveffi_error};\n\n");
+
+    for m in &api.modules {
+        render_module(&mut out, m);
+    }
+
+    out.push_str("#[no_mangle]\n");
+    out.push_str("pub extern \"C\" fn weaveffi_free_string(ptr: *const c_char) {\n");
+    out.push_str("    abi::free_string(ptr);\n");
+    out.push_str("}\n\n");
+
+    out.push_str("#[no_mangle]\n");
+    out.push_str("pub extern \"C\" fn weaveffi_free_bytes(ptr: *mut u8, len: usize) {\n");
+    out.push_str("    abi::free_bytes(ptr, len);\n");
+    out.push_str("}\n\n");
+
+    out.push_str("#[no_mangle]\n");
+    out.push_str("pub extern \"C\" fn weaveffi_error_clear(err: *mut weaveffi_error) {\n");
+    out.push_str("    abi::error_clear(err);\n");
+    out.push_str("}\n");
+
+    out
+}
+
+fn render_module(out: &mut String, module: &Module) {
+    let mod_name = &module.name;
+
+    for s in &module.structs {
+        render_struct_scaffold(out, mod_name, s);
+    }
+
+    for f in &module.functions {
+        let fn_name = format!("weaveffi_{mod_name}_{}", f.name);
+        let mut params = Vec::new();
+        for p in &f.params {
+            params.extend(rust_param_fragments(&p.name, &p.ty, mod_name));
+        }
+        let ret_sig = if let Some(ret) = &f.returns {
+            let (ret_ty, needs_len) = rust_return_type(ret, mod_name);
+            if needs_len {
+                params.push("out_len: *mut usize".into());
+            }
+            format!(" -> {ret_ty}")
+        } else {
+            String::new()
+        };
+        params.push("out_err: *mut weaveffi_error".into());
+
+        out.push_str("#[no_mangle]\n");
+        out.push_str(&format!(
+            "pub extern \"C\" fn {fn_name}({}){ret_sig} {{\n",
+            params.join(", ")
+        ));
+        out.push_str("    todo!()\n");
+        out.push_str("}\n\n");
+    }
+}
+
+fn render_struct_scaffold(out: &mut String, module: &str, s: &StructDef) {
+    let prefix = format!("weaveffi_{module}_{}", s.name);
+
+    out.push_str("#[repr(C)]\n");
+    out.push_str(&format!("pub struct {prefix} {{\n"));
+    out.push_str("    // TODO: add fields\n");
+    out.push_str("}\n\n");
+
+    let mut params = Vec::new();
+    for f in &s.fields {
+        params.extend(rust_param_fragments(&f.name, &f.ty, module));
+    }
+    params.push("out_err: *mut weaveffi_error".into());
+    out.push_str("#[no_mangle]\n");
+    out.push_str(&format!(
+        "pub extern \"C\" fn {prefix}_create({}) -> *mut {prefix} {{\n",
+        params.join(", ")
+    ));
+    out.push_str("    todo!()\n");
+    out.push_str("}\n\n");
+
+    out.push_str("#[no_mangle]\n");
+    out.push_str(&format!(
+        "pub extern \"C\" fn {prefix}_destroy(ptr: *mut {prefix}) {{\n"
+    ));
+    out.push_str("    todo!()\n");
+    out.push_str("}\n\n");
+
+    for field in &s.fields {
+        let (ret_ty, needs_len) = rust_return_type(&field.ty, module);
+        let getter = format!("{prefix}_get_{}", field.name);
+        let mut getter_params = vec![format!("ptr: *const {prefix}")];
+        if needs_len {
+            getter_params.push("out_len: *mut usize".into());
+        }
+        out.push_str("#[no_mangle]\n");
+        out.push_str(&format!(
+            "pub extern \"C\" fn {getter}({}) -> {ret_ty} {{\n",
+            getter_params.join(", ")
+        ));
+        out.push_str("    todo!()\n");
+        out.push_str("}\n\n");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use weaveffi_ir::ir::{Api, Function, Module, Param, StructDef, StructField, TypeRef};
+
+    fn minimal_api(functions: Vec<Function>, structs: Vec<StructDef>) -> Api {
+        Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "calc".to_string(),
+                functions,
+                structs,
+                enums: vec![],
+                errors: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn scaffold_has_allow_unsafe() {
+        let api = minimal_api(vec![], vec![]);
+        let out = render_scaffold(&api);
+        assert!(out.contains("#![allow(unsafe_code)]"));
+    }
+
+    #[test]
+    fn scaffold_imports_abi() {
+        let api = minimal_api(vec![], vec![]);
+        let out = render_scaffold(&api);
+        assert!(out.contains("use weaveffi_abi::{self as abi, weaveffi_error};"));
+    }
+
+    #[test]
+    fn scaffold_includes_runtime_exports() {
+        let api = minimal_api(vec![], vec![]);
+        let out = render_scaffold(&api);
+        assert!(out.contains("fn weaveffi_free_string("));
+        assert!(out.contains("fn weaveffi_free_bytes("));
+        assert!(out.contains("fn weaveffi_error_clear("));
+        assert!(
+            out.contains("abi::free_string(ptr);"),
+            "runtime exports should delegate to abi"
+        );
+    }
+
+    #[test]
+    fn scaffold_function_i32() {
+        let api = minimal_api(
+            vec![Function {
+                name: "add".into(),
+                params: vec![
+                    Param {
+                        name: "a".into(),
+                        ty: TypeRef::I32,
+                    },
+                    Param {
+                        name: "b".into(),
+                        ty: TypeRef::I32,
+                    },
+                ],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+            }],
+            vec![],
+        );
+        let out = render_scaffold(&api);
+        assert!(
+            out.contains(
+                "pub extern \"C\" fn weaveffi_calc_add(a: i32, b: i32, out_err: *mut weaveffi_error) -> i32 {"
+            ),
+            "missing add stub: {out}"
+        );
+        assert!(out.contains("todo!()"));
+    }
+
+    #[test]
+    fn scaffold_function_string_param_and_return() {
+        let api = minimal_api(
+            vec![Function {
+                name: "echo".into(),
+                params: vec![Param {
+                    name: "s".into(),
+                    ty: TypeRef::StringUtf8,
+                }],
+                returns: Some(TypeRef::StringUtf8),
+                doc: None,
+                r#async: false,
+            }],
+            vec![],
+        );
+        let out = render_scaffold(&api);
+        assert!(
+            out.contains(
+                "pub extern \"C\" fn weaveffi_calc_echo(s_ptr: *const u8, s_len: usize, out_err: *mut weaveffi_error) -> *const c_char {"
+            ),
+            "missing echo stub: {out}"
+        );
+    }
+
+    #[test]
+    fn scaffold_function_bytes_return_has_out_len() {
+        let api = minimal_api(
+            vec![Function {
+                name: "data".into(),
+                params: vec![],
+                returns: Some(TypeRef::Bytes),
+                doc: None,
+                r#async: false,
+            }],
+            vec![],
+        );
+        let out = render_scaffold(&api);
+        assert!(
+            out.contains("out_len: *mut usize"),
+            "bytes return should add out_len param: {out}"
+        );
+        assert!(
+            out.contains("-> *mut u8"),
+            "bytes return type should be *mut u8: {out}"
+        );
+    }
+
+    #[test]
+    fn scaffold_void_function() {
+        let api = minimal_api(
+            vec![Function {
+                name: "reset".into(),
+                params: vec![],
+                returns: None,
+                doc: None,
+                r#async: false,
+            }],
+            vec![],
+        );
+        let out = render_scaffold(&api);
+        assert!(
+            out.contains("pub extern \"C\" fn weaveffi_calc_reset(out_err: *mut weaveffi_error) {"),
+            "missing void function: {out}"
+        );
+    }
+
+    #[test]
+    fn scaffold_struct_stubs() {
+        let api = minimal_api(
+            vec![],
+            vec![StructDef {
+                name: "Point".into(),
+                doc: None,
+                fields: vec![
+                    StructField {
+                        name: "x".into(),
+                        ty: TypeRef::F64,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "y".into(),
+                        ty: TypeRef::F64,
+                        doc: None,
+                    },
+                ],
+            }],
+        );
+        let out = render_scaffold(&api);
+        assert!(out.contains("#[repr(C)]"), "struct should be repr(C)");
+        assert!(
+            out.contains("pub struct weaveffi_calc_Point"),
+            "missing struct definition: {out}"
+        );
+        assert!(
+            out.contains("fn weaveffi_calc_Point_create(x: f64, y: f64, out_err: *mut weaveffi_error) -> *mut weaveffi_calc_Point"),
+            "missing create stub: {out}"
+        );
+        assert!(
+            out.contains("fn weaveffi_calc_Point_destroy(ptr: *mut weaveffi_calc_Point)"),
+            "missing destroy stub: {out}"
+        );
+        assert!(
+            out.contains("fn weaveffi_calc_Point_get_x(ptr: *const weaveffi_calc_Point) -> f64"),
+            "missing x getter: {out}"
+        );
+        assert!(
+            out.contains("fn weaveffi_calc_Point_get_y(ptr: *const weaveffi_calc_Point) -> f64"),
+            "missing y getter: {out}"
+        );
+    }
+
+    #[test]
+    fn scaffold_struct_string_field_getter() {
+        let api = minimal_api(
+            vec![],
+            vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                }],
+            }],
+        );
+        let out = render_scaffold(&api);
+        assert!(
+            out.contains("fn weaveffi_calc_Contact_get_name(ptr: *const weaveffi_calc_Contact) -> *const c_char"),
+            "string getter should return *const c_char: {out}"
+        );
+    }
+
+    #[test]
+    fn scaffold_optional_value_param() {
+        let api = minimal_api(
+            vec![Function {
+                name: "find".into(),
+                params: vec![Param {
+                    name: "id".into(),
+                    ty: TypeRef::Optional(Box::new(TypeRef::I32)),
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+            }],
+            vec![],
+        );
+        let out = render_scaffold(&api);
+        assert!(
+            out.contains("id: *const i32"),
+            "optional i32 param should be pointer: {out}"
+        );
+    }
+
+    #[test]
+    fn scaffold_list_param() {
+        let api = minimal_api(
+            vec![Function {
+                name: "sum".into(),
+                params: vec![Param {
+                    name: "items".into(),
+                    ty: TypeRef::List(Box::new(TypeRef::I32)),
+                }],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+            }],
+            vec![],
+        );
+        let out = render_scaffold(&api);
+        assert!(
+            out.contains("items: *const i32, items_len: usize"),
+            "list param should be ptr+len: {out}"
+        );
+    }
+
+    #[test]
+    fn scaffold_enum_param_uses_i32() {
+        let api = minimal_api(
+            vec![Function {
+                name: "paint".into(),
+                params: vec![Param {
+                    name: "color".into(),
+                    ty: TypeRef::Enum("Color".into()),
+                }],
+                returns: Some(TypeRef::Enum("Color".into())),
+                doc: None,
+                r#async: false,
+            }],
+            vec![],
+        );
+        let out = render_scaffold(&api);
+        assert!(
+            out.contains("color: i32"),
+            "enum param should be i32: {out}"
+        );
+        assert!(out.contains("-> i32"), "enum return should be i32: {out}");
+    }
+
+    #[test]
+    fn scaffold_all_functions_have_no_mangle() {
+        let api = minimal_api(
+            vec![Function {
+                name: "add".into(),
+                params: vec![],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+            }],
+            vec![],
+        );
+        let out = render_scaffold(&api);
+        let no_mangle_count = out.matches("#[no_mangle]").count();
+        let extern_count = out.matches("pub extern \"C\"").count();
+        assert_eq!(
+            no_mangle_count, extern_count,
+            "every extern fn should have #[no_mangle]"
+        );
+    }
+
+    #[test]
+    fn scaffold_handle_type() {
+        let api = minimal_api(
+            vec![Function {
+                name: "open".into(),
+                params: vec![],
+                returns: Some(TypeRef::Handle),
+                doc: None,
+                r#async: false,
+            }],
+            vec![],
+        );
+        let out = render_scaffold(&api);
+        assert!(out.contains("-> u64"), "handle return should be u64: {out}");
+    }
+
+    #[test]
+    fn scaffold_multiple_modules() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![
+                Module {
+                    name: "math".into(),
+                    functions: vec![Function {
+                        name: "add".into(),
+                        params: vec![],
+                        returns: Some(TypeRef::I32),
+                        doc: None,
+                        r#async: false,
+                    }],
+                    structs: vec![],
+                    enums: vec![],
+                    errors: None,
+                },
+                Module {
+                    name: "io".into(),
+                    functions: vec![Function {
+                        name: "read".into(),
+                        params: vec![],
+                        returns: Some(TypeRef::StringUtf8),
+                        doc: None,
+                        r#async: false,
+                    }],
+                    structs: vec![],
+                    enums: vec![],
+                    errors: None,
+                },
+            ],
+        };
+        let out = render_scaffold(&api);
+        assert!(out.contains("weaveffi_math_add"), "missing math module");
+        assert!(out.contains("weaveffi_io_read"), "missing io module");
+    }
+}
