@@ -650,6 +650,59 @@ modules:
     }
 
     #[test]
+    fn doc_example_error_domain() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: contacts
+    errors:
+      name: ContactErrors
+      codes:
+        - name: not_found
+          code: 1
+          message: "Contact not found"
+        - name: duplicate
+          code: 2
+          message: "Contact already exists"
+        - name: invalid_email
+          code: 3
+          message: "Email address is invalid"
+    functions:
+      - name: create_contact
+        params:
+          - { name: name, type: string }
+          - { name: email, type: string }
+        return: handle
+      - name: get_contact
+        params:
+          - { name: id, type: handle }
+        return: string
+"#;
+        let api = parse_api_str(yaml, "yaml").unwrap();
+        let m = &api.modules[0];
+        assert_eq!(m.name, "contacts");
+
+        let errors = m.errors.as_ref().expect("error domain should be present");
+        assert_eq!(errors.name, "ContactErrors");
+        assert_eq!(errors.codes.len(), 3);
+        assert_eq!(errors.codes[0].name, "not_found");
+        assert_eq!(errors.codes[0].code, 1);
+        assert_eq!(errors.codes[0].message, "Contact not found");
+        assert_eq!(errors.codes[1].name, "duplicate");
+        assert_eq!(errors.codes[1].code, 2);
+        assert_eq!(errors.codes[1].message, "Contact already exists");
+        assert_eq!(errors.codes[2].name, "invalid_email");
+        assert_eq!(errors.codes[2].code, 3);
+        assert_eq!(errors.codes[2].message, "Email address is invalid");
+
+        assert_eq!(m.functions.len(), 2);
+        assert_eq!(m.functions[0].name, "create_contact");
+        assert_eq!(m.functions[0].returns, Some(TypeRef::Handle));
+        assert_eq!(m.functions[1].name, "get_contact");
+        assert_eq!(m.functions[1].returns, Some(TypeRef::StringUtf8));
+    }
+
+    #[test]
     fn doc_example_complete_contacts() {
         let yaml = r#"
 version: "0.1.0"
