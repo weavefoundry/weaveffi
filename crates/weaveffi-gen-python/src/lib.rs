@@ -6,28 +6,51 @@ use weaveffi_ir::ir::{Api, EnumDef, Function, StructDef, StructField, TypeRef};
 
 pub struct PythonGenerator;
 
+impl PythonGenerator {
+    fn generate_impl(&self, api: &Api, out_dir: &Utf8Path, package_name: &str) -> Result<()> {
+        let dir = out_dir.join("python");
+        let pkg_dir = dir.join(package_name);
+        std::fs::create_dir_all(&pkg_dir)?;
+        std::fs::write(
+            pkg_dir.join("__init__.py"),
+            "from .weaveffi import *  # noqa: F401,F403\n",
+        )?;
+        std::fs::write(pkg_dir.join("weaveffi.py"), render_python_module(api))?;
+        std::fs::write(pkg_dir.join("weaveffi.pyi"), render_pyi_module(api))?;
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            render_pyproject_toml(package_name),
+        )?;
+        std::fs::write(dir.join("setup.py"), render_setup_py(package_name))?;
+        std::fs::write(dir.join("README.md"), render_readme())?;
+        Ok(())
+    }
+}
+
 impl Generator for PythonGenerator {
     fn name(&self) -> &'static str {
         "python"
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        let dir = out_dir.join("python");
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(
-            dir.join("__init__.py"),
-            "from .weaveffi import *  # noqa: F401,F403\n",
-        )?;
-        std::fs::write(dir.join("weaveffi.py"), render_python_module(api))?;
-        std::fs::write(dir.join("weaveffi.pyi"), render_pyi_module(api))?;
-        Ok(())
+        self.generate_impl(api, out_dir, "weaveffi")
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
+        let pkg = "weaveffi";
         vec![
-            out_dir.join("python/__init__.py").to_string(),
-            out_dir.join("python/weaveffi.py").to_string(),
-            out_dir.join("python/weaveffi.pyi").to_string(),
+            out_dir
+                .join(format!("python/{pkg}/__init__.py"))
+                .to_string(),
+            out_dir
+                .join(format!("python/{pkg}/weaveffi.py"))
+                .to_string(),
+            out_dir
+                .join(format!("python/{pkg}/weaveffi.pyi"))
+                .to_string(),
+            out_dir.join("python/pyproject.toml").to_string(),
+            out_dir.join("python/setup.py").to_string(),
+            out_dir.join("python/README.md").to_string(),
         ]
     }
 }
@@ -618,6 +641,69 @@ fn render_map_return(out: &mut String, k: &TypeRef, v: &TypeRef, ind: &str) {
     ));
 }
 
+// ── Packaging ──
+
+fn render_pyproject_toml(package_name: &str) -> String {
+    format!(
+        r#"[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "{package_name}"
+version = "0.1.0"
+description = "Python bindings for WeaveFFI (auto-generated)"
+requires-python = ">=3.8"
+
+[tool.setuptools]
+packages = ["{package_name}"]
+"#,
+    )
+}
+
+fn render_setup_py(package_name: &str) -> String {
+    format!(
+        r#"from setuptools import setup
+
+setup(
+    name="{package_name}",
+    version="0.1.0",
+    packages=["{package_name}"],
+)
+"#,
+    )
+}
+
+fn render_readme() -> &'static str {
+    r#"# WeaveFFI Python Bindings
+
+Auto-generated Python bindings using ctypes.
+
+## Prerequisites
+
+- Python >= 3.8
+- The compiled shared library (`libweaveffi.so`, `libweaveffi.dylib`, or `weaveffi.dll`) available on your library search path.
+
+## Install
+
+```bash
+pip install .
+```
+
+## Development install
+
+```bash
+pip install -e .
+```
+
+## Usage
+
+```python
+from weaveffi import *
+```
+"#
+}
+
 // ── Type stub (.pyi) rendering ──
 
 fn render_pyi_module(api: &Api) -> String {
@@ -730,10 +816,10 @@ mod tests {
 
         PythonGenerator.generate(&api, out_dir).unwrap();
 
-        let init = std::fs::read_to_string(tmp.join("python/__init__.py")).unwrap();
+        let init = std::fs::read_to_string(tmp.join("python/weaveffi/__init__.py")).unwrap();
         assert!(init.contains("from .weaveffi import *"));
 
-        let weaveffi = std::fs::read_to_string(tmp.join("python/weaveffi.py")).unwrap();
+        let weaveffi = std::fs::read_to_string(tmp.join("python/weaveffi/weaveffi.py")).unwrap();
         assert!(weaveffi.contains("WeaveFFI"));
         assert!(weaveffi.contains("def add("));
 
@@ -748,9 +834,12 @@ mod tests {
         assert_eq!(
             files,
             vec![
-                "/tmp/out/python/__init__.py",
-                "/tmp/out/python/weaveffi.py",
-                "/tmp/out/python/weaveffi.pyi",
+                "/tmp/out/python/weaveffi/__init__.py",
+                "/tmp/out/python/weaveffi/weaveffi.py",
+                "/tmp/out/python/weaveffi/weaveffi.pyi",
+                "/tmp/out/python/pyproject.toml",
+                "/tmp/out/python/setup.py",
+                "/tmp/out/python/README.md",
             ]
         );
     }
@@ -1467,7 +1556,7 @@ mod tests {
 
         PythonGenerator.generate(&api, out_dir).unwrap();
 
-        let py = std::fs::read_to_string(tmp.join("python/weaveffi.py")).unwrap();
+        let py = std::fs::read_to_string(tmp.join("python/weaveffi/weaveffi.py")).unwrap();
 
         assert!(py.contains("class ContactType(IntEnum):"));
         assert!(py.contains("Personal = 0"));
@@ -1698,7 +1787,7 @@ mod tests {
 
         PythonGenerator.generate(&api, out_dir).unwrap();
 
-        let pyi_path = tmp.join("python/weaveffi.pyi");
+        let pyi_path = tmp.join("python/weaveffi/weaveffi.pyi");
         assert!(pyi_path.exists(), ".pyi file must exist");
 
         let pyi = std::fs::read_to_string(&pyi_path).unwrap();
@@ -1755,6 +1844,81 @@ mod tests {
         assert!(
             pyi.contains("def delete_contact(id: int) -> None: ..."),
             "missing delete_contact stub: {pyi}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn python_generates_packaging() {
+        let api = make_api(vec![simple_module(vec![Function {
+            name: "add".into(),
+            params: vec![
+                Param {
+                    name: "a".into(),
+                    ty: TypeRef::I32,
+                },
+                Param {
+                    name: "b".into(),
+                    ty: TypeRef::I32,
+                },
+            ],
+            returns: Some(TypeRef::I32),
+            doc: None,
+            r#async: false,
+        }])]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_python_packaging");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        PythonGenerator.generate(&api, out_dir).unwrap();
+
+        let pyproject = std::fs::read_to_string(tmp.join("python/pyproject.toml")).unwrap();
+        assert!(
+            pyproject.contains("[build-system]"),
+            "missing build-system: {pyproject}"
+        );
+        assert!(
+            pyproject.contains("setuptools"),
+            "missing setuptools: {pyproject}"
+        );
+        assert!(
+            pyproject.contains("[project]"),
+            "missing project section: {pyproject}"
+        );
+        assert!(
+            pyproject.contains("name = \"weaveffi\""),
+            "missing project name: {pyproject}"
+        );
+        assert!(
+            pyproject.contains("version = \"0.1.0\""),
+            "missing version: {pyproject}"
+        );
+        assert!(
+            pyproject.contains("[tool.setuptools]"),
+            "missing tool.setuptools: {pyproject}"
+        );
+        assert!(
+            pyproject.contains("packages = [\"weaveffi\"]"),
+            "missing packages list: {pyproject}"
+        );
+
+        let setup = std::fs::read_to_string(tmp.join("python/setup.py")).unwrap();
+        assert!(
+            setup.contains("from setuptools import setup"),
+            "missing setuptools import: {setup}"
+        );
+        assert!(
+            setup.contains("name=\"weaveffi\""),
+            "missing package name: {setup}"
+        );
+
+        let readme = std::fs::read_to_string(tmp.join("python/README.md")).unwrap();
+        assert!(
+            readme.contains("pip install"),
+            "missing install instructions: {readme}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
