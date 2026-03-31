@@ -1,3 +1,4 @@
+use predicates::prelude::*;
 use std::path::Path;
 
 #[test]
@@ -86,4 +87,32 @@ fn validate_command_succeeds() {
         .assert()
         .success()
         .stdout(predicates::str::contains("Validation passed"));
+}
+
+#[test]
+fn quiet_flag_suppresses_output() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
+    let input = repo_root.join("samples/calculator/calculator.yml");
+
+    let out_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let out_path = out_dir.path();
+
+    assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args([
+            "--quiet",
+            "generate",
+            input.to_str().unwrap(),
+            "-o",
+            out_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+
+    assert!(
+        out_path.join("c/weaveffi.h").exists(),
+        "files should still be generated with --quiet"
+    );
 }
