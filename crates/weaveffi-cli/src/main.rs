@@ -22,6 +22,10 @@ use weaveffi_ir::parse::{parse_api_str, ParseError};
 #[derive(Parser, Debug)]
 #[command(name = "weaveffi", version, about = "WeaveFFI CLI")]
 struct Cli {
+    #[arg(long, global = true)]
+    quiet: bool,
+    #[arg(long, short, global = true)]
+    verbose: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -82,14 +86,24 @@ enum Commands {
 
 fn main() -> Result<()> {
     let _ = color_eyre::install();
+
+    let cli = Cli::parse();
+
+    let filter = if cli.verbose {
+        EnvFilter::new("trace")
+    } else if cli.quiet {
+        EnvFilter::new("error")
+    } else {
+        EnvFilter::from_default_env()
+    };
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(filter)
         .without_time()
         .init();
 
-    let cli = Cli::parse();
+    let quiet = cli.quiet;
     match cli.command {
-        Commands::New { name } => cmd_new(&name)?,
+        Commands::New { name } => cmd_new(&name, quiet)?,
         Commands::Generate {
             input,
             out,
@@ -108,8 +122,9 @@ fn main() -> Result<()> {
             warn,
             force,
             dry_run,
+            quiet,
         )?,
-        Commands::Validate { input, warn } => cmd_validate(&input, warn)?,
+        Commands::Validate { input, warn } => cmd_validate(&input, warn, quiet)?,
         Commands::Extract {
             input,
             output,
@@ -118,9 +133,10 @@ fn main() -> Result<()> {
             &input,
             output.as_deref(),
             format.as_deref().unwrap_or("yaml"),
+            quiet,
         )?,
         Commands::Lint { input } => {
-            if !cmd_lint(&input)? {
+            if !cmd_lint(&input, quiet)? {
                 std::process::exit(1);
             }
         }
@@ -129,7 +145,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn cmd_new(name: &str) -> Result<()> {
+fn cmd_new(name: &str, quiet: bool) -> Result<()> {
     let project_dir = Utf8Path::new(name);
     if project_dir.exists() {
         bail!(
@@ -182,12 +198,14 @@ fn cmd_new(name: &str) -> Result<()> {
     std::fs::write(readme_path.as_std_path(), readme)
         .wrap_err_with(|| format!("failed to write {}", readme_path))?;
 
-    println!("Initialized WeaveFFI project at {}", project_dir);
-    println!("- IDL: {}", idl_path);
-    println!(
-        "Next: run `weaveffi generate {}/weaveffi.yml -o generated`",
-        name
-    );
+    if !quiet {
+        println!("Initialized WeaveFFI project at {}", project_dir);
+        println!("- IDL: {}", idl_path);
+        println!(
+            "Next: run `weaveffi generate {}/weaveffi.yml -o generated`",
+            name
+        );
+    }
     Ok(())
 }
 
@@ -213,6 +231,7 @@ fn cmd_generate(
     warn: bool,
     force: bool,
     dry_run: bool,
+    quiet: bool,
 ) -> Result<()> {
     let config = load_config(config_path)?;
 
@@ -283,14 +302,18 @@ fn cmd_generate(
         let contents = scaffold::render_scaffold(&api);
         std::fs::write(scaffold_path.as_std_path(), contents)
             .wrap_err_with(|| format!("failed to write {}", scaffold_path))?;
-        println!("Scaffold written to {}", scaffold_path);
+        if !quiet {
+            println!("Scaffold written to {}", scaffold_path);
+        }
     }
 
-    println!("Generated artifacts in {}", out);
+    if !quiet {
+        println!("Generated artifacts in {}", out);
+    }
     Ok(())
 }
 
-fn cmd_validate(input: &str, warn: bool) -> Result<()> {
+fn cmd_validate(input: &str, warn: bool, quiet: bool) -> Result<()> {
     let in_path = Utf8Path::new(input);
     let ext = in_path.extension().unwrap_or("");
     if ext.is_empty() {
@@ -316,15 +339,17 @@ fn cmd_validate(input: &str, warn: bool) -> Result<()> {
                     eprintln!("warning: {w}");
                 }
             }
-            let n_modules = api.modules.len();
-            let n_functions: usize = api.modules.iter().map(|m| m.functions.len()).sum();
-            let n_structs: usize = api.modules.iter().map(|m| m.structs.len()).sum();
-            let n_enums: usize = api.modules.iter().map(|m| m.enums.len()).sum();
-            println!("Validation passed");
-            println!(
-                "  {} modules, {} functions, {} structs, {} enums",
-                n_modules, n_functions, n_structs, n_enums
-            );
+            if !quiet {
+                let n_modules = api.modules.len();
+                let n_functions: usize = api.modules.iter().map(|m| m.functions.len()).sum();
+                let n_structs: usize = api.modules.iter().map(|m| m.structs.len()).sum();
+                let n_enums: usize = api.modules.iter().map(|m| m.enums.len()).sum();
+                println!("Validation passed");
+                println!(
+                    "  {} modules, {} functions, {} structs, {} enums",
+                    n_modules, n_functions, n_structs, n_enums
+                );
+            }
             Ok(())
         }
         Err(e) => Err(format_validation_error(e)),
@@ -332,7 +357,7 @@ fn cmd_validate(input: &str, warn: bool) -> Result<()> {
 }
 
 /// Returns `Ok(true)` when the file is clean, `Ok(false)` when warnings were found.
-fn cmd_lint(input: &str) -> Result<bool> {
+fn cmd_lint(input: &str, quiet: bool) -> Result<bool> {
     let in_path = Utf8Path::new(input);
     let ext = in_path.extension().unwrap_or("");
     if ext.is_empty() {
@@ -354,7 +379,9 @@ fn cmd_lint(input: &str) -> Result<bool> {
 
     let warnings = collect_warnings(&api);
     if warnings.is_empty() {
-        println!("No warnings.");
+        if !quiet {
+            println!("No warnings.");
+        }
         Ok(true)
     } else {
         for w in &warnings {
@@ -462,7 +489,7 @@ fn validation_suggestion(err: &ValidationError) -> &'static str {
     }
 }
 
-fn cmd_extract(input: &str, output: Option<&str>, format: &str) -> Result<()> {
+fn cmd_extract(input: &str, output: Option<&str>, format: &str, quiet: bool) -> Result<()> {
     let source = std::fs::read_to_string(input)
         .wrap_err_with(|| format!("failed to read source file: {}", input))?;
 
@@ -489,7 +516,9 @@ fn cmd_extract(input: &str, output: Option<&str>, format: &str) -> Result<()> {
         Some(path) => {
             std::fs::write(path, &serialized)
                 .wrap_err_with(|| format!("failed to write output file: {}", path))?;
-            println!("Extracted API written to {}", path);
+            if !quiet {
+                println!("Extracted API written to {}", path);
+            }
         }
         None => print!("{}", serialized),
     }
@@ -785,7 +814,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR")
         );
         assert!(
-            cmd_lint(&sample).unwrap(),
+            cmd_lint(&sample, false).unwrap(),
             "calculator sample should be lint-clean"
         );
     }
@@ -823,7 +852,7 @@ mod tests {
         let input = yml.to_str().unwrap();
         let out_str = out.to_str().unwrap();
 
-        cmd_generate(input, out_str, None, false, None, false, false, true).unwrap();
+        cmd_generate(input, out_str, None, false, None, false, false, true, false).unwrap();
 
         assert!(!out.exists(), "dry-run should not create output directory");
 
