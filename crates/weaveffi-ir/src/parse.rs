@@ -767,4 +767,52 @@ modules:
         assert_eq!(m.functions[3].returns, Some(TypeRef::Bool));
         assert_eq!(m.functions[4].returns, Some(TypeRef::I32));
     }
+
+    #[test]
+    fn parse_function_with_map_param() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: store
+    functions:
+      - name: put_scores
+        params:
+          - name: scores
+            type: "{string:i32}"
+"#;
+        let api = parse_api_str(yaml, "yaml").unwrap();
+        let param = &api.modules[0].functions[0].params[0];
+        assert_eq!(param.name, "scores");
+        assert_eq!(
+            param.ty,
+            TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32))
+        );
+    }
+
+    #[test]
+    fn parse_function_with_map_return() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: store
+    structs:
+      - name: Contact
+        fields:
+          - { name: name, type: string }
+    functions:
+      - name: get_contacts
+        params: []
+        return: "{string:Contact}"
+"#;
+        let api = parse_api_str(yaml, "yaml").unwrap();
+        let f = &api.modules[0].functions[0];
+        assert_eq!(f.name, "get_contacts");
+        assert_eq!(
+            f.returns,
+            Some(TypeRef::Map(
+                Box::new(TypeRef::StringUtf8),
+                Box::new(TypeRef::Struct("Contact".into()))
+            ))
+        );
+    }
 }
