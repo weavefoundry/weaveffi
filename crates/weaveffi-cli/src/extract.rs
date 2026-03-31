@@ -9,7 +9,7 @@ fn has_attr(attrs: &[syn::Attribute], name: &str) -> bool {
 
 fn has_repr_i32(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|a| {
-        a.path().is_ident("repr") && a.parse_args::<syn::Ident>().map_or(false, |id| id == "i32")
+        a.path().is_ident("repr") && a.parse_args::<syn::Ident>().is_ok_and(|id| id == "i32")
     })
 }
 
