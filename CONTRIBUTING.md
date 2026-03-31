@@ -113,13 +113,13 @@ BREAKING CHANGE: JS bindings now return Promises instead of using callbacks; upd
 ### Branching rules
 
 - `main`: default branch.
-- Feature branches: `feature/...` from `main`; hotfixes: `hotfix/...` from `main`.
+- All work branches are created from `main`.
 
 #### Branch naming
 
 - Use lowercase kebab-case; no spaces; keep names concise (aim ≤ 40 chars).
-- Suggested prefixes (align with Conventional Commit categories):
-  - `feature/<short-desc>`
+- Branch prefixes match Conventional Commit types:
+  - `feat/<short-desc>`
   - `fix/<short-desc>`
   - `chore/<short-desc>`
   - `docs/<short-desc>`
@@ -128,19 +128,18 @@ BREAKING CHANGE: JS bindings now return Promises instead of using callbacks; upd
   - `test/<short-desc>`
   - `perf/<short-desc>`
   - `build/<short-desc>`
-  - `hotfix/<short-desc>`
 
 Examples:
 
 ```text
-feature/struct-codegen
+feat/struct-codegen
 fix/swift-string-ownership
 docs/contributing-guidelines
 ci/add-wasm-workflow
 build/update-clap
 refactor/extract-template-engine
 test/calculator-fixtures
-hotfix/android-jni-crash
+fix/android-jni-crash
 ```
 
 ## CI
