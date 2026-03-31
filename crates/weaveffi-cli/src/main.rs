@@ -67,6 +67,10 @@ enum Commands {
         #[arg(short, long, default_value = "yaml")]
         format: Option<String>,
     },
+    Lint {
+        /// Input IDL/IR file (yaml|yml|json|toml)
+        input: String,
+    },
     Doctor,
 }
 
@@ -105,6 +109,11 @@ fn main() -> Result<()> {
             output.as_deref(),
             format.as_deref().unwrap_or("yaml"),
         )?,
+        Commands::Lint { input } => {
+            if !cmd_lint(&input)? {
+                std::process::exit(1);
+            }
+        }
         Commands::Doctor => cmd_doctor()?,
     }
     Ok(())
@@ -293,6 +302,39 @@ fn cmd_validate(input: &str, warn: bool) -> Result<()> {
             Ok(())
         }
         Err(e) => Err(format_validation_error(e)),
+    }
+}
+
+/// Returns `Ok(true)` when the file is clean, `Ok(false)` when warnings were found.
+fn cmd_lint(input: &str) -> Result<bool> {
+    let in_path = Utf8Path::new(input);
+    let ext = in_path.extension().unwrap_or("");
+    if ext.is_empty() {
+        bail!("input file has no extension (expected yml|yaml|json|toml)");
+    }
+    let format = match ext {
+        "yml" | "yaml" => "yaml",
+        "json" => "json",
+        "toml" => "toml",
+        other => bail!(
+            "unsupported input format: {} (expected yml|yaml|json|toml)",
+            other
+        ),
+    };
+    let contents = std::fs::read_to_string(in_path.as_std_path())
+        .wrap_err_with(|| format!("failed to read input file: {}", input))?;
+    let mut api = parse_api_str(&contents, format).map_err(|e| format_parse_error(input, e))?;
+    validate_api(&mut api).map_err(format_validation_error)?;
+
+    let warnings = collect_warnings(&api);
+    if warnings.is_empty() {
+        println!("No warnings.");
+        Ok(true)
+    } else {
+        for w in &warnings {
+            eprintln!("warning: {w}");
+        }
+        Ok(false)
     }
 }
 
@@ -707,6 +749,19 @@ mod tests {
         assert_eq!(cfg.android_package(), "com.example.myapp");
         assert!(cfg.strip_module_prefix);
         assert_eq!(cfg.c_prefix(), "weaveffi");
+    }
+
+    #[test]
+    fn lint_clean_file_succeeds() {
+        let _ = color_eyre::install();
+        let sample = format!(
+            "{}/../../samples/calculator/calculator.yml",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        assert!(
+            cmd_lint(&sample).unwrap(),
+            "calculator sample should be lint-clean"
+        );
     }
 
     #[test]
