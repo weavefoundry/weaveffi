@@ -142,6 +142,12 @@ mod tests {
     }
 
     #[test]
+    fn ts_type_for_map() {
+        let ty = TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32));
+        assert_eq!(ts_type_for(&ty), "Record<string, number>");
+    }
+
+    #[test]
     fn ts_type_for_optional_list() {
         let ty = TypeRef::Optional(Box::new(TypeRef::List(Box::new(TypeRef::I32))));
         assert_eq!(ts_type_for(&ty), "number[] | null");
