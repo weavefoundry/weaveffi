@@ -2014,4 +2014,669 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn generate_dotnet_basic() {
+        let api = make_api(vec![simple_module(vec![Function {
+            name: "add".into(),
+            params: vec![
+                Param {
+                    name: "a".into(),
+                    ty: TypeRef::I32,
+                },
+                Param {
+                    name: "b".into(),
+                    ty: TypeRef::I32,
+                },
+            ],
+            returns: Some(TypeRef::I32),
+            doc: None,
+            r#async: false,
+        }])]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_dotnet_basic");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        DotnetGenerator.generate(&api, out_dir).unwrap();
+        let cs = std::fs::read_to_string(tmp.join("dotnet/WeaveFFI.cs")).unwrap();
+
+        assert!(
+            cs.contains("EntryPoint = \"weaveffi_math_add\""),
+            "missing P/Invoke EntryPoint: {cs}"
+        );
+        assert!(
+            cs.contains(
+                "internal static extern int weaveffi_math_add(int a, int b, ref WeaveffiError err)"
+            ),
+            "missing P/Invoke declaration: {cs}"
+        );
+        assert!(
+            cs.contains("public static int Add(int a, int b)"),
+            "missing wrapper method signature: {cs}"
+        );
+        assert!(
+            cs.contains("NativeMethods.weaveffi_math_add(a, b, ref err)"),
+            "missing P/Invoke call in wrapper: {cs}"
+        );
+        assert!(
+            cs.contains("WeaveffiError.Check(err)"),
+            "missing error check in wrapper: {cs}"
+        );
+        assert!(
+            cs.contains("return result;"),
+            "missing return statement: {cs}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn generate_dotnet_with_structs() {
+        let api = make_api(vec![Module {
+            name: "crm".into(),
+            functions: vec![],
+            structs: vec![StructDef {
+                name: "Person".into(),
+                doc: Some("A person record".into()),
+                fields: vec![
+                    StructField {
+                        name: "full_name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "age".into(),
+                        ty: TypeRef::I32,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "score".into(),
+                        ty: TypeRef::F64,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "active".into(),
+                        ty: TypeRef::Bool,
+                        doc: None,
+                    },
+                ],
+            }],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let cs = render_csharp(&api);
+
+        assert!(
+            cs.contains("public class Person : IDisposable"),
+            "missing IDisposable class: {cs}"
+        );
+        assert!(
+            cs.contains("<summary>A person record</summary>"),
+            "missing doc summary: {cs}"
+        );
+        assert!(
+            cs.contains("internal Person(IntPtr handle)"),
+            "missing internal constructor: {cs}"
+        );
+        assert!(
+            cs.contains("internal IntPtr Handle => _handle"),
+            "missing Handle property: {cs}"
+        );
+
+        assert!(
+            cs.contains("public string FullName"),
+            "missing FullName getter: {cs}"
+        );
+        assert!(cs.contains("public int Age"), "missing Age getter: {cs}");
+        assert!(
+            cs.contains("public double Score"),
+            "missing Score getter: {cs}"
+        );
+        assert!(
+            cs.contains("public bool Active"),
+            "missing Active getter: {cs}"
+        );
+
+        assert!(
+            cs.contains("weaveffi_crm_Person_get_full_name(_handle)"),
+            "missing full_name native call: {cs}"
+        );
+        assert!(
+            cs.contains("weaveffi_crm_Person_get_age(_handle)"),
+            "missing age native call: {cs}"
+        );
+        assert!(
+            cs.contains("weaveffi_crm_Person_get_active(_handle) != 0"),
+            "missing bool getter conversion: {cs}"
+        );
+
+        assert!(
+            cs.contains("public void Dispose()"),
+            "missing Dispose: {cs}"
+        );
+        assert!(
+            cs.contains("weaveffi_crm_Person_destroy(_handle)"),
+            "missing destroy in Dispose: {cs}"
+        );
+        assert!(
+            cs.contains("GC.SuppressFinalize(this)"),
+            "missing SuppressFinalize: {cs}"
+        );
+        assert!(cs.contains("~Person()"), "missing finalizer: {cs}");
+
+        assert!(
+            cs.contains("weaveffi_crm_Person_create("),
+            "missing create P/Invoke: {cs}"
+        );
+        assert!(
+            cs.contains("weaveffi_crm_Person_destroy(IntPtr ptr)"),
+            "missing destroy P/Invoke: {cs}"
+        );
+    }
+
+    #[test]
+    fn generate_dotnet_with_enums() {
+        let api = make_api(vec![Module {
+            name: "status".into(),
+            functions: vec![Function {
+                name: "get_status".into(),
+                params: vec![],
+                returns: Some(TypeRef::Enum("Priority".into())),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![EnumDef {
+                name: "Priority".into(),
+                doc: Some("Task priority levels".into()),
+                variants: vec![
+                    EnumVariant {
+                        name: "Low".into(),
+                        value: 0,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Medium".into(),
+                        value: 1,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "High".into(),
+                        value: 2,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Critical".into(),
+                        value: 3,
+                        doc: None,
+                    },
+                ],
+            }],
+            errors: None,
+        }]);
+
+        let cs = render_csharp(&api);
+
+        assert!(
+            cs.contains("<summary>Task priority levels</summary>"),
+            "missing enum doc: {cs}"
+        );
+        assert!(
+            cs.contains("public enum Priority"),
+            "missing enum declaration: {cs}"
+        );
+        assert!(cs.contains("Low = 0,"), "missing Low variant: {cs}");
+        assert!(cs.contains("Medium = 1,"), "missing Medium variant: {cs}");
+        assert!(cs.contains("High = 2,"), "missing High variant: {cs}");
+        assert!(
+            cs.contains("Critical = 3,"),
+            "missing Critical variant: {cs}"
+        );
+
+        assert!(
+            cs.contains("(Priority)result"),
+            "missing enum return cast: {cs}"
+        );
+        assert!(
+            cs.contains("public static Priority GetStatus()"),
+            "missing wrapper returning enum: {cs}"
+        );
+    }
+
+    #[test]
+    fn generate_dotnet_with_optionals() {
+        let api = make_api(vec![Module {
+            name: "config".into(),
+            functions: vec![Function {
+                name: "update".into(),
+                params: vec![
+                    Param {
+                        name: "label".into(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                    },
+                    Param {
+                        name: "count".into(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::I32)),
+                    },
+                ],
+                returns: Some(TypeRef::Optional(Box::new(TypeRef::I64))),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![StructDef {
+                name: "Settings".into(),
+                doc: None,
+                fields: vec![
+                    StructField {
+                        name: "nickname".into(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                        doc: None,
+                    },
+                    StructField {
+                        name: "max_retries".into(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::I32)),
+                        doc: None,
+                    },
+                    StructField {
+                        name: "threshold".into(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::F64)),
+                        doc: None,
+                    },
+                    StructField {
+                        name: "enabled".into(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::Bool)),
+                        doc: None,
+                    },
+                ],
+            }],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let cs = render_csharp(&api);
+
+        assert!(
+            cs.contains("public static long? Update(string? label, int? count)"),
+            "missing Nullable wrapper sig: {cs}"
+        );
+        assert!(
+            cs.contains("if (result == IntPtr.Zero) return null;"),
+            "missing null check for optional return: {cs}"
+        );
+        assert!(
+            cs.contains("Marshal.ReadInt64(result)"),
+            "missing ReadInt64 for optional i64 return: {cs}"
+        );
+
+        assert!(
+            cs.contains("public string? Nickname"),
+            "missing optional string getter: {cs}"
+        );
+        assert!(
+            cs.contains("public int? MaxRetries"),
+            "missing optional int getter: {cs}"
+        );
+        assert!(
+            cs.contains("public double? Threshold"),
+            "missing optional f64 getter: {cs}"
+        );
+        assert!(
+            cs.contains("public bool? Enabled"),
+            "missing optional bool getter: {cs}"
+        );
+
+        assert!(
+            cs.contains("Marshal.ReadInt32(ptr) != 0"),
+            "missing optional bool unmarshal: {cs}"
+        );
+        assert!(
+            cs.contains("BitConverter.Int64BitsToDouble(Marshal.ReadInt64(ptr))"),
+            "missing optional f64 unmarshal: {cs}"
+        );
+    }
+
+    #[test]
+    fn generate_dotnet_with_lists() {
+        let api = make_api(vec![Module {
+            name: "data".into(),
+            functions: vec![
+                Function {
+                    name: "get_ids".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::List(Box::new(TypeRef::I32))),
+                    doc: None,
+                    r#async: false,
+                },
+                Function {
+                    name: "get_values".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::List(Box::new(TypeRef::F64))),
+                    doc: None,
+                    r#async: false,
+                },
+                Function {
+                    name: "get_timestamps".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::List(Box::new(TypeRef::I64))),
+                    doc: None,
+                    r#async: false,
+                },
+            ],
+            structs: vec![StructDef {
+                name: "Record".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "tags".into(),
+                    ty: TypeRef::List(Box::new(TypeRef::I32)),
+                    doc: None,
+                }],
+            }],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let cs = render_csharp(&api);
+
+        assert!(
+            cs.contains("public static int[] GetIds()"),
+            "missing int[] return: {cs}"
+        );
+        assert!(
+            cs.contains("public static double[] GetValues()"),
+            "missing double[] return: {cs}"
+        );
+        assert!(
+            cs.contains("public static long[] GetTimestamps()"),
+            "missing long[] return: {cs}"
+        );
+        assert!(
+            cs.contains("out var outLen"),
+            "missing outLen parameter: {cs}"
+        );
+        assert!(
+            cs.contains("Marshal.Copy(result, arr, 0, (int)outLen)"),
+            "missing Marshal.Copy for array: {cs}"
+        );
+        assert!(
+            cs.contains("Array.Empty<int>()"),
+            "missing empty array fallback for int: {cs}"
+        );
+
+        assert!(
+            cs.contains("public int[] Tags"),
+            "missing list struct getter: {cs}"
+        );
+    }
+
+    #[test]
+    fn generate_dotnet_full_contacts() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            enums: vec![EnumDef {
+                name: "ContactType".into(),
+                doc: Some("Type of contact".into()),
+                variants: vec![
+                    EnumVariant {
+                        name: "Personal".into(),
+                        value: 0,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Business".into(),
+                        value: 1,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Government".into(),
+                        value: 2,
+                        doc: None,
+                    },
+                ],
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: Some("A contact entry".into()),
+                fields: vec![
+                    StructField {
+                        name: "id".into(),
+                        ty: TypeRef::Handle,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "first_name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "last_name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "email".into(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                        doc: None,
+                    },
+                    StructField {
+                        name: "age".into(),
+                        ty: TypeRef::I32,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "active".into(),
+                        ty: TypeRef::Bool,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "contact_type".into(),
+                        ty: TypeRef::Enum("ContactType".into()),
+                        doc: None,
+                    },
+                    StructField {
+                        name: "scores".into(),
+                        ty: TypeRef::List(Box::new(TypeRef::I32)),
+                        doc: None,
+                    },
+                ],
+            }],
+            functions: vec![
+                Function {
+                    name: "create_contact".into(),
+                    params: vec![
+                        Param {
+                            name: "first_name".into(),
+                            ty: TypeRef::StringUtf8,
+                        },
+                        Param {
+                            name: "last_name".into(),
+                            ty: TypeRef::StringUtf8,
+                        },
+                        Param {
+                            name: "email".into(),
+                            ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                        },
+                        Param {
+                            name: "contact_type".into(),
+                            ty: TypeRef::Enum("ContactType".into()),
+                        },
+                    ],
+                    returns: Some(TypeRef::Handle),
+                    doc: None,
+                    r#async: false,
+                },
+                Function {
+                    name: "get_contact".into(),
+                    params: vec![Param {
+                        name: "id".into(),
+                        ty: TypeRef::Handle,
+                    }],
+                    returns: Some(TypeRef::Struct("Contact".into())),
+                    doc: None,
+                    r#async: false,
+                },
+                Function {
+                    name: "list_contacts".into(),
+                    params: vec![Param {
+                        name: "contact_type".into(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::Enum("ContactType".into()))),
+                    }],
+                    returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
+                    doc: None,
+                    r#async: false,
+                },
+                Function {
+                    name: "delete_contact".into(),
+                    params: vec![Param {
+                        name: "id".into(),
+                        ty: TypeRef::Handle,
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                },
+                Function {
+                    name: "count_contacts".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                },
+            ],
+            errors: None,
+        }]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_dotnet_full_contacts");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        DotnetGenerator.generate(&api, out_dir).unwrap();
+        let cs = std::fs::read_to_string(tmp.join("dotnet/WeaveFFI.cs")).unwrap();
+
+        // Enum
+        assert!(cs.contains("public enum ContactType"), "missing enum: {cs}");
+        assert!(cs.contains("Personal = 0,"), "missing Personal: {cs}");
+        assert!(cs.contains("Business = 1,"), "missing Business: {cs}");
+        assert!(cs.contains("Government = 2,"), "missing Government: {cs}");
+        assert!(
+            cs.contains("<summary>Type of contact</summary>"),
+            "missing enum doc: {cs}"
+        );
+
+        // Struct class with IDisposable
+        assert!(
+            cs.contains("public class Contact : IDisposable"),
+            "missing IDisposable: {cs}"
+        );
+        assert!(
+            cs.contains("<summary>A contact entry</summary>"),
+            "missing struct doc: {cs}"
+        );
+        assert!(
+            cs.contains("internal Contact(IntPtr handle)"),
+            "missing constructor: {cs}"
+        );
+        assert!(cs.contains("~Contact()"), "missing finalizer: {cs}");
+        assert!(
+            cs.contains("weaveffi_contacts_Contact_destroy(_handle)"),
+            "missing destroy: {cs}"
+        );
+
+        // Property getters
+        assert!(cs.contains("public ulong Id"), "missing Id getter: {cs}");
+        assert!(
+            cs.contains("public string FirstName"),
+            "missing FirstName: {cs}"
+        );
+        assert!(
+            cs.contains("public string LastName"),
+            "missing LastName: {cs}"
+        );
+        assert!(
+            cs.contains("public string? Email"),
+            "missing optional Email: {cs}"
+        );
+        assert!(cs.contains("public int Age"), "missing Age: {cs}");
+        assert!(cs.contains("public bool Active"), "missing Active: {cs}");
+        assert!(
+            cs.contains("public ContactType ContactType"),
+            "missing ContactType getter: {cs}"
+        );
+        assert!(
+            cs.contains("public int[] Scores"),
+            "missing Scores list getter: {cs}"
+        );
+
+        // P/Invoke declarations
+        assert!(
+            cs.contains("weaveffi_contacts_Contact_create("),
+            "missing create P/Invoke: {cs}"
+        );
+        assert!(
+            cs.contains("weaveffi_contacts_Contact_destroy(IntPtr ptr)"),
+            "missing destroy P/Invoke: {cs}"
+        );
+        assert!(
+            cs.contains("weaveffi_contacts_create_contact("),
+            "missing create_contact P/Invoke: {cs}"
+        );
+        assert!(
+            cs.contains("weaveffi_contacts_get_contact("),
+            "missing get_contact P/Invoke: {cs}"
+        );
+        assert!(
+            cs.contains("weaveffi_contacts_list_contacts("),
+            "missing list_contacts P/Invoke: {cs}"
+        );
+        assert!(
+            cs.contains("weaveffi_contacts_delete_contact("),
+            "missing delete_contact P/Invoke: {cs}"
+        );
+        assert!(
+            cs.contains("weaveffi_contacts_count_contacts("),
+            "missing count_contacts P/Invoke: {cs}"
+        );
+
+        // Wrapper class
+        assert!(
+            cs.contains("public static class Contacts"),
+            "missing Contacts wrapper class: {cs}"
+        );
+        assert!(
+            cs.contains("public static ulong CreateContact("),
+            "missing CreateContact wrapper: {cs}"
+        );
+        assert!(
+            cs.contains("public static Contact GetContact(ulong id)"),
+            "missing GetContact wrapper: {cs}"
+        );
+        assert!(
+            cs.contains("public static Contact[] ListContacts("),
+            "missing ListContacts wrapper: {cs}"
+        );
+        assert!(
+            cs.contains("public static void DeleteContact(ulong id)"),
+            "missing DeleteContact wrapper: {cs}"
+        );
+        assert!(
+            cs.contains("public static int CountContacts()"),
+            "missing CountContacts wrapper: {cs}"
+        );
+
+        // Supporting output files
+        assert!(
+            tmp.join("dotnet/WeaveFFI.csproj").exists(),
+            ".csproj must exist"
+        );
+        assert!(
+            tmp.join("dotnet/WeaveFFI.nuspec").exists(),
+            ".nuspec must exist"
+        );
+        assert!(tmp.join("dotnet/README.md").exists(), "README must exist");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
