@@ -23,7 +23,11 @@ impl Generator for CGenerator {
 fn is_c_pointer_type(ty: &TypeRef) -> bool {
     matches!(
         ty,
-        TypeRef::StringUtf8 | TypeRef::Bytes | TypeRef::Struct(_) | TypeRef::List(_)
+        TypeRef::StringUtf8
+            | TypeRef::Bytes
+            | TypeRef::Struct(_)
+            | TypeRef::List(_)
+            | TypeRef::Map(_, _)
     )
 }
 
@@ -41,6 +45,7 @@ fn c_element_type(ty: &TypeRef, module: &str) -> String {
         TypeRef::Struct(s) => format!("weaveffi_{module}_{s}*"),
         TypeRef::Enum(e) => format!("weaveffi_{module}_{e}"),
         TypeRef::Optional(inner) | TypeRef::List(inner) => c_element_type(inner, module),
+        TypeRef::Map(_, _) => "void*".to_string(),
     }
 }
 
@@ -72,6 +77,7 @@ fn c_type_for_param(ty: &TypeRef, name: &str, module: &str) -> String {
                 format!("const {elem}* {name}, size_t {name}_len")
             }
         }
+        TypeRef::Map(_, _) => format!("const void* {name}"),
     }
 }
 
@@ -99,6 +105,7 @@ fn c_ret_type(ty: &TypeRef, module: &str) -> (String, bool) {
             let elem = c_element_type(inner, module);
             (format!("{elem}*"), true)
         }
+        TypeRef::Map(_, _) => ("void*".to_string(), false),
     }
 }
 

@@ -69,6 +69,7 @@ fn kotlin_type(t: &TypeRef) -> String {
         TypeRef::Enum(_) => "Int".to_string(),
         TypeRef::Optional(inner) => format!("{}?", kotlin_type(inner)),
         TypeRef::List(inner) => kotlin_list_type(inner),
+        TypeRef::Map(_, _) => "Long".to_string(),
     }
 }
 
@@ -82,7 +83,7 @@ fn kotlin_list_type(inner: &TypeRef) -> String {
         TypeRef::Bool => "BooleanArray".to_string(),
         TypeRef::StringUtf8 => "Array<String>".to_string(),
         TypeRef::Bytes => "Array<ByteArray>".to_string(),
-        TypeRef::Optional(_) | TypeRef::List(_) => "LongArray".to_string(),
+        TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) => "LongArray".to_string(),
     }
 }
 
@@ -100,6 +101,7 @@ fn jni_param_type(t: &TypeRef) -> String {
             _ => "jobject".to_string(),
         },
         TypeRef::List(inner) => jni_array_type(inner),
+        TypeRef::Map(_, _) => "jobject".to_string(),
     }
 }
 
@@ -132,7 +134,9 @@ fn c_type_for_return(t: &TypeRef) -> &'static str {
         TypeRef::Handle => "weaveffi_handle_t",
         TypeRef::StringUtf8 => "const char*",
         TypeRef::Bytes => "const uint8_t*",
-        TypeRef::Struct(_) | TypeRef::Optional(_) | TypeRef::List(_) => "void*",
+        TypeRef::Struct(_) | TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            "void*"
+        }
     }
 }
 
@@ -146,7 +150,7 @@ fn jni_default_return(t: Option<&TypeRef>) -> &'static str {
         Some(TypeRef::StringUtf8) => "return NULL;",
         Some(TypeRef::Bytes) => "return NULL;",
         Some(TypeRef::Struct(_)) => "return 0;",
-        Some(TypeRef::Optional(_) | TypeRef::List(_)) => "return NULL;",
+        Some(TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _)) => "return NULL;",
     }
 }
 
@@ -429,7 +433,7 @@ fn write_optional_acquire(out: &mut String, name: &str, inner: &TypeRef) {
             let _ = writeln!(out, "        {n}_ptr = &{n}_val;", n = name);
             let _ = writeln!(out, "    }}");
         }
-        TypeRef::Optional(_) | TypeRef::List(_) => {}
+        TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {}
     }
 }
 
@@ -553,6 +557,7 @@ fn build_c_call_args(args: &mut Vec<String>, name: &str, ty: &TypeRef, module: &
             }
             args.push(format!("(size_t){n}_len", n = name));
         }
+        TypeRef::Map(_, _) => args.push(format!("(const void*){}", name)),
     }
 }
 

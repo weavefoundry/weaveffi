@@ -3,7 +3,11 @@ use weaveffi_ir::ir::{Api, Module, StructDef, TypeRef};
 fn is_pointer_type(ty: &TypeRef) -> bool {
     matches!(
         ty,
-        TypeRef::StringUtf8 | TypeRef::Bytes | TypeRef::Struct(_) | TypeRef::List(_)
+        TypeRef::StringUtf8
+            | TypeRef::Bytes
+            | TypeRef::Struct(_)
+            | TypeRef::List(_)
+            | TypeRef::Map(_, _)
     )
 }
 
@@ -20,6 +24,7 @@ fn rust_scalar_type(ty: &TypeRef, module: &str) -> String {
         TypeRef::Struct(s) => format!("weaveffi_{module}_{s}"),
         TypeRef::Enum(_) => "i32".into(),
         TypeRef::Optional(inner) | TypeRef::List(inner) => rust_scalar_type(inner, module),
+        TypeRef::Map(_, _) => "u8".into(),
     }
 }
 
@@ -59,6 +64,7 @@ fn rust_param_fragments(name: &str, ty: &TypeRef, module: &str) -> Vec<String> {
                 ]
             }
         }
+        TypeRef::Map(_, _) => vec![format!("{name}: *const u8"), format!("{name}_len: usize")],
     }
 }
 
@@ -90,6 +96,7 @@ fn rust_return_type(ty: &TypeRef, module: &str) -> (String, bool) {
                 (format!("*mut {elem}"), true)
             }
         }
+        TypeRef::Map(_, _) => ("*mut u8".into(), true),
     }
 }
 

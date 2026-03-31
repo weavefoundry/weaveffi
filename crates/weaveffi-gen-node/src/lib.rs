@@ -43,6 +43,7 @@ fn ts_type_for(ty: &TypeRef) -> String {
                 format!("{inner_ts}[]")
             }
         }
+        TypeRef::Map(k, v) => format!("Record<{}, {}>", ts_type_for(k), ts_type_for(v)),
     }
 }
 
