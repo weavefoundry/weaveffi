@@ -39,6 +39,16 @@ impl Generator for NodeGenerator {
     ) -> Result<()> {
         self.generate_impl(api, out_dir, config.node_package_name())
     }
+
+    fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
+        vec![
+            out_dir.join("node/index.js").to_string(),
+            out_dir.join("node/types.d.ts").to_string(),
+            out_dir.join("node/package.json").to_string(),
+            out_dir.join("node/binding.gyp").to_string(),
+            out_dir.join("node/weaveffi_addon.c").to_string(),
+        ]
+    }
 }
 
 fn render_package_json(name: &str) -> String {

@@ -52,6 +52,9 @@ enum Commands {
         /// Force regeneration, bypassing the incremental cache
         #[arg(long)]
         force: bool,
+        /// Parse and validate only; print which files would be generated without writing them
+        #[arg(long)]
+        dry_run: bool,
     },
     Validate {
         /// Input IDL/IR file (yaml|yml|json|toml)
@@ -95,6 +98,7 @@ fn main() -> Result<()> {
             config,
             warn,
             force,
+            dry_run,
         } => cmd_generate(
             &input,
             &out,
@@ -103,6 +107,7 @@ fn main() -> Result<()> {
             config.as_deref(),
             warn,
             force,
+            dry_run,
         )?,
         Commands::Validate { input, warn } => cmd_validate(&input, warn)?,
         Commands::Extract {
@@ -198,6 +203,7 @@ fn load_config(path: Option<&str>) -> Result<GeneratorConfig> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_generate(
     input: &str,
     out: &str,
@@ -206,6 +212,7 @@ fn cmd_generate(
     config_path: Option<&str>,
     warn: bool,
     force: bool,
+    dry_run: bool,
 ) -> Result<()> {
     let config = load_config(config_path)?;
 
@@ -235,8 +242,6 @@ fn cmd_generate(
     }
 
     let out_dir = Utf8Path::new(out);
-    std::fs::create_dir_all(out_dir.as_std_path())
-        .wrap_err_with(|| format!("failed to create output directory: {}", out))?;
 
     let c = CGenerator;
     let swift = SwiftGenerator;
@@ -247,11 +252,26 @@ fn cmd_generate(
 
     let filter: Option<Vec<&str>> = targets.map(|t| t.split(',').map(str::trim).collect());
 
-    let mut orchestrator = Orchestrator::new();
-    for &gen in &all {
-        if filter.as_ref().is_none_or(|ts| ts.contains(&gen.name())) {
-            orchestrator = orchestrator.with_generator(gen);
+    let selected: Vec<&dyn Generator> = all
+        .into_iter()
+        .filter(|gen| filter.as_ref().is_none_or(|ts| ts.contains(&gen.name())))
+        .collect();
+
+    if dry_run {
+        for gen in &selected {
+            for path in gen.output_files(&api, out_dir) {
+                println!("{path}");
+            }
         }
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(out_dir.as_std_path())
+        .wrap_err_with(|| format!("failed to create output directory: {}", out))?;
+
+    let mut orchestrator = Orchestrator::new();
+    for &gen in &selected {
+        orchestrator = orchestrator.with_generator(gen);
     }
 
     orchestrator
@@ -776,5 +796,76 @@ mod tests {
         assert_eq!(cfg.swift_module_name(), "WeaveFFI");
         assert_eq!(cfg.android_package(), "com.weaveffi");
         assert!(!cfg.strip_module_prefix);
+    }
+
+    #[test]
+    fn dry_run_lists_files() {
+        let _ = color_eyre::install();
+        let dir = tempfile::tempdir().unwrap();
+        let yml = dir.path().join("api.yml");
+        std::fs::write(
+            &yml,
+            concat!(
+                "version: \"0.1.0\"\n",
+                "modules:\n",
+                "  - name: math\n",
+                "    functions:\n",
+                "      - name: add\n",
+                "        params:\n",
+                "          - { name: a, type: i32 }\n",
+                "          - { name: b, type: i32 }\n",
+                "        return: i32\n",
+            ),
+        )
+        .unwrap();
+
+        let out = dir.path().join("out");
+        let input = yml.to_str().unwrap();
+        let out_str = out.to_str().unwrap();
+
+        cmd_generate(input, out_str, None, false, None, false, false, true).unwrap();
+
+        assert!(!out.exists(), "dry-run should not create output directory");
+
+        let api = {
+            let contents = std::fs::read_to_string(&yml).unwrap();
+            let mut api = weaveffi_ir::parse::parse_api_str(&contents, "yaml").unwrap();
+            weaveffi_core::validate::validate_api(&mut api).unwrap();
+            api
+        };
+        let out_dir = Utf8Path::new(out_str);
+
+        let c = CGenerator;
+        let swift = SwiftGenerator;
+        let android = AndroidGenerator;
+        let node = NodeGenerator;
+        let wasm = WasmGenerator;
+        let all: Vec<&dyn Generator> = vec![&c, &swift, &android, &node, &wasm];
+
+        let mut files: Vec<String> = Vec::new();
+        for gen in &all {
+            files.extend(gen.output_files(&api, out_dir));
+        }
+
+        assert!(
+            files.iter().any(|f| f.contains("c/weaveffi.h")),
+            "missing c header: {files:?}"
+        );
+        assert!(
+            files.iter().any(|f| f.contains("swift/Package.swift")),
+            "missing swift package: {files:?}"
+        );
+        assert!(
+            files.iter().any(|f| f.contains("android/build.gradle")),
+            "missing android gradle: {files:?}"
+        );
+        assert!(
+            files.iter().any(|f| f.contains("node/types.d.ts")),
+            "missing node types: {files:?}"
+        );
+        assert!(
+            files.iter().any(|f| f.contains("wasm/weaveffi_wasm.js")),
+            "missing wasm js: {files:?}"
+        );
     }
 }

@@ -68,6 +68,20 @@ impl Generator for SwiftGenerator {
     ) -> Result<()> {
         self.generate_impl(api, out_dir, config.swift_module_name())
     }
+
+    fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
+        let module_name = "WeaveFFI";
+        let c_module = format!("C{module_name}");
+        vec![
+            out_dir.join("swift/Package.swift").to_string(),
+            out_dir
+                .join(format!("swift/{c_module}/module.modulemap"))
+                .to_string(),
+            out_dir
+                .join(format!("swift/Sources/{module_name}/{module_name}.swift"))
+                .to_string(),
+        ]
+    }
 }
 
 fn swift_type_for(t: &TypeRef) -> String {
