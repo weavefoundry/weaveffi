@@ -528,6 +528,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "inventory"
+version = "0.1.0"
+dependencies = [
+ "weaveffi-abi",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
