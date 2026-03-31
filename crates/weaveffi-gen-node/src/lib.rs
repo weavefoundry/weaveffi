@@ -18,12 +18,81 @@ impl Generator for NodeGenerator {
             "module.exports = require('./index.node')\n",
         )?;
         std::fs::write(dir.join("types.d.ts"), render_node_dts(api))?;
-        std::fs::write(
-            dir.join("package.json"),
-            "{\n  \"name\": \"weaveffi\",\n  \"version\": \"0.1.0\",\n  \"main\": \"index.js\",\n  \"types\": \"types.d.ts\"\n}\n",
-        )?;
+        std::fs::write(dir.join("package.json"), render_package_json())?;
+        std::fs::write(dir.join("binding.gyp"), render_binding_gyp())?;
+        std::fs::write(dir.join("weaveffi_addon.c"), render_addon_c(api))?;
         Ok(())
     }
+}
+
+fn render_package_json() -> String {
+    r#"{
+  "name": "weaveffi",
+  "version": "0.1.0",
+  "main": "index.js",
+  "types": "types.d.ts",
+  "gypfile": true,
+  "scripts": {
+    "install": "node-gyp rebuild"
+  }
+}
+"#
+    .to_string()
+}
+
+fn render_binding_gyp() -> String {
+    r#"{
+  "targets": [
+    {
+      "target_name": "weaveffi",
+      "sources": ["weaveffi_addon.c"],
+      "include_dirs": ["../c"],
+      "libraries": ["-lweaveffi"]
+    }
+  ]
+}
+"#
+    .to_string()
+}
+
+fn render_addon_c(api: &Api) -> String {
+    let mut out = String::from("#include <node_api.h>\n#include \"weaveffi.h\"\n\n");
+
+    let mut all_exports: Vec<(String, String)> = Vec::new();
+
+    for m in &api.modules {
+        for f in &m.functions {
+            let c_name = format!("weaveffi_{}_{}", m.name, f.name);
+            let napi_name = format!("Napi_{c_name}");
+            all_exports.push((f.name.clone(), napi_name.clone()));
+
+            out.push_str(&format!(
+                "static napi_value {napi_name}(napi_env env, napi_callback_info info) {{\n"
+            ));
+            out.push_str(&format!("  // TODO: implement — call {c_name}()\n"));
+            out.push_str("  return NULL;\n");
+            out.push_str("}\n\n");
+        }
+    }
+
+    out.push_str("static napi_value Init(napi_env env, napi_value exports) {\n");
+    if !all_exports.is_empty() {
+        out.push_str("  napi_property_descriptor props[] = {\n");
+        for (js_name, napi_fn) in &all_exports {
+            out.push_str(&format!(
+                "    {{ \"{js_name}\", NULL, {napi_fn}, NULL, NULL, NULL, napi_default, NULL }},\n"
+            ));
+        }
+        out.push_str("  };\n");
+        out.push_str(&format!(
+            "  napi_define_properties(env, exports, {}, props);\n",
+            all_exports.len()
+        ));
+    }
+    out.push_str("  return exports;\n");
+    out.push_str("}\n\n");
+    out.push_str("NAPI_MODULE(NODE_GYP_MODULE_NAME, Init)\n");
+    out
 }
 
 fn ts_type_for(ty: &TypeRef) -> String {
@@ -239,6 +308,70 @@ mod tests {
             "interface should appear before functions"
         );
         assert!(enum_pos < fn_pos, "enum should appear before functions");
+    }
+
+    #[test]
+    fn node_generates_binding_gyp() {
+        let api = make_api(vec![{
+            let mut m = make_module("math");
+            m.functions.push(Function {
+                name: "add".into(),
+                params: vec![
+                    Param {
+                        name: "a".into(),
+                        ty: TypeRef::I32,
+                    },
+                    Param {
+                        name: "b".into(),
+                        ty: TypeRef::I32,
+                    },
+                ],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+            });
+            m
+        }]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_node_binding_gyp");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        NodeGenerator.generate(&api, out_dir).unwrap();
+
+        let gyp = std::fs::read_to_string(tmp.join("node").join("binding.gyp")).unwrap();
+        assert!(
+            gyp.contains("\"target_name\": \"weaveffi\""),
+            "missing target_name: {gyp}"
+        );
+        assert!(
+            gyp.contains("weaveffi_addon.c"),
+            "missing source file: {gyp}"
+        );
+
+        let addon = std::fs::read_to_string(tmp.join("node").join("weaveffi_addon.c")).unwrap();
+        assert!(
+            addon.contains("napi_value Init("),
+            "missing Init function: {addon}"
+        );
+        assert!(
+            addon.contains("weaveffi_math_add"),
+            "missing C ABI call: {addon}"
+        );
+        assert!(
+            addon.contains("// TODO: implement"),
+            "missing TODO comment: {addon}"
+        );
+
+        let pkg = std::fs::read_to_string(tmp.join("node").join("package.json")).unwrap();
+        assert!(pkg.contains("\"gypfile\": true"), "missing gypfile: {pkg}");
+        assert!(
+            pkg.contains("node-gyp rebuild"),
+            "missing install script: {pkg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
