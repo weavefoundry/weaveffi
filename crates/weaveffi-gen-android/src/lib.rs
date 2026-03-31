@@ -45,7 +45,19 @@ const BUILD_GRADLE: &str = r#"plugins {
 android {
     namespace 'com.weaveffi'
     compileSdk 34
-    defaultConfig { minSdk 24 }
+    defaultConfig {
+        minSdk 24
+        externalNativeBuild {
+            cmake {
+                cppFlags ""
+            }
+        }
+    }
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+        }
+    }
 }
 "#;
 
@@ -2835,6 +2847,44 @@ mod tests {
             jni.contains("(size_t)scores_len"),
             "missing length arg: {jni}"
         );
+    }
+
+    #[test]
+    fn android_build_gradle_has_cmake_config() {
+        let api = make_api(vec![Module {
+            name: "math".to_string(),
+            functions: vec![],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_android_build_gradle_cmake");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        AndroidGenerator.generate(&api, out_dir).unwrap();
+
+        let gradle = std::fs::read_to_string(tmp.join("android/build.gradle")).unwrap();
+        assert!(
+            gradle.contains("externalNativeBuild"),
+            "missing externalNativeBuild in build.gradle: {gradle}"
+        );
+        assert!(
+            gradle.contains("path \"src/main/cpp/CMakeLists.txt\""),
+            "missing cmake path in build.gradle: {gradle}"
+        );
+        assert!(
+            gradle.contains("cppFlags \"\""),
+            "missing cppFlags in build.gradle: {gradle}"
+        );
+        assert!(
+            gradle.contains("namespace 'com.weaveffi'"),
+            "missing namespace in build.gradle: {gradle}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
