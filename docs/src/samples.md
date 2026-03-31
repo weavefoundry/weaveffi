@@ -22,6 +22,18 @@ This produces target-specific output under `generated/` (C headers, Swift
 wrapper, Android skeleton, Node addon loader, WASM stub). Runnable examples
 that consume the generated output are in `examples/`.
 
+## Inventory (multi-module)
+
+Path: `samples/inventory`
+
+A richer sample with two modules (`products` and `orders`) that exercises
+enums, structs with optional and list fields, and handle-based CRUD functions.
+
+```bash
+cargo build -p inventory
+weaveffi generate samples/inventory/inventory.yml -o generated
+```
+
 ## Node addon
 
 Path: `samples/node-addon`
