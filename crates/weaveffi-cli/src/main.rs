@@ -51,6 +51,16 @@ enum Commands {
         /// Input IDL/IR file (yaml|yml|json|toml)
         input: String,
     },
+    Extract {
+        /// Path to a Rust source file to extract API definitions from
+        input: String,
+        /// Output file path (defaults to stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+        /// Output format: yaml (default), json, or toml
+        #[arg(short, long, default_value = "yaml")]
+        format: Option<String>,
+    },
     Doctor,
 }
 
@@ -72,6 +82,15 @@ fn main() -> Result<()> {
             config,
         } => cmd_generate(&input, &out, target.as_deref(), scaffold, config.as_deref())?,
         Commands::Validate { input } => cmd_validate(&input)?,
+        Commands::Extract {
+            input,
+            output,
+            format,
+        } => cmd_extract(
+            &input,
+            output.as_deref(),
+            format.as_deref().unwrap_or("yaml"),
+        )?,
         Commands::Doctor => cmd_doctor()?,
     }
     Ok(())
@@ -347,6 +366,41 @@ fn validation_suggestion(err: &ValidationError) -> &'static str {
             "map keys must be primitive types (i32, u32, i64, f64, bool, string); structs, lists, and maps cannot be keys"
         }
     }
+}
+
+fn cmd_extract(input: &str, output: Option<&str>, format: &str) -> Result<()> {
+    let source = std::fs::read_to_string(input)
+        .wrap_err_with(|| format!("failed to read source file: {}", input))?;
+
+    let mut api = extract::extract_api_from_rust(&source)
+        .wrap_err("failed to extract API from Rust source")?;
+
+    if let Err(e) = validate_api(&mut api) {
+        eprintln!("warning: {}", e);
+    }
+
+    let serialized = match format {
+        "yaml" | "yml" => {
+            serde_yaml::to_string(&api).wrap_err("failed to serialize API as YAML")?
+        }
+        "json" => serde_json::to_string_pretty(&api).wrap_err("failed to serialize API as JSON")?,
+        "toml" => toml::to_string_pretty(&api).wrap_err("failed to serialize API as TOML")?,
+        other => bail!(
+            "unsupported output format: {} (expected yaml, json, or toml)",
+            other
+        ),
+    };
+
+    match output {
+        Some(path) => {
+            std::fs::write(path, &serialized)
+                .wrap_err_with(|| format!("failed to write output file: {}", path))?;
+            println!("Extracted API written to {}", path);
+        }
+        None => print!("{}", serialized),
+    }
+
+    Ok(())
 }
 
 fn cmd_doctor() -> Result<()> {

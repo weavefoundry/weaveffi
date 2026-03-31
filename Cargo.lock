@@ -1177,6 +1177,8 @@ dependencies = [
  "color-eyre",
  "predicates",
  "quote",
+ "serde_json",
+ "serde_yaml",
  "syn",
  "tempfile",
  "toml",

@@ -28,11 +28,14 @@ weaveffi-gen-node = { path = "../weaveffi-gen-node", version = "0.1.0" }
 weaveffi-gen-wasm = { path = "../weaveffi-gen-wasm", version = "0.1.0" }
 syn = { workspace = true }
 quote = { workspace = true }
+serde_yaml = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+serde_yaml = { workspace = true }
 
 [lints]
 workspace = true
