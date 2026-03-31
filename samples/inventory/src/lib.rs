@@ -756,7 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn update_price() {
+    fn update_product_price() {
         let _g = setup();
         let mut err = new_err();
         let name = CString::new("Item").unwrap();
@@ -1042,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn order_item_getters_and_setters() {
+    fn order_item_getters() {
         let item = Box::into_raw(Box::new(OrderItem {
             product_id: 5,
             quantity: 2,
