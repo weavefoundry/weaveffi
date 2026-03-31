@@ -181,6 +181,7 @@ fn render_python_module(api: &Api) -> String {
 fn render_preamble(out: &mut String) {
     out.push_str(
         r#""""WeaveFFI Python ctypes bindings (auto-generated)"""
+import contextlib
 import ctypes
 import platform
 from enum import IntEnum
@@ -227,6 +228,30 @@ def _check_error(err: _WeaveffiErrorStruct) -> None:
         message = err.message.decode("utf-8") if err.message else ""
         _lib.weaveffi_error_clear(ctypes.byref(err))
         raise WeaveffiError(code, message)
+
+
+class _PointerGuard(contextlib.AbstractContextManager):
+    def __init__(self, ptr, free_fn) -> None:
+        self.ptr = ptr
+        self._free_fn = free_fn
+
+    def __exit__(self, *exc) -> bool:
+        if self.ptr is not None:
+            self._free_fn(self.ptr)
+            self.ptr = None
+        return False
+
+
+def _string_to_bytes(s: Optional[str]) -> Optional[bytes]:
+    if s is None:
+        return None
+    return s.encode("utf-8")
+
+
+def _bytes_to_string(ptr) -> Optional[str]:
+    if ptr is None:
+        return None
+    return ptr.decode("utf-8")
 "#,
     );
 }
@@ -411,7 +436,7 @@ fn render_function(out: &mut String, module_name: &str, f: &Function) {
 
 fn py_list_convert_expr(name: &str, elem: &TypeRef) -> String {
     match elem {
-        TypeRef::StringUtf8 => format!("*[v.encode(\"utf-8\") for v in {name}]"),
+        TypeRef::StringUtf8 => format!("*[_string_to_bytes(v) for v in {name}]"),
         TypeRef::Struct(_) => format!("*[v._ptr for v in {name}]"),
         TypeRef::Enum(_) => format!("*[v.value for v in {name}]"),
         TypeRef::Bool => format!("*[1 if v else 0 for v in {name}]"),
@@ -421,7 +446,7 @@ fn py_list_convert_expr(name: &str, elem: &TypeRef) -> String {
 
 fn py_map_elem_convert(list_name: &str, ty: &TypeRef, var: &str) -> String {
     match ty {
-        TypeRef::StringUtf8 => format!("*[{var}.encode(\"utf-8\") for {var} in {list_name}]"),
+        TypeRef::StringUtf8 => format!("*[_string_to_bytes({var}) for {var} in {list_name}]"),
         TypeRef::Enum(_) => format!("*[{var}.value for {var} in {list_name}]"),
         TypeRef::Struct(_) => format!("*[{var}._ptr for {var} in {list_name}]"),
         TypeRef::Bool => format!("*[1 if {var} else 0 for {var} in {list_name}]"),
@@ -448,9 +473,7 @@ fn py_param_conversion(name: &str, ty: &TypeRef, ind: &str) -> Vec<String> {
                 )]
             }
             TypeRef::StringUtf8 => {
-                vec![format!(
-                    "{ind}_{name}_c = {name}.encode(\"utf-8\") if {name} is not None else None"
-                )]
+                vec![format!("{ind}_{name}_c = _string_to_bytes({name})")]
             }
             TypeRef::Enum(_) => {
                 vec![format!(
@@ -509,7 +532,7 @@ fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
             vec![name.to_string()]
         }
         TypeRef::Bool => vec![format!("1 if {name} else 0")],
-        TypeRef::StringUtf8 => vec![format!("{name}.encode(\"utf-8\")")],
+        TypeRef::StringUtf8 => vec![format!("_string_to_bytes({name})")],
         TypeRef::Bytes => vec![format!("_{name}_arr"), format!("len({name})")],
         TypeRef::Struct(_) => vec![format!("{name}._ptr")],
         TypeRef::Enum(_) => vec![format!("{name}.value")],
@@ -542,7 +565,7 @@ fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
 
 fn py_read_element(expr: &str, ty: &TypeRef) -> String {
     match ty {
-        TypeRef::StringUtf8 => format!("{expr}.decode(\"utf-8\")"),
+        TypeRef::StringUtf8 => format!("_bytes_to_string({expr})"),
         TypeRef::Struct(name) => format!("{name}({expr})"),
         TypeRef::Enum(name) => format!("{name}({expr})"),
         TypeRef::Bool => format!("bool({expr})"),
@@ -559,9 +582,7 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
             out.push_str(&format!("{ind}return bool(_result)\n"));
         }
         TypeRef::StringUtf8 => {
-            out.push_str(&format!("{ind}if _result is None:\n"));
-            out.push_str(&format!("{ind}    return \"\"\n"));
-            out.push_str(&format!("{ind}return _result.decode(\"utf-8\")\n"));
+            out.push_str(&format!("{ind}return _bytes_to_string(_result) or \"\"\n"));
         }
         TypeRef::Bytes => {
             out.push_str(&format!("{ind}if not _result:\n"));
@@ -587,9 +608,7 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
 fn render_optional_return(out: &mut String, inner: &TypeRef, ind: &str) {
     match inner {
         TypeRef::StringUtf8 => {
-            out.push_str(&format!("{ind}if _result is None:\n"));
-            out.push_str(&format!("{ind}    return None\n"));
-            out.push_str(&format!("{ind}return _result.decode(\"utf-8\")\n"));
+            out.push_str(&format!("{ind}return _bytes_to_string(_result)\n"));
         }
         TypeRef::Bytes => {
             out.push_str(&format!("{ind}if not _result:\n"));
@@ -946,12 +965,12 @@ mod tests {
         );
         assert!(py.contains("ctypes.c_char_p"), "missing c_char_p: {py}");
         assert!(
-            py.contains("msg.encode(\"utf-8\")"),
-            "missing encode call: {py}"
+            py.contains("_string_to_bytes(msg)"),
+            "missing _string_to_bytes call: {py}"
         );
         assert!(
-            py.contains("_result.decode(\"utf-8\")"),
-            "missing decode call: {py}"
+            py.contains("_bytes_to_string(_result)"),
+            "missing _bytes_to_string call: {py}"
         );
     }
 
@@ -1105,8 +1124,8 @@ mod tests {
             "missing name getter C call: {py}"
         );
         assert!(
-            py.contains("_result.decode(\"utf-8\")"),
-            "missing string decode in getter: {py}"
+            py.contains("_bytes_to_string(_result)"),
+            "missing _bytes_to_string in getter: {py}"
         );
         assert!(
             py.contains("def age(self) -> int:"),
@@ -1294,12 +1313,8 @@ mod tests {
             "missing optional str return: {py}"
         );
         assert!(
-            py.contains("if _result is None:\n        return None"),
-            "missing None check for optional string: {py}"
-        );
-        assert!(
-            py.contains("_result.decode(\"utf-8\")"),
-            "missing decode for optional string: {py}"
+            py.contains("return _bytes_to_string(_result)"),
+            "missing _bytes_to_string for optional string: {py}"
         );
     }
 
@@ -1420,8 +1435,8 @@ mod tests {
             "missing optional getter: {py}"
         );
         assert!(
-            py.contains("return None"),
-            "missing None return for optional getter: {py}"
+            py.contains("_bytes_to_string(_result)"),
+            "missing _bytes_to_string in optional getter: {py}"
         );
     }
 
@@ -2094,8 +2109,8 @@ mod tests {
             "missing Optional[str] return"
         );
         assert!(
-            py.contains("prefix.encode(\"utf-8\") if prefix is not None else None"),
-            "missing optional string encode"
+            py.contains("_string_to_bytes(prefix)"),
+            "missing optional _string_to_bytes"
         );
 
         assert!(
@@ -2170,8 +2185,8 @@ mod tests {
             "missing List[str] return: {py}"
         );
         assert!(
-            py.contains("_result[_i].decode(\"utf-8\") for _i in range(_out_len.value)"),
-            "missing string list decode: {py}"
+            py.contains("_bytes_to_string(_result[_i]) for _i in range(_out_len.value)"),
+            "missing string list _bytes_to_string: {py}"
         );
 
         assert!(
@@ -2259,7 +2274,7 @@ mod tests {
             "missing empty map check"
         );
         assert!(
-            py.contains("_out_keys[_i].decode(\"utf-8\"): _out_values[_i]"),
+            py.contains("_bytes_to_string(_out_keys[_i]): _out_values[_i]"),
             "missing map comprehension"
         );
     }
@@ -2546,7 +2561,7 @@ mod tests {
         assert!(py.contains("contact_type: \"ContactType\""));
         assert!(py.contains("-> int:"));
         assert!(py.contains("weaveffi_contacts_create_contact"));
-        assert!(py.contains("first_name.encode(\"utf-8\")"));
+        assert!(py.contains("_string_to_bytes(first_name)"));
         assert!(py.contains("contact_type.value"));
 
         assert!(py.contains("def get_contact(id: int) -> \"Contact\":"));
@@ -2651,5 +2666,31 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn python_has_memory_helpers() {
+        let api = make_api(vec![]);
+        let py = render_python_module(&api);
+        assert!(
+            py.contains("import contextlib"),
+            "missing contextlib import"
+        );
+        assert!(
+            py.contains("class _PointerGuard(contextlib.AbstractContextManager):"),
+            "missing _PointerGuard class"
+        );
+        assert!(
+            py.contains("def __exit__(self, *exc)"),
+            "missing _PointerGuard.__exit__"
+        );
+        assert!(
+            py.contains("def _string_to_bytes("),
+            "missing _string_to_bytes helper"
+        );
+        assert!(
+            py.contains("def _bytes_to_string("),
+            "missing _bytes_to_string helper"
+        );
     }
 }
