@@ -249,3 +249,37 @@ modules:
         "expected Suggestion section in generate, got: {stderr}"
     );
 }
+
+#[test]
+fn validate_with_warnings() {
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: nodocs
+    functions:
+      - name: do_stuff
+        params: []
+"#;
+    let path = write_temp_file(&dir, "nodocs.yml", yaml);
+
+    let output = cargo_bin()
+        .args(["validate", "--warn", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "validate should succeed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("warning:"),
+        "expected warning prefix in stderr, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("nodocs"),
+        "expected module name in warning, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("no doc comments"),
+        "expected doc comment warning text, got: {stderr}"
+    );
+}

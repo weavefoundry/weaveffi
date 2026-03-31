@@ -11,7 +11,7 @@ use std::process::Command;
 use tracing_subscriber::EnvFilter;
 use weaveffi_core::codegen::{Generator, Orchestrator};
 use weaveffi_core::config::GeneratorConfig;
-use weaveffi_core::validate::{validate_api, ValidationError};
+use weaveffi_core::validate::{collect_warnings, validate_api, ValidationError};
 use weaveffi_gen_android::AndroidGenerator;
 use weaveffi_gen_c::CGenerator;
 use weaveffi_gen_node::NodeGenerator;
@@ -46,10 +46,16 @@ enum Commands {
         /// Path to a TOML configuration file for generator options
         #[arg(long)]
         config: Option<String>,
+        /// Print non-fatal warnings after validation
+        #[arg(long)]
+        warn: bool,
     },
     Validate {
         /// Input IDL/IR file (yaml|yml|json|toml)
         input: String,
+        /// Print non-fatal warnings after validation
+        #[arg(long)]
+        warn: bool,
     },
     Extract {
         /// Path to a Rust source file to extract API definitions from
@@ -80,8 +86,16 @@ fn main() -> Result<()> {
             target,
             scaffold,
             config,
-        } => cmd_generate(&input, &out, target.as_deref(), scaffold, config.as_deref())?,
-        Commands::Validate { input } => cmd_validate(&input)?,
+            warn,
+        } => cmd_generate(
+            &input,
+            &out,
+            target.as_deref(),
+            scaffold,
+            config.as_deref(),
+            warn,
+        )?,
+        Commands::Validate { input, warn } => cmd_validate(&input, warn)?,
         Commands::Extract {
             input,
             output,
@@ -176,6 +190,7 @@ fn cmd_generate(
     targets: Option<&str>,
     emit_scaffold: bool,
     config_path: Option<&str>,
+    warn: bool,
 ) -> Result<()> {
     let config = load_config(config_path)?;
 
@@ -197,6 +212,12 @@ fn cmd_generate(
         .wrap_err_with(|| format!("failed to read input file: {}", input))?;
     let mut api = parse_api_str(&contents, format).map_err(|e| format_parse_error(input, e))?;
     validate_api(&mut api).map_err(format_validation_error)?;
+
+    if warn {
+        for w in collect_warnings(&api) {
+            eprintln!("warning: {w}");
+        }
+    }
 
     let out_dir = Utf8Path::new(out);
     std::fs::create_dir_all(out_dir.as_std_path())
@@ -234,7 +255,7 @@ fn cmd_generate(
     Ok(())
 }
 
-fn cmd_validate(input: &str) -> Result<()> {
+fn cmd_validate(input: &str, warn: bool) -> Result<()> {
     let in_path = Utf8Path::new(input);
     let ext = in_path.extension().unwrap_or("");
     if ext.is_empty() {
@@ -255,6 +276,11 @@ fn cmd_validate(input: &str) -> Result<()> {
 
     match validate_api(&mut api) {
         Ok(()) => {
+            if warn {
+                for w in collect_warnings(&api) {
+                    eprintln!("warning: {w}");
+                }
+            }
             let n_modules = api.modules.len();
             let n_functions: usize = api.modules.iter().map(|m| m.functions.len()).sum();
             let n_structs: usize = api.modules.iter().map(|m| m.structs.len()).sum();
