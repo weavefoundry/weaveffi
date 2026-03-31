@@ -1083,7 +1083,9 @@ mod tests {
             "missing wasm js: {files:?}"
         );
         assert!(
-            files.iter().any(|f| f.contains("python/__init__.py")),
+            files
+                .iter()
+                .any(|f| f.contains("python/weaveffi/__init__.py")),
             "missing python init: {files:?}"
         );
     }
