@@ -6,9 +6,9 @@
 
 WeaveFFI is a CLI code-generation tool that takes an API definition written in
 YAML, JSON, or TOML and produces idiomatic bindings for C, Swift, Android
-(Kotlin/JNI), Node.js (N-API), and WebAssembly — all through a stable C ABI.
-No hand-written JNI glue, no duplicate implementations; one definition, every
-platform.
+(Kotlin/JNI), Node.js (N-API), WebAssembly, Python (ctypes), and .NET
+(P/Invoke) — all through a stable C ABI. No hand-written JNI glue, no
+duplicate implementations; one definition, every platform.
 
 WeaveFFI works with any native library that can expose a stable C ABI — whether
 it's written in Rust, C, C++, Zig, or another language. Rust has first-class
@@ -29,9 +29,12 @@ WeaveFFI tooling or runtime dependencies.
   - Enums with explicit integer discriminants
   - Optionals (`string?`, `Contact?`)
   - Lists (`[i32]`, `[Contact]`)
-- **Five target languages** from one definition (see table below)
+  - Maps (`{string:i32}`, `{string:Contact}`)
+- **Seven target languages** from one definition (see table below)
 - **Validation** — catches duplicate names, unknown type references, reserved keywords, and invalid identifiers before code generation
+- **Extract** — `weaveffi extract` reads annotated Rust source files and produces an API definition, so you don't have to write IDL by hand
 - **Scaffolding** — `--scaffold` flag emits a Rust `extern "C"` stub file so you can fill in the implementation
+- **Generator configuration** — customise Swift module names, Android package, Node package name, and more via a TOML config file (see [docs](https://weavefoundry.github.io/weaveffi/guides/config.html))
 - **Doctor** — `weaveffi doctor` checks for required toolchains (Rust, Xcode, NDK, Node)
 
 ## Supported targets
@@ -43,6 +46,8 @@ WeaveFFI tooling or runtime dependencies.
 | **Android** | `android/` | Kotlin JNI wrapper + Gradle project skeleton |
 | **Node.js** | `node/` | N-API addon loader + TypeScript type definitions |
 | **WASM** | `wasm/` | JavaScript loader stub for `wasm32-unknown-unknown` builds |
+| **Python** | `python/` | ctypes bindings + `.pyi` type stubs + pip-installable package |
+| **.NET** | `dotnet/` | C# P/Invoke bindings + `.csproj` + `.nuspec` for NuGet |
 
 ## Quickstart
 
@@ -83,7 +88,7 @@ modules:
 3. **Generate bindings**
 
 ```bash
-weaveffi generate contacts.yml -o generated
+weaveffi generate contacts.yml -o generated --target c,swift,python
 ```
 
 4. **Inspect the output** — for example, the generated C header (`generated/c/weaveffi.h`) contains:
@@ -112,10 +117,12 @@ weaveffi_contacts_Contact* weaveffi_contacts_create_contact(
 
 | Command | Description |
 |---------|-------------|
-| `weaveffi generate <file> -o <dir>` | Generate bindings from an API definition |
+| `weaveffi generate <file> -o <dir>` | Generate bindings for all targets |
 | `weaveffi generate <file> -o <dir> --target c,swift` | Generate only specific targets |
 | `weaveffi generate <file> -o <dir> --scaffold` | Also emit a Rust FFI stub file |
+| `weaveffi generate <file> -o <dir> --config cfg.toml` | Apply generator configuration |
 | `weaveffi validate <file>` | Validate an API definition without generating |
+| `weaveffi extract <file.rs>` | Extract an API definition from annotated Rust source |
 | `weaveffi new <name>` | Scaffold a new project with a starter API definition |
 | `weaveffi doctor` | Check for required toolchains (Rust, Xcode, NDK, Node) |
 
