@@ -1,16 +1,13 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use weaveffi_core::codegen::Generator;
+use weaveffi_core::config::GeneratorConfig;
 use weaveffi_ir::ir::{Api, TypeRef};
 
 pub struct NodeGenerator;
 
-impl Generator for NodeGenerator {
-    fn name(&self) -> &'static str {
-        "node"
-    }
-
-    fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
+impl NodeGenerator {
+    fn generate_impl(&self, api: &Api, out_dir: &Utf8Path, package_name: &str) -> Result<()> {
         let dir = out_dir.join("node");
         std::fs::create_dir_all(&dir)?;
         std::fs::write(
@@ -18,26 +15,46 @@ impl Generator for NodeGenerator {
             "module.exports = require('./index.node')\n",
         )?;
         std::fs::write(dir.join("types.d.ts"), render_node_dts(api))?;
-        std::fs::write(dir.join("package.json"), render_package_json())?;
+        std::fs::write(dir.join("package.json"), render_package_json(package_name))?;
         std::fs::write(dir.join("binding.gyp"), render_binding_gyp())?;
         std::fs::write(dir.join("weaveffi_addon.c"), render_addon_c(api))?;
         Ok(())
     }
 }
 
-fn render_package_json() -> String {
-    r#"{
-  "name": "weaveffi",
+impl Generator for NodeGenerator {
+    fn name(&self) -> &'static str {
+        "node"
+    }
+
+    fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
+        self.generate_impl(api, out_dir, "weaveffi")
+    }
+
+    fn generate_with_config(
+        &self,
+        api: &Api,
+        out_dir: &Utf8Path,
+        config: &GeneratorConfig,
+    ) -> Result<()> {
+        self.generate_impl(api, out_dir, config.node_package_name())
+    }
+}
+
+fn render_package_json(name: &str) -> String {
+    format!(
+        r#"{{
+  "name": "{name}",
   "version": "0.1.0",
   "main": "index.js",
   "types": "types.d.ts",
   "gypfile": true,
-  "scripts": {
+  "scripts": {{
     "install": "node-gyp rebuild"
-  }
-}
+  }}
+}}
 "#
-    .to_string()
+    )
 }
 
 fn render_binding_gyp() -> String {
@@ -162,6 +179,7 @@ fn render_node_dts(api: &Api) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField};
 
     fn make_api(modules: Vec<Module>) -> Api {
@@ -532,6 +550,36 @@ mod tests {
             "interface should appear before functions"
         );
         assert!(enum_pos < fn_pos, "enum should appear before functions");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn node_custom_package_name() {
+        let api = make_api(vec![make_module("math")]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_node_custom_pkg");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        let config = GeneratorConfig {
+            node_package_name: Some("@myorg/cool-lib".into()),
+            ..GeneratorConfig::default()
+        };
+        NodeGenerator
+            .generate_with_config(&api, out_dir, &config)
+            .unwrap();
+
+        let pkg = std::fs::read_to_string(tmp.join("node").join("package.json")).unwrap();
+        assert!(
+            pkg.contains("\"name\": \"@myorg/cool-lib\""),
+            "package.json should use custom name: {pkg}"
+        );
+        assert!(
+            !pkg.contains("\"name\": \"weaveffi\""),
+            "package.json should not contain default name: {pkg}"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
