@@ -15,6 +15,7 @@ impl Generator for WasmGenerator {
         std::fs::create_dir_all(&wasm_dir)?;
         std::fs::write(wasm_dir.join("README.md"), render_wasm_readme(api))?;
         std::fs::write(wasm_dir.join("weaveffi_wasm.js"), render_wasm_js_stub(api))?;
+        std::fs::write(wasm_dir.join("weaveffi_wasm.d.ts"), render_wasm_dts(api))?;
         Ok(())
     }
 }
@@ -227,6 +228,87 @@ fn api_needs_string_helpers(api: &Api) -> bool {
             .iter()
             .any(|s| s.fields.iter().any(|f| matches!(f.ty, TypeRef::StringUtf8)))
     })
+}
+
+fn ts_type_for(ty: &TypeRef) -> String {
+    match ty {
+        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 => "number".into(),
+        TypeRef::Bool => "boolean".into(),
+        TypeRef::StringUtf8 => "string".into(),
+        TypeRef::Bytes => "Buffer".into(),
+        TypeRef::Handle => "bigint".into(),
+        TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
+        TypeRef::Optional(inner) => format!("{} | null", ts_type_for(inner)),
+        TypeRef::List(inner) => {
+            let inner_ts = ts_type_for(inner);
+            if matches!(inner.as_ref(), TypeRef::Optional(_)) {
+                format!("({inner_ts})[]")
+            } else {
+                format!("{inner_ts}[]")
+            }
+        }
+        TypeRef::Map(k, v) => format!("Record<{}, {}>", ts_type_for(k), ts_type_for(v)),
+    }
+}
+
+fn render_wasm_dts(api: &Api) -> String {
+    let mut out =
+        String::from("// Generated TypeScript declarations for WeaveFFI WASM bindings\n\n");
+
+    for m in &api.modules {
+        for s in &m.structs {
+            out.push_str(&format!("export interface {} {{\n", s.name));
+            for field in &s.fields {
+                out.push_str(&format!(
+                    "  readonly {}: {};\n",
+                    field.name,
+                    ts_type_for(&field.ty)
+                ));
+            }
+            out.push_str("}\n\n");
+        }
+
+        for e in &m.enums {
+            out.push_str(&format!("export declare const {}: Readonly<{{\n", e.name));
+            for v in &e.variants {
+                out.push_str(&format!("  {}: {};\n", v.name, v.value));
+            }
+            out.push_str("}>;\n\n");
+        }
+    }
+
+    out.push_str("export interface WeaveFFIModule {\n");
+    if api.modules.iter().any(|m| !m.functions.is_empty()) {
+        out.push_str("  _raw: WebAssembly.Exports;\n");
+        for module in &api.modules {
+            if module.functions.is_empty() {
+                continue;
+            }
+            out.push_str(&format!("  {}: {{\n", module.name));
+            for func in &module.functions {
+                let params: Vec<String> = func
+                    .params
+                    .iter()
+                    .map(|p| format!("{}: {}", p.name, ts_type_for(&p.ty)))
+                    .collect();
+                let ret = match &func.returns {
+                    Some(ty) => ts_type_for(ty),
+                    None => "void".into(),
+                };
+                out.push_str(&format!(
+                    "    {}({}): {};\n",
+                    func.name,
+                    params.join(", "),
+                    ret
+                ));
+            }
+            out.push_str("  };\n");
+        }
+    }
+    out.push_str("}\n\n");
+
+    out.push_str("export function loadWeaveFFI(url: string): Promise<WeaveFFIModule>;\n");
+    out
 }
 
 fn render_wasm_js_stub(api: &Api) -> String {
@@ -867,6 +949,26 @@ mod tests {
         assert!(js.contains("Blue: 2"));
         assert!(js.contains("_raw: wasm"));
         assert!(js.contains("math: {"));
+    }
+
+    #[test]
+    fn wasm_generates_dts() {
+        let tmp = std::env::temp_dir().join("weaveffi_test_wasm_dts");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let out = Utf8Path::from_path(tmp.as_path()).unwrap();
+        let api = sample_api();
+        WasmGenerator.generate(&api, out).unwrap();
+
+        let dts = std::fs::read_to_string(out.join("wasm/weaveffi_wasm.d.ts")).unwrap();
+        assert!(dts.contains("export interface WeaveFFIModule"));
+        assert!(dts.contains("export function loadWeaveFFI(url: string): Promise<WeaveFFIModule>"));
+        assert!(dts.contains("add(a: number, b: number): number"));
+        assert!(dts.contains("export interface Point"));
+        assert!(dts.contains("readonly x: number"));
+        assert!(dts.contains("readonly y: number"));
+        assert!(dts.contains("export declare const Color"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
