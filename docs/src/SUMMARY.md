@@ -11,6 +11,7 @@
 - [Generators](generators/README.md)
   - [Android](generators/android.md)
   - [C](generators/c.md)
+  - [.NET](generators/dotnet.md)
   - [Node](generators/node.md)
   - [Python](generators/python.md)
   - [Swift](generators/swift.md)
