@@ -64,7 +64,21 @@ fn rust_param_fragments(name: &str, ty: &TypeRef, module: &str) -> Vec<String> {
                 ]
             }
         }
-        TypeRef::Map(_, _) => vec![format!("{name}: *const u8"), format!("{name}_len: usize")],
+        TypeRef::Map(key_ty, val_ty) => {
+            let k = rust_scalar_type(key_ty, module);
+            let v = rust_scalar_type(val_ty, module);
+            let key_frag = if is_pointer_type(key_ty) {
+                format!("{name}_keys: *const *const {k}")
+            } else {
+                format!("{name}_keys: *const {k}")
+            };
+            let val_frag = if is_pointer_type(val_ty) {
+                format!("{name}_values: *const *const {v}")
+            } else {
+                format!("{name}_values: *const {v}")
+            };
+            vec![key_frag, val_frag, format!("{name}_len: usize")]
+        }
     }
 }
 
@@ -143,11 +157,28 @@ fn render_module(out: &mut String, module: &Module) {
             params.extend(rust_param_fragments(&p.name, &p.ty, mod_name));
         }
         let ret_sig = if let Some(ret) = &f.returns {
-            let (ret_ty, needs_len) = rust_return_type(ret, mod_name);
-            if needs_len {
-                params.push("out_len: *mut usize".into());
+            if let TypeRef::Map(key_ty, val_ty) = ret {
+                let k = rust_scalar_type(key_ty, mod_name);
+                let v = rust_scalar_type(val_ty, mod_name);
+                if is_pointer_type(key_ty) {
+                    params.push(format!("out_keys: *mut *mut {k}"));
+                } else {
+                    params.push(format!("out_keys: *mut {k}"));
+                }
+                if is_pointer_type(val_ty) {
+                    params.push(format!("out_values: *mut *mut {v}"));
+                } else {
+                    params.push(format!("out_values: *mut {v}"));
+                }
+                params.push("out_map_len: *mut usize".into());
+                String::new()
+            } else {
+                let (ret_ty, needs_len) = rust_return_type(ret, mod_name);
+                if needs_len {
+                    params.push("out_len: *mut usize".into());
+                }
+                format!(" -> {ret_ty}")
             }
-            format!(" -> {ret_ty}")
         } else {
             String::new()
         };
@@ -518,6 +549,51 @@ mod tests {
         );
         let out = render_scaffold(&api);
         assert!(out.contains("-> u64"), "handle return should be u64: {out}");
+    }
+
+    #[test]
+    fn scaffold_with_map_type() {
+        let api = minimal_api(
+            vec![Function {
+                name: "get_scores".into(),
+                params: vec![Param {
+                    name: "grades".into(),
+                    ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
+                }],
+                returns: Some(TypeRef::Map(
+                    Box::new(TypeRef::StringUtf8),
+                    Box::new(TypeRef::I32),
+                )),
+                doc: None,
+                r#async: false,
+            }],
+            vec![],
+        );
+        let out = render_scaffold(&api);
+        assert!(
+            out.contains("grades_keys: *const *const c_char"),
+            "map param should have keys array: {out}"
+        );
+        assert!(
+            out.contains("grades_values: *const i32"),
+            "map param should have values array: {out}"
+        );
+        assert!(
+            out.contains("grades_len: usize"),
+            "map param should have length: {out}"
+        );
+        assert!(
+            out.contains("out_keys: *mut *mut c_char"),
+            "map return should have out_keys: {out}"
+        );
+        assert!(
+            out.contains("out_values: *mut i32"),
+            "map return should have out_values: {out}"
+        );
+        assert!(
+            out.contains("out_map_len: *mut usize"),
+            "map return should have out_map_len: {out}"
+        );
     }
 
     #[test]
