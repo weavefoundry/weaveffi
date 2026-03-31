@@ -317,6 +317,9 @@ fn validation_suggestion(err: &ValidationError) -> &'static str {
         ValidationError::UnknownTypeRef { .. } => {
             "define a struct or enum with this name in the same module, or check for typos"
         }
+        ValidationError::InvalidMapKey { .. } => {
+            "map keys must be primitive types (i32, u32, i64, f64, bool, string); structs, lists, and maps cannot be keys"
+        }
     }
 }
 
@@ -506,6 +509,9 @@ mod tests {
                 value: 0,
             },
             ValidationError::UnknownTypeRef { name: "Foo".into() },
+            ValidationError::InvalidMapKey {
+                key_type: "struct Foo".into(),
+            },
         ];
 
         for err in &cases {
