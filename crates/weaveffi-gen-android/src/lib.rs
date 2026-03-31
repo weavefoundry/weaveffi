@@ -69,7 +69,7 @@ fn kotlin_type(t: &TypeRef) -> String {
         TypeRef::Enum(_) => "Int".to_string(),
         TypeRef::Optional(inner) => format!("{}?", kotlin_type(inner)),
         TypeRef::List(inner) => kotlin_list_type(inner),
-        TypeRef::Map(_, _) => "Long".to_string(),
+        TypeRef::Map(k, v) => format!("Map<{}, {}>", kotlin_type(k), kotlin_type(v)),
     }
 }
 
@@ -218,7 +218,7 @@ fn render_kotlin_enum(out: &mut String, e: &EnumDef) {
 }
 
 fn render_jni_c(api: &Api) -> String {
-    let mut jni_c = String::from("#include <jni.h>\n#include <stdbool.h>\n#include <stdint.h>\n#include <stddef.h>\n#include \"weaveffi.h\"\n\n");
+    let mut jni_c = String::from("#include <jni.h>\n#include <stdbool.h>\n#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n#include \"weaveffi.h\"\n\n");
     for m in &api.modules {
         for f in &m.functions {
             let jret = jni_ret_type(f.returns.as_ref());
@@ -307,6 +307,7 @@ fn write_param_acquire(out: &mut String, name: &str, ty: &TypeRef) {
         }
         TypeRef::Optional(inner) => write_optional_acquire(out, name, inner),
         TypeRef::List(inner) => write_list_acquire(out, name, inner),
+        TypeRef::Map(k, v) => write_map_acquire(out, name, k, v),
         _ => {}
     }
 }
@@ -497,6 +498,252 @@ fn write_list_acquire(out: &mut String, name: &str, inner: &TypeRef) {
     }
 }
 
+fn map_elem_c_type(ty: &TypeRef) -> &'static str {
+    match ty {
+        TypeRef::I32 | TypeRef::Enum(_) => "int32_t",
+        TypeRef::U32 => "uint32_t",
+        TypeRef::I64 | TypeRef::Handle => "int64_t",
+        TypeRef::F64 => "double",
+        TypeRef::Bool => "jboolean",
+        TypeRef::StringUtf8 => "const char*",
+        _ => "void*",
+    }
+}
+
+fn map_elem_c_call_cast(ty: &TypeRef) -> &'static str {
+    match ty {
+        TypeRef::I32 | TypeRef::Enum(_) => "(const int32_t*)",
+        TypeRef::U32 => "(const uint32_t*)",
+        TypeRef::I64 | TypeRef::Handle => "(const int64_t*)",
+        TypeRef::F64 => "(const double*)",
+        TypeRef::Bool => "(const bool*)",
+        TypeRef::StringUtf8 => "(const char* const*)",
+        _ => "(const void*)",
+    }
+}
+
+fn write_map_acquire(out: &mut String, name: &str, key: &TypeRef, val: &TypeRef) {
+    let key_c = map_elem_c_type(key);
+    let val_c = map_elem_c_type(val);
+    let _ = writeln!(
+        out,
+        "    jclass {n}_mc = (*env)->FindClass(env, \"java/util/Map\");",
+        n = name
+    );
+    let _ = writeln!(
+        out,
+        "    jsize {n}_len = (jsize)(*env)->CallIntMethod(env, {n}, (*env)->GetMethodID(env, {n}_mc, \"size\", \"()I\"));",
+        n = name
+    );
+    let _ = writeln!(
+        out,
+        "    jobject {n}_ks = (*env)->CallObjectMethod(env, {n}, (*env)->GetMethodID(env, {n}_mc, \"keySet\", \"()Ljava/util/Set;\"));",
+        n = name
+    );
+    let _ = writeln!(
+        out,
+        "    jclass {n}_sc = (*env)->FindClass(env, \"java/util/Set\");",
+        n = name
+    );
+    let _ = writeln!(
+        out,
+        "    jobjectArray {n}_ka = (jobjectArray)(*env)->CallObjectMethod(env, {n}_ks, (*env)->GetMethodID(env, {n}_sc, \"toArray\", \"()[Ljava/lang/Object;\"));",
+        n = name
+    );
+    let _ = writeln!(
+        out,
+        "    jmethodID {n}_gm = (*env)->GetMethodID(env, {n}_mc, \"get\", \"(Ljava/lang/Object;)Ljava/lang/Object;\");",
+        n = name
+    );
+    let _ = writeln!(
+        out,
+        "    {kc}* {n}_c_keys = ({kc}*)malloc((size_t){n}_len * sizeof({kc}));",
+        kc = key_c,
+        n = name
+    );
+    let _ = writeln!(
+        out,
+        "    {vc}* {n}_c_vals = ({vc}*)malloc((size_t){n}_len * sizeof({vc}));",
+        vc = val_c,
+        n = name
+    );
+    if matches!(key, TypeRef::StringUtf8) {
+        let _ = writeln!(
+            out,
+            "    jstring* {n}_jk = (jstring*)malloc((size_t){n}_len * sizeof(jstring));",
+            n = name
+        );
+    }
+    if matches!(val, TypeRef::StringUtf8) {
+        let _ = writeln!(
+            out,
+            "    jstring* {n}_jv = (jstring*)malloc((size_t){n}_len * sizeof(jstring));",
+            n = name
+        );
+    }
+    write_map_unbox_setup(out, name, "k", key);
+    write_map_unbox_setup(out, name, "v", val);
+    let _ = writeln!(
+        out,
+        "    for (jsize {n}_i = 0; {n}_i < {n}_len; {n}_i++) {{",
+        n = name
+    );
+    let _ = writeln!(
+        out,
+        "        jobject {n}_ko = (*env)->GetObjectArrayElement(env, {n}_ka, {n}_i);",
+        n = name
+    );
+    write_map_elem_extract(out, name, "k", "c_keys", key, &format!("{name}_ko"));
+    let _ = writeln!(
+        out,
+        "        jobject {n}_vo = (*env)->CallObjectMethod(env, {n}, {n}_gm, {n}_ko);",
+        n = name
+    );
+    write_map_elem_extract(out, name, "v", "c_vals", val, &format!("{name}_vo"));
+    let _ = writeln!(out, "    }}");
+}
+
+fn write_map_unbox_setup(out: &mut String, name: &str, suffix: &str, ty: &TypeRef) {
+    match ty {
+        TypeRef::I32 | TypeRef::Enum(_) => {
+            let _ = writeln!(
+                out,
+                "    jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Integer\");",
+                n = name,
+                s = suffix
+            );
+            let _ = writeln!(
+                out,
+                "    jmethodID {n}_{s}m = (*env)->GetMethodID(env, {n}_{s}c, \"intValue\", \"()I\");",
+                n = name,
+                s = suffix
+            );
+        }
+        TypeRef::U32 | TypeRef::I64 | TypeRef::Handle => {
+            let _ = writeln!(
+                out,
+                "    jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Long\");",
+                n = name,
+                s = suffix
+            );
+            let _ = writeln!(
+                out,
+                "    jmethodID {n}_{s}m = (*env)->GetMethodID(env, {n}_{s}c, \"longValue\", \"()J\");",
+                n = name,
+                s = suffix
+            );
+        }
+        TypeRef::F64 => {
+            let _ = writeln!(
+                out,
+                "    jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Double\");",
+                n = name,
+                s = suffix
+            );
+            let _ = writeln!(
+                out,
+                "    jmethodID {n}_{s}m = (*env)->GetMethodID(env, {n}_{s}c, \"doubleValue\", \"()D\");",
+                n = name,
+                s = suffix
+            );
+        }
+        TypeRef::Bool => {
+            let _ = writeln!(
+                out,
+                "    jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Boolean\");",
+                n = name,
+                s = suffix
+            );
+            let _ = writeln!(
+                out,
+                "    jmethodID {n}_{s}m = (*env)->GetMethodID(env, {n}_{s}c, \"booleanValue\", \"()Z\");",
+                n = name,
+                s = suffix
+            );
+        }
+        _ => {}
+    }
+}
+
+fn write_map_elem_extract(
+    out: &mut String,
+    name: &str,
+    suffix: &str,
+    arr: &str,
+    ty: &TypeRef,
+    obj_var: &str,
+) {
+    match ty {
+        TypeRef::StringUtf8 => {
+            let _ = writeln!(
+                out,
+                "        {n}_j{s}[{n}_i] = (jstring){obj};",
+                n = name,
+                s = suffix,
+                obj = obj_var
+            );
+            let _ = writeln!(
+                out,
+                "        {n}_{a}[{n}_i] = (*env)->GetStringUTFChars(env, (jstring){obj}, NULL);",
+                n = name,
+                a = arr,
+                obj = obj_var
+            );
+        }
+        TypeRef::I32 | TypeRef::Enum(_) => {
+            let _ = writeln!(
+                out,
+                "        {n}_{a}[{n}_i] = (int32_t)(*env)->CallIntMethod(env, {obj}, {n}_{s}m);",
+                n = name,
+                a = arr,
+                obj = obj_var,
+                s = suffix
+            );
+        }
+        TypeRef::U32 => {
+            let _ = writeln!(
+                out,
+                "        {n}_{a}[{n}_i] = (uint32_t)(*env)->CallLongMethod(env, {obj}, {n}_{s}m);",
+                n = name,
+                a = arr,
+                obj = obj_var,
+                s = suffix
+            );
+        }
+        TypeRef::I64 | TypeRef::Handle => {
+            let _ = writeln!(
+                out,
+                "        {n}_{a}[{n}_i] = (int64_t)(*env)->CallLongMethod(env, {obj}, {n}_{s}m);",
+                n = name,
+                a = arr,
+                obj = obj_var,
+                s = suffix
+            );
+        }
+        TypeRef::F64 => {
+            let _ = writeln!(
+                out,
+                "        {n}_{a}[{n}_i] = (*env)->CallDoubleMethod(env, {obj}, {n}_{s}m);",
+                n = name,
+                a = arr,
+                obj = obj_var,
+                s = suffix
+            );
+        }
+        TypeRef::Bool => {
+            let _ = writeln!(
+                out,
+                "        {n}_{a}[{n}_i] = (*env)->CallBooleanMethod(env, {obj}, {n}_{s}m);",
+                n = name,
+                a = arr,
+                obj = obj_var,
+                s = suffix
+            );
+        }
+        _ => {}
+    }
+}
+
 fn build_c_call_args(args: &mut Vec<String>, name: &str, ty: &TypeRef, module: &str) {
     match ty {
         TypeRef::StringUtf8 => {
@@ -557,7 +804,11 @@ fn build_c_call_args(args: &mut Vec<String>, name: &str, ty: &TypeRef, module: &
             }
             args.push(format!("(size_t){n}_len", n = name));
         }
-        TypeRef::Map(_, _) => args.push(format!("(const void*){}", name)),
+        TypeRef::Map(k, v) => {
+            args.push(format!("{}{n}_c_keys", map_elem_c_call_cast(k), n = name));
+            args.push(format!("{}{n}_c_vals", map_elem_c_call_cast(v), n = name));
+            args.push(format!("(size_t){n}_len", n = name));
+        }
     }
 }
 
@@ -618,6 +869,9 @@ fn write_return_handling(
         }
         TypeRef::List(inner) => {
             write_list_return(jni_c, inner, c_sym, &args_str, returns, params);
+        }
+        TypeRef::Map(k, v) => {
+            write_map_return(jni_c, k, v, c_sym, &args_str, returns, params);
         }
         ret_type => {
             let c_ty = c_type_for_return(ret_type);
@@ -820,6 +1074,125 @@ fn write_list_return(
     }
 }
 
+fn write_map_return(
+    out: &mut String,
+    key: &TypeRef,
+    val: &TypeRef,
+    c_sym: &str,
+    args_str: &str,
+    returns: Option<&TypeRef>,
+    params: &[weaveffi_ir::ir::Param],
+) {
+    let key_c = map_elem_c_type(key);
+    let val_c = map_elem_c_type(val);
+    let _ = writeln!(out, "    size_t out_map_len = 0;");
+    let _ = writeln!(out, "    {kc}* out_keys = NULL;", kc = key_c);
+    let _ = writeln!(out, "    {vc}* out_vals = NULL;", vc = val_c);
+    if args_str.is_empty() {
+        let _ = writeln!(
+            out,
+            "    {}(out_keys, out_vals, &out_map_len, &err);",
+            c_sym
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "    {}({}, out_keys, out_vals, &out_map_len, &err);",
+            c_sym, args_str
+        );
+    }
+    write_error_check(out, returns);
+    release_jni_resources(out, params);
+    let _ = writeln!(
+        out,
+        "    jclass hm_cls = (*env)->FindClass(env, \"java/util/HashMap\");"
+    );
+    let _ = writeln!(out, "    jobject result = (*env)->NewObject(env, hm_cls, (*env)->GetMethodID(env, hm_cls, \"<init>\", \"(I)V\"), (jint)out_map_len);");
+    let _ = writeln!(out, "    jmethodID hm_put = (*env)->GetMethodID(env, hm_cls, \"put\", \"(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;\");");
+    let _ = writeln!(out, "    for (size_t i = 0; i < out_map_len; i++) {{");
+    write_map_box_elem(out, key, "jkey", "out_keys");
+    write_map_box_elem(out, val, "jval", "out_vals");
+    let _ = writeln!(
+        out,
+        "        (*env)->CallObjectMethod(env, result, hm_put, jkey, jval);"
+    );
+    let _ = writeln!(out, "    }}");
+    let _ = writeln!(out, "    return result;");
+}
+
+fn write_map_box_elem(out: &mut String, ty: &TypeRef, var: &str, arr: &str) {
+    match ty {
+        TypeRef::StringUtf8 => {
+            let _ = writeln!(
+                out,
+                "        jstring {v} = (*env)->NewStringUTF(env, {a}[i]);",
+                v = var,
+                a = arr
+            );
+        }
+        TypeRef::I32 | TypeRef::Enum(_) => {
+            let _ = writeln!(
+                out,
+                "        jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Integer\");",
+                v = var
+            );
+            let _ = writeln!(
+                out,
+                "        jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(I)Ljava/lang/Integer;\"), (jint){a}[i]);",
+                v = var,
+                a = arr
+            );
+        }
+        TypeRef::U32 | TypeRef::I64 | TypeRef::Handle => {
+            let _ = writeln!(
+                out,
+                "        jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Long\");",
+                v = var
+            );
+            let _ = writeln!(
+                out,
+                "        jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(J)Ljava/lang/Long;\"), (jlong){a}[i]);",
+                v = var,
+                a = arr
+            );
+        }
+        TypeRef::F64 => {
+            let _ = writeln!(
+                out,
+                "        jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Double\");",
+                v = var
+            );
+            let _ = writeln!(
+                out,
+                "        jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(D)Ljava/lang/Double;\"), (jdouble){a}[i]);",
+                v = var,
+                a = arr
+            );
+        }
+        TypeRef::Bool => {
+            let _ = writeln!(
+                out,
+                "        jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Boolean\");",
+                v = var
+            );
+            let _ = writeln!(
+                out,
+                "        jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(Z)Ljava/lang/Boolean;\"), {a}[i]);",
+                v = var,
+                a = arr
+            );
+        }
+        _ => {
+            let _ = writeln!(
+                out,
+                "        jobject {v} = (jobject){a}[i];",
+                v = var,
+                a = arr
+            );
+        }
+    }
+}
+
 fn write_error_check(out: &mut String, ret_type: Option<&TypeRef>) {
     let _ = writeln!(out, "    if (err.code != 0) {{");
     let _ = writeln!(
@@ -901,9 +1274,43 @@ fn release_jni_resources(out: &mut String, params: &[weaveffi_ir::ir::Param]) {
                 }
                 _ => {}
             },
+            TypeRef::Map(k, v) => write_map_release(out, &p.name, k, v),
             _ => {}
         }
     }
+}
+
+fn write_map_release(out: &mut String, name: &str, key: &TypeRef, val: &TypeRef) {
+    if matches!(key, TypeRef::StringUtf8) {
+        let _ = writeln!(
+            out,
+            "    for (jsize {n}_ri = 0; {n}_ri < {n}_len; {n}_ri++) {{",
+            n = name
+        );
+        let _ = writeln!(
+            out,
+            "        (*env)->ReleaseStringUTFChars(env, {n}_jk[{n}_ri], {n}_c_keys[{n}_ri]);",
+            n = name
+        );
+        let _ = writeln!(out, "    }}");
+        let _ = writeln!(out, "    free({n}_jk);", n = name);
+    }
+    if matches!(val, TypeRef::StringUtf8) {
+        let _ = writeln!(
+            out,
+            "    for (jsize {n}_ri = 0; {n}_ri < {n}_len; {n}_ri++) {{",
+            n = name
+        );
+        let _ = writeln!(
+            out,
+            "        (*env)->ReleaseStringUTFChars(env, {n}_jv[{n}_ri], {n}_c_vals[{n}_ri]);",
+            n = name
+        );
+        let _ = writeln!(out, "    }}");
+        let _ = writeln!(out, "    free({n}_jv);", n = name);
+    }
+    let _ = writeln!(out, "    free((void*){n}_c_keys);", n = name);
+    let _ = writeln!(out, "    free((void*){n}_c_vals);", n = name);
 }
 
 fn to_pascal_case(s: &str) -> String {
@@ -1355,6 +1762,7 @@ fn release_jni_resources_single(out: &mut String, name: &str, ty: &TypeRef) {
             }
             _ => {}
         },
+        TypeRef::Map(k, v) => write_map_release(out, name, k, v),
         _ => {}
     }
 }
@@ -2334,5 +2742,129 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn kotlin_type_for_map() {
+        assert_eq!(
+            kotlin_type(&TypeRef::Map(
+                Box::new(TypeRef::StringUtf8),
+                Box::new(TypeRef::I32)
+            )),
+            "Map<String, Int>"
+        );
+        assert_eq!(
+            kotlin_type(&TypeRef::Map(
+                Box::new(TypeRef::StringUtf8),
+                Box::new(TypeRef::F64)
+            )),
+            "Map<String, Double>"
+        );
+        assert_eq!(
+            kotlin_type(&TypeRef::Map(
+                Box::new(TypeRef::I32),
+                Box::new(TypeRef::StringUtf8)
+            )),
+            "Map<Int, String>"
+        );
+    }
+
+    #[test]
+    fn function_with_map_param_kotlin() {
+        let api = make_api(vec![Module {
+            name: "store".to_string(),
+            functions: vec![Function {
+                name: "update_scores".to_string(),
+                params: vec![Param {
+                    name: "scores".to_string(),
+                    ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let kt = render_kotlin(&api);
+        assert!(
+            kt.contains("scores: Map<String, Int>"),
+            "missing Map<String, Int> param: {kt}"
+        );
+    }
+
+    #[test]
+    fn function_with_map_param_jni() {
+        let api = make_api(vec![Module {
+            name: "store".to_string(),
+            functions: vec![Function {
+                name: "update_scores".to_string(),
+                params: vec![Param {
+                    name: "scores".to_string(),
+                    ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let jni = render_jni_c(&api);
+        assert!(
+            jni.contains("jobject scores"),
+            "missing jobject param: {jni}"
+        );
+        assert!(
+            jni.contains("java/util/Map"),
+            "missing Map class lookup: {jni}"
+        );
+        assert!(
+            jni.contains("scores_c_keys"),
+            "missing parallel keys array: {jni}"
+        );
+        assert!(
+            jni.contains("scores_c_vals"),
+            "missing parallel vals array: {jni}"
+        );
+        assert!(
+            jni.contains("(size_t)scores_len"),
+            "missing length arg: {jni}"
+        );
+    }
+
+    #[test]
+    fn function_returning_map_jni() {
+        let api = make_api(vec![Module {
+            name: "store".to_string(),
+            functions: vec![Function {
+                name: "get_scores".to_string(),
+                params: vec![],
+                returns: Some(TypeRef::Map(
+                    Box::new(TypeRef::StringUtf8),
+                    Box::new(TypeRef::I32),
+                )),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let jni = render_jni_c(&api);
+        assert!(
+            jni.contains("JNIEXPORT jobject JNICALL"),
+            "missing jobject return: {jni}"
+        );
+        assert!(
+            jni.contains("java/util/HashMap"),
+            "missing HashMap construction: {jni}"
+        );
+        assert!(jni.contains("out_map_len"), "missing out_map_len: {jni}");
     }
 }
