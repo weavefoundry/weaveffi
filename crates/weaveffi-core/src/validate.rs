@@ -78,7 +78,7 @@ fn check_identifier(name: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-pub fn validate_api(api: &Api) -> Result<(), ValidationError> {
+pub fn validate_api(api: &mut Api) -> Result<(), ValidationError> {
     let mut module_names = BTreeSet::new();
     for m in &api.modules {
         if !module_names.insert(m.name.clone()) {
@@ -86,7 +86,40 @@ pub fn validate_api(api: &Api) -> Result<(), ValidationError> {
         }
         validate_module(m)?;
     }
+    resolve_type_refs(api);
     Ok(())
+}
+
+pub fn resolve_type_refs(api: &mut Api) {
+    for module in &mut api.modules {
+        let enum_names: BTreeSet<&str> = module.enums.iter().map(|e| e.name.as_str()).collect();
+        for f in &mut module.functions {
+            for p in &mut f.params {
+                resolve_single_type_ref(&mut p.ty, &enum_names);
+            }
+            if let Some(ret) = &mut f.returns {
+                resolve_single_type_ref(ret, &enum_names);
+            }
+        }
+        for s in &mut module.structs {
+            for field in &mut s.fields {
+                resolve_single_type_ref(&mut field.ty, &enum_names);
+            }
+        }
+    }
+}
+
+fn resolve_single_type_ref(ty: &mut TypeRef, enum_names: &BTreeSet<&str>) {
+    match ty {
+        TypeRef::Struct(name) if enum_names.contains(name.as_str()) => {
+            let name = std::mem::take(name);
+            *ty = TypeRef::Enum(name);
+        }
+        TypeRef::Optional(inner) | TypeRef::List(inner) => {
+            resolve_single_type_ref(inner, enum_names);
+        }
+        _ => {}
+    }
 }
 
 fn validate_module(module: &Module) -> Result<(), ValidationError> {
@@ -323,24 +356,25 @@ mod tests {
 
     #[test]
     fn valid_api_passes() {
-        assert!(validate_api(&simple_api()).is_ok());
+        let mut api = simple_api();
+        assert!(validate_api(&mut api).is_ok());
     }
 
     #[test]
     fn duplicate_module_names_rejected() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![simple_module("dup"), simple_module("dup")],
         };
         assert!(matches!(
-            validate_api(&api).unwrap_err(),
+            validate_api(&mut api).unwrap_err(),
             ValidationError::DuplicateModuleName(n) if n == "dup"
         ));
     }
 
     #[test]
     fn duplicate_function_names_rejected() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
                 name: "mymod".to_string(),
@@ -351,7 +385,7 @@ mod tests {
             }],
         };
         assert!(matches!(
-            validate_api(&api).unwrap_err(),
+            validate_api(&mut api).unwrap_err(),
             ValidationError::DuplicateFunctionName { .. }
         ));
     }
@@ -359,7 +393,7 @@ mod tests {
     #[test]
     fn reserved_keywords_rejected() {
         for kw in ["type", "async"] {
-            let api = Api {
+            let mut api = Api {
                 version: "0.1.0".to_string(),
                 modules: vec![Module {
                     name: kw.to_string(),
@@ -370,7 +404,7 @@ mod tests {
                 }],
             };
             assert!(
-                validate_api(&api).is_err(),
+                validate_api(&mut api).is_err(),
                 "Expected reserved keyword '{kw}' to be rejected"
             );
         }
@@ -379,7 +413,7 @@ mod tests {
     #[test]
     fn invalid_identifiers_rejected() {
         for bad in ["123", "has spaces", ""] {
-            let api = Api {
+            let mut api = Api {
                 version: "0.1.0".to_string(),
                 modules: vec![Module {
                     name: bad.to_string(),
@@ -390,7 +424,7 @@ mod tests {
                 }],
             };
             assert!(
-                validate_api(&api).is_err(),
+                validate_api(&mut api).is_err(),
                 "Expected invalid identifier '{bad}' to be rejected"
             );
         }
@@ -398,7 +432,7 @@ mod tests {
 
     #[test]
     fn async_functions_rejected() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
                 name: "mymod".to_string(),
@@ -415,14 +449,14 @@ mod tests {
             }],
         };
         assert!(matches!(
-            validate_api(&api).unwrap_err(),
+            validate_api(&mut api).unwrap_err(),
             ValidationError::AsyncNotSupported { .. }
         ));
     }
 
     #[test]
     fn empty_module_name_rejected() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
                 name: "".to_string(),
@@ -433,14 +467,14 @@ mod tests {
             }],
         };
         assert!(matches!(
-            validate_api(&api).unwrap_err(),
+            validate_api(&mut api).unwrap_err(),
             ValidationError::NoModuleName
         ));
     }
 
     #[test]
     fn doc_example_error_domain_validates() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
                 name: "contacts".to_string(),
@@ -496,12 +530,12 @@ mod tests {
                 }),
             }],
         };
-        assert!(validate_api(&api).is_ok());
+        assert!(validate_api(&mut api).is_ok());
     }
 
     #[test]
     fn error_code_zero_rejected() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
                 name: "mymod".to_string(),
@@ -519,7 +553,7 @@ mod tests {
             }],
         };
         assert!(matches!(
-            validate_api(&api).unwrap_err(),
+            validate_api(&mut api).unwrap_err(),
             ValidationError::InvalidErrorCode { module, name }
                 if module == "mymod" && name == "success"
         ));
@@ -527,7 +561,7 @@ mod tests {
 
     #[test]
     fn error_domain_name_collision_rejected() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
                 name: "mymod".to_string(),
@@ -545,7 +579,7 @@ mod tests {
             }],
         };
         assert!(matches!(
-            validate_api(&api).unwrap_err(),
+            validate_api(&mut api).unwrap_err(),
             ValidationError::NameCollisionWithErrorDomain { module, name }
                 if module == "mymod" && name == "do_stuff"
         ));
@@ -553,7 +587,7 @@ mod tests {
 
     #[test]
     fn duplicate_error_names_rejected() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
                 name: "mymod".to_string(),
@@ -578,7 +612,7 @@ mod tests {
             }],
         };
         assert!(matches!(
-            validate_api(&api).unwrap_err(),
+            validate_api(&mut api).unwrap_err(),
             ValidationError::DuplicateErrorName { module, name }
                 if module == "mymod" && name == "fail"
         ));
@@ -586,7 +620,7 @@ mod tests {
 
     #[test]
     fn duplicate_error_codes_rejected() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
                 name: "mymod".to_string(),
@@ -611,7 +645,7 @@ mod tests {
             }],
         };
         assert!(matches!(
-            validate_api(&api).unwrap_err(),
+            validate_api(&mut api).unwrap_err(),
             ValidationError::DuplicateErrorCode { .. }
         ));
     }
@@ -630,7 +664,7 @@ mod tests {
 
     #[test]
     fn duplicate_struct_names_rejected() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
                 name: "mymod".to_string(),
@@ -641,7 +675,7 @@ mod tests {
             }],
         };
         assert!(matches!(
-            validate_api(&api).unwrap_err(),
+            validate_api(&mut api).unwrap_err(),
             ValidationError::DuplicateStructName { module, name }
                 if module == "mymod" && name == "Point"
         ));
@@ -649,7 +683,7 @@ mod tests {
 
     #[test]
     fn empty_struct_rejected() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
                 name: "mymod".to_string(),
@@ -664,7 +698,7 @@ mod tests {
             }],
         };
         assert!(matches!(
-            validate_api(&api).unwrap_err(),
+            validate_api(&mut api).unwrap_err(),
             ValidationError::EmptyStruct { module, name }
                 if module == "mymod" && name == "Empty"
         ));
@@ -672,7 +706,7 @@ mod tests {
 
     #[test]
     fn duplicate_struct_field_names_rejected() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
                 name: "mymod".to_string(),
@@ -698,7 +732,7 @@ mod tests {
             }],
         };
         assert!(matches!(
-            validate_api(&api).unwrap_err(),
+            validate_api(&mut api).unwrap_err(),
             ValidationError::DuplicateStructField { struct_name, field }
                 if struct_name == "Point" && field == "x"
         ));
@@ -725,7 +759,7 @@ mod tests {
 
     #[test]
     fn duplicate_enum_names_rejected() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
                 name: "mymod".to_string(),
@@ -736,7 +770,7 @@ mod tests {
             }],
         };
         assert!(matches!(
-            validate_api(&api).unwrap_err(),
+            validate_api(&mut api).unwrap_err(),
             ValidationError::DuplicateEnumName { module, name }
                 if module == "mymod" && name == "Color"
         ));
@@ -744,7 +778,7 @@ mod tests {
 
     #[test]
     fn empty_enum_rejected() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
                 name: "mymod".to_string(),
@@ -759,7 +793,7 @@ mod tests {
             }],
         };
         assert!(matches!(
-            validate_api(&api).unwrap_err(),
+            validate_api(&mut api).unwrap_err(),
             ValidationError::EmptyEnum { module, name }
                 if module == "mymod" && name == "Empty"
         ));
@@ -767,7 +801,7 @@ mod tests {
 
     #[test]
     fn duplicate_enum_variant_rejected() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
                 name: "mymod".to_string(),
@@ -793,7 +827,7 @@ mod tests {
             }],
         };
         assert!(matches!(
-            validate_api(&api).unwrap_err(),
+            validate_api(&mut api).unwrap_err(),
             ValidationError::DuplicateEnumVariant { enum_name, variant }
                 if enum_name == "Color" && variant == "Red"
         ));
@@ -801,7 +835,7 @@ mod tests {
 
     #[test]
     fn duplicate_enum_value_rejected() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
                 name: "mymod".to_string(),
@@ -827,7 +861,7 @@ mod tests {
             }],
         };
         assert!(matches!(
-            validate_api(&api).unwrap_err(),
+            validate_api(&mut api).unwrap_err(),
             ValidationError::DuplicateEnumValue { enum_name, value }
                 if enum_name == "Color" && value == 0
         ));
@@ -835,7 +869,7 @@ mod tests {
 
     #[test]
     fn unknown_type_ref_rejected() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
                 name: "mymod".to_string(),
@@ -855,14 +889,14 @@ mod tests {
             }],
         };
         assert!(matches!(
-            validate_api(&api).unwrap_err(),
+            validate_api(&mut api).unwrap_err(),
             ValidationError::UnknownTypeRef { name } if name == "Foo"
         ));
     }
 
     #[test]
     fn valid_struct_ref_passes() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
                 name: "mymod".to_string(),
@@ -881,12 +915,12 @@ mod tests {
                 errors: None,
             }],
         };
-        assert!(validate_api(&api).is_ok());
+        assert!(validate_api(&mut api).is_ok());
     }
 
     #[test]
     fn unknown_type_ref_in_optional_rejected() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
                 name: "mymod".to_string(),
@@ -906,14 +940,14 @@ mod tests {
             }],
         };
         assert!(matches!(
-            validate_api(&api).unwrap_err(),
+            validate_api(&mut api).unwrap_err(),
             ValidationError::UnknownTypeRef { name } if name == "Bar"
         ));
     }
 
     #[test]
     fn unknown_type_ref_in_list_rejected() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
                 name: "mymod".to_string(),
@@ -930,14 +964,14 @@ mod tests {
             }],
         };
         assert!(matches!(
-            validate_api(&api).unwrap_err(),
+            validate_api(&mut api).unwrap_err(),
             ValidationError::UnknownTypeRef { name } if name == "Baz"
         ));
     }
 
     #[test]
     fn struct_field_referencing_unknown_type() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
                 name: "mymod".to_string(),
@@ -956,14 +990,14 @@ mod tests {
             }],
         };
         assert!(matches!(
-            validate_api(&api).unwrap_err(),
+            validate_api(&mut api).unwrap_err(),
             ValidationError::UnknownTypeRef { name } if name == "Nonexistent"
         ));
     }
 
     #[test]
     fn function_param_with_optional_struct() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
                 name: "mymod".to_string(),
@@ -990,12 +1024,12 @@ mod tests {
                 errors: None,
             }],
         };
-        assert!(validate_api(&api).is_ok());
+        assert!(validate_api(&mut api).is_ok());
     }
 
     #[test]
     fn function_param_with_list_of_enums() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
                 name: "mymod".to_string(),
@@ -1014,12 +1048,12 @@ mod tests {
                 errors: None,
             }],
         };
-        assert!(validate_api(&api).is_ok());
+        assert!(validate_api(&mut api).is_ok());
     }
 
     #[test]
     fn nested_optional_list_validates() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
                 name: "mymod".to_string(),
@@ -1045,12 +1079,12 @@ mod tests {
                 errors: None,
             }],
         };
-        assert!(validate_api(&api).is_ok());
+        assert!(validate_api(&mut api).is_ok());
     }
 
     #[test]
     fn enum_variant_value_zero_allowed() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
                 name: "mymod".to_string(),
@@ -1075,12 +1109,12 @@ mod tests {
                 errors: None,
             }],
         };
-        assert!(validate_api(&api).is_ok());
+        assert!(validate_api(&mut api).is_ok());
     }
 
     #[test]
     fn valid_enum_ref_passes() {
-        let api = Api {
+        let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
                 name: "mymod".to_string(),
@@ -1096,6 +1130,117 @@ mod tests {
                 errors: None,
             }],
         };
-        assert!(validate_api(&api).is_ok());
+        assert!(validate_api(&mut api).is_ok());
+    }
+
+    #[test]
+    fn resolve_enum_ref_in_function_param() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "paint".to_string(),
+                    params: vec![Param {
+                        name: "color".to_string(),
+                        ty: TypeRef::Struct("Color".to_string()),
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![simple_enum("Color")],
+                errors: None,
+            }],
+        };
+        validate_api(&mut api).unwrap();
+        assert_eq!(
+            api.modules[0].functions[0].params[0].ty,
+            TypeRef::Enum("Color".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_enum_ref_in_optional() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "paint".to_string(),
+                    params: vec![Param {
+                        name: "color".to_string(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::Struct("Color".to_string()))),
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![simple_enum("Color")],
+                errors: None,
+            }],
+        };
+        validate_api(&mut api).unwrap();
+        assert_eq!(
+            api.modules[0].functions[0].params[0].ty,
+            TypeRef::Optional(Box::new(TypeRef::Enum("Color".to_string())))
+        );
+    }
+
+    #[test]
+    fn struct_ref_not_changed() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "save".to_string(),
+                    params: vec![Param {
+                        name: "c".to_string(),
+                        ty: TypeRef::Struct("Contact".to_string()),
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![simple_struct("Contact")],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        validate_api(&mut api).unwrap();
+        assert_eq!(
+            api.modules[0].functions[0].params[0].ty,
+            TypeRef::Struct("Contact".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_enum_ref_in_struct_field() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![simple_function("ok_fn")],
+                structs: vec![StructDef {
+                    name: "Widget".to_string(),
+                    doc: None,
+                    fields: vec![StructField {
+                        name: "color".to_string(),
+                        ty: TypeRef::Struct("Color".to_string()),
+                        doc: None,
+                    }],
+                }],
+                enums: vec![simple_enum("Color")],
+                errors: None,
+            }],
+        };
+        validate_api(&mut api).unwrap();
+        assert_eq!(
+            api.modules[0].structs[0].fields[0].ty,
+            TypeRef::Enum("Color".to_string())
+        );
     }
 }

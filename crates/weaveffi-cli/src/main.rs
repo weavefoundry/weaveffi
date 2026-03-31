@@ -150,8 +150,8 @@ fn cmd_generate(input: &str, out: &str, targets: Option<&str>, emit_scaffold: bo
     };
     let contents = std::fs::read_to_string(in_path.as_std_path())
         .wrap_err_with(|| format!("failed to read input file: {}", input))?;
-    let api = parse_api_str(&contents, format).map_err(|e| format_parse_error(input, e))?;
-    validate_api(&api).map_err(format_validation_error)?;
+    let mut api = parse_api_str(&contents, format).map_err(|e| format_parse_error(input, e))?;
+    validate_api(&mut api).map_err(format_validation_error)?;
 
     let out_dir = Utf8Path::new(out);
     std::fs::create_dir_all(out_dir.as_std_path())
@@ -206,9 +206,9 @@ fn cmd_validate(input: &str) -> Result<()> {
     };
     let contents = std::fs::read_to_string(in_path.as_std_path())
         .wrap_err_with(|| format!("failed to read input file: {}", input))?;
-    let api = parse_api_str(&contents, format).map_err(|e| format_parse_error(input, e))?;
+    let mut api = parse_api_str(&contents, format).map_err(|e| format_parse_error(input, e))?;
 
-    match validate_api(&api) {
+    match validate_api(&mut api) {
         Ok(()) => {
             let n_modules = api.modules.len();
             let n_functions: usize = api.modules.iter().map(|m| m.functions.len()).sum();
