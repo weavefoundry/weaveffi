@@ -1177,6 +1177,7 @@ dependencies = [
  "color-eyre",
  "predicates",
  "tempfile",
+ "toml",
  "tracing-subscriber",
  "weaveffi-core",
  "weaveffi-gen-android",

@@ -9,6 +9,7 @@ use std::ffi::OsStr;
 use std::process::Command;
 use tracing_subscriber::EnvFilter;
 use weaveffi_core::codegen::{Generator, Orchestrator};
+use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::validate::{validate_api, ValidationError};
 use weaveffi_gen_android::AndroidGenerator;
 use weaveffi_gen_c::CGenerator;
@@ -41,6 +42,9 @@ enum Commands {
         /// Also generate a scaffold.rs with Rust FFI function stubs
         #[arg(long)]
         scaffold: bool,
+        /// Path to a TOML configuration file for generator options
+        #[arg(long)]
+        config: Option<String>,
     },
     Validate {
         /// Input IDL/IR file (yaml|yml|json|toml)
@@ -64,7 +68,8 @@ fn main() -> Result<()> {
             out,
             target,
             scaffold,
-        } => cmd_generate(&input, &out, target.as_deref(), scaffold)?,
+            config,
+        } => cmd_generate(&input, &out, target.as_deref(), scaffold, config.as_deref())?,
         Commands::Validate { input } => cmd_validate(&input)?,
         Commands::Doctor => cmd_doctor()?,
     }
@@ -133,7 +138,27 @@ fn cmd_new(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_generate(input: &str, out: &str, targets: Option<&str>, emit_scaffold: bool) -> Result<()> {
+fn load_config(path: Option<&str>) -> Result<GeneratorConfig> {
+    match path {
+        Some(p) => {
+            let contents = std::fs::read_to_string(p)
+                .wrap_err_with(|| format!("failed to read config file: {}", p))?;
+            toml::from_str(&contents)
+                .wrap_err_with(|| format!("failed to parse config file: {}", p))
+        }
+        None => Ok(GeneratorConfig::default()),
+    }
+}
+
+fn cmd_generate(
+    input: &str,
+    out: &str,
+    targets: Option<&str>,
+    emit_scaffold: bool,
+    config_path: Option<&str>,
+) -> Result<()> {
+    let config = load_config(config_path)?;
+
     let in_path = Utf8Path::new(input);
     let ext = in_path.extension().unwrap_or("");
     if ext.is_empty() {
@@ -174,7 +199,7 @@ fn cmd_generate(input: &str, out: &str, targets: Option<&str>, emit_scaffold: bo
     }
 
     orchestrator
-        .run(&api, out_dir)
+        .run(&api, out_dir, &config)
         .map_err(|e| eyre!("{:#}", e))?;
 
     if emit_scaffold {
@@ -580,5 +605,34 @@ mod tests {
             "missing error message in: {msg}"
         );
         assert!(msg.contains("foo"), "missing module name in: {msg}");
+    }
+
+    #[test]
+    fn config_file_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("weaveffi.toml");
+        std::fs::write(
+            &cfg_path,
+            concat!(
+                "swift_module_name = \"MyApp\"\n",
+                "android_package = \"com.example.myapp\"\n",
+                "strip_module_prefix = true\n",
+            ),
+        )
+        .unwrap();
+
+        let cfg = load_config(Some(cfg_path.to_str().unwrap())).unwrap();
+        assert_eq!(cfg.swift_module_name(), "MyApp");
+        assert_eq!(cfg.android_package(), "com.example.myapp");
+        assert!(cfg.strip_module_prefix);
+        assert_eq!(cfg.c_prefix(), "weaveffi");
+    }
+
+    #[test]
+    fn config_default_when_no_file() {
+        let cfg = load_config(None).unwrap();
+        assert_eq!(cfg.swift_module_name(), "WeaveFFI");
+        assert_eq!(cfg.android_package(), "com.weaveffi");
+        assert!(!cfg.strip_module_prefix);
     }
 }
