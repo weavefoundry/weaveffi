@@ -56,6 +56,7 @@ fn swift_type_for(t: &TypeRef) -> String {
         TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
         TypeRef::Optional(inner) => format!("{}?", swift_type_for(inner)),
         TypeRef::List(inner) => format!("[{}]", swift_type_for(inner)),
+        TypeRef::Map(k, v) => format!("[{}: {}]", swift_type_for(k), swift_type_for(v)),
     }
 }
 

@@ -51,6 +51,7 @@ pub enum TypeRef {
     Enum(String),
     Optional(Box<TypeRef>),
     List(Box<TypeRef>),
+    Map(Box<TypeRef>, Box<TypeRef>),
 }
 
 pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
@@ -61,6 +62,15 @@ pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
     if s.starts_with('[') && s.ends_with(']') {
         let inner = &s[1..s.len() - 1];
         return parse_type_ref(inner).map(|t| TypeRef::List(Box::new(t)));
+    }
+    if s.starts_with('{') && s.ends_with('}') {
+        let inner = &s[1..s.len() - 1];
+        let colon = inner
+            .find(':')
+            .ok_or_else(|| "map type missing ':' separator".to_string())?;
+        let key = parse_type_ref(&inner[..colon])?;
+        let val = parse_type_ref(&inner[colon + 1..])?;
+        return Ok(TypeRef::Map(Box::new(key), Box::new(val)));
     }
     if let Some(inner) = s.strip_suffix('?') {
         return parse_type_ref(inner).map(|t| TypeRef::Optional(Box::new(t)));
@@ -91,6 +101,7 @@ fn type_ref_to_string(ty: &TypeRef) -> String {
         TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
         TypeRef::Optional(inner) => format!("{}?", type_ref_to_string(inner)),
         TypeRef::List(inner) => format!("[{}]", type_ref_to_string(inner)),
+        TypeRef::Map(k, v) => format!("{{{}:{}}}", type_ref_to_string(k), type_ref_to_string(v)),
     }
 }
 
@@ -567,6 +578,103 @@ modules:
         set.insert(TypeRef::Optional(Box::new(TypeRef::I32)));
         set.insert(TypeRef::List(Box::new(TypeRef::I32)));
         set.insert(TypeRef::Optional(Box::new(TypeRef::Struct("Foo".into()))));
-        assert_eq!(set.len(), 4);
+        set.insert(TypeRef::Map(
+            Box::new(TypeRef::StringUtf8),
+            Box::new(TypeRef::I32),
+        ));
+        assert_eq!(set.len(), 5);
+    }
+
+    #[test]
+    fn parse_type_ref_map_primitives() {
+        assert_eq!(
+            parse_type_ref("{string:i32}"),
+            Ok(TypeRef::Map(
+                Box::new(TypeRef::StringUtf8),
+                Box::new(TypeRef::I32)
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_type_ref_map_struct_value() {
+        assert_eq!(
+            parse_type_ref("{string:Contact}"),
+            Ok(TypeRef::Map(
+                Box::new(TypeRef::StringUtf8),
+                Box::new(TypeRef::Struct("Contact".into()))
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_type_ref_map_nested_value() {
+        assert_eq!(
+            parse_type_ref("{string:[i32]}"),
+            Ok(TypeRef::Map(
+                Box::new(TypeRef::StringUtf8),
+                Box::new(TypeRef::List(Box::new(TypeRef::I32)))
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_type_ref_map_missing_colon() {
+        assert!(parse_type_ref("{string}").is_err());
+    }
+
+    #[test]
+    fn typeref_map_round_trip() {
+        let ty = TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32));
+        let json = serde_json::to_string(&ty).unwrap();
+        assert_eq!(json, r#""{string:i32}""#);
+        let back: TypeRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ty);
+    }
+
+    #[test]
+    fn typeref_map_struct_round_trip() {
+        let ty = TypeRef::Map(
+            Box::new(TypeRef::StringUtf8),
+            Box::new(TypeRef::Struct("Contact".into())),
+        );
+        let json = serde_json::to_string(&ty).unwrap();
+        assert_eq!(json, r#""{string:Contact}""#);
+        let back: TypeRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ty);
+    }
+
+    #[test]
+    fn typeref_map_yaml_deser() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: contacts
+    functions:
+      - name: get_metadata
+        params: []
+        return: "{string:i32}"
+"#;
+        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert_eq!(
+            f.returns,
+            Some(TypeRef::Map(
+                Box::new(TypeRef::StringUtf8),
+                Box::new(TypeRef::I32)
+            ))
+        );
+    }
+
+    #[test]
+    fn typeref_optional_map_round_trip() {
+        let ty = TypeRef::Optional(Box::new(TypeRef::Map(
+            Box::new(TypeRef::StringUtf8),
+            Box::new(TypeRef::I32),
+        )));
+        let json = serde_json::to_string(&ty).unwrap();
+        assert_eq!(json, r#""{string:i32}?""#);
+        let back: TypeRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ty);
     }
 }

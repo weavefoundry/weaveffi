@@ -118,6 +118,10 @@ fn resolve_single_type_ref(ty: &mut TypeRef, enum_names: &BTreeSet<&str>) {
         TypeRef::Optional(inner) | TypeRef::List(inner) => {
             resolve_single_type_ref(inner, enum_names);
         }
+        TypeRef::Map(k, v) => {
+            resolve_single_type_ref(k, enum_names);
+            resolve_single_type_ref(v, enum_names);
+        }
         _ => {}
     }
 }
@@ -272,6 +276,10 @@ fn validate_type_ref(ty: &TypeRef, known: &BTreeSet<&str>) -> Result<(), Validat
             Ok(())
         }
         TypeRef::Optional(inner) | TypeRef::List(inner) => validate_type_ref(inner, known),
+        TypeRef::Map(k, v) => {
+            validate_type_ref(k, known)?;
+            validate_type_ref(v, known)
+        }
         _ => Ok(()),
     }
 }
