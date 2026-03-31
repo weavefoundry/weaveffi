@@ -30,11 +30,12 @@ syn = { workspace = true }
 quote = { workspace = true }
 serde_yaml = { workspace = true }
 serde_json = { workspace = true }
+similar = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
-tempfile = "3"
 serde_yaml = { workspace = true }
 
 [lints]
