@@ -9,6 +9,31 @@ pub enum ValidationWarning {
     EmptyModuleDoc { module: String },
 }
 
+impl std::fmt::Display for ValidationWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DeprecatedHandleType { module, function } => {
+                write!(
+                    f,
+                    "deprecated 'handle' type in {module}::{function}; consider using typed handles"
+                )
+            }
+            Self::LargeEnumVariantCount { enum_name, count } => {
+                write!(f, "enum '{enum_name}' has {count} variants (>100)")
+            }
+            Self::DeepNesting { location, depth } => {
+                write!(
+                    f,
+                    "deep type nesting at {location} (depth {depth}, max recommended 3)"
+                )
+            }
+            Self::EmptyModuleDoc { module } => {
+                write!(f, "module '{module}' has no doc comments on any function")
+            }
+        }
+    }
+}
+
 pub fn collect_warnings(api: &Api) -> Vec<ValidationWarning> {
     let mut warnings = Vec::new();
     for module in &api.modules {
