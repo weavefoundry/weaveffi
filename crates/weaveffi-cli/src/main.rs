@@ -721,6 +721,22 @@ fn cmd_doctor() -> Result<()> {
         Some("Install Node.js which includes npm, or use pnpm/yarn"),
     );
 
+    check_cross_targets();
+
+    println!("\nWebAssembly tools:");
+    check_tool(
+        "wasm-pack",
+        &["--version"],
+        "wasm-pack",
+        Some("install with `cargo install wasm-pack`"),
+    );
+    check_tool(
+        "wasm-bindgen",
+        &["--version"],
+        "wasm-bindgen-cli",
+        Some("install with `cargo install wasm-bindgen-cli`"),
+    );
+
     println!("\nDoctor completed. Address any missing items above.");
     Ok(())
 }
@@ -739,6 +755,37 @@ fn sanitize_module_name(name: &str) -> String {
         String::from("module")
     } else {
         out
+    }
+}
+
+fn check_cross_targets() {
+    println!("\nCross-compilation targets:");
+
+    let installed = match Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output()
+    {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).to_string(),
+        _ => {
+            println!("- rustup: MISSING (cannot check installed targets)");
+            println!("  hint: install via https://rustup.rs");
+            return;
+        }
+    };
+
+    let required = [
+        ("aarch64-apple-ios", "iOS"),
+        ("aarch64-linux-android", "Android"),
+        ("wasm32-unknown-unknown", "WebAssembly"),
+    ];
+
+    for (target, label) in &required {
+        if installed.lines().any(|line| line.trim() == *target) {
+            println!("- {} ({}): installed", label, target);
+        } else {
+            println!("- {} ({}): MISSING", label, target);
+            println!("  hint: install with `rustup target add {}`", target);
+        }
     }
 }
 
@@ -1030,6 +1077,46 @@ mod tests {
         assert!(
             files.iter().any(|f| f.contains("wasm/weaveffi_wasm.js")),
             "missing wasm js: {files:?}"
+        );
+    }
+
+    #[test]
+    fn doctor_checks_cross_targets() {
+        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .arg("doctor")
+            .output()
+            .expect("failed to run weaveffi doctor");
+
+        let stdout = String::from_utf8_lossy(&cmd.stdout);
+        assert!(cmd.status.success(), "doctor failed: {stdout}");
+        assert!(
+            stdout.contains("Cross-compilation targets:"),
+            "missing cross-target section in doctor output: {stdout}"
+        );
+        assert!(
+            stdout.contains("aarch64-apple-ios"),
+            "missing iOS target check: {stdout}"
+        );
+        assert!(
+            stdout.contains("aarch64-linux-android"),
+            "missing Android target check: {stdout}"
+        );
+        assert!(
+            stdout.contains("wasm32-unknown-unknown"),
+            "missing WASM target check: {stdout}"
+        );
+        assert!(
+            stdout.contains("WebAssembly tools:"),
+            "missing wasm tools section: {stdout}"
+        );
+        assert!(
+            stdout.contains("wasm-pack"),
+            "missing wasm-pack check: {stdout}"
+        );
+        assert!(
+            stdout.contains("wasm-bindgen-cli"),
+            "missing wasm-bindgen-cli check: {stdout}"
         );
     }
 
