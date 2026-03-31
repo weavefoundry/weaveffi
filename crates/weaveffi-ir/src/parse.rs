@@ -815,4 +815,92 @@ modules:
             ))
         );
     }
+
+    #[test]
+    fn parse_inventory_sample() {
+        let yaml = std::fs::read_to_string("../../samples/inventory/inventory.yml").unwrap();
+        let api = parse_api_str(&yaml, "yml").unwrap();
+        assert_eq!(api.version, "0.1.0");
+        assert_eq!(api.modules.len(), 2);
+
+        let products = &api.modules[0];
+        assert_eq!(products.name, "products");
+        assert_eq!(products.enums.len(), 1);
+        assert_eq!(products.structs.len(), 1);
+        assert_eq!(products.functions.len(), 5);
+
+        let cat = &products.enums[0];
+        assert_eq!(cat.name, "Category");
+        assert_eq!(cat.variants.len(), 4);
+        assert_eq!(cat.variants[0].name, "Electronics");
+        assert_eq!(cat.variants[0].value, 0);
+        assert_eq!(cat.variants[3].name, "Books");
+        assert_eq!(cat.variants[3].value, 3);
+
+        let product = &products.structs[0];
+        assert_eq!(product.name, "Product");
+        assert_eq!(product.fields.len(), 6);
+        assert_eq!(product.fields[0].ty, TypeRef::I64);
+        assert_eq!(product.fields[1].ty, TypeRef::StringUtf8);
+        assert_eq!(
+            product.fields[2].ty,
+            TypeRef::Optional(Box::new(TypeRef::StringUtf8))
+        );
+        assert_eq!(product.fields[3].ty, TypeRef::F64);
+        assert_eq!(
+            product.fields[4].ty,
+            TypeRef::Struct("Category".to_string())
+        );
+        assert_eq!(
+            product.fields[5].ty,
+            TypeRef::List(Box::new(TypeRef::StringUtf8))
+        );
+
+        assert_eq!(products.functions[0].name, "create_product");
+        assert_eq!(products.functions[0].returns, Some(TypeRef::Handle));
+        assert_eq!(products.functions[1].name, "get_product");
+        assert_eq!(
+            products.functions[1].returns,
+            Some(TypeRef::Struct("Product".to_string()))
+        );
+        assert_eq!(products.functions[2].name, "search_products");
+        assert_eq!(
+            products.functions[2].returns,
+            Some(TypeRef::List(Box::new(TypeRef::Struct(
+                "Product".to_string()
+            ))))
+        );
+        assert_eq!(products.functions[3].name, "update_price");
+        assert_eq!(products.functions[3].returns, Some(TypeRef::Bool));
+        assert_eq!(products.functions[4].name, "delete_product");
+        assert_eq!(products.functions[4].returns, Some(TypeRef::Bool));
+
+        let orders = &api.modules[1];
+        assert_eq!(orders.name, "orders");
+        assert_eq!(orders.enums.len(), 0);
+        assert_eq!(orders.structs.len(), 2);
+        assert_eq!(orders.functions.len(), 3);
+
+        let order_item = &orders.structs[0];
+        assert_eq!(order_item.name, "OrderItem");
+        assert_eq!(order_item.fields.len(), 3);
+
+        let order = &orders.structs[1];
+        assert_eq!(order.name, "Order");
+        assert_eq!(order.fields.len(), 4);
+        assert_eq!(
+            order.fields[1].ty,
+            TypeRef::List(Box::new(TypeRef::Struct("OrderItem".to_string())))
+        );
+
+        assert_eq!(orders.functions[0].name, "create_order");
+        assert_eq!(orders.functions[0].returns, Some(TypeRef::Handle));
+        assert_eq!(orders.functions[1].name, "get_order");
+        assert_eq!(
+            orders.functions[1].returns,
+            Some(TypeRef::Struct("Order".to_string()))
+        );
+        assert_eq!(orders.functions[2].name, "cancel_order");
+        assert_eq!(orders.functions[2].returns, Some(TypeRef::Bool));
+    }
 }
