@@ -75,7 +75,7 @@ fn is_c_value_type(ty: &TypeRef) -> bool {
 
 fn needs_closure(ty: &TypeRef) -> bool {
     match ty {
-        TypeRef::StringUtf8 | TypeRef::Bytes | TypeRef::List(_) => true,
+        TypeRef::StringUtf8 | TypeRef::Bytes | TypeRef::List(_) | TypeRef::Map(_, _) => true,
         TypeRef::Optional(inner) => is_c_value_type(inner),
         _ => false,
     }
@@ -254,6 +254,11 @@ fn build_c_call_args(params: &[Param], module_name: &str) -> String {
                 args.push(format!("{}_ptr", p.name));
                 args.push(format!("{}_len", p.name));
             }
+            TypeRef::Map(_, _) => {
+                args.push(format!("{}_keys_ptr", p.name));
+                args.push(format!("{}_values_ptr", p.name));
+                args.push(format!("{}_len", p.name));
+            }
             _ => args.push(p.name.clone()),
         }
     }
@@ -303,6 +308,9 @@ fn render_direct_call(out: &mut String, f: &Function, call_with_err: &str) {
         }
         Some(TypeRef::List(inner)) => {
             render_list_return(out, call_with_err, inner);
+        }
+        Some(TypeRef::Map(k, v)) => {
+            render_map_return(out, call_with_err, k, v);
         }
         Some(_) => {
             out.push_str(&format!("        let rv = {}\n", call_with_err));
@@ -445,6 +453,103 @@ fn render_list_return_inner(out: &mut String, call: &str, inner: &TypeRef, inden
     }
 }
 
+fn swift_c_ptr_element(ty: &TypeRef) -> String {
+    match ty {
+        TypeRef::I32 => "Int32".to_string(),
+        TypeRef::U32 => "UInt32".to_string(),
+        TypeRef::I64 => "Int64".to_string(),
+        TypeRef::F64 => "Double".to_string(),
+        TypeRef::Bool => "Bool".to_string(),
+        TypeRef::Handle => "UInt64".to_string(),
+        TypeRef::StringUtf8 => "UnsafePointer<CChar>?".to_string(),
+        TypeRef::Bytes => "UInt8".to_string(),
+        TypeRef::Enum(_) => "Int32".to_string(),
+        TypeRef::Struct(_) => "OpaquePointer?".to_string(),
+        TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            "OpaquePointer?".to_string()
+        }
+    }
+}
+
+fn map_element_read(ty: &TypeRef, expr: &str) -> String {
+    match ty {
+        TypeRef::StringUtf8 => format!("String(cString: {}!)", expr),
+        TypeRef::Enum(name) => format!("{}(rawValue: {}.rawValue)!", name, expr),
+        TypeRef::Struct(name) => format!("{}(ptr: {}!)", name, expr),
+        _ => expr.to_string(),
+    }
+}
+
+fn render_map_return(out: &mut String, call_with_err: &str, k: &TypeRef, v: &TypeRef) {
+    let key_elem = swift_c_ptr_element(k);
+    let val_elem = swift_c_ptr_element(v);
+    let key_swift = swift_type_for(k);
+    let val_swift = swift_type_for(v);
+
+    out.push_str(&format!(
+        "        var outKeysPtr: UnsafeMutablePointer<{}>? = nil\n",
+        key_elem
+    ));
+    out.push_str(&format!(
+        "        var outValuesPtr: UnsafeMutablePointer<{}>? = nil\n",
+        val_elem
+    ));
+    out.push_str("        var outLen: Int = 0\n");
+    let modified_call =
+        call_with_err.replace("&err)", "&outKeysPtr, &outValuesPtr, &outLen, &err)");
+    out.push_str(&format!("        {}\n", modified_call));
+    out.push_str("        try check(&err)\n");
+    out.push_str(
+        "        guard let outKeys = outKeysPtr, let outValues = outValuesPtr else { return [:] }\n",
+    );
+    out.push_str(&format!(
+        "        var result: [{}: {}] = [:]\n",
+        key_swift, val_swift
+    ));
+    out.push_str("        for i in 0..<outLen {\n");
+    let key_expr = map_element_read(k, "outKeys[i]");
+    let val_expr = map_element_read(v, "outValues[i]");
+    out.push_str(&format!(
+        "            result[{}] = {}\n",
+        key_expr, val_expr
+    ));
+    out.push_str("        }\n");
+    out.push_str("        return result\n");
+}
+
+fn render_map_return_inner(out: &mut String, call: &str, k: &TypeRef, v: &TypeRef, indent: &str) {
+    let key_swift = swift_type_for(k);
+    let val_swift = swift_type_for(v);
+
+    out.push_str(&format!("{}    {}\n", indent, call));
+    out.push_str(&format!("{}    try check(&err)\n", indent));
+    out.push_str(&format!(
+        "{}    guard let outKeys = outKeysPtr, let outValues = outValuesPtr else {{ return [:] }}\n",
+        indent
+    ));
+    out.push_str(&format!(
+        "{}    var result: [{}: {}] = [:]\n",
+        indent, key_swift, val_swift
+    ));
+    out.push_str(&format!("{}    for i in 0..<outLen {{\n", indent));
+    let key_expr = map_element_read(k, "outKeys[i]");
+    let val_expr = map_element_read(v, "outValues[i]");
+    out.push_str(&format!(
+        "{}        result[{}] = {}\n",
+        indent, key_expr, val_expr
+    ));
+    out.push_str(&format!("{}    }}\n", indent));
+    out.push_str(&format!("{}    return result\n", indent));
+}
+
+fn map_array_source(ty: &TypeRef, name: &str, suffix: &str) -> String {
+    match ty {
+        TypeRef::Enum(_) => format!("{name}_{suffix}Raw"),
+        TypeRef::Struct(_) => format!("{name}_{suffix}Ptrs"),
+        _ => format!("{name}_{suffix}"),
+    }
+}
+
 fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module_name: &str) {
     for p in params {
         match &p.ty {
@@ -482,6 +587,46 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
                 }
                 _ => {}
             },
+            TypeRef::Map(k, v) => {
+                out.push_str(&format!(
+                    "        let {n}_keys = Array({n}.keys)\n",
+                    n = p.name
+                ));
+                out.push_str(&format!(
+                    "        let {n}_values = {n}_keys.map {{ {n}[$0]! }}\n",
+                    n = p.name
+                ));
+                match k.as_ref() {
+                    TypeRef::Enum(e) => {
+                        out.push_str(&format!(
+                            "        let {n}_keysRaw = {n}_keys.map {{ weaveffi_{m}_{e}($0.rawValue) }}\n",
+                            n = p.name, m = module_name, e = e
+                        ));
+                    }
+                    TypeRef::Struct(_) => {
+                        out.push_str(&format!(
+                            "        let {n}_keysPtrs = {n}_keys.map {{ $0.ptr }}\n",
+                            n = p.name
+                        ));
+                    }
+                    _ => {}
+                }
+                match v.as_ref() {
+                    TypeRef::Enum(e) => {
+                        out.push_str(&format!(
+                            "        let {n}_valuesRaw = {n}_values.map {{ weaveffi_{m}_{e}($0.rawValue) }}\n",
+                            n = p.name, m = module_name, e = e
+                        ));
+                    }
+                    TypeRef::Struct(_) => {
+                        out.push_str(&format!(
+                            "        let {n}_valuesPtrs = {n}_values.map {{ $0.ptr }}\n",
+                            n = p.name
+                        ));
+                    }
+                    _ => {}
+                }
+            }
             _ => {}
         }
     }
@@ -489,8 +634,21 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
     let closure_params: Vec<&Param> = params.iter().filter(|p| needs_closure(&p.ty)).collect();
 
     let is_list_return = matches!(f.returns.as_ref(), Some(TypeRef::List(_)));
-    if is_list_return {
+    let is_map_return = matches!(f.returns.as_ref(), Some(TypeRef::Map(_, _)));
+    if is_list_return || is_map_return {
         out.push_str("        var outLen: Int = 0\n");
+    }
+    if let Some(TypeRef::Map(k, v)) = &f.returns {
+        let key_elem = swift_c_ptr_element(k);
+        let val_elem = swift_c_ptr_element(v);
+        out.push_str(&format!(
+            "        var outKeysPtr: UnsafeMutablePointer<{}>? = nil\n",
+            key_elem
+        ));
+        out.push_str(&format!(
+            "        var outValuesPtr: UnsafeMutablePointer<{}>? = nil\n",
+            val_elem
+        ));
     }
 
     let handles_return_inside = matches!(
@@ -499,6 +657,7 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
             | Some(TypeRef::Enum(_))
             | Some(TypeRef::Optional(_))
             | Some(TypeRef::List(_))
+            | Some(TypeRef::Map(_, _))
     );
 
     let ret_type = match &f.returns {
@@ -508,11 +667,13 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
     };
     let needs_return = f.returns.is_some();
 
-    for (i, p) in closure_params.iter().enumerate() {
-        let indent = "        ".to_string() + &"    ".repeat(i);
+    let mut closure_depth: usize = 0;
+    for p in &closure_params {
+        let indent = "        ".to_string() + &"    ".repeat(closure_depth);
+        let is_first = closure_depth == 0;
         match &p.ty {
             TypeRef::StringUtf8 | TypeRef::Bytes => {
-                if needs_return && i == 0 {
+                if needs_return && is_first {
                     out.push_str(&format!(
                         "{}let result: {} = {}_bytes.withUnsafeBufferPointer {{ {}_buf in\n",
                         indent, ret_type, p.name, p.name
@@ -531,6 +692,7 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
                     "{}    let {}_len = {}_buf.count\n",
                     indent, p.name, p.name
                 ));
+                closure_depth += 1;
             }
             TypeRef::Optional(inner) if is_c_value_type(inner) => {
                 let source = if matches!(inner.as_ref(), TypeRef::Enum(_)) {
@@ -538,7 +700,7 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
                 } else {
                     p.name.clone()
                 };
-                if needs_return && i == 0 {
+                if needs_return && is_first {
                     out.push_str(&format!(
                         "{}let result: {} = withOptionalPointer(to: {}) {{ {}_ptr in\n",
                         indent, ret_type, source, p.name
@@ -549,6 +711,7 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
                         indent, source, p.name
                     ));
                 }
+                closure_depth += 1;
             }
             TypeRef::List(inner) => {
                 let source = match inner.as_ref() {
@@ -556,7 +719,7 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
                     TypeRef::Struct(_) => format!("{}_ptrs", p.name),
                     _ => p.name.clone(),
                 };
-                if needs_return && i == 0 {
+                if needs_return && is_first {
                     out.push_str(&format!(
                         "{}let result: {} = {}.withUnsafeBufferPointer {{ {}_buf in\n",
                         indent, ret_type, source, p.name
@@ -575,15 +738,59 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
                     "{}    let {}_len = {}_buf.count\n",
                     indent, p.name, p.name
                 ));
+                closure_depth += 1;
+            }
+            TypeRef::Map(k, v) => {
+                let keys_source = map_array_source(k, &p.name, "keys");
+                let values_source = map_array_source(v, &p.name, "values");
+                if needs_return && is_first {
+                    out.push_str(&format!(
+                        "{}let result: {} = {}.withUnsafeBufferPointer {{ {}_keys_buf in\n",
+                        indent, ret_type, keys_source, p.name
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "{}{}.withUnsafeBufferPointer {{ {}_keys_buf in\n",
+                        indent, keys_source, p.name
+                    ));
+                }
+                out.push_str(&format!(
+                    "{}    let {}_keys_ptr = {}_keys_buf.baseAddress\n",
+                    indent, p.name, p.name
+                ));
+                closure_depth += 1;
+                let vind = "        ".to_string() + &"    ".repeat(closure_depth);
+                out.push_str(&format!(
+                    "{}{}.withUnsafeBufferPointer {{ {}_values_buf in\n",
+                    vind, values_source, p.name
+                ));
+                out.push_str(&format!(
+                    "{}    let {}_values_ptr = {}_values_buf.baseAddress\n",
+                    vind, p.name, p.name
+                ));
+                out.push_str(&format!(
+                    "{}    let {}_len = {}_values_buf.count\n",
+                    vind, p.name, p.name
+                ));
+                closure_depth += 1;
             }
             _ => unreachable!(),
         }
     }
 
-    let inner_indent = "        ".to_string() + &"    ".repeat(closure_params.len());
+    let inner_indent = "        ".to_string() + &"    ".repeat(closure_depth);
     let c_sym = c_symbol_name(module_name, &f.name);
     let call_args = build_c_call_args(params, module_name);
-    let call_with_err = if is_list_return {
+    let call_with_err = if is_map_return {
+        if call_args.is_empty() {
+            format!("{}(&outKeysPtr, &outValuesPtr, &outLen, &err)", c_sym)
+        } else {
+            format!(
+                "{}({}, &outKeysPtr, &outValuesPtr, &outLen, &err)",
+                c_sym, call_args
+            )
+        }
+    } else if is_list_return {
         if call_args.is_empty() {
             format!("{}(&outLen, &err)", c_sym)
         } else {
@@ -623,12 +830,15 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
         Some(TypeRef::List(inner)) => {
             render_list_return_inner(out, &call_with_err, inner, &inner_indent);
         }
+        Some(TypeRef::Map(k, v)) => {
+            render_map_return_inner(out, &call_with_err, k, v, &inner_indent);
+        }
         Some(_) => {
             out.push_str(&format!("{}    return {}\n", inner_indent, call_with_err));
         }
     }
 
-    for i in (0..closure_params.len()).rev() {
+    for i in (0..closure_depth).rev() {
         let indent = "        ".to_string() + &"    ".repeat(i);
         out.push_str(&format!("{}}}\n", indent));
     }
@@ -1379,5 +1589,107 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn swift_type_for_map() {
+        assert_eq!(
+            swift_type_for(&TypeRef::Map(
+                Box::new(TypeRef::StringUtf8),
+                Box::new(TypeRef::I32)
+            )),
+            "[String: Int32]"
+        );
+        assert_eq!(
+            swift_type_for(&TypeRef::Map(
+                Box::new(TypeRef::I32),
+                Box::new(TypeRef::F64)
+            )),
+            "[Int32: Double]"
+        );
+    }
+
+    #[test]
+    fn render_function_with_map_param() {
+        let api = make_api(vec![Module {
+            name: "store".to_string(),
+            functions: vec![Function {
+                name: "update_scores".to_string(),
+                params: vec![Param {
+                    name: "scores".to_string(),
+                    ty: TypeRef::Map(Box::new(TypeRef::I32), Box::new(TypeRef::F64)),
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let out = render_swift_wrapper(&api);
+        assert!(
+            out.contains("_ scores: [Int32: Double]"),
+            "missing map param type: {out}"
+        );
+        assert!(
+            out.contains("scores_keys = Array(scores.keys)"),
+            "missing keys extraction: {out}"
+        );
+        assert!(
+            out.contains("scores_values = scores_keys.map { scores[$0]! }"),
+            "missing values extraction: {out}"
+        );
+        assert!(
+            out.contains(".withUnsafeBufferPointer"),
+            "missing withUnsafeBufferPointer: {out}"
+        );
+        assert!(
+            out.contains("scores_keys_ptr"),
+            "missing keys pointer: {out}"
+        );
+        assert!(
+            out.contains("scores_values_ptr"),
+            "missing values pointer: {out}"
+        );
+        assert!(out.contains("scores_len"), "missing length: {out}");
+    }
+
+    #[test]
+    fn render_function_with_map_return() {
+        let api = make_api(vec![Module {
+            name: "store".to_string(),
+            functions: vec![Function {
+                name: "get_scores".to_string(),
+                params: vec![],
+                returns: Some(TypeRef::Map(Box::new(TypeRef::I32), Box::new(TypeRef::F64))),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let out = render_swift_wrapper(&api);
+        assert!(
+            out.contains("-> [Int32: Double] {"),
+            "missing map return type: {out}"
+        );
+        assert!(out.contains("var outLen: Int = 0"), "missing outLen: {out}");
+        assert!(out.contains("outKeysPtr"), "missing keys out-param: {out}");
+        assert!(
+            out.contains("outValuesPtr"),
+            "missing values out-param: {out}"
+        );
+        assert!(
+            out.contains("var result: [Int32: Double] = [:]"),
+            "missing dict construction: {out}"
+        );
+        assert!(
+            out.contains("for i in 0..<outLen"),
+            "missing iteration: {out}"
+        );
     }
 }
