@@ -14,7 +14,7 @@ impl Generator for WasmGenerator {
         let wasm_dir = out_dir.join("wasm");
         std::fs::create_dir_all(&wasm_dir)?;
         std::fs::write(wasm_dir.join("README.md"), render_wasm_readme(api))?;
-        std::fs::write(wasm_dir.join("weaveffi_wasm.js"), render_wasm_js_stub())?;
+        std::fs::write(wasm_dir.join("weaveffi_wasm.js"), render_wasm_js_stub(api))?;
         Ok(())
     }
 }
@@ -217,9 +217,23 @@ fn render_enum_ref(out: &mut String, e: &EnumDef) {
     }
 }
 
-fn render_wasm_js_stub() -> String {
+fn api_needs_string_helpers(api: &Api) -> bool {
+    api.modules.iter().any(|m| {
+        m.functions.iter().any(|f| {
+            f.params.iter().any(|p| matches!(p.ty, TypeRef::StringUtf8))
+                || matches!(f.returns.as_ref(), Some(TypeRef::StringUtf8))
+        }) || m
+            .structs
+            .iter()
+            .any(|s| s.fields.iter().any(|f| matches!(f.ty, TypeRef::StringUtf8)))
+    })
+}
+
+fn render_wasm_js_stub(api: &Api) -> String {
     let mut out = String::new();
-    out.push_str("// Minimal JS loader for WeaveFFI WASM\n");
+    let needs_strings = api_needs_string_helpers(api);
+
+    out.push_str("// WeaveFFI WASM bindings (auto-generated)\n");
     out.push_str("//\n");
     out.push_str("// Complex type conventions at the WASM boundary:\n");
     out.push_str("//\n");
@@ -230,41 +244,208 @@ fn render_wasm_js_stub() -> String {
     );
     out.push_str("//   Lists     -> (i32 pointer, i32 length) pair into linear memory\n");
     out.push('\n');
+
+    if needs_strings {
+        out.push_str("const _encoder = new TextEncoder();\n");
+        out.push_str("const _decoder = new TextDecoder();\n\n");
+        out.push_str("function _encodeString(wasm, str) {\n");
+        out.push_str("  const bytes = _encoder.encode(str);\n");
+        out.push_str("  const ptr = wasm.weaveffi_alloc(bytes.length);\n");
+        out.push_str("  new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);\n");
+        out.push_str("  return [ptr, bytes.length];\n");
+        out.push_str("}\n\n");
+        out.push_str("function _decodeString(wasm, ptr, len) {\n");
+        out.push_str("  return _decoder.decode(new Uint8Array(wasm.memory.buffer, ptr, len));\n");
+        out.push_str("}\n\n");
+    }
+
+    for module in &api.modules {
+        for e in &module.enums {
+            out.push_str(&format!("export const {} = Object.freeze({{\n", e.name));
+            for v in &e.variants {
+                out.push_str(&format!("  {}: {},\n", v.name, v.value));
+            }
+            out.push_str("});\n\n");
+        }
+    }
+
+    for module in &api.modules {
+        for s in &module.structs {
+            out.push_str(&format!("class {} {{\n", s.name));
+            out.push_str("  constructor(wasm, handle) {\n");
+            out.push_str("    this._wasm = wasm;\n");
+            out.push_str("    this._handle = handle;\n");
+            out.push_str("  }\n");
+            for field in &s.fields {
+                let accessor = format!("weaveffi_{}_{}_get_{}", module.name, s.name, field.name);
+                match &field.ty {
+                    TypeRef::Bool => {
+                        out.push_str(&format!("  get {}() {{\n", field.name));
+                        out.push_str(&format!(
+                            "    return this._wasm.{}(this._handle) !== 0;\n",
+                            accessor
+                        ));
+                        out.push_str("  }\n");
+                    }
+                    TypeRef::StringUtf8 => {
+                        out.push_str(&format!("  get {}() {{\n", field.name));
+                        out.push_str("    const retptr = this._wasm.weaveffi_alloc(8);\n");
+                        out.push_str(&format!(
+                            "    this._wasm.{}(retptr, this._handle);\n",
+                            accessor
+                        ));
+                        out.push_str("    const view = new DataView(this._wasm.memory.buffer);\n");
+                        out.push_str("    return _decodeString(this._wasm, view.getInt32(retptr, true), view.getInt32(retptr + 4, true));\n");
+                        out.push_str("  }\n");
+                    }
+                    _ => {
+                        out.push_str(&format!("  get {}() {{\n", field.name));
+                        out.push_str(&format!(
+                            "    return this._wasm.{}(this._handle);\n",
+                            accessor
+                        ));
+                        out.push_str("  }\n");
+                    }
+                }
+            }
+            out.push_str("}\n\n");
+        }
+    }
+
     out.push_str("/**\n");
     out.push_str(" * Load a WeaveFFI WASM module from the given URL.\n");
     out.push_str(" *\n");
     out.push_str(" * @param {string} url - URL to the `.wasm` file.\n");
-    out.push_str(" * @returns {Promise<WebAssembly.Exports>} The exported WASM functions.\n");
+    if api.modules.is_empty() {
+        out.push_str(" * @returns {Promise<WebAssembly.Exports>} The exported WASM functions.\n");
+    } else {
+        out.push_str(" * @returns {Promise<Object>} The API bindings.\n");
+    }
     out.push_str(" *\n");
     out.push_str(" * Exported functions follow the C ABI naming convention:\n");
     out.push_str(" *   weaveffi_{module}_{function}(params...) -> result\n");
     out.push_str(" *\n");
     out.push_str(" * @example\n");
-    out.push_str(" * const wasm = await loadWeaveFFI('lib.wasm');\n");
+    out.push_str(" * const api = await loadWeaveFFI('lib.wasm');\n");
     out.push_str(" *\n");
     out.push_str(" * // Primitive: (i32, i32) -> i32\n");
-    out.push_str(" * const sum = wasm.weaveffi_math_add(1, 2);\n");
+    out.push_str(" * const sum = api.math.add(1, 2);\n");
     out.push_str(" *\n");
     out.push_str(" * // Struct handle: () -> i64 (opaque pointer)\n");
-    out.push_str(" * const handle = wasm.weaveffi_contacts_create();\n");
+    out.push_str(" * const handle = api.contacts.create();\n");
     out.push_str(" *\n");
     out.push_str(" * // Enum: (i32 discriminant) -> void\n");
-    out.push_str(" * wasm.weaveffi_ui_set_color(0); // 0 = first variant\n");
+    out.push_str(" * api.ui.set_color(0); // 0 = first variant\n");
     out.push_str(" *\n");
     out.push_str(" * // Optional: (i32 is_present, i32 value) -> void\n");
-    out.push_str(" * wasm.weaveffi_config_set_timeout(1, 5000); // present\n");
-    out.push_str(" * wasm.weaveffi_config_set_timeout(0, 0);    // absent\n");
+    out.push_str(" * api.config.set_timeout(1, 5000); // present\n");
+    out.push_str(" * api.config.set_timeout(0, 0);    // absent\n");
     out.push_str(" *\n");
     out.push_str(" * // List: (i32 pointer, i32 length) -> void\n");
-    out.push_str(" * wasm.weaveffi_data_process(ptr, len);\n");
+    out.push_str(" * api.data.process(ptr, len);\n");
     out.push_str(" */\n");
     out.push_str("export async function loadWeaveFFI(url) {\n");
     out.push_str("  const response = await fetch(url);\n");
     out.push_str("  const bytes = await response.arrayBuffer();\n");
     out.push_str("  const { instance } = await WebAssembly.instantiate(bytes, {});\n");
-    out.push_str("  return instance.exports;\n");
+
+    if api.modules.is_empty() {
+        out.push_str("  return instance.exports;\n");
+    } else {
+        out.push_str("  const wasm = instance.exports;\n\n");
+        out.push_str("  return {\n");
+        out.push_str("    _raw: wasm,\n");
+        for module in &api.modules {
+            if module.functions.is_empty() {
+                continue;
+            }
+            out.push_str(&format!("    {}: {{\n", module.name));
+            for func in &module.functions {
+                emit_js_function_wrapper(&mut out, &module.name, func);
+            }
+            out.push_str("    },\n");
+        }
+        out.push_str("  };\n");
+    }
+
     out.push_str("}\n");
     out
+}
+
+fn emit_js_function_wrapper(out: &mut String, module_name: &str, func: &Function) {
+    let abi_name = format!("weaveffi_{}_{}", module_name, func.name);
+    let js_params: Vec<&str> = func.params.iter().map(|p| p.name.as_str()).collect();
+    let indent = "        ";
+
+    out.push_str(&format!(
+        "      {}({}) {{\n",
+        func.name,
+        js_params.join(", ")
+    ));
+
+    let mut wasm_args = Vec::new();
+    let returns_string = matches!(func.returns.as_ref(), Some(TypeRef::StringUtf8));
+
+    if returns_string {
+        out.push_str(&format!("{indent}const retptr = wasm.weaveffi_alloc(8);\n"));
+        wasm_args.push("retptr".to_string());
+    }
+
+    for param in &func.params {
+        match &param.ty {
+            TypeRef::StringUtf8 => {
+                out.push_str(&format!(
+                    "{indent}const [{name}_ptr, {name}_len] = _encodeString(wasm, {name});\n",
+                    name = param.name
+                ));
+                wasm_args.push(format!("{}_ptr", param.name));
+                wasm_args.push(format!("{}_len", param.name));
+            }
+            TypeRef::Struct(_) => {
+                wasm_args.push(format!("{}._handle", param.name));
+            }
+            _ => {
+                wasm_args.push(param.name.clone());
+            }
+        }
+    }
+
+    let wasm_call = format!("wasm.{}({})", abi_name, wasm_args.join(", "));
+
+    match func.returns.as_ref() {
+        None => {
+            out.push_str(&format!("{indent}{wasm_call};\n"));
+        }
+        Some(TypeRef::Bool) => {
+            out.push_str(&format!("{indent}return {wasm_call} !== 0;\n"));
+        }
+        Some(TypeRef::StringUtf8) => {
+            out.push_str(&format!("{indent}{wasm_call};\n"));
+            out.push_str(&format!(
+                "{indent}const view = new DataView(wasm.memory.buffer);\n"
+            ));
+            out.push_str(&format!("{indent}return _decodeString(wasm, view.getInt32(retptr, true), view.getInt32(retptr + 4, true));\n"));
+        }
+        Some(TypeRef::Struct(name)) => {
+            out.push_str(&format!("{indent}return new {name}(wasm, {wasm_call});\n"));
+        }
+        Some(TypeRef::Optional(inner)) => match inner.as_ref() {
+            TypeRef::Struct(name) => {
+                out.push_str(&format!("{indent}const result = {wasm_call};\n"));
+                out.push_str(&format!(
+                    "{indent}return result === 0n ? null : new {name}(wasm, result);\n"
+                ));
+            }
+            _ => {
+                out.push_str(&format!("{indent}return {wasm_call};\n"));
+            }
+        },
+        _ => {
+            out.push_str(&format!("{indent}return {wasm_call};\n"));
+        }
+    }
+
+    out.push_str("      },\n");
 }
 
 #[cfg(test)]
@@ -382,7 +563,7 @@ mod tests {
 
     #[test]
     fn js_stub_has_jsdoc() {
-        let js = render_wasm_js_stub();
+        let js = render_wasm_js_stub(&empty_api());
         assert!(js.contains("@param {string} url"));
         assert!(js.contains("@returns {Promise<WebAssembly.Exports>}"));
         assert!(js.contains("@example"));
@@ -390,7 +571,7 @@ mod tests {
 
     #[test]
     fn js_stub_documents_complex_types() {
-        let js = render_wasm_js_stub();
+        let js = render_wasm_js_stub(&empty_api());
         assert!(js.contains("Struct handle: () -> i64 (opaque pointer)"));
         assert!(js.contains("Enum: (i32 discriminant) -> void"));
         assert!(js.contains("Optional: (i32 is_present, i32 value) -> void"));
@@ -399,7 +580,7 @@ mod tests {
 
     #[test]
     fn js_stub_has_type_convention_header() {
-        let js = render_wasm_js_stub();
+        let js = render_wasm_js_stub(&empty_api());
         assert!(js.contains("Structs   -> i64 opaque handle"));
         assert!(js.contains("Enums     -> i32 discriminant value"));
         assert!(js.contains("Optionals -> 0/null for absent"));
@@ -667,5 +848,53 @@ mod tests {
         assert!(readme.contains("##### `Color`"));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn wasm_js_has_api_functions() {
+        let api = sample_api();
+        let js = render_wasm_js_stub(&api);
+        assert!(js.contains("add(a, b)"));
+        assert!(js.contains("wasm.weaveffi_math_add(a, b)"));
+        assert!(js.contains("class Point"));
+        assert!(js.contains("get x()"));
+        assert!(js.contains("get y()"));
+        assert!(js.contains("weaveffi_math_Point_get_x"));
+        assert!(js.contains("weaveffi_math_Point_get_y"));
+        assert!(js.contains("export const Color = Object.freeze("));
+        assert!(js.contains("Red: 0"));
+        assert!(js.contains("Green: 1"));
+        assert!(js.contains("Blue: 2"));
+        assert!(js.contains("_raw: wasm"));
+        assert!(js.contains("math: {"));
+    }
+
+    #[test]
+    fn wasm_js_has_string_helpers() {
+        let api = make_api(vec![Module {
+            name: "greeting".into(),
+            functions: vec![Function {
+                name: "greet".into(),
+                params: vec![Param {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                }],
+                returns: Some(TypeRef::StringUtf8),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+        let js = render_wasm_js_stub(&api);
+        assert!(js.contains("function _encodeString(wasm, str)"));
+        assert!(js.contains("function _decodeString(wasm, ptr, len)"));
+        assert!(js.contains("TextEncoder"));
+        assert!(js.contains("TextDecoder"));
+        assert!(js.contains("_encodeString(wasm, name)"));
+        assert!(js.contains("_decodeString(wasm,"));
+        assert!(js.contains("greet(name)"));
+        assert!(js.contains("wasm.weaveffi_greeting_greet("));
     }
 }
