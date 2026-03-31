@@ -1850,6 +1850,735 @@ mod tests {
     }
 
     #[test]
+    fn generate_python_basic() {
+        let api = make_api(vec![simple_module(vec![Function {
+            name: "add".into(),
+            params: vec![
+                Param {
+                    name: "a".into(),
+                    ty: TypeRef::I32,
+                },
+                Param {
+                    name: "b".into(),
+                    ty: TypeRef::I32,
+                },
+            ],
+            returns: Some(TypeRef::I32),
+            doc: None,
+            r#async: false,
+        }])]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_py_basic");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        PythonGenerator.generate(&api, out_dir).unwrap();
+
+        let py = std::fs::read_to_string(tmp.join("python/weaveffi/weaveffi.py")).unwrap();
+
+        assert!(py.contains("def add(a: int, b: int) -> int:"));
+        assert!(py.contains("_fn = _lib.weaveffi_math_add"));
+        assert!(py.contains("ctypes.c_int32, ctypes.c_int32"));
+        assert!(py.contains("_fn.restype = ctypes.c_int32"));
+        assert!(py.contains("_err = _WeaveffiErrorStruct()"));
+        assert!(py.contains("_check_error(_err)"));
+        assert!(py.contains("return _result"));
+
+        assert!(py.contains("import ctypes"));
+        assert!(py.contains("from enum import IntEnum"));
+        assert!(py.contains("from typing import Dict, List, Optional"));
+        assert!(py.contains("class WeaveffiError(Exception):"));
+        assert!(py.contains("def _load_library()"));
+        assert!(py.contains("_lib = _load_library()"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn generate_python_with_structs() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: Some("A contact record".into()),
+                fields: vec![
+                    StructField {
+                        name: "id".into(),
+                        ty: TypeRef::I64,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "first_name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "last_name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "email".into(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                        doc: None,
+                    },
+                ],
+            }],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let py = render_python_module(&api);
+
+        assert!(py.contains("class Contact:"), "missing class decl");
+        assert!(
+            py.contains("\"\"\"A contact record\"\"\""),
+            "missing doc: {py}"
+        );
+        assert!(py.contains("def __init__(self, _ptr: int) -> None:"));
+        assert!(py.contains("self._ptr = _ptr"));
+        assert!(py.contains("def __del__(self) -> None:"));
+        assert!(py.contains("weaveffi_contacts_Contact_destroy"));
+
+        assert!(py.contains("@property\n    def id(self) -> int:"));
+        assert!(py.contains("weaveffi_contacts_Contact_get_id"));
+        assert!(py.contains("_fn.restype = ctypes.c_int64"));
+
+        assert!(py.contains("@property\n    def first_name(self) -> str:"));
+        assert!(py.contains("weaveffi_contacts_Contact_get_first_name"));
+
+        assert!(py.contains("@property\n    def last_name(self) -> str:"));
+        assert!(py.contains("weaveffi_contacts_Contact_get_last_name"));
+
+        assert!(py.contains("@property\n    def email(self) -> Optional[str]:"));
+        assert!(py.contains("weaveffi_contacts_Contact_get_email"));
+    }
+
+    #[test]
+    fn generate_python_with_enums() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "get_type".into(),
+                params: vec![Param {
+                    name: "ct".into(),
+                    ty: TypeRef::Enum("ContactType".into()),
+                }],
+                returns: Some(TypeRef::Enum("ContactType".into())),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![EnumDef {
+                name: "ContactType".into(),
+                doc: Some("Type of contact".into()),
+                variants: vec![
+                    EnumVariant {
+                        name: "Personal".into(),
+                        value: 0,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Work".into(),
+                        value: 1,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Other".into(),
+                        value: 2,
+                        doc: None,
+                    },
+                ],
+            }],
+            errors: None,
+        }]);
+
+        let py = render_python_module(&api);
+
+        assert!(py.contains("class ContactType(IntEnum):"));
+        assert!(py.contains("\"\"\"Type of contact\"\"\""));
+        assert!(py.contains("Personal = 0"));
+        assert!(py.contains("Work = 1"));
+        assert!(py.contains("Other = 2"));
+
+        assert!(
+            py.contains("ct: \"ContactType\""),
+            "missing enum param hint"
+        );
+        assert!(
+            py.contains("-> \"ContactType\":"),
+            "missing enum return hint"
+        );
+        assert!(py.contains("ct.value"), "missing .value for enum param");
+        assert!(
+            py.contains("return ContactType(_result)"),
+            "missing enum return wrap"
+        );
+        assert!(py.contains("ctypes.c_int32"), "enum should use c_int32 ABI");
+    }
+
+    #[test]
+    fn generate_python_with_optionals() {
+        let api = make_api(vec![Module {
+            name: "store".into(),
+            functions: vec![
+                Function {
+                    name: "find_int".into(),
+                    params: vec![Param {
+                        name: "key".into(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::I32)),
+                    }],
+                    returns: Some(TypeRef::Optional(Box::new(TypeRef::I32))),
+                    doc: None,
+                    r#async: false,
+                },
+                Function {
+                    name: "find_name".into(),
+                    params: vec![Param {
+                        name: "prefix".into(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                    }],
+                    returns: Some(TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
+                    doc: None,
+                    r#async: false,
+                },
+                Function {
+                    name: "find_contact".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                        "Contact".into(),
+                    )))),
+                    doc: None,
+                    r#async: false,
+                },
+                Function {
+                    name: "find_flag".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Bool))),
+                    doc: None,
+                    r#async: false,
+                },
+            ],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let py = render_python_module(&api);
+
+        assert!(
+            py.contains("key: Optional[int]"),
+            "missing Optional[int] param"
+        );
+        assert!(
+            py.contains("-> Optional[int]:"),
+            "missing Optional[int] return"
+        );
+        assert!(
+            py.contains("ctypes.byref(ctypes.c_int32(key)) if key is not None else None"),
+            "missing optional i32 conversion"
+        );
+        assert!(
+            py.contains("ctypes.POINTER(ctypes.c_int32)"),
+            "missing POINTER for optional i32"
+        );
+
+        assert!(
+            py.contains("prefix: Optional[str]"),
+            "missing Optional[str] param"
+        );
+        assert!(
+            py.contains("-> Optional[str]:"),
+            "missing Optional[str] return"
+        );
+        assert!(
+            py.contains("prefix.encode(\"utf-8\") if prefix is not None else None"),
+            "missing optional string encode"
+        );
+
+        assert!(
+            py.contains("-> Optional[\"Contact\"]:"),
+            "missing Optional struct return"
+        );
+        assert!(
+            py.contains("if _result is None:\n        return None\n    return Contact(_result)"),
+            "missing optional struct None check"
+        );
+
+        assert!(
+            py.contains("-> Optional[bool]:"),
+            "missing Optional[bool] return"
+        );
+        assert!(
+            py.contains("return bool(_result[0])"),
+            "missing optional bool deref"
+        );
+    }
+
+    #[test]
+    fn generate_python_with_lists() {
+        let api = make_api(vec![Module {
+            name: "batch".into(),
+            functions: vec![
+                Function {
+                    name: "process_ids".into(),
+                    params: vec![Param {
+                        name: "ids".into(),
+                        ty: TypeRef::List(Box::new(TypeRef::I32)),
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                },
+                Function {
+                    name: "get_names".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
+                    doc: None,
+                    r#async: false,
+                },
+                Function {
+                    name: "get_items".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Item".into())))),
+                    doc: None,
+                    r#async: false,
+                },
+            ],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let py = render_python_module(&api);
+
+        assert!(py.contains("ids: List[int]"), "missing List[int] param");
+        assert!(
+            py.contains("(ctypes.c_int32 * len(ids))(*ids)"),
+            "missing list-to-array conversion"
+        );
+        assert!(
+            py.contains("ctypes.POINTER(ctypes.c_int32)"),
+            "missing POINTER for list param"
+        );
+        assert!(py.contains("ctypes.c_size_t"), "missing size_t for length");
+
+        assert!(
+            py.contains("-> List[str]:"),
+            "missing List[str] return: {py}"
+        );
+        assert!(
+            py.contains("_result[_i].decode(\"utf-8\") for _i in range(_out_len.value)"),
+            "missing string list decode: {py}"
+        );
+
+        assert!(
+            py.contains("-> List[\"Item\"]:"),
+            "missing List struct return"
+        );
+        assert!(
+            py.contains("Item(_result[_i]) for _i in range(_out_len.value)"),
+            "missing struct wrapping in list"
+        );
+    }
+
+    #[test]
+    fn generate_python_with_maps() {
+        let api = make_api(vec![Module {
+            name: "config".into(),
+            functions: vec![
+                Function {
+                    name: "set_config".into(),
+                    params: vec![Param {
+                        name: "settings".into(),
+                        ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                },
+                Function {
+                    name: "get_config".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::Map(
+                        Box::new(TypeRef::StringUtf8),
+                        Box::new(TypeRef::I32),
+                    )),
+                    doc: None,
+                    r#async: false,
+                },
+            ],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let py = render_python_module(&api);
+
+        assert!(
+            py.contains("settings: Dict[str, int]"),
+            "missing Dict param hint"
+        );
+        assert!(
+            py.contains("list(settings.keys())"),
+            "missing keys extraction"
+        );
+        assert!(
+            py.contains("_settings_vals = [settings[_k] for _k in _settings_keys]"),
+            "missing values extraction"
+        );
+        assert!(
+            py.contains("ctypes.c_char_p * len(_settings_keys)"),
+            "missing key array creation"
+        );
+        assert!(
+            py.contains("ctypes.c_int32 * len(_settings_vals)"),
+            "missing value array creation"
+        );
+
+        assert!(
+            py.contains("-> Dict[str, int]:"),
+            "missing Dict return hint"
+        );
+        assert!(
+            py.contains("_out_keys = ctypes.POINTER(ctypes.c_char_p)()"),
+            "missing out_keys init"
+        );
+        assert!(
+            py.contains("_out_values = ctypes.POINTER(ctypes.c_int32)()"),
+            "missing out_values init"
+        );
+        assert!(
+            py.contains("_out_len = ctypes.c_size_t(0)"),
+            "missing out_len init"
+        );
+        assert!(
+            py.contains("if not _out_keys or not _out_values:"),
+            "missing empty map check"
+        );
+        assert!(
+            py.contains("_out_keys[_i].decode(\"utf-8\"): _out_values[_i]"),
+            "missing map comprehension"
+        );
+    }
+
+    #[test]
+    fn generate_python_pyi_types() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            enums: vec![EnumDef {
+                name: "ContactType".into(),
+                doc: None,
+                variants: vec![
+                    EnumVariant {
+                        name: "Personal".into(),
+                        value: 0,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Work".into(),
+                        value: 1,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Other".into(),
+                        value: 2,
+                        doc: None,
+                    },
+                ],
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![
+                    StructField {
+                        name: "id".into(),
+                        ty: TypeRef::I64,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "first_name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "email".into(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                        doc: None,
+                    },
+                    StructField {
+                        name: "tags".into(),
+                        ty: TypeRef::List(Box::new(TypeRef::StringUtf8)),
+                        doc: None,
+                    },
+                    StructField {
+                        name: "scores".into(),
+                        ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
+                        doc: None,
+                    },
+                ],
+            }],
+            functions: vec![
+                Function {
+                    name: "create_contact".into(),
+                    params: vec![
+                        Param {
+                            name: "name".into(),
+                            ty: TypeRef::StringUtf8,
+                        },
+                        Param {
+                            name: "email".into(),
+                            ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                        },
+                    ],
+                    returns: Some(TypeRef::Handle),
+                    doc: None,
+                    r#async: false,
+                },
+                Function {
+                    name: "get_contact".into(),
+                    params: vec![Param {
+                        name: "id".into(),
+                        ty: TypeRef::Handle,
+                    }],
+                    returns: Some(TypeRef::Struct("Contact".into())),
+                    doc: None,
+                    r#async: false,
+                },
+                Function {
+                    name: "list_contacts".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
+                    doc: None,
+                    r#async: false,
+                },
+                Function {
+                    name: "delete_contact".into(),
+                    params: vec![Param {
+                        name: "id".into(),
+                        ty: TypeRef::Handle,
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                },
+            ],
+            errors: None,
+        }]);
+
+        let pyi = render_pyi_module(&api);
+
+        assert!(pyi.contains("from enum import IntEnum"));
+        assert!(pyi.contains("from typing import Dict, List, Optional"));
+
+        assert!(pyi.contains("class ContactType(IntEnum):"));
+        assert!(pyi.contains("    Personal: int"));
+        assert!(pyi.contains("    Work: int"));
+        assert!(pyi.contains("    Other: int"));
+
+        assert!(pyi.contains("class Contact:"));
+        assert!(pyi.contains("    def id(self) -> int: ..."));
+        assert!(pyi.contains("    def first_name(self) -> str: ..."));
+        assert!(pyi.contains("    def email(self) -> Optional[str]: ..."));
+        assert!(pyi.contains("    def tags(self) -> List[str]: ..."));
+        assert!(pyi.contains("    def scores(self) -> Dict[str, int]: ..."));
+
+        assert!(pyi.contains("def create_contact(name: str, email: Optional[str]) -> int: ..."));
+        assert!(pyi.contains("def get_contact(id: int) -> \"Contact\": ..."));
+        assert!(pyi.contains("def list_contacts() -> List[\"Contact\"]: ..."));
+        assert!(pyi.contains("def delete_contact(id: int) -> None: ..."));
+    }
+
+    #[test]
+    fn generate_python_full_contacts() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            enums: vec![EnumDef {
+                name: "ContactType".into(),
+                doc: None,
+                variants: vec![
+                    EnumVariant {
+                        name: "Personal".into(),
+                        value: 0,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Work".into(),
+                        value: 1,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Other".into(),
+                        value: 2,
+                        doc: None,
+                    },
+                ],
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![
+                    StructField {
+                        name: "id".into(),
+                        ty: TypeRef::I64,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "first_name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "last_name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "email".into(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                        doc: None,
+                    },
+                    StructField {
+                        name: "contact_type".into(),
+                        ty: TypeRef::Enum("ContactType".into()),
+                        doc: None,
+                    },
+                ],
+            }],
+            functions: vec![
+                Function {
+                    name: "create_contact".into(),
+                    params: vec![
+                        Param {
+                            name: "first_name".into(),
+                            ty: TypeRef::StringUtf8,
+                        },
+                        Param {
+                            name: "last_name".into(),
+                            ty: TypeRef::StringUtf8,
+                        },
+                        Param {
+                            name: "email".into(),
+                            ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                        },
+                        Param {
+                            name: "contact_type".into(),
+                            ty: TypeRef::Enum("ContactType".into()),
+                        },
+                    ],
+                    returns: Some(TypeRef::Handle),
+                    doc: None,
+                    r#async: false,
+                },
+                Function {
+                    name: "get_contact".into(),
+                    params: vec![Param {
+                        name: "id".into(),
+                        ty: TypeRef::Handle,
+                    }],
+                    returns: Some(TypeRef::Struct("Contact".into())),
+                    doc: None,
+                    r#async: false,
+                },
+                Function {
+                    name: "list_contacts".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
+                    doc: None,
+                    r#async: false,
+                },
+                Function {
+                    name: "delete_contact".into(),
+                    params: vec![Param {
+                        name: "id".into(),
+                        ty: TypeRef::Handle,
+                    }],
+                    returns: Some(TypeRef::Bool),
+                    doc: None,
+                    r#async: false,
+                },
+                Function {
+                    name: "count_contacts".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                },
+            ],
+            errors: None,
+        }]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_py_full_contacts");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        PythonGenerator.generate(&api, out_dir).unwrap();
+
+        let py = std::fs::read_to_string(tmp.join("python/weaveffi/weaveffi.py")).unwrap();
+        let pyi = std::fs::read_to_string(tmp.join("python/weaveffi/weaveffi.pyi")).unwrap();
+
+        assert!(py.contains("class ContactType(IntEnum):"));
+        assert!(py.contains("Personal = 0"));
+        assert!(py.contains("Work = 1"));
+        assert!(py.contains("Other = 2"));
+
+        assert!(py.contains("class Contact:"));
+        assert!(py.contains("weaveffi_contacts_Contact_destroy"));
+        assert!(py.contains("@property\n    def id(self) -> int:"));
+        assert!(py.contains("weaveffi_contacts_Contact_get_id"));
+        assert!(py.contains("@property\n    def first_name(self) -> str:"));
+        assert!(py.contains("weaveffi_contacts_Contact_get_first_name"));
+        assert!(py.contains("@property\n    def last_name(self) -> str:"));
+        assert!(py.contains("weaveffi_contacts_Contact_get_last_name"));
+        assert!(py.contains("@property\n    def email(self) -> Optional[str]:"));
+        assert!(py.contains("weaveffi_contacts_Contact_get_email"));
+        assert!(py.contains("@property\n    def contact_type(self) -> \"ContactType\":"));
+        assert!(py.contains("weaveffi_contacts_Contact_get_contact_type"));
+        assert!(py.contains("return ContactType(_result)"));
+
+        assert!(py.contains("def create_contact("));
+        assert!(py.contains("first_name: str"));
+        assert!(py.contains("last_name: str"));
+        assert!(py.contains("email: Optional[str]"));
+        assert!(py.contains("contact_type: \"ContactType\""));
+        assert!(py.contains("-> int:"));
+        assert!(py.contains("weaveffi_contacts_create_contact"));
+        assert!(py.contains("first_name.encode(\"utf-8\")"));
+        assert!(py.contains("contact_type.value"));
+
+        assert!(py.contains("def get_contact(id: int) -> \"Contact\":"));
+        assert!(py.contains("weaveffi_contacts_get_contact"));
+        assert!(py.contains("return Contact(_result)"));
+
+        assert!(py.contains("def list_contacts() -> List[\"Contact\"]:"));
+        assert!(py.contains("weaveffi_contacts_list_contacts"));
+        assert!(py.contains("Contact(_result[_i]) for _i in range(_out_len.value)"));
+
+        assert!(py.contains("def delete_contact(id: int) -> bool:"));
+        assert!(py.contains("weaveffi_contacts_delete_contact"));
+        assert!(py.contains("return bool(_result)"));
+
+        assert!(py.contains("def count_contacts() -> int:"));
+        assert!(py.contains("weaveffi_contacts_count_contacts"));
+
+        assert!(pyi.contains("class ContactType(IntEnum):"));
+        assert!(pyi.contains("    Personal: int"));
+        assert!(pyi.contains("    Work: int"));
+        assert!(pyi.contains("    Other: int"));
+        assert!(pyi.contains("class Contact:"));
+        assert!(pyi.contains("def create_contact("));
+        assert!(pyi.contains("def get_contact(id: int) -> \"Contact\": ..."));
+        assert!(pyi.contains("def list_contacts() -> List[\"Contact\"]: ..."));
+        assert!(pyi.contains("def delete_contact(id: int) -> bool: ..."));
+        assert!(pyi.contains("def count_contacts() -> int: ..."));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn python_generates_packaging() {
         let api = make_api(vec![simple_module(vec![Function {
             name: "add".into(),
