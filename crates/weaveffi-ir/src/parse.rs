@@ -903,4 +903,69 @@ modules:
         assert_eq!(orders.functions[2].name, "cancel_order");
         assert_eq!(orders.functions[2].returns, Some(TypeRef::Bool));
     }
+
+    #[test]
+    fn parse_idl_doc_map_example() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: example
+    structs:
+      - name: Contact
+        fields:
+          - { name: id, type: i64 }
+          - { name: name, type: string }
+          - { name: email, type: "string?" }
+    functions:
+      - name: update_scores
+        params:
+          - { name: scores, type: "{string:i32}" }
+        return: bool
+
+      - name: get_contacts
+        params: []
+        return: "{string:Contact}"
+
+      - name: merge_tags
+        params:
+          - { name: current, type: "{string:string}" }
+          - { name: additions, type: "{string:string}" }
+        return: "{string:string}"
+"#;
+        let api = parse_api_str(yaml, "yaml").unwrap();
+        let m = &api.modules[0];
+        assert_eq!(m.functions.len(), 3);
+
+        let f0 = &m.functions[0];
+        assert_eq!(f0.name, "update_scores");
+        assert_eq!(
+            f0.params[0].ty,
+            TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32))
+        );
+        assert_eq!(f0.returns, Some(TypeRef::Bool));
+
+        let f1 = &m.functions[1];
+        assert_eq!(f1.name, "get_contacts");
+        assert_eq!(
+            f1.returns,
+            Some(TypeRef::Map(
+                Box::new(TypeRef::StringUtf8),
+                Box::new(TypeRef::Struct("Contact".into()))
+            ))
+        );
+
+        let f2 = &m.functions[2];
+        assert_eq!(f2.name, "merge_tags");
+        assert_eq!(
+            f2.params[0].ty,
+            TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::StringUtf8))
+        );
+        assert_eq!(
+            f2.returns,
+            Some(TypeRef::Map(
+                Box::new(TypeRef::StringUtf8),
+                Box::new(TypeRef::StringUtf8)
+            ))
+        );
+    }
 }
