@@ -145,6 +145,10 @@ fn render_node_dts(api: &Api) -> String {
                 None => "void".into(),
             };
             out.push_str(&format!(
+                "/** Maps to C function: weaveffi_{}_{} */\n",
+                m.name, f.name
+            ));
+            out.push_str(&format!(
                 "export function {}({}): {}\n",
                 f.name,
                 params.join(", "),
@@ -530,5 +534,58 @@ mod tests {
         assert!(enum_pos < fn_pos, "enum should appear before functions");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn node_dts_has_jsdoc() {
+        let api = make_api(vec![{
+            let mut m = make_module("math");
+            m.functions.push(Function {
+                name: "add".into(),
+                params: vec![
+                    Param {
+                        name: "a".into(),
+                        ty: TypeRef::I32,
+                    },
+                    Param {
+                        name: "b".into(),
+                        ty: TypeRef::I32,
+                    },
+                ],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+            });
+            m.functions.push(Function {
+                name: "subtract".into(),
+                params: vec![
+                    Param {
+                        name: "a".into(),
+                        ty: TypeRef::I32,
+                    },
+                    Param {
+                        name: "b".into(),
+                        ty: TypeRef::I32,
+                    },
+                ],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+            });
+            m
+        }]);
+
+        let dts = render_node_dts(&api);
+
+        assert!(
+            dts.contains("/** Maps to C function: weaveffi_math_add */\nexport function add("),
+            "missing JSDoc for add: {dts}"
+        );
+        assert!(
+            dts.contains(
+                "/** Maps to C function: weaveffi_math_subtract */\nexport function subtract("
+            ),
+            "missing JSDoc for subtract: {dts}"
+        );
     }
 }
