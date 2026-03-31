@@ -316,15 +316,97 @@ functions:
 
 ---
 
+## Map types
+
+Wrap a key-value pair in `{K:V}` braces to declare a map (dictionary /
+associative array). Keys must be primitive types or enums — structs, lists,
+and maps are not valid key types. Values may be any valid `TypeRef`.
+
+| Syntax            | Meaning                               |
+|-------------------|---------------------------------------|
+| `{string:i32}`    | Map from string to i32                |
+| `{string:Contact}`| Map from string to struct             |
+| `{i32:string}`    | Map from i32 to string                |
+| `{string:[i32]}`  | Map from string to list of i32        |
+
+### Map example
+
+```yaml
+structs:
+  - name: Contact
+    fields:
+      - { name: id, type: i64 }
+      - { name: name, type: string }
+      - { name: email, type: "string?" }
+
+functions:
+  - name: update_scores
+    params:
+      - { name: scores, type: "{string:i32}" }
+    return: bool
+    doc: "Update player scores by name"
+
+  - name: get_contacts
+    params: []
+    return: "{string:Contact}"
+    doc: "Returns a map of name to Contact"
+
+  - name: merge_tags
+    params:
+      - { name: current, type: "{string:string}" }
+      - { name: additions, type: "{string:string}" }
+    return: "{string:string}"
+```
+
+> **YAML note:** Quote map types like `"{string:i32}"` because YAML
+> interprets bare `{...}` as an inline mapping.
+
+### C ABI convention
+
+Maps are passed across the FFI boundary as **parallel arrays** of keys and
+values, plus a shared length. A map parameter `{K:V}` named `m` expands to
+three C parameters:
+
+```c
+const K* m_keys, const V* m_values, size_t m_len
+```
+
+A map return value expands to out-parameters:
+
+```c
+K* out_keys, V* out_values, size_t* out_len
+```
+
+For example, a function `update_scores(scores: {string:i32})` generates:
+
+```c
+void weaveffi_mymod_update_scores(
+    const char* const* scores_keys,
+    const int32_t* scores_values,
+    size_t scores_len,
+    weaveffi_error* out_err
+);
+```
+
+### Key type restrictions
+
+Only primitive types (`i32`, `u32`, `i64`, `f64`, `bool`, `string`, `bytes`,
+`handle`) and enum types are valid map keys. The validator rejects structs,
+lists, and maps as key types.
+
+---
+
 ## Nested types
 
 Optional and list modifiers compose freely:
 
-| Syntax         | Meaning                                         |
-|----------------|--------------------------------------------------|
-| `[Contact?]`   | List of optional contacts (items may be null)    |
-| `[i32]?`       | Optional list of i32 (the entire list may be null) |
-| `[string?]`    | List of optional strings                         |
+| Syntax           | Meaning                                            |
+|------------------|----------------------------------------------------|
+| `[Contact?]`     | List of optional contacts (items may be null)      |
+| `[i32]?`         | Optional list of i32 (the entire list may be null) |
+| `[string?]`      | List of optional strings                           |
+| `{string:[i32]}` | Map from string to list of i32                     |
+| `{string:i32}?`  | Optional map (the entire map may be null)          |
 
 ### Nested type example
 
@@ -374,6 +456,8 @@ All types are valid in both parameter and return positions.
 | `[T]`          | yes    | yes     | yes           |
 | `[T?]`         | yes    | yes     | yes           |
 | `[T]?`         | yes    | yes     | yes           |
+| `{K:V}`        | yes    | yes     | yes           |
+| `{K:V}?`       | yes    | yes     | yes           |
 
 ---
 
