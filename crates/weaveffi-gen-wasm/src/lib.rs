@@ -18,6 +18,14 @@ impl Generator for WasmGenerator {
         std::fs::write(wasm_dir.join("weaveffi_wasm.d.ts"), render_wasm_dts(api))?;
         Ok(())
     }
+
+    fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
+        vec![
+            out_dir.join("wasm/README.md").to_string(),
+            out_dir.join("wasm/weaveffi_wasm.js").to_string(),
+            out_dir.join("wasm/weaveffi_wasm.d.ts").to_string(),
+        ]
+    }
 }
 
 fn wasm_type(ty: &TypeRef) -> &'static str {

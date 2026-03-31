@@ -18,6 +18,13 @@ impl Generator for CGenerator {
         std::fs::write(dir.join("weaveffi.c"), render_c_convenience_c())?;
         Ok(())
     }
+
+    fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
+        vec![
+            out_dir.join("c/weaveffi.h").to_string(),
+            out_dir.join("c/weaveffi.c").to_string(),
+        ]
+    }
 }
 
 fn is_c_pointer_type(ty: &TypeRef) -> bool {

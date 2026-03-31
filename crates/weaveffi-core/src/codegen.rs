@@ -17,6 +17,10 @@ pub trait Generator {
     ) -> Result<()> {
         self.generate(api, out_dir)
     }
+
+    fn output_files(&self, _api: &Api, _out_dir: &Utf8Path) -> Vec<String> {
+        vec![]
+    }
 }
 
 #[derive(Default)]

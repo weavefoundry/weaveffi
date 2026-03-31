@@ -52,6 +52,22 @@ impl Generator for AndroidGenerator {
     ) -> Result<()> {
         self.generate_impl(api, out_dir, config.android_package())
     }
+
+    fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
+        vec![
+            out_dir.join("android/settings.gradle").to_string(),
+            out_dir.join("android/build.gradle").to_string(),
+            out_dir
+                .join("android/src/main/kotlin/com/weaveffi/WeaveFFI.kt")
+                .to_string(),
+            out_dir
+                .join("android/src/main/cpp/CMakeLists.txt")
+                .to_string(),
+            out_dir
+                .join("android/src/main/cpp/weaveffi_jni.c")
+                .to_string(),
+        ]
+    }
 }
 
 fn build_gradle(namespace: &str) -> String {
