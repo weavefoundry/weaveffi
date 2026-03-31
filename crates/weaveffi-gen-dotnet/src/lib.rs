@@ -184,6 +184,7 @@ fn render_csharp(api: &Api) -> String {
 
     render_exception_class(&mut out);
     render_error_struct(&mut out);
+    render_helpers_class(&mut out);
 
     for m in &api.modules {
         for e in &m.enums {
@@ -226,6 +227,22 @@ fn render_error_struct(out: &mut String) {
     out.push_str("                var msg = Marshal.PtrToStringUTF8(err.Message) ?? \"\";\n");
     out.push_str("                throw new WeaveffiException(err.Code, msg);\n");
     out.push_str("            }\n");
+    out.push_str("        }\n");
+    out.push_str("    }\n\n");
+}
+
+fn render_helpers_class(out: &mut String) {
+    out.push_str("    internal static class WeaveFFIHelpers\n    {\n");
+    out.push_str("        internal static IntPtr StringToPtr(string? s)\n        {\n");
+    out.push_str(
+        "            return s == null ? IntPtr.Zero : Marshal.StringToCoTaskMemUTF8(s);\n",
+    );
+    out.push_str("        }\n\n");
+    out.push_str("        internal static string? PtrToString(IntPtr ptr)\n        {\n");
+    out.push_str("            return ptr == IntPtr.Zero ? null : Marshal.PtrToStringUTF8(ptr);\n");
+    out.push_str("        }\n\n");
+    out.push_str("        internal static void FreePtr(IntPtr ptr)\n        {\n");
+    out.push_str("            Marshal.FreeCoTaskMem(ptr);\n");
     out.push_str("        }\n");
     out.push_str("    }\n\n");
 }
@@ -303,7 +320,7 @@ fn render_struct_getter(out: &mut String, prefix: &str, field: &StructField) {
             out.push_str(&format!(
                 "                var ptr = NativeMethods.{getter_sym}(_handle);\n"
             ));
-            out.push_str("                var str = Marshal.PtrToStringUTF8(ptr);\n");
+            out.push_str("                var str = WeaveFFIHelpers.PtrToString(ptr);\n");
             out.push_str("                NativeMethods.weaveffi_free_string(ptr);\n");
             out.push_str("                return str;\n");
         }
@@ -344,7 +361,7 @@ fn render_struct_getter(out: &mut String, prefix: &str, field: &StructField) {
             match inner.as_ref() {
                 TypeRef::StringUtf8 => {
                     out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
-                    out.push_str("                var str = Marshal.PtrToStringUTF8(ptr);\n");
+                    out.push_str("                var str = WeaveFFIHelpers.PtrToString(ptr);\n");
                     out.push_str("                NativeMethods.weaveffi_free_string(ptr);\n");
                     out.push_str("                return str;\n");
                 }
@@ -1481,7 +1498,7 @@ mod tests {
             "missing getter call: {cs}"
         );
         assert!(
-            cs.contains("Marshal.PtrToStringUTF8(ptr)"),
+            cs.contains("WeaveFFIHelpers.PtrToString(ptr)"),
             "missing UTF8 unmarshal: {cs}"
         );
         assert!(
@@ -1836,7 +1853,7 @@ mod tests {
             "missing null check: {cs}"
         );
         assert!(
-            cs.contains("Marshal.PtrToStringUTF8(ptr)"),
+            cs.contains("WeaveFFIHelpers.PtrToString(ptr)"),
             "missing UTF8 unmarshal: {cs}"
         );
     }
@@ -2678,5 +2695,35 @@ mod tests {
         assert!(tmp.join("dotnet/README.md").exists(), "README must exist");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dotnet_has_memory_helpers() {
+        let api = make_api(vec![simple_module(vec![])]);
+        let cs = render_csharp(&api);
+        assert!(
+            cs.contains("internal static class WeaveFFIHelpers"),
+            "missing WeaveFFIHelpers class: {cs}"
+        );
+        assert!(
+            cs.contains("internal static IntPtr StringToPtr(string? s)"),
+            "missing StringToPtr: {cs}"
+        );
+        assert!(
+            cs.contains("internal static string? PtrToString(IntPtr ptr)"),
+            "missing PtrToString: {cs}"
+        );
+        assert!(
+            cs.contains("internal static void FreePtr(IntPtr ptr)"),
+            "missing FreePtr: {cs}"
+        );
+        assert!(
+            cs.contains("Marshal.StringToCoTaskMemUTF8(s)"),
+            "missing StringToCoTaskMemUTF8 in helper: {cs}"
+        );
+        assert!(
+            cs.contains("Marshal.FreeCoTaskMem(ptr)"),
+            "missing FreeCoTaskMem in helper: {cs}"
+        );
     }
 }
