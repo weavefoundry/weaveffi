@@ -1,8 +1,8 @@
 # WeaveFFI Roadmap
 
-This roadmap tracks high-level goals for WeaveFFI. The project uses a Rust
-workspace that generates multi-language bindings from a YAML-based IR,
-exposing a stable C ABI consumed by language-specific wrappers.
+This roadmap tracks high-level goals for WeaveFFI. The project generates
+multi-language bindings from an API definition (YAML, JSON, or TOML), producing
+a stable C ABI contract consumed by language-specific wrappers.
 
 ## Crate structure
 

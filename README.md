@@ -5,10 +5,15 @@
 [![crates.io](https://img.shields.io/crates/v/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli)
 
 WeaveFFI is a CLI code-generation tool that takes an API definition written in
-YAML, JSON, or TOML and produces idiomatic foreign-language bindings for C,
-Swift, Android (Kotlin/JNI), Node.js (N-API), and WebAssembly — all backed by a
-single Rust core through a stable C ABI. No hand-written JNI glue, no duplicate
-implementations; one definition, every platform.
+YAML, JSON, or TOML and produces idiomatic bindings for C, Swift, Android
+(Kotlin/JNI), Node.js (N-API), and WebAssembly — all through a stable C ABI.
+No hand-written JNI glue, no duplicate implementations; one definition, every
+platform.
+
+WeaveFFI works with any native library that can expose a stable C ABI — whether
+it's written in Rust, C, C++, Zig, or another language. Rust has first-class
+scaffolding support today via `--scaffold`; other languages implement the
+functions declared in the generated C header directly.
 
 ## Features
 
