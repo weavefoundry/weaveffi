@@ -185,6 +185,63 @@ fn render_swift_getter(out: &mut String, prefix: &str, field: &StructField) {
         TypeRef::Struct(name) => {
             out.push_str(&format!("        return {}(ptr: {}(ptr)!)\n", name, getter));
         }
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::StringUtf8 => {
+                out.push_str(&format!("        let p = {}(ptr)\n", getter));
+                out.push_str("        guard let p = p else { return nil }\n");
+                out.push_str("        defer { weaveffi_free_string(p) }\n");
+                out.push_str("        return String(cString: p)\n");
+            }
+            TypeRef::Bytes => {
+                out.push_str("        var outLen: Int = 0\n");
+                out.push_str(&format!("        let p = {}(ptr, &outLen)\n", getter));
+                out.push_str("        guard let p = p else { return nil }\n");
+                out.push_str("        defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: p), outLen) }\n");
+                out.push_str("        return Data(bytes: p, count: outLen)\n");
+            }
+            TypeRef::Struct(name) => {
+                out.push_str(&format!("        let p = {}(ptr)\n", getter));
+                out.push_str(&format!("        return p.map {{ {}(ptr: $0) }}\n", name));
+            }
+            TypeRef::Enum(name) => {
+                out.push_str(&format!("        let p = {}(ptr)\n", getter));
+                out.push_str(&format!(
+                    "        return p.map {{ {}(rawValue: $0.pointee.rawValue)! }}\n",
+                    name
+                ));
+            }
+            _ if is_c_value_type(inner) => {
+                out.push_str(&format!("        let p = {}(ptr)\n", getter));
+                out.push_str("        return p?.pointee\n");
+            }
+            _ => {
+                out.push_str(&format!("        return {}(ptr)\n", getter));
+            }
+        },
+        TypeRef::List(inner) => {
+            out.push_str("        var outLen: Int = 0\n");
+            out.push_str(&format!("        let rv = {}(ptr, &outLen)\n", getter));
+            out.push_str("        guard let rv = rv else { return [] }\n");
+            match inner.as_ref() {
+                TypeRef::Enum(name) => {
+                    out.push_str(&format!(
+                        "        return (0..<outLen).map {{ {}(rawValue: rv[$0].rawValue)! }}\n",
+                        name
+                    ));
+                }
+                TypeRef::Struct(name) => {
+                    out.push_str(&format!(
+                        "        return (0..<outLen).map {{ {}(ptr: rv[$0]!) }}\n",
+                        name
+                    ));
+                }
+                _ => {
+                    out.push_str(
+                        "        return Array(UnsafeBufferPointer(start: rv, count: outLen))\n",
+                    );
+                }
+            }
+        }
         _ => {
             out.push_str(&format!("        return {}(ptr)\n", getter));
         }
@@ -1690,6 +1747,128 @@ mod tests {
         assert!(
             out.contains("for i in 0..<outLen"),
             "missing iteration: {out}"
+        );
+    }
+
+    #[test]
+    fn swift_struct_optional_field_getter() {
+        let api = make_api(vec![Module {
+            name: "contacts".to_string(),
+            functions: vec![],
+            structs: vec![StructDef {
+                name: "Contact".to_string(),
+                doc: None,
+                fields: vec![
+                    StructField {
+                        name: "email".to_string(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                        doc: None,
+                    },
+                    StructField {
+                        name: "age".to_string(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::I32)),
+                        doc: None,
+                    },
+                    StructField {
+                        name: "role".to_string(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::Enum("Role".into()))),
+                        doc: None,
+                    },
+                ],
+            }],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let out = render_swift_wrapper(&api);
+
+        assert!(
+            out.contains("public var email: String? {"),
+            "missing optional string getter: {out}"
+        );
+        assert!(
+            out.contains("guard let p = p else { return nil }"),
+            "missing nil guard for optional string: {out}"
+        );
+        assert!(
+            out.contains("defer { weaveffi_free_string(p) }"),
+            "missing free_string for optional string: {out}"
+        );
+        assert!(
+            out.contains("return String(cString: p)"),
+            "missing cString conversion: {out}"
+        );
+
+        assert!(
+            out.contains("public var age: Int32? {"),
+            "missing optional i32 getter: {out}"
+        );
+        assert!(
+            out.contains("return p?.pointee"),
+            "missing pointee for optional value: {out}"
+        );
+
+        assert!(
+            out.contains("public var role: Role? {"),
+            "missing optional enum getter: {out}"
+        );
+        assert!(
+            out.contains("Role(rawValue: $0.pointee.rawValue)!"),
+            "missing optional enum conversion: {out}"
+        );
+    }
+
+    #[test]
+    fn swift_struct_list_field_getter() {
+        let api = make_api(vec![Module {
+            name: "store".to_string(),
+            functions: vec![],
+            structs: vec![StructDef {
+                name: "Order".to_string(),
+                doc: None,
+                fields: vec![
+                    StructField {
+                        name: "item_ids".to_string(),
+                        ty: TypeRef::List(Box::new(TypeRef::I32)),
+                        doc: None,
+                    },
+                    StructField {
+                        name: "tags".to_string(),
+                        ty: TypeRef::List(Box::new(TypeRef::Enum("Tag".into()))),
+                        doc: None,
+                    },
+                ],
+            }],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let out = render_swift_wrapper(&api);
+
+        assert!(
+            out.contains("public var item_ids: [Int32] {"),
+            "missing list i32 getter: {out}"
+        );
+        assert!(
+            out.contains("weaveffi_store_Order_get_item_ids(ptr, &outLen)"),
+            "missing list getter call with outLen: {out}"
+        );
+        assert!(
+            out.contains("guard let rv = rv else { return [] }"),
+            "missing empty-array guard: {out}"
+        );
+        assert!(
+            out.contains("UnsafeBufferPointer(start: rv, count: outLen)"),
+            "missing buffer-to-array conversion: {out}"
+        );
+
+        assert!(
+            out.contains("public var tags: [Tag] {"),
+            "missing list enum getter: {out}"
+        );
+        assert!(
+            out.contains("Tag(rawValue: rv[$0].rawValue)!"),
+            "missing list enum conversion: {out}"
         );
     }
 }
