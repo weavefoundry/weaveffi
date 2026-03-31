@@ -12,6 +12,8 @@ CRATES=(
   weaveffi-gen-android
   weaveffi-gen-node
   weaveffi-gen-wasm
+  weaveffi-gen-python
+  weaveffi-gen-dotnet
   weaveffi-cli
 )
 
