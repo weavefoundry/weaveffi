@@ -15,9 +15,11 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 camino = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
+tempfile = "3"
 
 [lints]
 workspace = true

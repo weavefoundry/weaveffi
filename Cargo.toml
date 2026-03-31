@@ -35,6 +35,7 @@ thiserror = "1.0"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 camino = "1.1"
+sha2 = "0.10"
 heck = "0.5"
 color-eyre = "0.6"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
