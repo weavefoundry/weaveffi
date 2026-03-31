@@ -77,35 +77,63 @@ fn c_type_for_param(ty: &TypeRef, name: &str, module: &str) -> String {
                 format!("const {elem}* {name}, size_t {name}_len")
             }
         }
-        TypeRef::Map(_, _) => format!("const void* {name}"),
+        TypeRef::Map(k, v) => {
+            let key_elem = c_element_type(k, module);
+            let val_elem = c_element_type(v, module);
+            let keys_part = if is_c_pointer_type(k) {
+                format!("{key_elem} const* {name}_keys")
+            } else {
+                format!("const {key_elem}* {name}_keys")
+            };
+            let vals_part = if is_c_pointer_type(v) {
+                format!("{val_elem} const* {name}_values")
+            } else {
+                format!("const {val_elem}* {name}_values")
+            };
+            format!("{keys_part}, {vals_part}, size_t {name}_len")
+        }
     }
 }
 
-fn c_ret_type(ty: &TypeRef, module: &str) -> (String, bool) {
+fn c_ret_type(ty: &TypeRef, module: &str) -> (String, Vec<String>) {
     match ty {
-        TypeRef::I32 => ("int32_t".to_string(), false),
-        TypeRef::U32 => ("uint32_t".to_string(), false),
-        TypeRef::I64 => ("int64_t".to_string(), false),
-        TypeRef::F64 => ("double".to_string(), false),
-        TypeRef::Bool => ("bool".to_string(), false),
-        TypeRef::StringUtf8 => ("const char*".to_string(), false),
-        TypeRef::Bytes => ("const uint8_t*".to_string(), true),
-        TypeRef::Handle => ("weaveffi_handle_t".to_string(), false),
-        TypeRef::Struct(s) => (format!("weaveffi_{module}_{s}*"), false),
-        TypeRef::Enum(e) => (format!("weaveffi_{module}_{e}"), false),
+        TypeRef::I32 => ("int32_t".to_string(), vec![]),
+        TypeRef::U32 => ("uint32_t".to_string(), vec![]),
+        TypeRef::I64 => ("int64_t".to_string(), vec![]),
+        TypeRef::F64 => ("double".to_string(), vec![]),
+        TypeRef::Bool => ("bool".to_string(), vec![]),
+        TypeRef::StringUtf8 => ("const char*".to_string(), vec![]),
+        TypeRef::Bytes => (
+            "const uint8_t*".to_string(),
+            vec!["size_t* out_len".to_string()],
+        ),
+        TypeRef::Handle => ("weaveffi_handle_t".to_string(), vec![]),
+        TypeRef::Struct(s) => (format!("weaveffi_{module}_{s}*"), vec![]),
+        TypeRef::Enum(e) => (format!("weaveffi_{module}_{e}"), vec![]),
         TypeRef::Optional(inner) => {
             if is_c_pointer_type(inner) {
                 c_ret_type(inner, module)
             } else {
                 let base = c_element_type(inner, module);
-                (format!("{base}*"), false)
+                (format!("{base}*"), vec![])
             }
         }
         TypeRef::List(inner) => {
             let elem = c_element_type(inner, module);
-            (format!("{elem}*"), true)
+            (format!("{elem}*"), vec!["size_t* out_len".to_string()])
         }
-        TypeRef::Map(_, _) => ("void*".to_string(), false),
+        TypeRef::Map(k, v) => {
+            let key_elem = c_element_type(k, module);
+            let val_elem = c_element_type(v, module);
+            (
+                "void".to_string(),
+                vec![
+                    format!("{key_elem}* out_keys"),
+                    format!("{val_elem}* out_values"),
+                    "size_t* out_len".to_string(),
+                ],
+            )
+        }
     }
 }
 
@@ -131,6 +159,13 @@ fn render_c_header(api: &Api) -> String {
     out.push_str("void weaveffi_error_clear(weaveffi_error* err);\n");
     out.push_str("void weaveffi_free_string(const char* ptr);\n");
     out.push_str("void weaveffi_free_bytes(uint8_t* ptr, size_t len);\n\n");
+    out.push_str("/*\n");
+    out.push_str(" * Map convention: Maps are passed as parallel arrays of keys and values.\n");
+    out.push_str(" * A map parameter {K:V} named \"m\" expands to:\n");
+    out.push_str(" *   const K* m_keys, const V* m_values, size_t m_len\n");
+    out.push_str(" * A map return value expands to out-parameters:\n");
+    out.push_str(" *   K* out_keys, V* out_values, size_t* out_len\n");
+    out.push_str(" */\n\n");
 
     for m in &api.modules {
         render_module_header(&mut out, m);
@@ -160,14 +195,15 @@ fn render_struct_header(out: &mut String, module_name: &str, s: &StructDef) {
     out.push_str(&format!("void {prefix}_destroy({prefix}* ptr);\n"));
 
     for field in &s.fields {
-        let (ret_ty, needs_len) = c_ret_type(&field.ty, module_name);
+        let (ret_ty, out_params) = c_ret_type(&field.ty, module_name);
         let getter = format!("{prefix}_get_{}", field.name);
-        if needs_len {
-            out.push_str(&format!(
-                "{ret_ty} {getter}(const {prefix}* ptr, size_t* out_len);\n"
-            ));
-        } else {
+        if out_params.is_empty() {
             out.push_str(&format!("{ret_ty} {getter}(const {prefix}* ptr);\n"));
+        } else {
+            let extra = out_params.join(", ");
+            out.push_str(&format!(
+                "{ret_ty} {getter}(const {prefix}* ptr, {extra});\n"
+            ));
         }
     }
     out.push('\n');
@@ -197,10 +233,8 @@ fn render_module_header(out: &mut String, module: &Module) {
     for f in &module.functions {
         let mut params_sig = c_params_sig(&f.params, &module.name);
         let ret_sig = if let Some(ret) = &f.returns {
-            let (ret_ty, needs_len) = c_ret_type(ret, &module.name);
-            if needs_len {
-                params_sig.push("size_t* out_len".to_string());
-            }
+            let (ret_ty, out_params) = c_ret_type(ret, &module.name);
+            params_sig.extend(out_params);
             ret_ty
         } else {
             "void".to_string()
@@ -520,47 +554,47 @@ mod tests {
 
     #[test]
     fn c_ret_struct() {
-        let (ty, needs_len) = c_ret_type(&TypeRef::Struct("Contact".into()), "contacts");
+        let (ty, out_params) = c_ret_type(&TypeRef::Struct("Contact".into()), "contacts");
         assert_eq!(ty, "weaveffi_contacts_Contact*");
-        assert!(!needs_len);
+        assert!(out_params.is_empty());
     }
 
     #[test]
     fn c_ret_enum() {
-        let (ty, needs_len) = c_ret_type(&TypeRef::Enum("Color".into()), "contacts");
+        let (ty, out_params) = c_ret_type(&TypeRef::Enum("Color".into()), "contacts");
         assert_eq!(ty, "weaveffi_contacts_Color");
-        assert!(!needs_len);
+        assert!(out_params.is_empty());
     }
 
     #[test]
     fn c_ret_optional_value() {
-        let (ty, needs_len) = c_ret_type(&TypeRef::Optional(Box::new(TypeRef::I32)), "m");
+        let (ty, out_params) = c_ret_type(&TypeRef::Optional(Box::new(TypeRef::I32)), "m");
         assert_eq!(ty, "int32_t*");
-        assert!(!needs_len);
+        assert!(out_params.is_empty());
     }
 
     #[test]
     fn c_ret_optional_pointer() {
-        let (ty, needs_len) = c_ret_type(&TypeRef::Optional(Box::new(TypeRef::StringUtf8)), "m");
+        let (ty, out_params) = c_ret_type(&TypeRef::Optional(Box::new(TypeRef::StringUtf8)), "m");
         assert_eq!(ty, "const char*");
-        assert!(!needs_len);
+        assert!(out_params.is_empty());
     }
 
     #[test]
     fn c_ret_list_value() {
-        let (ty, needs_len) = c_ret_type(&TypeRef::List(Box::new(TypeRef::I32)), "m");
+        let (ty, out_params) = c_ret_type(&TypeRef::List(Box::new(TypeRef::I32)), "m");
         assert_eq!(ty, "int32_t*");
-        assert!(needs_len);
+        assert_eq!(out_params, vec!["size_t* out_len"]);
     }
 
     #[test]
     fn c_ret_list_struct() {
-        let (ty, needs_len) = c_ret_type(
+        let (ty, out_params) = c_ret_type(
             &TypeRef::List(Box::new(TypeRef::Struct("Contact".into()))),
             "contacts",
         );
         assert_eq!(ty, "weaveffi_contacts_Contact**");
-        assert!(needs_len);
+        assert_eq!(out_params, vec!["size_t* out_len"]);
     }
 
     #[test]
@@ -876,6 +910,71 @@ mod tests {
         assert!(
             header.contains("weaveffi_paint_Color weaveffi_paint_mix(weaveffi_paint_Color a, weaveffi_error* out_err);"),
             "missing function with enum param/return: {header}"
+        );
+    }
+
+    #[test]
+    fn c_type_map_param() {
+        let result = c_type_for_param(
+            &TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
+            "scores",
+            "m",
+        );
+        assert_eq!(
+            result,
+            "const char* const* scores_keys, const int32_t* scores_values, size_t scores_len"
+        );
+    }
+
+    #[test]
+    fn c_ret_map() {
+        let (ty, out_params) = c_ret_type(
+            &TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
+            "m",
+        );
+        assert_eq!(ty, "void");
+        assert_eq!(
+            out_params,
+            vec![
+                "const char** out_keys",
+                "int32_t* out_values",
+                "size_t* out_len"
+            ]
+        );
+    }
+
+    #[test]
+    fn c_header_with_map_type() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "store".to_string(),
+                functions: vec![Function {
+                    name: "update_scores".to_string(),
+                    params: vec![Param {
+                        name: "scores".to_string(),
+                        ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+
+        let header = render_c_header(&api);
+        assert!(
+            header.contains(
+                "const char* const* scores_keys, const int32_t* scores_values, size_t scores_len"
+            ),
+            "missing map param expansion: {header}"
+        );
+        assert!(
+            header.contains("Map convention"),
+            "missing map convention comment: {header}"
         );
     }
 }
