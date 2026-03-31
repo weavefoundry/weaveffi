@@ -14,6 +14,10 @@ weaveffi-ir = { path = "../weaveffi-ir", version = "0.1.0" }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 camino = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [lints]
 workspace = true
