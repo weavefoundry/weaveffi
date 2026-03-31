@@ -1,3 +1,4 @@
+mod extract;
 mod scaffold;
 
 use camino::Utf8Path;
