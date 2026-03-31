@@ -1,6 +1,98 @@
 use std::collections::{BTreeMap, BTreeSet};
 use weaveffi_ir::ir::{Api, ErrorDomain, Function, Module, Param, TypeRef};
 
+#[derive(Debug, Clone)]
+pub enum ValidationWarning {
+    DeprecatedHandleType { module: String, function: String },
+    LargeEnumVariantCount { enum_name: String, count: usize },
+    DeepNesting { location: String, depth: usize },
+    EmptyModuleDoc { module: String },
+}
+
+pub fn collect_warnings(api: &Api) -> Vec<ValidationWarning> {
+    let mut warnings = Vec::new();
+    for module in &api.modules {
+        for f in &module.functions {
+            if function_uses_handle(f) {
+                warnings.push(ValidationWarning::DeprecatedHandleType {
+                    module: module.name.clone(),
+                    function: f.name.clone(),
+                });
+            }
+        }
+
+        for e in &module.enums {
+            if e.variants.len() > 100 {
+                warnings.push(ValidationWarning::LargeEnumVariantCount {
+                    enum_name: e.name.clone(),
+                    count: e.variants.len(),
+                });
+            }
+        }
+
+        for f in &module.functions {
+            for p in &f.params {
+                let depth = nesting_depth(&p.ty);
+                if depth > 3 {
+                    warnings.push(ValidationWarning::DeepNesting {
+                        location: format!("{}::{}::{}", module.name, f.name, p.name),
+                        depth,
+                    });
+                }
+            }
+            if let Some(ret) = &f.returns {
+                let depth = nesting_depth(ret);
+                if depth > 3 {
+                    warnings.push(ValidationWarning::DeepNesting {
+                        location: format!("{}::{}::return", module.name, f.name),
+                        depth,
+                    });
+                }
+            }
+        }
+        for s in &module.structs {
+            for field in &s.fields {
+                let depth = nesting_depth(&field.ty);
+                if depth > 3 {
+                    warnings.push(ValidationWarning::DeepNesting {
+                        location: format!("{}::{}::{}", module.name, s.name, field.name),
+                        depth,
+                    });
+                }
+            }
+        }
+
+        if !module.functions.is_empty() && module.functions.iter().all(|f| f.doc.is_none()) {
+            warnings.push(ValidationWarning::EmptyModuleDoc {
+                module: module.name.clone(),
+            });
+        }
+    }
+    warnings
+}
+
+fn function_uses_handle(f: &Function) -> bool {
+    f.params.iter().any(|p| contains_handle(&p.ty))
+        || f.returns.as_ref().is_some_and(|r| contains_handle(r))
+}
+
+fn contains_handle(ty: &TypeRef) -> bool {
+    match ty {
+        TypeRef::Handle => true,
+        TypeRef::Optional(inner) | TypeRef::List(inner) => contains_handle(inner),
+        TypeRef::Map(k, v) => contains_handle(k) || contains_handle(v),
+        _ => false,
+    }
+}
+
+fn nesting_depth(ty: &TypeRef) -> usize {
+    match ty {
+        TypeRef::Optional(inner) | TypeRef::List(inner) => 1 + nesting_depth(inner),
+        TypeRef::Map(k, v) => nesting_depth(k).max(nesting_depth(v)),
+        _ => 0,
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
     #[error("module has no name")]
@@ -1309,6 +1401,376 @@ mod tests {
             }],
         };
         assert!(validate_api(&mut api).is_ok());
+    }
+
+    #[test]
+    fn warning_deprecated_handle_in_param() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "get_thing".to_string(),
+                    params: vec![Param {
+                        name: "h".to_string(),
+                        ty: TypeRef::Handle,
+                    }],
+                    returns: None,
+                    doc: Some("documented".to_string()),
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        let warnings = collect_warnings(&api);
+        assert_eq!(warnings.len(), 1);
+        assert!(matches!(
+            &warnings[0],
+            ValidationWarning::DeprecatedHandleType { module, function }
+                if module == "mymod" && function == "get_thing"
+        ));
+    }
+
+    #[test]
+    fn warning_deprecated_handle_in_return() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "create".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::Handle),
+                    doc: Some("documented".to_string()),
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        let warnings = collect_warnings(&api);
+        assert!(warnings.iter().any(|w| matches!(
+            w,
+            ValidationWarning::DeprecatedHandleType { function, .. } if function == "create"
+        )));
+    }
+
+    #[test]
+    fn warning_deprecated_handle_nested() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "find".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Handle))),
+                    doc: Some("documented".to_string()),
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        let warnings = collect_warnings(&api);
+        assert!(warnings.iter().any(|w| matches!(
+            w,
+            ValidationWarning::DeprecatedHandleType { function, .. } if function == "find"
+        )));
+    }
+
+    #[test]
+    fn warning_no_handle_no_warning() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "add".to_string(),
+                    params: vec![Param {
+                        name: "x".to_string(),
+                        ty: TypeRef::I32,
+                    }],
+                    returns: Some(TypeRef::I32),
+                    doc: Some("documented".to_string()),
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        let warnings = collect_warnings(&api);
+        assert!(!warnings
+            .iter()
+            .any(|w| matches!(w, ValidationWarning::DeprecatedHandleType { .. })));
+    }
+
+    #[test]
+    fn warning_large_enum_variant_count() {
+        let variants: Vec<EnumVariant> = (0..101)
+            .map(|i| EnumVariant {
+                name: format!("V{i}"),
+                value: i,
+                doc: None,
+            })
+            .collect();
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![simple_function("ok_fn")],
+                structs: vec![],
+                enums: vec![EnumDef {
+                    name: "BigEnum".to_string(),
+                    doc: None,
+                    variants,
+                }],
+                errors: None,
+            }],
+        };
+        let warnings = collect_warnings(&api);
+        assert!(warnings.iter().any(|w| matches!(
+            w,
+            ValidationWarning::LargeEnumVariantCount { enum_name, count }
+                if enum_name == "BigEnum" && *count == 101
+        )));
+    }
+
+    #[test]
+    fn warning_enum_at_100_no_warning() {
+        let variants: Vec<EnumVariant> = (0..100)
+            .map(|i| EnumVariant {
+                name: format!("V{i}"),
+                value: i,
+                doc: None,
+            })
+            .collect();
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![simple_function("ok_fn")],
+                structs: vec![],
+                enums: vec![EnumDef {
+                    name: "BigEnum".to_string(),
+                    doc: None,
+                    variants,
+                }],
+                errors: None,
+            }],
+        };
+        let warnings = collect_warnings(&api);
+        assert!(!warnings
+            .iter()
+            .any(|w| matches!(w, ValidationWarning::LargeEnumVariantCount { .. })));
+    }
+
+    #[test]
+    fn warning_deep_nesting_in_param() {
+        let deep = TypeRef::Optional(Box::new(TypeRef::List(Box::new(TypeRef::Optional(
+            Box::new(TypeRef::List(Box::new(TypeRef::I32))),
+        )))));
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "nested_fn".to_string(),
+                    params: vec![Param {
+                        name: "data".to_string(),
+                        ty: deep,
+                    }],
+                    returns: None,
+                    doc: Some("documented".to_string()),
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        let warnings = collect_warnings(&api);
+        assert!(warnings.iter().any(|w| matches!(
+            w,
+            ValidationWarning::DeepNesting { location, depth }
+                if location == "mymod::nested_fn::data" && *depth == 4
+        )));
+    }
+
+    #[test]
+    fn warning_nesting_at_3_no_warning() {
+        let nested = TypeRef::Optional(Box::new(TypeRef::List(Box::new(TypeRef::Optional(
+            Box::new(TypeRef::I32),
+        )))));
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "ok_fn".to_string(),
+                    params: vec![Param {
+                        name: "data".to_string(),
+                        ty: nested,
+                    }],
+                    returns: None,
+                    doc: Some("documented".to_string()),
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        let warnings = collect_warnings(&api);
+        assert!(!warnings
+            .iter()
+            .any(|w| matches!(w, ValidationWarning::DeepNesting { .. })));
+    }
+
+    #[test]
+    fn warning_deep_nesting_in_struct_field() {
+        let deep = TypeRef::Optional(Box::new(TypeRef::List(Box::new(TypeRef::Optional(
+            Box::new(TypeRef::List(Box::new(TypeRef::I32))),
+        )))));
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![simple_function("ok_fn")],
+                structs: vec![StructDef {
+                    name: "Widget".to_string(),
+                    doc: None,
+                    fields: vec![StructField {
+                        name: "data".to_string(),
+                        ty: deep,
+                        doc: None,
+                    }],
+                }],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        let warnings = collect_warnings(&api);
+        assert!(warnings.iter().any(|w| matches!(
+            w,
+            ValidationWarning::DeepNesting { location, .. }
+                if location == "mymod::Widget::data"
+        )));
+    }
+
+    #[test]
+    fn warning_empty_module_doc() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "undocumented".to_string(),
+                functions: vec![
+                    Function {
+                        name: "a".to_string(),
+                        params: vec![],
+                        returns: None,
+                        doc: None,
+                        r#async: false,
+                    },
+                    Function {
+                        name: "b".to_string(),
+                        params: vec![],
+                        returns: None,
+                        doc: None,
+                        r#async: false,
+                    },
+                ],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        let warnings = collect_warnings(&api);
+        assert!(warnings.iter().any(|w| matches!(
+            w,
+            ValidationWarning::EmptyModuleDoc { module } if module == "undocumented"
+        )));
+    }
+
+    #[test]
+    fn warning_partial_docs_no_warning() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "partial".to_string(),
+                functions: vec![
+                    Function {
+                        name: "a".to_string(),
+                        params: vec![],
+                        returns: None,
+                        doc: Some("has doc".to_string()),
+                        r#async: false,
+                    },
+                    Function {
+                        name: "b".to_string(),
+                        params: vec![],
+                        returns: None,
+                        doc: None,
+                        r#async: false,
+                    },
+                ],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        let warnings = collect_warnings(&api);
+        assert!(!warnings
+            .iter()
+            .any(|w| matches!(w, ValidationWarning::EmptyModuleDoc { .. })));
+    }
+
+    #[test]
+    fn warning_no_functions_no_empty_doc_warning() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "empty".to_string(),
+                functions: vec![],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        let warnings = collect_warnings(&api);
+        assert!(!warnings
+            .iter()
+            .any(|w| matches!(w, ValidationWarning::EmptyModuleDoc { .. })));
+    }
+
+    #[test]
+    fn warning_clean_api_no_warnings() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "clean".to_string(),
+                functions: vec![Function {
+                    name: "add".to_string(),
+                    params: vec![Param {
+                        name: "x".to_string(),
+                        ty: TypeRef::I32,
+                    }],
+                    returns: Some(TypeRef::I32),
+                    doc: Some("Adds numbers".to_string()),
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![simple_enum("Color")],
+                errors: None,
+            }],
+        };
+        let warnings = collect_warnings(&api);
+        assert!(warnings.is_empty());
     }
 
     #[test]
