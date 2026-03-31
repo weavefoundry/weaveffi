@@ -41,3 +41,6 @@ node_modules/
 /docs/site/
 /docs/api/
 /site/
+
+# WeaveFFI cache
+.weaveffi-cache
