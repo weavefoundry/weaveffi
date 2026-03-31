@@ -677,4 +677,56 @@ modules:
         let back: TypeRef = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ty);
     }
+
+    #[test]
+    fn parse_map_string_to_i32() {
+        assert_eq!(
+            parse_type_ref("{string:i32}"),
+            Ok(TypeRef::Map(
+                Box::new(TypeRef::StringUtf8),
+                Box::new(TypeRef::I32),
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_map_string_to_struct() {
+        assert_eq!(
+            parse_type_ref("{string:Contact}"),
+            Ok(TypeRef::Map(
+                Box::new(TypeRef::StringUtf8),
+                Box::new(TypeRef::Struct("Contact".into())),
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_map_roundtrip() {
+        let ty = TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32));
+        let json = serde_json::to_string(&ty).unwrap();
+        let back: TypeRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ty);
+    }
+
+    #[test]
+    fn parse_optional_map() {
+        assert_eq!(
+            parse_type_ref("{string:i32}?"),
+            Ok(TypeRef::Optional(Box::new(TypeRef::Map(
+                Box::new(TypeRef::StringUtf8),
+                Box::new(TypeRef::I32),
+            ))))
+        );
+    }
+
+    #[test]
+    fn parse_map_of_lists() {
+        assert_eq!(
+            parse_type_ref("{string:[i32]}"),
+            Ok(TypeRef::Map(
+                Box::new(TypeRef::StringUtf8),
+                Box::new(TypeRef::List(Box::new(TypeRef::I32))),
+            ))
+        );
+    }
 }
