@@ -17,6 +17,7 @@ use weaveffi_core::validate::{collect_warnings, validate_api, ValidationError};
 use weaveffi_gen_android::AndroidGenerator;
 use weaveffi_gen_c::CGenerator;
 use weaveffi_gen_node::NodeGenerator;
+use weaveffi_gen_python::PythonGenerator;
 use weaveffi_gen_swift::SwiftGenerator;
 use weaveffi_gen_wasm::WasmGenerator;
 use weaveffi_ir::parse::{parse_api_str, ParseError};
@@ -43,7 +44,7 @@ enum Commands {
         /// Output directory for generated artifacts
         #[arg(short, long, default_value = "./generated")]
         out: String,
-        /// Comma-separated list of targets to generate (c, swift, android, node, wasm)
+        /// Comma-separated list of targets to generate (c, swift, android, node, wasm, python)
         #[arg(short, long)]
         target: Option<String>,
         /// Also generate a scaffold.rs with Rust FFI function stubs
@@ -277,7 +278,8 @@ fn cmd_generate(
     let android = AndroidGenerator;
     let node = NodeGenerator;
     let wasm = WasmGenerator;
-    let all: Vec<&dyn Generator> = vec![&c, &swift, &android, &node, &wasm];
+    let python = PythonGenerator;
+    let all: Vec<&dyn Generator> = vec![&c, &swift, &android, &node, &wasm, &python];
 
     let filter: Option<Vec<&str>> = targets.map(|t| t.split(',').map(str::trim).collect());
 
@@ -432,7 +434,8 @@ fn cmd_diff(input: &str, out: Option<&str>, quiet: bool) -> Result<()> {
     let android = AndroidGenerator;
     let node = NodeGenerator;
     let wasm = WasmGenerator;
-    let all: Vec<&dyn Generator> = vec![&c, &swift, &android, &node, &wasm];
+    let python = PythonGenerator;
+    let all: Vec<&dyn Generator> = vec![&c, &swift, &android, &node, &wasm, &python];
 
     let config = GeneratorConfig::default();
     let mut orchestrator = Orchestrator::new();
@@ -1051,7 +1054,8 @@ mod tests {
         let android = AndroidGenerator;
         let node = NodeGenerator;
         let wasm = WasmGenerator;
-        let all: Vec<&dyn Generator> = vec![&c, &swift, &android, &node, &wasm];
+        let python = PythonGenerator;
+        let all: Vec<&dyn Generator> = vec![&c, &swift, &android, &node, &wasm, &python];
 
         let mut files: Vec<String> = Vec::new();
         for gen in &all {
@@ -1077,6 +1081,10 @@ mod tests {
         assert!(
             files.iter().any(|f| f.contains("wasm/weaveffi_wasm.js")),
             "missing wasm js: {files:?}"
+        );
+        assert!(
+            files.iter().any(|f| f.contains("python/__init__.py")),
+            "missing python init: {files:?}"
         );
     }
 
