@@ -5,6 +5,8 @@ use camino::Utf8Path;
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::{bail, eyre, Report, Result, WrapErr};
 use color_eyre::Section;
+use similar::TextDiff;
+use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsStr;
 use std::process::Command;
@@ -81,6 +83,13 @@ enum Commands {
         /// Input IDL/IR file (yaml|yml|json|toml)
         input: String,
     },
+    Diff {
+        /// Input IDL/IR file (yaml|yml|json|toml)
+        input: String,
+        /// Output directory to compare against (defaults to ./generated)
+        #[arg(short, long)]
+        out: Option<String>,
+    },
     Doctor,
 }
 
@@ -140,6 +149,7 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Commands::Diff { input, out } => cmd_diff(&input, out.as_deref(), quiet)?,
         Commands::Doctor => cmd_doctor()?,
     }
     Ok(())
@@ -388,6 +398,131 @@ fn cmd_lint(input: &str, quiet: bool) -> Result<bool> {
             eprintln!("warning: {w}");
         }
         Ok(false)
+    }
+}
+
+fn cmd_diff(input: &str, out: Option<&str>, quiet: bool) -> Result<()> {
+    let out = out.unwrap_or("./generated");
+
+    let in_path = Utf8Path::new(input);
+    let ext = in_path.extension().unwrap_or("");
+    if ext.is_empty() {
+        bail!("input file has no extension (expected yml|yaml|json|toml)");
+    }
+    let format = match ext {
+        "yml" | "yaml" => "yaml",
+        "json" => "json",
+        "toml" => "toml",
+        other => bail!(
+            "unsupported input format: {} (expected yml|yaml|json|toml)",
+            other
+        ),
+    };
+    let contents = std::fs::read_to_string(in_path.as_std_path())
+        .wrap_err_with(|| format!("failed to read input file: {}", input))?;
+    let mut api = parse_api_str(&contents, format).map_err(|e| format_parse_error(input, e))?;
+    validate_api(&mut api).map_err(format_validation_error)?;
+
+    let tmp = tempfile::tempdir().wrap_err("failed to create temp directory")?;
+    let tmp_path = Utf8Path::from_path(tmp.path())
+        .ok_or_else(|| eyre!("temp directory path is not valid UTF-8"))?;
+
+    let c = CGenerator;
+    let swift = SwiftGenerator;
+    let android = AndroidGenerator;
+    let node = NodeGenerator;
+    let wasm = WasmGenerator;
+    let all: Vec<&dyn Generator> = vec![&c, &swift, &android, &node, &wasm];
+
+    let config = GeneratorConfig::default();
+    let mut orchestrator = Orchestrator::new();
+    for &gen in &all {
+        orchestrator = orchestrator.with_generator(gen);
+    }
+    orchestrator
+        .run(&api, tmp_path, &config, true)
+        .map_err(|e| eyre!("{:#}", e))?;
+
+    let out_dir = Utf8Path::new(out);
+
+    let generated = collect_relative_files(tmp_path)?;
+    let existing = if out_dir.exists() {
+        collect_relative_files(out_dir)?
+    } else {
+        BTreeSet::new()
+    };
+
+    let all_paths: BTreeSet<_> = generated.union(&existing).collect();
+    let mut has_diff = false;
+
+    for rel in &all_paths {
+        let gen_file = tmp_path.join(rel);
+        let out_file = out_dir.join(rel);
+
+        match (gen_file.exists(), out_file.exists()) {
+            (true, false) => {
+                has_diff = true;
+                println!("{rel}: [new file]");
+            }
+            (false, true) => {
+                has_diff = true;
+                println!("{rel}: [would be removed]");
+            }
+            (true, true) => {
+                let gen_content = std::fs::read_to_string(gen_file.as_std_path())?;
+                let out_content = std::fs::read_to_string(out_file.as_std_path())?;
+                if gen_content != out_content {
+                    has_diff = true;
+                    print_unified_diff(rel, &out_content, &gen_content);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !has_diff && !quiet {
+        println!("No differences found.");
+    }
+
+    Ok(())
+}
+
+fn collect_relative_files(base: &Utf8Path) -> Result<BTreeSet<String>> {
+    let mut files = BTreeSet::new();
+    walk_dir(base, base, &mut files)?;
+    Ok(files)
+}
+
+fn walk_dir(base: &Utf8Path, dir: &Utf8Path, out: &mut BTreeSet<String>) -> Result<()> {
+    let entries = std::fs::read_dir(dir.as_std_path())
+        .wrap_err_with(|| format!("failed to read directory: {}", dir))?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let utf8 = Utf8Path::from_path(&path)
+            .ok_or_else(|| eyre!("non-UTF-8 path: {:?}", path))?
+            .to_owned();
+        if utf8.is_dir() {
+            walk_dir(base, &utf8, out)?;
+        } else {
+            let rel = utf8
+                .strip_prefix(base)
+                .wrap_err("failed to strip prefix")?
+                .to_string();
+            if rel != ".weaveffi-cache" {
+                out.insert(rel);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_unified_diff(path: &str, old: &str, new: &str) {
+    let diff = TextDiff::from_lines(old, new);
+    println!("--- {path}");
+    println!("+++ {path}");
+    for hunk in diff.unified_diff().context_radius(3).iter_hunks() {
+        println!("{hunk}");
     }
 }
 
@@ -896,5 +1031,51 @@ mod tests {
             files.iter().any(|f| f.contains("wasm/weaveffi_wasm.js")),
             "missing wasm js: {files:?}"
         );
+    }
+
+    #[test]
+    fn diff_shows_new_files() {
+        let _ = color_eyre::install();
+        let dir = tempfile::tempdir().unwrap();
+        let yml = dir.path().join("api.yml");
+        std::fs::write(
+            &yml,
+            concat!(
+                "version: \"0.1.0\"\n",
+                "modules:\n",
+                "  - name: math\n",
+                "    functions:\n",
+                "      - name: add\n",
+                "        params:\n",
+                "          - { name: a, type: i32 }\n",
+                "          - { name: b, type: i32 }\n",
+                "        return: i32\n",
+            ),
+        )
+        .unwrap();
+
+        let empty_out = dir.path().join("empty_out");
+        std::fs::create_dir_all(&empty_out).unwrap();
+        let input = yml.to_str().unwrap();
+        let out_str = empty_out.to_str().unwrap();
+
+        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .args(["diff", input, "--out", out_str])
+            .output()
+            .expect("failed to run weaveffi diff");
+
+        let stdout = String::from_utf8_lossy(&cmd.stdout);
+        assert!(cmd.status.success(), "diff failed: {stdout}");
+        assert!(
+            !stdout.is_empty(),
+            "diff output should not be empty for an empty output dir"
+        );
+        for line in stdout.lines() {
+            assert!(
+                line.contains("[new file]"),
+                "expected [new file] in every line, got: {line}"
+            );
+        }
     }
 }

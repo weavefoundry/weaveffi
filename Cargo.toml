@@ -41,6 +41,8 @@ color-eyre = "0.6"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 syn = { version = "2.0", features = ["full", "parsing", "visit"] }
 quote = "1.0"
+similar = "2.0"
+tempfile = "3"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
