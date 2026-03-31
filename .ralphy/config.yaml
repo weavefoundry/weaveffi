@@ -12,7 +12,7 @@ commands:
 rules:
   - "This is a Cargo workspace. Crates live in crates/, samples in samples/, consumer examples in examples/."
   - "Crate structure: weaveffi-ir (IR model + parsing), weaveffi-abi (C ABI runtime), weaveffi-core (Generator trait, Orchestrator, validation, utils), weaveffi-gen-c, weaveffi-gen-swift, weaveffi-gen-android, weaveffi-gen-node, weaveffi-gen-wasm (generators), weaveffi-cli (CLI binary named 'weaveffi')."
-  - "Use Conventional Commits: feat, fix, refactor, test, docs, chore, ci, build, style, perf. No scopes. Imperative mood, no trailing period, max 72 chars."
+  - "Use Conventional Commits: feat, fix, refactor, test, docs, chore, ci, build, style, perf. No scopes. Single-line messages only (no body or footer). Imperative mood, no trailing period, max 72 chars. Use '!' after the type for breaking changes (e.g. feat!: ...), not a BREAKING CHANGE footer."
   - "Run cargo fmt --all before committing."
   - "All new code must have tests. Add tests as #[cfg(test)] mod tests at the bottom of existing files, or as integration tests in tests/ directories."
   - "Async is explicitly rejected. Do not add async support. The validator rejects async: true."
