@@ -329,6 +329,7 @@ fn render_kotlin(api: &Api, package: &str) -> String {
             render_kotlin_struct(&mut kotlin, s);
         }
     }
+    render_kotlin_error_types(&mut kotlin, api);
     kotlin
 }
 
@@ -350,9 +351,77 @@ fn render_kotlin_enum(out: &mut String, e: &EnumDef) {
     let _ = writeln!(out, "}}");
 }
 
+fn render_kotlin_error_types(out: &mut String, api: &Api) {
+    let error_codes: Vec<_> = api
+        .modules
+        .iter()
+        .filter_map(|m| m.errors.as_ref())
+        .flat_map(|e| &e.codes)
+        .collect();
+
+    let _ = writeln!(out);
+    if error_codes.is_empty() {
+        let _ = writeln!(
+            out,
+            "open class WeaveFFIException(val code: Int, message: String) : Exception(message)"
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "sealed class WeaveFFIException(val code: Int, message: String) : Exception(message) {{"
+        );
+        for ec in &error_codes {
+            let _ = writeln!(
+                out,
+                "    class {}(message: String = \"{}\") : WeaveFFIException({}, message)",
+                ec.name, ec.message, ec.code
+            );
+        }
+        let _ = writeln!(out, "}}");
+    }
+}
+
 fn render_jni_c(api: &Api, package: &str) -> String {
     let jni_prefix = package.replace('.', "_");
+    let jni_pkg_path = package.replace('.', "/");
     let mut jni_c = String::from("#include <jni.h>\n#include <stdbool.h>\n#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n#include \"weaveffi.h\"\n\n");
+
+    let error_codes: Vec<_> = api
+        .modules
+        .iter()
+        .filter_map(|m| m.errors.as_ref())
+        .flat_map(|e| &e.codes)
+        .collect();
+
+    jni_c.push_str("static void throw_weaveffi_error(JNIEnv* env, weaveffi_error* err) {\n");
+    jni_c.push_str("    const char* msg = err->message ? err->message : \"WeaveFFI error\";\n");
+    if error_codes.is_empty() {
+        jni_c.push_str(
+            "    jclass exClass = (*env)->FindClass(env, \"java/lang/RuntimeException\");\n",
+        );
+    } else {
+        jni_c.push_str("    jclass exClass;\n");
+        jni_c.push_str("    switch (err->code) {\n");
+        for ec in &error_codes {
+            let _ = writeln!(jni_c, "    case {}:", ec.code);
+            let _ = writeln!(
+                jni_c,
+                "        exClass = (*env)->FindClass(env, \"{}/WeaveFFIException${}\");",
+                jni_pkg_path, ec.name
+            );
+            jni_c.push_str("        break;\n");
+        }
+        jni_c.push_str("    default:\n");
+        jni_c.push_str(
+            "        exClass = (*env)->FindClass(env, \"java/lang/RuntimeException\");\n",
+        );
+        jni_c.push_str("        break;\n");
+        jni_c.push_str("    }\n");
+    }
+    jni_c.push_str("    (*env)->ThrowNew(env, exClass, msg);\n");
+    jni_c.push_str("    weaveffi_error_clear(err);\n");
+    jni_c.push_str("}\n\n");
+
     for m in &api.modules {
         for f in &m.functions {
             let jret = jni_ret_type(f.returns.as_ref());
@@ -1335,16 +1404,7 @@ fn write_map_box_elem(out: &mut String, ty: &TypeRef, var: &str, arr: &str) {
 
 fn write_error_check(out: &mut String, ret_type: Option<&TypeRef>) {
     let _ = writeln!(out, "    if (err.code != 0) {{");
-    let _ = writeln!(
-        out,
-        "        jclass exClass = (*env)->FindClass(env, \"java/lang/RuntimeException\");"
-    );
-    let _ = writeln!(
-        out,
-        "        const char* msg = err.message ? err.message : \"WeaveFFI error\";"
-    );
-    let _ = writeln!(out, "        (*env)->ThrowNew(env, exClass, msg);");
-    let _ = writeln!(out, "        weaveffi_error_clear(&err);");
+    let _ = writeln!(out, "        throw_weaveffi_error(env, &err);");
     let _ = writeln!(out, "        {}", jni_default_return(ret_type));
     let _ = writeln!(out, "    }}");
 }
@@ -1912,7 +1972,10 @@ fn release_jni_resources_single(out: &mut String, name: &str, ty: &TypeRef) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weaveffi_ir::ir::{EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField};
+    use weaveffi_ir::ir::{
+        EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param, StructDef,
+        StructField,
+    };
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
@@ -3187,5 +3250,75 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn kotlin_inline_error_types() {
+        let api = make_api(vec![Module {
+            name: "contacts".to_string(),
+            functions: vec![Function {
+                name: "get".to_string(),
+                params: vec![Param {
+                    name: "id".to_string(),
+                    ty: TypeRef::I32,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: Some(ErrorDomain {
+                name: "ContactError".to_string(),
+                codes: vec![
+                    ErrorCode {
+                        name: "ContactNotFound".to_string(),
+                        code: 1001,
+                        message: "Contact not found".to_string(),
+                    },
+                    ErrorCode {
+                        name: "InvalidInput".to_string(),
+                        code: 1002,
+                        message: "Invalid input provided".to_string(),
+                    },
+                ],
+            }),
+        }]);
+
+        let kt = render_kotlin(&api, "com.weaveffi");
+        assert!(
+            kt.contains("sealed class WeaveFFIException(val code: Int, message: String) : Exception(message)"),
+            "missing sealed class declaration: {kt}"
+        );
+        assert!(
+            kt.contains("class ContactNotFound(message: String = \"Contact not found\") : WeaveFFIException(1001, message)"),
+            "missing ContactNotFound subclass: {kt}"
+        );
+        assert!(
+            kt.contains("class InvalidInput(message: String = \"Invalid input provided\") : WeaveFFIException(1002, message)"),
+            "missing InvalidInput subclass: {kt}"
+        );
+
+        let jni = render_jni_c(&api, "com.weaveffi");
+        assert!(
+            jni.contains("throw_weaveffi_error(env, &err)"),
+            "missing throw_weaveffi_error call: {jni}"
+        );
+        assert!(
+            jni.contains("case 1001:"),
+            "missing case for ContactNotFound: {jni}"
+        );
+        assert!(
+            jni.contains("WeaveFFIException$ContactNotFound"),
+            "missing FindClass for ContactNotFound: {jni}"
+        );
+        assert!(
+            jni.contains("case 1002:"),
+            "missing case for InvalidInput: {jni}"
+        );
+        assert!(
+            jni.contains("WeaveFFIException$InvalidInput"),
+            "missing FindClass for InvalidInput: {jni}"
+        );
     }
 }
