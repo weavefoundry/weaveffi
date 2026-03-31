@@ -49,6 +49,8 @@ pub enum ValidationError {
     DuplicateEnumValue { enum_name: String, value: i32 },
     #[error("unknown type reference: {name}")]
     UnknownTypeRef { name: String },
+    #[error("invalid map key type: {key_type}; only primitive types and strings are allowed as map keys")]
+    InvalidMapKey { key_type: String },
 }
 
 const RESERVED: &[&str] = &[
@@ -277,6 +279,15 @@ fn validate_type_ref(ty: &TypeRef, known: &BTreeSet<&str>) -> Result<(), Validat
         }
         TypeRef::Optional(inner) | TypeRef::List(inner) => validate_type_ref(inner, known),
         TypeRef::Map(k, v) => {
+            let bad_key = match k.as_ref() {
+                TypeRef::Struct(name) => Some(format!("struct {name}")),
+                TypeRef::List(_) => Some("list".to_string()),
+                TypeRef::Map(_, _) => Some("map".to_string()),
+                _ => None,
+            };
+            if let Some(key_type) = bad_key {
+                return Err(ValidationError::InvalidMapKey { key_type });
+            }
             validate_type_ref(k, known)?;
             validate_type_ref(v, known)
         }
@@ -1223,6 +1234,81 @@ mod tests {
             api.modules[0].functions[0].params[0].ty,
             TypeRef::Struct("Contact".to_string())
         );
+    }
+
+    #[test]
+    fn map_with_string_key_passes() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "get_map".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::Map(
+                        Box::new(TypeRef::StringUtf8),
+                        Box::new(TypeRef::I32),
+                    )),
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        assert!(validate_api(&mut api).is_ok());
+    }
+
+    #[test]
+    fn map_with_struct_key_rejected() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "get_map".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::Map(
+                        Box::new(TypeRef::Struct("Point".to_string())),
+                        Box::new(TypeRef::I32),
+                    )),
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![simple_struct("Point")],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        assert!(matches!(
+            validate_api(&mut api).unwrap_err(),
+            ValidationError::InvalidMapKey { key_type } if key_type == "struct Point"
+        ));
+    }
+
+    #[test]
+    fn map_with_enum_key_passes() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "get_map".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::Map(
+                        Box::new(TypeRef::Enum("Color".to_string())),
+                        Box::new(TypeRef::StringUtf8),
+                    )),
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![simple_enum("Color")],
+                errors: None,
+            }],
+        };
+        assert!(validate_api(&mut api).is_ok());
     }
 
     #[test]
