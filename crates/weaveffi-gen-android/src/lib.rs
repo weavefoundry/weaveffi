@@ -3,7 +3,7 @@ use camino::Utf8Path;
 use std::fmt::Write as _;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::utils::c_symbol_name;
-use weaveffi_ir::ir::{Api, EnumDef, StructDef, TypeRef};
+use weaveffi_ir::ir::{Api, EnumDef, Function, StructDef, TypeRef};
 
 pub struct AndroidGenerator;
 
@@ -176,27 +176,111 @@ fn jni_cast_for(t: &TypeRef) -> &'static str {
     }
 }
 
+fn kotlin_public_type(t: &TypeRef) -> String {
+    match t {
+        TypeRef::Enum(name) => name.clone(),
+        other => kotlin_type(other),
+    }
+}
+
+fn has_enum_involvement(f: &Function) -> bool {
+    f.params.iter().any(|p| matches!(&p.ty, TypeRef::Enum(_)))
+        || matches!(&f.returns, Some(TypeRef::Enum(_)))
+}
+
 fn render_kotlin(api: &Api) -> String {
     let mut kotlin = String::from("package com.weaveffi\n\nclass WeaveFFI {\n    companion object {\n        init { System.loadLibrary(\"weaveffi\") }\n\n");
     for m in &api.modules {
         for f in &m.functions {
-            let params_sig: Vec<String> = f
-                .params
-                .iter()
-                .map(|p| format!("{}: {}", p.name, kotlin_type(&p.ty)))
-                .collect();
-            let ret = f
-                .returns
-                .as_ref()
-                .map(kotlin_type)
-                .unwrap_or_else(|| "Unit".to_string());
-            let _ = writeln!(
-                kotlin,
-                "        @JvmStatic external fun {}({}): {}",
-                f.name,
-                params_sig.join(", "),
-                ret
-            );
+            if has_enum_involvement(f) {
+                let native_params: Vec<String> = f
+                    .params
+                    .iter()
+                    .map(|p| format!("{}: {}", p.name, kotlin_type(&p.ty)))
+                    .collect();
+                let native_ret = f
+                    .returns
+                    .as_ref()
+                    .map(kotlin_type)
+                    .unwrap_or_else(|| "Unit".to_string());
+                let _ = writeln!(
+                    kotlin,
+                    "        @JvmStatic private external fun {}Jni({}): {}",
+                    f.name,
+                    native_params.join(", "),
+                    native_ret
+                );
+
+                let public_params: Vec<String> = f
+                    .params
+                    .iter()
+                    .map(|p| format!("{}: {}", p.name, kotlin_public_type(&p.ty)))
+                    .collect();
+                let public_ret = f
+                    .returns
+                    .as_ref()
+                    .map(kotlin_public_type)
+                    .unwrap_or_else(|| "Unit".to_string());
+                let call_args: Vec<String> = f
+                    .params
+                    .iter()
+                    .map(|p| {
+                        if matches!(&p.ty, TypeRef::Enum(_)) {
+                            format!("{}.value", p.name)
+                        } else {
+                            p.name.clone()
+                        }
+                    })
+                    .collect();
+                let call = format!("{}Jni({})", f.name, call_args.join(", "));
+
+                if let Some(TypeRef::Enum(name)) = &f.returns {
+                    let _ = writeln!(
+                        kotlin,
+                        "        @JvmStatic fun {}({}): {} = {}.fromValue({})",
+                        f.name,
+                        public_params.join(", "),
+                        public_ret,
+                        name,
+                        call
+                    );
+                } else if f.returns.is_some() {
+                    let _ = writeln!(
+                        kotlin,
+                        "        @JvmStatic fun {}({}): {} = {}",
+                        f.name,
+                        public_params.join(", "),
+                        public_ret,
+                        call
+                    );
+                } else {
+                    let _ = writeln!(
+                        kotlin,
+                        "        @JvmStatic fun {}({}) {{ {} }}",
+                        f.name,
+                        public_params.join(", "),
+                        call
+                    );
+                }
+            } else {
+                let params_sig: Vec<String> = f
+                    .params
+                    .iter()
+                    .map(|p| format!("{}: {}", p.name, kotlin_type(&p.ty)))
+                    .collect();
+                let ret = f
+                    .returns
+                    .as_ref()
+                    .map(kotlin_type)
+                    .unwrap_or_else(|| "Unit".to_string());
+                let _ = writeln!(
+                    kotlin,
+                    "        @JvmStatic external fun {}({}): {}",
+                    f.name,
+                    params_sig.join(", "),
+                    ret
+                );
+            }
         }
     }
     kotlin.push_str("    }\n}\n");
@@ -238,11 +322,16 @@ fn render_jni_c(api: &Api) -> String {
             for p in &f.params {
                 jparams.push(format!("{} {}", jni_param_type(&p.ty), p.name));
             }
+            let jni_name = if has_enum_involvement(f) {
+                format!("{}Jni", f.name)
+            } else {
+                f.name.clone()
+            };
             let _ = writeln!(
                 jni_c,
                 "JNIEXPORT {} JNICALL Java_com_weaveffi_WeaveFFI_{}({}) {{",
                 jret,
-                f.name,
+                jni_name,
                 jparams.join(", ")
             );
             let _ = writeln!(jni_c, "    weaveffi_error err = {{0, NULL}};");
@@ -2241,7 +2330,70 @@ mod tests {
         }]);
 
         let kt = render_kotlin(&api);
-        assert!(kt.contains("color: Int"), "missing enum param as Int: {kt}");
+        assert!(
+            kt.contains("color: Color"),
+            "public wrapper should use enum class name: {kt}"
+        );
+        assert!(
+            kt.contains("private external fun set_colorJni(color: Int)"),
+            "native function should use Int for JNI: {kt}"
+        );
+        assert!(
+            kt.contains("color.value"),
+            "wrapper should call .value on enum param: {kt}"
+        );
+    }
+
+    #[test]
+    fn kotlin_function_uses_enum_type() {
+        let api = make_api(vec![Module {
+            name: "contacts".to_string(),
+            functions: vec![Function {
+                name: "add_contact".to_string(),
+                params: vec![
+                    Param {
+                        name: "name".to_string(),
+                        ty: TypeRef::StringUtf8,
+                    },
+                    Param {
+                        name: "contact_type".to_string(),
+                        ty: TypeRef::Enum("ContactType".into()),
+                    },
+                ],
+                returns: Some(TypeRef::Enum("ContactType".into())),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let kt = render_kotlin(&api);
+        assert!(
+            kt.contains("contact_type: ContactType"),
+            "public signature should use enum class name, not Int: {kt}"
+        );
+        assert!(
+            kt.contains("): ContactType"),
+            "return type should use enum class name: {kt}"
+        );
+        assert!(
+            !kt.contains("external fun add_contact("),
+            "public function should not be external: {kt}"
+        );
+        assert!(
+            kt.contains("private external fun add_contactJni("),
+            "native function should be private: {kt}"
+        );
+        assert!(
+            kt.contains("contact_type.value"),
+            "wrapper should extract int via .value: {kt}"
+        );
+        assert!(
+            kt.contains("ContactType.fromValue("),
+            "wrapper should wrap return in fromValue: {kt}"
+        );
     }
 
     #[test]
@@ -2272,6 +2424,10 @@ mod tests {
             jni.contains("(int32_t)color"),
             "missing int32_t cast: {jni}"
         );
+        assert!(
+            jni.contains("WeaveFFI_set_colorJni("),
+            "JNI function name should have Jni suffix for enum functions: {jni}"
+        );
     }
 
     #[test]
@@ -2296,6 +2452,10 @@ mod tests {
             "missing jint return in JNI: {jni}"
         );
         assert!(jni.contains("(jint)"), "missing jint cast: {jni}");
+        assert!(
+            jni.contains("WeaveFFI_get_colorJni("),
+            "JNI function name should have Jni suffix for enum functions: {jni}"
+        );
     }
 
     // --- Optional tests ---
