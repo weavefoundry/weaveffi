@@ -21,5 +21,6 @@
 - [Guides](guides/README.md)
   - [Memory Ownership](guides/memory.md)
   - [Error Handling](guides/errors.md)
+  - [Annotated Rust Extraction](guides/extract.md)
 - [Tutorials](tutorials/README.md)
   - [Calculator](tutorials/calculator.md)
