@@ -2,10 +2,54 @@ use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_core::codegen::Generator;
+use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::c_symbol_name;
 use weaveffi_ir::ir::{Api, EnumDef, Function, Param, StructDef, StructField, TypeRef};
 
 pub struct SwiftGenerator;
+
+impl SwiftGenerator {
+    fn generate_impl(&self, api: &Api, out_dir: &Utf8Path, module_name: &str) -> Result<()> {
+        let dir = out_dir.join("swift");
+        let c_module = format!("C{}", module_name);
+        let module_dir = dir.join(&c_module);
+        std::fs::create_dir_all(&module_dir)?;
+
+        let package = format!(
+            r#"// swift-tools-version:5.7
+import PackageDescription
+
+let package = Package(
+    name: "{name}",
+    products: [
+        .library(name: "{name}", targets: ["{name}"]),
+    ],
+    targets: [
+        .systemLibrary(name: "{c_name}"),
+        .target(name: "{name}", dependencies: ["{c_name}"]),
+    ]
+)
+"#,
+            name = module_name,
+            c_name = c_module,
+        );
+        std::fs::write(dir.join("Package.swift"), package)?;
+
+        let modulemap = format!(
+            "module {} [system] {{\n  header \"../../c/weaveffi.h\"\n  link \"weaveffi\"\n  export *\n}}\n",
+            c_module
+        );
+        std::fs::write(module_dir.join("module.modulemap"), modulemap)?;
+
+        let src_dir = dir.join("Sources").join(module_name);
+        std::fs::create_dir_all(&src_dir)?;
+        std::fs::write(
+            src_dir.join(format!("{}.swift", module_name)),
+            render_swift_wrapper(api),
+        )?;
+        Ok(())
+    }
+}
 
 impl Generator for SwiftGenerator {
     fn name(&self) -> &'static str {
@@ -13,33 +57,16 @@ impl Generator for SwiftGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        let dir = out_dir.join("swift");
-        let module_dir = dir.join("CWeaveFFI");
-        std::fs::create_dir_all(&module_dir)?;
+        self.generate_impl(api, out_dir, "WeaveFFI")
+    }
 
-        let package = r#"// swift-tools-version:5.7
-import PackageDescription
-
-let package = Package(
-    name: "WeaveFFI",
-    products: [
-        .library(name: "WeaveFFI", targets: ["WeaveFFI"]),
-    ],
-    targets: [
-        .systemLibrary(name: "CWeaveFFI"),
-        .target(name: "WeaveFFI", dependencies: ["CWeaveFFI"]),
-    ]
-)
-"#;
-        std::fs::write(dir.join("Package.swift"), package)?;
-
-        let modulemap = "module CWeaveFFI [system] {\n  header \"../../c/weaveffi.h\"\n  link \"weaveffi\"\n  export *\n}\n";
-        std::fs::write(module_dir.join("module.modulemap"), modulemap)?;
-
-        let src_dir = dir.join("Sources").join("WeaveFFI");
-        std::fs::create_dir_all(&src_dir)?;
-        std::fs::write(src_dir.join("WeaveFFI.swift"), render_swift_wrapper(api))?;
-        Ok(())
+    fn generate_with_config(
+        &self,
+        api: &Api,
+        out_dir: &Utf8Path,
+        config: &GeneratorConfig,
+    ) -> Result<()> {
+        self.generate_impl(api, out_dir, config.swift_module_name())
     }
 }
 
@@ -1816,6 +1843,83 @@ mod tests {
             out.contains("Role(rawValue: $0.pointee.rawValue)!"),
             "missing optional enum conversion: {out}"
         );
+    }
+
+    #[test]
+    fn swift_custom_module_name() {
+        let api = make_api(vec![Module {
+            name: "math".to_string(),
+            functions: vec![Function {
+                name: "add".to_string(),
+                params: vec![
+                    Param {
+                        name: "a".to_string(),
+                        ty: TypeRef::I32,
+                    },
+                    Param {
+                        name: "b".to_string(),
+                        ty: TypeRef::I32,
+                    },
+                ],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let config = GeneratorConfig {
+            swift_module_name: Some("MyCoolLib".into()),
+            ..Default::default()
+        };
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_swift_custom_module");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        SwiftGenerator
+            .generate_with_config(&api, out_dir, &config)
+            .unwrap();
+
+        let pkg = std::fs::read_to_string(tmp.join("swift").join("Package.swift")).unwrap();
+        assert!(
+            pkg.contains("name: \"MyCoolLib\""),
+            "Package.swift should use custom module name: {pkg}"
+        );
+        assert!(
+            pkg.contains("\"CMyCoolLib\""),
+            "Package.swift should reference CMyCoolLib: {pkg}"
+        );
+        assert!(
+            !pkg.contains("WeaveFFI"),
+            "Package.swift should not contain WeaveFFI: {pkg}"
+        );
+
+        let modulemap = std::fs::read_to_string(
+            tmp.join("swift")
+                .join("CMyCoolLib")
+                .join("module.modulemap"),
+        )
+        .unwrap();
+        assert!(
+            modulemap.contains("module CMyCoolLib"),
+            "modulemap should use custom name: {modulemap}"
+        );
+
+        let swift_src = tmp
+            .join("swift")
+            .join("Sources")
+            .join("MyCoolLib")
+            .join("MyCoolLib.swift");
+        assert!(
+            swift_src.exists(),
+            "Swift source should be at MyCoolLib/MyCoolLib.swift"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
