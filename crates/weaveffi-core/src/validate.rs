@@ -98,7 +98,7 @@ pub fn collect_warnings(api: &Api) -> Vec<ValidationWarning> {
 
 fn function_uses_handle(f: &Function) -> bool {
     f.params.iter().any(|p| contains_handle(&p.ty))
-        || f.returns.as_ref().is_some_and(|r| contains_handle(r))
+        || f.returns.as_ref().is_some_and(contains_handle)
 }
 
 fn contains_handle(ty: &TypeRef) -> bool {
