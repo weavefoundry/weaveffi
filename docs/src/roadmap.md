@@ -24,41 +24,56 @@ a stable C ABI contract consumed by language-specific wrappers.
 
 - **CLI** with three commands: `weaveffi generate`, `weaveffi new`, `weaveffi doctor`
 - **IR parsing** from YAML with validation (name collisions, reserved keywords, unsupported shapes)
-- **Code generators** for C, Swift, Android, Node.js, and WASM targets
+- **Code generators** for C, Swift, Android, Node.js, WASM, Python, and .NET targets
+- **Map types** in the IR and all generators
+- **Annotated Rust extraction** — derive/proc-macro input as an alternative to hand-written YAML
+- **Incremental codegen** with content-hash caching to skip unchanged files
+- **Generator configuration** via `[generators.<target>]` sections in the IDL
 - **Calculator sample** demonstrating end-to-end usage (`add`, `mul`, `div`, `echo`)
 - **C ABI layer** with error struct, string/bytes free functions, and handle convention
 
-## Release goals
+## Completed releases
 
-### 0.1.0 — MVP (current)
+### 0.1.0 — MVP
 
-Deliver a usable CLI that reads a YAML IR, validates it, and generates
-bindings for all five targets. Ship with the calculator sample and docs.
+Delivered a usable CLI that reads a YAML IR, validates it, and generates
+bindings for all five original targets. Shipped with the calculator sample
+and docs.
 
 ### 0.2.0 — IR expansion + packaging
 
-- Extend the IR to support structs, enums, optional types, and arrays/slices
+- Extended the IR to support structs, enums, optional types, arrays/slices, and maps
 - Richer string and byte-buffer handling
 - Packaging improvements (SwiftPM, Gradle, npm scaffolds)
 - Better cross-compilation UX
 
 ### 0.3.0 — Annotated Rust input
 
-- Support reading an annotated Rust crate as input (derive/proc-macro) instead of hand-written YAML
+- Annotated Rust crate extraction via derive/proc-macro as an alternative to hand-written YAML
 - Improved diagnostics and template customization hooks
 
-### 0.4.0 — Safety + performance
+## Release goals
+
+### 0.4.0 — Safety + performance (current)
 
 - Zero-copy where safe, arena/pool patterns, lifetime-safe handles
-- Incremental codegen and caching
+- ~~Incremental codegen and caching~~ *(done)*
 - DX polish across all targets
 
 ### 0.5.0 — Ecosystem expansion
 
-- Additional language targets (e.g., Python, .NET)
+- ~~Python target~~ *(done)*
+- ~~.NET target~~ *(done)*
 - Inline generated helpers per target (idiomatic error types, memory wrappers) — bundled into each package, not separate runtime dependencies
-- Publishing to crates.io, npm, CocoaPods, Maven Central
+- Publishing to crates.io, npm, CocoaPods, Maven Central, PyPI, NuGet
 - Prebuilt CLI binaries and release automation
+
+### 0.6.0 — New horizons
+
+- Async support investigation (currently rejected by the validator)
+- C++ target
+- Ruby target
+- Dart/Flutter target
 
 ## Design principle: standalone generated packages
 
@@ -73,5 +88,5 @@ shared runtime dependency.
 ## Non-goals (for now)
 
 - **Async surface**: mapping callbacks to async/await or Promises is explicitly
-  out of scope for the 0.1.x series. The IR rejects `async: true` at validation time.
-- **Proc-macro input**: planned for 0.3.0, not before.
+  out of scope. The IR rejects `async: true` at validation time. Investigation
+  is planned for 0.6.0.
