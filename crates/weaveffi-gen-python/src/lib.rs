@@ -19,6 +19,7 @@ impl Generator for PythonGenerator {
             "from .weaveffi import *  # noqa: F401,F403\n",
         )?;
         std::fs::write(dir.join("weaveffi.py"), render_python_module(api))?;
+        std::fs::write(dir.join("weaveffi.pyi"), render_pyi_module(api))?;
         Ok(())
     }
 
@@ -26,6 +27,7 @@ impl Generator for PythonGenerator {
         vec![
             out_dir.join("python/__init__.py").to_string(),
             out_dir.join("python/weaveffi.py").to_string(),
+            out_dir.join("python/weaveffi.pyi").to_string(),
         ]
     }
 }
@@ -616,6 +618,62 @@ fn render_map_return(out: &mut String, k: &TypeRef, v: &TypeRef, ind: &str) {
     ));
 }
 
+// ── Type stub (.pyi) rendering ──
+
+fn render_pyi_module(api: &Api) -> String {
+    let mut out =
+        String::from("from enum import IntEnum\nfrom typing import Dict, List, Optional\n");
+    for m in &api.modules {
+        for e in &m.enums {
+            render_pyi_enum(&mut out, e);
+        }
+        for s in &m.structs {
+            render_pyi_struct(&mut out, s);
+        }
+        for f in &m.functions {
+            render_pyi_function(&mut out, f);
+        }
+    }
+    out
+}
+
+fn render_pyi_enum(out: &mut String, e: &EnumDef) {
+    out.push_str(&format!("\nclass {}(IntEnum):\n", e.name));
+    for v in &e.variants {
+        out.push_str(&format!("    {}: int\n", v.name));
+    }
+}
+
+fn render_pyi_struct(out: &mut String, s: &StructDef) {
+    out.push_str(&format!("\nclass {}:\n", s.name));
+    for field in &s.fields {
+        let py_ty = py_type_hint(&field.ty);
+        out.push_str(&format!(
+            "    @property\n    def {}(self) -> {}: ...\n",
+            field.name, py_ty
+        ));
+    }
+}
+
+fn render_pyi_function(out: &mut String, f: &Function) {
+    let params: Vec<String> = f
+        .params
+        .iter()
+        .map(|p| format!("{}: {}", p.name, py_type_hint(&p.ty)))
+        .collect();
+    let ret = f
+        .returns
+        .as_ref()
+        .map(py_type_hint)
+        .unwrap_or_else(|| "None".into());
+    out.push_str(&format!(
+        "\ndef {}({}) -> {}: ...\n",
+        f.name,
+        params.join(", "),
+        ret
+    ));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,13 +741,17 @@ mod tests {
     }
 
     #[test]
-    fn output_files_lists_both() {
+    fn output_files_lists_all() {
         let api = make_api(vec![]);
         let out = Utf8Path::new("/tmp/out");
         let files = PythonGenerator.output_files(&api, out);
         assert_eq!(
             files,
-            vec!["/tmp/out/python/__init__.py", "/tmp/out/python/weaveffi.py"]
+            vec![
+                "/tmp/out/python/__init__.py",
+                "/tmp/out/python/weaveffi.py",
+                "/tmp/out/python/weaveffi.pyi",
+            ]
         );
     }
 
@@ -1535,5 +1597,166 @@ mod tests {
             py.contains("_result[:_out_len.value]"),
             "missing bytes slice: {py}"
         );
+    }
+
+    #[test]
+    fn python_generates_type_stubs() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            enums: vec![EnumDef {
+                name: "ContactType".into(),
+                doc: None,
+                variants: vec![
+                    EnumVariant {
+                        name: "Personal".into(),
+                        value: 0,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Work".into(),
+                        value: 1,
+                        doc: None,
+                    },
+                ],
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![
+                    StructField {
+                        name: "id".into(),
+                        ty: TypeRef::I64,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "email".into(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                        doc: None,
+                    },
+                    StructField {
+                        name: "tags".into(),
+                        ty: TypeRef::List(Box::new(TypeRef::StringUtf8)),
+                        doc: None,
+                    },
+                    StructField {
+                        name: "metadata".into(),
+                        ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
+                        doc: None,
+                    },
+                ],
+            }],
+            functions: vec![
+                Function {
+                    name: "create_contact".into(),
+                    params: vec![
+                        Param {
+                            name: "name".into(),
+                            ty: TypeRef::StringUtf8,
+                        },
+                        Param {
+                            name: "email".into(),
+                            ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                        },
+                    ],
+                    returns: Some(TypeRef::Handle),
+                    doc: None,
+                    r#async: false,
+                },
+                Function {
+                    name: "get_contact".into(),
+                    params: vec![Param {
+                        name: "id".into(),
+                        ty: TypeRef::Handle,
+                    }],
+                    returns: Some(TypeRef::Struct("Contact".into())),
+                    doc: None,
+                    r#async: false,
+                },
+                Function {
+                    name: "delete_contact".into(),
+                    params: vec![Param {
+                        name: "id".into(),
+                        ty: TypeRef::Handle,
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                },
+            ],
+            errors: None,
+        }]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_python_pyi");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        PythonGenerator.generate(&api, out_dir).unwrap();
+
+        let pyi_path = tmp.join("python/weaveffi.pyi");
+        assert!(pyi_path.exists(), ".pyi file must exist");
+
+        let pyi = std::fs::read_to_string(&pyi_path).unwrap();
+
+        assert!(
+            pyi.contains("from enum import IntEnum"),
+            "missing IntEnum import"
+        );
+        assert!(
+            pyi.contains("from typing import Dict, List, Optional"),
+            "missing typing imports"
+        );
+
+        assert!(
+            pyi.contains("class ContactType(IntEnum):"),
+            "missing enum stub"
+        );
+        assert!(
+            pyi.contains("    Personal: int"),
+            "missing enum variant Personal"
+        );
+        assert!(pyi.contains("    Work: int"), "missing enum variant Work");
+
+        assert!(pyi.contains("class Contact:"), "missing struct stub");
+        assert!(
+            pyi.contains("    def id(self) -> int: ..."),
+            "missing id property: {pyi}"
+        );
+        assert!(
+            pyi.contains("    def name(self) -> str: ..."),
+            "missing name property: {pyi}"
+        );
+        assert!(
+            pyi.contains("    def email(self) -> Optional[str]: ..."),
+            "missing email property: {pyi}"
+        );
+        assert!(
+            pyi.contains("    def tags(self) -> List[str]: ..."),
+            "missing tags property: {pyi}"
+        );
+        assert!(
+            pyi.contains("    def metadata(self) -> Dict[str, int]: ..."),
+            "missing metadata property: {pyi}"
+        );
+
+        assert!(
+            pyi.contains("def create_contact(name: str, email: Optional[str]) -> int: ..."),
+            "missing create_contact stub: {pyi}"
+        );
+        assert!(
+            pyi.contains("def get_contact(id: int) -> \"Contact\": ..."),
+            "missing get_contact stub: {pyi}"
+        );
+        assert!(
+            pyi.contains("def delete_contact(id: int) -> None: ..."),
+            "missing delete_contact stub: {pyi}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
