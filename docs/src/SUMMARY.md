@@ -12,6 +12,7 @@
   - [Android](generators/android.md)
   - [C](generators/c.md)
   - [Node](generators/node.md)
+  - [Python](generators/python.md)
   - [Swift](generators/swift.md)
   - [WASM](generators/wasm.md)
 - [API](api/README.md)
