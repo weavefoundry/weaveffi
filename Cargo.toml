@@ -8,6 +8,7 @@ members = [
     "crates/weaveffi-gen-android",
     "crates/weaveffi-gen-node",
     "crates/weaveffi-gen-wasm",
+    "crates/weaveffi-gen-python",
     "crates/weaveffi-cli",
     "samples/calculator",
     "samples/node-addon",
