@@ -1176,6 +1176,8 @@ dependencies = [
  "clap",
  "color-eyre",
  "predicates",
+ "quote",
+ "syn",
  "tempfile",
  "toml",
  "tracing-subscriber",
