@@ -13,6 +13,37 @@ fn has_repr_i32(attrs: &[syn::Attribute]) -> bool {
     })
 }
 
+fn extract_doc(attrs: &[syn::Attribute]) -> Option<String> {
+    let lines: Vec<String> = attrs
+        .iter()
+        .filter_map(|attr| {
+            let syn::Meta::NameValue(nv) = &attr.meta else {
+                return None;
+            };
+            if !nv.path.is_ident("doc") {
+                return None;
+            }
+            let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(s),
+                ..
+            }) = &nv.value
+            else {
+                return None;
+            };
+            let val = s.value();
+            Some(match val.strip_prefix(' ') {
+                Some(stripped) => stripped.to_string(),
+                None => val,
+            })
+        })
+        .collect();
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
 fn is_ident(ty: &syn::Type, name: &str) -> bool {
     matches!(ty, syn::Type::Path(p) if p.path.is_ident(name))
 }
@@ -129,7 +160,7 @@ fn extract_function(item: &syn::ItemFn) -> Result<Function> {
         name,
         params,
         returns,
-        doc: None,
+        doc: extract_doc(&item.attrs),
         r#async: false,
     })
 }
@@ -149,7 +180,7 @@ fn extract_struct(item: &syn::ItemStruct) -> Result<StructDef> {
                 Ok(StructField {
                     name: field_name,
                     ty: map_type(&f.ty)?,
-                    doc: None,
+                    doc: extract_doc(&f.attrs),
                 })
             })
             .collect::<Result<_>>()?,
@@ -158,7 +189,7 @@ fn extract_struct(item: &syn::ItemStruct) -> Result<StructDef> {
 
     Ok(StructDef {
         name,
-        doc: None,
+        doc: extract_doc(&item.attrs),
         fields,
     })
 }
@@ -184,14 +215,14 @@ fn extract_enum(item: &syn::ItemEnum) -> Result<EnumDef> {
             Ok(EnumVariant {
                 name: v.ident.to_string(),
                 value: parse_discriminant(expr)?,
-                doc: None,
+                doc: extract_doc(&v.attrs),
             })
         })
         .collect::<Result<_>>()?;
 
     Ok(EnumDef {
         name,
-        doc: None,
+        doc: extract_doc(&item.attrs),
         variants,
     })
 }
@@ -586,5 +617,179 @@ mod tests {
                 TypeRef::StringUtf8
             )))))
         );
+    }
+
+    #[test]
+    fn extract_simple_function() {
+        let src = r#"
+            mod calc {
+                #[weaveffi_export]
+                fn multiply(x: f64, y: f64) -> f64 { x * y }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert_eq!(f.name, "multiply");
+        assert_eq!(f.params.len(), 2);
+        assert_eq!(f.params[0].name, "x");
+        assert_eq!(f.params[0].ty, TypeRef::F64);
+        assert_eq!(f.params[1].name, "y");
+        assert_eq!(f.params[1].ty, TypeRef::F64);
+        assert_eq!(f.returns, Some(TypeRef::F64));
+    }
+
+    #[test]
+    fn extract_struct_with_typed_fields() {
+        let src = r#"
+            mod shapes {
+                #[weaveffi_struct]
+                struct Rect {
+                    width: i32,
+                    height: i32,
+                    label: String,
+                }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let s = &api.modules[0].structs[0];
+        assert_eq!(s.name, "Rect");
+        assert_eq!(s.fields.len(), 3);
+        assert_eq!(s.fields[0].name, "width");
+        assert_eq!(s.fields[0].ty, TypeRef::I32);
+        assert_eq!(s.fields[1].name, "height");
+        assert_eq!(s.fields[1].ty, TypeRef::I32);
+        assert_eq!(s.fields[2].name, "label");
+        assert_eq!(s.fields[2].ty, TypeRef::StringUtf8);
+    }
+
+    #[test]
+    fn extract_enum_with_explicit_discriminants() {
+        let src = r#"
+            mod status {
+                #[weaveffi_enum]
+                #[repr(i32)]
+                enum Level {
+                    Low = 0,
+                    Medium = 5,
+                    High = 10,
+                }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let e = &api.modules[0].enums[0];
+        assert_eq!(e.name, "Level");
+        assert_eq!(e.variants.len(), 3);
+        assert_eq!(e.variants[0].name, "Low");
+        assert_eq!(e.variants[0].value, 0);
+        assert_eq!(e.variants[1].name, "Medium");
+        assert_eq!(e.variants[1].value, 5);
+        assert_eq!(e.variants[2].name, "High");
+        assert_eq!(e.variants[2].value, 10);
+    }
+
+    #[test]
+    fn extract_optional_param() {
+        let src = r#"
+            mod m {
+                #[weaveffi_export]
+                fn greet(name: Option<String>) {}
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert_eq!(
+            f.params[0].ty,
+            TypeRef::Optional(Box::new(TypeRef::StringUtf8))
+        );
+    }
+
+    #[test]
+    fn extract_vec_param() {
+        let src = r#"
+            mod m {
+                #[weaveffi_export]
+                fn sum(values: Vec<i32>) -> i32 { 0 }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert_eq!(f.params[0].ty, TypeRef::List(Box::new(TypeRef::I32)));
+    }
+
+    #[test]
+    fn extract_hashmap_param() {
+        let src = r#"
+            mod m {
+                #[weaveffi_export]
+                fn lookup(table: HashMap<String, i32>) {}
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert_eq!(
+            f.params[0].ty,
+            TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32))
+        );
+    }
+
+    #[test]
+    fn extract_nested_module() {
+        let src = r#"
+            mod outer {
+                #[weaveffi_export]
+                fn action(x: i32) -> bool { true }
+
+                #[weaveffi_struct]
+                struct Config { limit: i32 }
+
+                #[weaveffi_enum]
+                #[repr(i32)]
+                enum Mode { Fast = 0, Safe = 1 }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        assert_eq!(api.modules.len(), 1);
+        let m = &api.modules[0];
+        assert_eq!(m.name, "outer");
+        assert_eq!(m.functions.len(), 1);
+        assert_eq!(m.functions[0].name, "action");
+        assert_eq!(m.structs.len(), 1);
+        assert_eq!(m.structs[0].name, "Config");
+        assert_eq!(m.enums.len(), 1);
+        assert_eq!(m.enums[0].name, "Mode");
+    }
+
+    #[test]
+    fn extract_unannotated_items_skipped() {
+        let src = r#"
+            mod m {
+                fn private_fn(x: i32) -> i32 { x }
+                struct InternalData { v: i32 }
+                enum InternalState { A, B }
+
+                #[weaveffi_export]
+                fn public_fn() -> bool { true }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let m = &api.modules[0];
+        assert_eq!(m.functions.len(), 1);
+        assert_eq!(m.functions[0].name, "public_fn");
+        assert!(m.structs.is_empty());
+        assert!(m.enums.is_empty());
+    }
+
+    #[test]
+    fn extract_doc_comments() {
+        let src = r#"
+            mod m {
+                /// Adds two numbers.
+                #[weaveffi_export]
+                fn add(a: i32, b: i32) -> i32 { a + b }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert_eq!(f.doc.as_deref(), Some("Adds two numbers."));
     }
 }
