@@ -142,10 +142,41 @@ fn render_swift_wrapper(api: &Api) -> String {
     let mut out = String::new();
     out.push_str("import CWeaveFFI\nimport Foundation\n\n");
 
-    out.push_str("public enum WeaveFFIError: Error, CustomStringConvertible {\n");
+    let error_codes: Vec<_> = api
+        .modules
+        .iter()
+        .filter_map(|m| m.errors.as_ref())
+        .flat_map(|e| &e.codes)
+        .collect();
+
+    out.push_str("public enum WeaveFFIError: Error, LocalizedError {\n");
     out.push_str("    case error(code: Int32, message: String)\n");
-    out.push_str("    public var description: String {\n");
-    out.push_str("        switch self { case let .error(code, message): return \"(\\(code)) \\(message)\" }\n");
+    for ec in &error_codes {
+        out.push_str(&format!("    case {}\n", ec.name.to_lower_camel_case()));
+    }
+    out.push_str("    public var errorDescription: String? {\n");
+    out.push_str("        switch self {\n");
+    out.push_str("        case let .error(_, message): return message\n");
+    for ec in &error_codes {
+        out.push_str(&format!(
+            "        case .{}: return \"{}\"\n",
+            ec.name.to_lower_camel_case(),
+            ec.message
+        ));
+    }
+    out.push_str("        }\n");
+    out.push_str("    }\n");
+    out.push_str("    public var errorCode: Int32 {\n");
+    out.push_str("        switch self {\n");
+    out.push_str("        case let .error(code, _): return code\n");
+    for ec in &error_codes {
+        out.push_str(&format!(
+            "        case .{}: return {}\n",
+            ec.name.to_lower_camel_case(),
+            ec.code
+        ));
+    }
+    out.push_str("        }\n");
     out.push_str("    }\n");
     out.push_str("}\n\n");
 
@@ -154,7 +185,20 @@ fn render_swift_wrapper(api: &Api) -> String {
     out.push_str("        let code = err.code\n");
     out.push_str("        let message = err.message.flatMap { String(cString: $0) } ?? \"\"\n");
     out.push_str("        weaveffi_error_clear(&err)\n");
-    out.push_str("        throw WeaveFFIError.error(code: code, message: message)\n");
+    if error_codes.is_empty() {
+        out.push_str("        throw WeaveFFIError.error(code: code, message: message)\n");
+    } else {
+        out.push_str("        switch code {\n");
+        for ec in &error_codes {
+            out.push_str(&format!(
+                "        case {}: throw WeaveFFIError.{}\n",
+                ec.code,
+                ec.name.to_lower_camel_case()
+            ));
+        }
+        out.push_str("        default: throw WeaveFFIError.error(code: code, message: message)\n");
+        out.push_str("        }\n");
+    }
     out.push_str("    }\n");
     out.push_str("}\n\n");
 
@@ -958,7 +1002,10 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weaveffi_ir::ir::{EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField};
+    use weaveffi_ir::ir::{
+        EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param, StructDef,
+        StructField,
+    };
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
@@ -1934,6 +1981,91 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn swift_inline_error_types() {
+        let api = make_api(vec![Module {
+            name: "contacts".to_string(),
+            functions: vec![Function {
+                name: "get".to_string(),
+                params: vec![Param {
+                    name: "id".to_string(),
+                    ty: TypeRef::I32,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: Some(ErrorDomain {
+                name: "ContactError".to_string(),
+                codes: vec![
+                    ErrorCode {
+                        name: "ContactNotFound".to_string(),
+                        code: 1001,
+                        message: "Contact not found".to_string(),
+                    },
+                    ErrorCode {
+                        name: "InvalidInput".to_string(),
+                        code: 1002,
+                        message: "Invalid input provided".to_string(),
+                    },
+                ],
+            }),
+        }]);
+
+        let out = render_swift_wrapper(&api);
+
+        assert!(
+            out.contains("public enum WeaveFFIError: Error, LocalizedError {"),
+            "missing LocalizedError conformance: {out}"
+        );
+        assert!(
+            out.contains("case contactNotFound"),
+            "missing contactNotFound case: {out}"
+        );
+        assert!(
+            out.contains("case invalidInput"),
+            "missing invalidInput case: {out}"
+        );
+        assert!(
+            out.contains("public var errorDescription: String?"),
+            "missing errorDescription property: {out}"
+        );
+        assert!(
+            out.contains("case .contactNotFound: return \"Contact not found\""),
+            "missing contactNotFound description: {out}"
+        );
+        assert!(
+            out.contains("case .invalidInput: return \"Invalid input provided\""),
+            "missing invalidInput description: {out}"
+        );
+        assert!(
+            out.contains("public var errorCode: Int32"),
+            "missing errorCode property: {out}"
+        );
+        assert!(
+            out.contains("case .contactNotFound: return 1001"),
+            "missing contactNotFound code: {out}"
+        );
+        assert!(
+            out.contains("case .invalidInput: return 1002"),
+            "missing invalidInput code: {out}"
+        );
+        assert!(
+            out.contains("case 1001: throw WeaveFFIError.contactNotFound"),
+            "missing domain-specific throw in check(): {out}"
+        );
+        assert!(
+            out.contains("case 1002: throw WeaveFFIError.invalidInput"),
+            "missing domain-specific throw in check(): {out}"
+        );
+        assert!(
+            out.contains("default: throw WeaveFFIError.error(code: code, message: message)"),
+            "missing fallback throw in check(): {out}"
+        );
     }
 
     #[test]
