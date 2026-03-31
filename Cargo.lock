@@ -1193,6 +1193,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "camino",
+ "serde",
+ "serde_json",
  "thiserror",
  "weaveffi-ir",
 ]
