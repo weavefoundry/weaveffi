@@ -15,6 +15,10 @@ it's written in Rust, C, C++, Zig, or another language. Rust has first-class
 scaffolding support today via `--scaffold`; other languages implement the
 functions declared in the generated C header directly.
 
+Generated packages are designed to be standalone and publishable — consumers
+install a normal ecosystem package (npm, SwiftPM, Gradle) without needing
+WeaveFFI tooling or runtime dependencies.
+
 ## Features
 
 - **Multi-format input** — define your API in YAML, JSON, or TOML

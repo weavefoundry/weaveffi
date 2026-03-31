@@ -56,9 +56,19 @@ bindings for all five targets. Ship with the calculator sample and docs.
 ### 0.5.0 — Ecosystem expansion
 
 - Additional language targets (e.g., Python, .NET)
-- Runtime libraries per target language (idiomatic error types, memory wrappers)
+- Inline generated helpers per target (idiomatic error types, memory wrappers) — bundled into each package, not separate runtime dependencies
 - Publishing to crates.io, npm, CocoaPods, Maven Central
 - Prebuilt CLI binaries and release automation
+
+## Design principle: standalone generated packages
+
+Generated packages should be fully self-contained and publishable to their
+native ecosystem (npm, CocoaPods, Maven Central, etc.) without requiring
+consumers to install WeaveFFI tooling, runtimes, or support packages.
+WeaveFFI is a build-time tool for library authors — end users should never
+need to know it exists. Any helper code (error types, memory management
+utilities) is generated inline into each package rather than pulled from a
+shared runtime dependency.
 
 ## Non-goals (for now)
 
