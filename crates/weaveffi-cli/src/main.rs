@@ -49,6 +49,9 @@ enum Commands {
         /// Print non-fatal warnings after validation
         #[arg(long)]
         warn: bool,
+        /// Force regeneration, bypassing the incremental cache
+        #[arg(long)]
+        force: bool,
     },
     Validate {
         /// Input IDL/IR file (yaml|yml|json|toml)
@@ -91,6 +94,7 @@ fn main() -> Result<()> {
             scaffold,
             config,
             warn,
+            force,
         } => cmd_generate(
             &input,
             &out,
@@ -98,6 +102,7 @@ fn main() -> Result<()> {
             scaffold,
             config.as_deref(),
             warn,
+            force,
         )?,
         Commands::Validate { input, warn } => cmd_validate(&input, warn)?,
         Commands::Extract {
@@ -200,6 +205,7 @@ fn cmd_generate(
     emit_scaffold: bool,
     config_path: Option<&str>,
     warn: bool,
+    force: bool,
 ) -> Result<()> {
     let config = load_config(config_path)?;
 
@@ -249,7 +255,7 @@ fn cmd_generate(
     }
 
     orchestrator
-        .run(&api, out_dir, &config)
+        .run(&api, out_dir, &config, force)
         .map_err(|e| eyre!("{:#}", e))?;
 
     if emit_scaffold {
