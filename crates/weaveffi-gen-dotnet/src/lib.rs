@@ -16,11 +16,19 @@ impl Generator for DotnetGenerator {
         let dir = out_dir.join("dotnet");
         std::fs::create_dir_all(&dir)?;
         std::fs::write(dir.join("WeaveFFI.cs"), render_csharp(api))?;
+        std::fs::write(dir.join("WeaveFFI.csproj"), render_csproj())?;
+        std::fs::write(dir.join("WeaveFFI.nuspec"), render_nuspec())?;
+        std::fs::write(dir.join("README.md"), render_readme())?;
         Ok(())
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
-        vec![out_dir.join("dotnet/WeaveFFI.cs").to_string()]
+        vec![
+            out_dir.join("dotnet/WeaveFFI.cs").to_string(),
+            out_dir.join("dotnet/WeaveFFI.csproj").to_string(),
+            out_dir.join("dotnet/WeaveFFI.nuspec").to_string(),
+            out_dir.join("dotnet/README.md").to_string(),
+        ]
     }
 }
 
@@ -110,6 +118,60 @@ fn pinvoke_return_info(ty: &TypeRef) -> (String, Vec<String>) {
         }
         _ => (pinvoke_type(ty), vec![]),
     }
+}
+
+fn render_csproj() -> String {
+    r#"<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <PackageId>WeaveFFI</PackageId>
+    <Version>0.1.0</Version>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+</Project>
+"#
+    .into()
+}
+
+fn render_nuspec() -> String {
+    r#"<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>WeaveFFI</id>
+    <version>0.1.0</version>
+    <authors>WeaveFFI Contributors</authors>
+    <description>Auto-generated .NET bindings for a WeaveFFI native library.</description>
+    <license type="expression">MIT</license>
+    <projectUrl>https://github.com/AstroForge-Incorporated/weaveffi</projectUrl>
+    <tags>ffi interop native pinvoke</tags>
+  </metadata>
+</package>
+"#
+    .into()
+}
+
+fn render_readme() -> String {
+    r#"# WeaveFFI .NET Bindings
+
+Auto-generated P/Invoke bindings for the WeaveFFI native library.
+
+## Build
+
+```bash
+dotnet build
+```
+
+## Pack
+
+```bash
+dotnet pack
+```
+
+The resulting `.nupkg` will be in `bin/Debug/` (or `bin/Release/` with `-c Release`).
+"#
+    .into()
 }
 
 fn render_csharp(api: &Api) -> String {
@@ -1044,11 +1106,19 @@ mod tests {
     }
 
     #[test]
-    fn output_files_lists_csharp_file() {
+    fn output_files_lists_all() {
         let api = make_api(vec![]);
         let out = Utf8Path::new("/tmp/out");
         let files = DotnetGenerator.output_files(&api, out);
-        assert_eq!(files, vec!["/tmp/out/dotnet/WeaveFFI.cs"]);
+        assert_eq!(
+            files,
+            vec![
+                "/tmp/out/dotnet/WeaveFFI.cs",
+                "/tmp/out/dotnet/WeaveFFI.csproj",
+                "/tmp/out/dotnet/WeaveFFI.nuspec",
+                "/tmp/out/dotnet/README.md",
+            ]
+        );
     }
 
     #[test]
@@ -1081,6 +1151,60 @@ mod tests {
         assert!(cs.contains("namespace WeaveFFI"));
         assert!(cs.contains("DllImport"));
         assert!(cs.contains("weaveffi_math_add"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dotnet_generates_csproj() {
+        let api = make_api(vec![simple_module(vec![])]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_dotnet_csproj");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        DotnetGenerator.generate(&api, out_dir).unwrap();
+
+        let csproj_path = tmp.join("dotnet/WeaveFFI.csproj");
+        assert!(csproj_path.exists(), ".csproj file must exist");
+        let csproj = std::fs::read_to_string(&csproj_path).unwrap();
+        assert!(
+            csproj.contains(r#"Sdk="Microsoft.NET.Sdk""#),
+            "missing SDK attribute: {csproj}"
+        );
+        assert!(
+            csproj.contains("<TargetFramework>net8.0</TargetFramework>"),
+            "missing target framework: {csproj}"
+        );
+        assert!(
+            csproj.contains("<PackageId>WeaveFFI</PackageId>"),
+            "missing package id: {csproj}"
+        );
+        assert!(
+            csproj.contains("<Version>0.1.0</Version>"),
+            "missing version: {csproj}"
+        );
+
+        let nuspec_path = tmp.join("dotnet/WeaveFFI.nuspec");
+        assert!(nuspec_path.exists(), ".nuspec file must exist");
+        let nuspec = std::fs::read_to_string(&nuspec_path).unwrap();
+        assert!(
+            nuspec.contains("<id>WeaveFFI</id>"),
+            "missing nuspec id: {nuspec}"
+        );
+
+        let readme_path = tmp.join("dotnet/README.md");
+        assert!(readme_path.exists(), "README.md must exist");
+        let readme = std::fs::read_to_string(&readme_path).unwrap();
+        assert!(
+            readme.contains("dotnet build"),
+            "missing build instructions: {readme}"
+        );
+        assert!(
+            readme.contains("dotnet pack"),
+            "missing pack instructions: {readme}"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
