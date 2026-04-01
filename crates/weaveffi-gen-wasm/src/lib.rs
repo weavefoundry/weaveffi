@@ -349,9 +349,14 @@ fn render_wasm_dts(api: &Api, module_name: &str) -> String {
                     .iter()
                     .map(|p| format!("{}: {}", p.name, ts_type_for(&p.ty)))
                     .collect();
-                let ret = match &func.returns {
+                let base_ret = match &func.returns {
                     Some(ty) => ts_type_for(ty),
                     None => "void".into(),
+                };
+                let ret = if func.r#async {
+                    format!("Promise<{base_ret}>")
+                } else {
+                    base_ret
                 };
                 out.push_str("    /** @throws {Error} if the native call fails */\n");
                 out.push_str(&format!(
@@ -405,6 +410,7 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
     }
 
     let has_functions = api.modules.iter().any(|m| !m.functions.is_empty());
+    let has_async = api_has_async(api);
     if has_functions {
         out.push_str("function _allocError(wasm) {\n");
         out.push_str("  return wasm.weaveffi_alloc(8);\n");
@@ -423,6 +429,17 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
         out.push_str("    wasm.weaveffi_error_clear(errPtr);\n");
         out.push_str("    throw new Error(`WeaveFFI error ${code}: ${msg}`);\n");
         out.push_str("  }\n");
+        out.push_str("}\n\n");
+    }
+
+    if has_async {
+        out.push_str("function _registerTrampoline(table, paramTypes, handler) {\n");
+        out.push_str("  const idx = table.grow(1);\n");
+        out.push_str("  table.set(idx, new WebAssembly.Function(\n");
+        out.push_str("    { parameters: paramTypes, results: [] },\n");
+        out.push_str("    handler\n");
+        out.push_str("  ));\n");
+        out.push_str("  return idx;\n");
         out.push_str("}\n\n");
     }
 
@@ -520,6 +537,47 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
         out.push_str("  return instance.exports;\n");
     } else {
         out.push_str("  const wasm = instance.exports;\n\n");
+
+        if has_async {
+            out.push_str("  let _nextCtxId = 1;\n");
+            out.push_str("  const _asyncContexts = new Map();\n");
+            out.push_str("  const _table = wasm.__indirect_function_table;\n\n");
+            out.push_str("  function _asyncHandler(ctxId, errPtr, ...results) {\n");
+            out.push_str("    const ctx = _asyncContexts.get(ctxId);\n");
+            out.push_str("    if (!ctx) return;\n");
+            out.push_str("    _asyncContexts.delete(ctxId);\n");
+            out.push_str("    try {\n");
+            out.push_str("      if (errPtr !== 0) _checkError(wasm, errPtr);\n");
+            out.push_str(
+                "      ctx.resolve(ctx.unwrap ? ctx.unwrap(wasm, ...results) : results[0]);\n",
+            );
+            out.push_str("    } catch (e) {\n");
+            out.push_str("      ctx.reject(e);\n");
+            out.push_str("    }\n");
+            out.push_str("  }\n\n");
+
+            let mut trampolines: Vec<(String, Vec<&'static str>)> = Vec::new();
+            for m in &api.modules {
+                for f in &m.functions {
+                    if f.r#async {
+                        let params = async_cb_wasm_params(f.returns.as_ref());
+                        let key = params.join("_");
+                        if !trampolines.iter().any(|(k, _)| k == &key) {
+                            trampolines.push((key, params));
+                        }
+                    }
+                }
+            }
+            for (sig_key, params) in &trampolines {
+                let params_js: Vec<String> = params.iter().map(|p| format!("'{p}'")).collect();
+                out.push_str(&format!(
+                    "  const _cbPtr_{sig_key} = _registerTrampoline(_table, [{}], _asyncHandler);\n",
+                    params_js.join(", ")
+                ));
+            }
+            out.push('\n');
+        }
+
         out.push_str("  return {\n");
         out.push_str("    _raw: wasm,\n");
         for module in &api.modules {
@@ -528,7 +586,11 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
             }
             out.push_str(&format!("    {}: {{\n", module.name));
             for func in &module.functions {
-                emit_js_function_wrapper(&mut out, &module.name, func);
+                if func.r#async {
+                    emit_js_async_function_wrapper(&mut out, &module.name, func);
+                } else {
+                    emit_js_function_wrapper(&mut out, &module.name, func);
+                }
             }
             out.push_str("    },\n");
         }
@@ -626,6 +688,153 @@ fn emit_js_function_wrapper(out: &mut String, module_name: &str, func: &Function
         }
     }
 
+    out.push_str("      },\n");
+}
+
+fn api_has_async(api: &Api) -> bool {
+    api.modules
+        .iter()
+        .any(|m| m.functions.iter().any(|f| f.r#async))
+}
+
+fn async_cb_wasm_params(returns: Option<&TypeRef>) -> Vec<&'static str> {
+    let mut params = vec!["i32", "i32"];
+    match returns {
+        None => {}
+        Some(
+            TypeRef::I32
+            | TypeRef::U32
+            | TypeRef::Bool
+            | TypeRef::Enum(_)
+            | TypeRef::StringUtf8
+            | TypeRef::BorrowedStr,
+        ) => {
+            params.push("i32");
+        }
+        Some(TypeRef::I64 | TypeRef::Handle | TypeRef::TypedHandle(_) | TypeRef::Struct(_)) => {
+            params.push("i64");
+        }
+        Some(TypeRef::F64) => {
+            params.push("f64");
+        }
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_)) => {
+            params.push("i32");
+            params.push("i32");
+        }
+        Some(TypeRef::Map(_, _)) => {
+            params.push("i32");
+            params.push("i32");
+            params.push("i32");
+        }
+        Some(TypeRef::Optional(inner)) => match inner.as_ref() {
+            TypeRef::Struct(_) | TypeRef::Handle | TypeRef::TypedHandle(_) | TypeRef::Map(_, _) => {
+                params.push("i64");
+            }
+            _ => {
+                params.push("i32");
+                params.push("i32");
+            }
+        },
+        Some(TypeRef::Callback(_)) => todo!("callback WASM type"),
+    }
+    params
+}
+
+fn emit_js_async_function_wrapper(out: &mut String, module_name: &str, func: &Function) {
+    let abi_name = format!("weaveffi_{}_{}", module_name, func.name);
+    let js_params: Vec<&str> = func.params.iter().map(|p| p.name.as_str()).collect();
+    let indent = "        ";
+    let indent2 = "          ";
+
+    out.push_str(&format!(
+        "      {}({}) {{\n",
+        func.name,
+        js_params.join(", ")
+    ));
+    out.push_str(&format!(
+        "{indent}return new Promise((resolve, reject) => {{\n"
+    ));
+    out.push_str(&format!("{indent2}const ctxId = _nextCtxId++;\n"));
+
+    match func.returns.as_ref() {
+        None => {
+            out.push_str(&format!(
+                "{indent2}_asyncContexts.set(ctxId, {{ resolve, reject }});\n"
+            ));
+        }
+        Some(TypeRef::Bool) => {
+            out.push_str(&format!(
+                "{indent2}_asyncContexts.set(ctxId, {{ resolve, reject, unwrap: (w, r) => r !== 0 }});\n"
+            ));
+        }
+        Some(TypeRef::StringUtf8) => {
+            out.push_str(&format!(
+                "{indent2}_asyncContexts.set(ctxId, {{ resolve, reject, unwrap: (w, ptr) => {{\n"
+            ));
+            out.push_str(&format!(
+                "{indent2}  const b = new Uint8Array(w.memory.buffer, ptr);\n"
+            ));
+            out.push_str(&format!("{indent2}  let e = 0; while (b[e] !== 0) e++;\n"));
+            out.push_str(&format!(
+                "{indent2}  return new TextDecoder().decode(new Uint8Array(w.memory.buffer, ptr, e));\n"
+            ));
+            out.push_str(&format!("{indent2}}} }});\n"));
+        }
+        Some(TypeRef::Struct(name)) => {
+            out.push_str(&format!(
+                "{indent2}_asyncContexts.set(ctxId, {{ resolve, reject, unwrap: (w, handle) => new {name}(w, handle) }});\n"
+            ));
+        }
+        Some(TypeRef::Optional(inner)) => match inner.as_ref() {
+            TypeRef::Struct(name) => {
+                out.push_str(&format!(
+                    "{indent2}_asyncContexts.set(ctxId, {{ resolve, reject, unwrap: (w, handle) => handle === 0n ? null : new {name}(w, handle) }});\n"
+                ));
+            }
+            _ => {
+                out.push_str(&format!(
+                    "{indent2}_asyncContexts.set(ctxId, {{ resolve, reject }});\n"
+                ));
+            }
+        },
+        _ => {
+            out.push_str(&format!(
+                "{indent2}_asyncContexts.set(ctxId, {{ resolve, reject }});\n"
+            ));
+        }
+    }
+
+    let mut wasm_args = Vec::new();
+    for param in &func.params {
+        match &param.ty {
+            TypeRef::StringUtf8 => {
+                out.push_str(&format!(
+                    "{indent2}const [{name}_ptr, {name}_len] = _encodeString(wasm, {name});\n",
+                    name = param.name
+                ));
+                wasm_args.push(format!("{}_ptr", param.name));
+                wasm_args.push(format!("{}_len", param.name));
+            }
+            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+                wasm_args.push(format!("{}._handle", param.name));
+            }
+            _ => {
+                wasm_args.push(param.name.clone());
+            }
+        }
+    }
+
+    let cb_params = async_cb_wasm_params(func.returns.as_ref());
+    let sig_key = cb_params.join("_");
+    wasm_args.push(format!("_cbPtr_{sig_key}"));
+    wasm_args.push("ctxId".to_string());
+
+    out.push_str(&format!(
+        "{indent2}wasm.{abi_name}_async({});\n",
+        wasm_args.join(", ")
+    ));
+
+    out.push_str(&format!("{indent}}}));\n"));
     out.push_str("      },\n");
 }
 
@@ -1398,6 +1607,106 @@ mod tests {
         assert!(
             js.contains("result === 0n ? null : new Contact(wasm, result)"),
             "optional struct return should null-check before wrapping"
+        );
+    }
+
+    #[test]
+    fn wasm_async_returns_promise() {
+        let api = make_api(vec![Module {
+            name: "math".into(),
+            functions: vec![Function {
+                name: "compute".into(),
+                params: vec![Param {
+                    name: "x".into(),
+                    ty: TypeRef::I32,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: true,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        assert!(
+            js.contains("new Promise"),
+            "async function should return a Promise: {js}"
+        );
+        assert!(
+            js.contains("resolve"),
+            "Promise should have resolve callback: {js}"
+        );
+        assert!(
+            js.contains("reject"),
+            "Promise should have reject callback: {js}"
+        );
+        assert!(
+            js.contains("_asyncContexts"),
+            "should use async context map: {js}"
+        );
+        assert!(
+            js.contains("_registerTrampoline"),
+            "should register trampoline in function table: {js}"
+        );
+        assert!(
+            js.contains("weaveffi_math_compute_async("),
+            "should call the _async export: {js}"
+        );
+        assert!(
+            js.contains("__indirect_function_table"),
+            "should reference the WASM function table: {js}"
+        );
+    }
+
+    #[test]
+    fn wasm_dts_async_function() {
+        let api = make_api(vec![Module {
+            name: "math".into(),
+            functions: vec![
+                Function {
+                    name: "compute".into(),
+                    params: vec![Param {
+                        name: "x".into(),
+                        ty: TypeRef::I32,
+                    }],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: true,
+                },
+                Function {
+                    name: "add".into(),
+                    params: vec![
+                        Param {
+                            name: "a".into(),
+                            ty: TypeRef::I32,
+                        },
+                        Param {
+                            name: "b".into(),
+                            ty: TypeRef::I32,
+                        },
+                    ],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                },
+            ],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+        let dts = render_wasm_dts(&api, DEFAULT_MODULE_NAME);
+        assert!(
+            dts.contains("compute(x: number): Promise<number>"),
+            "async function should return Promise<T> in .d.ts: {dts}"
+        );
+        assert!(
+            dts.contains("add(a: number, b: number): number"),
+            "sync function should not return Promise: {dts}"
+        );
+        assert!(
+            !dts.contains("add(a: number, b: number): Promise"),
+            "sync function must not return Promise: {dts}"
         );
     }
 }
