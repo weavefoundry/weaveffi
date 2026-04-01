@@ -224,6 +224,17 @@ fn render_swift_wrapper(api: &Api, strip_module_prefix: bool) -> String {
     out.push_str("    return try withUnsafePointer(to: value) { try body($0) }\n");
     out.push_str("}\n\n");
 
+    let has_async = api
+        .modules
+        .iter()
+        .any(|m| m.functions.iter().any(|f| f.r#async));
+    if has_async {
+        out.push_str("private final class ContinuationRef<T> {\n");
+        out.push_str("    let value: CheckedContinuation<T, Error>\n");
+        out.push_str("    init(_ value: CheckedContinuation<T, Error>) { self.value = value }\n");
+        out.push_str("}\n\n");
+    }
+
     for m in &api.modules {
         for e in &m.enums {
             render_swift_enum(&mut out, e);
@@ -234,7 +245,11 @@ fn render_swift_wrapper(api: &Api, strip_module_prefix: bool) -> String {
         let type_name = m.name.to_upper_camel_case();
         out.push_str(&format!("public enum {} {{\n", type_name));
         for f in &m.functions {
-            render_swift_function(&mut out, &m.name, f, strip_module_prefix);
+            if f.r#async {
+                render_swift_async_function(&mut out, &m.name, f, strip_module_prefix);
+            } else {
+                render_swift_function(&mut out, &m.name, f, strip_module_prefix);
+            }
         }
         out.push_str("}\n\n");
     }
@@ -392,6 +407,447 @@ fn render_swift_function(
     }
 
     out.push_str("    }\n");
+}
+
+fn render_swift_async_function(
+    out: &mut String,
+    module_name: &str,
+    f: &Function,
+    strip_module_prefix: bool,
+) {
+    let func_name = wrapper_name(module_name, &f.name, strip_module_prefix);
+    let params_sig: Vec<String> = f
+        .params
+        .iter()
+        .map(|p| format!("_ {}: {}", p.name, swift_type_for(&p.ty)))
+        .collect();
+    let ret_swift = f
+        .returns
+        .as_ref()
+        .map(swift_type_for)
+        .unwrap_or_else(|| "Void".to_string());
+
+    out.push_str(&format!(
+        "    public static func {}({}) async throws -> {} {{\n",
+        func_name,
+        params_sig.join(", "),
+        ret_swift
+    ));
+    out.push_str(&format!(
+        "        try await withCheckedThrowingContinuation {{ (continuation: CheckedContinuation<{}, Error>) in\n",
+        ret_swift
+    ));
+    out.push_str(
+        "            let ctx = Unmanaged.passRetained(ContinuationRef(continuation)).toOpaque()\n",
+    );
+
+    let base = "            ";
+
+    for p in &f.params {
+        match &p.ty {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                out.push_str(&format!(
+                    "{}let {n}_bytes = Array({n}.utf8)\n",
+                    base,
+                    n = p.name
+                ));
+            }
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
+                out.push_str(&format!("{}let {n}_bytes = Array({n})\n", base, n = p.name));
+            }
+            TypeRef::Optional(inner) => {
+                if let TypeRef::Enum(enum_name) = inner.as_ref() {
+                    out.push_str(&format!(
+                        "{}let {n}_c: weaveffi_{m}_{e}? = {n}.map {{ weaveffi_{m}_{e}($0.rawValue) }}\n",
+                        base,
+                        n = p.name,
+                        m = module_name,
+                        e = enum_name
+                    ));
+                }
+            }
+            TypeRef::List(inner) => match inner.as_ref() {
+                TypeRef::Enum(enum_name) => {
+                    out.push_str(&format!(
+                        "{}let {n}_raw = {n}.map {{ weaveffi_{m}_{e}($0.rawValue) }}\n",
+                        base,
+                        n = p.name,
+                        m = module_name,
+                        e = enum_name
+                    ));
+                }
+                TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+                    out.push_str(&format!(
+                        "{}let {n}_ptrs = {n}.map {{ $0.ptr }}\n",
+                        base,
+                        n = p.name
+                    ));
+                }
+                _ => {}
+            },
+            TypeRef::Map(k, v) => {
+                out.push_str(&format!(
+                    "{}let {n}_keys = Array({n}.keys)\n",
+                    base,
+                    n = p.name
+                ));
+                out.push_str(&format!(
+                    "{}let {n}_values = {n}_keys.map {{ {n}[$0]! }}\n",
+                    base,
+                    n = p.name
+                ));
+                if let TypeRef::Enum(e) = k.as_ref() {
+                    out.push_str(&format!(
+                        "{}let {n}_keysRaw = {n}_keys.map {{ weaveffi_{m}_{e}($0.rawValue) }}\n",
+                        base,
+                        n = p.name,
+                        m = module_name,
+                        e = e
+                    ));
+                } else if matches!(k.as_ref(), TypeRef::Struct(_) | TypeRef::TypedHandle(_)) {
+                    out.push_str(&format!(
+                        "{}let {n}_keysPtrs = {n}_keys.map {{ $0.ptr }}\n",
+                        base,
+                        n = p.name
+                    ));
+                }
+                if let TypeRef::Enum(e) = v.as_ref() {
+                    out.push_str(&format!(
+                        "{}let {n}_valuesRaw = {n}_values.map {{ weaveffi_{m}_{e}($0.rawValue) }}\n",
+                        base,
+                        n = p.name,
+                        m = module_name,
+                        e = e
+                    ));
+                } else if matches!(v.as_ref(), TypeRef::Struct(_) | TypeRef::TypedHandle(_)) {
+                    out.push_str(&format!(
+                        "{}let {n}_valuesPtrs = {n}_values.map {{ $0.ptr }}\n",
+                        base,
+                        n = p.name
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let closure_params: Vec<&Param> = f.params.iter().filter(|p| needs_closure(&p.ty)).collect();
+    let mut closure_depth: usize = 0;
+
+    for p in &closure_params {
+        let indent = format!("{}{}", base, "    ".repeat(closure_depth));
+        match &p.ty {
+            TypeRef::StringUtf8
+            | TypeRef::BorrowedStr
+            | TypeRef::Bytes
+            | TypeRef::BorrowedBytes => {
+                out.push_str(&format!(
+                    "{}{}_bytes.withUnsafeBufferPointer {{ {}_buf in\n",
+                    indent, p.name, p.name
+                ));
+                out.push_str(&format!(
+                    "{}    let {}_ptr = {}_buf.baseAddress!\n",
+                    indent, p.name, p.name
+                ));
+                out.push_str(&format!(
+                    "{}    let {}_len = {}_buf.count\n",
+                    indent, p.name, p.name
+                ));
+                closure_depth += 1;
+            }
+            TypeRef::Optional(inner) if is_c_value_type(inner) => {
+                let source = if matches!(inner.as_ref(), TypeRef::Enum(_)) {
+                    format!("{}_c", p.name)
+                } else {
+                    p.name.clone()
+                };
+                out.push_str(&format!(
+                    "{}withOptionalPointer(to: {}) {{ {}_ptr in\n",
+                    indent, source, p.name
+                ));
+                closure_depth += 1;
+            }
+            TypeRef::List(inner) => {
+                let source = match inner.as_ref() {
+                    TypeRef::Enum(_) => format!("{}_raw", p.name),
+                    TypeRef::Struct(_) | TypeRef::TypedHandle(_) => format!("{}_ptrs", p.name),
+                    _ => p.name.clone(),
+                };
+                out.push_str(&format!(
+                    "{}{}.withUnsafeBufferPointer {{ {}_buf in\n",
+                    indent, source, p.name
+                ));
+                out.push_str(&format!(
+                    "{}    let {}_ptr = {}_buf.baseAddress\n",
+                    indent, p.name, p.name
+                ));
+                out.push_str(&format!(
+                    "{}    let {}_len = {}_buf.count\n",
+                    indent, p.name, p.name
+                ));
+                closure_depth += 1;
+            }
+            TypeRef::Map(k, v) => {
+                let keys_source = map_array_source(k, &p.name, "keys");
+                let values_source = map_array_source(v, &p.name, "values");
+                out.push_str(&format!(
+                    "{}{}.withUnsafeBufferPointer {{ {}_keys_buf in\n",
+                    indent, keys_source, p.name
+                ));
+                out.push_str(&format!(
+                    "{}    let {}_keys_ptr = {}_keys_buf.baseAddress\n",
+                    indent, p.name, p.name
+                ));
+                closure_depth += 1;
+                let vind = format!("{}{}", base, "    ".repeat(closure_depth));
+                out.push_str(&format!(
+                    "{}{}.withUnsafeBufferPointer {{ {}_values_buf in\n",
+                    vind, values_source, p.name
+                ));
+                out.push_str(&format!(
+                    "{}    let {}_values_ptr = {}_values_buf.baseAddress\n",
+                    vind, p.name, p.name
+                ));
+                out.push_str(&format!(
+                    "{}    let {}_len = {}_values_buf.count\n",
+                    vind, p.name, p.name
+                ));
+                closure_depth += 1;
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    let inner_indent = format!("{}{}", base, "    ".repeat(closure_depth));
+    let c_sym = format!("{}_async", c_symbol_name(module_name, &f.name));
+    let call_args = build_c_call_args(&f.params, module_name);
+    let cb_param_names = async_callback_param_names(&f.returns);
+
+    if call_args.is_empty() {
+        out.push_str(&format!(
+            "{}{}({{ {} in\n",
+            inner_indent, c_sym, cb_param_names
+        ));
+    } else {
+        out.push_str(&format!(
+            "{}{}({}, {{ {} in\n",
+            inner_indent, c_sym, call_args, cb_param_names
+        ));
+    }
+
+    let cb_indent = format!("{}    ", inner_indent);
+    out.push_str(&format!(
+        "{}let contRef = Unmanaged<ContinuationRef<{}>>.fromOpaque(context!).takeRetainedValue()\n",
+        cb_indent, ret_swift
+    ));
+    out.push_str(&format!(
+        "{}if let err = err, err.pointee.code != 0 {{\n",
+        cb_indent
+    ));
+    out.push_str(&format!("{}    let code = err.pointee.code\n", cb_indent));
+    out.push_str(&format!(
+        "{}    let msg = err.pointee.message.flatMap {{ String(cString: $0) }} ?? \"\"\n",
+        cb_indent
+    ));
+    out.push_str(&format!(
+        "{}    contRef.value.resume(throwing: WeaveFFIError.error(code: code, message: msg))\n",
+        cb_indent
+    ));
+    out.push_str(&format!("{}}} else {{\n", cb_indent));
+
+    let success_indent = format!("{}    ", cb_indent);
+    render_async_resume_result(out, &f.returns, &success_indent);
+
+    out.push_str(&format!("{}}}\n", cb_indent));
+    out.push_str(&format!("{}}}, ctx)\n", inner_indent));
+
+    for i in (0..closure_depth).rev() {
+        let indent = format!("{}{}", base, "    ".repeat(i));
+        out.push_str(&format!("{}}}\n", indent));
+    }
+
+    out.push_str("        }\n");
+    out.push_str("    }\n");
+}
+
+fn async_callback_param_names(returns: &Option<TypeRef>) -> &'static str {
+    match returns {
+        None => "context, err",
+        Some(TypeRef::Bytes) | Some(TypeRef::BorrowedBytes) | Some(TypeRef::List(_)) => {
+            "context, err, result, resultLen"
+        }
+        Some(TypeRef::Map(_, _)) => "context, err, resultKeys, resultValues, resultLen",
+        Some(_) => "context, err, result",
+    }
+}
+
+fn render_async_resume_result(out: &mut String, returns: &Option<TypeRef>, indent: &str) {
+    match returns {
+        None => {
+            out.push_str(&format!("{}contRef.value.resume(returning: ())\n", indent));
+        }
+        Some(TypeRef::StringUtf8) => {
+            out.push_str(&format!("{}guard let result = result else {{\n", indent));
+            out.push_str(&format!(
+                "{}    contRef.value.resume(throwing: WeaveFFIError.error(code: -1, message: \"null string\"))\n",
+                indent
+            ));
+            out.push_str(&format!("{}    return\n", indent));
+            out.push_str(&format!("{}}}\n", indent));
+            out.push_str(&format!("{}let str = String(cString: result)\n", indent));
+            out.push_str(&format!(
+                "{}weaveffi_free_string(UnsafeMutablePointer(mutating: result))\n",
+                indent
+            ));
+            out.push_str(&format!("{}contRef.value.resume(returning: str)\n", indent));
+        }
+        Some(TypeRef::Struct(name) | TypeRef::TypedHandle(name)) => {
+            out.push_str(&format!("{}guard let result = result else {{\n", indent));
+            out.push_str(&format!(
+                "{}    contRef.value.resume(throwing: WeaveFFIError.error(code: -1, message: \"null pointer\"))\n",
+                indent
+            ));
+            out.push_str(&format!("{}    return\n", indent));
+            out.push_str(&format!("{}}}\n", indent));
+            out.push_str(&format!(
+                "{}contRef.value.resume(returning: {}(ptr: result))\n",
+                indent, name
+            ));
+        }
+        Some(TypeRef::Enum(name)) => {
+            out.push_str(&format!(
+                "{}contRef.value.resume(returning: {}(rawValue: result.rawValue)!)\n",
+                indent, name
+            ));
+        }
+        Some(TypeRef::Optional(inner)) => match inner.as_ref() {
+            TypeRef::StringUtf8 => {
+                out.push_str(&format!("{}if let result = result {{\n", indent));
+                out.push_str(&format!(
+                    "{}    let str = String(cString: result)\n",
+                    indent
+                ));
+                out.push_str(&format!(
+                    "{}    weaveffi_free_string(UnsafeMutablePointer(mutating: result))\n",
+                    indent
+                ));
+                out.push_str(&format!(
+                    "{}    contRef.value.resume(returning: str)\n",
+                    indent
+                ));
+                out.push_str(&format!("{}}} else {{\n", indent));
+                out.push_str(&format!(
+                    "{}    contRef.value.resume(returning: nil)\n",
+                    indent
+                ));
+                out.push_str(&format!("{}}}\n", indent));
+            }
+            TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+                out.push_str(&format!(
+                    "{}contRef.value.resume(returning: result.map {{ {}(ptr: $0) }})\n",
+                    indent, name
+                ));
+            }
+            TypeRef::Enum(name) => {
+                out.push_str(&format!(
+                    "{}contRef.value.resume(returning: result.map {{ {}(rawValue: $0.pointee.rawValue)! }})\n",
+                    indent, name
+                ));
+            }
+            _ if is_c_value_type(inner) => {
+                out.push_str(&format!(
+                    "{}contRef.value.resume(returning: result?.pointee)\n",
+                    indent
+                ));
+            }
+            _ => {
+                out.push_str(&format!(
+                    "{}contRef.value.resume(returning: result)\n",
+                    indent
+                ));
+            }
+        },
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
+            out.push_str(&format!("{}if let result = result {{\n", indent));
+            out.push_str(&format!(
+                "{}    contRef.value.resume(returning: Data(bytes: result, count: Int(resultLen)))\n",
+                indent
+            ));
+            out.push_str(&format!("{}}} else {{\n", indent));
+            out.push_str(&format!(
+                "{}    contRef.value.resume(returning: Data())\n",
+                indent
+            ));
+            out.push_str(&format!("{}}}\n", indent));
+        }
+        Some(TypeRef::List(inner)) => {
+            out.push_str(&format!("{}guard let result = result else {{\n", indent));
+            out.push_str(&format!(
+                "{}    contRef.value.resume(returning: [])\n",
+                indent
+            ));
+            out.push_str(&format!("{}    return\n", indent));
+            out.push_str(&format!("{}}}\n", indent));
+            out.push_str(&format!("{}let len = Int(resultLen)\n", indent));
+            match inner.as_ref() {
+                TypeRef::Enum(name) => {
+                    out.push_str(&format!(
+                        "{}contRef.value.resume(returning: (0..<len).map {{ {}(rawValue: result[$0].rawValue)! }})\n",
+                        indent, name
+                    ));
+                }
+                TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+                    out.push_str(&format!(
+                        "{}contRef.value.resume(returning: (0..<len).map {{ {}(ptr: result[$0]!) }})\n",
+                        indent, name
+                    ));
+                }
+                _ => {
+                    out.push_str(&format!(
+                        "{}contRef.value.resume(returning: Array(UnsafeBufferPointer(start: result, count: len)))\n",
+                        indent
+                    ));
+                }
+            }
+        }
+        Some(TypeRef::Map(k, v)) => {
+            let key_swift = swift_type_for(k);
+            let val_swift = swift_type_for(v);
+            out.push_str(&format!(
+                "{}guard let resultKeys = resultKeys, let resultValues = resultValues else {{\n",
+                indent
+            ));
+            out.push_str(&format!(
+                "{}    contRef.value.resume(returning: [:])\n",
+                indent
+            ));
+            out.push_str(&format!("{}    return\n", indent));
+            out.push_str(&format!("{}}}\n", indent));
+            out.push_str(&format!("{}let len = Int(resultLen)\n", indent));
+            out.push_str(&format!(
+                "{}var dict: [{}: {}] = [:]\n",
+                indent, key_swift, val_swift
+            ));
+            out.push_str(&format!("{}for i in 0..<len {{\n", indent));
+            let key_expr = map_element_read(k, "resultKeys[i]");
+            let val_expr = map_element_read(v, "resultValues[i]");
+            out.push_str(&format!(
+                "{}    dict[{}] = {}\n",
+                indent, key_expr, val_expr
+            ));
+            out.push_str(&format!("{}}}\n", indent));
+            out.push_str(&format!(
+                "{}contRef.value.resume(returning: dict)\n",
+                indent
+            ));
+        }
+        Some(_) => {
+            out.push_str(&format!(
+                "{}contRef.value.resume(returning: result)\n",
+                indent
+            ));
+        }
+    }
 }
 
 fn build_c_call_args(params: &[Param], module_name: &str) -> String {
@@ -2542,6 +2998,74 @@ mod tests {
         assert!(
             out.contains("rv.map { Contact(ptr: $0) }"),
             "optional struct return should map null before wrapping: {out}"
+        );
+    }
+
+    #[test]
+    fn swift_async_function_signature() {
+        let api = make_api(vec![Module {
+            name: "tasks".to_string(),
+            functions: vec![Function {
+                name: "run".to_string(),
+                params: vec![Param {
+                    name: "id".to_string(),
+                    ty: TypeRef::I32,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: true,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let out = render_swift_wrapper(&api, true);
+        assert!(
+            out.contains("async throws"),
+            "missing async throws in signature: {out}"
+        );
+        assert!(
+            out.contains("public static func run(_ id: Int32) async throws -> Int32"),
+            "missing complete async function signature: {out}"
+        );
+    }
+
+    #[test]
+    fn swift_async_uses_continuation() {
+        let api = make_api(vec![Module {
+            name: "tasks".to_string(),
+            functions: vec![Function {
+                name: "run".to_string(),
+                params: vec![Param {
+                    name: "id".to_string(),
+                    ty: TypeRef::I32,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: true,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let out = render_swift_wrapper(&api, true);
+        assert!(
+            out.contains("withCheckedThrowingContinuation"),
+            "missing withCheckedThrowingContinuation: {out}"
+        );
+        assert!(
+            out.contains("ContinuationRef"),
+            "missing ContinuationRef usage: {out}"
+        );
+        assert!(
+            out.contains("Unmanaged"),
+            "missing Unmanaged for context bridging: {out}"
+        );
+        assert!(
+            out.contains("weaveffi_tasks_run_async"),
+            "missing async C function call: {out}"
         );
     }
 }
