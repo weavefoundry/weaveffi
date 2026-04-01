@@ -17,6 +17,7 @@
   - [Python](generators/python.md)
   - [.NET](generators/dotnet.md)
   - [C++](generators/cpp.md)
+  - [Dart](generators/dart.md)
 - [API](api/README.md)
   - [Rust API (cargo doc)](api/rust.md)
 - [Guides](guides/README.md)
