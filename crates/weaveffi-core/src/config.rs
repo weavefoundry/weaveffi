@@ -18,6 +18,7 @@ pub struct GeneratorConfig {
     pub cpp_header_name: Option<String>,
     pub cpp_standard: Option<String>,
     pub dart_package_name: Option<String>,
+    pub go_module_path: Option<String>,
     #[serde(default)]
     pub strip_module_prefix: bool,
     pub template_dir: Option<String>,
@@ -69,6 +70,10 @@ impl GeneratorConfig {
     pub fn dart_package_name(&self) -> &str {
         self.dart_package_name.as_deref().unwrap_or("weaveffi")
     }
+
+    pub fn go_module_path(&self) -> &str {
+        self.go_module_path.as_deref().unwrap_or("weaveffi")
+    }
 }
 
 #[cfg(test)]
@@ -90,6 +95,7 @@ mod tests {
         assert_eq!(cfg.cpp_header_name(), "weaveffi.hpp");
         assert_eq!(cfg.cpp_standard(), "17");
         assert_eq!(cfg.dart_package_name(), "weaveffi");
+        assert_eq!(cfg.go_module_path(), "weaveffi");
         assert!(!cfg.strip_module_prefix);
     }
 
@@ -107,6 +113,7 @@ mod tests {
             cpp_header_name: Some("mylib.hpp".into()),
             cpp_standard: Some("20".into()),
             dart_package_name: Some("my_dart_pkg".into()),
+            go_module_path: Some("github.com/myorg/mylib".into()),
             strip_module_prefix: true,
             template_dir: None,
             pre_generate: None,
@@ -124,6 +131,7 @@ mod tests {
         assert_eq!(cfg.cpp_header_name(), "mylib.hpp");
         assert_eq!(cfg.cpp_standard(), "20");
         assert_eq!(cfg.dart_package_name(), "my_dart_pkg");
+        assert_eq!(cfg.go_module_path(), "github.com/myorg/mylib");
         assert!(cfg.strip_module_prefix);
     }
 
@@ -141,6 +149,7 @@ mod tests {
             cpp_header_name: None,
             cpp_standard: None,
             dart_package_name: None,
+            go_module_path: None,
             strip_module_prefix: true,
             template_dir: None,
             pre_generate: None,
@@ -158,6 +167,7 @@ mod tests {
         assert_eq!(back.cpp_header_name(), "weaveffi.hpp");
         assert_eq!(back.cpp_standard(), "17");
         assert_eq!(back.dart_package_name(), "weaveffi");
+        assert_eq!(back.go_module_path(), "weaveffi");
         assert!(back.strip_module_prefix);
     }
 
