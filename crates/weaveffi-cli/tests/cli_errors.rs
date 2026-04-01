@@ -120,7 +120,7 @@ modules:
 }
 
 #[test]
-fn validation_error_async_shows_suggestion() {
+fn async_function_validates_successfully() {
     let dir = tempfile::tempdir().unwrap();
     let yaml = r#"
 version: "0.1.0"
@@ -138,15 +138,10 @@ modules:
         .output()
         .unwrap();
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success());
     assert!(
-        stderr.contains("async functions are not yet supported"),
-        "expected async rejection message, got: {stderr}"
-    );
-    assert!(
-        stderr.contains("remove 'async: true'"),
-        "expected fix suggestion for async, got: {stderr}"
+        output.status.success(),
+        "async function should pass validation, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

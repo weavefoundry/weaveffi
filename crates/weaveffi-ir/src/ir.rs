@@ -45,6 +45,24 @@ pub struct Param {
     pub ty: TypeRef,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallbackDef {
+    pub params: Vec<Param>,
+    #[serde(rename = "return", default)]
+    pub returns: Option<TypeRef>,
+}
+
+impl std::hash::Hash for CallbackDef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.params.len().hash(state);
+        for p in &self.params {
+            p.name.hash(state);
+            p.ty.hash(state);
+        }
+        self.returns.hash(state);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeRef {
     I32,
@@ -63,6 +81,7 @@ pub enum TypeRef {
     Optional(Box<TypeRef>),
     List(Box<TypeRef>),
     Map(Box<TypeRef>, Box<TypeRef>),
+    Callback(Box<CallbackDef>),
 }
 
 pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
@@ -124,6 +143,7 @@ fn type_ref_to_string(ty: &TypeRef) -> String {
         TypeRef::Optional(inner) => format!("{}?", type_ref_to_string(inner)),
         TypeRef::List(inner) => format!("[{}]", type_ref_to_string(inner)),
         TypeRef::Map(k, v) => format!("{{{}:{}}}", type_ref_to_string(k), type_ref_to_string(v)),
+        TypeRef::Callback(_) => "callback".to_string(),
     }
 }
 

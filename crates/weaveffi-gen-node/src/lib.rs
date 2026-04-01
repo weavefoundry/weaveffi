@@ -125,6 +125,7 @@ fn c_elem_type(ty: &TypeRef, module: &str) -> String {
         TypeRef::Enum(e) => format!("weaveffi_{module}_{e}"),
         TypeRef::Optional(inner) | TypeRef::List(inner) => c_elem_type(inner, module),
         TypeRef::Map(_, _) => "void*".into(),
+        TypeRef::Callback(_) => todo!("callback Node type"),
     }
 }
 
@@ -149,6 +150,7 @@ fn c_ret_type_str(ty: &TypeRef, module: &str) -> String {
         }
         TypeRef::List(inner) => format!("{}*", c_elem_type(inner, module)),
         TypeRef::Map(_, _) => "void".into(),
+        TypeRef::Callback(_) => todo!("callback Node type"),
     }
 }
 
@@ -336,6 +338,7 @@ fn emit_param(
         TypeRef::Map(k, v) => {
             emit_map_param(out, c_args, cleanups, k, v, name, idx, module);
         }
+        TypeRef::Callback(_) => todo!("callback Node param"),
     }
 }
 
@@ -708,6 +711,7 @@ fn emit_ret_to_napi(out: &mut String, ty: &TypeRef, module: &str) {
         TypeRef::Map(_, _) => {
             out.push_str("  napi_create_object(env, &ret);\n");
         }
+        TypeRef::Callback(_) => todo!("callback Node return"),
     }
     out.push_str("  return ret;\n");
 }
@@ -819,6 +823,7 @@ fn ts_type_for(ty: &TypeRef) -> String {
             }
         }
         TypeRef::Map(k, v) => format!("Record<{}, {}>", ts_type_for(k), ts_type_for(v)),
+        TypeRef::Callback(_) => todo!("callback Node type"),
     }
 }
 

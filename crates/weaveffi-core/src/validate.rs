@@ -7,6 +7,7 @@ pub enum ValidationWarning {
     LargeEnumVariantCount { enum_name: String, count: usize },
     DeepNesting { location: String, depth: usize },
     EmptyModuleDoc { module: String },
+    AsyncVoidFunction { module: String, function: String },
 }
 
 impl std::fmt::Display for ValidationWarning {
@@ -29,6 +30,12 @@ impl std::fmt::Display for ValidationWarning {
             }
             Self::EmptyModuleDoc { module } => {
                 write!(f, "module '{module}' has no doc comments on any function")
+            }
+            Self::AsyncVoidFunction { module, function } => {
+                write!(
+                    f,
+                    "async function {module}::{function} has no return type; async void is unusual"
+                )
             }
         }
     }
@@ -87,6 +94,15 @@ pub fn collect_warnings(api: &Api) -> Vec<ValidationWarning> {
             }
         }
 
+        for f in &module.functions {
+            if f.r#async && f.returns.is_none() {
+                warnings.push(ValidationWarning::AsyncVoidFunction {
+                    module: module.name.clone(),
+                    function: f.name.clone(),
+                });
+            }
+        }
+
         if !module.functions.is_empty() && module.functions.iter().all(|f| f.doc.is_none()) {
             warnings.push(ValidationWarning::EmptyModuleDoc {
                 module: module.name.clone(),
@@ -140,8 +156,6 @@ pub enum ValidationError {
     ReservedKeyword(String),
     #[error("invalid identifier '{0}': {1}")]
     InvalidIdentifier(String, &'static str),
-    #[error("async functions are not yet supported: {module}::{function}")]
-    AsyncNotSupported { module: String, function: String },
     #[error("error domain missing name in module '{0}'")]
     ErrorDomainMissingName(String),
     #[error("duplicate error code name in module '{module}': {name}")]
@@ -384,12 +398,6 @@ fn validate_module(module: &Module) -> Result<(), ValidationError> {
 
 fn validate_function(module: &Module, f: &Function) -> Result<(), ValidationError> {
     check_identifier(&f.name)?;
-    if f.r#async {
-        return Err(ValidationError::AsyncNotSupported {
-            module: module.name.clone(),
-            function: f.name.clone(),
-        });
-    }
 
     let mut param_names = BTreeSet::new();
     for p in &f.params {
@@ -607,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn async_functions_rejected() {
+    fn async_function_passes_validation() {
         let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![Module {
@@ -625,12 +633,84 @@ mod tests {
             }],
             generators: None,
         };
-        let err = validate_api(&mut api).unwrap_err();
-        assert!(matches!(err, ValidationError::AsyncNotSupported { .. }));
-        assert_eq!(
-            err.to_string(),
-            "async functions are not yet supported: mymod::do_async"
-        );
+        assert!(validate_api(&mut api).is_ok());
+    }
+
+    #[test]
+    fn async_function_with_return_passes() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "fetch_data".to_string(),
+                    params: vec![Param {
+                        name: "url".to_string(),
+                        ty: TypeRef::StringUtf8,
+                    }],
+                    returns: Some(TypeRef::StringUtf8),
+                    doc: None,
+                    r#async: true,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+            generators: None,
+        };
+        assert!(validate_api(&mut api).is_ok());
+    }
+
+    #[test]
+    fn async_void_function_emits_warning() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "fire_and_forget".to_string(),
+                    params: vec![],
+                    returns: None,
+                    doc: Some("documented".to_string()),
+                    r#async: true,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+            generators: None,
+        };
+        let warnings = collect_warnings(&api);
+        assert!(warnings.iter().any(|w| matches!(
+            w,
+            ValidationWarning::AsyncVoidFunction { module, function }
+                if module == "mymod" && function == "fire_and_forget"
+        )));
+    }
+
+    #[test]
+    fn async_function_with_return_no_void_warning() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "fetch".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::StringUtf8),
+                    doc: Some("documented".to_string()),
+                    r#async: true,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+            generators: None,
+        };
+        let warnings = collect_warnings(&api);
+        assert!(!warnings
+            .iter()
+            .any(|w| matches!(w, ValidationWarning::AsyncVoidFunction { .. })));
     }
 
     #[test]
