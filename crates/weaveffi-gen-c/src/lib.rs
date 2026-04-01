@@ -1085,4 +1085,156 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn c_deeply_nested_optional() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "edge".into(),
+                functions: vec![Function {
+                    name: "process".into(),
+                    params: vec![Param {
+                        name: "data".into(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::List(Box::new(
+                            TypeRef::Optional(Box::new(TypeRef::Struct("Contact".into()))),
+                        )))),
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![StructDef {
+                    name: "Contact".into(),
+                    doc: None,
+                    fields: vec![StructField {
+                        name: "name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    }],
+                }],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        let header = render_c_header(&api, "weaveffi");
+        assert!(
+            header.contains("weaveffi_edge_process"),
+            "should contain function name: {header}"
+        );
+        assert!(
+            header.contains("data"),
+            "should contain param name: {header}"
+        );
+        assert!(
+            header.contains("data_len"),
+            "list param should expand to include length: {header}"
+        );
+    }
+
+    #[test]
+    fn c_map_of_lists() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "edge".into(),
+                functions: vec![Function {
+                    name: "process".into(),
+                    params: vec![Param {
+                        name: "scores".into(),
+                        ty: TypeRef::Map(
+                            Box::new(TypeRef::StringUtf8),
+                            Box::new(TypeRef::List(Box::new(TypeRef::I32))),
+                        ),
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        let header = render_c_header(&api, "weaveffi");
+        assert!(
+            header.contains("scores_keys"),
+            "map param should have keys: {header}"
+        );
+        assert!(
+            header.contains("scores_values"),
+            "map param should have values: {header}"
+        );
+        assert!(
+            header.contains("scores_len"),
+            "map param should have length: {header}"
+        );
+    }
+
+    #[test]
+    fn c_enum_keyed_map() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "edge".into(),
+                functions: vec![Function {
+                    name: "process".into(),
+                    params: vec![Param {
+                        name: "contacts".into(),
+                        ty: TypeRef::Map(
+                            Box::new(TypeRef::Enum("Color".into())),
+                            Box::new(TypeRef::Struct("Contact".into())),
+                        ),
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![StructDef {
+                    name: "Contact".into(),
+                    doc: None,
+                    fields: vec![StructField {
+                        name: "name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    }],
+                }],
+                enums: vec![EnumDef {
+                    name: "Color".into(),
+                    doc: None,
+                    variants: vec![
+                        EnumVariant {
+                            name: "Red".into(),
+                            value: 0,
+                            doc: None,
+                        },
+                        EnumVariant {
+                            name: "Green".into(),
+                            value: 1,
+                            doc: None,
+                        },
+                        EnumVariant {
+                            name: "Blue".into(),
+                            value: 2,
+                            doc: None,
+                        },
+                    ],
+                }],
+                errors: None,
+            }],
+        };
+        let header = render_c_header(&api, "weaveffi");
+        assert!(
+            header.contains("contacts_keys"),
+            "map param should have keys: {header}"
+        );
+        assert!(
+            header.contains("contacts_values"),
+            "map param should have values: {header}"
+        );
+        assert!(
+            header.contains("Color"),
+            "should reference Color enum: {header}"
+        );
+    }
 }
