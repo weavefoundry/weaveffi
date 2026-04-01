@@ -3,7 +3,7 @@ use camino::Utf8Path;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_abi_struct_name, local_type_name, wrapper_name};
-use weaveffi_ir::ir::{Api, Function, TypeRef};
+use weaveffi_ir::ir::{Api, Function, Module, TypeRef};
 
 pub struct NodeGenerator;
 
@@ -167,13 +167,36 @@ fn napi_getter(ty: &TypeRef) -> &'static str {
     }
 }
 
+fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
+    let mut all = Vec::new();
+    for m in modules {
+        all.push(m);
+        all.extend(collect_all_modules(&m.modules));
+    }
+    all
+}
+
+fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
+    let mut result = Vec::new();
+    for m in modules {
+        collect_module_with_path(m, &m.name, &mut result);
+    }
+    result
+}
+
+fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Module, String)>) {
+    out.push((m, path.to_string()));
+    for sub in &m.modules {
+        collect_module_with_path(sub, &format!("{path}_{}", sub.name), out);
+    }
+}
+
 fn render_addon_c(api: &Api, strip_module_prefix: bool) -> String {
     let mut out = String::from(
         "#include <node_api.h>\n#include \"weaveffi.h\"\n#include <stdlib.h>\n#include <string.h>\n\n",
     );
 
-    let has_async = api
-        .modules
+    let has_async = collect_all_modules(&api.modules)
         .iter()
         .any(|m| m.functions.iter().any(|f| f.r#async));
     if has_async {
@@ -185,24 +208,24 @@ fn render_addon_c(api: &Api, strip_module_prefix: bool) -> String {
 
     let mut all_exports: Vec<(String, String)> = Vec::new();
 
-    for m in &api.modules {
+    for (m, path) in collect_modules_with_path(&api.modules) {
         for f in &m.functions {
-            let c_name = format!("weaveffi_{}_{}", m.name, f.name);
+            let c_name = format!("weaveffi_{}_{}", path, f.name);
             let napi_name = format!("Napi_{c_name}");
-            let js_name = wrapper_name(&m.name, &f.name, strip_module_prefix);
+            let js_name = wrapper_name(&path, &f.name, strip_module_prefix);
             all_exports.push((js_name, napi_name.clone()));
 
             if f.r#async {
-                render_async_callback(&mut out, f, &c_name, &m.name);
+                render_async_callback(&mut out, f, &c_name, &path);
             }
 
             out.push_str(&format!(
                 "static napi_value {napi_name}(napi_env env, napi_callback_info info) {{\n"
             ));
             if f.r#async {
-                render_async_napi_body(&mut out, f, &c_name, &m.name);
+                render_async_napi_body(&mut out, f, &c_name, &path);
             } else {
-                render_napi_body(&mut out, f, &c_name, &m.name);
+                render_napi_body(&mut out, f, &c_name, &path);
             }
             out.push_str("}\n\n");
         }
@@ -960,7 +983,7 @@ fn ts_type_for(ty: &TypeRef) -> String {
 
 fn render_node_dts(api: &Api, strip_module_prefix: bool) -> String {
     let mut out = String::from("// Generated types for WeaveFFI functions\n");
-    for m in &api.modules {
+    for (m, path) in collect_modules_with_path(&api.modules) {
         for s in &m.structs {
             out.push_str(&format!("export interface {} {{\n", s.name));
             for field in &s.fields {
@@ -975,7 +998,7 @@ fn render_node_dts(api: &Api, strip_module_prefix: bool) -> String {
             }
             out.push_str("}\n");
         }
-        out.push_str(&format!("// module {}\n", m.name));
+        out.push_str(&format!("// module {}\n", path));
         for f in &m.functions {
             let params: Vec<String> = f
                 .params
@@ -991,10 +1014,10 @@ fn render_node_dts(api: &Api, strip_module_prefix: bool) -> String {
             } else {
                 base_ret
             };
-            let ts_name = wrapper_name(&m.name, &f.name, strip_module_prefix);
+            let ts_name = wrapper_name(&path, &f.name, strip_module_prefix);
             out.push_str(&format!(
                 "/** Maps to C function: weaveffi_{}_{} */\n",
-                m.name, f.name
+                path, f.name
             ));
             out.push_str(&format!(
                 "export function {}({}): {}\n",

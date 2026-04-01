@@ -4,7 +4,7 @@ use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name, wrapper_name};
-use weaveffi_ir::ir::{Api, EnumDef, Function, Param, StructDef, StructField, TypeRef};
+use weaveffi_ir::ir::{Api, EnumDef, Function, Module, Param, StructDef, StructField, TypeRef};
 
 pub struct SwiftGenerator;
 
@@ -160,8 +160,8 @@ fn render_swift_wrapper(api: &Api, strip_module_prefix: bool) -> String {
     let mut out = String::new();
     out.push_str("import CWeaveFFI\nimport Foundation\n\n");
 
-    let error_codes: Vec<_> = api
-        .modules
+    let all_mods = collect_all_modules(&api.modules);
+    let error_codes: Vec<_> = all_mods
         .iter()
         .filter_map(|m| m.errors.as_ref())
         .flat_map(|e| &e.codes)
@@ -225,8 +225,7 @@ fn render_swift_wrapper(api: &Api, strip_module_prefix: bool) -> String {
     out.push_str("    return try withUnsafePointer(to: value) { try body($0) }\n");
     out.push_str("}\n\n");
 
-    let has_async = api
-        .modules
+    let has_async = all_mods
         .iter()
         .any(|m| m.functions.iter().any(|f| f.r#async));
     if has_async {
@@ -237,24 +236,74 @@ fn render_swift_wrapper(api: &Api, strip_module_prefix: bool) -> String {
     }
 
     for m in &api.modules {
-        for e in &m.enums {
-            render_swift_enum(&mut out, e);
-        }
-        for s in &m.structs {
-            render_swift_struct(&mut out, &m.name, s);
-        }
+        render_swift_module_types(&mut out, m, &m.name);
         let type_name = m.name.to_upper_camel_case();
         out.push_str(&format!("public enum {} {{\n", type_name));
-        for f in &m.functions {
-            if f.r#async {
-                render_swift_async_function(&mut out, &m.name, f, strip_module_prefix);
-            } else {
-                render_swift_function(&mut out, &m.name, f, strip_module_prefix);
-            }
-        }
+        render_swift_module_body(&mut out, m, &m.name, 1, strip_module_prefix);
         out.push_str("}\n\n");
     }
     out
+}
+
+fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
+    let mut all = Vec::new();
+    for m in modules {
+        all.push(m);
+        all.extend(collect_all_modules(&m.modules));
+    }
+    all
+}
+
+fn render_swift_module_types(out: &mut String, m: &Module, module_path: &str) {
+    for e in &m.enums {
+        render_swift_enum(out, e);
+    }
+    for s in &m.structs {
+        render_swift_struct(out, module_path, s);
+    }
+    for sub in &m.modules {
+        let sub_path = format!("{module_path}_{}", sub.name);
+        render_swift_module_types(out, sub, &sub_path);
+    }
+}
+
+fn render_swift_module_body(
+    out: &mut String,
+    m: &Module,
+    module_path: &str,
+    depth: usize,
+    strip_module_prefix: bool,
+) {
+    let indent = "    ".repeat(depth);
+    for f in &m.functions {
+        let mut buf = String::new();
+        if f.r#async {
+            render_swift_async_function(&mut buf, module_path, f, strip_module_prefix);
+        } else {
+            render_swift_function(&mut buf, module_path, f, strip_module_prefix);
+        }
+        if depth > 1 {
+            let extra = "    ".repeat(depth - 1);
+            for line in buf.lines() {
+                if line.is_empty() {
+                    out.push('\n');
+                } else {
+                    out.push_str(&extra);
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        } else {
+            out.push_str(&buf);
+        }
+    }
+    for sub in &m.modules {
+        let sub_path = format!("{module_path}_{}", sub.name);
+        let sub_name = sub.name.to_upper_camel_case();
+        out.push_str(&format!("{indent}public enum {sub_name} {{\n"));
+        render_swift_module_body(out, sub, &sub_path, depth + 1, strip_module_prefix);
+        out.push_str(&format!("{indent}}}\n"));
+    }
 }
 
 fn render_swift_struct(out: &mut String, module_name: &str, s: &StructDef) {
@@ -3281,6 +3330,56 @@ mod tests {
         assert!(
             !out.contains("types.Name"),
             "dot-qualified name should not appear in generated Swift code: {out}"
+        );
+    }
+
+    #[test]
+    fn swift_nested_module_output() {
+        let api = make_api(vec![Module {
+            name: "parent".to_string(),
+            functions: vec![Function {
+                name: "outer_fn".to_string(),
+                params: vec![],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+            modules: vec![Module {
+                name: "child".to_string(),
+                functions: vec![Function {
+                    name: "inner_fn".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+        }]);
+        let out = render_swift_wrapper(&api, true);
+        assert!(
+            out.contains("public enum Parent {"),
+            "top-level module enum missing: {out}"
+        );
+        assert!(
+            out.contains("public enum Child {"),
+            "nested module enum missing: {out}"
+        );
+        assert!(
+            out.contains("weaveffi_parent_outer_fn"),
+            "parent C ABI call missing: {out}"
+        );
+        assert!(
+            out.contains("weaveffi_parent_child_inner_fn"),
+            "nested child C ABI call missing: {out}"
         );
     }
 }
