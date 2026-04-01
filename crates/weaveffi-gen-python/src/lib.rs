@@ -3,7 +3,7 @@ use camino::Utf8Path;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name, wrapper_name};
-use weaveffi_ir::ir::{Api, EnumDef, Function, StructDef, StructField, TypeRef};
+use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, StructField, TypeRef};
 
 pub struct PythonGenerator;
 
@@ -477,27 +477,63 @@ fn render_async_ffi_call_body(out: &mut String, module_name: &str, f: &Function)
 fn render_python_module(api: &Api, strip_module_prefix: bool) -> String {
     let mut out = String::new();
     render_preamble(&mut out);
-    let has_async = api
-        .modules
+    let has_async = collect_all_modules(&api.modules)
         .iter()
         .any(|m| m.functions.iter().any(|f| f.r#async));
     if has_async {
         out.push_str("\nimport asyncio\nimport threading\n");
     }
     for m in &api.modules {
-        out.push_str(&format!("\n\n# === Module: {} ===", m.name));
-        for e in &m.enums {
-            render_enum(&mut out, e);
-        }
-        for s in &m.structs {
-            render_struct(&mut out, &m.name, s);
-        }
-        for f in &m.functions {
-            render_function(&mut out, &m.name, f, strip_module_prefix);
-        }
+        render_python_module_content(&mut out, m, &m.name, strip_module_prefix);
     }
     out.push('\n');
     out
+}
+
+fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
+    let mut all = Vec::new();
+    for m in modules {
+        all.push(m);
+        all.extend(collect_all_modules(&m.modules));
+    }
+    all
+}
+
+fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
+    let mut result = Vec::new();
+    for m in modules {
+        collect_module_with_path(m, &m.name, &mut result);
+    }
+    result
+}
+
+fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Module, String)>) {
+    out.push((m, path.to_string()));
+    for sub in &m.modules {
+        collect_module_with_path(sub, &format!("{path}_{}", sub.name), out);
+    }
+}
+
+fn render_python_module_content(
+    out: &mut String,
+    m: &Module,
+    module_path: &str,
+    strip_module_prefix: bool,
+) {
+    out.push_str(&format!("\n\n# === Module: {} ===", module_path));
+    for e in &m.enums {
+        render_enum(out, e);
+    }
+    for s in &m.structs {
+        render_struct(out, module_path, s);
+    }
+    for f in &m.functions {
+        render_function(out, module_path, f, strip_module_prefix);
+    }
+    for sub in &m.modules {
+        let sub_path = format!("{module_path}_{}", sub.name);
+        render_python_module_content(out, sub, &sub_path, strip_module_prefix);
+    }
 }
 
 fn render_preamble(out: &mut String) {
@@ -1113,7 +1149,7 @@ from weaveffi import *
 fn render_pyi_module(api: &Api, strip_module_prefix: bool) -> String {
     let mut out =
         String::from("from enum import IntEnum\nfrom typing import Dict, List, Optional\n");
-    for m in &api.modules {
+    for (m, path) in collect_modules_with_path(&api.modules) {
         for e in &m.enums {
             render_pyi_enum(&mut out, e);
         }
@@ -1121,7 +1157,7 @@ fn render_pyi_module(api: &Api, strip_module_prefix: bool) -> String {
             render_pyi_struct(&mut out, s);
         }
         for f in &m.functions {
-            render_pyi_function(&mut out, &m.name, f, strip_module_prefix);
+            render_pyi_function(&mut out, &path, f, strip_module_prefix);
         }
     }
     out
@@ -3719,6 +3755,61 @@ mod tests {
         assert!(
             !stubs.contains("types.Name"),
             "dot-qualified name should not appear in pyi stubs: {stubs}"
+        );
+    }
+
+    #[test]
+    fn python_nested_module_output() {
+        let api = make_api(vec![Module {
+            name: "parent".to_string(),
+            functions: vec![Function {
+                name: "outer_fn".to_string(),
+                params: vec![],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+            modules: vec![Module {
+                name: "child".to_string(),
+                functions: vec![Function {
+                    name: "inner_fn".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+        }]);
+        let py = render_python_module(&api, true);
+        assert!(
+            py.contains("# === Module: parent ==="),
+            "parent module section missing: {py}"
+        );
+        assert!(
+            py.contains("# === Module: parent_child ==="),
+            "nested child module section missing: {py}"
+        );
+        assert!(
+            py.contains("weaveffi_parent_outer_fn"),
+            "parent C function missing: {py}"
+        );
+        assert!(
+            py.contains("weaveffi_parent_child_inner_fn"),
+            "nested child C function missing: {py}"
+        );
+        let pyi = render_pyi_module(&api, true);
+        assert!(
+            pyi.contains("def inner_fn"),
+            "nested child function missing from pyi: {pyi}"
         );
     }
 }

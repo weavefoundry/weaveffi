@@ -107,6 +107,30 @@ Then include the header in your code:
     .to_string()
 }
 
+fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
+    let mut all = Vec::new();
+    for m in modules {
+        all.push(m);
+        all.extend(collect_all_modules(&m.modules));
+    }
+    all
+}
+
+fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
+    let mut result = Vec::new();
+    for m in modules {
+        collect_module_with_path(m, &m.name, &mut result);
+    }
+    result
+}
+
+fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Module, String)>) {
+    out.push((m, path.to_string()));
+    for sub in &m.modules {
+        collect_module_with_path(sub, &format!("{path}_{}", sub.name), out);
+    }
+}
+
 fn render_cpp_header(api: &Api, namespace: &str) -> String {
     let mut out = String::new();
 
@@ -118,8 +142,7 @@ fn render_cpp_header(api: &Api, namespace: &str) -> String {
     out.push_str("#include <unordered_map>\n");
     out.push_str("#include <memory>\n");
     out.push_str("#include <stdexcept>\n");
-    if api
-        .modules
+    if collect_all_modules(&api.modules)
         .iter()
         .any(|m| m.functions.iter().any(|f| f.r#async))
     {
@@ -133,18 +156,17 @@ fn render_cpp_header(api: &Api, namespace: &str) -> String {
 
     out.push_str(&format!("namespace {namespace} {{\n\n"));
 
-    let error_codes: Vec<_> = api
-        .modules
+    let error_codes: Vec<_> = collect_all_modules(&api.modules)
         .iter()
         .filter_map(|m| m.errors.as_ref())
         .flat_map(|e| &e.codes)
         .collect();
     render_cpp_error_classes(&mut out, &error_codes);
 
-    for module in &api.modules {
+    for (module, path) in collect_modules_with_path(&api.modules) {
         render_cpp_enums(&mut out, module);
-        render_cpp_classes(&mut out, module);
-        render_cpp_functions(&mut out, module, &error_codes);
+        render_cpp_classes(&mut out, module, &path);
+        render_cpp_functions(&mut out, module, &error_codes, &path);
     }
     out.push_str(&format!("}} // namespace {namespace}\n"));
 
@@ -319,9 +341,9 @@ fn render_extern_c(out: &mut String, api: &Api) {
     out.push_str("bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token* token);\n");
     out.push_str("void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);\n\n");
 
-    for module in &api.modules {
+    for (module, path) in collect_modules_with_path(&api.modules) {
         for e in &module.enums {
-            let tag = format!("weaveffi_{}_{}", module.name, e.name);
+            let tag = format!("weaveffi_{}_{}", path, e.name);
             let vars: Vec<String> = e
                 .variants
                 .iter()
@@ -331,20 +353,20 @@ fn render_extern_c(out: &mut String, api: &Api) {
         }
 
         for s in &module.structs {
-            let tag = format!("weaveffi_{}_{}", module.name, s.name);
+            let tag = format!("weaveffi_{}_{}", path, s.name);
             out.push_str(&format!("typedef struct {tag} {tag};\n"));
 
             let mut params: Vec<String> = s
                 .fields
                 .iter()
-                .map(|f| c_param_type(&f.ty, &f.name, &module.name))
+                .map(|f| c_param_type(&f.ty, &f.name, &path))
                 .collect();
             params.push("weaveffi_error* out_err".into());
             out.push_str(&format!("{tag}* {tag}_create({});\n", params.join(", ")));
             out.push_str(&format!("void {tag}_destroy({tag}* ptr);\n"));
 
             for field in &s.fields {
-                let (ret_ty, extra) = c_ret_type(&field.ty, &module.name);
+                let (ret_ty, extra) = c_ret_type(&field.ty, &path);
                 let getter = format!("{tag}_get_{}", field.name);
                 if extra.is_empty() {
                     out.push_str(&format!("{ret_ty} {getter}(const {tag}* ptr);\n"));
@@ -359,14 +381,14 @@ fn render_extern_c(out: &mut String, api: &Api) {
 
         for f in &module.functions {
             if f.r#async {
-                let fn_base = format!("weaveffi_{}_{}", module.name, f.name);
+                let fn_base = format!("weaveffi_{}_{}", path, f.name);
                 let cb_name = format!("{fn_base}_callback");
                 let mut cb_params = vec![
                     "void* context".to_string(),
                     "weaveffi_error* err".to_string(),
                 ];
                 if let Some(ret) = &f.returns {
-                    cb_params.extend(c_callback_result_params(ret, &module.name));
+                    cb_params.extend(c_callback_result_params(ret, &path));
                 }
                 out.push_str(&format!(
                     "typedef void (*{cb_name})({});\n",
@@ -375,7 +397,7 @@ fn render_extern_c(out: &mut String, api: &Api) {
                 let mut params_sig: Vec<String> = f
                     .params
                     .iter()
-                    .map(|p| c_param_type(&p.ty, &p.name, &module.name))
+                    .map(|p| c_param_type(&p.ty, &p.name, &path))
                     .collect();
                 if f.cancellable {
                     params_sig.push("weaveffi_cancel_token* cancel_token".to_string());
@@ -390,10 +412,10 @@ fn render_extern_c(out: &mut String, api: &Api) {
                 let mut p: Vec<String> = f
                     .params
                     .iter()
-                    .map(|p| c_param_type(&p.ty, &p.name, &module.name))
+                    .map(|p| c_param_type(&p.ty, &p.name, &path))
                     .collect();
                 let ret = if let Some(r) = &f.returns {
-                    let (rt, extra) = c_ret_type(r, &module.name);
+                    let (rt, extra) = c_ret_type(r, &path);
                     p.extend(extra);
                     rt
                 } else {
@@ -402,7 +424,7 @@ fn render_extern_c(out: &mut String, api: &Api) {
                 p.push("weaveffi_error* out_err".into());
                 out.push_str(&format!(
                     "{ret} weaveffi_{}_{}({});\n",
-                    module.name,
+                    path,
                     f.name,
                     p.join(", ")
                 ));
@@ -491,9 +513,9 @@ fn render_cpp_enums(out: &mut String, module: &Module) {
 
 // ── Namespace: RAII classes ──
 
-fn render_cpp_classes(out: &mut String, module: &Module) {
+fn render_cpp_classes(out: &mut String, module: &Module, abi_module: &str) {
     for s in &module.structs {
-        let tag = format!("weaveffi_{}_{}", module.name, s.name);
+        let tag = format!("weaveffi_{}_{}", abi_module, s.name);
         let name = &s.name;
 
         out.push_str(&format!("class {name} {{\n"));
@@ -540,7 +562,7 @@ fn render_cpp_classes(out: &mut String, module: &Module) {
         out.push_str("    void* handle() const { return handle_; }\n\n");
 
         for field in &s.fields {
-            render_cpp_getter(out, name, &module.name, field);
+            render_cpp_getter(out, name, abi_module, field);
         }
 
         out.push_str("};\n\n");
@@ -707,12 +729,17 @@ fn render_getter_map(
 
 // ── Namespace: free function wrappers ──
 
-fn render_cpp_functions(out: &mut String, module: &Module, error_codes: &[&ErrorCode]) {
+fn render_cpp_functions(
+    out: &mut String,
+    module: &Module,
+    error_codes: &[&ErrorCode],
+    abi_module: &str,
+) {
     for func in &module.functions {
         if func.r#async {
-            render_cpp_async_function(out, func, module);
+            render_cpp_async_function(out, func, abi_module);
         } else {
-            render_cpp_function(out, func, module, error_codes);
+            render_cpp_function(out, func, abi_module, error_codes);
         }
     }
 }
@@ -869,7 +896,7 @@ fn param_to_c_args(ty: &TypeRef, name: &str, module: &str) -> (Vec<String>, Vec<
 fn render_cpp_function(
     out: &mut String,
     func: &Function,
-    module: &Module,
+    abi_module: &str,
     error_codes: &[&ErrorCode],
 ) {
     let cpp_ret = func
@@ -881,7 +908,7 @@ fn render_cpp_function(
         .iter()
         .map(|p| cpp_param_decl(&p.ty, &p.name))
         .collect();
-    let fn_name = format!("{}_{}", module.name, func.name);
+    let fn_name = format!("{}_{}", abi_module, func.name);
 
     out.push_str(&format!(
         "inline {cpp_ret} {fn_name}({}) {{\n",
@@ -891,7 +918,7 @@ fn render_cpp_function(
     let mut setup = Vec::new();
     let mut c_args = Vec::new();
     for p in &func.params {
-        let (s, a) = param_to_c_args(&p.ty, &p.name, &module.name);
+        let (s, a) = param_to_c_args(&p.ty, &p.name, abi_module);
         setup.extend(s);
         c_args.extend(a);
     }
@@ -908,8 +935,8 @@ fn render_cpp_function(
                 c_args.push("&out_len".into());
             }
             TypeRef::Map(k, v) => {
-                let kc = c_element_type(k, &module.name);
-                let vc = c_element_type(v, &module.name);
+                let kc = c_element_type(k, abi_module);
+                let vc = c_element_type(v, abi_module);
                 setup.push(format!("{kc}* out_keys = nullptr;"));
                 setup.push(format!("{vc}* out_values = nullptr;"));
                 setup.push("size_t out_len = 0;".into());
@@ -928,7 +955,7 @@ fn render_cpp_function(
     }
     out.push_str("    weaveffi_error err{};\n");
 
-    let c_fn = format!("weaveffi_{}_{}", module.name, func.name);
+    let c_fn = format!("weaveffi_{}_{}", abi_module, func.name);
     let args_str = c_args.join(", ");
     if is_void_c {
         out.push_str(&format!("    {c_fn}({args_str});\n"));
@@ -1073,7 +1100,7 @@ fn render_cpp_return(out: &mut String, ty: &TypeRef) {
     }
 }
 
-fn render_cpp_async_function(out: &mut String, func: &Function, module: &Module) {
+fn render_cpp_async_function(out: &mut String, func: &Function, abi_module: &str) {
     let cpp_ret = func
         .returns
         .as_ref()
@@ -1086,7 +1113,7 @@ fn render_cpp_async_function(out: &mut String, func: &Function, module: &Module)
     if func.cancellable {
         cpp_params.push("weaveffi_cancel_token* cancel_token = nullptr".to_string());
     }
-    let fn_name = format!("{}_{}", module.name, func.name);
+    let fn_name = format!("{}_{}", abi_module, func.name);
 
     out.push_str(&format!(
         "inline std::future<{cpp_ret}> {fn_name}({}) {{\n",
@@ -1096,7 +1123,7 @@ fn render_cpp_async_function(out: &mut String, func: &Function, module: &Module)
     let mut setup = Vec::new();
     let mut c_args = Vec::new();
     for p in &func.params {
-        let (s, a) = param_to_c_args(&p.ty, &p.name, &module.name);
+        let (s, a) = param_to_c_args(&p.ty, &p.name, abi_module);
         setup.extend(s);
         c_args.extend(a);
     }
@@ -1118,10 +1145,10 @@ fn render_cpp_async_function(out: &mut String, func: &Function, module: &Module)
         "weaveffi_error* err".to_string(),
     ];
     if let Some(ret) = &func.returns {
-        cb_params.extend(c_callback_result_params(ret, &module.name));
+        cb_params.extend(c_callback_result_params(ret, abi_module));
     }
 
-    let c_fn = format!("weaveffi_{}_{}_async", module.name, func.name);
+    let c_fn = format!("weaveffi_{}_{}_async", abi_module, func.name);
     if c_args.is_empty() {
         out.push_str(&format!("    {c_fn}([]({}) {{\n", cb_params.join(", ")));
     } else {

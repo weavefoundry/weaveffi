@@ -4,7 +4,7 @@ use heck::ToUpperCamelCase;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::local_type_name;
-use weaveffi_ir::ir::{Api, EnumDef, Function, StructDef, TypeRef};
+use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, TypeRef};
 
 pub struct WasmGenerator;
 
@@ -288,7 +288,7 @@ fn render_enum_ref(out: &mut String, e: &EnumDef) {
 }
 
 fn api_needs_string_helpers(api: &Api) -> bool {
-    api.modules.iter().any(|m| {
+    fn module_needs_string_helpers(m: &Module) -> bool {
         m.functions.iter().any(|f| {
             f.params.iter().any(|p| matches!(p.ty, TypeRef::StringUtf8))
                 || matches!(f.returns.as_ref(), Some(TypeRef::StringUtf8))
@@ -296,7 +296,9 @@ fn api_needs_string_helpers(api: &Api) -> bool {
             .structs
             .iter()
             .any(|s| s.fields.iter().any(|f| matches!(f.ty, TypeRef::StringUtf8)))
-    })
+            || m.modules.iter().any(module_needs_string_helpers)
+    }
+    api.modules.iter().any(module_needs_string_helpers)
 }
 
 fn ts_type_for(ty: &TypeRef) -> String {
@@ -322,6 +324,30 @@ fn ts_type_for(ty: &TypeRef) -> String {
     }
 }
 
+fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
+    let mut all = Vec::new();
+    for m in modules {
+        all.push(m);
+        all.extend(collect_all_modules(&m.modules));
+    }
+    all
+}
+
+fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
+    let mut result = Vec::new();
+    for m in modules {
+        collect_module_with_path(m, &m.name, &mut result);
+    }
+    result
+}
+
+fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Module, String)>) {
+    out.push((m, path.to_string()));
+    for sub in &m.modules {
+        collect_module_with_path(sub, &format!("{path}_{}", sub.name), out);
+    }
+}
+
 fn render_wasm_dts(api: &Api, module_name: &str) -> String {
     let pascal_name = module_name.to_upper_camel_case();
     let interface_name = format!("{pascal_name}Module");
@@ -329,7 +355,7 @@ fn render_wasm_dts(api: &Api, module_name: &str) -> String {
     let mut out =
         String::from("// Generated TypeScript declarations for WeaveFFI WASM bindings\n\n");
 
-    for m in &api.modules {
+    for (m, _path) in collect_modules_with_path(&api.modules) {
         for s in &m.structs {
             out.push_str(&format!("export interface {} {{\n", s.name));
             for field in &s.fields {
@@ -352,37 +378,11 @@ fn render_wasm_dts(api: &Api, module_name: &str) -> String {
     }
 
     out.push_str(&format!("export interface {interface_name} {{\n"));
-    if api.modules.iter().any(|m| !m.functions.is_empty()) {
+    let all_mods = collect_all_modules(&api.modules);
+    if all_mods.iter().any(|m| !m.functions.is_empty()) {
         out.push_str("  _raw: WebAssembly.Exports;\n");
         for module in &api.modules {
-            if module.functions.is_empty() {
-                continue;
-            }
-            out.push_str(&format!("  {}: {{\n", module.name));
-            for func in &module.functions {
-                let params: Vec<String> = func
-                    .params
-                    .iter()
-                    .map(|p| format!("{}: {}", p.name, ts_type_for(&p.ty)))
-                    .collect();
-                let base_ret = match &func.returns {
-                    Some(ty) => ts_type_for(ty),
-                    None => "void".into(),
-                };
-                let ret = if func.r#async {
-                    format!("Promise<{base_ret}>")
-                } else {
-                    base_ret
-                };
-                out.push_str("    /** @throws {Error} if the native call fails */\n");
-                out.push_str(&format!(
-                    "    {}({}): {};\n",
-                    func.name,
-                    params.join(", "),
-                    ret
-                ));
-            }
-            out.push_str("  };\n");
+            render_dts_module_interface(&mut out, module, &module.name, "  ");
         }
     }
     out.push_str("}\n\n");
@@ -391,6 +391,48 @@ fn render_wasm_dts(api: &Api, module_name: &str) -> String {
         "export function {load_fn}(url: string): Promise<{interface_name}>;\n"
     ));
     out
+}
+
+fn render_dts_module_interface(out: &mut String, m: &Module, module_path: &str, indent: &str) {
+    let has_content = !m.functions.is_empty()
+        || m.modules
+            .iter()
+            .any(|sub| !sub.functions.is_empty() || !sub.modules.is_empty());
+    if !has_content {
+        return;
+    }
+    out.push_str(&format!("{indent}{}: {{\n", m.name));
+    let inner = format!("{indent}  ");
+    for func in &m.functions {
+        let params: Vec<String> = func
+            .params
+            .iter()
+            .map(|p| format!("{}: {}", p.name, ts_type_for(&p.ty)))
+            .collect();
+        let base_ret = match &func.returns {
+            Some(ty) => ts_type_for(ty),
+            None => "void".into(),
+        };
+        let ret = if func.r#async {
+            format!("Promise<{base_ret}>")
+        } else {
+            base_ret
+        };
+        out.push_str(&format!(
+            "{inner}/** @throws {{Error}} if the native call fails */\n"
+        ));
+        out.push_str(&format!(
+            "{inner}{}({}): {};\n",
+            func.name,
+            params.join(", "),
+            ret
+        ));
+    }
+    for sub in &m.modules {
+        let sub_path = format!("{module_path}_{}", sub.name);
+        render_dts_module_interface(out, sub, &sub_path, &inner);
+    }
+    out.push_str(&format!("{indent}}};\n"));
 }
 
 fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
@@ -425,7 +467,8 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
         out.push_str("}\n\n");
     }
 
-    let has_functions = api.modules.iter().any(|m| !m.functions.is_empty());
+    let all_mods = collect_all_modules(&api.modules);
+    let has_functions = all_mods.iter().any(|m| !m.functions.is_empty());
     let has_async = api_has_async(api);
     if has_functions {
         out.push_str("function _allocError(wasm) {\n");
@@ -459,7 +502,7 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
         out.push_str("}\n\n");
     }
 
-    for module in &api.modules {
+    for (module, _path) in collect_modules_with_path(&api.modules) {
         for e in &module.enums {
             out.push_str(&format!("export const {} = Object.freeze({{\n", e.name));
             for v in &e.variants {
@@ -469,7 +512,7 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
         }
     }
 
-    for module in &api.modules {
+    for (module, path) in collect_modules_with_path(&api.modules) {
         for s in &module.structs {
             out.push_str(&format!("class {} {{\n", s.name));
             out.push_str("  constructor(wasm, handle) {\n");
@@ -477,7 +520,7 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
             out.push_str("    this._handle = handle;\n");
             out.push_str("  }\n");
             for field in &s.fields {
-                let accessor = format!("weaveffi_{}_{}_get_{}", module.name, s.name, field.name);
+                let accessor = format!("weaveffi_{}_{}_get_{}", path, s.name, field.name);
                 match &field.ty {
                     TypeRef::Bool => {
                         out.push_str(&format!("  get {}() {{\n", field.name));
@@ -573,7 +616,7 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
             out.push_str("  }\n\n");
 
             let mut trampolines: Vec<(String, Vec<&'static str>)> = Vec::new();
-            for m in &api.modules {
+            for m in collect_all_modules(&api.modules) {
                 for f in &m.functions {
                     if f.r#async {
                         let params = async_cb_wasm_params(f.returns.as_ref());
@@ -597,24 +640,53 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
         out.push_str("  return {\n");
         out.push_str("    _raw: wasm,\n");
         for module in &api.modules {
-            if module.functions.is_empty() {
-                continue;
-            }
-            out.push_str(&format!("    {}: {{\n", module.name));
-            for func in &module.functions {
-                if func.r#async {
-                    emit_js_async_function_wrapper(&mut out, &module.name, func);
-                } else {
-                    emit_js_function_wrapper(&mut out, &module.name, func);
-                }
-            }
-            out.push_str("    },\n");
+            render_js_module_object(&mut out, module, &module.name, "    ");
         }
         out.push_str("  };\n");
     }
 
     out.push_str("}\n");
     out
+}
+
+fn render_js_module_object(out: &mut String, m: &Module, module_path: &str, indent: &str) {
+    let has_content = !m.functions.is_empty()
+        || m.modules
+            .iter()
+            .any(|sub| !sub.functions.is_empty() || !sub.modules.is_empty());
+    if !has_content {
+        return;
+    }
+    out.push_str(&format!("{indent}{}: {{\n", m.name));
+    let extra = indent.len().saturating_sub(4);
+    for func in &m.functions {
+        let mut buf = String::new();
+        if func.r#async {
+            emit_js_async_function_wrapper(&mut buf, module_path, func);
+        } else {
+            emit_js_function_wrapper(&mut buf, module_path, func);
+        }
+        if extra > 0 {
+            let pad = " ".repeat(extra);
+            for line in buf.lines() {
+                if line.is_empty() {
+                    out.push('\n');
+                } else {
+                    out.push_str(&pad);
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        } else {
+            out.push_str(&buf);
+        }
+    }
+    let child_indent = format!("{indent}  ");
+    for sub in &m.modules {
+        let sub_path = format!("{module_path}_{}", sub.name);
+        render_js_module_object(out, sub, &sub_path, &child_indent);
+    }
+    out.push_str(&format!("{indent}}},\n"));
 }
 
 fn emit_js_function_wrapper(out: &mut String, module_name: &str, func: &Function) {
@@ -710,7 +782,7 @@ fn emit_js_function_wrapper(out: &mut String, module_name: &str, func: &Function
 }
 
 fn api_has_async(api: &Api) -> bool {
-    api.modules
+    collect_all_modules(&api.modules)
         .iter()
         .any(|m| m.functions.iter().any(|f| f.r#async))
 }
@@ -1761,6 +1833,65 @@ mod tests {
         assert!(
             !dts.contains("add(a: number, b: number): Promise"),
             "sync function must not return Promise: {dts}"
+        );
+    }
+
+    #[test]
+    fn wasm_nested_module_output() {
+        let api = make_api(vec![Module {
+            name: "parent".into(),
+            functions: vec![Function {
+                name: "outer_fn".into(),
+                params: vec![],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+            modules: vec![Module {
+                name: "child".into(),
+                functions: vec![Function {
+                    name: "inner_fn".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+        }]);
+        let dts = render_wasm_dts(&api, DEFAULT_MODULE_NAME);
+        assert!(
+            dts.contains("parent:"),
+            "parent module in DTS interface missing: {dts}"
+        );
+        assert!(
+            dts.contains("child:"),
+            "nested child module in DTS interface missing: {dts}"
+        );
+        assert!(
+            dts.contains("outer_fn(): number"),
+            "parent function in DTS missing: {dts}"
+        );
+        assert!(
+            dts.contains("inner_fn(): number"),
+            "nested child function in DTS missing: {dts}"
+        );
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        assert!(
+            js.contains("weaveffi_parent_outer_fn"),
+            "parent C ABI call in JS missing: {js}"
+        );
+        assert!(
+            js.contains("weaveffi_parent_child_inner_fn"),
+            "nested child C ABI call in JS missing: {js}"
         );
     }
 }

@@ -4,7 +4,7 @@ use heck::{ToShoutySnakeCase, ToSnakeCase};
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name};
-use weaveffi_ir::ir::{Api, EnumDef, Function, StructDef, StructField, TypeRef};
+use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, StructField, TypeRef};
 
 pub struct RubyGenerator;
 
@@ -239,30 +239,55 @@ fn rb_element_expr(var: &str, ty: &TypeRef) -> String {
     }
 }
 
+#[allow(dead_code)]
+fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
+    let mut all = Vec::new();
+    for m in modules {
+        all.push(m);
+        all.extend(collect_all_modules(&m.modules));
+    }
+    all
+}
+
+fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
+    let mut result = Vec::new();
+    for m in modules {
+        collect_module_with_path(m, &m.name, &mut result);
+    }
+    result
+}
+
+fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Module, String)>) {
+    out.push((m, path.to_string()));
+    for sub in &m.modules {
+        collect_module_with_path(sub, &format!("{path}_{}", sub.name), out);
+    }
+}
+
 // ── Rendering ──
 
 fn render_ruby_module(api: &Api, module_name: &str) -> String {
     let mut out = String::new();
     render_preamble(&mut out, module_name);
-    for m in &api.modules {
-        out.push_str(&format!("\n  # === Module: {} ===\n", m.name));
+    for (m, path) in collect_modules_with_path(&api.modules) {
+        out.push_str(&format!("\n  # === Module: {} ===\n", path));
         for e in &m.enums {
             render_enum(&mut out, e);
         }
         for s in &m.structs {
-            render_struct_ffi(&mut out, &m.name, s);
+            render_struct_ffi(&mut out, &path, s);
         }
         for f in &m.functions {
             if !f.r#async {
-                render_attach_function(&mut out, &m.name, f);
+                render_attach_function(&mut out, &path, f);
             }
         }
         for s in &m.structs {
-            render_struct_class(&mut out, &m.name, s, module_name);
+            render_struct_class(&mut out, &path, s, module_name);
         }
         for f in &m.functions {
             if !f.r#async {
-                render_function_wrapper(&mut out, &m.name, f);
+                render_function_wrapper(&mut out, &path, f);
             }
         }
     }

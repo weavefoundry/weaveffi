@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name, wrapper_name};
-use weaveffi_ir::ir::{Api, EnumDef, Function, StructDef, TypeRef};
+use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, TypeRef};
 
 pub struct AndroidGenerator;
 
@@ -263,9 +263,33 @@ fn has_enum_involvement(f: &Function) -> bool {
         || matches!(&f.returns, Some(TypeRef::Enum(_)))
 }
 
+fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
+    let mut all = Vec::new();
+    for m in modules {
+        all.push(m);
+        all.extend(collect_all_modules(&m.modules));
+    }
+    all
+}
+
+fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
+    let mut result = Vec::new();
+    for m in modules {
+        collect_module_with_path(m, &m.name, &mut result);
+    }
+    result
+}
+
+fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Module, String)>) {
+    out.push((m, path.to_string()));
+    for sub in &m.modules {
+        collect_module_with_path(sub, &format!("{path}_{}", sub.name), out);
+    }
+}
+
 fn render_kotlin(api: &Api, package: &str, strip_module_prefix: bool) -> String {
-    let has_async = api
-        .modules
+    let all_mods = collect_all_modules(&api.modules);
+    let has_async = all_mods
         .iter()
         .any(|m| m.functions.iter().any(|f| f.r#async));
     let mut kotlin = format!("package {package}\n\n");
@@ -275,9 +299,9 @@ fn render_kotlin(api: &Api, package: &str, strip_module_prefix: bool) -> String 
         kotlin.push_str("import kotlin.coroutines.resumeWithException\n\n");
     }
     kotlin.push_str("class WeaveFFI {\n    companion object {\n        init { System.loadLibrary(\"weaveffi\") }\n\n");
-    for m in &api.modules {
+    for (m, path) in collect_modules_with_path(&api.modules) {
         for f in &m.functions {
-            let func_name = wrapper_name(&m.name, &f.name, strip_module_prefix);
+            let func_name = wrapper_name(&path, &f.name, strip_module_prefix);
             if f.r#async {
                 render_kotlin_async_fun(&mut kotlin, f, &func_name);
             } else if has_enum_involvement(f) {
@@ -374,7 +398,7 @@ fn render_kotlin(api: &Api, package: &str, strip_module_prefix: bool) -> String 
         }
     }
     kotlin.push_str("    }\n}\n");
-    for m in &api.modules {
+    for m in collect_all_modules(&api.modules) {
         for e in &m.enums {
             render_kotlin_enum(&mut kotlin, e);
         }
@@ -462,8 +486,7 @@ fn render_kotlin_enum(out: &mut String, e: &EnumDef) {
 }
 
 fn render_kotlin_error_types(out: &mut String, api: &Api) {
-    let error_codes: Vec<_> = api
-        .modules
+    let error_codes: Vec<_> = collect_all_modules(&api.modules)
         .iter()
         .filter_map(|m| m.errors.as_ref())
         .flat_map(|e| &e.codes)
@@ -496,8 +519,8 @@ fn render_jni_c(api: &Api, package: &str, strip_module_prefix: bool) -> String {
     let jni_pkg_path = package.replace('.', "/");
     let mut jni_c = String::from("#include <jni.h>\n#include <stdbool.h>\n#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n#include \"weaveffi.h\"\n\n");
 
-    let error_codes: Vec<_> = api
-        .modules
+    let all_mods = collect_all_modules(&api.modules);
+    let error_codes: Vec<_> = all_mods
         .iter()
         .filter_map(|m| m.errors.as_ref())
         .flat_map(|e| &e.codes)
@@ -532,8 +555,7 @@ fn render_jni_c(api: &Api, package: &str, strip_module_prefix: bool) -> String {
     jni_c.push_str("    weaveffi_error_clear(err);\n");
     jni_c.push_str("}\n\n");
 
-    let has_async = api
-        .modules
+    let has_async = all_mods
         .iter()
         .any(|m| m.functions.iter().any(|f| f.r#async));
     if has_async {
@@ -543,11 +565,11 @@ fn render_jni_c(api: &Api, package: &str, strip_module_prefix: bool) -> String {
         jni_c.push_str("} weaveffi_jni_async_ctx;\n\n");
     }
 
-    for m in &api.modules {
+    for (m, path) in collect_modules_with_path(&api.modules) {
         for f in &m.functions {
             if f.r#async {
-                let func_name = wrapper_name(&m.name, &f.name, strip_module_prefix);
-                render_jni_async_function(&mut jni_c, &m.name, f, &func_name, &jni_prefix);
+                let func_name = wrapper_name(&path, &f.name, strip_module_prefix);
+                render_jni_async_function(&mut jni_c, &path, f, &func_name, &jni_prefix);
                 continue;
             }
             let jret = jni_ret_type(f.returns.as_ref());
@@ -555,7 +577,7 @@ fn render_jni_c(api: &Api, package: &str, strip_module_prefix: bool) -> String {
             for p in &f.params {
                 jparams.push(format!("{} {}", jni_param_type(&p.ty), p.name));
             }
-            let func_name = wrapper_name(&m.name, &f.name, strip_module_prefix);
+            let func_name = wrapper_name(&path, &f.name, strip_module_prefix);
             let jni_name = if has_enum_involvement(f) {
                 format!("{}Jni", func_name)
             } else {
@@ -575,10 +597,10 @@ fn render_jni_c(api: &Api, package: &str, strip_module_prefix: bool) -> String {
                 write_param_acquire(&mut jni_c, &p.name, &p.ty);
             }
 
-            let c_sym = c_symbol_name(&m.name, &f.name);
+            let c_sym = c_symbol_name(&path, &f.name);
             let mut call_args: Vec<String> = Vec::new();
             for p in &f.params {
-                build_c_call_args(&mut call_args, &p.name, &p.ty, &m.name);
+                build_c_call_args(&mut call_args, &p.name, &p.ty, &path);
             }
 
             let needs_out_len = matches!(
@@ -597,7 +619,7 @@ fn render_jni_c(api: &Api, package: &str, strip_module_prefix: bool) -> String {
                     &call_args,
                     f.returns.as_ref(),
                     &f.params,
-                    &m.name,
+                    &path,
                 );
             } else {
                 let _ = writeln!(jni_c, "    {}({}, &err);", c_sym, call_args.join(", "));
@@ -609,9 +631,9 @@ fn render_jni_c(api: &Api, package: &str, strip_module_prefix: bool) -> String {
             let _ = writeln!(jni_c, "}}\n");
         }
     }
-    for m in &api.modules {
+    for (m, path) in collect_modules_with_path(&api.modules) {
         for s in &m.structs {
-            render_jni_struct(&mut jni_c, &m.name, s, &jni_prefix);
+            render_jni_struct(&mut jni_c, &path, s, &jni_prefix);
         }
     }
     jni_c

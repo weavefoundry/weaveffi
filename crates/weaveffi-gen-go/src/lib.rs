@@ -4,7 +4,7 @@ use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name};
-use weaveffi_ir::ir::{Api, EnumDef, Function, StructDef, StructField, TypeRef};
+use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, StructField, TypeRef};
 
 pub struct GoGenerator;
 
@@ -155,22 +155,45 @@ fn type_has_bool(ty: &TypeRef) -> bool {
     }
 }
 
+fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
+    let mut all = Vec::new();
+    for m in modules {
+        all.push(m);
+        all.extend(collect_all_modules(&m.modules));
+    }
+    all
+}
+
+fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
+    let mut result = Vec::new();
+    for m in modules {
+        collect_module_with_path(m, &m.name, &mut result);
+    }
+    result
+}
+
+fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Module, String)>) {
+    out.push((m, path.to_string()));
+    for sub in &m.modules {
+        collect_module_with_path(sub, &format!("{path}_{}", sub.name), out);
+    }
+}
+
 fn scan_imports(api: &Api) -> (bool, bool, bool) {
-    let has_sync_funcs = api
-        .modules
+    let has_sync_funcs = collect_all_modules(&api.modules)
         .iter()
         .any(|m| m.functions.iter().any(|f| !f.r#async));
 
     let needs_fmt = has_sync_funcs;
 
-    let needs_unsafe = api.modules.iter().any(|m| {
+    let needs_unsafe = collect_all_modules(&api.modules).iter().any(|m| {
         m.functions.iter().filter(|f| !f.r#async).any(|f| {
             f.params.iter().any(|p| param_uses_unsafe(&p.ty))
                 || f.returns.as_ref().is_some_and(return_uses_unsafe)
         })
     });
 
-    let needs_bool = api.modules.iter().any(|m| {
+    let needs_bool = collect_all_modules(&api.modules).iter().any(|m| {
         m.functions.iter().filter(|f| !f.r#async).any(|f| {
             f.params.iter().any(|p| type_has_bool(&p.ty))
                 || f.returns.as_ref().is_some_and(type_has_bool)
@@ -268,16 +291,16 @@ fn render_go(api: &Api) -> String {
         out.push_str("}\n\n");
     }
 
-    for m in &api.modules {
+    for (m, path) in collect_modules_with_path(&api.modules) {
         for e in &m.enums {
             render_enum(&mut out, e);
         }
         for s in &m.structs {
-            render_struct(&mut out, &m.name, s);
+            render_struct(&mut out, &path, s);
         }
         for f in &m.functions {
             if !f.r#async {
-                render_function(&mut out, &m.name, f);
+                render_function(&mut out, &path, f);
             }
         }
     }

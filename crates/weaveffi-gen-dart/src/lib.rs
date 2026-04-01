@@ -155,10 +155,33 @@ import 'package:weaveffi/weaveffi.dart';
     .into()
 }
 
+fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
+    let mut all = Vec::new();
+    for m in modules {
+        all.push(m);
+        all.extend(collect_all_modules(&m.modules));
+    }
+    all
+}
+
+fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
+    let mut result = Vec::new();
+    for m in modules {
+        collect_module_with_path(m, &m.name, &mut result);
+    }
+    result
+}
+
+fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Module, String)>) {
+    out.push((m, path.to_string()));
+    for sub in &m.modules {
+        collect_module_with_path(sub, &format!("{path}_{}", sub.name), out);
+    }
+}
+
 fn render_dart_module(api: &Api) -> String {
     let mut out = String::new();
-    let has_async = api
-        .modules
+    let has_async = collect_all_modules(&api.modules)
         .iter()
         .any(|m| m.functions.iter().any(|f| f.r#async));
 
@@ -212,15 +235,15 @@ fn render_dart_module(api: &Api) -> String {
     out.push_str("  }\n");
     out.push_str("}\n");
 
-    for module in &api.modules {
+    for (module, path) in collect_modules_with_path(&api.modules) {
         for e in &module.enums {
             render_enum(&mut out, e);
         }
         for s in &module.structs {
-            render_struct(&mut out, module, s);
+            render_struct(&mut out, &path, s);
         }
         for f in &module.functions {
-            render_function(&mut out, module, f);
+            render_function(&mut out, &path, f);
         }
     }
 
@@ -251,9 +274,9 @@ fn render_enum(out: &mut String, e: &EnumDef) {
     out.push_str("}\n");
 }
 
-fn render_struct(out: &mut String, module: &Module, s: &StructDef) {
+fn render_struct(out: &mut String, module_path: &str, s: &StructDef) {
     let class_name = s.name.to_upper_camel_case();
-    let c_prefix = format!("weaveffi_{}_{}", module.name, s.name);
+    let c_prefix = format!("weaveffi_{}_{}", module_path, s.name);
 
     let destroy_sym = format!("{c_prefix}_destroy");
     emit_typedef_and_lookup(
@@ -318,8 +341,8 @@ fn render_struct(out: &mut String, module: &Module, s: &StructDef) {
     out.push_str("}\n");
 }
 
-fn render_function(out: &mut String, module: &Module, f: &Function) {
-    let c_sym = c_symbol_name(&module.name, &f.name);
+fn render_function(out: &mut String, module_path: &str, f: &Function) {
+    let c_sym = c_symbol_name(module_path, &f.name);
 
     let mut native_params: Vec<String> = f.params.iter().map(|p| native_ffi_type(&p.ty)).collect();
     native_params.push("Pointer<_WeaveffiError>".into());
