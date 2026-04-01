@@ -1308,4 +1308,90 @@ mod tests {
             "should contain enum-keyed map type: {dts}"
         );
     }
+
+    #[test]
+    fn wasm_no_double_free_on_error() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "find_contact".into(),
+                params: vec![Param {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                }],
+                returns: Some(TypeRef::Struct("Contact".into())),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                }],
+            }],
+            enums: vec![],
+            errors: None,
+        }]);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        assert!(
+            js.contains("_encodeString(wasm, name)"),
+            "string param should be copied to WASM memory via _encodeString"
+        );
+        assert!(
+            !js.contains("free(name"),
+            "caller must not free the JS string input"
+        );
+        let check_err = js
+            .find("_checkError(wasm, _err)")
+            .expect("_checkError(wasm, _err) should appear in generated JS");
+        let return_contact = js
+            .find("return new Contact(")
+            .expect("return new Contact( should appear for struct return");
+        assert!(
+            check_err < return_contact,
+            "errors must be checked before constructing the result wrapper"
+        );
+        assert!(
+            js.contains("class Contact {\n  constructor(wasm, handle) {"),
+            "struct returns should use a handle wrapper class"
+        );
+    }
+
+    #[test]
+    fn wasm_null_check_on_optional_return() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "find_contact".into(),
+                params: vec![Param {
+                    name: "id".into(),
+                    ty: TypeRef::I32,
+                }],
+                returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                    "Contact".into(),
+                )))),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                }],
+            }],
+            enums: vec![],
+            errors: None,
+        }]);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        assert!(
+            js.contains("result === 0n ? null : new Contact(wasm, result)"),
+            "optional struct return should null-check before wrapping"
+        );
+    }
 }

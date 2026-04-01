@@ -2458,4 +2458,87 @@ mod tests {
             "TypedHandle should extract .ptr: {swift}"
         );
     }
+
+    #[test]
+    fn swift_no_double_free_on_error() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                }],
+            }],
+            enums: vec![],
+            functions: vec![Function {
+                name: "find_contact".into(),
+                params: vec![Param {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                }],
+                returns: Some(TypeRef::Struct("Contact".into())),
+                doc: None,
+                r#async: false,
+            }],
+            errors: None,
+        }]);
+
+        let out = render_swift_wrapper(&api, true);
+
+        assert!(
+            !out.contains("weaveffi_free_string(name"),
+            "borrowed string param must not be freed by the wrapper: {out}"
+        );
+
+        let fn_start = out
+            .find("public static func find_contact")
+            .expect("find_contact wrapper");
+        let fn_body = &out[fn_start..];
+        let check_pos = fn_body
+            .find("try check(&err)")
+            .expect("try check in find_contact");
+        let contact_ptr_pos = fn_body
+            .find("Contact(ptr:")
+            .expect("Contact(ptr: in find_contact");
+        assert!(
+            check_pos < contact_ptr_pos,
+            "error must be checked before wrapping the struct return: {out}"
+        );
+
+        assert!(
+            out.contains("deinit") && out.contains("weaveffi_contacts_Contact_destroy(ptr)"),
+            "struct return type should use a class with destroy in deinit: {out}"
+        );
+    }
+
+    #[test]
+    fn swift_null_check_on_optional_return() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "find_contact".into(),
+                params: vec![Param {
+                    name: "id".into(),
+                    ty: TypeRef::I32,
+                }],
+                returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                    "Contact".into(),
+                )))),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let out = render_swift_wrapper(&api, true);
+        assert!(
+            out.contains("rv.map { Contact(ptr: $0) }"),
+            "optional struct return should map null before wrapping: {out}"
+        );
+    }
 }

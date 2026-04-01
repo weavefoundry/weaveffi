@@ -1670,4 +1670,100 @@ mod tests {
             "should contain enum-keyed map type: {dts}"
         );
     }
+
+    #[test]
+    fn node_no_double_free_on_error() {
+        let api = make_api(vec![{
+            let mut m = make_module("contacts");
+            m.structs.push(StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                }],
+            });
+            m.functions.push(Function {
+                name: "find_contact".into(),
+                params: vec![Param {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                }],
+                returns: Some(TypeRef::Struct("Contact".into())),
+                doc: None,
+                r#async: false,
+            });
+            m
+        }]);
+        let addon = render_addon_c(&api, true);
+        assert!(
+            addon.contains("free(name)"),
+            "malloc'd JS string copy should be freed after the C call: {addon}"
+        );
+        assert!(
+            !addon.contains("weaveffi_free_string(name)"),
+            "input string param must not use weaveffi_free_string: {addon}"
+        );
+        let free_pos = addon
+            .find("free(name)")
+            .expect("free(name) should be present");
+        let err_pos = addon
+            .find("if (err.code != 0)")
+            .expect("err.code check should be present");
+        assert!(
+            free_pos < err_pos,
+            "cleanup should run before error check: free at {free_pos}, err at {err_pos}"
+        );
+        let err_block_start = addon
+            .find("  if (err.code != 0) {\n")
+            .expect("error if block should be present");
+        let after_err = &addon[err_block_start..];
+        let err_block_end_rel = after_err
+            .find("  }\n  napi_value ret;")
+            .expect("napi_value ret should follow error block");
+        let err_block = &addon[err_block_start..err_block_start + err_block_end_rel];
+        assert!(
+            !err_block.contains("result"),
+            "error path should not touch result before return NULL: {err_block}"
+        );
+    }
+
+    #[test]
+    fn node_null_check_on_optional_return() {
+        let api = make_api(vec![{
+            let mut m = make_module("contacts");
+            m.structs.push(StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                }],
+            });
+            m.functions.push(Function {
+                name: "find_contact".into(),
+                params: vec![Param {
+                    name: "id".into(),
+                    ty: TypeRef::I32,
+                }],
+                returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                    "Contact".into(),
+                )))),
+                doc: None,
+                r#async: false,
+            });
+            m
+        }]);
+        let addon = render_addon_c(&api, true);
+        assert!(
+            addon.contains("if (result == NULL)"),
+            "optional struct return should null-check before wrapping: {addon}"
+        );
+        assert!(
+            addon.contains("napi_get_null"),
+            "optional absent should return JS null via napi_get_null: {addon}"
+        );
+    }
 }
