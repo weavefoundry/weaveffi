@@ -172,6 +172,17 @@ fn render_addon_c(api: &Api, strip_module_prefix: bool) -> String {
         "#include <node_api.h>\n#include \"weaveffi.h\"\n#include <stdlib.h>\n#include <string.h>\n\n",
     );
 
+    let has_async = api
+        .modules
+        .iter()
+        .any(|m| m.functions.iter().any(|f| f.r#async));
+    if has_async {
+        out.push_str("typedef struct {\n");
+        out.push_str("    napi_env env;\n");
+        out.push_str("    napi_deferred deferred;\n");
+        out.push_str("} weaveffi_napi_async_ctx;\n\n");
+    }
+
     let mut all_exports: Vec<(String, String)> = Vec::new();
 
     for m in &api.modules {
@@ -181,10 +192,18 @@ fn render_addon_c(api: &Api, strip_module_prefix: bool) -> String {
             let js_name = wrapper_name(&m.name, &f.name, strip_module_prefix);
             all_exports.push((js_name, napi_name.clone()));
 
+            if f.r#async {
+                render_async_callback(&mut out, f, &c_name, &m.name);
+            }
+
             out.push_str(&format!(
                 "static napi_value {napi_name}(napi_env env, napi_callback_info info) {{\n"
             ));
-            render_napi_body(&mut out, f, &c_name, &m.name);
+            if f.r#async {
+                render_async_napi_body(&mut out, f, &c_name, &m.name);
+            } else {
+                render_napi_body(&mut out, f, &c_name, &m.name);
+            }
             out.push_str("}\n\n");
         }
     }
@@ -207,6 +226,112 @@ fn render_addon_c(api: &Api, strip_module_prefix: bool) -> String {
     out.push_str("}\n\n");
     out.push_str("NAPI_MODULE(NODE_GYP_MODULE_NAME, Init)\n");
     out
+}
+
+fn async_cb_result_params_node(ret: Option<&TypeRef>, module: &str) -> String {
+    match ret {
+        None => String::new(),
+        Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => ", const char* result".into(),
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
+            ", const uint8_t* result, size_t result_len".into()
+        }
+        Some(TypeRef::List(inner)) => {
+            let et = c_elem_type(inner, module);
+            format!(", {et}* result, size_t result_len")
+        }
+        Some(TypeRef::Map(k, v)) => {
+            let kt = c_elem_type(k, module);
+            let vt = c_elem_type(v, module);
+            format!(", {kt}* result_keys, {vt}* result_values, size_t result_len")
+        }
+        Some(t) => format!(", {} result", c_ret_type_str(t, module)),
+    }
+}
+
+fn emit_async_resolve_value(out: &mut String, ret: Option<&TypeRef>) {
+    out.push_str("        napi_value val;\n");
+    match ret {
+        None => out.push_str("        napi_get_undefined(ctx->env, &val);\n"),
+        Some(TypeRef::I32) => out.push_str("        napi_create_int32(ctx->env, result, &val);\n"),
+        Some(TypeRef::U32) => out.push_str("        napi_create_uint32(ctx->env, result, &val);\n"),
+        Some(TypeRef::I64) => out.push_str("        napi_create_int64(ctx->env, result, &val);\n"),
+        Some(TypeRef::F64) => out.push_str("        napi_create_double(ctx->env, result, &val);\n"),
+        Some(TypeRef::Bool) => out.push_str("        napi_get_boolean(ctx->env, result, &val);\n"),
+        Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
+            out.push_str(
+                "        napi_create_string_utf8(ctx->env, result, NAPI_AUTO_LENGTH, &val);\n",
+            );
+        }
+        Some(TypeRef::TypedHandle(_) | TypeRef::Handle) => {
+            out.push_str("        napi_create_int64(ctx->env, (int64_t)result, &val);\n");
+        }
+        Some(TypeRef::Struct(_)) => {
+            out.push_str("        napi_create_int64(ctx->env, (int64_t)(intptr_t)result, &val);\n");
+        }
+        Some(TypeRef::Enum(_)) => {
+            out.push_str("        napi_create_int32(ctx->env, (int32_t)result, &val);\n");
+        }
+        _ => out.push_str("        napi_get_undefined(ctx->env, &val);\n"),
+    }
+    out.push_str("        napi_resolve_deferred(ctx->env, ctx->deferred, val);\n");
+}
+
+fn render_async_callback(out: &mut String, f: &Function, c_name: &str, module: &str) {
+    let cb_name = format!("{c_name}_napi_cb");
+    let cb_result = async_cb_result_params_node(f.returns.as_ref(), module);
+
+    out.push_str(&format!(
+        "static void {cb_name}(void* context, weaveffi_error* err{cb_result}) {{\n"
+    ));
+    out.push_str("    weaveffi_napi_async_ctx* ctx = (weaveffi_napi_async_ctx*)context;\n");
+    out.push_str("    if (err != NULL && err->code != 0) {\n");
+    out.push_str("        napi_value err_msg;\n");
+    out.push_str(
+        "        napi_create_string_utf8(ctx->env, err->message, NAPI_AUTO_LENGTH, &err_msg);\n",
+    );
+    out.push_str("        napi_reject_deferred(ctx->env, ctx->deferred, err_msg);\n");
+    out.push_str("    } else {\n");
+    emit_async_resolve_value(out, f.returns.as_ref());
+    out.push_str("    }\n");
+    out.push_str("    free(ctx);\n");
+    out.push_str("}\n\n");
+}
+
+fn render_async_napi_body(out: &mut String, f: &Function, c_name: &str, module: &str) {
+    let n = f.params.len();
+    if n > 0 {
+        out.push_str(&format!("  size_t argc = {n};\n"));
+        out.push_str(&format!("  napi_value args[{n}];\n"));
+        out.push_str("  napi_get_cb_info(env, info, &argc, args, NULL, NULL);\n");
+    } else {
+        out.push_str("  size_t argc = 0;\n");
+        out.push_str("  napi_get_cb_info(env, info, &argc, NULL, NULL, NULL);\n");
+    }
+
+    let mut c_args: Vec<String> = Vec::new();
+    let mut cleanups: Vec<String> = Vec::new();
+    for (i, p) in f.params.iter().enumerate() {
+        emit_param(out, &mut c_args, &mut cleanups, &p.ty, &p.name, i, module);
+    }
+
+    out.push_str(
+        "  weaveffi_napi_async_ctx* ctx = (weaveffi_napi_async_ctx*)malloc(sizeof(weaveffi_napi_async_ctx));\n",
+    );
+    out.push_str("  ctx->env = env;\n");
+    out.push_str("  napi_value promise;\n");
+    out.push_str("  napi_create_promise(env, &ctx->deferred, &promise);\n");
+
+    let cb_name = format!("{c_name}_napi_cb");
+    c_args.push(cb_name);
+    c_args.push("ctx".into());
+    let args_str = c_args.join(", ");
+    out.push_str(&format!("  {c_name}_async({args_str});\n"));
+
+    for cleanup in &cleanups {
+        out.push_str(cleanup);
+    }
+
+    out.push_str("  return promise;\n");
 }
 
 fn render_napi_body(out: &mut String, f: &Function, c_name: &str, module: &str) {
@@ -851,9 +976,14 @@ fn render_node_dts(api: &Api, strip_module_prefix: bool) -> String {
                 .iter()
                 .map(|p| format!("{}: {}", p.name, ts_type_for(&p.ty)))
                 .collect();
-            let ret = match &f.returns {
+            let base_ret = match &f.returns {
                 Some(ty) => ts_type_for(ty),
                 None => "void".into(),
+            };
+            let ret = if f.r#async {
+                format!("Promise<{base_ret}>")
+            } else {
+                base_ret
             };
             let ts_name = wrapper_name(&m.name, &f.name, strip_module_prefix);
             out.push_str(&format!(
@@ -1770,6 +1900,87 @@ mod tests {
         assert!(
             addon.contains("napi_get_null"),
             "optional absent should return JS null via napi_get_null: {addon}"
+        );
+    }
+
+    #[test]
+    fn node_async_returns_promise() {
+        let api = make_api(vec![{
+            let mut m = make_module("tasks");
+            m.functions.push(Function {
+                name: "run".into(),
+                params: vec![Param {
+                    name: "id".into(),
+                    ty: TypeRef::I32,
+                }],
+                returns: Some(TypeRef::StringUtf8),
+                doc: None,
+                r#async: true,
+            });
+            m.functions.push(Function {
+                name: "fire_and_forget".into(),
+                params: vec![],
+                returns: None,
+                doc: None,
+                r#async: true,
+            });
+            m
+        }]);
+        let dts = render_node_dts(&api, true);
+        assert!(
+            dts.contains("Promise<"),
+            "async function should return Promise in .d.ts: {dts}"
+        );
+        assert!(
+            dts.contains("): Promise<string>"),
+            "async string return should be Promise<string>: {dts}"
+        );
+        assert!(
+            dts.contains("): Promise<void>"),
+            "async void return should be Promise<void>: {dts}"
+        );
+    }
+
+    #[test]
+    fn node_addon_creates_promise() {
+        let api = make_api(vec![{
+            let mut m = make_module("tasks");
+            m.functions.push(Function {
+                name: "run".into(),
+                params: vec![Param {
+                    name: "id".into(),
+                    ty: TypeRef::I32,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: true,
+            });
+            m
+        }]);
+        let addon = render_addon_c(&api, true);
+        assert!(
+            addon.contains("napi_create_promise"),
+            "async addon should call napi_create_promise: {addon}"
+        );
+        assert!(
+            addon.contains("napi_resolve_deferred"),
+            "async callback should call napi_resolve_deferred: {addon}"
+        );
+        assert!(
+            addon.contains("napi_reject_deferred"),
+            "async callback should call napi_reject_deferred: {addon}"
+        );
+        assert!(
+            addon.contains("weaveffi_napi_async_ctx"),
+            "async addon should define async context struct: {addon}"
+        );
+        assert!(
+            addon.contains("weaveffi_tasks_run_async("),
+            "async addon should call the _async C function: {addon}"
+        );
+        assert!(
+            addon.contains("weaveffi_tasks_run_napi_cb"),
+            "async addon should define the callback: {addon}"
         );
     }
 }
