@@ -3,6 +3,8 @@
 #![allow(unsafe_code)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+pub mod arena;
+
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;
