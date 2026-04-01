@@ -146,8 +146,9 @@ fn napi_getter(ty: &TypeRef) -> &'static str {
 }
 
 fn render_addon_c(api: &Api) -> String {
-    let mut out =
-        String::from("#include <node_api.h>\n#include \"weaveffi.h\"\n#include <stdlib.h>\n\n");
+    let mut out = String::from(
+        "#include <node_api.h>\n#include \"weaveffi.h\"\n#include <stdlib.h>\n#include <string.h>\n\n",
+    );
 
     let mut all_exports: Vec<(String, String)> = Vec::new();
 
@@ -1353,6 +1354,41 @@ mod tests {
         assert!(
             addon.contains("napi_get_cb_info"),
             "generated addon.c should call napi_get_cb_info: {addon}"
+        );
+    }
+
+    #[test]
+    fn node_addon_frees_strings() {
+        let api = make_api(vec![{
+            let mut m = make_module("greet");
+            m.functions.push(Function {
+                name: "hello".into(),
+                params: vec![Param {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                }],
+                returns: Some(TypeRef::StringUtf8),
+                doc: None,
+                r#async: false,
+            });
+            m
+        }]);
+        let addon = render_addon_c(&api);
+        assert!(
+            addon.contains("weaveffi_free_string(result)"),
+            "generated addon should free returned strings: {addon}"
+        );
+        assert!(
+            addon.contains("#include <string.h>"),
+            "generated addon should include string.h: {addon}"
+        );
+        assert!(
+            addon.contains("#include <stdlib.h>"),
+            "generated addon should include stdlib.h: {addon}"
+        );
+        assert!(
+            addon.contains("weaveffi_error_clear(&err)"),
+            "generated addon should clear errors: {addon}"
         );
     }
 
