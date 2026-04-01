@@ -76,6 +76,7 @@ fn calculator_api() -> Api {
             enums: vec![],
             errors: None,
         }],
+        generators: None,
     }
 }
 
@@ -170,6 +171,7 @@ fn large_api() -> Api {
     Api {
         version: "0.1.0".to_string(),
         modules,
+        generators: None,
     }
 }
 
