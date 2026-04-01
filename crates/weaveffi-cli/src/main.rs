@@ -746,9 +746,6 @@ fn validation_suggestion(err: &ValidationError) -> &'static str {
         ValidationError::InvalidIdentifier(_, _) => {
             "identifiers must start with a letter or underscore and contain only alphanumeric or underscore characters"
         }
-        ValidationError::AsyncNotSupported { .. } => {
-            "remove 'async: true' from the function definition; async is not yet supported"
-        }
         ValidationError::ErrorDomainMissingName(_) => {
             "add a non-empty 'name' field to the error domain"
         }
@@ -1030,10 +1027,6 @@ mod tests {
             },
             ValidationError::ReservedKeyword("type".into()),
             ValidationError::InvalidIdentifier("123".into(), "bad"),
-            ValidationError::AsyncNotSupported {
-                module: "m".into(),
-                function: "f".into(),
-            },
             ValidationError::ErrorDomainMissingName("m".into()),
             ValidationError::DuplicateErrorName {
                 module: "m".into(),

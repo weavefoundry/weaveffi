@@ -29,6 +29,7 @@ fn rust_scalar_type(ty: &TypeRef, module: &str) -> String {
         TypeRef::Enum(_) => "i32".into(),
         TypeRef::Optional(inner) | TypeRef::List(inner) => rust_scalar_type(inner, module),
         TypeRef::Map(_, _) => "u8".into(),
+        TypeRef::Callback(_) => todo!("callback scaffold type"),
     }
 }
 
@@ -86,6 +87,7 @@ fn rust_param_fragments(name: &str, ty: &TypeRef, module: &str) -> Vec<String> {
             };
             vec![key_frag, val_frag, format!("{name}_len: usize")]
         }
+        TypeRef::Callback(_) => todo!("callback scaffold params"),
     }
 }
 
@@ -119,6 +121,7 @@ fn rust_return_type(ty: &TypeRef, module: &str) -> (String, bool) {
             }
         }
         TypeRef::Map(_, _) => ("*mut u8".into(), true),
+        TypeRef::Callback(_) => todo!("callback scaffold return"),
     }
 }
 

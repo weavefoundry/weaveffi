@@ -109,6 +109,7 @@ fn swift_type_for(t: &TypeRef) -> String {
         TypeRef::Optional(inner) => format!("{}?", swift_type_for(inner)),
         TypeRef::List(inner) => format!("[{}]", swift_type_for(inner)),
         TypeRef::Map(k, v) => format!("[{}: {}]", swift_type_for(k), swift_type_for(v)),
+        TypeRef::Callback(_) => todo!("callback Swift type"),
     }
 }
 
@@ -640,6 +641,7 @@ fn swift_c_ptr_element(ty: &TypeRef) -> String {
         TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
             "OpaquePointer?".to_string()
         }
+        TypeRef::Callback(_) => todo!("callback Swift type"),
     }
 }
 

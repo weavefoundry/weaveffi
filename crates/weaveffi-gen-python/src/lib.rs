@@ -112,6 +112,7 @@ fn py_ctypes_scalar(ty: &TypeRef) -> &'static str {
         TypeRef::Struct(_) => "ctypes.c_void_p",
         TypeRef::Enum(_) => "ctypes.c_int32",
         TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) => "ctypes.c_void_p",
+        TypeRef::Callback(_) => todo!("callback Python type"),
     }
 }
 
@@ -127,6 +128,7 @@ fn py_type_hint(ty: &TypeRef) -> String {
         TypeRef::Optional(inner) => format!("Optional[{}]", py_type_hint(inner)),
         TypeRef::List(inner) => format!("List[{}]", py_type_hint(inner)),
         TypeRef::Map(k, v) => format!("Dict[{}, {}]", py_type_hint(k), py_type_hint(v)),
+        TypeRef::Callback(_) => todo!("callback Python type"),
     }
 }
 
@@ -599,6 +601,7 @@ fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
             format!("_{name}_va"),
             format!("len(_{name}_keys)"),
         ],
+        TypeRef::Callback(_) => todo!("callback Python param call args"),
     }
 }
 
@@ -643,6 +646,7 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
         TypeRef::Optional(inner) => render_optional_return(out, inner, ind),
         TypeRef::List(inner) => render_list_return(out, inner, ind),
         TypeRef::Map(k, v) => render_map_return(out, k, v, ind),
+        TypeRef::Callback(_) => todo!("callback Python return"),
     }
 }
 

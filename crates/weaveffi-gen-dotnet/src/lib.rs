@@ -95,6 +95,7 @@ fn cs_type(ty: &TypeRef) -> String {
         },
         TypeRef::List(inner) => format!("{}[]", cs_type(inner)),
         TypeRef::Map(k, v) => format!("Dictionary<{}, {}>", cs_type(k), cs_type(v)),
+        TypeRef::Callback(_) => todo!("callback .NET type"),
     }
 }
 
@@ -116,6 +117,7 @@ fn pinvoke_type(ty: &TypeRef) -> String {
         TypeRef::Handle => "ulong".into(),
         TypeRef::TypedHandle(_) => "IntPtr".into(),
         TypeRef::Enum(_) => "int".into(),
+        TypeRef::Callback(_) => todo!("callback .NET type"),
     }
 }
 
@@ -494,6 +496,7 @@ fn render_struct_getter(out: &mut String, prefix: &str, field: &StructField) {
             out.push_str("                }\n");
             out.push_str("                return dict;\n");
         }
+        TypeRef::Callback(_) => todo!("callback struct getter"),
     }
 
     out.push_str("            }\n        }\n\n");

@@ -173,6 +173,7 @@ fn c_element_type(ty: &TypeRef, module: &str) -> String {
         TypeRef::Enum(e) => format!("weaveffi_{module}_{e}"),
         TypeRef::Optional(inner) | TypeRef::List(inner) => c_element_type(inner, module),
         TypeRef::Map(_, _) => "void*".into(),
+        TypeRef::Callback(_) => todo!("callback C++ type"),
     }
 }
 
@@ -222,6 +223,7 @@ fn c_param_type(ty: &TypeRef, name: &str, module: &str) -> String {
             };
             format!("{kp}, {vp}, size_t {name}_len")
         }
+        TypeRef::Callback(_) => todo!("callback C++ type"),
     }
 }
 
@@ -259,6 +261,7 @@ fn c_ret_type(ty: &TypeRef, module: &str) -> (String, Vec<String>) {
                 "size_t* out_len".into(),
             ],
         ),
+        TypeRef::Callback(_) => todo!("callback C++ type"),
     }
 }
 
@@ -357,6 +360,7 @@ fn cpp_type(ty: &TypeRef) -> String {
         TypeRef::Map(k, v) => {
             format!("std::unordered_map<{}, {}>", cpp_type(k), cpp_type(v))
         }
+        TypeRef::Callback(_) => todo!("callback C++ type"),
     }
 }
 
@@ -515,6 +519,7 @@ fn render_cpp_getter(out: &mut String, struct_name: &str, module: &str, field: &
         TypeRef::Map(k, v) => {
             render_getter_map(out, k, v, &getter, &cast, module);
         }
+        TypeRef::Callback(_) => todo!("callback C++ getter"),
     }
 
     out.push_str("    }\n\n");
@@ -766,6 +771,7 @@ fn param_to_c_args(ty: &TypeRef, name: &str, module: &str) -> (Vec<String>, Vec<
                 ],
             )
         }
+        TypeRef::Callback(_) => todo!("callback C++ param"),
     }
 }
 
@@ -963,6 +969,7 @@ fn render_cpp_return(out: &mut String, ty: &TypeRef) {
             out.push_str("    }\n");
             out.push_str("    return ret;\n");
         }
+        TypeRef::Callback(_) => todo!("callback C++ return"),
     }
 }
 

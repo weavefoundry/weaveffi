@@ -78,6 +78,7 @@ fn c_element_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
         TypeRef::Enum(e) => format!("{prefix}_{module}_{e}"),
         TypeRef::Optional(inner) | TypeRef::List(inner) => c_element_type(inner, module, prefix),
         TypeRef::Map(_, _) => "void*".to_string(),
+        TypeRef::Callback(_) => todo!("callback C type"),
     }
 }
 
@@ -127,6 +128,7 @@ fn c_type_for_param(ty: &TypeRef, name: &str, module: &str, prefix: &str) -> Str
             };
             format!("{keys_part}, {vals_part}, size_t {name}_len")
         }
+        TypeRef::Callback(_) => todo!("callback C type"),
     }
 }
 
@@ -170,6 +172,7 @@ fn c_ret_type(ty: &TypeRef, module: &str, prefix: &str) -> (String, Vec<String>)
                 ],
             )
         }
+        TypeRef::Callback(_) => todo!("callback C return type"),
     }
 }
 
