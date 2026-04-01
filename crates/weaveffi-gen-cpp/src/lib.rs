@@ -309,6 +309,11 @@ fn render_extern_c(out: &mut String, api: &Api) {
     out.push_str("void weaveffi_error_clear(weaveffi_error* err);\n");
     out.push_str("void weaveffi_free_string(const char* ptr);\n");
     out.push_str("void weaveffi_free_bytes(uint8_t* ptr, size_t len);\n\n");
+    out.push_str("typedef struct weaveffi_cancel_token weaveffi_cancel_token;\n");
+    out.push_str("weaveffi_cancel_token* weaveffi_cancel_token_create(void);\n");
+    out.push_str("void weaveffi_cancel_token_cancel(weaveffi_cancel_token* token);\n");
+    out.push_str("bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token* token);\n");
+    out.push_str("void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);\n\n");
 
     for module in &api.modules {
         for e in &module.enums {
@@ -368,6 +373,9 @@ fn render_extern_c(out: &mut String, api: &Api) {
                     .iter()
                     .map(|p| c_param_type(&p.ty, &p.name, &module.name))
                     .collect();
+                if f.cancellable {
+                    params_sig.push("weaveffi_cancel_token* cancel_token".to_string());
+                }
                 params_sig.push(format!("{cb_name} callback"));
                 params_sig.push("void* context".to_string());
                 out.push_str(&format!(
@@ -1042,11 +1050,14 @@ fn render_cpp_async_function(out: &mut String, func: &Function, module: &Module)
         .returns
         .as_ref()
         .map_or("void".to_string(), |ty| cpp_type(ty));
-    let cpp_params: Vec<String> = func
+    let mut cpp_params: Vec<String> = func
         .params
         .iter()
         .map(|p| cpp_param_decl(&p.ty, &p.name))
         .collect();
+    if func.cancellable {
+        cpp_params.push("weaveffi_cancel_token* cancel_token = nullptr".to_string());
+    }
     let fn_name = format!("{}_{}", module.name, func.name);
 
     out.push_str(&format!(
@@ -1060,6 +1071,9 @@ fn render_cpp_async_function(out: &mut String, func: &Function, module: &Module)
         let (s, a) = param_to_c_args(&p.ty, &p.name, &module.name);
         setup.extend(s);
         c_args.extend(a);
+    }
+    if func.cancellable {
+        c_args.push("cancel_token".to_string());
     }
 
     out.push_str(&format!(
@@ -1261,6 +1275,7 @@ mod tests {
                     returns: Some(TypeRef::I32),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![],
                 enums: vec![],
@@ -1327,6 +1342,7 @@ mod tests {
                         returns: Some(TypeRef::Struct("Contact".to_string())),
                         doc: None,
                         r#async: false,
+                        cancellable: false,
                     },
                     Function {
                         name: "delete_contact".to_string(),
@@ -1337,6 +1353,7 @@ mod tests {
                         returns: None,
                         doc: None,
                         r#async: false,
+                        cancellable: false,
                     },
                 ],
                 errors: None,
@@ -1707,6 +1724,7 @@ mod tests {
                     returns: Some(TypeRef::StringUtf8),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![],
                 enums: vec![],
@@ -1738,6 +1756,7 @@ mod tests {
                     returns: Some(TypeRef::List(Box::new(TypeRef::I32))),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![],
                 enums: vec![],
@@ -1775,6 +1794,7 @@ mod tests {
                     returns: Some(TypeRef::Optional(Box::new(TypeRef::I32))),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![],
                 enums: vec![],
@@ -1809,6 +1829,7 @@ mod tests {
                     returns: Some(TypeRef::Enum("Color".into())),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![],
                 enums: vec![EnumDef {
@@ -1858,6 +1879,7 @@ mod tests {
                     returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![StructDef {
                     name: "Contact".into(),
@@ -1899,6 +1921,7 @@ mod tests {
                     )),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![],
                 enums: vec![],
@@ -2039,6 +2062,7 @@ mod tests {
                     returns: Some(TypeRef::Bytes),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![],
                 enums: vec![],
@@ -2069,6 +2093,7 @@ mod tests {
                     returns: Some(TypeRef::I32),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![StructDef {
                     name: "Connection".into(),
@@ -2121,6 +2146,7 @@ mod tests {
                     returns: Some(TypeRef::I32),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![],
                 enums: vec![],
@@ -2398,6 +2424,7 @@ mod tests {
                     returns: Some(TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![StructDef {
                     name: "Config".into(),
@@ -2444,6 +2471,7 @@ mod tests {
                     returns: Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![StructDef {
                     name: "Record".into(),
@@ -2496,6 +2524,7 @@ mod tests {
                     )),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![StructDef {
                     name: "Settings".into(),
@@ -2542,6 +2571,7 @@ mod tests {
                     returns: Some(TypeRef::I32),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![StructDef {
                     name: "Session".into(),
@@ -2655,6 +2685,7 @@ mod tests {
                     returns: Some(TypeRef::I32),
                     doc: None,
                     r#async: true,
+                    cancellable: false,
                 }],
                 structs: vec![],
                 enums: vec![],
@@ -2703,6 +2734,7 @@ mod tests {
                         returns: Some(TypeRef::I32),
                         doc: None,
                         r#async: true,
+                        cancellable: false,
                     },
                     Function {
                         name: "fire".into(),
@@ -2710,6 +2742,7 @@ mod tests {
                         returns: None,
                         doc: None,
                         r#async: true,
+                        cancellable: false,
                     },
                 ],
                 structs: vec![],

@@ -139,6 +139,7 @@ mod tests {
                     returns: Some(TypeRef::I32),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![],
                 enums: vec![],

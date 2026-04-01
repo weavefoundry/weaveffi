@@ -382,6 +382,7 @@ mod tests {
                 returns: Some(TypeRef::I32),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             vec![],
         );
@@ -407,6 +408,7 @@ mod tests {
                 returns: Some(TypeRef::StringUtf8),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             vec![],
         );
@@ -428,6 +430,7 @@ mod tests {
                 returns: Some(TypeRef::Bytes),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             vec![],
         );
@@ -451,6 +454,7 @@ mod tests {
                 returns: None,
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             vec![],
         );
@@ -539,6 +543,7 @@ mod tests {
                 returns: None,
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             vec![],
         );
@@ -561,6 +566,7 @@ mod tests {
                 returns: Some(TypeRef::I32),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             vec![],
         );
@@ -583,6 +589,7 @@ mod tests {
                 returns: Some(TypeRef::Enum("Color".into())),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             vec![],
         );
@@ -603,6 +610,7 @@ mod tests {
                 returns: Some(TypeRef::I32),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             vec![],
         );
@@ -624,6 +632,7 @@ mod tests {
                 returns: Some(TypeRef::Handle),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             vec![],
         );
@@ -646,6 +655,7 @@ mod tests {
                 )),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             vec![],
         );
@@ -688,6 +698,7 @@ mod tests {
                 returns: Some(TypeRef::TypedHandle("Contact".into())),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             vec![],
         );
@@ -714,6 +725,7 @@ mod tests {
                 returns: Some(TypeRef::StringUtf8),
                 doc: None,
                 r#async: true,
+                cancellable: false,
             }],
             vec![],
         );
@@ -753,6 +765,7 @@ mod tests {
                 returns: None,
                 doc: None,
                 r#async: true,
+                cancellable: false,
             }],
             vec![],
         );
@@ -782,6 +795,7 @@ mod tests {
                         returns: Some(TypeRef::I32),
                         doc: None,
                         r#async: false,
+                        cancellable: false,
                     }],
                     structs: vec![],
                     enums: vec![],
@@ -795,6 +809,7 @@ mod tests {
                         returns: Some(TypeRef::StringUtf8),
                         doc: None,
                         r#async: false,
+                        cancellable: false,
                     }],
                     structs: vec![],
                     enums: vec![],

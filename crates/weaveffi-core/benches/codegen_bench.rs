@@ -24,6 +24,7 @@ fn calculator_api() -> Api {
                     ],
                     returns: Some(TypeRef::I32),
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "mul".to_string(),
@@ -40,6 +41,7 @@ fn calculator_api() -> Api {
                     ],
                     returns: Some(TypeRef::I32),
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "div".to_string(),
@@ -56,6 +58,7 @@ fn calculator_api() -> Api {
                     ],
                     returns: Some(TypeRef::I32),
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "echo".to_string(),
@@ -66,6 +69,7 @@ fn calculator_api() -> Api {
                     }],
                     returns: Some(TypeRef::StringUtf8),
                     r#async: false,
+                    cancellable: false,
                 },
             ],
             structs: vec![],
@@ -149,6 +153,7 @@ fn large_api() -> Api {
                         "Struct1".to_string(),
                     )))),
                     r#async: false,
+                    cancellable: false,
                 })
                 .collect();
 

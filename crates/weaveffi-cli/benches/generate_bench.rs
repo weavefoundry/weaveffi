@@ -87,6 +87,7 @@ fn build_large_api() -> Api {
                         "Struct1".into(),
                     )))),
                     r#async: false,
+                    cancellable: false,
                 })
                 .collect();
 

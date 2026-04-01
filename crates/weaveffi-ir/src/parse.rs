@@ -70,6 +70,7 @@ mod tests {
                     returns: Some(TypeRef::I32),
                     doc: Some("Adds two numbers".to_string()),
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![],
                 enums: vec![],

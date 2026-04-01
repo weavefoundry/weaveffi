@@ -321,6 +321,10 @@ fn render_async_napi_body(out: &mut String, f: &Function, c_name: &str, module: 
     out.push_str("  napi_value promise;\n");
     out.push_str("  napi_create_promise(env, &ctx->deferred, &promise);\n");
 
+    if f.cancellable {
+        c_args.push("NULL".into());
+    }
+
     let cb_name = format!("{c_name}_napi_cb");
     c_args.push(cb_name);
     c_args.push("ctx".into());
@@ -1126,6 +1130,7 @@ mod tests {
             )))),
             doc: None,
             r#async: false,
+            cancellable: false,
         });
         m.functions.push(Function {
             name: "list_contacts".into(),
@@ -1133,6 +1138,7 @@ mod tests {
             returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
             doc: None,
             r#async: false,
+            cancellable: false,
         });
 
         let dts = render_node_dts(&make_api(vec![m]), true);
@@ -1177,6 +1183,7 @@ mod tests {
                 returns: Some(TypeRef::I32),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             });
             m
         }]);
@@ -1238,6 +1245,7 @@ mod tests {
                     )))),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "list_contacts".to_string(),
@@ -1245,6 +1253,7 @@ mod tests {
                     returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "set_favorite_color".to_string(),
@@ -1261,6 +1270,7 @@ mod tests {
                     returns: None,
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "get_tags".to_string(),
@@ -1271,6 +1281,7 @@ mod tests {
                     returns: Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
             ],
             structs: vec![StructDef {
@@ -1429,6 +1440,7 @@ mod tests {
                 returns: Some(TypeRef::I32),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             });
             m.functions.push(Function {
                 name: "subtract".into(),
@@ -1445,6 +1457,7 @@ mod tests {
                 returns: Some(TypeRef::I32),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             });
             m
         }]);
@@ -1482,6 +1495,7 @@ mod tests {
                 returns: Some(TypeRef::I32),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             });
             m
         }]);
@@ -1511,6 +1525,7 @@ mod tests {
                 returns: Some(TypeRef::I32),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             });
             m
         }]);
@@ -1534,6 +1549,7 @@ mod tests {
                 returns: Some(TypeRef::StringUtf8),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             });
             m
         }]);
@@ -1575,6 +1591,7 @@ mod tests {
                 returns: Some(TypeRef::I32),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             });
             m
         }]);
@@ -1598,6 +1615,7 @@ mod tests {
                 returns: Some(TypeRef::I32),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             });
             m
         }]);
@@ -1678,6 +1696,7 @@ mod tests {
                 returns: None,
                 doc: None,
                 r#async: false,
+                cancellable: false,
             });
             m
         }]);
@@ -1703,6 +1722,7 @@ mod tests {
                 returns: None,
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             structs: vec![StructDef {
                 name: "Contact".into(),
@@ -1739,6 +1759,7 @@ mod tests {
                 returns: None,
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             structs: vec![],
             enums: vec![],
@@ -1767,6 +1788,7 @@ mod tests {
                 returns: None,
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             structs: vec![StructDef {
                 name: "Contact".into(),
@@ -1829,6 +1851,7 @@ mod tests {
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             });
             m
         }]);
@@ -1889,6 +1912,7 @@ mod tests {
                 )))),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             });
             m
         }]);
@@ -1916,6 +1940,7 @@ mod tests {
                 returns: Some(TypeRef::StringUtf8),
                 doc: None,
                 r#async: true,
+                cancellable: false,
             });
             m.functions.push(Function {
                 name: "fire_and_forget".into(),
@@ -1923,6 +1948,7 @@ mod tests {
                 returns: None,
                 doc: None,
                 r#async: true,
+                cancellable: false,
             });
             m
         }]);
@@ -1954,6 +1980,7 @@ mod tests {
                 returns: Some(TypeRef::I32),
                 doc: None,
                 r#async: true,
+                cancellable: false,
             });
             m
         }]);
