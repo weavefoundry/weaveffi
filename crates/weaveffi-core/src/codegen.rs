@@ -4,6 +4,7 @@ use weaveffi_ir::ir::Api;
 
 use crate::cache;
 use crate::config::GeneratorConfig;
+use crate::templates::TemplateEngine;
 
 pub trait Generator {
     fn name(&self) -> &'static str;
@@ -16,6 +17,16 @@ pub trait Generator {
         _config: &GeneratorConfig,
     ) -> Result<()> {
         self.generate(api, out_dir)
+    }
+
+    fn generate_with_templates(
+        &self,
+        api: &Api,
+        out_dir: &Utf8Path,
+        config: &GeneratorConfig,
+        _templates: Option<&TemplateEngine>,
+    ) -> Result<()> {
+        self.generate_with_config(api, out_dir, config)
     }
 
     fn output_files(&self, _api: &Api, _out_dir: &Utf8Path) -> Vec<String> {
@@ -44,6 +55,7 @@ impl<'a> Orchestrator<'a> {
         out_dir: &Utf8Path,
         config: &GeneratorConfig,
         force: bool,
+        templates: Option<&TemplateEngine>,
     ) -> Result<()> {
         let hash = cache::hash_api(api);
 
@@ -57,7 +69,7 @@ impl<'a> Orchestrator<'a> {
         }
 
         for g in &self.generators {
-            g.generate_with_config(api, out_dir, config)?;
+            g.generate_with_templates(api, out_dir, config, templates)?;
         }
 
         cache::write_cache(out_dir, &hash)?;
@@ -129,11 +141,11 @@ mod tests {
 
         let orch = Orchestrator::new().with_generator(&gen);
 
-        orch.run(&api, out_dir, &config, false).unwrap();
+        orch.run(&api, out_dir, &config, false, None).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let content_after_first = std::fs::read_to_string(out_dir.join("output.txt")).unwrap();
 
-        orch.run(&api, out_dir, &config, false).unwrap();
+        orch.run(&api, out_dir, &config, false, None).unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -157,10 +169,41 @@ mod tests {
 
         let orch = Orchestrator::new().with_generator(&gen);
 
-        orch.run(&api, out_dir, &config, false).unwrap();
+        orch.run(&api, out_dir, &config, false, None).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        orch.run(&api, out_dir, &config, true).unwrap();
+        orch.run(&api, out_dir, &config, true, None).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2, "force should bypass cache");
+    }
+
+    #[test]
+    fn generate_with_custom_templates_dir() {
+        use crate::templates::TemplateEngine;
+
+        let tpl_dir = tempfile::tempdir().unwrap();
+        let tpl_path = Utf8Path::from_path(tpl_dir.path()).unwrap();
+        std::fs::write(tpl_path.join("greeting.tera"), "Hello from {{ name }}!").unwrap();
+
+        let mut engine = TemplateEngine::new();
+        engine.load_dir(tpl_path).unwrap();
+
+        let mut ctx = tera::Context::new();
+        ctx.insert("name", "user-templates");
+        let rendered = engine.render("greeting.tera", &ctx).unwrap();
+        assert_eq!(rendered, "Hello from user-templates!");
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
+        let api = test_api();
+        let config = GeneratorConfig::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gen = CountingGenerator {
+            calls: Arc::clone(&calls),
+        };
+
+        let orch = Orchestrator::new().with_generator(&gen);
+        orch.run(&api, out_dir, &config, true, Some(&engine))
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

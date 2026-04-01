@@ -13,6 +13,7 @@ use std::process::Command;
 use tracing_subscriber::EnvFilter;
 use weaveffi_core::codegen::{Generator, Orchestrator};
 use weaveffi_core::config::GeneratorConfig;
+use weaveffi_core::templates::TemplateEngine;
 use weaveffi_core::validate::{collect_warnings, validate_api, ValidationError};
 use weaveffi_gen_android::AndroidGenerator;
 use weaveffi_gen_c::CGenerator;
@@ -64,6 +65,9 @@ enum Commands {
         /// Parse and validate only; print which files would be generated without writing them
         #[arg(long)]
         dry_run: bool,
+        /// Path to a directory containing user template overrides (.tera files)
+        #[arg(long)]
+        templates: Option<String>,
     },
     Validate {
         /// Input IDL/IR file (yaml|yml|json|toml)
@@ -129,6 +133,7 @@ fn main() -> Result<()> {
             warn,
             force,
             dry_run,
+            templates,
         } => cmd_generate(
             &input,
             &out,
@@ -138,6 +143,7 @@ fn main() -> Result<()> {
             warn,
             force,
             dry_run,
+            templates.as_deref(),
             quiet,
         )?,
         Commands::Validate { input, warn } => cmd_validate(&input, warn, quiet)?,
@@ -300,6 +306,7 @@ fn cmd_generate(
     warn: bool,
     force: bool,
     dry_run: bool,
+    templates_path: Option<&str>,
     quiet: bool,
 ) -> Result<()> {
     let config = load_config(config_path)?;
@@ -360,13 +367,23 @@ fn cmd_generate(
     std::fs::create_dir_all(out_dir.as_std_path())
         .wrap_err_with(|| format!("failed to create output directory: {}", out))?;
 
+    let engine = match templates_path {
+        Some(dir) => {
+            let mut te = TemplateEngine::new();
+            te.load_dir(Utf8Path::new(dir))
+                .map_err(|e| eyre!("failed to load templates from {}: {:#}", dir, e))?;
+            Some(te)
+        }
+        None => None,
+    };
+
     let mut orchestrator = Orchestrator::new();
     for &gen in &selected {
         orchestrator = orchestrator.with_generator(gen);
     }
 
     orchestrator
-        .run(&api, out_dir, &config, force)
+        .run(&api, out_dir, &config, force, engine.as_ref())
         .map_err(|e| eyre!("{:#}", e))?;
 
     if emit_scaffold {
@@ -505,7 +522,7 @@ fn cmd_diff(input: &str, out: Option<&str>, quiet: bool) -> Result<()> {
         orchestrator = orchestrator.with_generator(gen);
     }
     orchestrator
-        .run(&api, tmp_path, &config, true)
+        .run(&api, tmp_path, &config, true, None)
         .map_err(|e| eyre!("{:#}", e))?;
 
     let out_dir = Utf8Path::new(out);
@@ -1111,7 +1128,10 @@ mod tests {
         let input = yml.to_str().unwrap();
         let out_str = out.to_str().unwrap();
 
-        cmd_generate(input, out_str, None, false, None, false, false, true, false).unwrap();
+        cmd_generate(
+            input, out_str, None, false, None, false, false, true, None, false,
+        )
+        .unwrap();
 
         assert!(!out.exists(), "dry-run should not create output directory");
 
