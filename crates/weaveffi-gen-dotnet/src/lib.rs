@@ -76,7 +76,7 @@ fn cs_type(ty: &TypeRef) -> String {
         TypeRef::F64 => "double".into(),
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 => "string".into(),
-        TypeRef::Handle => "ulong".into(),
+        TypeRef::TypedHandle(_) | TypeRef::Handle => "ulong".into(),
         TypeRef::Bytes => "byte[]".into(),
         TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
         TypeRef::Optional(inner) => match inner.as_ref() {
@@ -85,7 +85,7 @@ fn cs_type(ty: &TypeRef) -> String {
             TypeRef::I64 => "long?".into(),
             TypeRef::F64 => "double?".into(),
             TypeRef::Bool => "bool?".into(),
-            TypeRef::Handle => "ulong?".into(),
+            TypeRef::TypedHandle(_) | TypeRef::Handle => "ulong?".into(),
             TypeRef::Enum(name) => format!("{name}?"),
             TypeRef::StringUtf8 => "string?".into(),
             TypeRef::Struct(name) => format!("{name}?"),
@@ -109,7 +109,7 @@ fn pinvoke_type(ty: &TypeRef) -> String {
         | TypeRef::Optional(_)
         | TypeRef::List(_)
         | TypeRef::Map(_, _) => "IntPtr".into(),
-        TypeRef::Handle => "ulong".into(),
+        TypeRef::TypedHandle(_) | TypeRef::Handle => "ulong".into(),
         TypeRef::Enum(_) => "int".into(),
     }
 }
@@ -344,7 +344,12 @@ fn render_struct_getter(out: &mut String, prefix: &str, field: &StructField) {
     ));
 
     match &field.ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => {
+        TypeRef::I32
+        | TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::F64
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Handle => {
             out.push_str(&format!(
                 "                return NativeMethods.{getter_sym}(_handle);\n"
             ));
@@ -428,7 +433,7 @@ fn render_struct_getter(out: &mut String, prefix: &str, field: &StructField) {
                     out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
                     out.push_str("                return Marshal.ReadInt32(ptr) != 0;\n");
                 }
-                TypeRef::Handle => {
+                TypeRef::TypedHandle(_) | TypeRef::Handle => {
                     out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
                     out.push_str("                return (ulong)Marshal.ReadInt64(ptr);\n");
                 }
@@ -641,6 +646,7 @@ fn param_needs_marshal(ty: &TypeRef) -> bool {
                 | TypeRef::I64
                 | TypeRef::F64
                 | TypeRef::Bool
+                | TypeRef::TypedHandle(_)
                 | TypeRef::Handle
                 | TypeRef::Enum(_)
         ),
@@ -725,14 +731,14 @@ fn render_marshal_setup(out: &mut String, p: &Param, indent: &str) {
                 ));
                 out.push_str(&format!("{indent}}}\n"));
             }
-            TypeRef::I64 | TypeRef::Handle | TypeRef::F64 => {
+            TypeRef::I64 | TypeRef::TypedHandle(_) | TypeRef::Handle | TypeRef::F64 => {
                 out.push_str(&format!("{indent}var {name}Ptr = IntPtr.Zero;\n"));
                 out.push_str(&format!("{indent}if ({name}.HasValue)\n{indent}{{\n"));
                 out.push_str(&format!(
                     "{indent}    {name}Ptr = Marshal.AllocHGlobal(sizeof(long));\n"
                 ));
                 let val = match inner.as_ref() {
-                    TypeRef::Handle => format!("(long){name}.Value"),
+                    TypeRef::TypedHandle(_) | TypeRef::Handle => format!("(long){name}.Value"),
                     TypeRef::F64 => {
                         format!("BitConverter.DoubleToInt64Bits({name}.Value)")
                     }
@@ -774,6 +780,7 @@ fn render_marshal_cleanup(out: &mut String, p: &Param, indent: &str) {
             | TypeRef::I64
             | TypeRef::F64
             | TypeRef::Bool
+            | TypeRef::TypedHandle(_)
             | TypeRef::Handle
             | TypeRef::Enum(_) => {
                 out.push_str(&format!(
@@ -859,6 +866,7 @@ fn build_call_args(params: &[Param]) -> String {
                     | TypeRef::I64
                     | TypeRef::F64
                     | TypeRef::Bool
+                    | TypeRef::TypedHandle(_)
                     | TypeRef::Handle
                     | TypeRef::Enum(_) => vec![format!("{name}Ptr")],
                     _ => vec![name],
@@ -982,7 +990,7 @@ fn render_optional_return_conversion(out: &mut String, inner: &TypeRef, indent: 
             ));
             out.push_str(&format!("{indent}return Marshal.ReadInt32(result) != 0;\n"));
         }
-        TypeRef::Handle => {
+        TypeRef::TypedHandle(_) | TypeRef::Handle => {
             out.push_str(&format!(
                 "{indent}if (result == IntPtr.Zero) return null;\n"
             ));
@@ -1104,7 +1112,7 @@ fn marshal_read_element(ty: &TypeRef, arr: &str, idx: &str) -> String {
         TypeRef::Bool => {
             format!("Marshal.ReadInt32({arr} + {idx} * sizeof(int)) != 0")
         }
-        TypeRef::Handle => {
+        TypeRef::TypedHandle(_) | TypeRef::Handle => {
             format!("(ulong)Marshal.ReadInt64({arr} + {idx} * sizeof(long))")
         }
         TypeRef::StringUtf8 => {

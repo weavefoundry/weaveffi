@@ -118,7 +118,7 @@ fn c_elem_type(ty: &TypeRef, module: &str) -> String {
         TypeRef::I64 => "int64_t".into(),
         TypeRef::F64 => "double".into(),
         TypeRef::Bool => "bool".into(),
-        TypeRef::Handle => "weaveffi_handle_t".into(),
+        TypeRef::TypedHandle(_) | TypeRef::Handle => "weaveffi_handle_t".into(),
         TypeRef::StringUtf8 => "const char*".into(),
         TypeRef::Bytes => "const uint8_t*".into(),
         TypeRef::Struct(s) => format!("weaveffi_{module}_{s}*"),
@@ -137,7 +137,7 @@ fn c_ret_type_str(ty: &TypeRef, module: &str) -> String {
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 => "const char*".into(),
         TypeRef::Bytes => "const uint8_t*".into(),
-        TypeRef::Handle => "weaveffi_handle_t".into(),
+        TypeRef::TypedHandle(_) | TypeRef::Handle => "weaveffi_handle_t".into(),
         TypeRef::Struct(s) => format!("weaveffi_{module}_{s}*"),
         TypeRef::Enum(e) => format!("weaveffi_{module}_{e}"),
         TypeRef::Optional(inner) => {
@@ -156,7 +156,9 @@ fn napi_getter(ty: &TypeRef) -> &'static str {
     match ty {
         TypeRef::I32 | TypeRef::Enum(_) => "napi_get_value_int32",
         TypeRef::U32 => "napi_get_value_uint32",
-        TypeRef::I64 | TypeRef::Handle | TypeRef::Struct(_) => "napi_get_value_int64",
+        TypeRef::I64 | TypeRef::Handle | TypeRef::TypedHandle(_) | TypeRef::Struct(_) => {
+            "napi_get_value_int64"
+        }
         TypeRef::F64 => "napi_get_value_double",
         TypeRef::Bool => "napi_get_value_bool",
         _ => "napi_get_value_int64",
@@ -291,7 +293,7 @@ fn emit_param(
             c_args.push(name.into());
             cleanups.push(format!("  free({name});\n"));
         }
-        TypeRef::Handle => {
+        TypeRef::TypedHandle(_) | TypeRef::Handle => {
             out.push_str(&format!("  int64_t {name}_raw;\n"));
             out.push_str(&format!(
                 "  napi_get_value_int64(env, args[{idx}], &{name}_raw);\n"
@@ -381,7 +383,7 @@ fn emit_optional_param(
         TypeRef::Bool => {
             emit_opt_val(out, c_args, "bool", "napi_get_value_bool", name, idx);
         }
-        TypeRef::Handle => {
+        TypeRef::TypedHandle(_) | TypeRef::Handle => {
             out.push_str(&format!("  int64_t {name}_raw = 0;\n"));
             out.push_str(&format!("  weaveffi_handle_t {name}_val;\n"));
             out.push_str(&format!("  const weaveffi_handle_t* {name}_ptr = NULL;\n"));
@@ -482,7 +484,7 @@ fn emit_list_param(
                 "    {getter}(env, {name}_el, &{name}_arr[{name}_i]);\n"
             ));
         }
-        TypeRef::Handle => {
+        TypeRef::TypedHandle(_) | TypeRef::Handle => {
             out.push_str(&format!("    int64_t {name}_h;\n"));
             out.push_str(&format!(
                 "    napi_get_value_int64(env, {name}_el, &{name}_h);\n"
@@ -676,7 +678,7 @@ fn emit_ret_to_napi(out: &mut String, ty: &TypeRef, module: &str) {
             out.push_str("  napi_create_string_utf8(env, result, NAPI_AUTO_LENGTH, &ret);\n");
             out.push_str("  weaveffi_free_string(result);\n");
         }
-        TypeRef::Handle => {
+        TypeRef::TypedHandle(_) | TypeRef::Handle => {
             out.push_str("  napi_create_int64(env, (int64_t)result, &ret);\n");
         }
         TypeRef::Struct(_) => {
@@ -726,7 +728,7 @@ fn emit_optional_ret_inner(out: &mut String, inner: &TypeRef, module: &str) {
             out.push_str("    napi_get_boolean(env, *result, &ret);\n");
             out.push_str("    free(result);\n");
         }
-        TypeRef::Handle => {
+        TypeRef::TypedHandle(_) | TypeRef::Handle => {
             out.push_str("    napi_create_int64(env, (int64_t)*result, &ret);\n");
             out.push_str("    free(result);\n");
         }
@@ -770,7 +772,7 @@ fn emit_list_ret(out: &mut String, inner: &TypeRef, _module: &str, ind: &str) {
         TypeRef::Bool => out.push_str(&format!(
             "{ind}  napi_get_boolean(env, result[ret_i], &elem);\n"
         )),
-        TypeRef::Handle => out.push_str(&format!(
+        TypeRef::TypedHandle(_) | TypeRef::Handle => out.push_str(&format!(
             "{ind}  napi_create_int64(env, (int64_t)result[ret_i], &elem);\n"
         )),
         TypeRef::StringUtf8 => {
@@ -799,7 +801,7 @@ fn ts_type_for(ty: &TypeRef) -> String {
         TypeRef::Bool => "boolean".into(),
         TypeRef::StringUtf8 => "string".into(),
         TypeRef::Bytes => "Buffer".into(),
-        TypeRef::Handle => "bigint".into(),
+        TypeRef::TypedHandle(_) | TypeRef::Handle => "bigint".into(),
         TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
         TypeRef::Optional(inner) => format!("{} | null", ts_type_for(inner)),
         TypeRef::List(inner) => {

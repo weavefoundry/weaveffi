@@ -56,11 +56,17 @@ impl Generator for WasmGenerator {
 fn wasm_type(ty: &TypeRef) -> &'static str {
     match ty {
         TypeRef::I32 | TypeRef::U32 | TypeRef::Bool | TypeRef::Enum(_) => "i32",
-        TypeRef::I64 | TypeRef::Handle | TypeRef::Struct(_) | TypeRef::Map(_, _) => "i64",
+        TypeRef::I64
+        | TypeRef::Handle
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Struct(_)
+        | TypeRef::Map(_, _) => "i64",
         TypeRef::F64 => "f64",
         TypeRef::StringUtf8 | TypeRef::Bytes | TypeRef::List(_) => "i32, i32",
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::Struct(_) | TypeRef::Handle | TypeRef::Map(_, _) => "i64",
+            TypeRef::Struct(_) | TypeRef::Handle | TypeRef::TypedHandle(_) | TypeRef::Map(_, _) => {
+                "i64"
+            }
             _ => "i32, i32",
         },
     }
@@ -74,13 +80,13 @@ fn wasm_type_note(ty: &TypeRef) -> &'static str {
         TypeRef::F64 => "native WASM f64",
         TypeRef::Bool => "0 = false, 1 = true",
         TypeRef::StringUtf8 | TypeRef::Bytes => "ptr + len in linear memory",
-        TypeRef::Handle => "opaque pointer",
+        TypeRef::TypedHandle(_) | TypeRef::Handle => "opaque pointer",
         TypeRef::Struct(_) => "opaque handle in linear memory",
         TypeRef::Enum(_) => "variant discriminant",
         TypeRef::List(_) => "ptr + len in linear memory",
         TypeRef::Map(_, _) => "opaque handle in linear memory",
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::Struct(_) | TypeRef::Handle | TypeRef::Map(_, _) => {
+            TypeRef::Struct(_) | TypeRef::Handle | TypeRef::TypedHandle(_) | TypeRef::Map(_, _) => {
                 "opaque handle, 0 = absent"
             }
             _ => "is_present flag + value",
@@ -97,7 +103,7 @@ fn type_display(ty: &TypeRef) -> String {
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 => "string".into(),
         TypeRef::Bytes => "bytes".into(),
-        TypeRef::Handle => "handle".into(),
+        TypeRef::TypedHandle(_) | TypeRef::Handle => "handle".into(),
         TypeRef::Struct(n) | TypeRef::Enum(n) => n.clone(),
         TypeRef::Optional(inner) => format!("{}?", type_display(inner)),
         TypeRef::List(inner) => format!("[{}]", type_display(inner)),
@@ -275,7 +281,7 @@ fn ts_type_for(ty: &TypeRef) -> String {
         TypeRef::Bool => "boolean".into(),
         TypeRef::StringUtf8 => "string".into(),
         TypeRef::Bytes => "Buffer".into(),
-        TypeRef::Handle => "bigint".into(),
+        TypeRef::TypedHandle(_) | TypeRef::Handle => "bigint".into(),
         TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
         TypeRef::Optional(inner) => format!("{} | null", ts_type_for(inner)),
         TypeRef::List(inner) => {

@@ -47,6 +47,7 @@ pub enum TypeRef {
     StringUtf8,
     Bytes,
     Handle,
+    TypedHandle(String),
     Struct(String),
     Enum(String),
     Optional(Box<TypeRef>),
@@ -75,6 +76,12 @@ pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
     if let Some(inner) = s.strip_suffix('?') {
         return parse_type_ref(inner).map(|t| TypeRef::Optional(Box::new(t)));
     }
+    if let Some(inner) = s
+        .strip_prefix("handle<")
+        .and_then(|rest| rest.strip_suffix('>'))
+    {
+        return Ok(TypeRef::TypedHandle(inner.into()));
+    }
     match s {
         "i32" => Ok(TypeRef::I32),
         "u32" => Ok(TypeRef::U32),
@@ -98,6 +105,7 @@ fn type_ref_to_string(ty: &TypeRef) -> String {
         TypeRef::StringUtf8 => "string".to_string(),
         TypeRef::Bytes => "bytes".to_string(),
         TypeRef::Handle => "handle".to_string(),
+        TypeRef::TypedHandle(name) => format!("handle<{name}>"),
         TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
         TypeRef::Optional(inner) => format!("{}?", type_ref_to_string(inner)),
         TypeRef::List(inner) => format!("[{}]", type_ref_to_string(inner)),
@@ -728,5 +736,23 @@ modules:
                 Box::new(TypeRef::List(Box::new(TypeRef::I32))),
             ))
         );
+    }
+
+    #[test]
+    fn parse_typed_handle() {
+        assert_eq!(
+            parse_type_ref("handle<Session>"),
+            Ok(TypeRef::TypedHandle("Session".into()))
+        );
+        assert_eq!(parse_type_ref("handle"), Ok(TypeRef::Handle));
+    }
+
+    #[test]
+    fn parse_typed_handle_roundtrip() {
+        let ty = TypeRef::TypedHandle("Connection".into());
+        let json = serde_json::to_string(&ty).unwrap();
+        assert_eq!(json, r#""handle<Connection>""#);
+        let back: TypeRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ty);
     }
 }

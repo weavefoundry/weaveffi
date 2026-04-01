@@ -103,7 +103,7 @@ fn py_ctypes_scalar(ty: &TypeRef) -> &'static str {
         TypeRef::F64 => "ctypes.c_double",
         TypeRef::Bool => "ctypes.c_int32",
         TypeRef::StringUtf8 => "ctypes.c_char_p",
-        TypeRef::Handle => "ctypes.c_uint64",
+        TypeRef::TypedHandle(_) | TypeRef::Handle => "ctypes.c_uint64",
         TypeRef::Bytes => "ctypes.c_uint8",
         TypeRef::Struct(_) => "ctypes.c_void_p",
         TypeRef::Enum(_) => "ctypes.c_int32",
@@ -113,7 +113,9 @@ fn py_ctypes_scalar(ty: &TypeRef) -> &'static str {
 
 fn py_type_hint(ty: &TypeRef) -> String {
     match ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle => "int".into(),
+        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::TypedHandle(_) => {
+            "int".into()
+        }
         TypeRef::F64 => "float".into(),
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 => "str".into(),
@@ -489,7 +491,12 @@ fn py_param_conversion(name: &str, ty: &TypeRef, ind: &str) -> Vec<String> {
             vec![format!("{ind}_{name}_arr = ({s} * len({name}))(*{name})")]
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => {
+            TypeRef::I32
+            | TypeRef::U32
+            | TypeRef::I64
+            | TypeRef::F64
+            | TypeRef::Handle
+            | TypeRef::TypedHandle(_) => {
                 let s = py_ctypes_scalar(inner);
                 vec![format!(
                     "{ind}_{name}_c = ctypes.byref({s}({name})) if {name} is not None else None"
@@ -556,7 +563,12 @@ fn py_param_conversion(name: &str, ty: &TypeRef, ind: &str) -> Vec<String> {
 
 fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
     match ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => {
+        TypeRef::I32
+        | TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::F64
+        | TypeRef::Handle
+        | TypeRef::TypedHandle(_) => {
             vec![name.to_string()]
         }
         TypeRef::Bool => vec![format!("1 if {name} else 0")],
@@ -603,7 +615,12 @@ fn py_read_element(expr: &str, ty: &TypeRef) -> String {
 
 fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
     match ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => {
+        TypeRef::I32
+        | TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::F64
+        | TypeRef::Handle
+        | TypeRef::TypedHandle(_) => {
             out.push_str(&format!("{ind}return _result\n"));
         }
         TypeRef::Bool => {
