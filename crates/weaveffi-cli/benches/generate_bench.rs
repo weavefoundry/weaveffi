@@ -4,9 +4,13 @@ use weaveffi_core::codegen::{Generator, Orchestrator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_gen_android::AndroidGenerator;
 use weaveffi_gen_c::CGenerator;
+use weaveffi_gen_cpp::CppGenerator;
+use weaveffi_gen_dart::DartGenerator;
 use weaveffi_gen_dotnet::DotnetGenerator;
+use weaveffi_gen_go::GoGenerator;
 use weaveffi_gen_node::NodeGenerator;
 use weaveffi_gen_python::PythonGenerator;
+use weaveffi_gen_ruby::RubyGenerator;
 use weaveffi_gen_swift::SwiftGenerator;
 use weaveffi_gen_wasm::WasmGenerator;
 use weaveffi_ir::ir::{
@@ -104,6 +108,7 @@ fn build_large_api() -> Api {
     Api {
         version: "0.1.0".into(),
         modules,
+        generators: None,
     }
 }
 
@@ -144,6 +149,10 @@ fn bench_generate_all_large_api(c: &mut Criterion) {
     let wasm = WasmGenerator;
     let python = PythonGenerator;
     let dotnet = DotnetGenerator;
+    let cpp = CppGenerator;
+    let dart = DartGenerator;
+    let go = GoGenerator;
+    let ruby = RubyGenerator;
 
     let orchestrator = Orchestrator::new()
         .with_generator(&c_gen)
@@ -152,7 +161,11 @@ fn bench_generate_all_large_api(c: &mut Criterion) {
         .with_generator(&node)
         .with_generator(&wasm)
         .with_generator(&python)
-        .with_generator(&dotnet);
+        .with_generator(&dotnet)
+        .with_generator(&cpp)
+        .with_generator(&dart)
+        .with_generator(&go)
+        .with_generator(&ruby);
 
     c.bench_function("generate_all_large_api", |b| {
         b.iter(|| {
