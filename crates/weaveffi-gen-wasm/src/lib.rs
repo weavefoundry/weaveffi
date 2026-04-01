@@ -281,8 +281,8 @@ fn ts_type_for(ty: &TypeRef) -> String {
         TypeRef::Bool => "boolean".into(),
         TypeRef::StringUtf8 => "string".into(),
         TypeRef::Bytes => "Buffer".into(),
-        TypeRef::TypedHandle(_) | TypeRef::Handle => "bigint".into(),
-        TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
+        TypeRef::Handle => "bigint".into(),
+        TypeRef::TypedHandle(name) | TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
         TypeRef::Optional(inner) => format!("{} | null", ts_type_for(inner)),
         TypeRef::List(inner) => {
             let inner_ts = ts_type_for(inner);
@@ -560,7 +560,7 @@ fn emit_js_function_wrapper(out: &mut String, module_name: &str, func: &Function
                 wasm_args.push(format!("{}_ptr", param.name));
                 wasm_args.push(format!("{}_len", param.name));
             }
-            TypeRef::Struct(_) => {
+            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
                 wasm_args.push(format!("{}._handle", param.name));
             }
             _ => {
@@ -1144,6 +1144,44 @@ mod tests {
         assert!(dts.contains("loadMyBindings"));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn wasm_typed_handle_type() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "get_info".into(),
+                params: vec![Param {
+                    name: "contact".into(),
+                    ty: TypeRef::TypedHandle("Contact".into()),
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                }],
+            }],
+            enums: vec![],
+            errors: None,
+        }]);
+        let dts = render_wasm_dts(&api, DEFAULT_MODULE_NAME);
+        assert!(
+            dts.contains("contact: Contact"),
+            "TypedHandle should use class type not bigint: {dts}"
+        );
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        assert!(
+            js.contains("contact._handle"),
+            "TypedHandle should extract ._handle: {js}"
+        );
     }
 
     #[test]

@@ -124,12 +124,20 @@ fn kotlin_type(t: &TypeRef) -> String {
         TypeRef::Bool => "Boolean".to_string(),
         TypeRef::StringUtf8 => "String".to_string(),
         TypeRef::Bytes => "ByteArray".to_string(),
-        TypeRef::TypedHandle(_) | TypeRef::Handle => "Long".to_string(),
+        TypeRef::Handle => "Long".to_string(),
+        TypeRef::TypedHandle(name) => name.clone(),
         TypeRef::Struct(_) => "Long".to_string(),
         TypeRef::Enum(_) => "Int".to_string(),
         TypeRef::Optional(inner) => format!("{}?", kotlin_type(inner)),
         TypeRef::List(inner) => kotlin_list_type(inner),
         TypeRef::Map(k, v) => format!("Map<{}, {}>", kotlin_type(k), kotlin_type(v)),
+    }
+}
+
+fn kotlin_jni_type(t: &TypeRef) -> String {
+    match t {
+        TypeRef::TypedHandle(_) => "Long".to_string(),
+        other => kotlin_type(other),
     }
 }
 
@@ -242,7 +250,9 @@ fn kotlin_public_type(t: &TypeRef) -> String {
 }
 
 fn has_enum_involvement(f: &Function) -> bool {
-    f.params.iter().any(|p| matches!(&p.ty, TypeRef::Enum(_)))
+    f.params
+        .iter()
+        .any(|p| matches!(&p.ty, TypeRef::Enum(_) | TypeRef::TypedHandle(_)))
         || matches!(&f.returns, Some(TypeRef::Enum(_)))
 }
 
@@ -255,12 +265,12 @@ fn render_kotlin(api: &Api, package: &str, strip_module_prefix: bool) -> String 
                 let native_params: Vec<String> = f
                     .params
                     .iter()
-                    .map(|p| format!("{}: {}", p.name, kotlin_type(&p.ty)))
+                    .map(|p| format!("{}: {}", p.name, kotlin_jni_type(&p.ty)))
                     .collect();
                 let native_ret = f
                     .returns
                     .as_ref()
-                    .map(kotlin_type)
+                    .map(kotlin_jni_type)
                     .unwrap_or_else(|| "Unit".to_string());
                 let _ = writeln!(
                     kotlin,
@@ -286,6 +296,8 @@ fn render_kotlin(api: &Api, package: &str, strip_module_prefix: bool) -> String 
                     .map(|p| {
                         if matches!(&p.ty, TypeRef::Enum(_)) {
                             format!("{}.value", p.name)
+                        } else if matches!(&p.ty, TypeRef::TypedHandle(_)) {
+                            format!("{}.handle", p.name)
                         } else {
                             p.name.clone()
                         }
@@ -3567,6 +3579,39 @@ mod tests {
         assert!(
             kotlin.contains("Map<Int, Long>"),
             "should contain enum-keyed map type: {kotlin}"
+        );
+    }
+
+    #[test]
+    fn android_typed_handle_type() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "get_info".into(),
+                params: vec![Param {
+                    name: "contact".into(),
+                    ty: TypeRef::TypedHandle("Contact".into()),
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                }],
+            }],
+            enums: vec![],
+            errors: None,
+        }]);
+        let kt = render_kotlin(&api, "com.weaveffi", true);
+        assert!(
+            kt.contains("contact: Contact"),
+            "TypedHandle should use class type not Long: {kt}"
         );
     }
 }

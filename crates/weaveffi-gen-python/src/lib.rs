@@ -90,6 +90,7 @@ fn is_c_pointer_type(ty: &TypeRef) -> bool {
         TypeRef::StringUtf8
             | TypeRef::Bytes
             | TypeRef::Struct(_)
+            | TypeRef::TypedHandle(_)
             | TypeRef::List(_)
             | TypeRef::Map(_, _)
     )
@@ -103,7 +104,8 @@ fn py_ctypes_scalar(ty: &TypeRef) -> &'static str {
         TypeRef::F64 => "ctypes.c_double",
         TypeRef::Bool => "ctypes.c_int32",
         TypeRef::StringUtf8 => "ctypes.c_char_p",
-        TypeRef::TypedHandle(_) | TypeRef::Handle => "ctypes.c_uint64",
+        TypeRef::Handle => "ctypes.c_uint64",
+        TypeRef::TypedHandle(_) => "ctypes.c_void_p",
         TypeRef::Bytes => "ctypes.c_uint8",
         TypeRef::Struct(_) => "ctypes.c_void_p",
         TypeRef::Enum(_) => "ctypes.c_int32",
@@ -113,9 +115,8 @@ fn py_ctypes_scalar(ty: &TypeRef) -> &'static str {
 
 fn py_type_hint(ty: &TypeRef) -> String {
     match ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::TypedHandle(_) => {
-            "int".into()
-        }
+        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle => "int".into(),
+        TypeRef::TypedHandle(name) => format!("\"{}\"", name),
         TypeRef::F64 => "float".into(),
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 => "str".into(),
@@ -467,7 +468,7 @@ fn render_function(out: &mut String, module_name: &str, f: &Function, strip_modu
 fn py_list_convert_expr(name: &str, elem: &TypeRef) -> String {
     match elem {
         TypeRef::StringUtf8 => format!("*[_string_to_bytes(v) for v in {name}]"),
-        TypeRef::Struct(_) => format!("*[v._ptr for v in {name}]"),
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => format!("*[v._ptr for v in {name}]"),
         TypeRef::Enum(_) => format!("*[v.value for v in {name}]"),
         TypeRef::Bool => format!("*[1 if v else 0 for v in {name}]"),
         _ => format!("*{name}"),
@@ -478,7 +479,9 @@ fn py_map_elem_convert(list_name: &str, ty: &TypeRef, var: &str) -> String {
     match ty {
         TypeRef::StringUtf8 => format!("*[_string_to_bytes({var}) for {var} in {list_name}]"),
         TypeRef::Enum(_) => format!("*[{var}.value for {var} in {list_name}]"),
-        TypeRef::Struct(_) => format!("*[{var}._ptr for {var} in {list_name}]"),
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+            format!("*[{var}._ptr for {var} in {list_name}]")
+        }
         TypeRef::Bool => format!("*[1 if {var} else 0 for {var} in {list_name}]"),
         _ => format!("*{list_name}"),
     }
@@ -491,12 +494,7 @@ fn py_param_conversion(name: &str, ty: &TypeRef, ind: &str) -> Vec<String> {
             vec![format!("{ind}_{name}_arr = ({s} * len({name}))(*{name})")]
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::I32
-            | TypeRef::U32
-            | TypeRef::I64
-            | TypeRef::F64
-            | TypeRef::Handle
-            | TypeRef::TypedHandle(_) => {
+            TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => {
                 let s = py_ctypes_scalar(inner);
                 vec![format!(
                     "{ind}_{name}_c = ctypes.byref({s}({name})) if {name} is not None else None"
@@ -563,22 +561,17 @@ fn py_param_conversion(name: &str, ty: &TypeRef, ind: &str) -> Vec<String> {
 
 fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
     match ty {
-        TypeRef::I32
-        | TypeRef::U32
-        | TypeRef::I64
-        | TypeRef::F64
-        | TypeRef::Handle
-        | TypeRef::TypedHandle(_) => {
+        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => {
             vec![name.to_string()]
         }
         TypeRef::Bool => vec![format!("1 if {name} else 0")],
         TypeRef::StringUtf8 => vec![format!("_string_to_bytes({name})")],
         TypeRef::Bytes => vec![format!("_{name}_arr"), format!("len({name})")],
-        TypeRef::Struct(_) => vec![format!("{name}._ptr")],
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => vec![format!("{name}._ptr")],
         TypeRef::Enum(_) => vec![format!("{name}.value")],
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 => vec![format!("_{name}_c")],
-            TypeRef::Struct(_) => {
+            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
                 vec![format!("{name}._ptr if {name} is not None else None")]
             }
             TypeRef::Bytes | TypeRef::List(_) => {
@@ -606,7 +599,7 @@ fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
 fn py_read_element(expr: &str, ty: &TypeRef) -> String {
     match ty {
         TypeRef::StringUtf8 => format!("_bytes_to_string({expr})"),
-        TypeRef::Struct(name) => format!("{name}({expr})"),
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => format!("{name}({expr})"),
         TypeRef::Enum(name) => format!("{name}({expr})"),
         TypeRef::Bool => format!("bool({expr})"),
         _ => expr.to_string(),
@@ -615,12 +608,7 @@ fn py_read_element(expr: &str, ty: &TypeRef) -> String {
 
 fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
     match ty {
-        TypeRef::I32
-        | TypeRef::U32
-        | TypeRef::I64
-        | TypeRef::F64
-        | TypeRef::Handle
-        | TypeRef::TypedHandle(_) => {
+        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => {
             out.push_str(&format!("{ind}return _result\n"));
         }
         TypeRef::Bool => {
@@ -634,7 +622,7 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
             out.push_str(&format!("{ind}    return b\"\"\n"));
             out.push_str(&format!("{ind}return bytes(_result[:_out_len.value])\n"));
         }
-        TypeRef::Struct(name) => {
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
             out.push_str(&format!("{ind}if _result is None:\n"));
             out.push_str(&format!(
                 "{ind}    raise WeaveffiError(-1, \"null pointer\")\n"
@@ -660,7 +648,7 @@ fn render_optional_return(out: &mut String, inner: &TypeRef, ind: &str) {
             out.push_str(&format!("{ind}    return None\n"));
             out.push_str(&format!("{ind}return bytes(_result[:_out_len.value])\n"));
         }
-        TypeRef::Struct(name) => {
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
             out.push_str(&format!("{ind}if _result is None:\n"));
             out.push_str(&format!("{ind}    return None\n"));
             out.push_str(&format!("{ind}return {name}(_result)\n"));
@@ -3002,6 +2990,50 @@ mod tests {
         assert!(
             pyi.contains("Dict[\"Color\", \"Contact\"]"),
             "should contain enum-keyed map type: {pyi}"
+        );
+    }
+
+    #[test]
+    fn python_typed_handle_type() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "contacts".into(),
+                functions: vec![Function {
+                    name: "get_info".into(),
+                    params: vec![Param {
+                        name: "contact".into(),
+                        ty: TypeRef::TypedHandle("Contact".into()),
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![StructDef {
+                    name: "Contact".into(),
+                    doc: None,
+                    fields: vec![StructField {
+                        name: "name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    }],
+                }],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        let py = render_python_module(&api, true);
+        assert!(
+            py.contains("contact: \"Contact\""),
+            "TypedHandle should use class type not int: {py}"
+        );
+        assert!(
+            py.contains("contact._ptr"),
+            "TypedHandle call arg should extract ._ptr: {py}"
+        );
+        assert!(
+            py.contains("ctypes.c_void_p"),
+            "TypedHandle ctypes type should be c_void_p: {py}"
         );
     }
 }
