@@ -1,0 +1,23 @@
+[package]
+name = "weaveffi-gen-ruby"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "WeaveFFI Ruby FFI binding generator"
+keywords = ["ffi", "codegen", "bindings", "ruby"]
+categories = ["development-tools::ffi"]
+
+[dependencies]
+weaveffi-core = { path = "../weaveffi-core", version = "0.2.0" }
+weaveffi-ir = { path = "../weaveffi-ir", version = "0.2.0" }
+anyhow = { workspace = true }
+camino = { workspace = true }
+heck = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
