@@ -23,6 +23,7 @@ use weaveffi_gen_dotnet::DotnetGenerator;
 use weaveffi_gen_go::GoGenerator;
 use weaveffi_gen_node::NodeGenerator;
 use weaveffi_gen_python::PythonGenerator;
+use weaveffi_gen_ruby::RubyGenerator;
 use weaveffi_gen_swift::SwiftGenerator;
 use weaveffi_gen_wasm::WasmGenerator;
 use weaveffi_ir::ir::{CURRENT_SCHEMA_VERSION, SUPPORTED_VERSIONS};
@@ -50,7 +51,7 @@ enum Commands {
         /// Output directory for generated artifacts
         #[arg(short, long, default_value = "./generated")]
         out: String,
-        /// Comma-separated list of targets to generate (c, cpp, swift, android, node, wasm, python, dotnet, dart, go)
+        /// Comma-separated list of targets to generate (c, cpp, swift, android, node, wasm, python, dotnet, dart, go, ruby)
         #[arg(short, long)]
         target: Option<String>,
         /// Also generate a scaffold.rs with Rust FFI function stubs
@@ -393,8 +394,9 @@ fn cmd_generate(
     let dotnet = DotnetGenerator;
     let dart = DartGenerator;
     let go = GoGenerator;
+    let ruby = RubyGenerator;
     let all: Vec<&dyn Generator> = vec![
-        &c, &cpp, &swift, &android, &node, &wasm, &python, &dotnet, &dart, &go,
+        &c, &cpp, &swift, &android, &node, &wasm, &python, &dotnet, &dart, &go, &ruby,
     ];
 
     let filter: Option<Vec<&str>> = targets.map(|t| t.split(',').map(str::trim).collect());
@@ -565,8 +567,9 @@ fn cmd_diff(input: &str, out: Option<&str>, quiet: bool) -> Result<()> {
     let dotnet = DotnetGenerator;
     let dart = DartGenerator;
     let go = GoGenerator;
+    let ruby = RubyGenerator;
     let all: Vec<&dyn Generator> = vec![
-        &c, &cpp, &swift, &android, &node, &wasm, &python, &dotnet, &dart, &go,
+        &c, &cpp, &swift, &android, &node, &wasm, &python, &dotnet, &dart, &go, &ruby,
     ];
 
     let config = GeneratorConfig::default();
@@ -1302,8 +1305,9 @@ mod tests {
         let dotnet = DotnetGenerator;
         let dart = DartGenerator;
         let go = GoGenerator;
+        let ruby = RubyGenerator;
         let all: Vec<&dyn Generator> = vec![
-            &c, &cpp, &swift, &android, &node, &wasm, &python, &dotnet, &dart, &go,
+            &c, &cpp, &swift, &android, &node, &wasm, &python, &dotnet, &dart, &go, &ruby,
         ];
 
         let mut files: Vec<String> = Vec::new();

@@ -1945,6 +1945,7 @@ dependencies = [
  "weaveffi-gen-go",
  "weaveffi-gen-node",
  "weaveffi-gen-python",
+ "weaveffi-gen-ruby",
  "weaveffi-gen-swift",
  "weaveffi-gen-wasm",
  "weaveffi-ir",
@@ -2046,6 +2047,18 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "camino",
+ "weaveffi-core",
+ "weaveffi-ir",
+]
+
+[[package]]
+name = "weaveffi-gen-ruby"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "camino",
+ "heck",
+ "tempfile",
  "weaveffi-core",
  "weaveffi-ir",
 ]

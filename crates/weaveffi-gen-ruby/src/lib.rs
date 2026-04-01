@@ -1,0 +1,1263 @@
+use anyhow::Result;
+use camino::Utf8Path;
+use heck::{ToShoutySnakeCase, ToSnakeCase};
+use weaveffi_core::codegen::Generator;
+use weaveffi_core::utils::c_symbol_name;
+use weaveffi_ir::ir::{Api, EnumDef, Function, StructDef, StructField, TypeRef};
+
+pub struct RubyGenerator;
+
+impl Generator for RubyGenerator {
+    fn name(&self) -> &'static str {
+        "ruby"
+    }
+
+    fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
+        let dir = out_dir.join("ruby/lib");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("weaveffi.rb"), render_ruby_module(api))?;
+        Ok(())
+    }
+
+    fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
+        vec![out_dir.join("ruby/lib/weaveffi.rb").to_string()]
+    }
+}
+
+// ── Type helpers ──
+
+fn is_c_pointer_type(ty: &TypeRef) -> bool {
+    matches!(
+        ty,
+        TypeRef::StringUtf8
+            | TypeRef::BorrowedStr
+            | TypeRef::Bytes
+            | TypeRef::BorrowedBytes
+            | TypeRef::Struct(_)
+            | TypeRef::TypedHandle(_)
+            | TypeRef::List(_)
+            | TypeRef::Map(_, _)
+    )
+}
+
+fn rb_ffi_scalar(ty: &TypeRef) -> &'static str {
+    match ty {
+        TypeRef::I32 | TypeRef::Bool | TypeRef::Enum(_) => ":int32",
+        TypeRef::U32 => ":uint32",
+        TypeRef::I64 => ":int64",
+        TypeRef::F64 => ":double",
+        TypeRef::Handle => ":uint64",
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => ":string",
+        _ => ":pointer",
+    }
+}
+
+fn rb_param_ffi_types(ty: &TypeRef) -> Vec<&'static str> {
+    match ty {
+        TypeRef::Bytes | TypeRef::BorrowedBytes => vec![":pointer", ":size_t"],
+        TypeRef::Optional(inner) if !is_c_pointer_type(inner) => vec![":pointer"],
+        TypeRef::Optional(inner) => rb_param_ffi_types(inner),
+        TypeRef::List(_) => vec![":pointer", ":size_t"],
+        TypeRef::Map(_, _) => vec![":pointer", ":pointer", ":size_t"],
+        _ => vec![rb_ffi_scalar(ty)],
+    }
+}
+
+fn rb_return_ffi_type(ty: &TypeRef) -> &'static str {
+    match ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => ":pointer",
+        TypeRef::Bytes | TypeRef::BorrowedBytes => ":pointer",
+        TypeRef::Optional(inner) if is_c_pointer_type(inner) => rb_return_ffi_type(inner),
+        TypeRef::Optional(_) => ":pointer",
+        TypeRef::List(_) => ":pointer",
+        TypeRef::Map(_, _) => ":void",
+        _ => rb_ffi_scalar(ty),
+    }
+}
+
+fn rb_return_out_params(ty: &TypeRef) -> Vec<&'static str> {
+    match ty {
+        TypeRef::Bytes | TypeRef::BorrowedBytes => vec![":pointer"],
+        TypeRef::Optional(inner) if is_c_pointer_type(inner) => rb_return_out_params(inner),
+        TypeRef::List(_) => vec![":pointer"],
+        TypeRef::Map(_, _) => vec![":pointer", ":pointer", ":pointer"],
+        _ => vec![],
+    }
+}
+
+fn rb_read_method(ty: &TypeRef) -> &'static str {
+    match ty {
+        TypeRef::I32 | TypeRef::Bool | TypeRef::Enum(_) => "read_int32",
+        TypeRef::U32 => "read_uint32",
+        TypeRef::I64 => "read_int64",
+        TypeRef::F64 => "read_double",
+        TypeRef::Handle => "read_uint64",
+        _ => "read_pointer",
+    }
+}
+
+fn rb_mem_type(ty: &TypeRef) -> &'static str {
+    match ty {
+        TypeRef::I32 | TypeRef::Bool | TypeRef::Enum(_) => ":int32",
+        TypeRef::U32 => ":uint32",
+        TypeRef::I64 => ":int64",
+        TypeRef::F64 => ":double",
+        TypeRef::Handle => ":uint64",
+        _ => ":pointer",
+    }
+}
+
+fn rb_write_method(ty: &TypeRef) -> &'static str {
+    match ty {
+        TypeRef::I32 | TypeRef::Bool | TypeRef::Enum(_) => "write_int32",
+        TypeRef::U32 => "write_uint32",
+        TypeRef::I64 => "write_int64",
+        TypeRef::F64 => "write_double",
+        TypeRef::Handle => "write_uint64",
+        _ => "write_pointer",
+    }
+}
+
+fn rb_array_reader(ty: &TypeRef) -> &'static str {
+    match ty {
+        TypeRef::I32 | TypeRef::Bool | TypeRef::Enum(_) => "read_array_of_int32",
+        TypeRef::U32 => "read_array_of_uint32",
+        TypeRef::I64 => "read_array_of_int64",
+        TypeRef::F64 => "read_array_of_double",
+        TypeRef::Handle => "read_array_of_uint64",
+        _ => "read_array_of_pointer",
+    }
+}
+
+fn rb_array_writer(ty: &TypeRef) -> &'static str {
+    match ty {
+        TypeRef::I32 | TypeRef::Enum(_) => "write_array_of_int32",
+        TypeRef::U32 => "write_array_of_uint32",
+        TypeRef::I64 => "write_array_of_int64",
+        TypeRef::F64 => "write_array_of_double",
+        TypeRef::Handle => "write_array_of_uint64",
+        _ => "write_array_of_pointer",
+    }
+}
+
+fn get_map_kv(ty: &TypeRef) -> Option<(&TypeRef, &TypeRef)> {
+    match ty {
+        TypeRef::Map(k, v) => Some((k, v)),
+        TypeRef::Optional(inner) => get_map_kv(inner),
+        _ => None,
+    }
+}
+
+fn rb_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
+    match ty {
+        TypeRef::I32
+        | TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::F64
+        | TypeRef::Handle
+        | TypeRef::Enum(_)
+        | TypeRef::StringUtf8
+        | TypeRef::BorrowedStr => {
+            vec![name.to_string()]
+        }
+        TypeRef::Bool => vec![format!("{name}_c")],
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            vec![format!("{name}_buf"), format!("{name}.bytesize")]
+        }
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => vec![format!("{name}.handle")],
+        TypeRef::Optional(inner) if !is_c_pointer_type(inner) => vec![format!("{name}_c")],
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![name.to_string()],
+            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => vec![format!("{name}&.handle")],
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
+                vec![format!("{name}_buf"), format!("{name}_len")]
+            }
+            TypeRef::List(_) => vec![format!("{name}_buf"), format!("{name}_len")],
+            TypeRef::Map(_, _) => vec![
+                format!("{name}_keys_buf"),
+                format!("{name}_vals_buf"),
+                format!("{name}_len"),
+            ],
+            _ => rb_call_args(name, inner),
+        },
+        TypeRef::List(_) => vec![format!("{name}_buf"), format!("{name}.length")],
+        TypeRef::Map(_, _) => vec![
+            format!("{name}_keys_buf"),
+            format!("{name}_vals_buf"),
+            format!("{name}.length"),
+        ],
+        TypeRef::Callback(_) => vec![name.to_string()],
+    }
+}
+
+fn rb_element_expr(var: &str, ty: &TypeRef) -> String {
+    match ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            format!("{var}.null? ? '' : {var}.read_string")
+        }
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => format!("{name}.new({var})"),
+        TypeRef::Bool => format!("{var} != 0"),
+        _ => var.to_string(),
+    }
+}
+
+// ── Rendering ──
+
+fn render_ruby_module(api: &Api) -> String {
+    let mut out = String::new();
+    render_preamble(&mut out);
+    for m in &api.modules {
+        out.push_str(&format!("\n  # === Module: {} ===\n", m.name));
+        for e in &m.enums {
+            render_enum(&mut out, e);
+        }
+        for s in &m.structs {
+            render_struct_ffi(&mut out, &m.name, s);
+        }
+        for f in &m.functions {
+            if !f.r#async {
+                render_attach_function(&mut out, &m.name, f);
+            }
+        }
+        for s in &m.structs {
+            render_struct_class(&mut out, &m.name, s);
+        }
+        for f in &m.functions {
+            if !f.r#async {
+                render_function_wrapper(&mut out, &m.name, f);
+            }
+        }
+    }
+    out.push_str("end\n");
+    out
+}
+
+fn render_preamble(out: &mut String) {
+    out.push_str(
+        "# frozen_string_literal: true
+# WeaveFFI Ruby FFI bindings (auto-generated)
+
+require 'ffi'
+
+module WeaveFFI
+  extend FFI::Library
+
+  case FFI::Platform::OS
+  when /darwin/
+    ffi_lib 'libweaveffi.dylib'
+  when /mswin|mingw/
+    ffi_lib 'weaveffi.dll'
+  else
+    ffi_lib 'libweaveffi.so'
+  end
+
+  class ErrorStruct < FFI::Struct
+    layout :code, :int32,
+           :message, :pointer
+  end
+
+  class Error < StandardError
+    attr_reader :code
+
+    def initialize(code, message)
+      @code = code
+      super(message)
+    end
+  end
+
+  attach_function :weaveffi_error_clear, [:pointer], :void
+  attach_function :weaveffi_free_string, [:pointer], :void
+  attach_function :weaveffi_free_bytes, [:pointer, :size_t], :void
+
+  def self.check_error!(err)
+    return if err[:code].zero?
+    code = err[:code]
+    msg_ptr = err[:message]
+    msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    weaveffi_error_clear(err.to_ptr)
+    raise Error.new(code, msg)
+  end
+",
+    );
+}
+
+fn render_enum(out: &mut String, e: &EnumDef) {
+    out.push_str(&format!("\n  module {}\n", e.name));
+    for v in &e.variants {
+        out.push_str(&format!(
+            "    {} = {}\n",
+            v.name.to_shouty_snake_case(),
+            v.value
+        ));
+    }
+    out.push_str("  end\n");
+}
+
+fn render_struct_ffi(out: &mut String, module_name: &str, s: &StructDef) {
+    let prefix = format!("weaveffi_{}_{}", module_name, s.name);
+    out.push_str(&format!(
+        "\n  attach_function :{prefix}_destroy, [:pointer], :void\n"
+    ));
+    for field in &s.fields {
+        let getter = format!("{prefix}_get_{}", field.name);
+        let mut argtypes = vec![":pointer".to_string()];
+        argtypes.extend(
+            rb_return_out_params(&field.ty)
+                .iter()
+                .map(|s| s.to_string()),
+        );
+        let restype = rb_return_ffi_type(&field.ty);
+        out.push_str(&format!(
+            "  attach_function :{getter}, [{}], {restype}\n",
+            argtypes.join(", ")
+        ));
+    }
+}
+
+fn render_attach_function(out: &mut String, module_name: &str, f: &Function) {
+    let c_sym = c_symbol_name(module_name, &f.name);
+    let mut argtypes: Vec<String> = Vec::new();
+    for p in &f.params {
+        argtypes.extend(rb_param_ffi_types(&p.ty).iter().map(|s| s.to_string()));
+    }
+    if let Some(ret_ty) = &f.returns {
+        argtypes.extend(rb_return_out_params(ret_ty).iter().map(|s| s.to_string()));
+    }
+    argtypes.push(":pointer".into());
+    let restype = f
+        .returns
+        .as_ref()
+        .map(|ty| rb_return_ffi_type(ty))
+        .unwrap_or(":void");
+    out.push_str(&format!(
+        "  attach_function :{c_sym}, [{}], {restype}\n",
+        argtypes.join(", ")
+    ));
+}
+
+fn render_struct_class(out: &mut String, module_name: &str, s: &StructDef) {
+    let prefix = format!("weaveffi_{}_{}", module_name, s.name);
+
+    out.push_str(&format!("\n  class {}Ptr < FFI::AutoPointer\n", s.name));
+    out.push_str(&format!(
+        "    def self.release(ptr)\n      WeaveFFI.{prefix}_destroy(ptr)\n    end\n"
+    ));
+    out.push_str("  end\n\n");
+
+    out.push_str(&format!("  class {}\n", s.name));
+    out.push_str("    attr_reader :handle\n\n");
+    out.push_str(&format!(
+        "    def initialize(handle)\n      @handle = {}Ptr.new(handle)\n    end\n\n",
+        s.name
+    ));
+    out.push_str("    def self.create(handle)\n      new(handle)\n    end\n\n");
+    out.push_str(
+        "    def destroy\n      return if @handle.nil?\n      @handle.free\n      @handle = nil\n    end\n",
+    );
+
+    for field in &s.fields {
+        render_getter(out, &prefix, field);
+    }
+
+    out.push_str("  end\n");
+}
+
+fn render_getter(out: &mut String, prefix: &str, field: &StructField) {
+    let getter = format!("{prefix}_get_{}", field.name);
+    let ind = "      ";
+
+    out.push_str(&format!("\n    def {}\n", field.name));
+
+    let out_params = rb_return_out_params(&field.ty);
+    let is_map = get_map_kv(&field.ty).is_some();
+
+    if is_map {
+        out.push_str(&format!(
+            "{ind}out_keys = FFI::MemoryPointer.new(:pointer)\n"
+        ));
+        out.push_str(&format!(
+            "{ind}out_values = FFI::MemoryPointer.new(:pointer)\n"
+        ));
+        out.push_str(&format!("{ind}out_len = FFI::MemoryPointer.new(:size_t)\n"));
+        out.push_str(&format!(
+            "{ind}WeaveFFI.{getter}(@handle, out_keys, out_values, out_len)\n"
+        ));
+        let (k, v) = get_map_kv(&field.ty).unwrap();
+        let is_optional = matches!(&field.ty, TypeRef::Optional(_));
+        render_map_return_code(out, k, v, ind, is_optional);
+    } else if !out_params.is_empty() {
+        out.push_str(&format!("{ind}out_len = FFI::MemoryPointer.new(:size_t)\n"));
+        out.push_str(&format!(
+            "{ind}result = WeaveFFI.{getter}(@handle, out_len)\n"
+        ));
+        render_return_code(out, &field.ty, ind, true);
+    } else {
+        out.push_str(&format!("{ind}result = WeaveFFI.{getter}(@handle)\n"));
+        render_return_code(out, &field.ty, ind, true);
+    }
+
+    out.push_str("    end\n");
+}
+
+fn render_function_wrapper(out: &mut String, module_name: &str, f: &Function) {
+    let c_sym = c_symbol_name(module_name, &f.name);
+    let func_name = f.name.to_snake_case();
+    let ind = "    ";
+
+    let params: Vec<String> = f.params.iter().map(|p| p.name.to_snake_case()).collect();
+    out.push_str(&format!(
+        "\n  def self.{}({})\n",
+        func_name,
+        params.join(", ")
+    ));
+
+    out.push_str(&format!("{ind}err = ErrorStruct.new\n"));
+
+    for p in &f.params {
+        render_param_conversion(out, &p.name.to_snake_case(), &p.ty, ind);
+    }
+
+    let is_map_ret = f.returns.as_ref().and_then(get_map_kv).is_some();
+    let has_out_len = f
+        .returns
+        .as_ref()
+        .is_some_and(|ty| !rb_return_out_params(ty).is_empty())
+        && !is_map_ret;
+
+    if is_map_ret {
+        out.push_str(&format!(
+            "{ind}out_keys = FFI::MemoryPointer.new(:pointer)\n"
+        ));
+        out.push_str(&format!(
+            "{ind}out_values = FFI::MemoryPointer.new(:pointer)\n"
+        ));
+        out.push_str(&format!("{ind}out_len = FFI::MemoryPointer.new(:size_t)\n"));
+    } else if has_out_len {
+        out.push_str(&format!("{ind}out_len = FFI::MemoryPointer.new(:size_t)\n"));
+    }
+
+    let mut call_args: Vec<String> = Vec::new();
+    for p in &f.params {
+        call_args.extend(rb_call_args(&p.name.to_snake_case(), &p.ty));
+    }
+    if is_map_ret {
+        call_args.extend(["out_keys".into(), "out_values".into(), "out_len".into()]);
+    } else if has_out_len {
+        call_args.push("out_len".into());
+    }
+    call_args.push("err".into());
+
+    let call = format!("{c_sym}({})", call_args.join(", "));
+    if f.returns.is_some() && !is_map_ret {
+        out.push_str(&format!("{ind}result = {call}\n"));
+    } else {
+        out.push_str(&format!("{ind}{call}\n"));
+    }
+
+    out.push_str(&format!("{ind}check_error!(err)\n"));
+
+    if let Some(ret_ty) = &f.returns {
+        if is_map_ret {
+            let (k, v) = get_map_kv(ret_ty).unwrap();
+            let is_optional = matches!(ret_ty, TypeRef::Optional(_));
+            render_map_return_code(out, k, v, ind, is_optional);
+        } else {
+            render_return_code(out, ret_ty, ind, false);
+        }
+    }
+
+    out.push_str("  end\n");
+}
+
+// ── Parameter conversion ──
+
+fn render_param_conversion(out: &mut String, name: &str, ty: &TypeRef, ind: &str) {
+    match ty {
+        TypeRef::Bool => {
+            out.push_str(&format!("{ind}{name}_c = {name} ? 1 : 0\n"));
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            out.push_str(&format!(
+                "{ind}{name}_buf = FFI::MemoryPointer.new(:uint8, {name}.bytesize)\n"
+            ));
+            out.push_str(&format!("{ind}{name}_buf.put_bytes(0, {name})\n"));
+        }
+        TypeRef::Optional(inner) if !is_c_pointer_type(inner) => {
+            let mem = rb_mem_type(inner);
+            let write = rb_write_method(inner);
+            let val = match inner.as_ref() {
+                TypeRef::Bool => format!("{name} ? 1 : 0"),
+                _ => name.to_string(),
+            };
+            out.push_str(&format!(
+                "{ind}{name}_c = {name}.nil? ? FFI::Pointer::NULL : \
+                 begin; p = FFI::MemoryPointer.new({mem}); p.{write}({val}); p; end\n"
+            ));
+        }
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
+                out.push_str(&format!("{ind}if {name}.nil?\n"));
+                out.push_str(&format!("{ind}  {name}_buf = FFI::Pointer::NULL\n"));
+                out.push_str(&format!("{ind}  {name}_len = 0\n"));
+                out.push_str(&format!("{ind}else\n"));
+                out.push_str(&format!(
+                    "{ind}  {name}_buf = FFI::MemoryPointer.new(:uint8, {name}.bytesize)\n"
+                ));
+                out.push_str(&format!("{ind}  {name}_buf.put_bytes(0, {name})\n"));
+                out.push_str(&format!("{ind}  {name}_len = {name}.bytesize\n"));
+                out.push_str(&format!("{ind}end\n"));
+            }
+            TypeRef::List(elem) => {
+                out.push_str(&format!("{ind}if {name}.nil?\n"));
+                out.push_str(&format!("{ind}  {name}_buf = FFI::Pointer::NULL\n"));
+                out.push_str(&format!("{ind}  {name}_len = 0\n"));
+                out.push_str(&format!("{ind}else\n"));
+                render_list_buf(out, name, elem, &format!("{ind}  "));
+                out.push_str(&format!("{ind}  {name}_len = {name}.length\n"));
+                out.push_str(&format!("{ind}end\n"));
+            }
+            TypeRef::Map(k, v) => {
+                out.push_str(&format!("{ind}if {name}.nil?\n"));
+                out.push_str(&format!("{ind}  {name}_keys_buf = FFI::Pointer::NULL\n"));
+                out.push_str(&format!("{ind}  {name}_vals_buf = FFI::Pointer::NULL\n"));
+                out.push_str(&format!("{ind}  {name}_len = 0\n"));
+                out.push_str(&format!("{ind}else\n"));
+                render_map_buf(out, name, k, v, &format!("{ind}  "));
+                out.push_str(&format!("{ind}end\n"));
+            }
+            _ => {}
+        },
+        TypeRef::List(elem) => {
+            render_list_buf(out, name, elem, ind);
+        }
+        TypeRef::Map(k, v) => {
+            render_map_buf(out, name, k, v, ind);
+        }
+        _ => {}
+    }
+}
+
+fn render_list_buf(out: &mut String, name: &str, elem: &TypeRef, ind: &str) {
+    let mem = rb_mem_type(elem);
+    out.push_str(&format!(
+        "{ind}{name}_buf = FFI::MemoryPointer.new({mem}, {name}.length)\n"
+    ));
+    match elem {
+        TypeRef::Bool => {
+            out.push_str(&format!(
+                "{ind}{name}_buf.write_array_of_int32({name}.map {{ |v| v ? 1 : 0 }})\n"
+            ));
+        }
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+            out.push_str(&format!(
+                "{ind}{name}_buf.write_array_of_pointer({name}.map(&:handle))\n"
+            ));
+        }
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            out.push_str(&format!(
+                "{ind}{name}_buf.write_array_of_pointer(\
+                 {name}.map {{ |s| FFI::MemoryPointer.from_string(s) }})\n"
+            ));
+        }
+        _ => {
+            let write = rb_array_writer(elem);
+            out.push_str(&format!("{ind}{name}_buf.{write}({name})\n"));
+        }
+    }
+}
+
+fn render_map_buf(out: &mut String, name: &str, k: &TypeRef, v: &TypeRef, ind: &str) {
+    let k_mem = rb_mem_type(k);
+    let v_mem = rb_mem_type(v);
+    out.push_str(&format!("{ind}{name}_k = {name}.keys\n"));
+    out.push_str(&format!("{ind}{name}_v = {name}.values\n"));
+    out.push_str(&format!(
+        "{ind}{name}_keys_buf = FFI::MemoryPointer.new({k_mem}, {name}_k.length)\n"
+    ));
+    out.push_str(&format!(
+        "{ind}{name}_vals_buf = FFI::MemoryPointer.new({v_mem}, {name}_v.length)\n"
+    ));
+    let k_write = rb_array_writer(k);
+    let v_write = rb_array_writer(v);
+    out.push_str(&format!("{ind}{name}_keys_buf.{k_write}({name}_k)\n"));
+    out.push_str(&format!("{ind}{name}_vals_buf.{v_write}({name}_v)\n"));
+}
+
+// ── Return value rendering ──
+
+fn render_return_code(out: &mut String, ty: &TypeRef, ind: &str, in_struct: bool) {
+    let m = if in_struct { "WeaveFFI." } else { "" };
+    match ty {
+        TypeRef::I32
+        | TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::F64
+        | TypeRef::Handle
+        | TypeRef::Enum(_) => {
+            out.push_str(&format!("{ind}result\n"));
+        }
+        TypeRef::Bool => {
+            out.push_str(&format!("{ind}result != 0\n"));
+        }
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            out.push_str(&format!("{ind}return '' if result.null?\n"));
+            out.push_str(&format!("{ind}str = result.read_string\n"));
+            out.push_str(&format!("{ind}{m}weaveffi_free_string(result)\n"));
+            out.push_str(&format!("{ind}str\n"));
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            out.push_str(&format!("{ind}return ''.b if result.null?\n"));
+            out.push_str(&format!("{ind}len = out_len.read(:size_t)\n"));
+            out.push_str(&format!("{ind}data = result.read_string(len)\n"));
+            out.push_str(&format!("{ind}{m}weaveffi_free_bytes(result, len)\n"));
+            out.push_str(&format!("{ind}data\n"));
+        }
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+            out.push_str(&format!(
+                "{ind}raise Error.new(-1, 'null pointer') if result.null?\n"
+            ));
+            out.push_str(&format!("{ind}{name}.new(result)\n"));
+        }
+        TypeRef::Optional(inner) => render_optional_return_code(out, inner, ind, in_struct),
+        TypeRef::List(inner) => {
+            out.push_str(&format!("{ind}return [] if result.null?\n"));
+            render_list_return_body(out, inner, ind);
+        }
+        TypeRef::Map(_, _) | TypeRef::Callback(_) => {
+            out.push_str(&format!("{ind}result\n"));
+        }
+    }
+}
+
+fn render_optional_return_code(out: &mut String, inner: &TypeRef, ind: &str, in_struct: bool) {
+    let m = if in_struct { "WeaveFFI." } else { "" };
+    match inner {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            out.push_str(&format!("{ind}return nil if result.null?\n"));
+            out.push_str(&format!("{ind}str = result.read_string\n"));
+            out.push_str(&format!("{ind}{m}weaveffi_free_string(result)\n"));
+            out.push_str(&format!("{ind}str\n"));
+        }
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+            out.push_str(&format!("{ind}return nil if result.null?\n"));
+            out.push_str(&format!("{ind}{name}.new(result)\n"));
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            out.push_str(&format!("{ind}return nil if result.null?\n"));
+            out.push_str(&format!("{ind}len = out_len.read(:size_t)\n"));
+            out.push_str(&format!("{ind}data = result.read_string(len)\n"));
+            out.push_str(&format!("{ind}{m}weaveffi_free_bytes(result, len)\n"));
+            out.push_str(&format!("{ind}data\n"));
+        }
+        TypeRef::Bool => {
+            out.push_str(&format!("{ind}return nil if result.null?\n"));
+            out.push_str(&format!("{ind}result.read_int32 != 0\n"));
+        }
+        TypeRef::List(elem) => {
+            out.push_str(&format!("{ind}return nil if result.null?\n"));
+            render_list_return_body(out, elem, ind);
+        }
+        TypeRef::Map(k, v) => {
+            render_map_return_code(out, k, v, ind, true);
+        }
+        _ if !is_c_pointer_type(inner) => {
+            let read = rb_read_method(inner);
+            out.push_str(&format!("{ind}return nil if result.null?\n"));
+            out.push_str(&format!("{ind}result.{read}\n"));
+        }
+        _ => {
+            out.push_str(&format!("{ind}result\n"));
+        }
+    }
+}
+
+fn render_list_return_body(out: &mut String, inner: &TypeRef, ind: &str) {
+    out.push_str(&format!("{ind}len = out_len.read(:size_t)\n"));
+    let reader = rb_array_reader(inner);
+    match inner {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            out.push_str(&format!(
+                "{ind}result.{reader}(len).map {{ |p| p.null? ? '' : p.read_string }}\n"
+            ));
+        }
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+            out.push_str(&format!(
+                "{ind}result.{reader}(len).map {{ |p| {name}.new(p) }}\n"
+            ));
+        }
+        TypeRef::Bool => {
+            out.push_str(&format!("{ind}result.{reader}(len).map {{ |v| v != 0 }}\n"));
+        }
+        _ => {
+            out.push_str(&format!("{ind}result.{reader}(len)\n"));
+        }
+    }
+}
+
+fn render_map_return_code(out: &mut String, k: &TypeRef, v: &TypeRef, ind: &str, optional: bool) {
+    let null_val = if optional { "nil" } else { "{}" };
+    out.push_str(&format!("{ind}len = out_len.read(:size_t)\n"));
+    out.push_str(&format!("{ind}keys_ptr = out_keys.read_pointer\n"));
+    out.push_str(&format!("{ind}vals_ptr = out_values.read_pointer\n"));
+    out.push_str(&format!(
+        "{ind}return {null_val} if keys_ptr.null? || vals_ptr.null?\n"
+    ));
+    let k_reader = rb_array_reader(k);
+    let v_reader = rb_array_reader(v);
+    let k_expr = rb_element_expr("k", k);
+    let v_expr = rb_element_expr("v", v);
+    out.push_str(&format!(
+        "{ind}keys_ptr.{k_reader}(len).zip(vals_ptr.{v_reader}(len))\
+         .each_with_object({{}}) {{ |(k, v), h| h[{k_expr}] = {v_expr} }}\n"
+    ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use camino::Utf8Path;
+    use weaveffi_ir::ir::{
+        Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
+    };
+
+    fn make_api(modules: Vec<Module>) -> Api {
+        Api {
+            version: "0.1.0".to_string(),
+            modules,
+            generators: None,
+        }
+    }
+
+    fn simple_module(name: &str, functions: Vec<Function>) -> Module {
+        Module {
+            name: name.into(),
+            functions,
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }
+    }
+
+    #[test]
+    fn name_returns_ruby() {
+        assert_eq!(RubyGenerator.name(), "ruby");
+    }
+
+    #[test]
+    fn generates_output_file() {
+        let api = make_api(vec![simple_module(
+            "math",
+            vec![Function {
+                name: "add".into(),
+                params: vec![
+                    Param {
+                        name: "a".into(),
+                        ty: TypeRef::I32,
+                    },
+                    Param {
+                        name: "b".into(),
+                        ty: TypeRef::I32,
+                    },
+                ],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+        )]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
+        RubyGenerator.generate(&api, out_dir).unwrap();
+
+        let file = out_dir.join("ruby/lib/weaveffi.rb");
+        assert!(file.exists(), "weaveffi.rb should exist");
+        let contents = std::fs::read_to_string(&file).unwrap();
+        assert!(contents.contains("require 'ffi'"));
+        assert!(contents.contains("module WeaveFFI"));
+        assert!(contents.contains("attach_function :weaveffi_math_add"));
+        assert!(contents.contains("def self.add(a, b)"));
+    }
+
+    #[test]
+    fn output_files_returns_correct_path() {
+        let api = make_api(vec![]);
+        let out_dir = Utf8Path::new("/tmp/out");
+        let files = RubyGenerator.output_files(&api, out_dir);
+        assert_eq!(files, vec!["/tmp/out/ruby/lib/weaveffi.rb"]);
+    }
+
+    #[test]
+    fn renders_enum_with_shouty_snake_case() {
+        let api = make_api(vec![Module {
+            name: "gfx".into(),
+            functions: vec![],
+            structs: vec![],
+            enums: vec![EnumDef {
+                name: "Color".into(),
+                doc: None,
+                variants: vec![
+                    EnumVariant {
+                        name: "Red".into(),
+                        value: 0,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "DarkBlue".into(),
+                        value: 1,
+                        doc: None,
+                    },
+                ],
+            }],
+            errors: None,
+        }]);
+
+        let code = render_ruby_module(&api);
+        assert!(code.contains("module Color"), "enum module: {code}");
+        assert!(code.contains("RED = 0"), "RED: {code}");
+        assert!(code.contains("DARK_BLUE = 1"), "DARK_BLUE: {code}");
+    }
+
+    #[test]
+    fn renders_struct_with_auto_pointer() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![
+                    StructField {
+                        name: "id".into(),
+                        ty: TypeRef::I64,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    },
+                ],
+            }],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let code = render_ruby_module(&api);
+        assert!(
+            code.contains("class ContactPtr < FFI::AutoPointer"),
+            "AutoPointer: {code}"
+        );
+        assert!(
+            code.contains("WeaveFFI.weaveffi_contacts_Contact_destroy(ptr)"),
+            "release: {code}"
+        );
+        assert!(code.contains("class Contact"), "class: {code}");
+        assert!(code.contains("attr_reader :handle"), "handle: {code}");
+        assert!(
+            code.contains("@handle = ContactPtr.new(handle)"),
+            "init: {code}"
+        );
+        assert!(code.contains("def self.create(handle)"), "create: {code}");
+        assert!(code.contains("def destroy"), "destroy: {code}");
+        assert!(code.contains("def id"), "id getter: {code}");
+        assert!(code.contains("def name"), "name getter: {code}");
+    }
+
+    #[test]
+    fn struct_getter_frees_string() {
+        let api = make_api(vec![Module {
+            name: "data".into(),
+            functions: vec![],
+            structs: vec![StructDef {
+                name: "Item".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "label".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                }],
+            }],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let code = render_ruby_module(&api);
+        assert!(
+            code.contains("WeaveFFI.weaveffi_free_string(result)"),
+            "free_string in getter: {code}"
+        );
+    }
+
+    #[test]
+    fn function_wrapper_checks_error() {
+        let api = make_api(vec![simple_module(
+            "math",
+            vec![Function {
+                name: "add".into(),
+                params: vec![
+                    Param {
+                        name: "a".into(),
+                        ty: TypeRef::I32,
+                    },
+                    Param {
+                        name: "b".into(),
+                        ty: TypeRef::I32,
+                    },
+                ],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+        )]);
+
+        let code = render_ruby_module(&api);
+        assert!(code.contains("err = ErrorStruct.new"), "err alloc: {code}");
+        assert!(code.contains("check_error!(err)"), "check_error: {code}");
+    }
+
+    #[test]
+    fn string_return_reads_and_frees() {
+        let api = make_api(vec![simple_module(
+            "data",
+            vec![Function {
+                name: "get_name".into(),
+                params: vec![],
+                returns: Some(TypeRef::StringUtf8),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+        )]);
+
+        let code = render_ruby_module(&api);
+        assert!(code.contains("result.read_string"), "read_string: {code}");
+        assert!(
+            code.contains("weaveffi_free_string(result)"),
+            "free_string: {code}"
+        );
+        assert!(
+            code.contains("return '' if result.null?"),
+            "null check: {code}"
+        );
+    }
+
+    #[test]
+    fn bool_param_and_return_conversion() {
+        let api = make_api(vec![simple_module(
+            "check",
+            vec![Function {
+                name: "is_valid".into(),
+                params: vec![Param {
+                    name: "value".into(),
+                    ty: TypeRef::Bool,
+                }],
+                returns: Some(TypeRef::Bool),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+        )]);
+
+        let code = render_ruby_module(&api);
+        assert!(
+            code.contains("value_c = value ? 1 : 0"),
+            "bool param: {code}"
+        );
+        assert!(code.contains("result != 0"), "bool return: {code}");
+    }
+
+    #[test]
+    fn optional_string_returns_nil() {
+        let api = make_api(vec![simple_module(
+            "data",
+            vec![Function {
+                name: "find".into(),
+                params: vec![],
+                returns: Some(TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+        )]);
+
+        let code = render_ruby_module(&api);
+        assert!(
+            code.contains("return nil if result.null?"),
+            "optional nil: {code}"
+        );
+    }
+
+    #[test]
+    fn list_return_uses_array() {
+        let api = make_api(vec![simple_module(
+            "data",
+            vec![Function {
+                name: "list_ids".into(),
+                params: vec![],
+                returns: Some(TypeRef::List(Box::new(TypeRef::I32))),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+        )]);
+
+        let code = render_ruby_module(&api);
+        assert!(
+            code.contains("return [] if result.null?"),
+            "empty array: {code}"
+        );
+        assert!(code.contains("read_array_of_int32"), "array reader: {code}");
+    }
+
+    #[test]
+    fn map_return_builds_hash() {
+        let api = make_api(vec![simple_module(
+            "data",
+            vec![Function {
+                name: "get_metadata".into(),
+                params: vec![],
+                returns: Some(TypeRef::Map(
+                    Box::new(TypeRef::StringUtf8),
+                    Box::new(TypeRef::I32),
+                )),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+        )]);
+
+        let code = render_ruby_module(&api);
+        assert!(code.contains("out_keys"), "out_keys: {code}");
+        assert!(code.contains("out_values"), "out_values: {code}");
+        assert!(code.contains("each_with_object"), "hash build: {code}");
+    }
+
+    #[test]
+    fn struct_return_wraps_in_class() {
+        let api = make_api(vec![Module {
+            name: "data".into(),
+            functions: vec![Function {
+                name: "get_item".into(),
+                params: vec![Param {
+                    name: "id".into(),
+                    ty: TypeRef::I64,
+                }],
+                returns: Some(TypeRef::Struct("Item".into())),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+            structs: vec![StructDef {
+                name: "Item".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "id".into(),
+                    ty: TypeRef::I64,
+                    doc: None,
+                }],
+            }],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let code = render_ruby_module(&api);
+        assert!(code.contains("Item.new(result)"), "struct wrap: {code}");
+        assert!(
+            code.contains("raise Error.new(-1, 'null pointer') if result.null?"),
+            "null ptr: {code}"
+        );
+    }
+
+    #[test]
+    fn skips_async_functions() {
+        let api = make_api(vec![simple_module(
+            "io",
+            vec![Function {
+                name: "read".into(),
+                params: vec![],
+                returns: Some(TypeRef::StringUtf8),
+                doc: None,
+                r#async: true,
+                cancellable: false,
+            }],
+        )]);
+
+        let code = render_ruby_module(&api);
+        assert!(
+            !code.contains("def self.read"),
+            "async should be skipped: {code}"
+        );
+        assert!(
+            !code.contains("weaveffi_io_read"),
+            "async attach should be skipped: {code}"
+        );
+    }
+
+    #[test]
+    fn preamble_has_platform_detection() {
+        let code = render_ruby_module(&make_api(vec![]));
+        assert!(code.contains("FFI::Platform::OS"), "platform: {code}");
+        assert!(code.contains("libweaveffi.dylib"), "darwin: {code}");
+        assert!(code.contains("weaveffi.dll"), "windows: {code}");
+        assert!(code.contains("libweaveffi.so"), "linux: {code}");
+    }
+
+    #[test]
+    fn error_class_structure() {
+        let code = render_ruby_module(&make_api(vec![]));
+        assert!(
+            code.contains("class Error < StandardError"),
+            "Error class: {code}"
+        );
+        assert!(code.contains("attr_reader :code"), "code attr: {code}");
+    }
+
+    #[test]
+    fn handle_type_uses_uint64() {
+        let api = make_api(vec![simple_module(
+            "store",
+            vec![Function {
+                name: "create".into(),
+                params: vec![],
+                returns: Some(TypeRef::Handle),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+        )]);
+
+        let code = render_ruby_module(&api);
+        assert!(code.contains(":uint64"), "handle type: {code}");
+    }
+
+    #[test]
+    fn ffi_type_mapping() {
+        assert_eq!(rb_ffi_scalar(&TypeRef::I32), ":int32");
+        assert_eq!(rb_ffi_scalar(&TypeRef::U32), ":uint32");
+        assert_eq!(rb_ffi_scalar(&TypeRef::I64), ":int64");
+        assert_eq!(rb_ffi_scalar(&TypeRef::F64), ":double");
+        assert_eq!(rb_ffi_scalar(&TypeRef::Bool), ":int32");
+        assert_eq!(rb_ffi_scalar(&TypeRef::Handle), ":uint64");
+        assert_eq!(rb_ffi_scalar(&TypeRef::StringUtf8), ":string");
+        assert_eq!(rb_ffi_scalar(&TypeRef::Enum("Color".into())), ":int32");
+        assert_eq!(rb_ffi_scalar(&TypeRef::Struct("Foo".into())), ":pointer");
+    }
+
+    #[test]
+    fn return_type_string_is_pointer() {
+        assert_eq!(rb_return_ffi_type(&TypeRef::StringUtf8), ":pointer");
+    }
+
+    #[test]
+    fn return_type_map_is_void() {
+        assert_eq!(
+            rb_return_ffi_type(&TypeRef::Map(
+                Box::new(TypeRef::StringUtf8),
+                Box::new(TypeRef::I32)
+            )),
+            ":void"
+        );
+    }
+
+    #[test]
+    fn enum_param_passes_int32() {
+        let api = make_api(vec![simple_module(
+            "gfx",
+            vec![Function {
+                name: "set_color".into(),
+                params: vec![Param {
+                    name: "color".into(),
+                    ty: TypeRef::Enum("Color".into()),
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+        )]);
+
+        let code = render_ruby_module(&api);
+        assert!(code.contains(":int32"), "enum type: {code}");
+    }
+
+    #[test]
+    fn void_function_no_result() {
+        let api = make_api(vec![simple_module(
+            "store",
+            vec![Function {
+                name: "clear".into(),
+                params: vec![],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+        )]);
+
+        let code = render_ruby_module(&api);
+        assert!(code.contains(":void"), "void return: {code}");
+        assert!(
+            !code.contains("result = weaveffi_store_clear"),
+            "no result capture: {code}"
+        );
+    }
+
+    #[test]
+    fn list_of_structs_return() {
+        let api = make_api(vec![Module {
+            name: "data".into(),
+            functions: vec![Function {
+                name: "list_items".into(),
+                params: vec![],
+                returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Item".into())))),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+            structs: vec![StructDef {
+                name: "Item".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "id".into(),
+                    ty: TypeRef::I64,
+                    doc: None,
+                }],
+            }],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let code = render_ruby_module(&api);
+        assert!(code.contains("Item.new(p)"), "struct list element: {code}");
+    }
+
+    #[test]
+    fn optional_struct_returns_nil_on_null() {
+        let api = make_api(vec![simple_module(
+            "data",
+            vec![Function {
+                name: "find_item".into(),
+                params: vec![Param {
+                    name: "id".into(),
+                    ty: TypeRef::I64,
+                }],
+                returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct("Item".into())))),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+        )]);
+
+        let code = render_ruby_module(&api);
+        assert!(
+            code.contains("return nil if result.null?"),
+            "optional struct nil: {code}"
+        );
+        assert!(
+            code.contains("Item.new(result)"),
+            "optional struct wrap: {code}"
+        );
+    }
+}

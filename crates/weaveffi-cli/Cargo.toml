@@ -32,6 +32,7 @@ weaveffi-gen-dotnet = { path = "../weaveffi-gen-dotnet", version = "0.2.0" }
 weaveffi-gen-cpp = { path = "../weaveffi-gen-cpp", version = "0.2.0" }
 weaveffi-gen-dart = { path = "../weaveffi-gen-dart", version = "0.2.0" }
 weaveffi-gen-go = { path = "../weaveffi-gen-go", version = "0.2.0" }
+weaveffi-gen-ruby = { path = "../weaveffi-gen-ruby", version = "0.2.0" }
 syn = { workspace = true }
 quote = { workspace = true }
 serde_yaml = { workspace = true }

@@ -14,6 +14,7 @@ CRATES=(
   weaveffi-gen-wasm
   weaveffi-gen-python
   weaveffi-gen-dotnet
+  weaveffi-gen-ruby
   weaveffi-cli
 )
 
