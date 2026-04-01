@@ -113,6 +113,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-demo"
+version = "0.1.0"
+dependencies = [
+ "weaveffi-abi",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
