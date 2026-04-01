@@ -164,6 +164,8 @@ fn extract_function(item: &syn::ItemFn) -> Result<Function> {
         doc: extract_doc(&item.attrs),
         r#async: false,
         cancellable: false,
+        deprecated: None,
+        since: None,
     })
 }
 
@@ -183,6 +185,7 @@ fn extract_struct(item: &syn::ItemStruct) -> Result<StructDef> {
                     name: field_name,
                     ty: map_type(&f.ty)?,
                     doc: extract_doc(&f.attrs),
+                    default: None,
                 })
             })
             .collect::<Result<_>>()?,

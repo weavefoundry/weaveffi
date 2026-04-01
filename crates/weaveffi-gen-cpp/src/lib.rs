@@ -1013,6 +1013,11 @@ fn render_cpp_function(
         .collect();
     let fn_name = format!("{}_{}", abi_module, func.name);
 
+    if let Some(msg) = &func.deprecated {
+        let escaped = msg.replace('"', "\\\"");
+        out.push_str(&format!("[[deprecated(\"{escaped}\")]]\n"));
+    }
+
     out.push_str(&format!(
         "inline {cpp_ret} {fn_name}({}) {{\n",
         cpp_params.join(", ")
@@ -1217,6 +1222,11 @@ fn render_cpp_async_function(out: &mut String, func: &Function, abi_module: &str
         cpp_params.push("weaveffi_cancel_token* cancel_token = nullptr".to_string());
     }
     let fn_name = format!("{}_{}", abi_module, func.name);
+
+    if let Some(msg) = &func.deprecated {
+        let escaped = msg.replace('"', "\\\"");
+        out.push_str(&format!("[[deprecated(\"{escaped}\")]]\n"));
+    }
 
     out.push_str(&format!(
         "inline std::future<{cpp_ret}> {fn_name}({}) {{\n",
@@ -1445,6 +1455,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 }],
                 structs: vec![],
                 enums: vec![],
@@ -1489,21 +1501,25 @@ mod tests {
                             name: "name".to_string(),
                             ty: TypeRef::StringUtf8,
                             doc: None,
+                            default: None,
                         },
                         StructField {
                             name: "age".to_string(),
                             ty: TypeRef::I32,
                             doc: None,
+                            default: None,
                         },
                         StructField {
                             name: "email".to_string(),
                             ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                             doc: None,
+                            default: None,
                         },
                         StructField {
                             name: "contact_type".to_string(),
                             ty: TypeRef::Enum("ContactType".to_string()),
                             doc: None,
+                            default: None,
                         },
                     ],
                 }],
@@ -1519,6 +1535,8 @@ mod tests {
                         doc: None,
                         r#async: false,
                         cancellable: false,
+                        deprecated: None,
+                        since: None,
                     },
                     Function {
                         name: "delete_contact".to_string(),
@@ -1531,6 +1549,8 @@ mod tests {
                         doc: None,
                         r#async: false,
                         cancellable: false,
+                        deprecated: None,
+                        since: None,
                     },
                 ],
                 errors: None,
@@ -1904,6 +1924,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 }],
                 structs: vec![],
                 enums: vec![],
@@ -1939,6 +1961,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 }],
                 structs: vec![],
                 enums: vec![],
@@ -1981,6 +2005,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 }],
                 structs: vec![],
                 enums: vec![],
@@ -2020,6 +2046,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 }],
                 structs: vec![],
                 enums: vec![EnumDef {
@@ -2073,6 +2101,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 }],
                 structs: vec![StructDef {
                     name: "Contact".into(),
@@ -2082,6 +2112,7 @@ mod tests {
                         name: "name".into(),
                         ty: TypeRef::StringUtf8,
                         doc: None,
+                        default: None,
                     }],
                 }],
                 enums: vec![],
@@ -2119,6 +2150,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 }],
                 structs: vec![],
                 enums: vec![],
@@ -2155,6 +2188,7 @@ mod tests {
                         name: "scores".into(),
                         ty: TypeRef::List(Box::new(TypeRef::I32)),
                         doc: None,
+                        default: None,
                     }],
                 }],
                 enums: vec![],
@@ -2187,6 +2221,7 @@ mod tests {
                         name: "tags".into(),
                         ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
                         doc: None,
+                        default: None,
                     }],
                 }],
                 enums: vec![],
@@ -2271,6 +2306,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 }],
                 structs: vec![],
                 enums: vec![],
@@ -2306,6 +2343,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 }],
                 structs: vec![StructDef {
                     name: "Connection".into(),
@@ -2364,6 +2403,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 }],
                 structs: vec![],
                 enums: vec![],
@@ -2526,11 +2567,13 @@ mod tests {
                             name: "name".into(),
                             ty: TypeRef::StringUtf8,
                             doc: None,
+                            default: None,
                         },
                         StructField {
                             name: "age".into(),
                             ty: TypeRef::I32,
                             doc: None,
+                            default: None,
                         },
                     ],
                 }],
@@ -2595,6 +2638,7 @@ mod tests {
                         name: "x".into(),
                         ty: TypeRef::F64,
                         doc: None,
+                        default: None,
                     }],
                 }],
                 enums: vec![],
@@ -2702,6 +2746,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 }],
                 structs: vec![StructDef {
                     name: "Config".into(),
@@ -2711,6 +2757,7 @@ mod tests {
                         name: "label".into(),
                         ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                         doc: None,
+                        default: None,
                     }],
                 }],
                 enums: vec![],
@@ -2754,6 +2801,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 }],
                 structs: vec![StructDef {
                     name: "Record".into(),
@@ -2763,6 +2812,7 @@ mod tests {
                         name: "values".into(),
                         ty: TypeRef::List(Box::new(TypeRef::F64)),
                         doc: None,
+                        default: None,
                     }],
                 }],
                 enums: vec![],
@@ -2811,6 +2861,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 }],
                 structs: vec![StructDef {
                     name: "Settings".into(),
@@ -2820,6 +2872,7 @@ mod tests {
                         name: "props".into(),
                         ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
                         doc: None,
+                        default: None,
                     }],
                 }],
                 enums: vec![],
@@ -2863,6 +2916,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 }],
                 structs: vec![StructDef {
                     name: "Session".into(),
@@ -2982,6 +3037,8 @@ mod tests {
                     doc: None,
                     r#async: true,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 }],
                 structs: vec![],
                 enums: vec![],
@@ -3035,6 +3092,8 @@ mod tests {
                         doc: None,
                         r#async: true,
                         cancellable: false,
+                        deprecated: None,
+                        since: None,
                     },
                     Function {
                         name: "fire".into(),
@@ -3043,6 +3102,8 @@ mod tests {
                         doc: None,
                         r#async: true,
                         cancellable: false,
+                        deprecated: None,
+                        since: None,
                     },
                 ],
                 structs: vec![],
@@ -3096,6 +3157,7 @@ mod tests {
                         name: "name".into(),
                         ty: TypeRef::StringUtf8,
                         doc: None,
+                        default: None,
                     }],
                 }],
                 enums: vec![],
@@ -3112,6 +3174,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 }],
                 errors: None,
                 modules: vec![],
@@ -3169,6 +3233,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 }],
                 structs: vec![],
                 enums: vec![],

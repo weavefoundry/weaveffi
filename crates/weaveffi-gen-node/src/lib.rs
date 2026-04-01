@@ -1096,6 +1096,9 @@ fn render_node_dts(api: &Api, strip_module_prefix: bool) -> String {
                 "/** Maps to C function: weaveffi_{}_{} */\n",
                 path, f.name
             ));
+            if let Some(msg) = &f.deprecated {
+                out.push_str(&format!("/** @deprecated {} */\n", msg));
+            }
             out.push_str(&format!(
                 "export function {}({}): {}\n",
                 ts_name,
@@ -1190,16 +1193,19 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
+                    default: None,
                 },
                 StructField {
                     name: "age".into(),
                     ty: TypeRef::I32,
                     doc: None,
+                    default: None,
                 },
                 StructField {
                     name: "active".into(),
                     ty: TypeRef::Bool,
                     doc: None,
+                    default: None,
                 },
             ],
             builder: false,
@@ -1238,6 +1244,8 @@ mod tests {
             doc: None,
             r#async: false,
             cancellable: false,
+            deprecated: None,
+            since: None,
         });
         m.functions.push(Function {
             name: "list_contacts".into(),
@@ -1246,6 +1254,8 @@ mod tests {
             doc: None,
             r#async: false,
             cancellable: false,
+            deprecated: None,
+            since: None,
         });
 
         let dts = render_node_dts(&make_api(vec![m]), true);
@@ -1293,6 +1303,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             });
             m
         }]);
@@ -1356,6 +1368,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 },
                 Function {
                     name: "list_contacts".to_string(),
@@ -1364,6 +1378,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 },
                 Function {
                     name: "set_favorite_color".to_string(),
@@ -1383,6 +1399,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 },
                 Function {
                     name: "get_tags".to_string(),
@@ -1395,6 +1413,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 },
             ],
             structs: vec![StructDef {
@@ -1405,16 +1425,19 @@ mod tests {
                         name: "name".to_string(),
                         ty: TypeRef::StringUtf8,
                         doc: None,
+                        default: None,
                     },
                     StructField {
                         name: "email".to_string(),
                         ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                         doc: None,
+                        default: None,
                     },
                     StructField {
                         name: "tags".to_string(),
                         ty: TypeRef::List(Box::new(TypeRef::StringUtf8)),
                         doc: None,
+                        default: None,
                     },
                 ],
                 builder: false,
@@ -1560,6 +1583,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             });
             m.functions.push(Function {
                 name: "subtract".into(),
@@ -1579,6 +1604,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             });
             m
         }]);
@@ -1619,6 +1646,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             });
             m
         }]);
@@ -1651,6 +1680,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             });
             m
         }]);
@@ -1676,6 +1707,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             });
             m
         }]);
@@ -1720,6 +1753,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             });
             m
         }]);
@@ -1745,6 +1780,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             });
             m
         }]);
@@ -1814,6 +1851,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
+                    default: None,
                 }],
                 builder: false,
             });
@@ -1828,6 +1866,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             });
             m
         }]);
@@ -1855,6 +1895,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
             structs: vec![StructDef {
                 name: "Contact".into(),
@@ -1863,6 +1905,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
+                    default: None,
                 }],
                 builder: false,
             }],
@@ -1897,6 +1940,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
             structs: vec![],
             enums: vec![],
@@ -1930,6 +1975,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
             structs: vec![StructDef {
                 name: "Contact".into(),
@@ -1938,6 +1985,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
+                    default: None,
                 }],
                 builder: false,
             }],
@@ -1985,6 +2033,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
+                    default: None,
                 }],
                 builder: false,
             });
@@ -1999,6 +2048,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             });
             m
         }]);
@@ -2046,6 +2097,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
+                    default: None,
                 }],
                 builder: false,
             });
@@ -2062,6 +2114,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             });
             m
         }]);
@@ -2091,6 +2145,8 @@ mod tests {
                 doc: None,
                 r#async: true,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             });
             m.functions.push(Function {
                 name: "fire_and_forget".into(),
@@ -2099,6 +2155,8 @@ mod tests {
                 doc: None,
                 r#async: true,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             });
             m
         }]);
@@ -2132,6 +2190,8 @@ mod tests {
                 doc: None,
                 r#async: true,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             });
             m
         }]);

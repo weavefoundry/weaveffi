@@ -60,6 +60,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 }],
                 structs: vec![],
                 enums: vec![],
@@ -120,6 +122,8 @@ mod tests {
             doc: None,
             r#async: false,
             cancellable: false,
+            deprecated: None,
+            since: None,
         });
         let h2 = hash_api(&api);
 
@@ -220,6 +224,8 @@ mod tests {
             doc: None,
             r#async: false,
             cancellable: false,
+            deprecated: None,
+            since: None,
         });
 
         orch.run(&modified_api, out_dir, &config, false, None)

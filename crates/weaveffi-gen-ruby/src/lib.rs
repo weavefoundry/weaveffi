@@ -516,6 +516,11 @@ fn render_function_wrapper(out: &mut String, module_name: &str, f: &Function) {
         params.join(", ")
     ));
 
+    if let Some(msg) = &f.deprecated {
+        let escaped = msg.replace('"', "\\\"");
+        out.push_str(&format!("{ind}warn \"[DEPRECATED] {escaped}\"\n"));
+    }
+
     out.push_str(&format!("{ind}err = ErrorStruct.new\n"));
 
     for p in &f.params {
@@ -935,6 +940,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
         )]);
 
@@ -1050,11 +1057,13 @@ mod tests {
                         name: "id".into(),
                         ty: TypeRef::I64,
                         doc: None,
+                        default: None,
                     },
                     StructField {
                         name: "name".into(),
                         ty: TypeRef::StringUtf8,
                         doc: None,
+                        default: None,
                     },
                 ],
             }],
@@ -1099,6 +1108,7 @@ mod tests {
                     name: "x".into(),
                     ty: TypeRef::F64,
                     doc: None,
+                    default: None,
                 }],
             }],
             enums: vec![],
@@ -1130,6 +1140,7 @@ mod tests {
                     name: "label".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
+                    default: None,
                 }],
             }],
             enums: vec![],
@@ -1168,6 +1179,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
         )]);
 
@@ -1187,6 +1200,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
         )]);
 
@@ -1217,6 +1232,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
         )]);
 
@@ -1239,6 +1256,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
         )]);
 
@@ -1260,6 +1279,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
         )]);
 
@@ -1285,6 +1306,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
         )]);
 
@@ -1309,6 +1332,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
             structs: vec![StructDef {
                 name: "Item".into(),
@@ -1318,6 +1343,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::I64,
                     doc: None,
+                    default: None,
                 }],
             }],
             enums: vec![],
@@ -1346,6 +1372,8 @@ mod tests {
                 doc: None,
                 r#async: true,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
         )]);
 
@@ -1390,6 +1418,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
         )]);
 
@@ -1441,6 +1471,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
         )]);
 
@@ -1459,6 +1491,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
         )]);
 
@@ -1481,6 +1515,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
             structs: vec![StructDef {
                 name: "Item".into(),
@@ -1490,6 +1526,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::I64,
                     doc: None,
+                    default: None,
                 }],
             }],
             enums: vec![],
@@ -1518,6 +1555,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
         )]);
 
@@ -1568,6 +1607,8 @@ mod tests {
                         doc: None,
                         r#async: false,
                         cancellable: false,
+                        deprecated: None,
+                        since: None,
                     },
                     Function {
                         name: "get_contact".into(),
@@ -1580,6 +1621,8 @@ mod tests {
                         doc: None,
                         r#async: false,
                         cancellable: false,
+                        deprecated: None,
+                        since: None,
                     },
                     Function {
                         name: "list_contacts".into(),
@@ -1588,6 +1631,8 @@ mod tests {
                         doc: None,
                         r#async: false,
                         cancellable: false,
+                        deprecated: None,
+                        since: None,
                     },
                     Function {
                         name: "delete_contact".into(),
@@ -1600,6 +1645,8 @@ mod tests {
                         doc: None,
                         r#async: false,
                         cancellable: false,
+                        deprecated: None,
+                        since: None,
                     },
                     Function {
                         name: "count_contacts".into(),
@@ -1608,6 +1655,8 @@ mod tests {
                         doc: None,
                         r#async: false,
                         cancellable: false,
+                        deprecated: None,
+                        since: None,
                     },
                 ],
                 structs: vec![StructDef {
@@ -1619,26 +1668,31 @@ mod tests {
                             name: "id".into(),
                             ty: TypeRef::I64,
                             doc: None,
+                            default: None,
                         },
                         StructField {
                             name: "first_name".into(),
                             ty: TypeRef::StringUtf8,
                             doc: None,
+                            default: None,
                         },
                         StructField {
                             name: "last_name".into(),
                             ty: TypeRef::StringUtf8,
                             doc: None,
+                            default: None,
                         },
                         StructField {
                             name: "email".into(),
                             ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                             doc: None,
+                            default: None,
                         },
                         StructField {
                             name: "contact_type".into(),
                             ty: TypeRef::Enum("ContactType".into()),
                             doc: None,
+                            default: None,
                         },
                     ],
                 }],
@@ -1694,6 +1748,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
         )]);
 
@@ -1729,6 +1785,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
             structs: vec![StructDef {
                 name: "Contact".into(),
@@ -1739,11 +1797,13 @@ mod tests {
                         name: "first_name".into(),
                         ty: TypeRef::StringUtf8,
                         doc: None,
+                        default: None,
                     },
                     StructField {
                         name: "last_name".into(),
                         ty: TypeRef::StringUtf8,
                         doc: None,
+                        default: None,
                     },
                 ],
             }],
@@ -1791,6 +1851,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
             structs: vec![],
             enums: vec![EnumDef {
@@ -1851,6 +1913,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 },
                 Function {
                     name: "find_count".into(),
@@ -1863,6 +1927,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 },
             ],
         )]);
@@ -1897,6 +1963,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 },
                 Function {
                     name: "set_names".into(),
@@ -1909,6 +1977,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 },
             ],
         )]);
@@ -2000,6 +2070,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
         )]);
 
@@ -2045,6 +2117,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
+                    default: None,
                 }],
             }],
             enums: vec![],
@@ -2061,6 +2134,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
             errors: None,
             modules: vec![],
@@ -2115,6 +2190,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
             structs: vec![],
             enums: vec![],

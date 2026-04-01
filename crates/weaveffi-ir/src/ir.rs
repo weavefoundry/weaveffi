@@ -14,7 +14,8 @@ pub struct Api {
     pub generators: Option<HashMap<String, toml::Value>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `Eq` is omitted because `StructField::default` contains `serde_yaml::Value`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Module {
     pub name: String,
     pub functions: Vec<Function>,
@@ -44,6 +45,10 @@ pub struct Function {
     pub r#async: bool,
     #[serde(default)]
     pub cancellable: bool,
+    #[serde(default)]
+    pub deprecated: Option<String>,
+    #[serde(default)]
+    pub since: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,7 +221,8 @@ pub struct EnumVariant {
     pub doc: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `Eq` is omitted because `StructField::default` contains `serde_yaml::Value`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StructDef {
     pub name: String,
     #[serde(default)]
@@ -226,13 +232,15 @@ pub struct StructDef {
     pub builder: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StructField {
     pub name: String,
     #[serde(rename = "type")]
     pub ty: TypeRef,
     #[serde(default)]
     pub doc: Option<String>,
+    #[serde(default)]
+    pub default: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -333,6 +341,7 @@ modules:
             name: "origin".to_string(),
             ty: TypeRef::Struct("Point".to_string()),
             doc: None,
+            default: None,
         };
         let json = serde_json::to_string(&field).unwrap();
         let back: StructField = serde_json::from_str(&json).unwrap();
@@ -456,16 +465,19 @@ modules:
                     name: "r".to_string(),
                     ty: TypeRef::U32,
                     doc: None,
+                    default: None,
                 },
                 StructField {
                     name: "g".to_string(),
                     ty: TypeRef::U32,
                     doc: None,
+                    default: None,
                 },
                 StructField {
                     name: "b".to_string(),
                     ty: TypeRef::U32,
                     doc: None,
+                    default: None,
                 },
             ],
             builder: false,
@@ -1141,5 +1153,70 @@ modules:
         }"#;
         let api: Api = serde_json::from_str(json).unwrap();
         assert!(!api.modules[0].functions[0].params[0].mutable);
+    }
+
+    #[test]
+    fn deprecated_and_since_default_to_none() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: math
+    functions:
+      - name: add
+        params: []
+"#;
+        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert_eq!(f.deprecated, None);
+        assert_eq!(f.since, None);
+    }
+
+    #[test]
+    fn deprecated_and_since_round_trip() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: math
+    functions:
+      - name: add_old
+        params: []
+        deprecated: "Use add_v2 instead"
+        since: "0.1.0"
+"#;
+        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert_eq!(f.deprecated.as_deref(), Some("Use add_v2 instead"));
+        assert_eq!(f.since.as_deref(), Some("0.1.0"));
+
+        let json = serde_json::to_string(&api).unwrap();
+        let back: Api = serde_json::from_str(&json).unwrap();
+        let f2 = &back.modules[0].functions[0];
+        assert_eq!(f2.deprecated.as_deref(), Some("Use add_v2 instead"));
+        assert_eq!(f2.since.as_deref(), Some("0.1.0"));
+    }
+
+    #[test]
+    fn struct_field_default_value_round_trip() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: contacts
+    functions: []
+    structs:
+      - name: Contact
+        fields:
+          - name: name
+            type: string
+          - name: age
+            type: i32
+            default: 0
+"#;
+        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        let fields = &api.modules[0].structs[0].fields;
+        assert!(fields[0].default.is_none());
+        assert_eq!(
+            fields[1].default,
+            Some(serde_yaml::Value::Number(serde_yaml::Number::from(0)))
+        );
     }
 }
