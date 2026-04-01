@@ -2,7 +2,7 @@ use anyhow::Result;
 use camino::Utf8Path;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
-use weaveffi_core::utils::{c_symbol_name, wrapper_name};
+use weaveffi_core::utils::{c_symbol_name, local_type_name, wrapper_name};
 use weaveffi_ir::ir::{Api, EnumDef, Function, StructDef, StructField, TypeRef};
 
 pub struct PythonGenerator;
@@ -124,7 +124,8 @@ fn py_type_hint(ty: &TypeRef) -> String {
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "str".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "bytes".into(),
-        TypeRef::Struct(name) | TypeRef::Enum(name) => format!("\"{}\"", name),
+        TypeRef::Enum(name) => format!("\"{}\"", name),
+        TypeRef::Struct(name) => format!("\"{}\"", local_type_name(name)),
         TypeRef::Optional(inner) => format!("Optional[{}]", py_type_hint(inner)),
         TypeRef::List(inner) => format!("List[{}]", py_type_hint(inner)),
         TypeRef::Map(k, v) => format!("Dict[{}, {}]", py_type_hint(k), py_type_hint(v)),
@@ -254,7 +255,16 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
         Some(TypeRef::Enum(name)) => {
             out.push_str(&format!("{ind}_state[\"val\"] = {name}(result)\n"));
         }
-        Some(TypeRef::Struct(name) | TypeRef::TypedHandle(name)) => {
+        Some(TypeRef::Struct(name)) => {
+            let name = local_type_name(name);
+            out.push_str(&format!("{ind}if result is None:\n"));
+            out.push_str(&format!(
+                "{ind}    _state[\"err\"] = WeaveffiError(-1, \"null pointer\")\n"
+            ));
+            out.push_str(&format!("{ind}else:\n"));
+            out.push_str(&format!("{ind}    _state[\"val\"] = {name}(result)\n"));
+        }
+        Some(TypeRef::TypedHandle(name)) => {
             out.push_str(&format!("{ind}if result is None:\n"));
             out.push_str(&format!(
                 "{ind}    _state[\"err\"] = WeaveffiError(-1, \"null pointer\")\n"
@@ -304,7 +314,14 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
                         out.push_str(&format!("{ind}    _lib.weaveffi_free_string(result)\n"));
                         out.push_str(&format!("{ind}    _state[\"val\"] = _s\n"));
                     }
-                    TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+                    TypeRef::Struct(name) => {
+                        let name = local_type_name(name);
+                        out.push_str(&format!("{ind}if not result:\n"));
+                        out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
+                        out.push_str(&format!("{ind}else:\n"));
+                        out.push_str(&format!("{ind}    _state[\"val\"] = {name}(result)\n"));
+                    }
+                    TypeRef::TypedHandle(name) => {
                         out.push_str(&format!("{ind}if not result:\n"));
                         out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
                         out.push_str(&format!("{ind}else:\n"));
@@ -915,7 +932,11 @@ fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
 fn py_read_element(expr: &str, ty: &TypeRef) -> String {
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("_bytes_to_string({expr})"),
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => format!("{name}({expr})"),
+        TypeRef::Struct(name) => {
+            let name = local_type_name(name);
+            format!("{name}({expr})")
+        }
+        TypeRef::TypedHandle(name) => format!("{name}({expr})"),
         TypeRef::Enum(name) => format!("{name}({expr})"),
         TypeRef::Bool => format!("bool({expr})"),
         _ => expr.to_string(),
@@ -938,7 +959,15 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
             out.push_str(&format!("{ind}    return b\"\"\n"));
             out.push_str(&format!("{ind}return bytes(_result[:_out_len.value])\n"));
         }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+        TypeRef::Struct(name) => {
+            let name = local_type_name(name);
+            out.push_str(&format!("{ind}if _result is None:\n"));
+            out.push_str(&format!(
+                "{ind}    raise WeaveffiError(-1, \"null pointer\")\n"
+            ));
+            out.push_str(&format!("{ind}return {name}(_result)\n"));
+        }
+        TypeRef::TypedHandle(name) => {
             out.push_str(&format!("{ind}if _result is None:\n"));
             out.push_str(&format!(
                 "{ind}    raise WeaveffiError(-1, \"null pointer\")\n"
@@ -965,7 +994,13 @@ fn render_optional_return(out: &mut String, inner: &TypeRef, ind: &str) {
             out.push_str(&format!("{ind}    return None\n"));
             out.push_str(&format!("{ind}return bytes(_result[:_out_len.value])\n"));
         }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+        TypeRef::Struct(name) => {
+            let name = local_type_name(name);
+            out.push_str(&format!("{ind}if _result is None:\n"));
+            out.push_str(&format!("{ind}    return None\n"));
+            out.push_str(&format!("{ind}return {name}(_result)\n"));
+        }
+        TypeRef::TypedHandle(name) => {
             out.push_str(&format!("{ind}if _result is None:\n"));
             out.push_str(&format!("{ind}    return None\n"));
             out.push_str(&format!("{ind}return {name}(_result)\n"));
@@ -3593,6 +3628,64 @@ mod tests {
         assert!(
             stubs.contains("async def fetch_data(id: int) -> str: ..."),
             "pyi should declare async def: {stubs}"
+        );
+    }
+
+    #[test]
+    fn python_cross_module_struct() {
+        let api = make_api(vec![
+            Module {
+                name: "types".into(),
+                functions: vec![],
+                structs: vec![StructDef {
+                    name: "Name".into(),
+                    doc: None,
+                    fields: vec![StructField {
+                        name: "value".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    }],
+                }],
+                enums: vec![],
+                errors: None,
+            },
+            Module {
+                name: "ops".into(),
+                functions: vec![Function {
+                    name: "get_name".into(),
+                    params: vec![Param {
+                        name: "id".into(),
+                        ty: TypeRef::I32,
+                    }],
+                    returns: Some(TypeRef::Struct("types.Name".into())),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            },
+        ]);
+
+        let code = render_python_module(&api, true);
+        let stubs = render_pyi_module(&api, true);
+
+        assert!(
+            code.contains("Name(_result)"),
+            "cross-module return should construct Name, not types.Name: {code}"
+        );
+        assert!(
+            !code.contains("types.Name"),
+            "dot-qualified name should not appear in generated Python code: {code}"
+        );
+        assert!(
+            stubs.contains("\"Name\""),
+            "pyi should use local type name: {stubs}"
+        );
+        assert!(
+            !stubs.contains("types.Name"),
+            "dot-qualified name should not appear in pyi stubs: {stubs}"
         );
     }
 }

@@ -3,7 +3,7 @@ use camino::Utf8Path;
 use heck::{ToShoutySnakeCase, ToSnakeCase};
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
-use weaveffi_core::utils::c_symbol_name;
+use weaveffi_core::utils::{c_symbol_name, local_type_name};
 use weaveffi_ir::ir::{Api, EnumDef, Function, StructDef, StructField, TypeRef};
 
 pub struct RubyGenerator;
@@ -232,7 +232,8 @@ fn rb_element_expr(var: &str, ty: &TypeRef) -> String {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             format!("{var}.null? ? '' : {var}.read_string")
         }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => format!("{name}.new({var})"),
+        TypeRef::TypedHandle(name) => format!("{name}.new({var})"),
+        TypeRef::Struct(name) => format!("{}.new({var})", local_type_name(name)),
         TypeRef::Bool => format!("{var} != 0"),
         _ => var.to_string(),
     }
@@ -656,11 +657,17 @@ fn render_return_code(out: &mut String, ty: &TypeRef, ind: &str, qualifier: Opti
             out.push_str(&format!("{ind}{m}weaveffi_free_bytes(result, len)\n"));
             out.push_str(&format!("{ind}data\n"));
         }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+        TypeRef::TypedHandle(name) => {
             out.push_str(&format!(
                 "{ind}raise Error.new(-1, 'null pointer') if result.null?\n"
             ));
             out.push_str(&format!("{ind}{name}.new(result)\n"));
+        }
+        TypeRef::Struct(name) => {
+            out.push_str(&format!(
+                "{ind}raise Error.new(-1, 'null pointer') if result.null?\n"
+            ));
+            out.push_str(&format!("{ind}{}.new(result)\n", local_type_name(name)));
         }
         TypeRef::Optional(inner) => render_optional_return_code(out, inner, ind, qualifier),
         TypeRef::List(inner) => {
@@ -687,9 +694,13 @@ fn render_optional_return_code(
             out.push_str(&format!("{ind}{m}weaveffi_free_string(result)\n"));
             out.push_str(&format!("{ind}str\n"));
         }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+        TypeRef::TypedHandle(name) => {
             out.push_str(&format!("{ind}return nil if result.null?\n"));
             out.push_str(&format!("{ind}{name}.new(result)\n"));
+        }
+        TypeRef::Struct(name) => {
+            out.push_str(&format!("{ind}return nil if result.null?\n"));
+            out.push_str(&format!("{ind}{}.new(result)\n", local_type_name(name)));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             out.push_str(&format!("{ind}return nil if result.null?\n"));
@@ -729,9 +740,15 @@ fn render_list_return_body(out: &mut String, inner: &TypeRef, ind: &str) {
                 "{ind}result.{reader}(len).map {{ |p| p.null? ? '' : p.read_string }}\n"
             ));
         }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+        TypeRef::TypedHandle(name) => {
             out.push_str(&format!(
                 "{ind}result.{reader}(len).map {{ |p| {name}.new(p) }}\n"
+            ));
+        }
+        TypeRef::Struct(name) => {
+            let local = local_type_name(name);
+            out.push_str(&format!(
+                "{ind}result.{reader}(len).map {{ |p| {local}.new(p) }}\n"
             ));
         }
         TypeRef::Bool => {

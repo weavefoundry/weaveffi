@@ -2,6 +2,7 @@ use anyhow::Result;
 use camino::Utf8Path;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
+use weaveffi_core::utils::c_abi_struct_name;
 use weaveffi_ir::ir::{Api, EnumDef, Module, Param, StructDef, TypeRef};
 
 pub struct CGenerator;
@@ -87,7 +88,7 @@ fn c_element_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
         TypeRef::TypedHandle(n) => format!("{prefix}_{module}_{n}*"),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*".to_string(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "const uint8_t*".to_string(),
-        TypeRef::Struct(s) => format!("{prefix}_{module}_{s}*"),
+        TypeRef::Struct(s) => format!("{}*", c_abi_struct_name(s, module, prefix)),
         TypeRef::Enum(e) => format!("{prefix}_{module}_{e}"),
         TypeRef::Optional(inner) | TypeRef::List(inner) => c_element_type(inner, module, prefix),
         TypeRef::Map(_, _) => "void*".to_string(),
@@ -108,7 +109,7 @@ fn c_type_for_param(ty: &TypeRef, name: &str, module: &str, prefix: &str) -> Str
         }
         TypeRef::Handle => format!("{prefix}_handle_t {name}"),
         TypeRef::TypedHandle(n) => format!("{prefix}_{module}_{n}* {name}"),
-        TypeRef::Struct(s) => format!("const {prefix}_{module}_{s}* {name}"),
+        TypeRef::Struct(s) => format!("const {}* {name}", c_abi_struct_name(s, module, prefix)),
         TypeRef::Enum(e) => format!("{prefix}_{module}_{e} {name}"),
         TypeRef::Optional(inner) => {
             if is_c_pointer_type(inner) {
@@ -159,7 +160,7 @@ fn c_ret_type(ty: &TypeRef, module: &str, prefix: &str) -> (String, Vec<String>)
         ),
         TypeRef::Handle => (format!("{prefix}_handle_t"), vec![]),
         TypeRef::TypedHandle(n) => (format!("{prefix}_{module}_{n}*"), vec![]),
-        TypeRef::Struct(s) => (format!("{prefix}_{module}_{s}*"), vec![]),
+        TypeRef::Struct(s) => (format!("{}*", c_abi_struct_name(s, module, prefix)), vec![]),
         TypeRef::Enum(e) => (format!("{prefix}_{module}_{e}"), vec![]),
         TypeRef::Optional(inner) => {
             if is_c_pointer_type(inner) {
@@ -1715,6 +1716,63 @@ mod tests {
         assert!(
             header.contains("weaveffi_cancel_token_destroy"),
             "header should declare cancel_token_destroy: {header}"
+        );
+    }
+
+    #[test]
+    fn c_cross_module_struct() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![
+                Module {
+                    name: "types".to_string(),
+                    functions: vec![],
+                    structs: vec![StructDef {
+                        name: "Name".to_string(),
+                        doc: None,
+                        fields: vec![StructField {
+                            name: "value".to_string(),
+                            ty: TypeRef::StringUtf8,
+                            doc: None,
+                        }],
+                    }],
+                    enums: vec![],
+                    errors: None,
+                },
+                Module {
+                    name: "ops".to_string(),
+                    functions: vec![Function {
+                        name: "get_name".to_string(),
+                        params: vec![Param {
+                            name: "id".to_string(),
+                            ty: TypeRef::I32,
+                        }],
+                        returns: Some(TypeRef::Struct("types.Name".to_string())),
+                        doc: None,
+                        r#async: false,
+                        cancellable: false,
+                    }],
+                    structs: vec![],
+                    enums: vec![],
+                    errors: None,
+                },
+            ],
+            generators: None,
+        };
+
+        let header = render_c_header(&api, "weaveffi");
+
+        assert!(
+            header.contains("typedef struct weaveffi_types_Name weaveffi_types_Name;"),
+            "struct def should use its own module prefix: {header}"
+        );
+        assert!(
+            header.contains("weaveffi_types_Name* weaveffi_ops_get_name("),
+            "cross-module return should use weaveffi_types_Name, not weaveffi_ops_types.Name: {header}"
+        );
+        assert!(
+            !header.contains("types.Name"),
+            "dot-qualified name should not appear in generated C code: {header}"
         );
     }
 }

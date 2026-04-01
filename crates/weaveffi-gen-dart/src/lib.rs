@@ -3,7 +3,7 @@ use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
-use weaveffi_core::utils::c_symbol_name;
+use weaveffi_core::utils::{c_symbol_name, local_type_name};
 use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, TypeRef};
 
 pub struct DartGenerator;
@@ -54,7 +54,8 @@ fn dart_type(ty: &TypeRef) -> String {
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "String".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "List<int>".into(),
-        TypeRef::TypedHandle(n) | TypeRef::Struct(n) | TypeRef::Enum(n) => n.to_upper_camel_case(),
+        TypeRef::TypedHandle(n) | TypeRef::Enum(n) => n.to_upper_camel_case(),
+        TypeRef::Struct(n) => local_type_name(n).to_upper_camel_case(),
         TypeRef::Optional(inner) => format!("{}?", dart_type(inner)),
         TypeRef::List(inner) => format!("List<{}>", dart_type(inner)),
         TypeRef::Map(k, v) => format!("Map<{}, {}>", dart_type(k), dart_type(v)),
@@ -439,7 +440,11 @@ fn emit_result_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
             let n = name.to_upper_camel_case();
             out.push_str(&format!("{indent}return {n}.fromValue(result);\n"));
         }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+        TypeRef::Struct(name) => {
+            let n = local_type_name(name).to_upper_camel_case();
+            out.push_str(&format!("{indent}return {n}._(result);\n"));
+        }
+        TypeRef::TypedHandle(name) => {
             let n = name.to_upper_camel_case();
             out.push_str(&format!("{indent}return {n}._(result);\n"));
         }
@@ -448,7 +453,12 @@ fn emit_result_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
                 out.push_str(&format!("{indent}if (result == nullptr) return null;\n"));
                 out.push_str(&format!("{indent}return result.toDartString();\n"));
             }
-            TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+            TypeRef::Struct(name) => {
+                let n = local_type_name(name).to_upper_camel_case();
+                out.push_str(&format!("{indent}if (result == nullptr) return null;\n"));
+                out.push_str(&format!("{indent}return {n}._(result);\n"));
+            }
+            TypeRef::TypedHandle(name) => {
                 let n = name.to_upper_camel_case();
                 out.push_str(&format!("{indent}if (result == nullptr) return null;\n"));
                 out.push_str(&format!("{indent}return {n}._(result);\n"));

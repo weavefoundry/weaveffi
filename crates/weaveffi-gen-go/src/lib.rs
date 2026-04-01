@@ -3,7 +3,7 @@ use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
-use weaveffi_core::utils::c_symbol_name;
+use weaveffi_core::utils::{c_symbol_name, local_type_name};
 use weaveffi_ir::ir::{Api, EnumDef, Function, StructDef, StructField, TypeRef};
 
 pub struct GoGenerator;
@@ -57,7 +57,8 @@ fn go_type(ty: &TypeRef) -> String {
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "[]byte".into(),
-        TypeRef::TypedHandle(n) | TypeRef::Struct(n) => format!("*{}", n.to_upper_camel_case()),
+        TypeRef::TypedHandle(n) => format!("*{}", n.to_upper_camel_case()),
+        TypeRef::Struct(n) => format!("*{}", local_type_name(n).to_upper_camel_case()),
         TypeRef::Enum(n) => n.to_upper_camel_case(),
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::Struct(_) | TypeRef::TypedHandle(_) => go_type(inner),
@@ -346,8 +347,12 @@ fn render_getter(
         TypeRef::Enum(_) => {
             out.push_str(&format!("\treturn {ret}({getter}(s.ptr))\n"));
         }
-        TypeRef::Struct(n) | TypeRef::TypedHandle(n) => {
+        TypeRef::TypedHandle(n) => {
             let inner = n.to_upper_camel_case();
+            out.push_str(&format!("\treturn &{inner}{{ptr: {getter}(s.ptr)}}\n"));
+        }
+        TypeRef::Struct(n) => {
+            let inner = local_type_name(n).to_upper_camel_case();
             out.push_str(&format!("\treturn &{inner}{{ptr: {getter}(s.ptr)}}\n"));
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
@@ -357,8 +362,14 @@ fn render_getter(
                 out.push_str("\tv := C.GoString(cStr)\n");
                 out.push_str("\treturn &v\n");
             }
-            TypeRef::Struct(n) | TypeRef::TypedHandle(n) => {
+            TypeRef::TypedHandle(n) => {
                 let inner_go = n.to_upper_camel_case();
+                out.push_str(&format!("\tcPtr := {getter}(s.ptr)\n"));
+                out.push_str("\tif cPtr == nil {\n\t\treturn nil\n\t}\n");
+                out.push_str(&format!("\treturn &{inner_go}{{ptr: cPtr}}\n"));
+            }
+            TypeRef::Struct(n) => {
+                let inner_go = local_type_name(n).to_upper_camel_case();
                 out.push_str(&format!("\tcPtr := {getter}(s.ptr)\n"));
                 out.push_str("\tif cPtr == nil {\n\t\treturn nil\n\t}\n");
                 out.push_str(&format!("\treturn &{inner_go}{{ptr: cPtr}}\n"));
@@ -702,8 +713,12 @@ fn emit_return(out: &mut String, ty: &TypeRef, module: &str) {
             let conv = go_scalar_conv("result", ty);
             out.push_str(&format!("\treturn {conv}, nil\n"));
         }
-        TypeRef::Struct(n) | TypeRef::TypedHandle(n) => {
+        TypeRef::TypedHandle(n) => {
             let g = n.to_upper_camel_case();
+            out.push_str(&format!("\treturn &{g}{{ptr: result}}, nil\n"));
+        }
+        TypeRef::Struct(n) => {
+            let g = local_type_name(n).to_upper_camel_case();
             out.push_str(&format!("\treturn &{g}{{ptr: result}}, nil\n"));
         }
         TypeRef::Optional(inner) => emit_optional_return(out, inner, module),
@@ -727,8 +742,12 @@ fn emit_optional_return(out: &mut String, inner: &TypeRef, _module: &str) {
             out.push_str("\tC.weaveffi_free_string(result)\n");
             out.push_str("\treturn &v, nil\n");
         }
-        TypeRef::Struct(n) | TypeRef::TypedHandle(n) => {
+        TypeRef::TypedHandle(n) => {
             let g = n.to_upper_camel_case();
+            out.push_str(&format!("\treturn &{g}{{ptr: result}}, nil\n"));
+        }
+        TypeRef::Struct(n) => {
+            let g = local_type_name(n).to_upper_camel_case();
             out.push_str(&format!("\treturn &{g}{{ptr: result}}, nil\n"));
         }
         TypeRef::Bool => {
@@ -763,9 +782,18 @@ fn emit_list_return(out: &mut String, inner: &TypeRef, module: &str) {
         out.push_str("\tfor i, v := range cSlice {\n");
         out.push_str("\t\tgoResult[i] = C.GoString(v)\n");
         out.push_str("\t}\n");
-    } else if let TypeRef::Struct(n) | TypeRef::TypedHandle(n) = inner {
+    } else if let TypeRef::TypedHandle(n) = inner {
         let ct = format!("C.weaveffi_{module}_{n}");
         let gs = n.to_upper_camel_case();
+        out.push_str(&format!(
+            "\tcSlice := unsafe.Slice((**{ct})(unsafe.Pointer(result)), count)\n"
+        ));
+        out.push_str("\tfor i, v := range cSlice {\n");
+        out.push_str(&format!("\t\tgoResult[i] = &{gs}{{ptr: v}}\n"));
+        out.push_str("\t}\n");
+    } else if let TypeRef::Struct(n) = inner {
+        let ct = format!("C.weaveffi_{module}_{n}");
+        let gs = local_type_name(n).to_upper_camel_case();
         out.push_str(&format!(
             "\tcSlice := unsafe.Slice((**{ct})(unsafe.Pointer(result)), count)\n"
         ));

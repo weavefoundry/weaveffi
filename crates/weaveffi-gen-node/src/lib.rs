@@ -2,7 +2,7 @@ use anyhow::Result;
 use camino::Utf8Path;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
-use weaveffi_core::utils::wrapper_name;
+use weaveffi_core::utils::{c_abi_struct_name, local_type_name, wrapper_name};
 use weaveffi_ir::ir::{Api, Function, TypeRef};
 
 pub struct NodeGenerator;
@@ -121,7 +121,7 @@ fn c_elem_type(ty: &TypeRef, module: &str) -> String {
         TypeRef::TypedHandle(_) | TypeRef::Handle => "weaveffi_handle_t".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "const uint8_t*".into(),
-        TypeRef::Struct(s) => format!("weaveffi_{module}_{s}*"),
+        TypeRef::Struct(s) => format!("{}*", c_abi_struct_name(s, module, "weaveffi")),
         TypeRef::Enum(e) => format!("weaveffi_{module}_{e}"),
         TypeRef::Optional(inner) | TypeRef::List(inner) => c_elem_type(inner, module),
         TypeRef::Map(_, _) => "void*".into(),
@@ -139,7 +139,7 @@ fn c_ret_type_str(ty: &TypeRef, module: &str) -> String {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "const uint8_t*".into(),
         TypeRef::TypedHandle(_) | TypeRef::Handle => "weaveffi_handle_t".into(),
-        TypeRef::Struct(s) => format!("weaveffi_{module}_{s}*"),
+        TypeRef::Struct(s) => format!("{}*", c_abi_struct_name(s, module, "weaveffi")),
         TypeRef::Enum(e) => format!("weaveffi_{module}_{e}"),
         TypeRef::Optional(inner) => {
             if is_c_ptr_type(inner) {
@@ -439,13 +439,12 @@ fn emit_param(
             c_args.push(format!("(weaveffi_{module}_{e}){name}"));
         }
         TypeRef::Struct(s) => {
+            let abi = c_abi_struct_name(s, module, "weaveffi");
             out.push_str(&format!("  int64_t {name}_raw;\n"));
             out.push_str(&format!(
                 "  napi_get_value_int64(env, args[{idx}], &{name}_raw);\n"
             ));
-            c_args.push(format!(
-                "(const weaveffi_{module}_{s}*)(intptr_t){name}_raw"
-            ));
+            c_args.push(format!("(const {abi}*)(intptr_t){name}_raw"));
         }
         TypeRef::Optional(inner) => {
             out.push_str(&format!("  napi_valuetype {name}_type;\n"));
@@ -566,6 +565,7 @@ fn emit_optional_param(
             cleanups.push(format!("  free({name});\n"));
         }
         TypeRef::Struct(s) => {
+            let abi = c_abi_struct_name(s, module, "weaveffi");
             out.push_str(&format!("  int64_t {name}_raw = 0;\n"));
             out.push_str(&format!(
                 "  if ({name}_type != napi_null && {name}_type != napi_undefined) {{\n"
@@ -575,7 +575,7 @@ fn emit_optional_param(
             ));
             out.push_str("  }\n");
             c_args.push(format!(
-                "{name}_raw ? (const weaveffi_{module}_{s}*)(intptr_t){name}_raw : NULL"
+                "{name}_raw ? (const {abi}*)(intptr_t){name}_raw : NULL"
             ));
         }
         _ => {
@@ -941,7 +941,9 @@ fn ts_type_for(ty: &TypeRef) -> String {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "Buffer".into(),
         TypeRef::Handle => "bigint".into(),
-        TypeRef::TypedHandle(name) | TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
+        TypeRef::TypedHandle(name) => name.clone(),
+        TypeRef::Struct(name) => local_type_name(name).to_string(),
+        TypeRef::Enum(name) => name.clone(),
         TypeRef::Optional(inner) => format!("{} | null", ts_type_for(inner)),
         TypeRef::List(inner) => {
             let inner_ts = ts_type_for(inner);

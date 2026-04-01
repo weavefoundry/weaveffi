@@ -3,7 +3,7 @@ use camino::Utf8Path;
 use std::fmt::Write as _;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
-use weaveffi_core::utils::{c_symbol_name, wrapper_name};
+use weaveffi_core::utils::{c_symbol_name, local_type_name, wrapper_name};
 use weaveffi_ir::ir::{Api, EnumDef, Function, StructDef, TypeRef};
 
 pub struct AndroidGenerator;
@@ -1243,10 +1243,8 @@ fn build_c_call_args(args: &mut Vec<String>, name: &str, ty: &TypeRef, module: &
             args.push(format!("(weaveffi_handle_t){}", name))
         }
         TypeRef::Struct(sname) => {
-            args.push(format!(
-                "(const weaveffi_{}_{}*)(intptr_t){}",
-                module, sname, name
-            ));
+            let c_struct = weaveffi_core::utils::c_abi_struct_name(sname, module, "weaveffi");
+            args.push(format!("(const {}*)(intptr_t){}", c_struct, name));
         }
         TypeRef::Enum(_) => args.push(format!("(int32_t){}", name)),
         TypeRef::Optional(inner) => match inner.as_ref() {
@@ -1341,7 +1339,7 @@ fn write_return_handling(
             let _ = writeln!(jni_c, "    return rv ? JNI_TRUE : JNI_FALSE;");
         }
         TypeRef::Struct(name) => {
-            let c_ty = format!("weaveffi_{}_{}", module, name);
+            let c_ty = weaveffi_core::utils::c_abi_struct_name(name, module, "weaveffi");
             let _ = writeln!(jni_c, "    {}* rv = {}({}, &err);", c_ty, c_sym, args_str);
             write_error_check(jni_c, returns);
             release_jni_resources(jni_c, params);
@@ -1814,7 +1812,8 @@ fn to_pascal_case(s: &str) -> String {
 
 fn kotlin_getter_type(t: &TypeRef) -> String {
     match t {
-        TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
+        TypeRef::Struct(name) => local_type_name(name).to_string(),
+        TypeRef::Enum(name) => name.clone(),
         TypeRef::Callback(_) => todo!("callback Android type"),
         other => kotlin_type(other),
     }
@@ -1873,10 +1872,11 @@ fn render_kotlin_struct(out: &mut String, s: &StructDef) {
         let kt_type = kotlin_getter_type(&f.ty);
         match &f.ty {
             TypeRef::Struct(name) => {
+                let local = local_type_name(name);
                 let _ = writeln!(
                     out,
                     "    val {}: {} get() = {}(nativeGet{}(handle))",
-                    f.name, kt_type, name, pascal
+                    f.name, kt_type, local, pascal
                 );
             }
             _ => {
@@ -2023,10 +2023,14 @@ fn render_jni_struct(out: &mut String, module_name: &str, s: &StructDef, jni_pre
                 let _ = writeln!(out, "    return rv ? JNI_TRUE : JNI_FALSE;");
             }
             TypeRef::Struct(name) => {
+                let c_struct =
+                    weaveffi_core::utils::c_abi_struct_name(name, module_name, "weaveffi");
                 let _ = writeln!(
                     out,
-                    "    const weaveffi_{}_{}* rv = {}((const {}*)(intptr_t)handle);",
-                    module_name, name, getter_c, prefix
+                    "    const {c_struct}* rv = {getter_c}((const {prefix}*)(intptr_t)handle);",
+                    c_struct = c_struct,
+                    getter_c = getter_c,
+                    prefix = prefix
                 );
                 let _ = writeln!(out, "    return (jlong)(intptr_t)rv;");
             }
