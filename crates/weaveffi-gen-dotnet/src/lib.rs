@@ -2895,4 +2895,123 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         let _ = std::fs::remove_dir_all(&tmp2);
     }
+
+    #[test]
+    fn dotnet_deeply_nested_optional() {
+        let api = make_api(vec![Module {
+            name: "edge".into(),
+            functions: vec![Function {
+                name: "process".into(),
+                params: vec![Param {
+                    name: "data".into(),
+                    ty: TypeRef::Optional(Box::new(TypeRef::List(Box::new(TypeRef::Optional(
+                        Box::new(TypeRef::Struct("Contact".into())),
+                    ))))),
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                }],
+            }],
+            enums: vec![],
+            errors: None,
+        }]);
+        let cs = render_csharp(&api, "WeaveFFI", true);
+        assert!(
+            cs.contains("Contact?[]?"),
+            "should contain deeply nested optional type: {cs}"
+        );
+    }
+
+    #[test]
+    fn dotnet_map_of_lists() {
+        let api = make_api(vec![Module {
+            name: "edge".into(),
+            functions: vec![Function {
+                name: "process".into(),
+                params: vec![Param {
+                    name: "scores".into(),
+                    ty: TypeRef::Map(
+                        Box::new(TypeRef::StringUtf8),
+                        Box::new(TypeRef::List(Box::new(TypeRef::I32))),
+                    ),
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+        let cs = render_csharp(&api, "WeaveFFI", true);
+        assert!(
+            cs.contains("Dictionary<string, int[]>"),
+            "should contain map of lists type: {cs}"
+        );
+    }
+
+    #[test]
+    fn dotnet_enum_keyed_map() {
+        let api = make_api(vec![Module {
+            name: "edge".into(),
+            functions: vec![Function {
+                name: "process".into(),
+                params: vec![Param {
+                    name: "contacts".into(),
+                    ty: TypeRef::Map(
+                        Box::new(TypeRef::Enum("Color".into())),
+                        Box::new(TypeRef::Struct("Contact".into())),
+                    ),
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                }],
+            }],
+            enums: vec![EnumDef {
+                name: "Color".into(),
+                doc: None,
+                variants: vec![
+                    EnumVariant {
+                        name: "Red".into(),
+                        value: 0,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Green".into(),
+                        value: 1,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Blue".into(),
+                        value: 2,
+                        doc: None,
+                    },
+                ],
+            }],
+            errors: None,
+        }]);
+        let cs = render_csharp(&api, "WeaveFFI", true);
+        assert!(
+            cs.contains("Dictionary<Color, Contact>"),
+            "should contain enum-keyed map type: {cs}"
+        );
+    }
 }
