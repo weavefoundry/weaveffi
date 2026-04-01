@@ -108,6 +108,12 @@ fn render_wasm_readme(api: &Api) -> String {
     out.push_str("Lists are passed as a **pointer + length** pair (`i32` pointer, `i32` length) ");
     out.push_str("referencing a contiguous region in linear memory. The caller is responsible ");
     out.push_str("for allocating and freeing the backing memory.\n");
+    out.push_str("\n### Error Handling\n\n");
+    out.push_str("The generated JS wrappers automatically handle errors by passing an error\n");
+    out.push_str("pointer as the last argument to each WASM function. Your WASM module must\n");
+    out.push_str("export the following functions:\n\n");
+    out.push_str("- `weaveffi_alloc(size: i32) -> i32` — allocate `size` bytes in linear memory\n");
+    out.push_str("- `weaveffi_error_clear(err_ptr: i32)` — clear and free error resources\n");
 
     if !api.modules.is_empty() {
         render_api_reference(&mut out, api);
@@ -349,6 +355,28 @@ fn render_wasm_js_stub(api: &Api) -> String {
         out.push_str("}\n\n");
     }
 
+    let has_functions = api.modules.iter().any(|m| !m.functions.is_empty());
+    if has_functions {
+        out.push_str("function _allocError(wasm) {\n");
+        out.push_str("  return wasm.weaveffi_alloc(8);\n");
+        out.push_str("}\n\n");
+        out.push_str("function _checkError(wasm, errPtr) {\n");
+        out.push_str("  const buffer = wasm.memory.buffer;\n");
+        out.push_str("  const code = new Int32Array(buffer, errPtr, 1)[0];\n");
+        out.push_str("  if (code !== 0) {\n");
+        out.push_str("    const msgPtr = new Uint32Array(buffer, errPtr + 4, 1)[0];\n");
+        out.push_str("    const bytes = new Uint8Array(buffer, msgPtr);\n");
+        out.push_str("    let end = 0;\n");
+        out.push_str("    while (bytes[end] !== 0) end++;\n");
+        out.push_str(
+            "    const msg = new TextDecoder().decode(new Uint8Array(buffer, msgPtr, end));\n",
+        );
+        out.push_str("    wasm.weaveffi_error_clear(errPtr);\n");
+        out.push_str("    throw new Error(`WeaveFFI error ${code}: ${msg}`);\n");
+        out.push_str("  }\n");
+        out.push_str("}\n\n");
+    }
+
     for module in &api.modules {
         for e in &module.enums {
             out.push_str(&format!("export const {} = Object.freeze({{\n", e.name));
@@ -473,6 +501,8 @@ fn emit_js_function_wrapper(out: &mut String, module_name: &str, func: &Function
         js_params.join(", ")
     ));
 
+    out.push_str(&format!("{indent}const _err = _allocError(wasm);\n"));
+
     let mut wasm_args = Vec::new();
     let returns_string = matches!(func.returns.as_ref(), Some(TypeRef::StringUtf8));
 
@@ -500,38 +530,50 @@ fn emit_js_function_wrapper(out: &mut String, module_name: &str, func: &Function
         }
     }
 
+    wasm_args.push("_err".to_string());
     let wasm_call = format!("wasm.{}({})", abi_name, wasm_args.join(", "));
 
     match func.returns.as_ref() {
         None => {
             out.push_str(&format!("{indent}{wasm_call};\n"));
+            out.push_str(&format!("{indent}_checkError(wasm, _err);\n"));
         }
         Some(TypeRef::Bool) => {
-            out.push_str(&format!("{indent}return {wasm_call} !== 0;\n"));
+            out.push_str(&format!("{indent}const _result = {wasm_call};\n"));
+            out.push_str(&format!("{indent}_checkError(wasm, _err);\n"));
+            out.push_str(&format!("{indent}return _result !== 0;\n"));
         }
         Some(TypeRef::StringUtf8) => {
             out.push_str(&format!("{indent}{wasm_call};\n"));
+            out.push_str(&format!("{indent}_checkError(wasm, _err);\n"));
             out.push_str(&format!(
                 "{indent}const view = new DataView(wasm.memory.buffer);\n"
             ));
             out.push_str(&format!("{indent}return _decodeString(wasm, view.getInt32(retptr, true), view.getInt32(retptr + 4, true));\n"));
         }
         Some(TypeRef::Struct(name)) => {
-            out.push_str(&format!("{indent}return new {name}(wasm, {wasm_call});\n"));
+            out.push_str(&format!("{indent}const _result = {wasm_call};\n"));
+            out.push_str(&format!("{indent}_checkError(wasm, _err);\n"));
+            out.push_str(&format!("{indent}return new {name}(wasm, _result);\n"));
         }
         Some(TypeRef::Optional(inner)) => match inner.as_ref() {
             TypeRef::Struct(name) => {
                 out.push_str(&format!("{indent}const result = {wasm_call};\n"));
+                out.push_str(&format!("{indent}_checkError(wasm, _err);\n"));
                 out.push_str(&format!(
                     "{indent}return result === 0n ? null : new {name}(wasm, result);\n"
                 ));
             }
             _ => {
-                out.push_str(&format!("{indent}return {wasm_call};\n"));
+                out.push_str(&format!("{indent}const _result = {wasm_call};\n"));
+                out.push_str(&format!("{indent}_checkError(wasm, _err);\n"));
+                out.push_str(&format!("{indent}return _result;\n"));
             }
         },
         _ => {
-            out.push_str(&format!("{indent}return {wasm_call};\n"));
+            out.push_str(&format!("{indent}const _result = {wasm_call};\n"));
+            out.push_str(&format!("{indent}_checkError(wasm, _err);\n"));
+            out.push_str(&format!("{indent}return _result;\n"));
         }
     }
 
@@ -945,7 +987,7 @@ mod tests {
         let api = sample_api();
         let js = render_wasm_js_stub(&api);
         assert!(js.contains("add(a, b)"));
-        assert!(js.contains("wasm.weaveffi_math_add(a, b)"));
+        assert!(js.contains("wasm.weaveffi_math_add(a, b, _err)"));
         assert!(js.contains("class Point"));
         assert!(js.contains("get x()"));
         assert!(js.contains("get y()"));
@@ -1006,5 +1048,21 @@ mod tests {
         assert!(js.contains("_decodeString(wasm,"));
         assert!(js.contains("greet(name)"));
         assert!(js.contains("wasm.weaveffi_greeting_greet("));
+    }
+
+    #[test]
+    fn wasm_js_has_error_helpers() {
+        let api = sample_api();
+        let js = render_wasm_js_stub(&api);
+        assert!(js.contains("function _allocError(wasm)"));
+        assert!(js.contains("function _checkError(wasm, errPtr)"));
+    }
+
+    #[test]
+    fn wasm_js_function_passes_err() {
+        let api = sample_api();
+        let js = render_wasm_js_stub(&api);
+        assert!(js.contains("const _err = _allocError(wasm)"));
+        assert!(js.contains("_checkError(wasm, _err)"));
     }
 }
