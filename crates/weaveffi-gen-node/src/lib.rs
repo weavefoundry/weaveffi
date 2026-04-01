@@ -2,22 +2,35 @@ use anyhow::Result;
 use camino::Utf8Path;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
+use weaveffi_core::utils::wrapper_name;
 use weaveffi_ir::ir::{Api, Function, TypeRef};
 
 pub struct NodeGenerator;
 
 impl NodeGenerator {
-    fn generate_impl(&self, api: &Api, out_dir: &Utf8Path, package_name: &str) -> Result<()> {
+    fn generate_impl(
+        &self,
+        api: &Api,
+        out_dir: &Utf8Path,
+        package_name: &str,
+        strip_module_prefix: bool,
+    ) -> Result<()> {
         let dir = out_dir.join("node");
         std::fs::create_dir_all(&dir)?;
         std::fs::write(
             dir.join("index.js"),
             "module.exports = require('./index.node')\n",
         )?;
-        std::fs::write(dir.join("types.d.ts"), render_node_dts(api))?;
+        std::fs::write(
+            dir.join("types.d.ts"),
+            render_node_dts(api, strip_module_prefix),
+        )?;
         std::fs::write(dir.join("package.json"), render_package_json(package_name))?;
         std::fs::write(dir.join("binding.gyp"), render_binding_gyp())?;
-        std::fs::write(dir.join("weaveffi_addon.c"), render_addon_c(api))?;
+        std::fs::write(
+            dir.join("weaveffi_addon.c"),
+            render_addon_c(api, strip_module_prefix),
+        )?;
         Ok(())
     }
 }
@@ -28,7 +41,7 @@ impl Generator for NodeGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "weaveffi")
+        self.generate_impl(api, out_dir, "weaveffi", true)
     }
 
     fn generate_with_config(
@@ -37,7 +50,12 @@ impl Generator for NodeGenerator {
         out_dir: &Utf8Path,
         config: &GeneratorConfig,
     ) -> Result<()> {
-        self.generate_impl(api, out_dir, config.node_package_name())
+        self.generate_impl(
+            api,
+            out_dir,
+            config.node_package_name(),
+            config.strip_module_prefix,
+        )
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
@@ -145,7 +163,7 @@ fn napi_getter(ty: &TypeRef) -> &'static str {
     }
 }
 
-fn render_addon_c(api: &Api) -> String {
+fn render_addon_c(api: &Api, strip_module_prefix: bool) -> String {
     let mut out = String::from(
         "#include <node_api.h>\n#include \"weaveffi.h\"\n#include <stdlib.h>\n#include <string.h>\n\n",
     );
@@ -156,7 +174,8 @@ fn render_addon_c(api: &Api) -> String {
         for f in &m.functions {
             let c_name = format!("weaveffi_{}_{}", m.name, f.name);
             let napi_name = format!("Napi_{c_name}");
-            all_exports.push((f.name.clone(), napi_name.clone()));
+            let js_name = wrapper_name(&m.name, &f.name, strip_module_prefix);
+            all_exports.push((js_name, napi_name.clone()));
 
             out.push_str(&format!(
                 "static napi_value {napi_name}(napi_env env, napi_callback_info info) {{\n"
@@ -795,7 +814,7 @@ fn ts_type_for(ty: &TypeRef) -> String {
     }
 }
 
-fn render_node_dts(api: &Api) -> String {
+fn render_node_dts(api: &Api, strip_module_prefix: bool) -> String {
     let mut out = String::from("// Generated types for WeaveFFI functions\n");
     for m in &api.modules {
         for s in &m.structs {
@@ -823,13 +842,14 @@ fn render_node_dts(api: &Api) -> String {
                 Some(ty) => ts_type_for(ty),
                 None => "void".into(),
             };
+            let ts_name = wrapper_name(&m.name, &f.name, strip_module_prefix);
             out.push_str(&format!(
                 "/** Maps to C function: weaveffi_{}_{} */\n",
                 m.name, f.name
             ));
             out.push_str(&format!(
                 "export function {}({}): {}\n",
-                f.name,
+                ts_name,
                 params.join(", "),
                 ret
             ));
@@ -971,7 +991,7 @@ mod tests {
             r#async: false,
         });
 
-        let dts = render_node_dts(&make_api(vec![m]));
+        let dts = render_node_dts(&make_api(vec![m]), true);
 
         assert!(dts.contains("export interface Contact {"));
         assert!(dts.contains("  name: string;"));
@@ -1285,7 +1305,7 @@ mod tests {
             m
         }]);
 
-        let dts = render_node_dts(&api);
+        let dts = render_node_dts(&api, true);
 
         assert!(
             dts.contains("/** Maps to C function: weaveffi_math_add */\nexport function add("),
@@ -1321,7 +1341,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api);
+        let addon = render_addon_c(&api, true);
         assert!(
             !addon.contains("// TODO: implement"),
             "generated addon.c should not contain TODO comments: {addon}"
@@ -1350,7 +1370,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api);
+        let addon = render_addon_c(&api, true);
         assert!(
             addon.contains("napi_get_cb_info"),
             "generated addon.c should call napi_get_cb_info: {addon}"
@@ -1373,7 +1393,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api);
+        let addon = render_addon_c(&api, true);
         assert!(
             addon.contains("weaveffi_free_string(result)"),
             "generated addon should free returned strings: {addon}"
@@ -1414,10 +1434,81 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api);
+        let addon = render_addon_c(&api, true);
         assert!(
             addon.contains("err.code"),
             "generated addon.c should check err.code: {addon}"
         );
+    }
+
+    #[test]
+    fn node_strip_module_prefix() {
+        let api = make_api(vec![{
+            let mut m = make_module("contacts");
+            m.functions.push(Function {
+                name: "create_contact".into(),
+                params: vec![Param {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+            });
+            m
+        }]);
+
+        let config = GeneratorConfig {
+            strip_module_prefix: true,
+            ..Default::default()
+        };
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_node_strip_prefix");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        NodeGenerator
+            .generate_with_config(&api, out_dir, &config)
+            .unwrap();
+
+        let dts = std::fs::read_to_string(tmp.join("node/types.d.ts")).unwrap();
+        assert!(
+            dts.contains("export function create_contact("),
+            "stripped name should be create_contact: {dts}"
+        );
+        assert!(
+            !dts.contains("export function contacts_create_contact("),
+            "should not contain module-prefixed name: {dts}"
+        );
+
+        let addon = std::fs::read_to_string(tmp.join("node/weaveffi_addon.c")).unwrap();
+        assert!(
+            addon.contains("\"create_contact\""),
+            "JS export name should be stripped: {addon}"
+        );
+        assert!(
+            addon.contains("weaveffi_contacts_create_contact"),
+            "C ABI call should still use full name: {addon}"
+        );
+
+        let no_strip = GeneratorConfig::default();
+        let tmp2 = std::env::temp_dir().join("weaveffi_test_node_no_strip_prefix");
+        let _ = std::fs::remove_dir_all(&tmp2);
+        std::fs::create_dir_all(&tmp2).unwrap();
+        let out_dir2 = Utf8Path::from_path(&tmp2).expect("valid UTF-8");
+
+        NodeGenerator
+            .generate_with_config(&api, out_dir2, &no_strip)
+            .unwrap();
+
+        let dts2 = std::fs::read_to_string(tmp2.join("node/types.d.ts")).unwrap();
+        assert!(
+            dts2.contains("export function contacts_create_contact("),
+            "default should use module-prefixed name: {dts2}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp2);
     }
 }

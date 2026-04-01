@@ -3,13 +3,19 @@ use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
-use weaveffi_core::utils::c_symbol_name;
+use weaveffi_core::utils::{c_symbol_name, wrapper_name};
 use weaveffi_ir::ir::{Api, EnumDef, Function, Param, StructDef, StructField, TypeRef};
 
 pub struct SwiftGenerator;
 
 impl SwiftGenerator {
-    fn generate_impl(&self, api: &Api, out_dir: &Utf8Path, module_name: &str) -> Result<()> {
+    fn generate_impl(
+        &self,
+        api: &Api,
+        out_dir: &Utf8Path,
+        module_name: &str,
+        strip_module_prefix: bool,
+    ) -> Result<()> {
         let dir = out_dir.join("swift");
         let c_module = format!("C{}", module_name);
         let module_dir = dir.join(&c_module);
@@ -45,7 +51,7 @@ let package = Package(
         std::fs::create_dir_all(&src_dir)?;
         std::fs::write(
             src_dir.join(format!("{}.swift", module_name)),
-            render_swift_wrapper(api),
+            render_swift_wrapper(api, strip_module_prefix),
         )?;
         Ok(())
     }
@@ -57,7 +63,7 @@ impl Generator for SwiftGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "WeaveFFI")
+        self.generate_impl(api, out_dir, "WeaveFFI", true)
     }
 
     fn generate_with_config(
@@ -66,7 +72,12 @@ impl Generator for SwiftGenerator {
         out_dir: &Utf8Path,
         config: &GeneratorConfig,
     ) -> Result<()> {
-        self.generate_impl(api, out_dir, config.swift_module_name())
+        self.generate_impl(
+            api,
+            out_dir,
+            config.swift_module_name(),
+            config.strip_module_prefix,
+        )
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
@@ -138,7 +149,7 @@ fn render_swift_enum(out: &mut String, e: &EnumDef) {
     out.push_str("}\n\n");
 }
 
-fn render_swift_wrapper(api: &Api) -> String {
+fn render_swift_wrapper(api: &Api, strip_module_prefix: bool) -> String {
     let mut out = String::new();
     out.push_str("import CWeaveFFI\nimport Foundation\n\n");
 
@@ -217,7 +228,7 @@ fn render_swift_wrapper(api: &Api) -> String {
         let type_name = m.name.to_upper_camel_case();
         out.push_str(&format!("public enum {} {{\n", type_name));
         for f in &m.functions {
-            render_swift_function(&mut out, &m.name, f);
+            render_swift_function(&mut out, &m.name, f, strip_module_prefix);
         }
         out.push_str("}\n\n");
     }
@@ -335,7 +346,13 @@ fn render_swift_getter(out: &mut String, prefix: &str, field: &StructField) {
     out.push_str("    }\n");
 }
 
-fn render_swift_function(out: &mut String, module_name: &str, f: &Function) {
+fn render_swift_function(
+    out: &mut String,
+    module_name: &str,
+    f: &Function,
+    strip_module_prefix: bool,
+) {
+    let func_name = wrapper_name(module_name, &f.name, strip_module_prefix);
     let params_sig: Vec<String> = f
         .params
         .iter()
@@ -348,7 +365,7 @@ fn render_swift_function(out: &mut String, module_name: &str, f: &Function) {
         .unwrap_or_else(|| "Void".to_string());
     out.push_str(&format!(
         "    public static func {}({}) throws -> {} {{\n",
-        f.name,
+        func_name,
         params_sig.join(", "),
         ret_swift
     ));
@@ -1083,7 +1100,7 @@ mod tests {
             errors: None,
         }]);
 
-        let out = render_swift_wrapper(&api);
+        let out = render_swift_wrapper(&api, true);
         assert!(
             out.contains("public enum Color: Int32 {"),
             "missing enum declaration: {out}"
@@ -1121,7 +1138,7 @@ mod tests {
             errors: None,
         }]);
 
-        let out = render_swift_wrapper(&api);
+        let out = render_swift_wrapper(&api, true);
         assert!(
             out.contains("case inProgress = 0"),
             "missing camelCase variant: {out}"
@@ -1151,7 +1168,7 @@ mod tests {
             errors: None,
         }]);
 
-        let out = render_swift_wrapper(&api);
+        let out = render_swift_wrapper(&api, true);
         assert!(out.contains("_ a: Color"), "missing enum param type: {out}");
         assert!(
             out.contains("-> Color {"),
@@ -1186,7 +1203,7 @@ mod tests {
             errors: None,
         }]);
 
-        let out = render_swift_wrapper(&api);
+        let out = render_swift_wrapper(&api, true);
         assert!(
             out.contains("_ id: Int32?"),
             "missing optional param type: {out}"
@@ -1217,7 +1234,7 @@ mod tests {
             errors: None,
         }]);
 
-        let out = render_swift_wrapper(&api);
+        let out = render_swift_wrapper(&api, true);
         assert!(
             out.contains("_ person: Contact?"),
             "missing optional struct param: {out}"
@@ -1247,7 +1264,7 @@ mod tests {
             errors: None,
         }]);
 
-        let out = render_swift_wrapper(&api);
+        let out = render_swift_wrapper(&api, true);
         assert!(
             out.contains("-> Int32? {"),
             "missing optional return type: {out}"
@@ -1274,7 +1291,7 @@ mod tests {
             errors: None,
         }]);
 
-        let out = render_swift_wrapper(&api);
+        let out = render_swift_wrapper(&api, true);
         assert!(
             out.contains("-> String? {"),
             "missing optional string return type: {out}"
@@ -1308,7 +1325,7 @@ mod tests {
             errors: None,
         }]);
 
-        let out = render_swift_wrapper(&api);
+        let out = render_swift_wrapper(&api, true);
         assert!(
             out.contains("_ ids: [Int32]"),
             "missing list param type: {out}"
@@ -1337,7 +1354,7 @@ mod tests {
             errors: None,
         }]);
 
-        let out = render_swift_wrapper(&api);
+        let out = render_swift_wrapper(&api, true);
         assert!(
             out.contains("-> [Int32] {"),
             "missing list return type: {out}"
@@ -1374,7 +1391,7 @@ mod tests {
             errors: None,
         }]);
 
-        let out = render_swift_wrapper(&api);
+        let out = render_swift_wrapper(&api, true);
         assert!(
             out.contains("-> Contact? {"),
             "missing optional struct return: {out}"
@@ -1388,7 +1405,7 @@ mod tests {
     #[test]
     fn render_with_optional_pointer_helper() {
         let api = make_api(vec![]);
-        let out = render_swift_wrapper(&api);
+        let out = render_swift_wrapper(&api, true);
         assert!(
             out.contains("func withOptionalPointer<T, R>"),
             "missing withOptionalPointer helper: {out}"
@@ -1424,7 +1441,7 @@ mod tests {
             errors: None,
         }]);
 
-        let out = render_swift_wrapper(&api);
+        let out = render_swift_wrapper(&api, true);
         assert!(
             out.contains("public class Contact {"),
             "missing class declaration: {out}"
@@ -1486,7 +1503,7 @@ mod tests {
             errors: None,
         }]);
 
-        let out = render_swift_wrapper(&api);
+        let out = render_swift_wrapper(&api, true);
         assert!(
             out.contains("-> Contact {"),
             "missing struct return type: {out}"
@@ -1516,7 +1533,7 @@ mod tests {
             errors: None,
         }]);
 
-        let out = render_swift_wrapper(&api);
+        let out = render_swift_wrapper(&api, true);
         assert!(
             out.contains("_ contact: Contact"),
             "missing struct param type: {out}"
@@ -1545,7 +1562,7 @@ mod tests {
             errors: None,
         }]);
 
-        let out = render_swift_wrapper(&api);
+        let out = render_swift_wrapper(&api, true);
         assert!(
             out.contains("public var data: Data {"),
             "missing bytes getter: {out}"
@@ -1574,7 +1591,7 @@ mod tests {
             errors: None,
         }]);
 
-        let out = render_swift_wrapper(&api);
+        let out = render_swift_wrapper(&api, true);
         assert!(
             out.contains("public var start: Point {"),
             "missing nested struct getter: {out}"
@@ -1604,7 +1621,7 @@ mod tests {
             errors: None,
         }]);
 
-        let out = render_swift_wrapper(&api);
+        let out = render_swift_wrapper(&api, true);
         assert!(
             out.contains("-> Contact {"),
             "missing struct return type with buffer params: {out}"
@@ -1773,7 +1790,7 @@ mod tests {
             errors: None,
         }]);
 
-        let out = render_swift_wrapper(&api);
+        let out = render_swift_wrapper(&api, true);
         assert!(
             out.contains("_ scores: [Int32: Double]"),
             "missing map param type: {out}"
@@ -1817,7 +1834,7 @@ mod tests {
             errors: None,
         }]);
 
-        let out = render_swift_wrapper(&api);
+        let out = render_swift_wrapper(&api, true);
         assert!(
             out.contains("-> [Int32: Double] {"),
             "missing map return type: {out}"
@@ -1868,7 +1885,7 @@ mod tests {
             errors: None,
         }]);
 
-        let out = render_swift_wrapper(&api);
+        let out = render_swift_wrapper(&api, true);
 
         assert!(
             out.contains("public var email: String? {"),
@@ -2016,7 +2033,7 @@ mod tests {
             }),
         }]);
 
-        let out = render_swift_wrapper(&api);
+        let out = render_swift_wrapper(&api, true);
 
         assert!(
             out.contains("public enum WeaveFFIError: Error, LocalizedError {"),
@@ -2093,7 +2110,7 @@ mod tests {
             errors: None,
         }]);
 
-        let out = render_swift_wrapper(&api);
+        let out = render_swift_wrapper(&api, true);
 
         assert!(
             out.contains("public var item_ids: [Int32] {"),
@@ -2120,5 +2137,83 @@ mod tests {
             out.contains("Tag(rawValue: rv[$0].rawValue)!"),
             "missing list enum conversion: {out}"
         );
+    }
+
+    #[test]
+    fn swift_strip_module_prefix() {
+        let api = make_api(vec![Module {
+            name: "contacts".to_string(),
+            functions: vec![Function {
+                name: "create_contact".to_string(),
+                params: vec![Param {
+                    name: "name".to_string(),
+                    ty: TypeRef::StringUtf8,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let config = GeneratorConfig {
+            strip_module_prefix: true,
+            ..Default::default()
+        };
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_swift_strip_prefix");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        SwiftGenerator
+            .generate_with_config(&api, out_dir, &config)
+            .unwrap();
+
+        let swift =
+            std::fs::read_to_string(tmp.join("swift/Sources/WeaveFFI/WeaveFFI.swift")).unwrap();
+
+        assert!(
+            swift.contains("func create_contact("),
+            "stripped name should be create_contact: {swift}"
+        );
+        assert!(
+            !swift.contains("func contacts_create_contact("),
+            "should not contain module-prefixed name: {swift}"
+        );
+        assert!(
+            swift.contains("weaveffi_contacts_create_contact"),
+            "C ABI call should still use full name: {swift}"
+        );
+
+        let no_strip_config = GeneratorConfig {
+            strip_module_prefix: false,
+            ..Default::default()
+        };
+        let tmp2 = std::env::temp_dir().join("weaveffi_test_swift_no_strip_prefix");
+        let _ = std::fs::remove_dir_all(&tmp2);
+        std::fs::create_dir_all(&tmp2).unwrap();
+        let out_dir2 = Utf8Path::from_path(&tmp2).expect("valid UTF-8");
+
+        SwiftGenerator
+            .generate_with_config(&api, out_dir2, &no_strip_config)
+            .unwrap();
+
+        let swift2 =
+            std::fs::read_to_string(tmp2.join("swift/Sources/WeaveFFI/WeaveFFI.swift")).unwrap();
+
+        assert!(
+            swift2.contains("func contacts_create_contact("),
+            "default should use module-prefixed name: {swift2}"
+        );
+        assert!(
+            swift2.contains("weaveffi_contacts_create_contact"),
+            "C ABI call should still use full name: {swift2}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp2);
     }
 }

@@ -488,8 +488,8 @@ fn getting_started_yaml_generates_all_targets() {
         "types.d.ts should contain Point interface"
     );
     assert!(
-        dts.contains("function add"),
-        "types.d.ts should contain add function"
+        dts.contains("function math_add"),
+        "types.d.ts should contain math_add function"
     );
 
     let scaffold = std::fs::read_to_string(gen.join("scaffold.rs")).unwrap();
