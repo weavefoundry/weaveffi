@@ -20,6 +20,11 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+criterion = { workspace = true }
+
+[[bench]]
+name = "codegen_bench"
+harness = false
 
 [lints]
 workspace = true
