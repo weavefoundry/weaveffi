@@ -1,9 +1,10 @@
 use anyhow::Result;
 use camino::Utf8Path;
+use heck::ToUpperCamelCase;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_abi_struct_name, local_type_name};
-use weaveffi_ir::ir::{Api, ErrorCode, Function, Module, StructField, TypeRef};
+use weaveffi_ir::ir::{Api, ErrorCode, Function, Module, StructDef, StructField, TypeRef};
 
 pub struct CppGenerator;
 
@@ -381,6 +382,25 @@ fn render_extern_c(out: &mut String, api: &Api) {
                     ));
                 }
             }
+
+            if s.builder {
+                let builder_ty = format!("{tag}Builder");
+                out.push_str(&format!("typedef struct {builder_ty} {builder_ty};\n"));
+                out.push_str(&format!("{builder_ty}* {tag}_Builder_new(void);\n"));
+                for field in &s.fields {
+                    let param = c_param_type(&field.ty, "value", &path);
+                    out.push_str(&format!(
+                        "void {tag}_Builder_set_{}({builder_ty}* builder, {});\n",
+                        field.name, param
+                    ));
+                }
+                out.push_str(&format!(
+                    "{tag}* {tag}_Builder_build({builder_ty}* builder, weaveffi_error* out_err);\n"
+                ));
+                out.push_str(&format!(
+                    "void {tag}_Builder_destroy({builder_ty}* builder);\n"
+                ));
+            }
         }
 
         for f in &module.functions {
@@ -572,7 +592,82 @@ fn render_cpp_classes(out: &mut String, module: &Module, abi_module: &str) {
         }
 
         out.push_str("};\n\n");
+
+        if s.builder {
+            render_cpp_builder(out, s, abi_module);
+        }
     }
+}
+
+fn render_cpp_builder(out: &mut String, s: &StructDef, abi_module: &str) {
+    let tag = format!("weaveffi_{}_{}", abi_module, s.name);
+    let builder_ty = format!("{tag}Builder");
+    let name = &s.name;
+
+    out.push_str(&format!("class {name}Builder {{\n"));
+    out.push_str("    void* handle_;\n\n");
+    out.push_str("public:\n");
+    out.push_str(&format!(
+        "    {name}Builder() : handle_(reinterpret_cast<void*>({tag}_Builder_new())) {{}}\n\n"
+    ));
+    out.push_str(&format!("    ~{name}Builder() {{\n"));
+    out.push_str(&format!(
+        "        if (handle_) {tag}_Builder_destroy(static_cast<{builder_ty}*>(handle_));\n"
+    ));
+    out.push_str("    }\n\n");
+
+    out.push_str(&format!(
+        "    {name}Builder(const {name}Builder&) = delete;\n"
+    ));
+    out.push_str(&format!(
+        "    {name}Builder& operator=(const {name}Builder&) = delete;\n\n"
+    ));
+    out.push_str(&format!(
+        "    {name}Builder({name}Builder&& other) noexcept : handle_(other.handle_) {{\n"
+    ));
+    out.push_str("        other.handle_ = nullptr;\n");
+    out.push_str("    }\n\n");
+    out.push_str(&format!(
+        "    {name}Builder& operator=({name}Builder&& other) noexcept {{\n"
+    ));
+    out.push_str("        if (this != &other) {\n");
+    out.push_str(&format!(
+        "            if (handle_) {tag}_Builder_destroy(static_cast<{builder_ty}*>(handle_));\n"
+    ));
+    out.push_str("            handle_ = other.handle_;\n");
+    out.push_str("            other.handle_ = nullptr;\n");
+    out.push_str("        }\n");
+    out.push_str("        return *this;\n");
+    out.push_str("    }\n\n");
+
+    for field in &s.fields {
+        let pascal = field.name.to_upper_camel_case();
+        let decl = cpp_param_decl(&field.ty, "value");
+        out.push_str(&format!("    {name}Builder& with{pascal}({decl}) {{\n"));
+        let (setup, args) = param_to_c_args(&field.ty, "value", abi_module);
+        for line in &setup {
+            out.push_str(&format!("        {line}\n"));
+        }
+        let args_str = args.join(", ");
+        out.push_str(&format!(
+            "        {tag}_Builder_set_{}(static_cast<{builder_ty}*>(handle_), {args_str});\n",
+            field.name
+        ));
+        out.push_str("        return *this;\n");
+        out.push_str("    }\n\n");
+    }
+
+    out.push_str(&format!("    {name} build() {{\n"));
+    out.push_str("        weaveffi_error err{};\n");
+    out.push_str(&format!(
+        "        auto* ptr = {tag}_Builder_build(static_cast<{builder_ty}*>(handle_), &err);\n"
+    ));
+    out.push_str(
+        "        if (err.code != 0) throw std::runtime_error(err.message ? err.message : \"build failed\");\n",
+    );
+    out.push_str(&format!("        return {name}(ptr);\n"));
+    out.push_str("    }\n");
+    out.push_str("};\n\n");
 }
 
 fn render_cpp_getter(out: &mut String, struct_name: &str, module: &str, field: &StructField) {
@@ -1386,6 +1481,7 @@ mod tests {
                 structs: vec![StructDef {
                     name: "Contact".to_string(),
                     doc: None,
+                    builder: false,
                     fields: vec![
                         StructField {
                             name: "name".to_string(),
@@ -1974,6 +2070,7 @@ mod tests {
                 structs: vec![StructDef {
                     name: "Contact".into(),
                     doc: None,
+                    builder: false,
                     fields: vec![StructField {
                         name: "name".into(),
                         ty: TypeRef::StringUtf8,
@@ -2046,6 +2143,7 @@ mod tests {
                 structs: vec![StructDef {
                     name: "Data".into(),
                     doc: None,
+                    builder: false,
                     fields: vec![StructField {
                         name: "scores".into(),
                         ty: TypeRef::List(Box::new(TypeRef::I32)),
@@ -2077,6 +2175,7 @@ mod tests {
                 structs: vec![StructDef {
                     name: "Data".into(),
                     doc: None,
+                    builder: false,
                     fields: vec![StructField {
                         name: "tags".into(),
                         ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
@@ -2203,6 +2302,7 @@ mod tests {
                 structs: vec![StructDef {
                     name: "Connection".into(),
                     doc: None,
+                    builder: false,
                     fields: vec![],
                 }],
                 enums: vec![],
@@ -2411,6 +2511,7 @@ mod tests {
                 structs: vec![StructDef {
                     name: "User".into(),
                     doc: None,
+                    builder: false,
                     fields: vec![
                         StructField {
                             name: "name".into(),
@@ -2468,6 +2569,55 @@ mod tests {
             h.contains("int32_t age() const {"),
             "missing i32 property getter"
         );
+    }
+
+    #[test]
+    fn cpp_builder_struct_emits_extern_and_wrapper() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "geo".into(),
+                functions: vec![],
+                structs: vec![StructDef {
+                    name: "Point".into(),
+                    doc: None,
+                    builder: true,
+                    fields: vec![StructField {
+                        name: "x".into(),
+                        ty: TypeRef::F64,
+                        doc: None,
+                    }],
+                }],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let h = render_cpp_header(&api, "weaveffi");
+        assert!(
+            h.contains("typedef struct weaveffi_geo_PointBuilder weaveffi_geo_PointBuilder;"),
+            "missing builder typedef: {h}"
+        );
+        assert!(
+            h.contains("weaveffi_geo_Point_Builder_new(void);"),
+            "missing Builder_new: {h}"
+        );
+        assert!(
+            h.contains("weaveffi_geo_Point_Builder_set_x("),
+            "missing Builder_set: {h}"
+        );
+        assert!(
+            h.contains("class PointBuilder {"),
+            "missing C++ builder class: {h}"
+        );
+        assert!(
+            h.contains("PointBuilder& withX(double value)"),
+            "missing fluent setter: {h}"
+        );
+        assert!(h.contains("Point build()"), "missing build(): {h}");
     }
 
     #[test]
@@ -2546,6 +2696,7 @@ mod tests {
                 structs: vec![StructDef {
                     name: "Config".into(),
                     doc: None,
+                    builder: false,
                     fields: vec![StructField {
                         name: "label".into(),
                         ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
@@ -2596,6 +2747,7 @@ mod tests {
                 structs: vec![StructDef {
                     name: "Record".into(),
                     doc: None,
+                    builder: false,
                     fields: vec![StructField {
                         name: "values".into(),
                         ty: TypeRef::List(Box::new(TypeRef::F64)),
@@ -2652,6 +2804,7 @@ mod tests {
                 structs: vec![StructDef {
                     name: "Settings".into(),
                     doc: None,
+                    builder: false,
                     fields: vec![StructField {
                         name: "props".into(),
                         ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
@@ -2702,6 +2855,7 @@ mod tests {
                 structs: vec![StructDef {
                     name: "Session".into(),
                     doc: None,
+                    builder: false,
                     fields: vec![],
                 }],
                 enums: vec![],
@@ -2923,6 +3077,7 @@ mod tests {
                 structs: vec![StructDef {
                     name: "Contact".into(),
                     doc: None,
+                    builder: false,
                     fields: vec![StructField {
                         name: "name".into(),
                         ty: TypeRef::StringUtf8,

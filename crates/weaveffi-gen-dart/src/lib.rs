@@ -64,6 +64,15 @@ fn dart_type(ty: &TypeRef) -> String {
     }
 }
 
+fn dart_nullable_type_for_builder_field(ty: &TypeRef) -> String {
+    let t = dart_type(ty);
+    if t.ends_with('?') {
+        t
+    } else {
+        format!("{t}?")
+    }
+}
+
 fn native_ffi_type(ty: &TypeRef) -> String {
     match ty {
         TypeRef::I32 => "Int32".into(),
@@ -246,6 +255,9 @@ fn render_dart_module(api: &Api) -> String {
         }
         for s in &module.structs {
             render_struct(&mut out, &path, s);
+            if s.builder {
+                render_dart_builder(&mut out, s);
+            }
         }
         for f in &module.functions {
             render_function(&mut out, &path, f);
@@ -343,6 +355,43 @@ fn render_struct(out: &mut String, module_path: &str, s: &StructDef) {
         out.push_str("  }\n");
     }
 
+    out.push_str("}\n");
+}
+
+fn render_dart_builder(out: &mut String, s: &StructDef) {
+    let class_name = s.name.to_upper_camel_case();
+    let builder_name = format!("{class_name}Builder");
+
+    out.push_str(&format!("\nclass {builder_name} {{\n"));
+    for field in &s.fields {
+        let dt = dart_nullable_type_for_builder_field(&field.ty);
+        let priv_name = field.name.to_lower_camel_case();
+        out.push_str(&format!("  {dt} _{priv_name};\n"));
+    }
+
+    for field in &s.fields {
+        let pascal = field.name.to_upper_camel_case();
+        let dt = dart_type(&field.ty);
+        let priv_name = field.name.to_lower_camel_case();
+        out.push_str(&format!(
+            "\n  {builder_name} with{pascal}({dt} value) {{\n    _{priv_name} = value;\n    return this;\n  }}\n"
+        ));
+    }
+
+    out.push_str(&format!("\n  {class_name} build() {{\n"));
+    for field in &s.fields {
+        if !matches!(&field.ty, TypeRef::Optional(_)) {
+            let priv_name = field.name.to_lower_camel_case();
+            out.push_str(&format!(
+                "    if (_{priv_name} == null) {{\n      throw StateError('missing field: {}');\n    }}\n",
+                field.name
+            ));
+        }
+    }
+    out.push_str(&format!(
+        "    throw UnimplementedError('{builder_name}.build requires FFI backing');\n"
+    ));
+    out.push_str("  }\n");
     out.push_str("}\n");
 }
 
@@ -723,6 +772,7 @@ mod tests {
             structs: vec![StructDef {
                 name: "Contact".into(),
                 doc: Some("A contact record".into()),
+                builder: false,
                 fields: vec![
                     StructField {
                         name: "id".into(),
@@ -788,6 +838,43 @@ mod tests {
         assert!(
             dart.contains("weaveffi_contacts_Contact_get_email"),
             "missing email getter sym: {dart}"
+        );
+    }
+
+    #[test]
+    fn generate_dart_with_builder_struct() {
+        let api = make_api(vec![Module {
+            name: "geo".into(),
+            functions: vec![],
+            structs: vec![StructDef {
+                name: "Point".into(),
+                doc: None,
+                builder: true,
+                fields: vec![StructField {
+                    name: "x".into(),
+                    ty: TypeRef::F64,
+                    doc: None,
+                }],
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let dart = render_dart_module(&api);
+        assert!(
+            dart.contains("class PointBuilder {"),
+            "builder class: {dart}"
+        );
+        assert!(
+            dart.contains("PointBuilder withX(double value)"),
+            "fluent setter: {dart}"
+        );
+        assert!(
+            dart.contains("UnimplementedError('PointBuilder.build requires FFI backing')"),
+            "build stub: {dart}"
         );
     }
 
@@ -1305,6 +1392,7 @@ mod tests {
             structs: vec![StructDef {
                 name: "Contact".into(),
                 doc: Some("A contact record".into()),
+                builder: false,
                 fields: vec![
                     StructField {
                         name: "id".into(),
@@ -1457,6 +1545,7 @@ mod tests {
             structs: vec![StructDef {
                 name: "Contact".into(),
                 doc: None,
+                builder: false,
                 fields: vec![StructField {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,

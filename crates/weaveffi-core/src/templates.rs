@@ -262,6 +262,7 @@ mod tests {
                         ty: TypeRef::F64,
                         doc: None,
                     }],
+                    builder: false,
                 }],
                 enums: vec![],
                 callbacks: vec![],

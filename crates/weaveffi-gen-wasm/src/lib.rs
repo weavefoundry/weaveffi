@@ -200,6 +200,9 @@ fn render_api_reference(out: &mut String, api: &Api) {
             out.push_str("\n#### Structs\n");
             for s in &module.structs {
                 render_struct_ref(out, &module.name, s);
+                if s.builder {
+                    render_builder_ref(out, &module.name, s);
+                }
             }
         }
 
@@ -276,6 +279,30 @@ fn render_struct_ref(out: &mut String, module_name: &str, s: &StructDef) {
             ));
         }
     }
+}
+
+fn render_builder_ref(out: &mut String, module_name: &str, s: &StructDef) {
+    let name = &s.name;
+    out.push_str(&format!("\n##### `{name}Builder`\n\n"));
+    out.push_str(&format!("Builder for `{name}`.\n\n"));
+    out.push_str("| Function | Args | Return |\n");
+    out.push_str("|----------|------|--------|\n");
+    out.push_str(&format!(
+        "| `weaveffi_{module_name}_{name}_Builder_new` | none | `i32` (handle) |\n"
+    ));
+    for field in &s.fields {
+        let wt = wasm_type(&field.ty);
+        out.push_str(&format!(
+            "| `weaveffi_{module_name}_{name}_Builder_set_{}` | `i32` handle, `{wt}` value | none |\n",
+            field.name
+        ));
+    }
+    out.push_str(&format!(
+        "| `weaveffi_{module_name}_{name}_Builder_build` | `i32` handle | `i32` (handle) |\n"
+    ));
+    out.push_str(&format!(
+        "| `weaveffi_{module_name}_{name}_Builder_destroy` | `i32` handle | none |\n"
+    ));
 }
 
 fn render_enum_ref(out: &mut String, e: &EnumDef) {
@@ -1018,6 +1045,7 @@ mod tests {
                         doc: None,
                     },
                 ],
+                builder: false,
             }],
             enums: vec![EnumDef {
                 name: "Color".into(),
@@ -1295,6 +1323,7 @@ mod tests {
                         doc: None,
                     },
                 ],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -1537,6 +1566,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -1581,6 +1611,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -1653,6 +1684,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![EnumDef {
                 name: "Color".into(),
@@ -1710,6 +1742,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -1767,6 +1800,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],

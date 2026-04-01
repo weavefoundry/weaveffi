@@ -267,6 +267,7 @@ fn render_csharp(api: &Api, namespace: &str, strip_module_prefix: bool) -> Strin
         }
         for s in &m.structs {
             render_struct_class(&mut out, &path, s);
+            render_builder_class(&mut out, &path, s);
         }
     }
 
@@ -384,6 +385,52 @@ fn render_struct_class(out: &mut String, module_name: &str, s: &StructDef) {
         s.name
     ));
     out.push_str("    }\n\n");
+}
+
+fn cs_type_builder_storage(ty: &TypeRef) -> String {
+    let t = cs_type(ty);
+    if t.ends_with('?') {
+        t
+    } else {
+        format!("{t}?")
+    }
+}
+
+fn render_builder_class(out: &mut String, module_name: &str, s: &StructDef) {
+    let _ = module_name;
+    if !s.builder {
+        return;
+    }
+    let builder_name = format!("{}Builder", s.name);
+    out.push_str(&format!("    public class {builder_name}\n    {{\n"));
+    for field in &s.fields {
+        let storage = cs_type_builder_storage(&field.ty);
+        let fname = safe_cs_name(&field.name);
+        out.push_str(&format!("        private {storage} _{fname};\n"));
+    }
+    out.push_str("\n");
+    for field in &s.fields {
+        let pascal = field.name.to_upper_camel_case();
+        let param_ty = cs_type(&field.ty);
+        let fname = safe_cs_name(&field.name);
+        out.push_str(&format!(
+            "        public {builder_name} With{pascal}({param_ty} value)\n        {{\n            _{fname} = value;\n            return this;\n        }}\n\n"
+        ));
+    }
+    out.push_str(&format!(
+        "        public {name} Build()\n        {{\n",
+        name = s.name
+    ));
+    for field in &s.fields {
+        let fname = safe_cs_name(&field.name);
+        let raw = field.name.replace('\\', "\\\\").replace('"', "\\\"");
+        out.push_str(&format!(
+            "            if (_{fname} == null) throw new InvalidOperationException(\"missing field: {raw}\");\n"
+        ));
+    }
+    out.push_str(&format!(
+        "            throw new NotImplementedException(\"{builder_name}.Build requires FFI backing\");\n        }}\n    }}\n\n"
+    ));
 }
 
 fn render_struct_getter(out: &mut String, prefix: &str, field: &StructField) {
@@ -1537,6 +1584,58 @@ mod tests {
     }
 
     #[test]
+    fn dotnet_builder_generated() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "contacts".into(),
+                functions: vec![],
+                structs: vec![StructDef {
+                    name: "Contact".into(),
+                    doc: None,
+                    fields: vec![
+                        StructField {
+                            name: "name".into(),
+                            ty: TypeRef::StringUtf8,
+                            doc: None,
+                        },
+                        StructField {
+                            name: "age".into(),
+                            ty: TypeRef::I32,
+                            doc: None,
+                        },
+                    ],
+                    builder: true,
+                }],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let out = Utf8Path::from_path(dir.path()).unwrap();
+        DotnetGenerator.generate(&api, out).unwrap();
+        let dotnet_dir = out.join("dotnet");
+        let cs_files: Vec<_> = std::fs::read_dir(&dotnet_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "cs").unwrap_or(false))
+            .collect();
+        assert!(!cs_files.is_empty(), "expected .cs files");
+        let cs = std::fs::read_to_string(cs_files[0].path()).unwrap();
+        assert!(
+            cs.contains("class ContactBuilder"),
+            "missing builder class: {cs}"
+        );
+        assert!(cs.contains("WithName("), "missing WithName: {cs}");
+        assert!(cs.contains("WithAge("), "missing WithAge: {cs}");
+        assert!(cs.contains("Build()"), "missing Build: {cs}");
+    }
+
+    #[test]
     fn dotnet_generates_csproj() {
         let api = make_api(vec![simple_module(vec![])]);
 
@@ -1800,6 +1899,7 @@ mod tests {
                         doc: None,
                     },
                 ],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -1857,6 +1957,7 @@ mod tests {
                         doc: None,
                     },
                 ],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -1912,6 +2013,7 @@ mod tests {
                     ty: TypeRef::I32,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -1956,6 +2058,7 @@ mod tests {
                         doc: None,
                     },
                 ],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -2239,6 +2342,7 @@ mod tests {
                     ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -2357,6 +2461,7 @@ mod tests {
                         doc: None,
                     },
                 ],
+                builder: false,
             }],
             functions: vec![
                 Function {
@@ -2534,6 +2639,7 @@ mod tests {
                         doc: None,
                     },
                 ],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -2731,6 +2837,7 @@ mod tests {
                         doc: None,
                     },
                 ],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -2819,6 +2926,7 @@ mod tests {
                     ty: TypeRef::List(Box::new(TypeRef::I32)),
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -2932,6 +3040,7 @@ mod tests {
                         doc: None,
                     },
                 ],
+                builder: false,
             }],
             functions: vec![
                 Function {
@@ -3327,6 +3436,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -3399,6 +3509,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![EnumDef {
                 name: "Color".into(),
@@ -3458,6 +3569,7 @@ mod tests {
                         ty: TypeRef::StringUtf8,
                         doc: None,
                     }],
+                    builder: false,
                 }],
                 enums: vec![],
                 callbacks: vec![],
@@ -3497,6 +3609,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -3564,6 +3677,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],

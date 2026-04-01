@@ -312,6 +312,27 @@ fn render_struct_header(out: &mut String, module_name: &str, s: &StructDef, pref
     out.push('\n');
 }
 
+fn render_builder_header(out: &mut String, module_name: &str, s: &StructDef, prefix: &str) {
+    let tag = format!("{prefix}_{module_name}_{}", s.name);
+    let builder_ty = format!("{tag}Builder");
+    out.push_str(&format!("typedef struct {builder_ty} {builder_ty};\n"));
+    out.push_str(&format!("{builder_ty}* {tag}_Builder_new(void);\n"));
+    for field in &s.fields {
+        let param = c_type_for_param(&field.ty, "value", module_name, prefix);
+        out.push_str(&format!(
+            "void {tag}_Builder_set_{}({builder_ty}* builder, {});\n",
+            field.name, param
+        ));
+    }
+    out.push_str(&format!(
+        "{tag}* {tag}_Builder_build({builder_ty}* builder, {prefix}_error* out_err);\n"
+    ));
+    out.push_str(&format!(
+        "void {tag}_Builder_destroy({builder_ty}* builder);\n"
+    ));
+    out.push('\n');
+}
+
 fn render_enum_header(out: &mut String, module_name: &str, e: &EnumDef, prefix: &str) {
     let tag = format!("{prefix}_{module_name}_{}", e.name);
     let variants: Vec<String> = e
@@ -332,6 +353,9 @@ fn render_module_header(out: &mut String, module: &Module, prefix: &str, module_
     }
     for s in &module.structs {
         render_struct_header(out, module_path, s, prefix);
+        if s.builder {
+            render_builder_header(out, module_path, s, prefix);
+        }
     }
     for cb in &module.callbacks {
         let cb_type = format!("{prefix}_{module_path}_{}_fn", cb.name);
@@ -550,6 +574,7 @@ mod tests {
                             doc: None,
                         },
                     ],
+                    builder: false,
                 }],
                 enums: vec![],
                 callbacks: vec![],
@@ -675,6 +700,7 @@ mod tests {
                         ty: TypeRef::I32,
                         doc: None,
                     }],
+                    builder: false,
                 }],
                 enums: vec![EnumDef {
                     name: "Color".to_string(),
@@ -938,6 +964,7 @@ mod tests {
                             doc: None,
                         },
                     ],
+                    builder: false,
                 }],
                 functions: vec![
                     Function {
@@ -1334,6 +1361,7 @@ mod tests {
                         ty: TypeRef::StringUtf8,
                         doc: None,
                     }],
+                    builder: false,
                 }],
                 enums: vec![],
                 callbacks: vec![],
@@ -1427,6 +1455,7 @@ mod tests {
                         ty: TypeRef::StringUtf8,
                         doc: None,
                     }],
+                    builder: false,
                 }],
                 enums: vec![],
                 callbacks: vec![],
@@ -1535,6 +1564,7 @@ mod tests {
                         ty: TypeRef::StringUtf8,
                         doc: None,
                     }],
+                    builder: false,
                 }],
                 enums: vec![EnumDef {
                     name: "Color".into(),
@@ -1604,6 +1634,7 @@ mod tests {
                         ty: TypeRef::StringUtf8,
                         doc: None,
                     }],
+                    builder: false,
                 }],
                 enums: vec![],
                 callbacks: vec![],
@@ -1858,6 +1889,7 @@ mod tests {
                             ty: TypeRef::StringUtf8,
                             doc: None,
                         }],
+                        builder: false,
                     }],
                     enums: vec![],
                     callbacks: vec![],
@@ -2143,6 +2175,7 @@ mod tests {
                         ty: TypeRef::StringUtf8,
                         doc: None,
                     }],
+                    builder: false,
                 }],
                 enums: vec![],
                 callbacks: vec![],
@@ -2169,6 +2202,109 @@ mod tests {
         assert!(
             header.contains("weaveffi_contacts_ListContactsIterator_destroy("),
             "missing destroy: {header}"
+        );
+    }
+
+    #[test]
+    fn c_builder_header_generated() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "contacts".into(),
+                functions: vec![],
+                structs: vec![StructDef {
+                    name: "Contact".into(),
+                    doc: None,
+                    fields: vec![
+                        StructField {
+                            name: "name".into(),
+                            ty: TypeRef::StringUtf8,
+                            doc: None,
+                        },
+                        StructField {
+                            name: "age".into(),
+                            ty: TypeRef::I32,
+                            doc: None,
+                        },
+                    ],
+                    builder: true,
+                }],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
+        let config = GeneratorConfig::default();
+        CGenerator
+            .generate_with_config(&api, out_dir, &config)
+            .unwrap();
+        let header = std::fs::read_to_string(out_dir.join("c/weaveffi.h")).unwrap();
+        assert!(
+            header.contains("weaveffi_contacts_ContactBuilder"),
+            "missing builder typedef: {header}"
+        );
+        assert!(
+            header.contains("weaveffi_contacts_Contact_Builder_new"),
+            "missing Builder_new: {header}"
+        );
+        assert!(
+            header.contains("weaveffi_contacts_Contact_Builder_set_name"),
+            "missing Builder_set_name: {header}"
+        );
+        assert!(
+            header.contains("weaveffi_contacts_Contact_Builder_set_age"),
+            "missing Builder_set_age: {header}"
+        );
+        assert!(
+            header.contains("weaveffi_contacts_Contact_Builder_build"),
+            "missing Builder_build: {header}"
+        );
+        assert!(
+            header.contains("weaveffi_contacts_Contact_Builder_destroy"),
+            "missing Builder_destroy: {header}"
+        );
+    }
+
+    #[test]
+    fn c_no_builder_when_false() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "contacts".into(),
+                functions: vec![],
+                structs: vec![StructDef {
+                    name: "Contact".into(),
+                    doc: None,
+                    fields: vec![StructField {
+                        name: "name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    }],
+                    builder: false,
+                }],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
+        let config = GeneratorConfig::default();
+        CGenerator
+            .generate_with_config(&api, out_dir, &config)
+            .unwrap();
+        let header = std::fs::read_to_string(out_dir.join("c/weaveffi.h")).unwrap();
+        assert!(
+            !header.contains("Builder"),
+            "should not contain Builder when builder=false: {header}"
         );
     }
 }

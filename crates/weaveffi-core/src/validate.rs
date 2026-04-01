@@ -206,6 +206,8 @@ pub enum ValidationError {
     DuplicateListenerName { module: String, name: String },
     #[error("iterator type is only valid as a function return type, found in {location}")]
     IteratorInInvalidPosition { location: String },
+    #[error("builder struct '{name}' in module '{module}' must have at least one field")]
+    BuilderStructEmpty { module: String, name: String },
 }
 
 const RESERVED: &[&str] = &[
@@ -409,6 +411,12 @@ fn validate_module(module: &Module, all_modules: &[Module]) -> Result<(), Valida
             });
         }
         if s.fields.is_empty() {
+            if s.builder {
+                return Err(ValidationError::BuilderStructEmpty {
+                    module: module.name.clone(),
+                    name: s.name.clone(),
+                });
+            }
             return Err(ValidationError::EmptyStruct {
                 module: module.name.clone(),
                 name: s.name.clone(),
@@ -1153,6 +1161,7 @@ mod tests {
                 ty: TypeRef::I32,
                 doc: None,
             }],
+            builder: false,
         }
     }
 
@@ -1190,6 +1199,7 @@ mod tests {
                     name: "Empty".to_string(),
                     doc: None,
                     fields: vec![],
+                    builder: false,
                 }],
                 enums: vec![],
                 callbacks: vec![],
@@ -1228,6 +1238,7 @@ mod tests {
                             doc: None,
                         },
                     ],
+                    builder: false,
                 }],
                 enums: vec![],
                 callbacks: vec![],
@@ -1526,6 +1537,7 @@ mod tests {
                         ty: TypeRef::Struct("Nonexistent".to_string()),
                         doc: None,
                     }],
+                    builder: false,
                 }],
                 enums: vec![],
                 callbacks: vec![],
@@ -1566,6 +1578,7 @@ mod tests {
                         ty: TypeRef::StringUtf8,
                         doc: None,
                     }],
+                    builder: false,
                 }],
                 enums: vec![],
                 callbacks: vec![],
@@ -1631,6 +1644,7 @@ mod tests {
                         ty: TypeRef::StringUtf8,
                         doc: None,
                     }],
+                    builder: false,
                 }],
                 enums: vec![],
                 callbacks: vec![],
@@ -2216,6 +2230,7 @@ mod tests {
                         ty: deep,
                         doc: None,
                     }],
+                    builder: false,
                 }],
                 enums: vec![],
                 callbacks: vec![],
@@ -2379,6 +2394,7 @@ mod tests {
                         ty: TypeRef::Struct("Color".to_string()),
                         doc: None,
                     }],
+                    builder: false,
                 }],
                 enums: vec![simple_enum("Color")],
                 callbacks: vec![],
@@ -2588,6 +2604,7 @@ mod tests {
                         ty: TypeRef::BorrowedStr,
                         doc: None,
                     }],
+                    builder: false,
                     doc: None,
                 }],
                 enums: vec![],
@@ -2619,6 +2636,7 @@ mod tests {
                         ty: TypeRef::BorrowedBytes,
                         doc: None,
                     }],
+                    builder: false,
                     doc: None,
                 }],
                 enums: vec![],
@@ -3110,6 +3128,7 @@ mod tests {
                         ty: TypeRef::Iterator(Box::new(TypeRef::I32)),
                         doc: None,
                     }],
+                    builder: false,
                 }],
                 enums: vec![],
                 callbacks: vec![],
@@ -3123,5 +3142,33 @@ mod tests {
             validate_api(&mut api).unwrap_err(),
             ValidationError::IteratorInInvalidPosition { .. }
         ));
+    }
+
+    #[test]
+    fn builder_struct_empty_is_error() {
+        let mut api = Api {
+            version: "0.2.0".to_string(),
+            modules: vec![Module {
+                name: "m".into(),
+                functions: vec![],
+                structs: vec![StructDef {
+                    name: "Empty".into(),
+                    doc: None,
+                    fields: vec![],
+                    builder: true,
+                }],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let err = validate_api(&mut api).unwrap_err();
+        assert!(
+            matches!(err, ValidationError::BuilderStructEmpty { .. }),
+            "expected BuilderStructEmpty, got: {err}"
+        );
     }
 }

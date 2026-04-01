@@ -220,6 +220,8 @@ pub struct StructDef {
     #[serde(default)]
     pub doc: Option<String>,
     pub fields: Vec<StructField>,
+    #[serde(default)]
+    pub builder: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -464,6 +466,7 @@ modules:
                     doc: None,
                 },
             ],
+            builder: false,
         };
         assert_eq!(s, s.clone());
     }
@@ -1025,5 +1028,62 @@ modules:
         let json = serde_json::to_string(&l).unwrap();
         let back: ListenerDef = serde_json::from_str(&json).unwrap();
         assert_eq!(back, l);
+    }
+
+    #[test]
+    fn builder_defaults_to_false() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: contacts
+    functions: []
+    structs:
+      - name: Contact
+        fields:
+          - name: name
+            type: string
+"#;
+        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        assert!(!api.modules[0].structs[0].builder);
+    }
+
+    #[test]
+    fn builder_true_round_trip() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: contacts
+    functions: []
+    structs:
+      - name: Contact
+        fields:
+          - name: name
+            type: string
+        builder: true
+"#;
+        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        assert!(api.modules[0].structs[0].builder);
+
+        let json = serde_json::to_string(&api).unwrap();
+        let back: Api = serde_json::from_str(&json).unwrap();
+        assert!(back.modules[0].structs[0].builder);
+    }
+
+    #[test]
+    fn builder_false_explicit() {
+        let json = r#"{
+            "version": "0.1.0",
+            "modules": [{
+                "name": "geo",
+                "functions": [],
+                "structs": [{
+                    "name": "Point",
+                    "fields": [{"name": "x", "type": "f64"}],
+                    "builder": false
+                }]
+            }]
+        }"#;
+        let api: Api = serde_json::from_str(json).unwrap();
+        assert!(!api.modules[0].structs[0].builder);
     }
 }

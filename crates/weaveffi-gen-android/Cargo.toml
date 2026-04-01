@@ -15,5 +15,8 @@ weaveffi-ir = { path = "../weaveffi-ir", version = "0.2.0" }
 anyhow = { workspace = true }
 camino = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [lints]
 workspace = true
