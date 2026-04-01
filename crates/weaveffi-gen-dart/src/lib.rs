@@ -500,13 +500,13 @@ fn emit_function_body(out: &mut String, f: &Function, c_sym: &str) {
     call_args.push("err".into());
 
     let var = c_sym.to_lower_camel_case();
-    if f.returns.is_some() {
+    if let Some(ret) = &f.returns {
         out.push_str(&format!(
             "    final result = _{var}({});\n",
             call_args.join(", ")
         ));
         out.push_str("    _checkError(err);\n");
-        emit_result_conversion(out, f.returns.as_ref().unwrap(), "    ");
+        emit_result_conversion(out, ret, "    ");
     } else {
         out.push_str(&format!("    _{var}({});\n", call_args.join(", ")));
         out.push_str("    _checkError(err);\n");
