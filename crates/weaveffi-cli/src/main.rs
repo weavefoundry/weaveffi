@@ -20,6 +20,7 @@ use weaveffi_gen_c::CGenerator;
 use weaveffi_gen_cpp::CppGenerator;
 use weaveffi_gen_dart::DartGenerator;
 use weaveffi_gen_dotnet::DotnetGenerator;
+use weaveffi_gen_go::GoGenerator;
 use weaveffi_gen_node::NodeGenerator;
 use weaveffi_gen_python::PythonGenerator;
 use weaveffi_gen_swift::SwiftGenerator;
@@ -49,7 +50,7 @@ enum Commands {
         /// Output directory for generated artifacts
         #[arg(short, long, default_value = "./generated")]
         out: String,
-        /// Comma-separated list of targets to generate (c, cpp, swift, android, node, wasm, python, dotnet, dart)
+        /// Comma-separated list of targets to generate (c, cpp, swift, android, node, wasm, python, dotnet, dart, go)
         #[arg(short, long)]
         target: Option<String>,
         /// Also generate a scaffold.rs with Rust FFI function stubs
@@ -391,8 +392,9 @@ fn cmd_generate(
     let python = PythonGenerator;
     let dotnet = DotnetGenerator;
     let dart = DartGenerator;
+    let go = GoGenerator;
     let all: Vec<&dyn Generator> = vec![
-        &c, &cpp, &swift, &android, &node, &wasm, &python, &dotnet, &dart,
+        &c, &cpp, &swift, &android, &node, &wasm, &python, &dotnet, &dart, &go,
     ];
 
     let filter: Option<Vec<&str>> = targets.map(|t| t.split(',').map(str::trim).collect());
@@ -562,8 +564,9 @@ fn cmd_diff(input: &str, out: Option<&str>, quiet: bool) -> Result<()> {
     let python = PythonGenerator;
     let dotnet = DotnetGenerator;
     let dart = DartGenerator;
+    let go = GoGenerator;
     let all: Vec<&dyn Generator> = vec![
-        &c, &cpp, &swift, &android, &node, &wasm, &python, &dotnet, &dart,
+        &c, &cpp, &swift, &android, &node, &wasm, &python, &dotnet, &dart, &go,
     ];
 
     let config = GeneratorConfig::default();
@@ -1298,8 +1301,9 @@ mod tests {
         let python = PythonGenerator;
         let dotnet = DotnetGenerator;
         let dart = DartGenerator;
+        let go = GoGenerator;
         let all: Vec<&dyn Generator> = vec![
-            &c, &cpp, &swift, &android, &node, &wasm, &python, &dotnet, &dart,
+            &c, &cpp, &swift, &android, &node, &wasm, &python, &dotnet, &dart, &go,
         ];
 
         let mut files: Vec<String> = Vec::new();
