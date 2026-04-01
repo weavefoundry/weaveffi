@@ -264,11 +264,23 @@ fn has_enum_involvement(f: &Function) -> bool {
 }
 
 fn render_kotlin(api: &Api, package: &str, strip_module_prefix: bool) -> String {
-    let mut kotlin = format!("package {package}\n\nclass WeaveFFI {{\n    companion object {{\n        init {{ System.loadLibrary(\"weaveffi\") }}\n\n");
+    let has_async = api
+        .modules
+        .iter()
+        .any(|m| m.functions.iter().any(|f| f.r#async));
+    let mut kotlin = format!("package {package}\n\n");
+    if has_async {
+        kotlin.push_str("import kotlinx.coroutines.suspendCancellableCoroutine\n");
+        kotlin.push_str("import kotlin.coroutines.resume\n");
+        kotlin.push_str("import kotlin.coroutines.resumeWithException\n\n");
+    }
+    kotlin.push_str("class WeaveFFI {\n    companion object {\n        init { System.loadLibrary(\"weaveffi\") }\n\n");
     for m in &api.modules {
         for f in &m.functions {
             let func_name = wrapper_name(&m.name, &f.name, strip_module_prefix);
-            if has_enum_involvement(f) {
+            if f.r#async {
+                render_kotlin_async_fun(&mut kotlin, f, &func_name);
+            } else if has_enum_involvement(f) {
                 let native_params: Vec<String> = f
                     .params
                     .iter()
@@ -371,7 +383,60 @@ fn render_kotlin(api: &Api, package: &str, strip_module_prefix: bool) -> String 
         }
     }
     render_kotlin_error_types(&mut kotlin, api);
+    if has_async {
+        kotlin.push_str("\ninternal class WeaveContinuation<T>(private val cont: kotlinx.coroutines.CancellableContinuation<T>) {\n");
+        kotlin.push_str("    @Suppress(\"UNCHECKED_CAST\")\n");
+        kotlin.push_str("    fun onSuccess(result: Any?) { cont.resume(result as T) }\n");
+        kotlin.push_str("    fun onError(message: String) { cont.resumeWithException(RuntimeException(message)) }\n");
+        kotlin.push_str("}\n");
+    }
     kotlin
+}
+
+fn render_kotlin_async_fun(out: &mut String, f: &Function, func_name: &str) {
+    let native_params: Vec<String> = f
+        .params
+        .iter()
+        .map(|p| format!("{}: {}", p.name, kotlin_type(&p.ty)))
+        .chain(std::iter::once("callback: Any".to_string()))
+        .collect();
+    let _ = writeln!(
+        out,
+        "        @JvmStatic private external fun {}Async({})",
+        func_name,
+        native_params.join(", ")
+    );
+
+    let params_sig: Vec<String> = f
+        .params
+        .iter()
+        .map(|p| format!("{}: {}", p.name, kotlin_type(&p.ty)))
+        .collect();
+    let ret = f
+        .returns
+        .as_ref()
+        .map(kotlin_type)
+        .unwrap_or_else(|| "Unit".to_string());
+    let call_args: Vec<String> = f
+        .params
+        .iter()
+        .map(|p| p.name.clone())
+        .chain(std::iter::once("WeaveContinuation(cont)".to_string()))
+        .collect();
+    let _ = writeln!(
+        out,
+        "        @JvmStatic suspend fun {}({}): {} = suspendCancellableCoroutine {{ cont ->",
+        func_name,
+        params_sig.join(", "),
+        ret
+    );
+    let _ = writeln!(
+        out,
+        "            {}Async({})",
+        func_name,
+        call_args.join(", ")
+    );
+    let _ = writeln!(out, "        }}");
 }
 
 fn render_kotlin_enum(out: &mut String, e: &EnumDef) {
@@ -463,8 +528,24 @@ fn render_jni_c(api: &Api, package: &str, strip_module_prefix: bool) -> String {
     jni_c.push_str("    weaveffi_error_clear(err);\n");
     jni_c.push_str("}\n\n");
 
+    let has_async = api
+        .modules
+        .iter()
+        .any(|m| m.functions.iter().any(|f| f.r#async));
+    if has_async {
+        jni_c.push_str("typedef struct {\n");
+        jni_c.push_str("    JavaVM* jvm;\n");
+        jni_c.push_str("    jobject callback;\n");
+        jni_c.push_str("} weaveffi_jni_async_ctx;\n\n");
+    }
+
     for m in &api.modules {
         for f in &m.functions {
+            if f.r#async {
+                let func_name = wrapper_name(&m.name, &f.name, strip_module_prefix);
+                render_jni_async_function(&mut jni_c, &m.name, f, &func_name, &jni_prefix);
+                continue;
+            }
             let jret = jni_ret_type(f.returns.as_ref());
             let mut jparams: Vec<String> = vec!["JNIEnv* env".into(), "jclass clazz".into()];
             for p in &f.params {
@@ -530,6 +611,132 @@ fn render_jni_c(api: &Api, package: &str, strip_module_prefix: bool) -> String {
         }
     }
     jni_c
+}
+
+fn async_cb_result_params(ret: Option<&TypeRef>) -> String {
+    match ret {
+        None => String::new(),
+        Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => ", const char* result".to_string(),
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
+            ", const uint8_t* result, size_t result_len".to_string()
+        }
+        Some(t) => format!(", {} result", c_type_for_return(t)),
+    }
+}
+
+fn write_jni_box_result(out: &mut String, ret: Option<&TypeRef>) {
+    match ret {
+        None => {
+            out.push_str("        jobject boxed = NULL;\n");
+        }
+        Some(TypeRef::I32 | TypeRef::Enum(_)) => {
+            out.push_str(
+                "        jclass boxCls = (*env)->FindClass(env, \"java/lang/Integer\");\n",
+            );
+            out.push_str("        jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(I)Ljava/lang/Integer;\");\n");
+            out.push_str("        jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jint)result);\n");
+        }
+        Some(
+            TypeRef::U32
+            | TypeRef::I64
+            | TypeRef::Handle
+            | TypeRef::TypedHandle(_)
+            | TypeRef::Struct(_),
+        ) => {
+            out.push_str("        jclass boxCls = (*env)->FindClass(env, \"java/lang/Long\");\n");
+            out.push_str("        jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(J)Ljava/lang/Long;\");\n");
+            out.push_str("        jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jlong)result);\n");
+        }
+        Some(TypeRef::F64) => {
+            out.push_str("        jclass boxCls = (*env)->FindClass(env, \"java/lang/Double\");\n");
+            out.push_str("        jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(D)Ljava/lang/Double;\");\n");
+            out.push_str("        jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jdouble)result);\n");
+        }
+        Some(TypeRef::Bool) => {
+            out.push_str(
+                "        jclass boxCls = (*env)->FindClass(env, \"java/lang/Boolean\");\n",
+            );
+            out.push_str("        jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(Z)Ljava/lang/Boolean;\");\n");
+            out.push_str("        jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, result ? JNI_TRUE : JNI_FALSE);\n");
+        }
+        Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
+            out.push_str("        jobject boxed = (*env)->NewStringUTF(env, result);\n");
+        }
+        _ => {
+            out.push_str("        jobject boxed = (jobject)(intptr_t)result;\n");
+        }
+    }
+    out.push_str("        jclass cls = (*env)->GetObjectClass(env, ctx->callback);\n");
+    out.push_str("        jmethodID mid = (*env)->GetMethodID(env, cls, \"onSuccess\", \"(Ljava/lang/Object;)V\");\n");
+    out.push_str("        (*env)->CallVoidMethod(env, ctx->callback, mid, boxed);\n");
+}
+
+fn render_jni_async_function(
+    out: &mut String,
+    module_name: &str,
+    f: &Function,
+    func_name: &str,
+    jni_prefix: &str,
+) {
+    let c_sym = c_symbol_name(module_name, &f.name);
+    let cb_name = format!("{c_sym}_jni_cb");
+    let cb_result_params = async_cb_result_params(f.returns.as_ref());
+
+    let _ = writeln!(
+        out,
+        "static void {cb_name}(void* context, weaveffi_error* err{cb_result_params}) {{"
+    );
+    out.push_str("    weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)context;\n");
+    out.push_str("    JNIEnv* env;\n");
+    out.push_str("    (*ctx->jvm)->AttachCurrentThread(ctx->jvm, (void**)&env, NULL);\n");
+    out.push_str("    if (err != NULL && err->code != 0) {\n");
+    out.push_str("        const char* msg = err->message ? err->message : \"WeaveFFI error\";\n");
+    out.push_str("        jstring jmsg = (*env)->NewStringUTF(env, msg);\n");
+    out.push_str("        jclass cls = (*env)->GetObjectClass(env, ctx->callback);\n");
+    out.push_str("        jmethodID mid = (*env)->GetMethodID(env, cls, \"onError\", \"(Ljava/lang/String;)V\");\n");
+    out.push_str("        (*env)->CallVoidMethod(env, ctx->callback, mid, jmsg);\n");
+    out.push_str("    } else {\n");
+    write_jni_box_result(out, f.returns.as_ref());
+    out.push_str("    }\n");
+    out.push_str("    (*env)->DeleteGlobalRef(env, ctx->callback);\n");
+    out.push_str("    free(ctx);\n");
+    out.push_str("}\n\n");
+
+    let mut jparams: Vec<String> = vec!["JNIEnv* env".into(), "jclass clazz".into()];
+    for p in &f.params {
+        jparams.push(format!("{} {}", jni_param_type(&p.ty), p.name));
+    }
+    jparams.push("jobject callback".to_string());
+
+    let jni_name = format!("{func_name}Async");
+    let _ = writeln!(
+        out,
+        "JNIEXPORT void JNICALL Java_{}_WeaveFFI_{}({}) {{",
+        jni_prefix,
+        jni_name,
+        jparams.join(", ")
+    );
+
+    out.push_str("    weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)malloc(sizeof(weaveffi_jni_async_ctx));\n");
+    out.push_str("    (*env)->GetJavaVM(env, &ctx->jvm);\n");
+    out.push_str("    ctx->callback = (*env)->NewGlobalRef(env, callback);\n");
+
+    for p in &f.params {
+        write_param_acquire(out, &p.name, &p.ty);
+    }
+
+    let mut call_args: Vec<String> = Vec::new();
+    for p in &f.params {
+        build_c_call_args(&mut call_args, &p.name, &p.ty, module_name);
+    }
+    call_args.push(cb_name);
+    call_args.push("ctx".to_string());
+
+    let _ = writeln!(out, "    {c_sym}_async({});", call_args.join(", "));
+
+    release_jni_resources(out, &f.params);
+
+    out.push_str("}\n\n");
 }
 
 fn write_param_acquire(out: &mut String, name: &str, ty: &TypeRef) {
@@ -3734,6 +3941,70 @@ mod tests {
         assert!(
             jni.contains("return NULL"),
             "optional null should return NULL: {jni}"
+        );
+    }
+
+    #[test]
+    fn kotlin_async_function_is_suspend() {
+        let api = make_api(vec![Module {
+            name: "tasks".to_string(),
+            functions: vec![Function {
+                name: "run".to_string(),
+                params: vec![Param {
+                    name: "id".to_string(),
+                    ty: TypeRef::I32,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: true,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let kt = render_kotlin(&api, "com.weaveffi", true);
+        assert!(
+            kt.contains("suspend fun"),
+            "async function should generate suspend fun: {kt}"
+        );
+        assert!(
+            kt.contains("suspend fun run(id: Int): Int"),
+            "suspend fun should have correct signature: {kt}"
+        );
+    }
+
+    #[test]
+    fn kotlin_async_uses_coroutine() {
+        let api = make_api(vec![Module {
+            name: "tasks".to_string(),
+            functions: vec![Function {
+                name: "run".to_string(),
+                params: vec![Param {
+                    name: "id".to_string(),
+                    ty: TypeRef::I32,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: true,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let kt = render_kotlin(&api, "com.weaveffi", true);
+        assert!(
+            kt.contains("suspendCancellableCoroutine"),
+            "async function should use suspendCancellableCoroutine: {kt}"
+        );
+        assert!(
+            kt.contains("WeaveContinuation"),
+            "async function should use WeaveContinuation: {kt}"
+        );
+        assert!(
+            kt.contains("import kotlinx.coroutines.suspendCancellableCoroutine"),
+            "should import suspendCancellableCoroutine: {kt}"
         );
     }
 }
