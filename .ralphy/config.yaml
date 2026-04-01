@@ -2,7 +2,7 @@ project:
   name: "weaveffi"
   language: "Rust"
   framework: ""
-  description: "CLI tool that generates multi-language FFI bindings (C, Swift, Kotlin/Android, Node.js, WASM) from a YAML/JSON/TOML API definition, using a stable C ABI."
+  description: "CLI tool that generates multi-language FFI bindings (C, Swift, Kotlin/Android, Node.js, WASM, Python, .NET) from a YAML/JSON/TOML API definition, using a stable C ABI."
 
 commands:
   test: "cargo test --workspace"
@@ -11,11 +11,11 @@ commands:
 
 rules:
   - "This is a Cargo workspace. Crates live in crates/, samples in samples/, consumer examples in examples/."
-  - "Crate structure: weaveffi-ir (IR model + parsing), weaveffi-abi (C ABI runtime), weaveffi-core (Generator trait, Orchestrator, validation, utils), weaveffi-gen-c, weaveffi-gen-swift, weaveffi-gen-android, weaveffi-gen-node, weaveffi-gen-wasm (generators), weaveffi-cli (CLI binary named 'weaveffi')."
+  - "Crate structure: weaveffi-ir (IR model + parsing), weaveffi-abi (C ABI runtime), weaveffi-core (Generator trait, Orchestrator, validation, utils), weaveffi-gen-c, weaveffi-gen-swift, weaveffi-gen-android, weaveffi-gen-node, weaveffi-gen-wasm, weaveffi-gen-python, weaveffi-gen-dotnet (generators), weaveffi-cli (CLI binary named 'weaveffi')."
   - "Use Conventional Commits: feat, fix, refactor, test, docs, chore, ci, build, style, perf. No scopes. Single-line messages only (no body or footer). Imperative mood, no trailing period, max 72 chars. Use '!' after the type for breaking changes (e.g. feat!: ...), not a BREAKING CHANGE footer."
   - "Run cargo fmt --all before committing."
   - "All new code must have tests. Add tests as #[cfg(test)] mod tests at the bottom of existing files, or as integration tests in tests/ directories."
-  - "Async is explicitly rejected. Do not add async support. The validator rejects async: true."
+  - "Async is currently rejected by the validator. Async support will be added in a future PRD phase — do not add it until the PRD instructs you to."
   - "Use anyhow::Result for fallible functions. Use thiserror for error enums in library crates."
   - "Use camino::Utf8Path instead of std::path::Path."
   - "IR types must derive Debug, Clone, PartialEq, Eq, Serialize, Deserialize."
@@ -23,7 +23,7 @@ rules:
   - "Generated foreign language code must be valid and compilable in the target language. Test by inspection."
   - "The C ABI naming convention is weaveffi_{module}_{function} for functions."
   - "Keep changes focused. Only modify files directly related to the task. Do not refactor unrelated code."
-  - "Do not create new crates. All crates already exist."
+  - "New generator crates may be created when the PRD explicitly instructs it. Follow existing crate patterns (Cargo.toml metadata, workspace dependencies, Generator trait)."
   - "workspace.lints.rust has unsafe_code = deny. Crates that need unsafe (weaveffi-abi, samples/calculator, samples/node-addon) have #![allow(unsafe_code)]."
 
 boundaries:
