@@ -1,10 +1,26 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use weaveffi_core::codegen::Generator;
-use weaveffi_core::utils::c_symbol_name;
+use weaveffi_core::config::GeneratorConfig;
 use weaveffi_ir::ir::{Api, EnumDef, Module, Param, StructDef, TypeRef};
 
 pub struct CGenerator;
+
+impl CGenerator {
+    fn generate_impl(&self, api: &Api, out_dir: &Utf8Path, prefix: &str) -> Result<()> {
+        let dir = out_dir.join("c");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(
+            dir.join(format!("{prefix}.h")),
+            render_c_header(api, prefix),
+        )?;
+        std::fs::write(
+            dir.join(format!("{prefix}.c")),
+            render_c_convenience_c(prefix),
+        )?;
+        Ok(())
+    }
+}
 
 impl Generator for CGenerator {
     fn name(&self) -> &'static str {
@@ -12,11 +28,16 @@ impl Generator for CGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        let dir = out_dir.join("c");
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join("weaveffi.h"), render_c_header(api))?;
-        std::fs::write(dir.join("weaveffi.c"), render_c_convenience_c())?;
-        Ok(())
+        self.generate_impl(api, out_dir, "weaveffi")
+    }
+
+    fn generate_with_config(
+        &self,
+        api: &Api,
+        out_dir: &Utf8Path,
+        config: &GeneratorConfig,
+    ) -> Result<()> {
+        self.generate_impl(api, out_dir, config.c_prefix())
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
@@ -39,24 +60,24 @@ fn is_c_pointer_type(ty: &TypeRef) -> bool {
 }
 
 /// Returns the scalar C type name for use in pointer/array contexts.
-fn c_element_type(ty: &TypeRef, module: &str) -> String {
+fn c_element_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
     match ty {
         TypeRef::I32 => "int32_t".to_string(),
         TypeRef::U32 => "uint32_t".to_string(),
         TypeRef::I64 => "int64_t".to_string(),
         TypeRef::F64 => "double".to_string(),
         TypeRef::Bool => "bool".to_string(),
-        TypeRef::Handle => "weaveffi_handle_t".to_string(),
+        TypeRef::Handle => format!("{prefix}_handle_t"),
         TypeRef::StringUtf8 => "const char*".to_string(),
         TypeRef::Bytes => "const uint8_t*".to_string(),
-        TypeRef::Struct(s) => format!("weaveffi_{module}_{s}*"),
-        TypeRef::Enum(e) => format!("weaveffi_{module}_{e}"),
-        TypeRef::Optional(inner) | TypeRef::List(inner) => c_element_type(inner, module),
+        TypeRef::Struct(s) => format!("{prefix}_{module}_{s}*"),
+        TypeRef::Enum(e) => format!("{prefix}_{module}_{e}"),
+        TypeRef::Optional(inner) | TypeRef::List(inner) => c_element_type(inner, module, prefix),
         TypeRef::Map(_, _) => "void*".to_string(),
     }
 }
 
-fn c_type_for_param(ty: &TypeRef, name: &str, module: &str) -> String {
+fn c_type_for_param(ty: &TypeRef, name: &str, module: &str, prefix: &str) -> String {
     match ty {
         TypeRef::I32 => format!("int32_t {name}"),
         TypeRef::U32 => format!("uint32_t {name}"),
@@ -65,19 +86,19 @@ fn c_type_for_param(ty: &TypeRef, name: &str, module: &str) -> String {
         TypeRef::Bool => format!("bool {name}"),
         TypeRef::StringUtf8 => format!("const char* {name}"),
         TypeRef::Bytes => format!("const uint8_t* {name}_ptr, size_t {name}_len"),
-        TypeRef::Handle => format!("weaveffi_handle_t {name}"),
-        TypeRef::Struct(s) => format!("const weaveffi_{module}_{s}* {name}"),
-        TypeRef::Enum(e) => format!("weaveffi_{module}_{e} {name}"),
+        TypeRef::Handle => format!("{prefix}_handle_t {name}"),
+        TypeRef::Struct(s) => format!("const {prefix}_{module}_{s}* {name}"),
+        TypeRef::Enum(e) => format!("{prefix}_{module}_{e} {name}"),
         TypeRef::Optional(inner) => {
             if is_c_pointer_type(inner) {
-                c_type_for_param(inner, name, module)
+                c_type_for_param(inner, name, module, prefix)
             } else {
-                let base = c_element_type(inner, module);
+                let base = c_element_type(inner, module, prefix);
                 format!("const {base}* {name}")
             }
         }
         TypeRef::List(inner) => {
-            let elem = c_element_type(inner, module);
+            let elem = c_element_type(inner, module, prefix);
             if is_c_pointer_type(inner) {
                 format!("{elem} const* {name}, size_t {name}_len")
             } else {
@@ -85,8 +106,8 @@ fn c_type_for_param(ty: &TypeRef, name: &str, module: &str) -> String {
             }
         }
         TypeRef::Map(k, v) => {
-            let key_elem = c_element_type(k, module);
-            let val_elem = c_element_type(v, module);
+            let key_elem = c_element_type(k, module, prefix);
+            let val_elem = c_element_type(v, module, prefix);
             let keys_part = if is_c_pointer_type(k) {
                 format!("{key_elem} const* {name}_keys")
             } else {
@@ -102,7 +123,7 @@ fn c_type_for_param(ty: &TypeRef, name: &str, module: &str) -> String {
     }
 }
 
-fn c_ret_type(ty: &TypeRef, module: &str) -> (String, Vec<String>) {
+fn c_ret_type(ty: &TypeRef, module: &str, prefix: &str) -> (String, Vec<String>) {
     match ty {
         TypeRef::I32 => ("int32_t".to_string(), vec![]),
         TypeRef::U32 => ("uint32_t".to_string(), vec![]),
@@ -114,24 +135,24 @@ fn c_ret_type(ty: &TypeRef, module: &str) -> (String, Vec<String>) {
             "const uint8_t*".to_string(),
             vec!["size_t* out_len".to_string()],
         ),
-        TypeRef::Handle => ("weaveffi_handle_t".to_string(), vec![]),
-        TypeRef::Struct(s) => (format!("weaveffi_{module}_{s}*"), vec![]),
-        TypeRef::Enum(e) => (format!("weaveffi_{module}_{e}"), vec![]),
+        TypeRef::Handle => (format!("{prefix}_handle_t"), vec![]),
+        TypeRef::Struct(s) => (format!("{prefix}_{module}_{s}*"), vec![]),
+        TypeRef::Enum(e) => (format!("{prefix}_{module}_{e}"), vec![]),
         TypeRef::Optional(inner) => {
             if is_c_pointer_type(inner) {
-                c_ret_type(inner, module)
+                c_ret_type(inner, module, prefix)
             } else {
-                let base = c_element_type(inner, module);
+                let base = c_element_type(inner, module, prefix);
                 (format!("{base}*"), vec![])
             }
         }
         TypeRef::List(inner) => {
-            let elem = c_element_type(inner, module);
+            let elem = c_element_type(inner, module, prefix);
             (format!("{elem}*"), vec!["size_t* out_len".to_string()])
         }
         TypeRef::Map(k, v) => {
-            let key_elem = c_element_type(k, module);
-            let val_elem = c_element_type(v, module);
+            let key_elem = c_element_type(k, module, prefix);
+            let val_elem = c_element_type(v, module, prefix);
             (
                 "void".to_string(),
                 vec![
@@ -144,28 +165,33 @@ fn c_ret_type(ty: &TypeRef, module: &str) -> (String, Vec<String>) {
     }
 }
 
-fn c_params_sig(params: &[Param], module: &str) -> Vec<String> {
+fn c_params_sig(params: &[Param], module: &str, prefix: &str) -> Vec<String> {
     params
         .iter()
-        .map(|p| c_type_for_param(&p.ty, &p.name, module))
+        .map(|p| c_type_for_param(&p.ty, &p.name, module, prefix))
         .collect()
 }
 
-fn render_c_header(api: &Api) -> String {
+fn render_c_header(api: &Api, prefix: &str) -> String {
+    let guard = format!("{}_H", prefix.to_uppercase());
     let mut out = String::new();
-    out.push_str("#ifndef WEAVEFFI_H\n");
-    out.push_str("#define WEAVEFFI_H\n\n");
+    out.push_str(&format!("#ifndef {guard}\n"));
+    out.push_str(&format!("#define {guard}\n\n"));
     out.push_str("#include <stdint.h>\n");
     out.push_str("#include <stddef.h>\n");
     out.push_str("#include <stdbool.h>\n\n");
     out.push_str("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n");
-    out.push_str("typedef uint64_t weaveffi_handle_t;\n\n");
-    out.push_str(
-        "typedef struct weaveffi_error { int32_t code; const char* message; } weaveffi_error;\n\n",
-    );
-    out.push_str("void weaveffi_error_clear(weaveffi_error* err);\n");
-    out.push_str("void weaveffi_free_string(const char* ptr);\n");
-    out.push_str("void weaveffi_free_bytes(uint8_t* ptr, size_t len);\n\n");
+    out.push_str(&format!("typedef uint64_t {prefix}_handle_t;\n\n"));
+    out.push_str(&format!(
+        "typedef struct {prefix}_error {{ int32_t code; const char* message; }} {prefix}_error;\n\n",
+    ));
+    out.push_str(&format!(
+        "void {prefix}_error_clear({prefix}_error* err);\n"
+    ));
+    out.push_str(&format!("void {prefix}_free_string(const char* ptr);\n"));
+    out.push_str(&format!(
+        "void {prefix}_free_bytes(uint8_t* ptr, size_t len);\n\n"
+    ));
     out.push_str("/*\n");
     out.push_str(" * Map convention: Maps are passed as parallel arrays of keys and values.\n");
     out.push_str(" * A map parameter {K:V} named \"m\" expands to:\n");
@@ -175,79 +201,74 @@ fn render_c_header(api: &Api) -> String {
     out.push_str(" */\n\n");
 
     for m in &api.modules {
-        render_module_header(&mut out, m);
+        render_module_header(&mut out, m, prefix);
     }
 
     out.push_str("\n#ifdef __cplusplus\n}\n#endif\n\n");
-    out.push_str("#endif // WEAVEFFI_H\n");
+    out.push_str(&format!("#endif // {guard}\n"));
     out
 }
 
-fn render_struct_header(out: &mut String, module_name: &str, s: &StructDef) {
-    let prefix = format!("weaveffi_{}_{}", module_name, s.name);
+fn render_struct_header(out: &mut String, module_name: &str, s: &StructDef, prefix: &str) {
+    let tag = format!("{prefix}_{module_name}_{}", s.name);
 
-    out.push_str(&format!("typedef struct {prefix} {prefix};\n"));
+    out.push_str(&format!("typedef struct {tag} {tag};\n"));
 
     let mut params: Vec<String> = s
         .fields
         .iter()
-        .map(|f| c_type_for_param(&f.ty, &f.name, module_name))
+        .map(|f| c_type_for_param(&f.ty, &f.name, module_name, prefix))
         .collect();
-    params.push("weaveffi_error* out_err".to_string());
-    out.push_str(&format!(
-        "{prefix}* {prefix}_create({});\n",
-        params.join(", ")
-    ));
+    params.push(format!("{prefix}_error* out_err"));
+    out.push_str(&format!("{tag}* {tag}_create({});\n", params.join(", ")));
 
-    out.push_str(&format!("void {prefix}_destroy({prefix}* ptr);\n"));
+    out.push_str(&format!("void {tag}_destroy({tag}* ptr);\n"));
 
     for field in &s.fields {
-        let (ret_ty, out_params) = c_ret_type(&field.ty, module_name);
-        let getter = format!("{prefix}_get_{}", field.name);
+        let (ret_ty, out_params) = c_ret_type(&field.ty, module_name, prefix);
+        let getter = format!("{tag}_get_{}", field.name);
         if out_params.is_empty() {
-            out.push_str(&format!("{ret_ty} {getter}(const {prefix}* ptr);\n"));
+            out.push_str(&format!("{ret_ty} {getter}(const {tag}* ptr);\n"));
         } else {
             let extra = out_params.join(", ");
-            out.push_str(&format!(
-                "{ret_ty} {getter}(const {prefix}* ptr, {extra});\n"
-            ));
+            out.push_str(&format!("{ret_ty} {getter}(const {tag}* ptr, {extra});\n"));
         }
     }
     out.push('\n');
 }
 
-fn render_enum_header(out: &mut String, module_name: &str, e: &EnumDef) {
-    let prefix = format!("weaveffi_{}_{}", module_name, e.name);
+fn render_enum_header(out: &mut String, module_name: &str, e: &EnumDef, prefix: &str) {
+    let tag = format!("{prefix}_{module_name}_{}", e.name);
     let variants: Vec<String> = e
         .variants
         .iter()
-        .map(|v| format!("{prefix}_{} = {}", v.name, v.value))
+        .map(|v| format!("{tag}_{} = {}", v.name, v.value))
         .collect();
     out.push_str(&format!(
-        "typedef enum {{ {} }} {prefix};\n",
+        "typedef enum {{ {} }} {tag};\n",
         variants.join(", ")
     ));
 }
 
-fn render_module_header(out: &mut String, module: &Module) {
+fn render_module_header(out: &mut String, module: &Module, prefix: &str) {
     out.push_str(&format!("// Module: {}\n", module.name));
     for e in &module.enums {
-        render_enum_header(out, &module.name, e);
+        render_enum_header(out, &module.name, e, prefix);
     }
     for s in &module.structs {
-        render_struct_header(out, &module.name, s);
+        render_struct_header(out, &module.name, s, prefix);
     }
     for f in &module.functions {
-        let mut params_sig = c_params_sig(&f.params, &module.name);
+        let mut params_sig = c_params_sig(&f.params, &module.name, prefix);
         let ret_sig = if let Some(ret) = &f.returns {
-            let (ret_ty, out_params) = c_ret_type(ret, &module.name);
+            let (ret_ty, out_params) = c_ret_type(ret, &module.name, prefix);
             params_sig.extend(out_params);
             ret_ty
         } else {
             "void".to_string()
         };
-        params_sig.push("weaveffi_error* out_err".to_string());
-        let fn_name = c_symbol_name(&module.name, &f.name);
+        params_sig.push(format!("{prefix}_error* out_err"));
+        let fn_name = format!("{prefix}_{}_{}", module.name, f.name);
         out.push_str(&format!(
             "{} {}({});\n",
             ret_sig,
@@ -258,8 +279,8 @@ fn render_module_header(out: &mut String, module: &Module) {
     out.push('\n');
 }
 
-fn render_c_convenience_c() -> String {
-    "#include \"weaveffi.h\"\n\n// Optional convenience wrappers can be added here in future versions.\n".to_string()
+fn render_c_convenience_c(prefix: &str) -> String {
+    format!("#include \"{prefix}.h\"\n\n// Optional convenience wrappers can be added here in future versions.\n")
 }
 
 #[cfg(test)]
@@ -267,6 +288,7 @@ mod tests {
     use super::*;
     use camino::Utf8Path;
     use weaveffi_core::codegen::Generator;
+    use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{
         Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
     };
@@ -365,7 +387,7 @@ mod tests {
             }],
         };
 
-        let header = render_c_header(&api);
+        let header = render_c_header(&api, "weaveffi");
 
         assert!(
             header.contains("typedef struct weaveffi_contacts_Contact weaveffi_contacts_Contact;"),
@@ -441,7 +463,7 @@ mod tests {
             }],
         };
 
-        let header = render_c_header(&api);
+        let header = render_c_header(&api, "weaveffi");
         assert!(header.contains("typedef enum {"), "missing typedef enum");
         assert!(
             header.contains("weaveffi_contacts_Color_Red = 0"),
@@ -489,7 +511,7 @@ mod tests {
                 errors: None,
             }],
         };
-        let header = render_c_header(&api);
+        let header = render_c_header(&api, "weaveffi");
         let enum_pos = header.find("typedef enum").unwrap();
         let struct_pos = header.find("typedef struct weaveffi_contacts_").unwrap();
         assert!(enum_pos < struct_pos, "enums must appear before structs");
@@ -501,33 +523,45 @@ mod tests {
             &TypeRef::Struct("Contact".to_string()),
             "person",
             "contacts",
+            "weaveffi",
         );
         assert_eq!(result, "const weaveffi_contacts_Contact* person");
     }
 
     #[test]
     fn c_type_enum_param() {
-        let result = c_type_for_param(&TypeRef::Enum("Color".to_string()), "color", "contacts");
+        let result = c_type_for_param(
+            &TypeRef::Enum("Color".to_string()),
+            "color",
+            "contacts",
+            "weaveffi",
+        );
         assert_eq!(result, "weaveffi_contacts_Color color");
     }
 
     #[test]
     fn c_type_optional_value_param() {
         let ty = TypeRef::Optional(Box::new(TypeRef::I32));
-        assert_eq!(c_type_for_param(&ty, "val", "m"), "const int32_t* val");
+        assert_eq!(
+            c_type_for_param(&ty, "val", "m", "weaveffi"),
+            "const int32_t* val"
+        );
     }
 
     #[test]
     fn c_type_optional_pointer_param() {
         let ty = TypeRef::Optional(Box::new(TypeRef::StringUtf8));
-        assert_eq!(c_type_for_param(&ty, "name", "m"), "const char* name");
+        assert_eq!(
+            c_type_for_param(&ty, "name", "m", "weaveffi"),
+            "const char* name"
+        );
     }
 
     #[test]
     fn c_type_optional_struct_param() {
         let ty = TypeRef::Optional(Box::new(TypeRef::Struct("Contact".into())));
         assert_eq!(
-            c_type_for_param(&ty, "person", "contacts"),
+            c_type_for_param(&ty, "person", "contacts", "weaveffi"),
             "const weaveffi_contacts_Contact* person"
         );
     }
@@ -536,7 +570,7 @@ mod tests {
     fn c_type_optional_enum_param() {
         let ty = TypeRef::Optional(Box::new(TypeRef::Enum("Color".into())));
         assert_eq!(
-            c_type_for_param(&ty, "color", "contacts"),
+            c_type_for_param(&ty, "color", "contacts", "weaveffi"),
             "const weaveffi_contacts_Color* color"
         );
     }
@@ -545,7 +579,7 @@ mod tests {
     fn c_type_list_value_param() {
         let ty = TypeRef::List(Box::new(TypeRef::I32));
         assert_eq!(
-            c_type_for_param(&ty, "items", "m"),
+            c_type_for_param(&ty, "items", "m", "weaveffi"),
             "const int32_t* items, size_t items_len"
         );
     }
@@ -554,42 +588,48 @@ mod tests {
     fn c_type_list_struct_param() {
         let ty = TypeRef::List(Box::new(TypeRef::Struct("Contact".into())));
         assert_eq!(
-            c_type_for_param(&ty, "items", "contacts"),
+            c_type_for_param(&ty, "items", "contacts", "weaveffi"),
             "weaveffi_contacts_Contact* const* items, size_t items_len"
         );
     }
 
     #[test]
     fn c_ret_struct() {
-        let (ty, out_params) = c_ret_type(&TypeRef::Struct("Contact".into()), "contacts");
+        let (ty, out_params) =
+            c_ret_type(&TypeRef::Struct("Contact".into()), "contacts", "weaveffi");
         assert_eq!(ty, "weaveffi_contacts_Contact*");
         assert!(out_params.is_empty());
     }
 
     #[test]
     fn c_ret_enum() {
-        let (ty, out_params) = c_ret_type(&TypeRef::Enum("Color".into()), "contacts");
+        let (ty, out_params) = c_ret_type(&TypeRef::Enum("Color".into()), "contacts", "weaveffi");
         assert_eq!(ty, "weaveffi_contacts_Color");
         assert!(out_params.is_empty());
     }
 
     #[test]
     fn c_ret_optional_value() {
-        let (ty, out_params) = c_ret_type(&TypeRef::Optional(Box::new(TypeRef::I32)), "m");
+        let (ty, out_params) =
+            c_ret_type(&TypeRef::Optional(Box::new(TypeRef::I32)), "m", "weaveffi");
         assert_eq!(ty, "int32_t*");
         assert!(out_params.is_empty());
     }
 
     #[test]
     fn c_ret_optional_pointer() {
-        let (ty, out_params) = c_ret_type(&TypeRef::Optional(Box::new(TypeRef::StringUtf8)), "m");
+        let (ty, out_params) = c_ret_type(
+            &TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+            "m",
+            "weaveffi",
+        );
         assert_eq!(ty, "const char*");
         assert!(out_params.is_empty());
     }
 
     #[test]
     fn c_ret_list_value() {
-        let (ty, out_params) = c_ret_type(&TypeRef::List(Box::new(TypeRef::I32)), "m");
+        let (ty, out_params) = c_ret_type(&TypeRef::List(Box::new(TypeRef::I32)), "m", "weaveffi");
         assert_eq!(ty, "int32_t*");
         assert_eq!(out_params, vec!["size_t* out_len"]);
     }
@@ -599,6 +639,7 @@ mod tests {
         let (ty, out_params) = c_ret_type(
             &TypeRef::List(Box::new(TypeRef::Struct("Contact".into()))),
             "contacts",
+            "weaveffi",
         );
         assert_eq!(ty, "weaveffi_contacts_Contact**");
         assert_eq!(out_params, vec!["size_t* out_len"]);
@@ -638,7 +679,7 @@ mod tests {
             }],
         };
 
-        let header = render_c_header(&api);
+        let header = render_c_header(&api, "weaveffi");
         assert!(
             header.contains(
                 "int32_t* weaveffi_store_find(const int32_t* id, weaveffi_error* out_err);"
@@ -909,7 +950,7 @@ mod tests {
             }],
         };
 
-        let header = render_c_header(&api);
+        let header = render_c_header(&api, "weaveffi");
         assert!(
             header.contains("typedef enum { weaveffi_paint_Color_Red = 0, weaveffi_paint_Color_Green = 1 } weaveffi_paint_Color;"),
             "missing enum typedef: {header}"
@@ -926,6 +967,7 @@ mod tests {
             &TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
             "scores",
             "m",
+            "weaveffi",
         );
         assert_eq!(
             result,
@@ -938,6 +980,7 @@ mod tests {
         let (ty, out_params) = c_ret_type(
             &TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
             "m",
+            "weaveffi",
         );
         assert_eq!(ty, "void");
         assert_eq!(
@@ -972,7 +1015,7 @@ mod tests {
             }],
         };
 
-        let header = render_c_header(&api);
+        let header = render_c_header(&api, "weaveffi");
         assert!(
             header.contains(
                 "const char* const* scores_keys, const int32_t* scores_values, size_t scores_len"
@@ -983,5 +1026,63 @@ mod tests {
             header.contains("Map convention"),
             "missing map convention comment: {header}"
         );
+    }
+
+    #[test]
+    fn c_custom_prefix() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "calculator".to_string(),
+                functions: vec![Function {
+                    name: "add".to_string(),
+                    params: vec![
+                        Param {
+                            name: "a".to_string(),
+                            ty: TypeRef::I32,
+                        },
+                        Param {
+                            name: "b".to_string(),
+                            ty: TypeRef::I32,
+                        },
+                    ],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_c_custom_prefix");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        let config = GeneratorConfig {
+            c_prefix: Some("mylib".into()),
+            ..GeneratorConfig::default()
+        };
+        CGenerator
+            .generate_with_config(&api, out_dir, &config)
+            .unwrap();
+
+        assert!(
+            tmp.join("c").join("mylib.h").exists(),
+            "header should be named mylib.h"
+        );
+        let header = std::fs::read_to_string(tmp.join("c").join("mylib.h")).unwrap();
+        assert!(
+            header.contains("mylib_calculator_add"),
+            "should use custom prefix for function names"
+        );
+        assert!(
+            !header.contains("weaveffi_"),
+            "should not contain default prefix"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
