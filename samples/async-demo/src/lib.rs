@@ -184,11 +184,13 @@ mod tests {
     #[test]
     fn run_task_calls_callback() {
         let (tx, rx) = mpsc::channel::<TaskCbMsg>();
+        let tx_ptr = Box::into_raw(Box::new(tx));
         let name = CString::new("test-task").unwrap();
 
-        weaveffi_tasks_run_task_async(name.as_ptr(), task_callback, &tx as *const _ as *mut c_void);
+        weaveffi_tasks_run_task_async(name.as_ptr(), task_callback, tx_ptr as *mut c_void);
 
         let (had_error, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        unsafe { drop(Box::from_raw(tx_ptr)) };
         assert!(!had_error);
         assert!(!result.is_null());
 
@@ -203,14 +205,12 @@ mod tests {
     #[test]
     fn run_task_null_name() {
         let (tx, rx) = mpsc::channel::<TaskCbMsg>();
+        let tx_ptr = Box::into_raw(Box::new(tx));
 
-        weaveffi_tasks_run_task_async(
-            std::ptr::null(),
-            task_callback,
-            &tx as *const _ as *mut c_void,
-        );
+        weaveffi_tasks_run_task_async(std::ptr::null(), task_callback, tx_ptr as *mut c_void);
 
         let (had_error, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        unsafe { drop(Box::from_raw(tx_ptr)) };
         assert!(!had_error);
         assert!(!result.is_null());
 
@@ -223,6 +223,7 @@ mod tests {
     #[test]
     fn run_batch_processes_sequentially() {
         let (tx, rx) = mpsc::channel::<BatchCbMsg>();
+        let tx_ptr = Box::into_raw(Box::new(tx));
         let names: Vec<CString> = vec![
             CString::new("task-a").unwrap(),
             CString::new("task-b").unwrap(),
@@ -234,10 +235,11 @@ mod tests {
             name_ptrs.as_ptr(),
             name_ptrs.len(),
             batch_callback,
-            &tx as *const _ as *mut c_void,
+            tx_ptr as *mut c_void,
         );
 
         let (had_error, results, results_len) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        unsafe { drop(Box::from_raw(tx_ptr)) };
         assert!(!had_error);
         assert_eq!(results_len, 3);
         assert!(!results.is_null());
@@ -260,15 +262,12 @@ mod tests {
     #[test]
     fn run_batch_empty_names() {
         let (tx, rx) = mpsc::channel::<BatchCbMsg>();
+        let tx_ptr = Box::into_raw(Box::new(tx));
 
-        weaveffi_tasks_run_batch_async(
-            std::ptr::null(),
-            0,
-            batch_callback,
-            &tx as *const _ as *mut c_void,
-        );
+        weaveffi_tasks_run_batch_async(std::ptr::null(), 0, batch_callback, tx_ptr as *mut c_void);
 
         let (had_error, results, results_len) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        unsafe { drop(Box::from_raw(tx_ptr)) };
         assert!(!had_error);
         assert_eq!(results_len, 0);
         assert!(results.is_null());
@@ -290,10 +289,12 @@ mod tests {
         assert_eq!(cancelled, 0);
 
         let (tx, rx) = mpsc::channel::<TaskCbMsg>();
+        let tx_ptr = Box::into_raw(Box::new(tx));
         let name = CString::new("post-cancel").unwrap();
-        weaveffi_tasks_run_task_async(name.as_ptr(), task_callback, &tx as *const _ as *mut c_void);
+        weaveffi_tasks_run_task_async(name.as_ptr(), task_callback, tx_ptr as *mut c_void);
 
         let (had_error, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        unsafe { drop(Box::from_raw(tx_ptr)) };
         assert!(!had_error);
         assert!(!result.is_null());
 
