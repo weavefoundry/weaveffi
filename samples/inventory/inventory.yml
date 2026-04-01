@@ -95,3 +95,10 @@ modules:
           - name: id
             type: handle
         return: bool
+      - name: add_product_to_order
+        params:
+          - name: order_id
+            type: handle
+          - name: product
+            type: Product
+        return: bool

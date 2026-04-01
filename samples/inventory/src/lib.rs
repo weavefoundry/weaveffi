@@ -446,6 +446,37 @@ pub extern "C" fn weaveffi_orders_cancel_order(
     }
 }
 
+#[no_mangle]
+pub extern "C" fn weaveffi_orders_add_product_to_order(
+    order_id: weaveffi_handle_t,
+    product: *const Product,
+    out_err: *mut weaveffi_error,
+) -> i32 {
+    if product.is_null() {
+        abi::error_set(out_err, 1, "product is null");
+        return 0;
+    }
+    let p = unsafe { &*product };
+    let mut store = ORDER_STORE.lock().unwrap();
+    match store.iter_mut().find(|o| o.id == order_id as i64) {
+        Some(order) => {
+            let item = OrderItem {
+                product_id: p.id,
+                quantity: 1,
+                unit_price: p.price,
+            };
+            order.total += item.unit_price;
+            order.items.push(item);
+            abi::error_set_ok(out_err);
+            1
+        }
+        None => {
+            abi::error_set_ok(out_err);
+            0
+        }
+    }
+}
+
 // ── Orders: OrderItem getters ───────────────────────────────
 
 #[no_mangle]
@@ -1078,5 +1109,113 @@ mod tests {
     #[test]
     fn free_null_order_item_list_is_safe() {
         weaveffi_orders_OrderItem_list_free(std::ptr::null_mut(), 0);
+    }
+
+    // ── Cross-module tests ──────────────────────────────────
+
+    #[test]
+    fn add_product_to_order_success() {
+        let _g = setup();
+        let mut err = new_err();
+        let name = CString::new("Gadget").unwrap();
+
+        let product_handle = weaveffi_products_create_product(
+            name.as_ptr(),
+            49.99,
+            Category::Electronics as i32,
+            &mut err,
+        );
+        assert_eq!(err.code, 0);
+
+        let order_handle = weaveffi_orders_create_order(std::ptr::null(), 0, &mut err);
+        assert_eq!(err.code, 0);
+
+        let product = weaveffi_products_get_product(product_handle, &mut err);
+        assert!(!product.is_null());
+
+        let result = weaveffi_orders_add_product_to_order(order_handle, product, &mut err);
+        assert_eq!(err.code, 0);
+        assert_eq!(result, 1);
+
+        let order = weaveffi_orders_get_order(order_handle, &mut err);
+        let o = unsafe { &*order };
+        assert_eq!(o.items.len(), 1);
+        assert_eq!(o.items[0].product_id, product_handle as i64);
+        assert_eq!(o.items[0].unit_price, 49.99);
+        assert_eq!(o.items[0].quantity, 1);
+        assert_eq!(o.total, 49.99);
+
+        weaveffi_orders_Order_destroy(order);
+        weaveffi_products_Product_destroy(product);
+    }
+
+    #[test]
+    fn add_product_to_order_not_found() {
+        let _g = setup();
+        let mut err = new_err();
+
+        let product = Box::into_raw(Box::new(Product {
+            id: 1,
+            name: "Test".to_string(),
+            description: None,
+            price: 10.0,
+            category: Category::Electronics,
+            tags: Vec::new(),
+        }));
+
+        let result = weaveffi_orders_add_product_to_order(999, product, &mut err);
+        assert_eq!(err.code, 0);
+        assert_eq!(result, 0);
+
+        weaveffi_products_Product_destroy(product);
+    }
+
+    #[test]
+    fn add_product_to_order_null_product() {
+        let _g = setup();
+        let mut err = new_err();
+
+        let order_handle = weaveffi_orders_create_order(std::ptr::null(), 0, &mut err);
+        assert_eq!(err.code, 0);
+
+        let result = weaveffi_orders_add_product_to_order(order_handle, std::ptr::null(), &mut err);
+        assert_ne!(err.code, 0);
+        assert_eq!(result, 0);
+        abi::error_clear(&mut err);
+    }
+
+    #[test]
+    fn add_multiple_products_to_order() {
+        let _g = setup();
+        let mut err = new_err();
+
+        let n1 = CString::new("Widget").unwrap();
+        let n2 = CString::new("Gizmo").unwrap();
+
+        let h1 = weaveffi_products_create_product(n1.as_ptr(), 10.0, 0, &mut err);
+        let h2 = weaveffi_products_create_product(n2.as_ptr(), 25.0, 1, &mut err);
+
+        let order_handle = weaveffi_orders_create_order(std::ptr::null(), 0, &mut err);
+
+        let p1 = weaveffi_products_get_product(h1, &mut err);
+        let p2 = weaveffi_products_get_product(h2, &mut err);
+
+        assert_eq!(
+            weaveffi_orders_add_product_to_order(order_handle, p1, &mut err),
+            1
+        );
+        assert_eq!(
+            weaveffi_orders_add_product_to_order(order_handle, p2, &mut err),
+            1
+        );
+
+        let order = weaveffi_orders_get_order(order_handle, &mut err);
+        let o = unsafe { &*order };
+        assert_eq!(o.items.len(), 2);
+        assert_eq!(o.total, 35.0);
+
+        weaveffi_orders_Order_destroy(order);
+        weaveffi_products_Product_destroy(p1);
+        weaveffi_products_Product_destroy(p2);
     }
 }
