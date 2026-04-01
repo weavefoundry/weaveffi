@@ -1,6 +1,9 @@
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use camino::Utf8Path;
 use tera::Tera;
+use weaveffi_ir::ir::{Api, TypeRef};
 
 pub struct TemplateEngine {
     tera: Tera,
@@ -49,9 +52,250 @@ impl TemplateEngine {
     }
 }
 
+pub fn type_ref_to_map(ty: &TypeRef) -> HashMap<String, tera::Value> {
+    let mut map: HashMap<String, tera::Value> = HashMap::new();
+    match ty {
+        TypeRef::I32 => {
+            map.insert("kind".into(), "i32".into());
+        }
+        TypeRef::U32 => {
+            map.insert("kind".into(), "u32".into());
+        }
+        TypeRef::I64 => {
+            map.insert("kind".into(), "i64".into());
+        }
+        TypeRef::F64 => {
+            map.insert("kind".into(), "f64".into());
+        }
+        TypeRef::Bool => {
+            map.insert("kind".into(), "bool".into());
+        }
+        TypeRef::StringUtf8 => {
+            map.insert("kind".into(), "string".into());
+        }
+        TypeRef::Bytes => {
+            map.insert("kind".into(), "bytes".into());
+        }
+        TypeRef::BorrowedStr => {
+            map.insert("kind".into(), "borrowed_str".into());
+        }
+        TypeRef::BorrowedBytes => {
+            map.insert("kind".into(), "borrowed_bytes".into());
+        }
+        TypeRef::Handle => {
+            map.insert("kind".into(), "handle".into());
+        }
+        TypeRef::TypedHandle(name) => {
+            map.insert("kind".into(), "handle".into());
+            map.insert("name".into(), name.clone().into());
+        }
+        TypeRef::Struct(name) => {
+            map.insert("kind".into(), "struct".into());
+            map.insert("name".into(), name.clone().into());
+        }
+        TypeRef::Enum(name) => {
+            map.insert("kind".into(), "enum".into());
+            map.insert("name".into(), name.clone().into());
+        }
+        TypeRef::Optional(inner) => {
+            map.insert("kind".into(), "optional".into());
+            map.insert(
+                "inner".into(),
+                serde_json::to_value(type_ref_to_map(inner)).unwrap(),
+            );
+        }
+        TypeRef::List(inner) => {
+            map.insert("kind".into(), "list".into());
+            map.insert(
+                "inner".into(),
+                serde_json::to_value(type_ref_to_map(inner)).unwrap(),
+            );
+        }
+        TypeRef::Map(key, value) => {
+            map.insert("kind".into(), "map".into());
+            map.insert(
+                "key".into(),
+                serde_json::to_value(type_ref_to_map(key)).unwrap(),
+            );
+            map.insert(
+                "value".into(),
+                serde_json::to_value(type_ref_to_map(value)).unwrap(),
+            );
+        }
+    }
+    map
+}
+
+pub fn api_to_context(api: &Api) -> tera::Context {
+    let mut ctx = tera::Context::new();
+    ctx.insert("version", &api.version);
+
+    let modules: Vec<tera::Value> = api
+        .modules
+        .iter()
+        .map(|module| {
+            let functions: Vec<tera::Value> = module
+                .functions
+                .iter()
+                .map(|func| {
+                    let params: Vec<tera::Value> = func
+                        .params
+                        .iter()
+                        .map(|p| {
+                            serde_json::json!({
+                                "name": p.name,
+                                "type": type_ref_to_map(&p.ty),
+                            })
+                        })
+                        .collect();
+
+                    let returns = func
+                        .returns
+                        .as_ref()
+                        .map(|r| serde_json::to_value(type_ref_to_map(r)).unwrap());
+
+                    serde_json::json!({
+                        "name": func.name,
+                        "params": params,
+                        "returns": returns,
+                        "doc": func.doc,
+                    })
+                })
+                .collect();
+
+            let structs: Vec<tera::Value> = module
+                .structs
+                .iter()
+                .map(|s| {
+                    let fields: Vec<tera::Value> = s
+                        .fields
+                        .iter()
+                        .map(|field| {
+                            serde_json::json!({
+                                "name": field.name,
+                                "type": type_ref_to_map(&field.ty),
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "name": s.name,
+                        "fields": fields,
+                    })
+                })
+                .collect();
+
+            let enums: Vec<tera::Value> = module
+                .enums
+                .iter()
+                .map(|e| {
+                    let variants: Vec<tera::Value> = e
+                        .variants
+                        .iter()
+                        .map(|v| {
+                            serde_json::json!({
+                                "name": v.name,
+                                "value": v.value,
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "name": e.name,
+                        "variants": variants,
+                    })
+                })
+                .collect();
+
+            serde_json::json!({
+                "name": module.name,
+                "functions": functions,
+                "structs": structs,
+                "enums": enums,
+            })
+        })
+        .collect();
+
+    ctx.insert("modules", &modules);
+    ctx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weaveffi_ir::ir::{Function, Module, Param, StructDef, StructField};
+
+    #[test]
+    fn api_context_has_modules() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "math".into(),
+                functions: vec![Function {
+                    name: "add".into(),
+                    params: vec![
+                        Param {
+                            name: "a".into(),
+                            ty: TypeRef::I32,
+                        },
+                        Param {
+                            name: "b".into(),
+                            ty: TypeRef::I32,
+                        },
+                    ],
+                    returns: Some(TypeRef::I32),
+                    doc: Some("Add two numbers".into()),
+                    r#async: false,
+                }],
+                structs: vec![StructDef {
+                    name: "Point".into(),
+                    doc: None,
+                    fields: vec![StructField {
+                        name: "x".into(),
+                        ty: TypeRef::F64,
+                        doc: None,
+                    }],
+                }],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+
+        let ctx = api_to_context(&api);
+        let json = ctx.into_json();
+
+        assert_eq!(json["version"], "0.1.0");
+
+        let modules = json["modules"].as_array().unwrap();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0]["name"], "math");
+
+        let funcs = modules[0]["functions"].as_array().unwrap();
+        assert_eq!(funcs.len(), 1);
+        assert_eq!(funcs[0]["name"], "add");
+        assert_eq!(funcs[0]["doc"], "Add two numbers");
+        assert_eq!(funcs[0]["returns"]["kind"], "i32");
+
+        let params = funcs[0]["params"].as_array().unwrap();
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0]["name"], "a");
+        assert_eq!(params[0]["type"]["kind"], "i32");
+
+        let structs = modules[0]["structs"].as_array().unwrap();
+        assert_eq!(structs.len(), 1);
+        assert_eq!(structs[0]["name"], "Point");
+
+        let fields = structs[0]["fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0]["name"], "x");
+        assert_eq!(fields[0]["type"]["kind"], "f64");
+    }
+
+    #[test]
+    fn type_ref_context_struct() {
+        let map = type_ref_to_map(&TypeRef::Struct("Point".into()));
+        assert_eq!(map["kind"], "struct");
+        assert_eq!(map["name"], "Point");
+        assert_eq!(map.len(), 2);
+    }
 
     #[test]
     fn template_render_basic() {
