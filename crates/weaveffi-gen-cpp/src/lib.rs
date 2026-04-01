@@ -1,9 +1,28 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use weaveffi_core::codegen::Generator;
+use weaveffi_core::config::GeneratorConfig;
 use weaveffi_ir::ir::{Api, ErrorCode, Function, Module, StructField, TypeRef};
 
 pub struct CppGenerator;
+
+impl CppGenerator {
+    fn generate_impl(
+        &self,
+        api: &Api,
+        out_dir: &Utf8Path,
+        namespace: &str,
+        header_name: &str,
+        cpp_std: &str,
+    ) -> Result<()> {
+        let dir = out_dir.join("cpp");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join(header_name), render_cpp_header(api, namespace))?;
+        std::fs::write(dir.join("CMakeLists.txt"), render_cmake(cpp_std))?;
+        std::fs::write(dir.join("README.md"), render_readme())?;
+        Ok(())
+    }
+}
 
 impl Generator for CppGenerator {
     fn name(&self) -> &'static str {
@@ -11,12 +30,22 @@ impl Generator for CppGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        let dir = out_dir.join("cpp");
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join("weaveffi.hpp"), render_cpp_header(api))?;
-        std::fs::write(dir.join("CMakeLists.txt"), render_cmake())?;
-        std::fs::write(dir.join("README.md"), render_readme())?;
-        Ok(())
+        self.generate_impl(api, out_dir, "weaveffi", "weaveffi.hpp", "17")
+    }
+
+    fn generate_with_config(
+        &self,
+        api: &Api,
+        out_dir: &Utf8Path,
+        config: &GeneratorConfig,
+    ) -> Result<()> {
+        self.generate_impl(
+            api,
+            out_dir,
+            config.cpp_namespace(),
+            config.cpp_header_name(),
+            config.cpp_standard(),
+        )
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
@@ -28,16 +57,17 @@ impl Generator for CppGenerator {
     }
 }
 
-fn render_cmake() -> String {
-    "\
+fn render_cmake(cpp_std: &str) -> String {
+    format!(
+        "\
 cmake_minimum_required(VERSION 3.14)
 project(weaveffi_cpp)
 add_library(weaveffi_cpp INTERFACE)
-target_include_directories(weaveffi_cpp INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(weaveffi_cpp INTERFACE ${{CMAKE_CURRENT_SOURCE_DIR}})
 target_link_libraries(weaveffi_cpp INTERFACE weaveffi)
-target_compile_features(weaveffi_cpp INTERFACE cxx_std_17)
+target_compile_features(weaveffi_cpp INTERFACE cxx_std_{cpp_std})
 "
-    .to_string()
+    )
 }
 
 fn render_readme() -> String {
@@ -76,7 +106,7 @@ Then include the header in your code:
     .to_string()
 }
 
-fn render_cpp_header(api: &Api) -> String {
+fn render_cpp_header(api: &Api, namespace: &str) -> String {
     let mut out = String::new();
 
     out.push_str("#pragma once\n\n");
@@ -92,7 +122,7 @@ fn render_cpp_header(api: &Api) -> String {
     render_extern_c(&mut out, api);
     out.push_str("} // extern \"C\"\n\n");
 
-    out.push_str("namespace weaveffi {\n\n");
+    out.push_str(&format!("namespace {namespace} {{\n\n"));
 
     let error_codes: Vec<_> = api
         .modules
@@ -107,7 +137,7 @@ fn render_cpp_header(api: &Api) -> String {
         render_cpp_classes(&mut out, module);
         render_cpp_functions(&mut out, module, &error_codes);
     }
-    out.push_str("} // namespace weaveffi\n");
+    out.push_str(&format!("}} // namespace {namespace}\n"));
 
     out
 }
@@ -940,6 +970,7 @@ fn render_cpp_return(out: &mut String, ty: &TypeRef) {
 mod tests {
     use super::*;
     use weaveffi_core::codegen::Generator;
+    use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{
         Api, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param, StructDef,
         StructField, TypeRef,
@@ -1131,7 +1162,7 @@ mod tests {
 
     #[test]
     fn header_includes() {
-        let h = render_cpp_header(&minimal_api());
+        let h = render_cpp_header(&minimal_api(), "weaveffi");
         for inc in [
             "<cstdint>",
             "<string>",
@@ -1150,7 +1181,7 @@ mod tests {
 
     #[test]
     fn extern_c_common_declarations() {
-        let h = render_cpp_header(&minimal_api());
+        let h = render_cpp_header(&minimal_api(), "weaveffi");
         assert!(
             h.contains("typedef uint64_t weaveffi_handle_t;"),
             "missing handle_t typedef"
@@ -1175,7 +1206,7 @@ mod tests {
 
     #[test]
     fn extern_c_function_declarations() {
-        let h = render_cpp_header(&minimal_api());
+        let h = render_cpp_header(&minimal_api(), "weaveffi");
         assert!(
             h.contains(
                 "int32_t weaveffi_calculator_add(int32_t a, int32_t b, weaveffi_error* out_err);"
@@ -1186,7 +1217,7 @@ mod tests {
 
     #[test]
     fn extern_c_enum_declarations() {
-        let h = render_cpp_header(&contacts_api());
+        let h = render_cpp_header(&contacts_api(), "weaveffi");
         assert!(
             h.contains("weaveffi_contacts_ContactType_Personal = 0"),
             "missing enum variant: {h}"
@@ -1203,7 +1234,7 @@ mod tests {
 
     #[test]
     fn extern_c_struct_declarations() {
-        let h = render_cpp_header(&contacts_api());
+        let h = render_cpp_header(&contacts_api(), "weaveffi");
         assert!(
             h.contains("typedef struct weaveffi_contacts_Contact weaveffi_contacts_Contact;"),
             "missing opaque struct: {h}"
@@ -1228,7 +1259,7 @@ mod tests {
 
     #[test]
     fn cpp_enum_class() {
-        let h = render_cpp_header(&contacts_api());
+        let h = render_cpp_header(&contacts_api(), "weaveffi");
         assert!(
             h.contains("enum class ContactType : int32_t {"),
             "missing enum class: {h}"
@@ -1239,7 +1270,7 @@ mod tests {
 
     #[test]
     fn cpp_raii_class_structure() {
-        let h = render_cpp_header(&contacts_api());
+        let h = render_cpp_header(&contacts_api(), "weaveffi");
         assert!(h.contains("class Contact {"), "missing class: {h}");
         assert!(h.contains("void* handle_;"), "missing handle member: {h}");
         assert!(
@@ -1275,7 +1306,7 @@ mod tests {
 
     #[test]
     fn cpp_string_getter() {
-        let h = render_cpp_header(&contacts_api());
+        let h = render_cpp_header(&contacts_api(), "weaveffi");
         assert!(
             h.contains("std::string name() const {"),
             "missing string getter: {h}"
@@ -1292,7 +1323,7 @@ mod tests {
 
     #[test]
     fn cpp_i32_getter() {
-        let h = render_cpp_header(&contacts_api());
+        let h = render_cpp_header(&contacts_api(), "weaveffi");
         assert!(
             h.contains("int32_t age() const {"),
             "missing i32 getter: {h}"
@@ -1301,7 +1332,7 @@ mod tests {
 
     #[test]
     fn cpp_optional_string_getter() {
-        let h = render_cpp_header(&contacts_api());
+        let h = render_cpp_header(&contacts_api(), "weaveffi");
         assert!(
             h.contains("std::optional<std::string> email() const {"),
             "missing optional string getter: {h}"
@@ -1314,7 +1345,7 @@ mod tests {
 
     #[test]
     fn cpp_enum_getter() {
-        let h = render_cpp_header(&contacts_api());
+        let h = render_cpp_header(&contacts_api(), "weaveffi");
         assert!(
             h.contains("ContactType contact_type() const {"),
             "missing enum getter: {h}"
@@ -1327,7 +1358,7 @@ mod tests {
 
     #[test]
     fn cpp_wrapper_function_scalar() {
-        let h = render_cpp_header(&minimal_api());
+        let h = render_cpp_header(&minimal_api(), "weaveffi");
         assert!(
             h.contains("inline int32_t calculator_add(int32_t a, int32_t b) {"),
             "missing wrapper function: {h}"
@@ -1345,7 +1376,7 @@ mod tests {
 
     #[test]
     fn cpp_wrapper_function_struct_return() {
-        let h = render_cpp_header(&contacts_api());
+        let h = render_cpp_header(&contacts_api(), "weaveffi");
         assert!(
             h.contains("inline Contact contacts_get_contact(void* id) {"),
             "missing struct-returning function: {h}"
@@ -1358,7 +1389,7 @@ mod tests {
 
     #[test]
     fn cpp_wrapper_function_void_return() {
-        let h = render_cpp_header(&contacts_api());
+        let h = render_cpp_header(&contacts_api(), "weaveffi");
         assert!(
             h.contains("inline void contacts_delete_contact(void* id) {"),
             "missing void function: {h}"
@@ -1373,7 +1404,7 @@ mod tests {
 
     #[test]
     fn cpp_wrapper_handle_param_conversion() {
-        let h = render_cpp_header(&contacts_api());
+        let h = render_cpp_header(&contacts_api(), "weaveffi");
         assert!(
             h.contains("static_cast<weaveffi_handle_t>(reinterpret_cast<uintptr_t>(id))"),
             "should convert void* to handle_t: {h}"
@@ -1382,7 +1413,7 @@ mod tests {
 
     #[test]
     fn cpp_wrapper_error_handling() {
-        let h = render_cpp_header(&minimal_api());
+        let h = render_cpp_header(&minimal_api(), "weaveffi");
         assert!(
             h.contains("weaveffi_error err{};"),
             "should declare error: {h}"
@@ -1415,7 +1446,7 @@ mod tests {
                 errors: None,
             }],
         };
-        let h = render_cpp_header(&api);
+        let h = render_cpp_header(&api, "weaveffi");
         assert!(
             h.contains("inline std::string io_echo(const std::string& msg)"),
             "string param should be const ref: {h}"
@@ -1445,7 +1476,7 @@ mod tests {
                 errors: None,
             }],
         };
-        let h = render_cpp_header(&api);
+        let h = render_cpp_header(&api, "weaveffi");
         assert!(
             h.contains("inline std::vector<int32_t> store_list_ids()"),
             "missing list return function: {h}"
@@ -1481,7 +1512,7 @@ mod tests {
                 errors: None,
             }],
         };
-        let h = render_cpp_header(&api);
+        let h = render_cpp_header(&api, "weaveffi");
         assert!(
             h.contains("inline std::optional<int32_t> store_find(int32_t id)"),
             "missing optional return function: {h}"
@@ -1529,7 +1560,7 @@ mod tests {
                 errors: None,
             }],
         };
-        let h = render_cpp_header(&api);
+        let h = render_cpp_header(&api, "weaveffi");
         assert!(
             h.contains("inline Color paint_mix(Color color)"),
             "missing enum function: {h}"
@@ -1570,7 +1601,7 @@ mod tests {
                 errors: None,
             }],
         };
-        let h = render_cpp_header(&api);
+        let h = render_cpp_header(&api, "weaveffi");
         assert!(
             h.contains("inline std::vector<Contact> contacts_list_all()"),
             "missing list struct return: {h}"
@@ -1602,7 +1633,7 @@ mod tests {
                 errors: None,
             }],
         };
-        let h = render_cpp_header(&api);
+        let h = render_cpp_header(&api, "weaveffi");
         assert!(
             h.contains("inline std::unordered_map<std::string, int32_t> store_get_scores()"),
             "missing map return function: {h}"
@@ -1633,7 +1664,7 @@ mod tests {
                 errors: None,
             }],
         };
-        let h = render_cpp_header(&api);
+        let h = render_cpp_header(&api, "weaveffi");
         assert!(
             h.contains("std::vector<int32_t> scores() const {"),
             "missing list getter: {h}"
@@ -1660,7 +1691,7 @@ mod tests {
                 errors: None,
             }],
         };
-        let h = render_cpp_header(&api);
+        let h = render_cpp_header(&api, "weaveffi");
         assert!(
             h.contains("std::unordered_map<std::string, int32_t> tags() const {"),
             "missing map getter: {h}"
@@ -1699,7 +1730,7 @@ mod tests {
 
     #[test]
     fn cpp_namespace_wrapping() {
-        let h = render_cpp_header(&minimal_api());
+        let h = render_cpp_header(&minimal_api(), "weaveffi");
         let ns_open = h.find("namespace weaveffi {").unwrap();
         let ns_close = h.find("} // namespace weaveffi").unwrap();
         let fn_pos = h.find("inline int32_t calculator_add").unwrap();
@@ -1711,7 +1742,7 @@ mod tests {
 
     #[test]
     fn cpp_extern_c_wrapping() {
-        let h = render_cpp_header(&minimal_api());
+        let h = render_cpp_header(&minimal_api(), "weaveffi");
         let ext_open = h.find("extern \"C\" {").unwrap();
         let ext_close = h.find("} // extern \"C\"").unwrap();
         let c_fn = h.find("weaveffi_calculator_add(").unwrap();
@@ -1739,7 +1770,7 @@ mod tests {
                 errors: None,
             }],
         };
-        let h = render_cpp_header(&api);
+        let h = render_cpp_header(&api, "weaveffi");
         assert!(
             h.contains("inline std::vector<uint8_t> io_read()"),
             "missing bytes return function: {h}"
@@ -1772,7 +1803,7 @@ mod tests {
                 errors: None,
             }],
         };
-        let h = render_cpp_header(&api);
+        let h = render_cpp_header(&api, "weaveffi");
         assert!(
             h.contains("inline int32_t db_query(Connection& conn)"),
             "TypedHandle param should be ref: {h}"
@@ -1782,7 +1813,7 @@ mod tests {
 
     #[test]
     fn cpp_has_error_class() {
-        let h = render_cpp_header(&minimal_api());
+        let h = render_cpp_header(&minimal_api(), "weaveffi");
         assert!(
             h.contains("class WeaveFFIError : public std::runtime_error"),
             "missing WeaveFFIError class: {h}"
@@ -1833,7 +1864,7 @@ mod tests {
                 }),
             }],
         };
-        let h = render_cpp_header(&api);
+        let h = render_cpp_header(&api, "weaveffi");
         assert!(
             h.contains("class NotFoundError : public WeaveFFIError"),
             "missing NotFoundError subclass: {h}"
@@ -1854,5 +1885,73 @@ mod tests {
             h.contains("default: throw WeaveFFIError(code, msg);"),
             "missing default throw case: {h}"
         );
+    }
+
+    #[test]
+    fn cpp_custom_namespace() {
+        let api = minimal_api();
+        let config = GeneratorConfig {
+            cpp_namespace: Some("mylib".into()),
+            ..GeneratorConfig::default()
+        };
+        let tmp = std::env::temp_dir().join("weaveffi_test_cpp_custom_ns");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        CppGenerator
+            .generate_with_config(&api, out_dir, &config)
+            .unwrap();
+
+        let content = std::fs::read_to_string(tmp.join("cpp/weaveffi.hpp")).unwrap();
+        assert!(
+            content.contains("namespace mylib {"),
+            "should use custom namespace: {content}"
+        );
+        assert!(
+            content.contains("} // namespace mylib"),
+            "closing comment should use custom namespace: {content}"
+        );
+        assert!(
+            !content.contains("namespace weaveffi"),
+            "should not contain default namespace: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cpp_custom_header_name() {
+        let api = minimal_api();
+        let config = GeneratorConfig {
+            cpp_header_name: Some("bindings.hpp".into()),
+            cpp_standard: Some("20".into()),
+            ..GeneratorConfig::default()
+        };
+        let tmp = std::env::temp_dir().join("weaveffi_test_cpp_custom_header");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        CppGenerator
+            .generate_with_config(&api, out_dir, &config)
+            .unwrap();
+
+        assert!(
+            tmp.join("cpp/bindings.hpp").exists(),
+            "header should use custom filename"
+        );
+
+        let cmake = std::fs::read_to_string(tmp.join("cpp/CMakeLists.txt")).unwrap();
+        assert!(
+            cmake.contains("cxx_std_20"),
+            "CMakeLists.txt should use custom C++ standard: {cmake}"
+        );
+        assert!(
+            !cmake.contains("cxx_std_17"),
+            "should not contain default standard: {cmake}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
