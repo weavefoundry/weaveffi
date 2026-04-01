@@ -500,6 +500,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }
     }
 
@@ -712,6 +713,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let dart = render_dart_module(&api);
@@ -795,6 +797,7 @@ mod tests {
                 ],
             }],
             errors: None,
+            modules: vec![],
         }]);
 
         let dart = render_dart_module(&api);
@@ -869,6 +872,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let dart = render_dart_module(&api);
@@ -961,6 +965,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let dart = render_dart_module(&api);
@@ -1051,6 +1056,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let dart = render_dart_module(&api);
@@ -1086,6 +1092,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let dart = render_dart_module(&api);
@@ -1117,6 +1124,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let dart = render_dart_module(&api);
@@ -1157,6 +1165,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let dart = render_dart_module(&api);
@@ -1300,6 +1309,7 @@ mod tests {
                 ],
             }],
             errors: None,
+            modules: vec![],
         }]);
 
         let dart = render_dart_module(&api);
@@ -1418,6 +1428,7 @@ mod tests {
                 cancellable: false,
             }],
             errors: None,
+            modules: vec![],
         }]);
 
         let dart = render_dart_module(&api);
@@ -1469,6 +1480,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let dart = render_dart_module(&api);

@@ -2308,6 +2308,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }])
     }
 
@@ -2521,6 +2522,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let kt = render_kotlin(&api, "com.weaveffi", true);
@@ -2556,6 +2558,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let kt = render_kotlin(&api, "com.weaveffi", true);
@@ -2609,6 +2612,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let kt = render_kotlin(&api, "com.weaveffi", true);
@@ -2642,6 +2646,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let jni = render_jni_c(&api, "com.weaveffi", true);
@@ -2685,6 +2690,7 @@ mod tests {
                 ],
             }],
             errors: None,
+            modules: vec![],
         }]);
 
         let kt = render_kotlin(&api, "com.weaveffi", true);
@@ -2736,6 +2742,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let kt = render_kotlin(&api, "com.weaveffi", true);
@@ -2777,6 +2784,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let kt = render_kotlin(&api, "com.weaveffi", true);
@@ -2824,6 +2832,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let jni = render_jni_c(&api, "com.weaveffi", true);
@@ -2856,6 +2865,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let jni = render_jni_c(&api, "com.weaveffi", true);
@@ -2906,6 +2916,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let kt = render_kotlin(&api, "com.weaveffi", true);
@@ -2930,6 +2941,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let jni = render_jni_c(&api, "com.weaveffi", true);
@@ -2963,6 +2975,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let jni = render_jni_c(&api, "com.weaveffi", true);
@@ -2991,6 +3004,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let jni = render_jni_c(&api, "com.weaveffi", true);
@@ -3027,6 +3041,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let jni = render_jni_c(&api, "com.weaveffi", true);
@@ -3085,6 +3100,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let kt = render_kotlin(&api, "com.weaveffi", true);
@@ -3109,6 +3125,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let jni = render_jni_c(&api, "com.weaveffi", true);
@@ -3141,6 +3158,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let jni = render_jni_c(&api, "com.weaveffi", true);
@@ -3251,6 +3269,7 @@ mod tests {
                 ],
             }],
             errors: None,
+            modules: vec![],
         }]);
 
         let tmp = std::env::temp_dir().join("weaveffi_test_android_structs_and_enums");
@@ -3380,6 +3399,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let kt = render_kotlin(&api, "com.weaveffi", true);
@@ -3407,6 +3427,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let jni = render_jni_c(&api, "com.weaveffi", true);
@@ -3440,6 +3461,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let tmp = std::env::temp_dir().join("weaveffi_test_android_build_gradle_cmake");
@@ -3488,6 +3510,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let jni = render_jni_c(&api, "com.weaveffi", true);
@@ -3526,6 +3549,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let config = GeneratorConfig {
@@ -3605,6 +3629,7 @@ mod tests {
                     },
                 ],
             }),
+            modules: vec![],
         }]);
 
         let kt = render_kotlin(&api, "com.weaveffi", true);
@@ -3662,6 +3687,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let config = GeneratorConfig {
@@ -3749,6 +3775,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let kotlin = render_kotlin(&api, "com.weaveffi", true);
         assert!(
@@ -3778,6 +3805,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let kotlin = render_kotlin(&api, "com.weaveffi", true);
         assert!(
@@ -3835,6 +3863,7 @@ mod tests {
                 ],
             }],
             errors: None,
+            modules: vec![],
         }]);
         let kotlin = render_kotlin(&api, "com.weaveffi", true);
         assert!(
@@ -3869,6 +3898,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let kt = render_kotlin(&api, "com.weaveffi", true);
         assert!(
@@ -3903,6 +3933,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let jni = render_jni_c(&api, "com.weaveffi", true);
@@ -3972,6 +4003,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let jni = render_jni_c(&api, "com.weaveffi", true);
@@ -4003,6 +4035,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let kt = render_kotlin(&api, "com.weaveffi", true);
@@ -4034,6 +4067,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let kt = render_kotlin(&api, "com.weaveffi", true);

@@ -75,6 +75,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         }
@@ -1026,5 +1027,41 @@ modules:
                 Box::new(TypeRef::StringUtf8)
             ))
         );
+    }
+
+    #[test]
+    fn parse_nested_modules() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: parent
+    functions:
+      - name: top_fn
+        params: []
+        return: i32
+    modules:
+      - name: child
+        functions:
+          - name: inner_fn
+            params:
+              - name: x
+                type: i32
+            return: i32
+"#;
+        let api = parse_api_str(yaml, "yaml").unwrap();
+        assert_eq!(api.modules.len(), 1);
+        let parent = &api.modules[0];
+        assert_eq!(parent.name, "parent");
+        assert_eq!(parent.functions.len(), 1);
+        assert_eq!(parent.functions[0].name, "top_fn");
+
+        assert_eq!(parent.modules.len(), 1);
+        let child = &parent.modules[0];
+        assert_eq!(child.name, "child");
+        assert_eq!(child.functions.len(), 1);
+        assert_eq!(child.functions[0].name, "inner_fn");
+        assert_eq!(child.functions[0].params[0].name, "x");
+        assert_eq!(child.functions[0].params[0].ty, TypeRef::I32);
+        assert_eq!(child.functions[0].returns, Some(TypeRef::I32));
     }
 }

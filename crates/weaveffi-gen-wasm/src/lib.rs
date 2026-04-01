@@ -943,6 +943,7 @@ mod tests {
                 ],
             }],
             errors: None,
+            modules: vec![],
         }])
     }
 
@@ -1197,6 +1198,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let readme = render_wasm_readme(&api);
         assert!(readme.contains("| `name` | `string` | `i32, i32` | ptr + len in linear memory |"));
@@ -1223,6 +1225,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let readme = render_wasm_readme(&api);
         assert!(readme.contains("-> void`"));
@@ -1238,6 +1241,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             },
             Module {
                 name: "io".into(),
@@ -1245,6 +1249,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             },
         ]);
         let readme = render_wasm_readme(&api);
@@ -1328,6 +1333,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
         assert!(js.contains("function _encodeString(wasm, str)"));
@@ -1424,6 +1430,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let dts = render_wasm_dts(&api, DEFAULT_MODULE_NAME);
         assert!(
@@ -1465,6 +1472,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let dts = render_wasm_dts(&api, DEFAULT_MODULE_NAME);
         assert!(
@@ -1494,6 +1502,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let dts = render_wasm_dts(&api, DEFAULT_MODULE_NAME);
         assert!(
@@ -1551,6 +1560,7 @@ mod tests {
                 ],
             }],
             errors: None,
+            modules: vec![],
         }]);
         let dts = render_wasm_dts(&api, DEFAULT_MODULE_NAME);
         assert!(
@@ -1585,6 +1595,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
         assert!(
@@ -1639,6 +1650,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
         assert!(
@@ -1665,6 +1677,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
         assert!(
@@ -1734,6 +1747,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let dts = render_wasm_dts(&api, DEFAULT_MODULE_NAME);
         assert!(

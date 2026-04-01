@@ -1195,6 +1195,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }
     }
 
@@ -1353,6 +1354,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let py = render_python_module(&api, true);
@@ -1425,6 +1427,7 @@ mod tests {
                 ],
             }],
             errors: None,
+            modules: vec![],
         }]);
 
         let py = render_python_module(&api, true);
@@ -1459,6 +1462,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let py = render_python_module(&api, true);
@@ -1497,6 +1501,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let py = render_python_module(&api, true);
@@ -1554,6 +1559,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let py = render_python_module(&api, true);
@@ -1638,6 +1644,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let py = render_python_module(&api, true);
@@ -1669,6 +1676,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let py = render_python_module(&api, true);
@@ -1710,6 +1718,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let py = render_python_module(&api, true);
@@ -1751,6 +1760,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let py = render_python_module(&api, true);
@@ -1801,6 +1811,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let py = render_python_module(&api, true);
@@ -1836,6 +1847,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let py = render_python_module(&api, true);
@@ -1865,6 +1877,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let py = render_python_module(&api, true);
@@ -1975,6 +1988,7 @@ mod tests {
                 },
             ],
             errors: None,
+            modules: vec![],
         }]);
 
         let tmp = std::env::temp_dir().join("weaveffi_test_python_gen_contacts");
@@ -2071,6 +2085,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let py = render_python_module(&api, true);
@@ -2100,6 +2115,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let py = render_python_module(&api, true);
@@ -2210,6 +2226,7 @@ mod tests {
                 },
             ],
             errors: None,
+            modules: vec![],
         }]);
 
         let tmp = std::env::temp_dir().join("weaveffi_test_python_pyi");
@@ -2361,6 +2378,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let py = render_python_module(&api, true);
@@ -2427,6 +2445,7 @@ mod tests {
                 ],
             }],
             errors: None,
+            modules: vec![],
         }]);
 
         let py = render_python_module(&api, true);
@@ -2502,6 +2521,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let py = render_python_module(&api, true);
@@ -2591,6 +2611,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let py = render_python_module(&api, true);
@@ -2656,6 +2677,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let py = render_python_module(&api, true);
@@ -2813,6 +2835,7 @@ mod tests {
                 },
             ],
             errors: None,
+            modules: vec![],
         }]);
 
         let pyi = render_pyi_module(&api, true);
@@ -2960,6 +2983,7 @@ mod tests {
                 },
             ],
             errors: None,
+            modules: vec![],
         }]);
 
         let tmp = std::env::temp_dir().join("weaveffi_test_py_full_contacts");
@@ -3212,6 +3236,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let config = GeneratorConfig {
@@ -3302,6 +3327,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let pyi = render_pyi_module(&api, true);
         assert!(
@@ -3331,6 +3357,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let pyi = render_pyi_module(&api, true);
         assert!(
@@ -3388,6 +3415,7 @@ mod tests {
                 ],
             }],
             errors: None,
+            modules: vec![],
         }]);
         let pyi = render_pyi_module(&api, true);
         assert!(
@@ -3424,6 +3452,7 @@ mod tests {
                 }],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -3468,6 +3497,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let py = render_python_module(&api, true);
@@ -3555,6 +3585,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let py = render_python_module(&api, true);
@@ -3648,6 +3679,7 @@ mod tests {
                 }],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             },
             Module {
                 name: "ops".into(),
@@ -3665,6 +3697,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             },
         ]);
 

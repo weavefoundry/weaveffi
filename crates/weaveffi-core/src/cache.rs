@@ -62,6 +62,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         }

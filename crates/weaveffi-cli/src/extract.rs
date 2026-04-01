@@ -257,6 +257,7 @@ fn extract_module(item_mod: &syn::ItemMod) -> Result<Module> {
         structs,
         enums,
         errors: None,
+        modules: vec![],
     })
 }
 

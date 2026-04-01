@@ -24,6 +24,8 @@ pub struct Module {
     pub enums: Vec<EnumDef>,
     #[serde(default)]
     pub errors: Option<ErrorDomain>,
+    #[serde(default)]
+    pub modules: Vec<Module>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

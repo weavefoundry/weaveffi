@@ -266,7 +266,7 @@ fn render_c_header(api: &Api, prefix: &str) -> String {
     out.push_str(" */\n\n");
 
     for m in &api.modules {
-        render_module_header(&mut out, m, prefix);
+        render_module_header(&mut out, m, prefix, &m.name);
     }
 
     out.push_str("\n#ifdef __cplusplus\n}\n#endif\n\n");
@@ -315,22 +315,22 @@ fn render_enum_header(out: &mut String, module_name: &str, e: &EnumDef, prefix: 
     ));
 }
 
-fn render_module_header(out: &mut String, module: &Module, prefix: &str) {
-    out.push_str(&format!("// Module: {}\n", module.name));
+fn render_module_header(out: &mut String, module: &Module, prefix: &str, module_path: &str) {
+    out.push_str(&format!("// Module: {module_path}\n"));
     for e in &module.enums {
-        render_enum_header(out, &module.name, e, prefix);
+        render_enum_header(out, module_path, e, prefix);
     }
     for s in &module.structs {
-        render_struct_header(out, &module.name, s, prefix);
+        render_struct_header(out, module_path, s, prefix);
     }
     for f in &module.functions {
         if f.r#async {
-            let fn_base = format!("{prefix}_{}_{}", module.name, f.name);
+            let fn_base = format!("{prefix}_{module_path}_{}", f.name);
             let cb_name = format!("{fn_base}_callback");
 
             let mut cb_params = vec!["void* context".to_string(), format!("{prefix}_error* err")];
             if let Some(ret) = &f.returns {
-                cb_params.extend(c_callback_result_params(ret, &module.name, prefix));
+                cb_params.extend(c_callback_result_params(ret, module_path, prefix));
             }
             out.push_str(&format!(
                 "typedef void (*{cb_name})({});\n",
@@ -344,7 +344,7 @@ fn render_module_header(out: &mut String, module: &Module, prefix: &str) {
             out.push_str(" * On failure, err is non-NULL with a non-zero code.\n");
             out.push_str(" */\n");
 
-            let mut params_sig = c_params_sig(&f.params, &module.name, prefix);
+            let mut params_sig = c_params_sig(&f.params, module_path, prefix);
             if f.cancellable {
                 params_sig.push(format!("{prefix}_cancel_token* cancel_token"));
             }
@@ -355,16 +355,16 @@ fn render_module_header(out: &mut String, module: &Module, prefix: &str) {
                 params_sig.join(", ")
             ));
         } else {
-            let mut params_sig = c_params_sig(&f.params, &module.name, prefix);
+            let mut params_sig = c_params_sig(&f.params, module_path, prefix);
             let ret_sig = if let Some(ret) = &f.returns {
-                let (ret_ty, out_params) = c_ret_type(ret, &module.name, prefix);
+                let (ret_ty, out_params) = c_ret_type(ret, module_path, prefix);
                 params_sig.extend(out_params);
                 ret_ty
             } else {
                 "void".to_string()
             };
             params_sig.push(format!("{prefix}_error* out_err"));
-            let fn_name = format!("{prefix}_{}_{}", module.name, f.name);
+            let fn_name = format!("{prefix}_{module_path}_{}", f.name);
             out.push_str(&format!(
                 "{} {}({});\n",
                 ret_sig,
@@ -372,6 +372,10 @@ fn render_module_header(out: &mut String, module: &Module, prefix: &str) {
                 params_sig.join(", ")
             ));
         }
+    }
+    for sub in &module.modules {
+        let nested_path = format!("{module_path}_{}", sub.name);
+        render_module_header(out, sub, prefix, &nested_path);
     }
     out.push('\n');
 }
@@ -429,6 +433,7 @@ mod tests {
                 errors: None,
                 structs: vec![],
                 enums: vec![],
+                modules: vec![],
             }],
             generators: None,
         };
@@ -484,6 +489,7 @@ mod tests {
                 }],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -561,6 +567,7 @@ mod tests {
                     ],
                 }],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -611,6 +618,7 @@ mod tests {
                     }],
                 }],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -781,6 +789,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -924,6 +933,7 @@ mod tests {
                     },
                 ],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1060,6 +1070,7 @@ mod tests {
                     ],
                 }],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1127,6 +1138,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1170,6 +1182,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1244,6 +1257,7 @@ mod tests {
                 }],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1285,6 +1299,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1331,6 +1346,7 @@ mod tests {
                 }],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1383,6 +1399,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1453,6 +1470,7 @@ mod tests {
                     ],
                 }],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1499,6 +1517,7 @@ mod tests {
                 }],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1557,6 +1576,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1594,6 +1614,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1635,6 +1656,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1685,6 +1707,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1738,6 +1761,7 @@ mod tests {
                     }],
                     enums: vec![],
                     errors: None,
+                    modules: vec![],
                 },
                 Module {
                     name: "ops".to_string(),
@@ -1755,6 +1779,7 @@ mod tests {
                     structs: vec![],
                     enums: vec![],
                     errors: None,
+                    modules: vec![],
                 },
             ],
             generators: None,
@@ -1773,6 +1798,67 @@ mod tests {
         assert!(
             !header.contains("types.Name"),
             "dot-qualified name should not appear in generated C code: {header}"
+        );
+    }
+
+    #[test]
+    fn c_nested_module_naming() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "parent".to_string(),
+                functions: vec![Function {
+                    name: "top_fn".to_string(),
+                    params: vec![Param {
+                        name: "x".to_string(),
+                        ty: TypeRef::I32,
+                    }],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+                modules: vec![Module {
+                    name: "child".to_string(),
+                    functions: vec![Function {
+                        name: "inner_fn".to_string(),
+                        params: vec![Param {
+                            name: "y".to_string(),
+                            ty: TypeRef::I32,
+                        }],
+                        returns: Some(TypeRef::I32),
+                        doc: None,
+                        r#async: false,
+                        cancellable: false,
+                    }],
+                    structs: vec![],
+                    enums: vec![],
+                    errors: None,
+                    modules: vec![],
+                }],
+            }],
+            generators: None,
+        };
+
+        let header = render_c_header(&api, "weaveffi");
+        assert!(
+            header.contains("weaveffi_parent_top_fn"),
+            "parent function should use weaveffi_parent_top_fn: {header}"
+        );
+        assert!(
+            header.contains("weaveffi_parent_child_inner_fn"),
+            "nested function should use weaveffi_parent_child_inner_fn: {header}"
+        );
+        assert!(
+            header.contains("// Module: parent\n"),
+            "parent module comment: {header}"
+        );
+        assert!(
+            header.contains("// Module: parent_child\n"),
+            "nested module comment: {header}"
         );
     }
 }
