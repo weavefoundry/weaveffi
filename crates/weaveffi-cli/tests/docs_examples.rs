@@ -260,7 +260,7 @@ fn doc_wasm_loader_generated() {
     let js = std::fs::read_to_string(out.join("generated/wasm/weaveffi_wasm.js")).unwrap();
 
     assert!(
-        js.contains("export async function loadWeaveFFI(url)"),
+        js.contains("export async function loadWeaveffiWasm(url)"),
         "loader function missing: {js}"
     );
     assert!(

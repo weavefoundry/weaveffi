@@ -1,9 +1,30 @@
 use anyhow::Result;
 use camino::Utf8Path;
+use heck::ToUpperCamelCase;
 use weaveffi_core::codegen::Generator;
+use weaveffi_core::config::GeneratorConfig;
 use weaveffi_ir::ir::{Api, EnumDef, Function, StructDef, TypeRef};
 
 pub struct WasmGenerator;
+
+const DEFAULT_MODULE_NAME: &str = "weaveffi_wasm";
+
+impl WasmGenerator {
+    fn generate_impl(&self, api: &Api, out_dir: &Utf8Path, module_name: &str) -> Result<()> {
+        let wasm_dir = out_dir.join("wasm");
+        std::fs::create_dir_all(&wasm_dir)?;
+        std::fs::write(wasm_dir.join("README.md"), render_wasm_readme(api))?;
+        std::fs::write(
+            wasm_dir.join(format!("{module_name}.js")),
+            render_wasm_js_stub(api, module_name),
+        )?;
+        std::fs::write(
+            wasm_dir.join(format!("{module_name}.d.ts")),
+            render_wasm_dts(api, module_name),
+        )?;
+        Ok(())
+    }
+}
 
 impl Generator for WasmGenerator {
     fn name(&self) -> &'static str {
@@ -11,12 +32,16 @@ impl Generator for WasmGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        let wasm_dir = out_dir.join("wasm");
-        std::fs::create_dir_all(&wasm_dir)?;
-        std::fs::write(wasm_dir.join("README.md"), render_wasm_readme(api))?;
-        std::fs::write(wasm_dir.join("weaveffi_wasm.js"), render_wasm_js_stub(api))?;
-        std::fs::write(wasm_dir.join("weaveffi_wasm.d.ts"), render_wasm_dts(api))?;
-        Ok(())
+        self.generate_impl(api, out_dir, DEFAULT_MODULE_NAME)
+    }
+
+    fn generate_with_config(
+        &self,
+        api: &Api,
+        out_dir: &Utf8Path,
+        config: &GeneratorConfig,
+    ) -> Result<()> {
+        self.generate_impl(api, out_dir, config.wasm_module_name())
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
@@ -265,7 +290,10 @@ fn ts_type_for(ty: &TypeRef) -> String {
     }
 }
 
-fn render_wasm_dts(api: &Api) -> String {
+fn render_wasm_dts(api: &Api, module_name: &str) -> String {
+    let pascal_name = module_name.to_upper_camel_case();
+    let interface_name = format!("{pascal_name}Module");
+    let load_fn = format!("load{pascal_name}");
     let mut out =
         String::from("// Generated TypeScript declarations for WeaveFFI WASM bindings\n\n");
 
@@ -291,7 +319,7 @@ fn render_wasm_dts(api: &Api) -> String {
         }
     }
 
-    out.push_str("export interface WeaveFFIModule {\n");
+    out.push_str(&format!("export interface {interface_name} {{\n"));
     if api.modules.iter().any(|m| !m.functions.is_empty()) {
         out.push_str("  _raw: WebAssembly.Exports;\n");
         for module in &api.modules {
@@ -322,11 +350,15 @@ fn render_wasm_dts(api: &Api) -> String {
     }
     out.push_str("}\n\n");
 
-    out.push_str("export function loadWeaveFFI(url: string): Promise<WeaveFFIModule>;\n");
+    out.push_str(&format!(
+        "export function {load_fn}(url: string): Promise<{interface_name}>;\n"
+    ));
     out
 }
 
-fn render_wasm_js_stub(api: &Api) -> String {
+fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
+    let pascal_name = module_name.to_upper_camel_case();
+    let load_fn = format!("load{pascal_name}");
     let mut out = String::new();
     let needs_strings = api_needs_string_helpers(api);
 
@@ -445,7 +477,7 @@ fn render_wasm_js_stub(api: &Api) -> String {
     out.push_str(" *   weaveffi_{module}_{function}(params...) -> result\n");
     out.push_str(" *\n");
     out.push_str(" * @example\n");
-    out.push_str(" * const api = await loadWeaveFFI('lib.wasm');\n");
+    out.push_str(&format!(" * const api = await {load_fn}('lib.wasm');\n"));
     out.push_str(" *\n");
     out.push_str(" * // Primitive: (i32, i32) -> i32\n");
     out.push_str(" * const sum = api.math.add(1, 2);\n");
@@ -463,7 +495,7 @@ fn render_wasm_js_stub(api: &Api) -> String {
     out.push_str(" * // List: (i32 pointer, i32 length) -> void\n");
     out.push_str(" * api.data.process(ptr, len);\n");
     out.push_str(" */\n");
-    out.push_str("export async function loadWeaveFFI(url) {\n");
+    out.push_str(&format!("export async function {load_fn}(url) {{\n"));
     out.push_str("  const response = await fetch(url);\n");
     out.push_str("  const bytes = await response.arrayBuffer();\n");
     out.push_str("  const { instance } = await WebAssembly.instantiate(bytes, {});\n");
@@ -586,6 +618,7 @@ mod tests {
     use super::*;
     use camino::Utf8Path;
     use weaveffi_core::codegen::Generator;
+    use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{EnumVariant, Module, Param, StructField};
 
     fn empty_api() -> Api {
@@ -696,7 +729,7 @@ mod tests {
 
     #[test]
     fn js_stub_has_jsdoc() {
-        let js = render_wasm_js_stub(&empty_api());
+        let js = render_wasm_js_stub(&empty_api(), DEFAULT_MODULE_NAME);
         assert!(js.contains("@param {string} url"));
         assert!(js.contains("@returns {Promise<WebAssembly.Exports>}"));
         assert!(js.contains("@example"));
@@ -704,7 +737,7 @@ mod tests {
 
     #[test]
     fn js_stub_documents_complex_types() {
-        let js = render_wasm_js_stub(&empty_api());
+        let js = render_wasm_js_stub(&empty_api(), DEFAULT_MODULE_NAME);
         assert!(js.contains("Struct handle: () -> i64 (opaque pointer)"));
         assert!(js.contains("Enum: (i32 discriminant) -> void"));
         assert!(js.contains("Optional: (i32 is_present, i32 value) -> void"));
@@ -713,7 +746,7 @@ mod tests {
 
     #[test]
     fn js_stub_has_type_convention_header() {
-        let js = render_wasm_js_stub(&empty_api());
+        let js = render_wasm_js_stub(&empty_api(), DEFAULT_MODULE_NAME);
         assert!(js.contains("Structs   -> i64 opaque handle"));
         assert!(js.contains("Enums     -> i32 discriminant value"));
         assert!(js.contains("Optionals -> 0/null for absent"));
@@ -732,7 +765,7 @@ mod tests {
         assert!(readme.contains("## Complex Type Handling"));
 
         let js = std::fs::read_to_string(out.join("wasm/weaveffi_wasm.js")).unwrap();
-        assert!(js.contains("export async function loadWeaveFFI"));
+        assert!(js.contains("export async function loadWeaveffiWasm"));
         assert!(js.contains("@param {string} url"));
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -986,7 +1019,7 @@ mod tests {
     #[test]
     fn wasm_js_has_api_functions() {
         let api = sample_api();
-        let js = render_wasm_js_stub(&api);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
         assert!(js.contains("add(a, b)"));
         assert!(js.contains("wasm.weaveffi_math_add(a, b, _err)"));
         assert!(js.contains("class Point"));
@@ -1011,8 +1044,10 @@ mod tests {
         WasmGenerator.generate(&api, out).unwrap();
 
         let dts = std::fs::read_to_string(out.join("wasm/weaveffi_wasm.d.ts")).unwrap();
-        assert!(dts.contains("export interface WeaveFFIModule"));
-        assert!(dts.contains("export function loadWeaveFFI(url: string): Promise<WeaveFFIModule>"));
+        assert!(dts.contains("export interface WeaveffiWasmModule"));
+        assert!(dts.contains(
+            "export function loadWeaveffiWasm(url: string): Promise<WeaveffiWasmModule>"
+        ));
         assert!(dts.contains("add(a: number, b: number): number"));
         assert!(dts.contains("export interface Point"));
         assert!(dts.contains("readonly x: number"));
@@ -1040,7 +1075,7 @@ mod tests {
             enums: vec![],
             errors: None,
         }]);
-        let js = render_wasm_js_stub(&api);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
         assert!(js.contains("function _encodeString(wasm, str)"));
         assert!(js.contains("function _decodeString(wasm, ptr, len)"));
         assert!(js.contains("TextEncoder"));
@@ -1054,7 +1089,7 @@ mod tests {
     #[test]
     fn wasm_js_has_error_helpers() {
         let api = sample_api();
-        let js = render_wasm_js_stub(&api);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
         assert!(js.contains("function _allocError(wasm)"));
         assert!(js.contains("function _checkError(wasm, errPtr)"));
     }
@@ -1062,7 +1097,7 @@ mod tests {
     #[test]
     fn wasm_js_function_passes_err() {
         let api = sample_api();
-        let js = render_wasm_js_stub(&api);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
         assert!(js.contains("const _err = _allocError(wasm)"));
         assert!(js.contains("_checkError(wasm, _err)"));
     }
@@ -1070,11 +1105,38 @@ mod tests {
     #[test]
     fn wasm_dts_has_throws_doc() {
         let api = sample_api();
-        let dts = render_wasm_dts(&api);
+        let dts = render_wasm_dts(&api, DEFAULT_MODULE_NAME);
         assert!(
             dts.contains("@throws"),
             "Expected .d.ts to contain @throws JSDoc comment"
         );
         assert!(dts.contains("/** @throws {Error} if the native call fails */"));
+    }
+
+    #[test]
+    fn wasm_custom_module_name() {
+        let tmp = std::env::temp_dir().join("weaveffi_test_wasm_custom_name");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let out = Utf8Path::from_path(tmp.as_path()).unwrap();
+        let api = sample_api();
+        let config = GeneratorConfig {
+            wasm_module_name: Some("my_bindings".into()),
+            ..GeneratorConfig::default()
+        };
+        WasmGenerator
+            .generate_with_config(&api, out, &config)
+            .unwrap();
+
+        assert!(out.join("wasm/my_bindings.js").exists());
+        assert!(out.join("wasm/my_bindings.d.ts").exists());
+
+        let js = std::fs::read_to_string(out.join("wasm/my_bindings.js")).unwrap();
+        assert!(js.contains("loadMyBindings"));
+
+        let dts = std::fs::read_to_string(out.join("wasm/my_bindings.d.ts")).unwrap();
+        assert!(dts.contains("MyBindingsModule"));
+        assert!(dts.contains("loadMyBindings"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
