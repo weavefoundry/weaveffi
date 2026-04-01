@@ -65,7 +65,7 @@ and docs.
 - ~~Python target~~ *(done)*
 - ~~.NET target~~ *(done)*
 - Inline generated helpers per target (idiomatic error types, memory wrappers) — bundled into each package, not separate runtime dependencies
-- Publishing to crates.io, npm, CocoaPods, Maven Central, PyPI, NuGet
+- Publishing to crates.io
 - Prebuilt CLI binaries and release automation
 
 ### 0.6.0 — New horizons
