@@ -75,10 +75,10 @@ fn cs_type(ty: &TypeRef) -> String {
         TypeRef::I64 => "long".into(),
         TypeRef::F64 => "double".into(),
         TypeRef::Bool => "bool".into(),
-        TypeRef::StringUtf8 => "string".into(),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string".into(),
         TypeRef::Handle => "ulong".into(),
         TypeRef::TypedHandle(name) => name.clone(),
-        TypeRef::Bytes => "byte[]".into(),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => "byte[]".into(),
         TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::I32 => "int?".into(),
@@ -89,7 +89,7 @@ fn cs_type(ty: &TypeRef) -> String {
             TypeRef::Handle => "ulong?".into(),
             TypeRef::TypedHandle(name) => format!("{name}?"),
             TypeRef::Enum(name) => format!("{name}?"),
-            TypeRef::StringUtf8 => "string?".into(),
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string?".into(),
             TypeRef::Struct(name) => format!("{name}?"),
             _ => format!("{}?", cs_type(inner)),
         },
@@ -106,7 +106,9 @@ fn pinvoke_type(ty: &TypeRef) -> String {
         TypeRef::F64 => "double".into(),
         TypeRef::Bool => "int".into(),
         TypeRef::StringUtf8
+        | TypeRef::BorrowedStr
         | TypeRef::Bytes
+        | TypeRef::BorrowedBytes
         | TypeRef::Struct(_)
         | TypeRef::Optional(_)
         | TypeRef::List(_)
@@ -119,7 +121,7 @@ fn pinvoke_type(ty: &TypeRef) -> String {
 
 fn pinvoke_param_list(p: &Param) -> Vec<String> {
     match &p.ty {
-        TypeRef::Bytes => vec![
+        TypeRef::Bytes | TypeRef::BorrowedBytes => vec![
             format!("IntPtr {}_ptr", p.name),
             format!("UIntPtr {}_len", p.name),
         ],
@@ -132,17 +134,23 @@ fn pinvoke_param_list(p: &Param) -> Vec<String> {
             format!("IntPtr {}_values", p.name),
             format!("UIntPtr {}_len", p.name),
         ],
-        TypeRef::Optional(inner) if matches!(inner.as_ref(), TypeRef::Bytes) => vec![
-            format!("IntPtr {}_ptr", p.name),
-            format!("UIntPtr {}_len", p.name),
-        ],
+        TypeRef::Optional(inner)
+            if matches!(inner.as_ref(), TypeRef::Bytes | TypeRef::BorrowedBytes) =>
+        {
+            vec![
+                format!("IntPtr {}_ptr", p.name),
+                format!("UIntPtr {}_len", p.name),
+            ]
+        }
         _ => vec![format!("{} {}", pinvoke_type(&p.ty), p.name)],
     }
 }
 
 fn pinvoke_return_info(ty: &TypeRef) -> (String, Vec<String>) {
     match ty {
-        TypeRef::Bytes => ("IntPtr".into(), vec!["out UIntPtr out_len".into()]),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            ("IntPtr".into(), vec!["out UIntPtr out_len".into()])
+        }
         TypeRef::List(_) => ("IntPtr".into(), vec!["out UIntPtr out_len".into()]),
         TypeRef::Map(_, _) => (
             "void".into(),
@@ -152,7 +160,9 @@ fn pinvoke_return_info(ty: &TypeRef) -> (String, Vec<String>) {
                 "out UIntPtr out_len".into(),
             ],
         ),
-        TypeRef::Optional(inner) if matches!(inner.as_ref(), TypeRef::Bytes) => {
+        TypeRef::Optional(inner)
+            if matches!(inner.as_ref(), TypeRef::Bytes | TypeRef::BorrowedBytes) =>
+        {
             ("IntPtr".into(), vec!["out UIntPtr out_len".into()])
         }
         _ => (pinvoke_type(ty), vec![]),
@@ -362,7 +372,7 @@ fn render_struct_getter(out: &mut String, prefix: &str, field: &StructField) {
                 "                return NativeMethods.{getter_sym}(_handle) != 0;\n"
             ));
         }
-        TypeRef::StringUtf8 => {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             out.push_str(&format!(
                 "                var ptr = NativeMethods.{getter_sym}(_handle);\n"
             ));
@@ -370,7 +380,7 @@ fn render_struct_getter(out: &mut String, prefix: &str, field: &StructField) {
             out.push_str("                NativeMethods.weaveffi_free_string(ptr);\n");
             out.push_str("                return str;\n");
         }
-        TypeRef::Bytes => {
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
             out.push_str(&format!(
                 "                var ptr = NativeMethods.{getter_sym}(_handle, out var len);\n"
             ));
@@ -390,7 +400,9 @@ fn render_struct_getter(out: &mut String, prefix: &str, field: &StructField) {
                 "                return new {name}(NativeMethods.{getter_sym}(_handle));\n"
             ));
         }
-        TypeRef::Optional(inner) if matches!(inner.as_ref(), TypeRef::Bytes) => {
+        TypeRef::Optional(inner)
+            if matches!(inner.as_ref(), TypeRef::Bytes | TypeRef::BorrowedBytes) =>
+        {
             out.push_str(&format!(
                 "                var ptr = NativeMethods.{getter_sym}(_handle, out var len);\n"
             ));
@@ -405,7 +417,7 @@ fn render_struct_getter(out: &mut String, prefix: &str, field: &StructField) {
                 "                var ptr = NativeMethods.{getter_sym}(_handle);\n"
             ));
             match inner.as_ref() {
-                TypeRef::StringUtf8 => {
+                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                     out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
                     out.push_str("                var str = WeaveFFIHelpers.PtrToString(ptr);\n");
                     out.push_str("                NativeMethods.weaveffi_free_string(ptr);\n");
@@ -644,11 +656,15 @@ fn render_wrapper_class(out: &mut String, m: &Module, strip_module_prefix: bool)
 
 fn param_needs_marshal(ty: &TypeRef) -> bool {
     match ty {
-        TypeRef::StringUtf8 | TypeRef::Bytes => true,
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr | TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            true
+        }
         TypeRef::Optional(inner) => matches!(
             inner.as_ref(),
             TypeRef::StringUtf8
+                | TypeRef::BorrowedStr
                 | TypeRef::Bytes
+                | TypeRef::BorrowedBytes
                 | TypeRef::I32
                 | TypeRef::U32
                 | TypeRef::I64
@@ -705,18 +721,18 @@ fn render_wrapper_method(out: &mut String, m: &Module, f: &Function, strip_modul
 fn render_marshal_setup(out: &mut String, p: &Param, indent: &str) {
     let name = safe_cs_name(&p.name);
     match &p.ty {
-        TypeRef::StringUtf8 => {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             out.push_str(&format!(
                 "{indent}var {name}Ptr = Marshal.StringToCoTaskMemUTF8({name});\n"
             ));
         }
-        TypeRef::Bytes => {
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
             out.push_str(&format!(
                 "{indent}var {name}Pin = GCHandle.Alloc({name}, GCHandleType.Pinned);\n"
             ));
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 => {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                 out.push_str(&format!(
                     "{indent}var {name}Ptr = {name} != null ? Marshal.StringToCoTaskMemUTF8({name}) : IntPtr.Zero;\n"
                 ));
@@ -756,7 +772,7 @@ fn render_marshal_setup(out: &mut String, p: &Param, indent: &str) {
                 ));
                 out.push_str(&format!("{indent}}}\n"));
             }
-            TypeRef::Bytes => {
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 out.push_str(&format!(
                     "{indent}var {name}Pin = {name} != null ? GCHandle.Alloc({name}, GCHandleType.Pinned) : default;\n"
                 ));
@@ -770,14 +786,14 @@ fn render_marshal_setup(out: &mut String, p: &Param, indent: &str) {
 fn render_marshal_cleanup(out: &mut String, p: &Param, indent: &str) {
     let name = safe_cs_name(&p.name);
     match &p.ty {
-        TypeRef::StringUtf8 => {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             out.push_str(&format!("{indent}Marshal.FreeCoTaskMem({name}Ptr);\n"));
         }
-        TypeRef::Bytes => {
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
             out.push_str(&format!("{indent}{name}Pin.Free();\n"));
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 => {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                 out.push_str(&format!(
                     "{indent}if ({name}Ptr != IntPtr.Zero) Marshal.FreeCoTaskMem({name}Ptr);\n"
                 ));
@@ -793,7 +809,7 @@ fn render_marshal_cleanup(out: &mut String, p: &Param, indent: &str) {
                     "{indent}if ({name}Ptr != IntPtr.Zero) Marshal.FreeHGlobal({name}Ptr);\n"
                 ));
             }
-            TypeRef::Bytes => {
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 out.push_str(&format!("{indent}if ({name} != null) {name}Pin.Free();\n"));
             }
             _ => {}
@@ -812,8 +828,14 @@ fn render_pinvoke_call_and_return(out: &mut String, m: &Module, f: &Function, in
     }
 
     let has_out_len = f.returns.as_ref().is_some_and(|r| {
-        matches!(r, TypeRef::Bytes | TypeRef::List(_))
-            || matches!(r, TypeRef::Optional(inner) if matches!(inner.as_ref(), TypeRef::Bytes))
+        matches!(
+            r,
+            TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_)
+        ) || matches!(
+            r,
+            TypeRef::Optional(inner)
+                if matches!(inner.as_ref(), TypeRef::Bytes | TypeRef::BorrowedBytes)
+        )
     });
 
     if f.returns.is_some() {
@@ -852,9 +874,9 @@ fn build_call_args(params: &[Param]) -> String {
             match &p.ty {
                 TypeRef::Bool => vec![format!("{name} ? 1 : 0")],
                 TypeRef::Enum(_) => vec![format!("(int){name}")],
-                TypeRef::StringUtf8 => vec![format!("{name}Ptr")],
+                TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![format!("{name}Ptr")],
                 TypeRef::Struct(_) | TypeRef::TypedHandle(_) => vec![format!("{name}.Handle")],
-                TypeRef::Bytes => vec![
+                TypeRef::Bytes | TypeRef::BorrowedBytes => vec![
                     format!("{name}Pin.AddrOfPinnedObject()"),
                     format!("(UIntPtr){name}.Length"),
                 ],
@@ -862,11 +884,12 @@ fn build_call_args(params: &[Param]) -> String {
                     TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
                         vec![format!("{name}?.Handle ?? IntPtr.Zero")]
                     }
-                    TypeRef::Bytes => vec![
+                    TypeRef::Bytes | TypeRef::BorrowedBytes => vec![
                         format!("{name} != null ? {name}Pin.AddrOfPinnedObject() : IntPtr.Zero"),
                         format!("{name} != null ? (UIntPtr){name}.Length : UIntPtr.Zero"),
                     ],
                     TypeRef::StringUtf8
+                    | TypeRef::BorrowedStr
                     | TypeRef::I32
                     | TypeRef::U32
                     | TypeRef::I64
@@ -888,7 +911,7 @@ fn render_return_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
         TypeRef::Bool => {
             out.push_str(&format!("{indent}return result != 0;\n"));
         }
-        TypeRef::StringUtf8 => {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             out.push_str(&format!(
                 "{indent}var str = Marshal.PtrToStringUTF8(result);\n"
             ));
@@ -903,7 +926,7 @@ fn render_return_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
         TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
             out.push_str(&format!("{indent}return new {name}(result);\n"));
         }
-        TypeRef::Bytes => {
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
             out.push_str(&format!(
                 "{indent}if (result == IntPtr.Zero) return Array.Empty<byte>();\n"
             ));
@@ -931,7 +954,7 @@ fn render_return_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
 
 fn render_optional_return_conversion(out: &mut String, inner: &TypeRef, indent: &str) {
     match inner {
-        TypeRef::StringUtf8 => {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             out.push_str(&format!(
                 "{indent}if (result == IntPtr.Zero) return null;\n"
             ));
@@ -948,7 +971,7 @@ fn render_optional_return_conversion(out: &mut String, inner: &TypeRef, indent: 
                 "{indent}return result == IntPtr.Zero ? null : new {name}(result);\n"
             ));
         }
-        TypeRef::Bytes => {
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
             out.push_str(&format!(
                 "{indent}if (result == IntPtr.Zero) return null;\n"
             ));
@@ -1128,7 +1151,7 @@ fn marshal_read_element(ty: &TypeRef, arr: &str, idx: &str) -> String {
         TypeRef::TypedHandle(name) => {
             format!("new {name}(Marshal.ReadIntPtr({arr}, {idx} * IntPtr.Size))")
         }
-        TypeRef::StringUtf8 => {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             format!("Marshal.PtrToStringUTF8(Marshal.ReadIntPtr({arr}, {idx} * IntPtr.Size))")
         }
         TypeRef::Enum(name) => {

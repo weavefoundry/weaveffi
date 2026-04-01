@@ -122,8 +122,8 @@ fn kotlin_type(t: &TypeRef) -> String {
         TypeRef::I64 => "Long".to_string(),
         TypeRef::F64 => "Double".to_string(),
         TypeRef::Bool => "Boolean".to_string(),
-        TypeRef::StringUtf8 => "String".to_string(),
-        TypeRef::Bytes => "ByteArray".to_string(),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "String".to_string(),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => "ByteArray".to_string(),
         TypeRef::Handle => "Long".to_string(),
         TypeRef::TypedHandle(name) => name.clone(),
         TypeRef::Struct(_) => "Long".to_string(),
@@ -151,8 +151,8 @@ fn kotlin_list_type(inner: &TypeRef) -> String {
         | TypeRef::Struct(_) => "LongArray".to_string(),
         TypeRef::F64 => "DoubleArray".to_string(),
         TypeRef::Bool => "BooleanArray".to_string(),
-        TypeRef::StringUtf8 => "Array<String>".to_string(),
-        TypeRef::Bytes => "Array<ByteArray>".to_string(),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Array<String>".to_string(),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => "Array<ByteArray>".to_string(),
         TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) => "LongArray".to_string(),
     }
 }
@@ -167,11 +167,11 @@ fn jni_param_type(t: &TypeRef) -> String {
         | TypeRef::Struct(_) => "jlong".to_string(),
         TypeRef::F64 => "jdouble".to_string(),
         TypeRef::Bool => "jboolean".to_string(),
-        TypeRef::StringUtf8 => "jstring".to_string(),
-        TypeRef::Bytes => "jbyteArray".to_string(),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "jstring".to_string(),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => "jbyteArray".to_string(),
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 => "jstring".to_string(),
-            TypeRef::Bytes => "jbyteArray".to_string(),
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => "jstring".to_string(),
+            TypeRef::Bytes | TypeRef::BorrowedBytes => "jbyteArray".to_string(),
             _ => "jobject".to_string(),
         },
         TypeRef::List(inner) => jni_array_type(inner),
@@ -208,8 +208,8 @@ fn c_type_for_return(t: &TypeRef) -> &'static str {
         TypeRef::F64 => "double",
         TypeRef::Bool => "bool",
         TypeRef::TypedHandle(_) | TypeRef::Handle => "weaveffi_handle_t",
-        TypeRef::StringUtf8 => "const char*",
-        TypeRef::Bytes => "const uint8_t*",
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*",
+        TypeRef::Bytes | TypeRef::BorrowedBytes => "const uint8_t*",
         TypeRef::Struct(_) | TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
             "void*"
         }
@@ -225,8 +225,8 @@ fn jni_default_return(t: Option<&TypeRef>) -> &'static str {
         }
         Some(TypeRef::F64) => "return 0.0;",
         Some(TypeRef::Bool) => "return JNI_FALSE;",
-        Some(TypeRef::StringUtf8) => "return NULL;",
-        Some(TypeRef::Bytes) => "return NULL;",
+        Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => "return NULL;",
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => "return NULL;",
         Some(TypeRef::Struct(_)) => "return 0;",
         Some(TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _)) => "return NULL;",
     }
@@ -489,7 +489,10 @@ fn render_jni_c(api: &Api, package: &str, strip_module_prefix: bool) -> String {
                 build_c_call_args(&mut call_args, &p.name, &p.ty, &m.name);
             }
 
-            let needs_out_len = matches!(f.returns, Some(TypeRef::Bytes) | Some(TypeRef::List(_)));
+            let needs_out_len = matches!(
+                f.returns,
+                Some(TypeRef::Bytes | TypeRef::BorrowedBytes) | Some(TypeRef::List(_))
+            );
             if needs_out_len {
                 let _ = writeln!(jni_c, "    size_t out_len = 0;");
             }
@@ -524,7 +527,7 @@ fn render_jni_c(api: &Api, package: &str, strip_module_prefix: bool) -> String {
 
 fn write_param_acquire(out: &mut String, name: &str, ty: &TypeRef) {
     match ty {
-        TypeRef::StringUtf8 => {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             let _ = writeln!(
                 out,
                 "    const char* {n}_chars = (*env)->GetStringUTFChars(env, {n}, NULL);",
@@ -536,7 +539,7 @@ fn write_param_acquire(out: &mut String, name: &str, ty: &TypeRef) {
                 n = name
             );
         }
-        TypeRef::Bytes => {
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
             let _ = writeln!(out, "    jboolean {n}_is_copy = 0;", n = name);
             let _ = writeln!(
                 out,
@@ -558,7 +561,7 @@ fn write_param_acquire(out: &mut String, name: &str, ty: &TypeRef) {
 
 fn write_optional_acquire(out: &mut String, name: &str, inner: &TypeRef) {
     match inner {
-        TypeRef::StringUtf8 => {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             let _ = writeln!(out, "    const char* {n}_chars = NULL;", n = name);
             let _ = writeln!(out, "    jsize {n}_len = 0;", n = name);
             let _ = writeln!(out, "    if ({n} != NULL) {{", n = name);
@@ -574,7 +577,7 @@ fn write_optional_acquire(out: &mut String, name: &str, inner: &TypeRef) {
             );
             let _ = writeln!(out, "    }}");
         }
-        TypeRef::Bytes => {
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
             let _ = writeln!(out, "    jbyte* {n}_elems = NULL;", n = name);
             let _ = writeln!(out, "    jsize {n}_len = 0;", n = name);
             let _ = writeln!(out, "    if ({n} != NULL) {{", n = name);
@@ -757,7 +760,7 @@ fn map_elem_c_type(ty: &TypeRef) -> &'static str {
         TypeRef::I64 | TypeRef::TypedHandle(_) | TypeRef::Handle => "int64_t",
         TypeRef::F64 => "double",
         TypeRef::Bool => "jboolean",
-        TypeRef::StringUtf8 => "const char*",
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*",
         _ => "void*",
     }
 }
@@ -769,7 +772,7 @@ fn map_elem_c_call_cast(ty: &TypeRef) -> &'static str {
         TypeRef::I64 | TypeRef::TypedHandle(_) | TypeRef::Handle => "(const int64_t*)",
         TypeRef::F64 => "(const double*)",
         TypeRef::Bool => "(const bool*)",
-        TypeRef::StringUtf8 => "(const char* const*)",
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "(const char* const*)",
         _ => "(const void*)",
     }
 }
@@ -819,14 +822,14 @@ fn write_map_acquire(out: &mut String, name: &str, key: &TypeRef, val: &TypeRef)
         vc = val_c,
         n = name
     );
-    if matches!(key, TypeRef::StringUtf8) {
+    if matches!(key, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
         let _ = writeln!(
             out,
             "    jstring* {n}_jk = (jstring*)malloc((size_t){n}_len * sizeof(jstring));",
             n = name
         );
     }
-    if matches!(val, TypeRef::StringUtf8) {
+    if matches!(val, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
         let _ = writeln!(
             out,
             "    jstring* {n}_jv = (jstring*)malloc((size_t){n}_len * sizeof(jstring));",
@@ -926,7 +929,7 @@ fn write_map_elem_extract(
     obj_var: &str,
 ) {
     match ty {
-        TypeRef::StringUtf8 => {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             let _ = writeln!(
                 out,
                 "        {n}_j{s}[{n}_i] = (jstring){obj};",
@@ -998,11 +1001,11 @@ fn write_map_elem_extract(
 
 fn build_c_call_args(args: &mut Vec<String>, name: &str, ty: &TypeRef, module: &str) {
     match ty {
-        TypeRef::StringUtf8 => {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             args.push(format!("(const uint8_t*){n}_chars", n = name));
             args.push(format!("(size_t){n}_len", n = name));
         }
-        TypeRef::Bytes => {
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
             args.push(format!("(const uint8_t*){n}_elems", n = name));
             args.push(format!("(size_t){n}_len", n = name));
         }
@@ -1022,11 +1025,11 @@ fn build_c_call_args(args: &mut Vec<String>, name: &str, ty: &TypeRef, module: &
         }
         TypeRef::Enum(_) => args.push(format!("(int32_t){}", name)),
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 => {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                 args.push(format!("(const uint8_t*){n}_chars", n = name));
                 args.push(format!("(size_t){n}_len", n = name));
             }
-            TypeRef::Bytes => {
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 args.push(format!("(const uint8_t*){n}_elems", n = name));
                 args.push(format!("(size_t){n}_len", n = name));
             }
@@ -1078,7 +1081,7 @@ fn write_return_handling(
 ) {
     let args_str = call_args.join(", ");
     match ret_type {
-        TypeRef::StringUtf8 => {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             let _ = writeln!(jni_c, "    const char* rv = {}({}, &err);", c_sym, args_str);
             write_error_check(jni_c, returns);
             let _ = writeln!(jni_c, "    jstring out = rv ? (*env)->NewStringUTF(env, rv) : (*env)->NewStringUTF(env, \"\");");
@@ -1086,7 +1089,7 @@ fn write_return_handling(
             release_jni_resources(jni_c, params);
             let _ = writeln!(jni_c, "    return out;");
         }
-        TypeRef::Bytes => {
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
             let _ = writeln!(
                 jni_c,
                 "    const uint8_t* rv = {}({}, &out_len, &err);",
@@ -1148,7 +1151,7 @@ fn write_optional_return(
     _module: &str,
 ) {
     match inner {
-        TypeRef::StringUtf8 => {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             let _ = writeln!(out, "    const char* rv = {}({}, &err);", c_sym, args_str);
             write_error_check(out, returns);
             release_jni_resources(out, params);
@@ -1384,7 +1387,7 @@ fn write_map_return(
 
 fn write_map_box_elem(out: &mut String, ty: &TypeRef, var: &str, arr: &str) {
     match ty {
-        TypeRef::StringUtf8 => {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             let _ = writeln!(
                 out,
                 "        jstring {v} = (*env)->NewStringUTF(env, {a}[i]);",
@@ -1465,14 +1468,14 @@ fn write_error_check(out: &mut String, ret_type: Option<&TypeRef>) {
 fn release_jni_resources(out: &mut String, params: &[weaveffi_ir::ir::Param]) {
     for p in params {
         match &p.ty {
-            TypeRef::StringUtf8 => {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                 let _ = writeln!(
                     out,
                     "    (*env)->ReleaseStringUTFChars(env, {n}, {n}_chars);",
                     n = p.name
                 );
             }
-            TypeRef::Bytes => {
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 let _ = writeln!(
                     out,
                     "    (*env)->ReleaseByteArrayElements(env, {n}, {n}_elems, 0);",
@@ -1480,14 +1483,14 @@ fn release_jni_resources(out: &mut String, params: &[weaveffi_ir::ir::Param]) {
                 );
             }
             TypeRef::Optional(inner) => match inner.as_ref() {
-                TypeRef::StringUtf8 => {
+                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                     let _ = writeln!(
                         out,
                         "    if ({n} != NULL) {{ (*env)->ReleaseStringUTFChars(env, {n}, {n}_chars); }}",
                         n = p.name
                     );
                 }
-                TypeRef::Bytes => {
+                TypeRef::Bytes | TypeRef::BorrowedBytes => {
                     let _ = writeln!(
                         out,
                         "    if ({n} != NULL && {n}_elems != NULL) {{ (*env)->ReleaseByteArrayElements(env, {n}, {n}_elems, 0); }}",
@@ -1538,7 +1541,7 @@ fn release_jni_resources(out: &mut String, params: &[weaveffi_ir::ir::Param]) {
 }
 
 fn write_map_release(out: &mut String, name: &str, key: &TypeRef, val: &TypeRef) {
-    if matches!(key, TypeRef::StringUtf8) {
+    if matches!(key, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
         let _ = writeln!(
             out,
             "    for (jsize {n}_ri = 0; {n}_ri < {n}_len; {n}_ri++) {{",
@@ -1552,7 +1555,7 @@ fn write_map_release(out: &mut String, name: &str, key: &TypeRef, val: &TypeRef)
         let _ = writeln!(out, "    }}");
         let _ = writeln!(out, "    free({n}_jk);", n = name);
     }
-    if matches!(val, TypeRef::StringUtf8) {
+    if matches!(val, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
         let _ = writeln!(
             out,
             "    for (jsize {n}_ri = 0; {n}_ri < {n}_len; {n}_ri++) {{",
@@ -1749,7 +1752,7 @@ fn render_jni_struct(out: &mut String, module_name: &str, s: &StructDef, jni_pre
         );
 
         match &f.ty {
-            TypeRef::StringUtf8 => {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                 let _ = writeln!(
                     out,
                     "    const char* rv = {}((const {}*)(intptr_t)handle);",
@@ -1762,7 +1765,7 @@ fn render_jni_struct(out: &mut String, module_name: &str, s: &StructDef, jni_pre
                 let _ = writeln!(out, "    weaveffi_free_string(rv);");
                 let _ = writeln!(out, "    return jout;");
             }
-            TypeRef::Bytes => {
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 let _ = writeln!(out, "    size_t out_len = 0;");
                 let _ = writeln!(
                     out,
@@ -1823,7 +1826,7 @@ fn render_jni_struct(out: &mut String, module_name: &str, s: &StructDef, jni_pre
 
 fn write_struct_optional_getter(out: &mut String, inner: &TypeRef, getter_c: &str, prefix: &str) {
     match inner {
-        TypeRef::StringUtf8 => {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             let _ = writeln!(
                 out,
                 "    const char* rv = {}((const {}*)(intptr_t)handle);",
@@ -1963,14 +1966,14 @@ fn write_struct_list_getter(out: &mut String, inner: &TypeRef, getter_c: &str, p
 
 fn release_jni_resources_single(out: &mut String, name: &str, ty: &TypeRef) {
     match ty {
-        TypeRef::StringUtf8 => {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             let _ = writeln!(
                 out,
                 "    (*env)->ReleaseStringUTFChars(env, {n}, {n}_chars);",
                 n = name
             );
         }
-        TypeRef::Bytes => {
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
             let _ = writeln!(
                 out,
                 "    (*env)->ReleaseByteArrayElements(env, {n}, {n}_elems, 0);",
@@ -1978,14 +1981,14 @@ fn release_jni_resources_single(out: &mut String, name: &str, ty: &TypeRef) {
             );
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 => {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                 let _ = writeln!(
                     out,
                     "    if ({n} != NULL) {{ (*env)->ReleaseStringUTFChars(env, {n}, {n}_chars); }}",
                     n = name
                 );
             }
-            TypeRef::Bytes => {
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 let _ = writeln!(
                     out,
                     "    if ({n} != NULL && {n}_elems != NULL) {{ (*env)->ReleaseByteArrayElements(env, {n}, {n}_elems, 0); }}",

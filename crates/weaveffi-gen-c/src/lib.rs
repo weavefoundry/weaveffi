@@ -52,7 +52,9 @@ fn is_c_pointer_type(ty: &TypeRef) -> bool {
     matches!(
         ty,
         TypeRef::StringUtf8
+            | TypeRef::BorrowedStr
             | TypeRef::Bytes
+            | TypeRef::BorrowedBytes
             | TypeRef::Struct(_)
             | TypeRef::TypedHandle(_)
             | TypeRef::List(_)
@@ -70,8 +72,8 @@ fn c_element_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
         TypeRef::Bool => "bool".to_string(),
         TypeRef::Handle => format!("{prefix}_handle_t"),
         TypeRef::TypedHandle(n) => format!("{prefix}_{module}_{n}*"),
-        TypeRef::StringUtf8 => "const char*".to_string(),
-        TypeRef::Bytes => "const uint8_t*".to_string(),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*".to_string(),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => "const uint8_t*".to_string(),
         TypeRef::Struct(s) => format!("{prefix}_{module}_{s}*"),
         TypeRef::Enum(e) => format!("{prefix}_{module}_{e}"),
         TypeRef::Optional(inner) | TypeRef::List(inner) => c_element_type(inner, module, prefix),
@@ -86,8 +88,10 @@ fn c_type_for_param(ty: &TypeRef, name: &str, module: &str, prefix: &str) -> Str
         TypeRef::I64 => format!("int64_t {name}"),
         TypeRef::F64 => format!("double {name}"),
         TypeRef::Bool => format!("bool {name}"),
-        TypeRef::StringUtf8 => format!("const char* {name}"),
-        TypeRef::Bytes => format!("const uint8_t* {name}_ptr, size_t {name}_len"),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("const char* {name}"),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            format!("const uint8_t* {name}_ptr, size_t {name}_len")
+        }
         TypeRef::Handle => format!("{prefix}_handle_t {name}"),
         TypeRef::TypedHandle(n) => format!("{prefix}_{module}_{n}* {name}"),
         TypeRef::Struct(s) => format!("const {prefix}_{module}_{s}* {name}"),
@@ -133,8 +137,8 @@ fn c_ret_type(ty: &TypeRef, module: &str, prefix: &str) -> (String, Vec<String>)
         TypeRef::I64 => ("int64_t".to_string(), vec![]),
         TypeRef::F64 => ("double".to_string(), vec![]),
         TypeRef::Bool => ("bool".to_string(), vec![]),
-        TypeRef::StringUtf8 => ("const char*".to_string(), vec![]),
-        TypeRef::Bytes => (
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => ("const char*".to_string(), vec![]),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => (
             "const uint8_t*".to_string(),
             vec!["size_t* out_len".to_string()],
         ),
@@ -1212,6 +1216,61 @@ mod tests {
         assert!(
             header.contains("weaveffi_contacts_Contact* weaveffi_contacts_get_info("),
             "TypedHandle return should use opaque struct pointer: {header}"
+        );
+    }
+
+    #[test]
+    fn c_type_borrowed_str_param() {
+        let result = c_type_for_param(&TypeRef::BorrowedStr, "msg", "io", "weaveffi");
+        assert_eq!(result, "const char* msg");
+    }
+
+    #[test]
+    fn c_type_borrowed_bytes_param() {
+        let result = c_type_for_param(&TypeRef::BorrowedBytes, "data", "io", "weaveffi");
+        assert_eq!(result, "const uint8_t* data_ptr, size_t data_len");
+    }
+
+    #[test]
+    fn c_header_with_borrowed_params() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "io".to_string(),
+                functions: vec![Function {
+                    name: "write".to_string(),
+                    params: vec![
+                        Param {
+                            name: "msg".to_string(),
+                            ty: TypeRef::BorrowedStr,
+                        },
+                        Param {
+                            name: "raw".to_string(),
+                            ty: TypeRef::BorrowedBytes,
+                        },
+                    ],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+
+        let header = render_c_header(&api, "weaveffi");
+        assert!(
+            header.contains("const char* msg"),
+            "BorrowedStr param should map to const char*: {header}"
+        );
+        assert!(
+            header.contains("const uint8_t* raw_ptr, size_t raw_len"),
+            "BorrowedBytes param should map to const uint8_t* + size_t: {header}"
+        );
+        assert!(
+            header.contains("weaveffi_io_write("),
+            "missing function declaration: {header}"
         );
     }
 

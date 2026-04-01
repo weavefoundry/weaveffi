@@ -50,6 +50,8 @@ pub enum TypeRef {
     TypedHandle(String),
     Struct(String),
     Enum(String),
+    BorrowedStr,
+    BorrowedBytes,
     Optional(Box<TypeRef>),
     List(Box<TypeRef>),
     Map(Box<TypeRef>, Box<TypeRef>),
@@ -91,6 +93,8 @@ pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
         "string" => Ok(TypeRef::StringUtf8),
         "bytes" => Ok(TypeRef::Bytes),
         "handle" => Ok(TypeRef::Handle),
+        "&str" => Ok(TypeRef::BorrowedStr),
+        "&[u8]" => Ok(TypeRef::BorrowedBytes),
         name => Ok(TypeRef::Struct(name.to_string())),
     }
 }
@@ -104,6 +108,8 @@ fn type_ref_to_string(ty: &TypeRef) -> String {
         TypeRef::Bool => "bool".to_string(),
         TypeRef::StringUtf8 => "string".to_string(),
         TypeRef::Bytes => "bytes".to_string(),
+        TypeRef::BorrowedStr => "&str".to_string(),
+        TypeRef::BorrowedBytes => "&[u8]".to_string(),
         TypeRef::Handle => "handle".to_string(),
         TypeRef::TypedHandle(name) => format!("handle<{name}>"),
         TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
@@ -736,6 +742,53 @@ modules:
                 Box::new(TypeRef::List(Box::new(TypeRef::I32))),
             ))
         );
+    }
+
+    #[test]
+    fn parse_type_ref_borrowed() {
+        assert_eq!(parse_type_ref("&str"), Ok(TypeRef::BorrowedStr));
+        assert_eq!(parse_type_ref("&[u8]"), Ok(TypeRef::BorrowedBytes));
+    }
+
+    #[test]
+    fn typeref_borrowed_round_trip() {
+        for ty in [TypeRef::BorrowedStr, TypeRef::BorrowedBytes] {
+            let json = serde_json::to_string(&ty).unwrap();
+            let back: TypeRef = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, ty);
+        }
+    }
+
+    #[test]
+    fn typeref_borrowed_str_serializes_as_ampersand_str() {
+        let json = serde_json::to_string(&TypeRef::BorrowedStr).unwrap();
+        assert_eq!(json, r#""&str""#);
+    }
+
+    #[test]
+    fn typeref_borrowed_bytes_serializes_as_ampersand_u8() {
+        let json = serde_json::to_string(&TypeRef::BorrowedBytes).unwrap();
+        assert_eq!(json, r#""&[u8]""#);
+    }
+
+    #[test]
+    fn typeref_borrowed_yaml_deser() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: io
+    functions:
+      - name: write
+        params:
+          - name: data
+            type: "&str"
+          - name: raw
+            type: "&[u8]"
+"#;
+        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert_eq!(f.params[0].ty, TypeRef::BorrowedStr);
+        assert_eq!(f.params[1].ty, TypeRef::BorrowedBytes);
     }
 
     #[test]

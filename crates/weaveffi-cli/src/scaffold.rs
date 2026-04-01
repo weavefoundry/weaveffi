@@ -4,7 +4,9 @@ fn is_pointer_type(ty: &TypeRef) -> bool {
     matches!(
         ty,
         TypeRef::StringUtf8
+            | TypeRef::BorrowedStr
             | TypeRef::Bytes
+            | TypeRef::BorrowedBytes
             | TypeRef::Struct(_)
             | TypeRef::TypedHandle(_)
             | TypeRef::List(_)
@@ -19,8 +21,8 @@ fn rust_scalar_type(ty: &TypeRef, module: &str) -> String {
         TypeRef::I64 => "i64".into(),
         TypeRef::F64 => "f64".into(),
         TypeRef::Bool => "bool".into(),
-        TypeRef::StringUtf8 => "c_char".into(),
-        TypeRef::Bytes => "u8".into(),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "c_char".into(),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => "u8".into(),
         TypeRef::Handle => "u64".into(),
         TypeRef::TypedHandle(name) => name.clone(),
         TypeRef::Struct(s) => format!("weaveffi_{module}_{s}"),
@@ -37,10 +39,12 @@ fn rust_param_fragments(name: &str, ty: &TypeRef, module: &str) -> Vec<String> {
         TypeRef::I64 => vec![format!("{name}: i64")],
         TypeRef::F64 => vec![format!("{name}: f64")],
         TypeRef::Bool => vec![format!("{name}: bool")],
-        TypeRef::StringUtf8 | TypeRef::Bytes => vec![
-            format!("{name}_ptr: *const u8"),
-            format!("{name}_len: usize"),
-        ],
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr | TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            vec![
+                format!("{name}_ptr: *const u8"),
+                format!("{name}_len: usize"),
+            ]
+        }
         TypeRef::Handle => vec![format!("{name}: u64")],
         TypeRef::TypedHandle(th) => vec![format!("{name}: *mut {th}")],
         TypeRef::Struct(s) => vec![format!("{name}: *const weaveffi_{module}_{s}")],
@@ -92,8 +96,8 @@ fn rust_return_type(ty: &TypeRef, module: &str) -> (String, bool) {
         TypeRef::I64 => ("i64".into(), false),
         TypeRef::F64 => ("f64".into(), false),
         TypeRef::Bool => ("bool".into(), false),
-        TypeRef::StringUtf8 => ("*const c_char".into(), false),
-        TypeRef::Bytes => ("*mut u8".into(), true),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => ("*const c_char".into(), false),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => ("*mut u8".into(), true),
         TypeRef::Handle => ("u64".into(), false),
         TypeRef::TypedHandle(name) => (format!("*mut {name}"), false),
         TypeRef::Struct(s) => (format!("*mut weaveffi_{module}_{s}"), false),
