@@ -95,42 +95,31 @@ a stable C ABI contract consumed by language-specific wrappers.
 - [x] Mutable parameter annotations for safer codegen
 - [x] Async-demo and events samples demonstrating callbacks, listeners, and iterators
 - [x] Cross-module type references (struct in one module used as param in another)
+- [x] WASM generator aligned with the C ABI error model (`out_err` parameter handling in generated JS)
+- [x] Node N-API addon stub bodies completed with functional glue
+- [x] End-to-end integration tests for JSON and TOML input formats
+- [x] Generator edge-case coverage (deeply nested optionals, maps of lists, enum-keyed maps)
+- [x] Zero-copy string and byte-buffer passing (borrowed slices across the ABI boundary)
+- [x] Arena/pool allocation patterns for batch handle creation and destruction
+- [x] IR parsing and validation profiling and optimization
+- [x] Generated code memory safety audit (double-free, use-after-free, null pointer paths)
+- [x] Swift `async/await` mapping for async functions
+- [x] Kotlin coroutine (`suspend fun`) mapping for async functions
+- [x] Node.js `Promise` mapping for async functions
+- [x] Python `asyncio` mapping for async functions
+- [x] .NET `Task<T>` / `async` mapping for async functions
+- [x] Cancellation token support for long-running async operations
+- [x] Full cross-platform CI (Windows added to the test matrix)
+- [x] Security audit of all generated code patterns (memory safety, input validation)
 
 ## Future releases
-
-### Quality and polish
-
-- [ ] Align WASM generator with the C ABI error model (`out_err` parameter handling in generated JS)
-- [ ] Complete Node N-API addon stub bodies (replace `// TODO: implement` with functional glue)
-- [ ] Add end-to-end integration tests for JSON and TOML input formats
-- [ ] Improve generator edge-case coverage (deeply nested optionals, maps of lists, enum-keyed maps)
-
-### Safety and performance
-
-- [ ] Zero-copy string and byte-buffer passing where safe (borrowed slices across the ABI boundary)
-- [ ] Arena/pool allocation patterns for batch handle creation and destruction
-- [ ] Profile and optimize IR parsing and validation for APIs with hundreds of functions
-- [ ] Audit generated code for memory safety (double-free, use-after-free, null pointer paths)
-
-### Async language mappings
-
-- [ ] Swift `async/await` mapping for async functions
-- [ ] Kotlin coroutine (`suspend fun`) mapping for async functions
-- [ ] Node.js `Promise` mapping for async functions
-- [ ] Python `asyncio` mapping for async functions
-- [ ] .NET `Task<T>` / `async` mapping for async functions
-- [ ] Cancellation token support for long-running async operations
 
 ### Dart Flutter integration
 
 - [ ] Flutter plugin scaffold with platform channel integration
 
-### Stability milestone
+### Documentation and benchmarks
 
-- [ ] Stability guarantees: IR schema, CLI interface, and Generator trait locked under SemVer
-- [ ] Comprehensive migration guide for major version transitions
-- [ ] Full cross-platform CI (add Windows to the test matrix)
-- [ ] Security audit of all generated code patterns (memory safety, input validation)
 - [ ] Published performance benchmarks for codegen throughput
 - [ ] Feature-complete documentation with per-target tutorials and cookbook recipes
 
