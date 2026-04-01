@@ -30,3 +30,7 @@
   - [Generator Configuration](guides/config.md)
 - [Tutorials](tutorials/README.md)
   - [Calculator](tutorials/calculator.md)
+  - [Swift iOS](tutorials/swift.md)
+  - [Android](tutorials/android.md)
+  - [Python](tutorials/python.md)
+  - [Node.js](tutorials/node.md)
