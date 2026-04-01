@@ -130,6 +130,7 @@ fn kotlin_type(t: &TypeRef) -> String {
         TypeRef::Enum(_) => "Int".to_string(),
         TypeRef::Optional(inner) => format!("{}?", kotlin_type(inner)),
         TypeRef::List(inner) => kotlin_list_type(inner),
+        TypeRef::Iterator(inner) => format!("Iterator<{}>", kotlin_type(inner)),
         TypeRef::Map(k, v) => format!("Map<{}, {}>", kotlin_type(k), kotlin_type(v)),
         TypeRef::Callback(_) => todo!("callback Android type"),
     }
@@ -155,7 +156,9 @@ fn kotlin_list_type(inner: &TypeRef) -> String {
         TypeRef::Bool => "BooleanArray".to_string(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Array<String>".to_string(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "Array<ByteArray>".to_string(),
-        TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) => "LongArray".to_string(),
+        TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) => {
+            "LongArray".to_string()
+        }
         TypeRef::Callback(_) => todo!("callback Android type"),
     }
 }
@@ -177,7 +180,7 @@ fn jni_param_type(t: &TypeRef) -> String {
             TypeRef::Bytes | TypeRef::BorrowedBytes => "jbyteArray".to_string(),
             _ => "jobject".to_string(),
         },
-        TypeRef::List(inner) => jni_array_type(inner),
+        TypeRef::List(inner) | TypeRef::Iterator(inner) => jni_array_type(inner),
         TypeRef::Map(_, _) => "jobject".to_string(),
         TypeRef::Callback(_) => todo!("callback Android type"),
     }
@@ -214,9 +217,11 @@ fn c_type_for_return(t: &TypeRef) -> &'static str {
         TypeRef::TypedHandle(_) | TypeRef::Handle => "weaveffi_handle_t",
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*",
         TypeRef::Bytes | TypeRef::BorrowedBytes => "const uint8_t*",
-        TypeRef::Struct(_) | TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
-            "void*"
-        }
+        TypeRef::Struct(_)
+        | TypeRef::Optional(_)
+        | TypeRef::List(_)
+        | TypeRef::Iterator(_)
+        | TypeRef::Map(_, _) => "void*",
         TypeRef::Callback(_) => todo!("callback Android type"),
     }
 }
@@ -233,7 +238,9 @@ fn jni_default_return(t: Option<&TypeRef>) -> &'static str {
         Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => "return NULL;",
         Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => "return NULL;",
         Some(TypeRef::Struct(_)) => "return 0;",
-        Some(TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _)) => "return NULL;",
+        Some(
+            TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _),
+        ) => "return NULL;",
         Some(TypeRef::Callback(_)) => todo!("callback Android type"),
     }
 }
@@ -931,7 +938,7 @@ fn write_optional_acquire(out: &mut String, name: &str, inner: &TypeRef) {
             let _ = writeln!(out, "        {n}_ptr = &{n}_val;", n = name);
             let _ = writeln!(out, "    }}");
         }
-        TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {}
+        TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) => {}
         TypeRef::Callback(_) => todo!(),
     }
 }
@@ -1312,6 +1319,7 @@ fn build_c_call_args(args: &mut Vec<String>, name: &str, ty: &TypeRef, module: &
             args.push(format!("(size_t){n}_len", n = name));
         }
         TypeRef::Callback(_) => todo!(),
+        TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
     }
 }
 
@@ -1370,7 +1378,7 @@ fn write_return_handling(
         TypeRef::Optional(inner) => {
             write_optional_return(jni_c, inner, c_sym, &args_str, returns, params, module);
         }
-        TypeRef::List(inner) => {
+        TypeRef::List(inner) | TypeRef::Iterator(inner) => {
             write_list_return(jni_c, inner, c_sym, &args_str, returns, params);
         }
         TypeRef::Map(k, v) => {

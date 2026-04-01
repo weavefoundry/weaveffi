@@ -110,6 +110,7 @@ fn swift_type_for(t: &TypeRef) -> String {
         TypeRef::Optional(inner) => format!("{}?", swift_type_for(inner)),
         TypeRef::List(inner) => format!("[{}]", swift_type_for(inner)),
         TypeRef::Map(k, v) => format!("[{}: {}]", swift_type_for(k), swift_type_for(v)),
+        TypeRef::Iterator(inner) => format!("[{}]", swift_type_for(inner)),
         TypeRef::Callback(_) => todo!("callback Swift type"),
     }
 }
@@ -467,7 +468,7 @@ fn render_swift_function(
     };
 
     if !has_buffer_params(&f.params) {
-        render_direct_call(out, f, &call_with_err);
+        render_direct_call(out, f, &call_with_err, module_name);
     } else {
         render_buffered_call(out, f, &f.params, module_name);
     }
@@ -734,7 +735,7 @@ fn render_swift_async_function(
     out.push_str(&format!("{}}} else {{\n", cb_indent));
 
     let success_indent = format!("{}    ", cb_indent);
-    render_async_resume_result(out, &f.returns, &success_indent);
+    render_async_resume_result(out, &f.returns, &success_indent, module_name, &f.name);
 
     out.push_str(&format!("{}}}\n", cb_indent));
     out.push_str(&format!("{}}}, ctx)\n", inner_indent));
@@ -759,7 +760,13 @@ fn async_callback_param_names(returns: &Option<TypeRef>) -> &'static str {
     }
 }
 
-fn render_async_resume_result(out: &mut String, returns: &Option<TypeRef>, indent: &str) {
+fn render_async_resume_result(
+    out: &mut String,
+    returns: &Option<TypeRef>,
+    indent: &str,
+    module_name: &str,
+    func_name: &str,
+) {
     match returns {
         None => {
             out.push_str(&format!("{}contRef.value.resume(returning: ())\n", indent));
@@ -947,6 +954,74 @@ fn render_async_resume_result(out: &mut String, returns: &Option<TypeRef>, inden
                 indent
             ));
         }
+        Some(TypeRef::Iterator(inner)) => {
+            let pascal_func = func_name.to_upper_camel_case();
+            let iter_prefix = format!("weaveffi_{module_name}_{pascal_func}Iterator");
+            let next_fn = format!("{iter_prefix}_next");
+            let destroy_fn = format!("{iter_prefix}_destroy");
+            let inner_swift = swift_type_for(inner);
+
+            out.push_str(&format!("{}guard let result = result else {{\n", indent));
+            out.push_str(&format!(
+                "{}    contRef.value.resume(returning: [])\n",
+                indent
+            ));
+            out.push_str(&format!("{}    return\n", indent));
+            out.push_str(&format!("{}}}\n", indent));
+            out.push_str(&format!("{}var items: [{}] = []\n", indent, inner_swift));
+
+            match inner.as_ref() {
+                TypeRef::Struct(name) => {
+                    let name = local_type_name(name);
+                    out.push_str(&format!(
+                        "{}while let ptr = {}(result) {{\n",
+                        indent, next_fn
+                    ));
+                    out.push_str(&format!("{}    items.append({}(ptr: ptr))\n", indent, name));
+                }
+                TypeRef::TypedHandle(name) => {
+                    out.push_str(&format!(
+                        "{}while let ptr = {}(result) {{\n",
+                        indent, next_fn
+                    ));
+                    out.push_str(&format!("{}    items.append({}(ptr: ptr))\n", indent, name));
+                }
+                TypeRef::StringUtf8 => {
+                    out.push_str(&format!(
+                        "{}while let ptr = {}(result) {{\n",
+                        indent, next_fn
+                    ));
+                    out.push_str(&format!(
+                        "{}    items.append(String(cString: ptr))\n",
+                        indent
+                    ));
+                }
+                TypeRef::Enum(name) => {
+                    out.push_str(&format!(
+                        "{}while let raw = {}(result) {{\n",
+                        indent, next_fn
+                    ));
+                    out.push_str(&format!(
+                        "{}    items.append({}(rawValue: raw.pointee.rawValue)!)\n",
+                        indent, name
+                    ));
+                }
+                _ => {
+                    out.push_str(&format!(
+                        "{}while let val = {}(result) {{\n",
+                        indent, next_fn
+                    ));
+                    out.push_str(&format!("{}    items.append(val.pointee)\n", indent));
+                }
+            }
+
+            out.push_str(&format!("{}}}\n", indent));
+            out.push_str(&format!("{}{}(result)\n", indent, destroy_fn));
+            out.push_str(&format!(
+                "{}contRef.value.resume(returning: items)\n",
+                indent
+            ));
+        }
         Some(_) => {
             out.push_str(&format!(
                 "{}contRef.value.resume(returning: result)\n",
@@ -1000,7 +1075,7 @@ fn build_c_call_args(params: &[Param], module_name: &str) -> String {
     args.join(", ")
 }
 
-fn render_direct_call(out: &mut String, f: &Function, call_with_err: &str) {
+fn render_direct_call(out: &mut String, f: &Function, call_with_err: &str, module_name: &str) {
     match &f.returns {
         None => {
             out.push_str(&format!("        {}\n", call_with_err));
@@ -1053,6 +1128,9 @@ fn render_direct_call(out: &mut String, f: &Function, call_with_err: &str) {
         }
         Some(TypeRef::Map(k, v)) => {
             render_map_return(out, call_with_err, k, v);
+        }
+        Some(TypeRef::Iterator(inner)) => {
+            render_iterator_return(out, module_name, &f.name, inner, call_with_err, "        ");
         }
         Some(_) => {
             out.push_str(&format!("        let rv = {}\n", call_with_err));
@@ -1236,7 +1314,7 @@ fn swift_c_ptr_element(ty: &TypeRef) -> String {
         TypeRef::Bytes | TypeRef::BorrowedBytes => "UInt8".to_string(),
         TypeRef::Enum(_) => "Int32".to_string(),
         TypeRef::TypedHandle(_) | TypeRef::Struct(_) => "OpaquePointer?".to_string(),
-        TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+        TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) | TypeRef::Iterator(_) => {
             "OpaquePointer?".to_string()
         }
         TypeRef::Callback(_) => todo!("callback Swift type"),
@@ -1313,6 +1391,58 @@ fn render_map_return_inner(out: &mut String, call: &str, k: &TypeRef, v: &TypeRe
     ));
     out.push_str(&format!("{}    }}\n", indent));
     out.push_str(&format!("{}    return result\n", indent));
+}
+
+fn render_iterator_return(
+    out: &mut String,
+    module_name: &str,
+    func_name: &str,
+    inner: &TypeRef,
+    call_with_err: &str,
+    indent: &str,
+) {
+    let pascal_func = func_name.to_upper_camel_case();
+    let iter_prefix = format!("weaveffi_{module_name}_{pascal_func}Iterator");
+    let next_fn = format!("{iter_prefix}_next");
+    let destroy_fn = format!("{iter_prefix}_destroy");
+    let inner_swift = swift_type_for(inner);
+
+    out.push_str(&format!("{indent}let iter = {call_with_err}\n"));
+    out.push_str(&format!("{indent}try check(&err)\n"));
+    out.push_str(&format!(
+        "{indent}guard let iter = iter else {{ return [] }}\n"
+    ));
+    out.push_str(&format!("{indent}var items: [{inner_swift}] = []\n"));
+
+    match inner {
+        TypeRef::Struct(name) => {
+            let name = local_type_name(name);
+            out.push_str(&format!("{indent}while let ptr = {next_fn}(iter) {{\n"));
+            out.push_str(&format!("{indent}    items.append({name}(ptr: ptr))\n"));
+        }
+        TypeRef::TypedHandle(name) => {
+            out.push_str(&format!("{indent}while let ptr = {next_fn}(iter) {{\n"));
+            out.push_str(&format!("{indent}    items.append({name}(ptr: ptr))\n"));
+        }
+        TypeRef::StringUtf8 => {
+            out.push_str(&format!("{indent}while let ptr = {next_fn}(iter) {{\n"));
+            out.push_str(&format!("{indent}    items.append(String(cString: ptr))\n"));
+        }
+        TypeRef::Enum(name) => {
+            out.push_str(&format!("{indent}while let raw = {next_fn}(iter) {{\n"));
+            out.push_str(&format!(
+                "{indent}    items.append({name}(rawValue: raw.pointee.rawValue)!)\n"
+            ));
+        }
+        _ => {
+            out.push_str(&format!("{indent}while let val = {next_fn}(iter) {{\n"));
+            out.push_str(&format!("{indent}    items.append(val.pointee)\n"));
+        }
+    }
+
+    out.push_str(&format!("{indent}}}\n"));
+    out.push_str(&format!("{indent}{destroy_fn}(iter)\n"));
+    out.push_str(&format!("{indent}return items\n"));
 }
 
 fn map_array_source(ty: &TypeRef, name: &str, suffix: &str) -> String {
@@ -1431,6 +1561,7 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
             | Some(TypeRef::Optional(_))
             | Some(TypeRef::List(_))
             | Some(TypeRef::Map(_, _))
+            | Some(TypeRef::Iterator(_))
     );
 
     let ret_type = match &f.returns {
@@ -1608,6 +1739,10 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
         }
         Some(TypeRef::Map(k, v)) => {
             render_map_return_inner(out, &call_with_err, k, v, &inner_indent);
+        }
+        Some(TypeRef::Iterator(inner)) => {
+            let ind = format!("{}    ", inner_indent);
+            render_iterator_return(out, module_name, &f.name, inner, &call_with_err, &ind);
         }
         Some(_) => {
             out.push_str(&format!("{}    return {}\n", inner_indent, call_with_err));
@@ -3456,6 +3591,54 @@ mod tests {
         assert!(
             out.contains("weaveffi_parent_child_inner_fn"),
             "nested child C ABI call missing: {out}"
+        );
+    }
+
+    #[test]
+    fn swift_type_for_iterator() {
+        assert_eq!(
+            swift_type_for(&TypeRef::Iterator(Box::new(TypeRef::I32))),
+            "[Int32]"
+        );
+        assert_eq!(
+            swift_type_for(&TypeRef::Iterator(Box::new(TypeRef::Struct(
+                "Contact".into()
+            )))),
+            "[Contact]"
+        );
+    }
+
+    #[test]
+    fn swift_iterator_return_generates_consumption_code() {
+        let api = make_api(vec![Module {
+            name: "data".to_string(),
+            functions: vec![Function {
+                name: "list_items".to_string(),
+                params: vec![],
+                returns: Some(TypeRef::Iterator(Box::new(TypeRef::I32))),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let out = render_swift_wrapper(&api, true);
+        assert!(
+            out.contains("ListItemsIterator"),
+            "should reference iterator type: {out}"
+        );
+        assert!(
+            out.contains("_next"),
+            "should call _next to consume iterator: {out}"
+        );
+        assert!(
+            out.contains("_destroy"),
+            "should call _destroy to clean up iterator: {out}"
         );
     }
 }

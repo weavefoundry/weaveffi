@@ -74,6 +74,7 @@ fn wasm_type(ty: &TypeRef) -> &'static str {
         | TypeRef::Handle
         | TypeRef::TypedHandle(_)
         | TypeRef::Struct(_)
+        | TypeRef::Iterator(_)
         | TypeRef::Map(_, _) => "i64",
         TypeRef::F64 => "f64",
         TypeRef::StringUtf8
@@ -82,9 +83,11 @@ fn wasm_type(ty: &TypeRef) -> &'static str {
         | TypeRef::BorrowedBytes
         | TypeRef::List(_) => "i32, i32",
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::Struct(_) | TypeRef::Handle | TypeRef::TypedHandle(_) | TypeRef::Map(_, _) => {
-                "i64"
-            }
+            TypeRef::Struct(_)
+            | TypeRef::Handle
+            | TypeRef::TypedHandle(_)
+            | TypeRef::Iterator(_)
+            | TypeRef::Map(_, _) => "i64",
             _ => "i32, i32",
         },
         TypeRef::Callback(_) => todo!("callback WASM type"),
@@ -106,10 +109,13 @@ fn wasm_type_note(ty: &TypeRef) -> &'static str {
         TypeRef::Enum(_) => "variant discriminant",
         TypeRef::List(_) => "ptr + len in linear memory",
         TypeRef::Map(_, _) => "opaque handle in linear memory",
+        TypeRef::Iterator(_) => "opaque iterator handle",
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::Struct(_) | TypeRef::Handle | TypeRef::TypedHandle(_) | TypeRef::Map(_, _) => {
-                "opaque handle, 0 = absent"
-            }
+            TypeRef::Struct(_)
+            | TypeRef::Handle
+            | TypeRef::TypedHandle(_)
+            | TypeRef::Iterator(_)
+            | TypeRef::Map(_, _) => "opaque handle, 0 = absent",
             _ => "is_present flag + value",
         },
         TypeRef::Callback(_) => todo!("callback WASM type"),
@@ -130,6 +136,7 @@ fn type_display(ty: &TypeRef) -> String {
         TypeRef::Enum(n) => n.clone(),
         TypeRef::Optional(inner) => format!("{}?", type_display(inner)),
         TypeRef::List(inner) => format!("[{}]", type_display(inner)),
+        TypeRef::Iterator(inner) => format!("iter<{}>", type_display(inner)),
         TypeRef::Map(k, v) => format!("{{{}:{}}}", type_display(k), type_display(v)),
         TypeRef::Callback(_) => todo!("callback WASM type"),
     }
@@ -318,6 +325,10 @@ fn ts_type_for(ty: &TypeRef) -> String {
             } else {
                 format!("{inner_ts}[]")
             }
+        }
+        TypeRef::Iterator(inner) => {
+            let t = ts_type_for(inner);
+            format!("{t}[]")
         }
         TypeRef::Map(k, v) => format!("Record<{}, {}>", ts_type_for(k), ts_type_for(v)),
         TypeRef::Callback(_) => todo!("callback WASM type"),
@@ -522,6 +533,9 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
             for field in &s.fields {
                 let accessor = format!("weaveffi_{}_{}_get_{}", path, s.name, field.name);
                 match &field.ty {
+                    TypeRef::Iterator(_) => {
+                        unreachable!("iterator not valid as struct field")
+                    }
                     TypeRef::Bool => {
                         out.push_str(&format!("  get {}() {{\n", field.name));
                         out.push_str(&format!(
@@ -712,6 +726,7 @@ fn emit_js_function_wrapper(out: &mut String, module_name: &str, func: &Function
 
     for param in &func.params {
         match &param.ty {
+            TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
             TypeRef::StringUtf8 => {
                 out.push_str(&format!(
                     "{indent}const [{name}_ptr, {name}_len] = _encodeString(wasm, {name});\n",
@@ -801,7 +816,13 @@ fn async_cb_wasm_params(returns: Option<&TypeRef>) -> Vec<&'static str> {
         ) => {
             params.push("i32");
         }
-        Some(TypeRef::I64 | TypeRef::Handle | TypeRef::TypedHandle(_) | TypeRef::Struct(_)) => {
+        Some(
+            TypeRef::I64
+            | TypeRef::Handle
+            | TypeRef::TypedHandle(_)
+            | TypeRef::Struct(_)
+            | TypeRef::Iterator(_),
+        ) => {
             params.push("i64");
         }
         Some(TypeRef::F64) => {
@@ -817,7 +838,11 @@ fn async_cb_wasm_params(returns: Option<&TypeRef>) -> Vec<&'static str> {
             params.push("i32");
         }
         Some(TypeRef::Optional(inner)) => match inner.as_ref() {
-            TypeRef::Struct(_) | TypeRef::Handle | TypeRef::TypedHandle(_) | TypeRef::Map(_, _) => {
+            TypeRef::Struct(_)
+            | TypeRef::Handle
+            | TypeRef::TypedHandle(_)
+            | TypeRef::Iterator(_)
+            | TypeRef::Map(_, _) => {
                 params.push("i64");
             }
             _ => {
@@ -899,6 +924,7 @@ fn emit_js_async_function_wrapper(out: &mut String, module_name: &str, func: &Fu
     let mut wasm_args = Vec::new();
     for param in &func.params {
         match &param.ty {
+            TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
             TypeRef::StringUtf8 => {
                 out.push_str(&format!(
                     "{indent2}const [{name}_ptr, {name}_len] = _encodeString(wasm, {name});\n",

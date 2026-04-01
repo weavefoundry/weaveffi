@@ -105,6 +105,7 @@ pub enum TypeRef {
     Optional(Box<TypeRef>),
     List(Box<TypeRef>),
     Map(Box<TypeRef>, Box<TypeRef>),
+    Iterator(Box<TypeRef>),
     Callback(Box<CallbackSignature>),
 }
 
@@ -134,6 +135,12 @@ pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
         .and_then(|rest| rest.strip_suffix('>'))
     {
         return Ok(TypeRef::TypedHandle(inner.into()));
+    }
+    if let Some(inner) = s
+        .strip_prefix("iter<")
+        .and_then(|rest| rest.strip_suffix('>'))
+    {
+        return parse_type_ref(inner).map(|t| TypeRef::Iterator(Box::new(t)));
     }
     match s {
         "i32" => Ok(TypeRef::I32),
@@ -167,6 +174,7 @@ fn type_ref_to_string(ty: &TypeRef) -> String {
         TypeRef::Optional(inner) => format!("{}?", type_ref_to_string(inner)),
         TypeRef::List(inner) => format!("[{}]", type_ref_to_string(inner)),
         TypeRef::Map(k, v) => format!("{{{}:{}}}", type_ref_to_string(k), type_ref_to_string(v)),
+        TypeRef::Iterator(inner) => format!("iter<{}>", type_ref_to_string(inner)),
         TypeRef::Callback(_) => "callback".to_string(),
     }
 }
@@ -794,6 +802,42 @@ modules:
                 Box::new(TypeRef::List(Box::new(TypeRef::I32))),
             ))
         );
+    }
+
+    #[test]
+    fn parse_type_ref_iterator() {
+        assert_eq!(
+            parse_type_ref("iter<i32>"),
+            Ok(TypeRef::Iterator(Box::new(TypeRef::I32)))
+        );
+        assert_eq!(
+            parse_type_ref("iter<string>"),
+            Ok(TypeRef::Iterator(Box::new(TypeRef::StringUtf8)))
+        );
+        assert_eq!(
+            parse_type_ref("iter<Contact>"),
+            Ok(TypeRef::Iterator(Box::new(TypeRef::Struct(
+                "Contact".into()
+            ))))
+        );
+    }
+
+    #[test]
+    fn typeref_iterator_round_trip() {
+        let ty = TypeRef::Iterator(Box::new(TypeRef::I32));
+        let json = serde_json::to_string(&ty).unwrap();
+        assert_eq!(json, r#""iter<i32>""#);
+        let back: TypeRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ty);
+    }
+
+    #[test]
+    fn typeref_iterator_struct_round_trip() {
+        let ty = TypeRef::Iterator(Box::new(TypeRef::Struct("Contact".into())));
+        let json = serde_json::to_string(&ty).unwrap();
+        assert_eq!(json, r#""iter<Contact>""#);
+        let back: TypeRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ty);
     }
 
     #[test]

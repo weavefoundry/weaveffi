@@ -95,7 +95,25 @@ fn is_c_pointer_type(ty: &TypeRef) -> bool {
             | TypeRef::TypedHandle(_)
             | TypeRef::List(_)
             | TypeRef::Map(_, _)
+            | TypeRef::Iterator(_)
     )
+}
+
+fn snake_to_pascal(s: &str) -> String {
+    s.split('_')
+        .map(|part| {
+            let mut c = part.chars();
+            match c.next() {
+                None => String::new(),
+                Some(first) => first.to_uppercase().chain(c).collect(),
+            }
+        })
+        .collect()
+}
+
+fn iter_type_name(func_name: &str, module: &str) -> String {
+    let pascal = snake_to_pascal(func_name);
+    format!("weaveffi_{module}_{pascal}Iterator")
 }
 
 fn py_ctypes_scalar(ty: &TypeRef) -> &'static str {
@@ -111,7 +129,9 @@ fn py_ctypes_scalar(ty: &TypeRef) -> &'static str {
         TypeRef::Bytes | TypeRef::BorrowedBytes => "ctypes.c_uint8",
         TypeRef::Struct(_) => "ctypes.c_void_p",
         TypeRef::Enum(_) => "ctypes.c_int32",
-        TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) => "ctypes.c_void_p",
+        TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) | TypeRef::Iterator(_) => {
+            "ctypes.c_void_p"
+        }
         TypeRef::Callback(_) => todo!("callback Python type"),
     }
 }
@@ -129,6 +149,7 @@ fn py_type_hint(ty: &TypeRef) -> String {
         TypeRef::Optional(inner) => format!("Optional[{}]", py_type_hint(inner)),
         TypeRef::List(inner) => format!("List[{}]", py_type_hint(inner)),
         TypeRef::Map(k, v) => format!("Dict[{}, {}]", py_type_hint(k), py_type_hint(v)),
+        TypeRef::Iterator(inner) => format!("Iterator[{}]", py_type_hint(inner)),
         TypeRef::Callback(_) => todo!("callback Python type"),
     }
 }
@@ -384,6 +405,7 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
                 }
             }
         }
+        Some(TypeRef::Iterator(_)) => todo!("async iterator return"),
         Some(TypeRef::Callback(_)) => todo!("async Python callback return type"),
     }
 }
@@ -543,7 +565,7 @@ import contextlib
 import ctypes
 import platform
 from enum import IntEnum
-from typing import Dict, List, Optional
+from typing import Dict, Iterator, List, Optional
 
 
 class WeaveffiError(Exception):
@@ -713,6 +735,10 @@ fn render_function(out: &mut String, module_name: &str, f: &Function, strip_modu
         func_name.clone()
     };
 
+    if let Some(TypeRef::Iterator(inner)) = &f.returns {
+        render_iterator_class(out, module_name, &f.name, inner);
+    }
+
     out.push_str(&format!(
         "\n\ndef {}({}) -> {}:\n",
         def_name,
@@ -796,7 +822,11 @@ fn render_function(out: &mut String, module_name: &str, f: &Function, strip_modu
         out.push_str(&format!("{ind}_check_error(_err)\n"));
 
         if let Some(ret_ty) = &f.returns {
-            render_return_value(out, ret_ty, ind);
+            if let TypeRef::Iterator(inner) = ret_ty {
+                render_iterator_return(out, module_name, &f.name, inner, ind);
+            } else {
+                render_return_value(out, ret_ty, ind);
+            }
         }
     }
 
@@ -959,6 +989,7 @@ fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
             format!("_{name}_va"),
             format!("len(_{name}_keys)"),
         ],
+        TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
         TypeRef::Callback(_) => todo!("callback Python param call args"),
     }
 }
@@ -1016,6 +1047,7 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
         TypeRef::Optional(inner) => render_optional_return(out, inner, ind),
         TypeRef::List(inner) => render_list_return(out, inner, ind),
         TypeRef::Map(k, v) => render_map_return(out, k, v, ind),
+        TypeRef::Iterator(_) => unreachable!("iterator return handled in render_function"),
         TypeRef::Callback(_) => todo!("callback Python return"),
     }
 }
@@ -1079,6 +1111,109 @@ fn render_map_return(out: &mut String, k: &TypeRef, v: &TypeRef, ind: &str) {
     out.push_str(&format!(
         "{ind}return {{{key_read}: {val_read} for _i in range(_out_len.value)}}\n"
     ));
+}
+
+// ── Iterator helpers ──
+
+fn py_read_iter_item(inner: &TypeRef) -> String {
+    match inner {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "_bytes_to_string(_out_item.value)".into(),
+        TypeRef::Struct(name) => {
+            let name = local_type_name(name);
+            format!("{name}(_out_item.value)")
+        }
+        TypeRef::TypedHandle(name) => format!("{name}(_out_item.value)"),
+        TypeRef::Enum(name) => format!("{name}(_out_item.value)"),
+        TypeRef::Bool => "bool(_out_item.value)".into(),
+        _ => "_out_item.value".into(),
+    }
+}
+
+fn render_iterator_class(out: &mut String, module_name: &str, func_name: &str, inner: &TypeRef) {
+    let iter_tag = iter_type_name(func_name, module_name);
+    let pascal = snake_to_pascal(func_name);
+    let class_name = format!("_{pascal}Iterator");
+    let item_scalar = py_ctypes_scalar(inner);
+    let read_expr = py_read_iter_item(inner);
+
+    out.push_str(&format!("\n\nclass {class_name}:"));
+    out.push_str("\n    def __init__(self, ptr):");
+    out.push_str("\n        self._ptr = ptr");
+    out.push_str("\n        self._done = False");
+
+    out.push_str("\n\n    def __iter__(self):");
+    out.push_str("\n        return self");
+
+    out.push_str("\n\n    def __next__(self):");
+    out.push_str("\n        if self._done:");
+    out.push_str("\n            raise StopIteration");
+    out.push_str(&format!("\n        _next_fn = _lib.{iter_tag}_next"));
+    out.push_str(&format!(
+        "\n        _next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER({item_scalar}), ctypes.POINTER(_WeaveffiErrorStruct)]"
+    ));
+    out.push_str("\n        _next_fn.restype = ctypes.c_int32");
+    out.push_str(&format!("\n        _out_item = {item_scalar}()"));
+    out.push_str("\n        _err = _WeaveffiErrorStruct()");
+    out.push_str(
+        "\n        _has = _next_fn(self._ptr, ctypes.byref(_out_item), ctypes.byref(_err))",
+    );
+    out.push_str("\n        _check_error(_err)");
+    out.push_str("\n        if not _has:");
+    out.push_str("\n            self._done = True");
+    out.push_str("\n            self._destroy()");
+    out.push_str("\n            raise StopIteration");
+    out.push_str(&format!("\n        return {read_expr}"));
+
+    out.push_str("\n\n    def _destroy(self):");
+    out.push_str("\n        if self._ptr is not None:");
+    out.push_str(&format!(
+        "\n            _destroy_fn = _lib.{iter_tag}_destroy"
+    ));
+    out.push_str("\n            _destroy_fn.argtypes = [ctypes.c_void_p]");
+    out.push_str("\n            _destroy_fn.restype = None");
+    out.push_str("\n            _destroy_fn(self._ptr)");
+    out.push_str("\n            self._ptr = None");
+
+    out.push_str("\n\n    def __del__(self):");
+    out.push_str("\n        self._destroy()");
+    out.push_str("\n");
+}
+
+fn render_iterator_return(
+    out: &mut String,
+    module_name: &str,
+    func_name: &str,
+    inner: &TypeRef,
+    ind: &str,
+) {
+    let iter_tag = iter_type_name(func_name, module_name);
+    let item_scalar = py_ctypes_scalar(inner);
+    let read_expr = py_read_iter_item(inner);
+
+    out.push_str(&format!("{ind}_next_fn = _lib.{iter_tag}_next\n"));
+    out.push_str(&format!(
+        "{ind}_next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER({item_scalar}), ctypes.POINTER(_WeaveffiErrorStruct)]\n"
+    ));
+    out.push_str(&format!("{ind}_next_fn.restype = ctypes.c_int32\n"));
+
+    out.push_str(&format!("{ind}_destroy_fn = _lib.{iter_tag}_destroy\n"));
+    out.push_str(&format!("{ind}_destroy_fn.argtypes = [ctypes.c_void_p]\n"));
+    out.push_str(&format!("{ind}_destroy_fn.restype = None\n"));
+
+    out.push_str(&format!("{ind}_items = []\n"));
+    out.push_str(&format!("{ind}while True:\n"));
+    out.push_str(&format!("{ind}    _out_item = {item_scalar}()\n"));
+    out.push_str(&format!("{ind}    _item_err = _WeaveffiErrorStruct()\n"));
+    out.push_str(&format!(
+        "{ind}    _has = _next_fn(_result, ctypes.byref(_out_item), ctypes.byref(_item_err))\n"
+    ));
+    out.push_str(&format!("{ind}    _check_error(_item_err)\n"));
+    out.push_str(&format!("{ind}    if not _has:\n"));
+    out.push_str(&format!("{ind}        break\n"));
+    out.push_str(&format!("{ind}    _items.append({read_expr})\n"));
+
+    out.push_str(&format!("{ind}_destroy_fn(_result)\n"));
+    out.push_str(&format!("{ind}return _items\n"));
 }
 
 // ── Packaging ──
@@ -1147,8 +1282,9 @@ from weaveffi import *
 // ── Type stub (.pyi) rendering ──
 
 fn render_pyi_module(api: &Api, strip_module_prefix: bool) -> String {
-    let mut out =
-        String::from("from enum import IntEnum\nfrom typing import Dict, List, Optional\n");
+    let mut out = String::from(
+        "from enum import IntEnum\nfrom typing import Dict, Iterator, List, Optional\n",
+    );
     for (m, path) in collect_modules_with_path(&api.modules) {
         for e in &m.enums {
             render_pyi_enum(&mut out, e);
@@ -2316,7 +2452,7 @@ mod tests {
             "missing IntEnum import"
         );
         assert!(
-            pyi.contains("from typing import Dict, List, Optional"),
+            pyi.contains("from typing import Dict, Iterator, List, Optional"),
             "missing typing imports"
         );
 
@@ -2407,7 +2543,7 @@ mod tests {
 
         assert!(py.contains("import ctypes"));
         assert!(py.contains("from enum import IntEnum"));
-        assert!(py.contains("from typing import Dict, List, Optional"));
+        assert!(py.contains("from typing import Dict, Iterator, List, Optional"));
         assert!(py.contains("class WeaveffiError(Exception):"));
         assert!(py.contains("def _load_library()"));
         assert!(py.contains("_lib = _load_library()"));
@@ -2923,7 +3059,7 @@ mod tests {
         let pyi = render_pyi_module(&api, true);
 
         assert!(pyi.contains("from enum import IntEnum"));
-        assert!(pyi.contains("from typing import Dict, List, Optional"));
+        assert!(pyi.contains("from typing import Dict, Iterator, List, Optional"));
 
         assert!(pyi.contains("class ContactType(IntEnum):"));
         assert!(pyi.contains("    Personal: int"));
@@ -3880,6 +4016,54 @@ mod tests {
         assert!(
             pyi.contains("def inner_fn"),
             "nested child function missing from pyi: {pyi}"
+        );
+    }
+
+    #[test]
+    fn python_type_hint_iterator() {
+        assert_eq!(
+            py_type_hint(&TypeRef::Iterator(Box::new(TypeRef::I32))),
+            "Iterator[int]"
+        );
+        assert_eq!(
+            py_type_hint(&TypeRef::Iterator(Box::new(TypeRef::Struct(
+                "Contact".into()
+            )))),
+            "Iterator[\"Contact\"]"
+        );
+    }
+
+    #[test]
+    fn python_iterator_return() {
+        let api = make_api(vec![Module {
+            name: "data".to_string(),
+            functions: vec![Function {
+                name: "list_items".to_string(),
+                params: vec![],
+                returns: Some(TypeRef::Iterator(Box::new(TypeRef::I32))),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let py = render_python_module(&api, true);
+        assert!(
+            py.contains("ListItemsIterator"),
+            "should reference iterator type name: {py}"
+        );
+        assert!(
+            py.contains("_next"),
+            "should call _next for iteration: {py}"
+        );
+        assert!(
+            py.contains("_destroy"),
+            "should call _destroy for cleanup: {py}"
         );
     }
 }

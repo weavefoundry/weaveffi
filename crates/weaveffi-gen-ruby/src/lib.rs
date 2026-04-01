@@ -74,6 +74,7 @@ fn is_c_pointer_type(ty: &TypeRef) -> bool {
             | TypeRef::TypedHandle(_)
             | TypeRef::List(_)
             | TypeRef::Map(_, _)
+            | TypeRef::Iterator(_)
     )
 }
 
@@ -116,7 +117,7 @@ fn rb_return_out_params(ty: &TypeRef) -> Vec<&'static str> {
     match ty {
         TypeRef::Bytes | TypeRef::BorrowedBytes => vec![":pointer"],
         TypeRef::Optional(inner) if is_c_pointer_type(inner) => rb_return_out_params(inner),
-        TypeRef::List(_) => vec![":pointer"],
+        TypeRef::List(_) | TypeRef::Iterator(_) => vec![":pointer"],
         TypeRef::Map(_, _) => vec![":pointer", ":pointer", ":pointer"],
         _ => vec![],
     }
@@ -224,6 +225,7 @@ fn rb_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
             format!("{name}.length"),
         ],
         TypeRef::Callback(_) => vec![name.to_string()],
+        TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
     }
 }
 
@@ -695,7 +697,7 @@ fn render_return_code(out: &mut String, ty: &TypeRef, ind: &str, qualifier: Opti
             out.push_str(&format!("{ind}{}.new(result)\n", local_type_name(name)));
         }
         TypeRef::Optional(inner) => render_optional_return_code(out, inner, ind, qualifier),
-        TypeRef::List(inner) => {
+        TypeRef::List(inner) | TypeRef::Iterator(inner) => {
             out.push_str(&format!("{ind}return [] if result.null?\n"));
             render_list_return_body(out, inner, ind);
         }

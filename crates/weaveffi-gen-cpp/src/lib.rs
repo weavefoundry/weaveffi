@@ -185,6 +185,7 @@ fn is_c_pointer_type(ty: &TypeRef) -> bool {
             | TypeRef::Struct(_)
             | TypeRef::TypedHandle(_)
             | TypeRef::List(_)
+            | TypeRef::Iterator(_)
             | TypeRef::Map(_, _)
     )
 }
@@ -202,7 +203,9 @@ fn c_element_type(ty: &TypeRef, module: &str) -> String {
         TypeRef::Bytes | TypeRef::BorrowedBytes => "const uint8_t*".into(),
         TypeRef::Struct(s) => format!("{}*", c_abi_struct_name(s, module, "weaveffi")),
         TypeRef::Enum(e) => format!("weaveffi_{module}_{e}"),
-        TypeRef::Optional(inner) | TypeRef::List(inner) => c_element_type(inner, module),
+        TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
+            c_element_type(inner, module)
+        }
         TypeRef::Map(_, _) => "void*".into(),
         TypeRef::Callback(_) => todo!("callback C++ type"),
     }
@@ -255,6 +258,7 @@ fn c_param_type(ty: &TypeRef, name: &str, module: &str) -> String {
             format!("{kp}, {vp}, size_t {name}_len")
         }
         TypeRef::Callback(_) => todo!("callback C++ type"),
+        TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
     }
 }
 
@@ -283,7 +287,7 @@ fn c_ret_type(ty: &TypeRef, module: &str) -> (String, Vec<String>) {
                 (format!("{}*", c_element_type(inner, module)), vec![])
             }
         }
-        TypeRef::List(inner) => (
+        TypeRef::List(inner) | TypeRef::Iterator(inner) => (
             format!("{}*", c_element_type(inner, module)),
             vec!["size_t* out_len".into()],
         ),
@@ -451,7 +455,9 @@ fn cpp_type(ty: &TypeRef) -> String {
         TypeRef::Struct(n) => local_type_name(n).to_string(),
         TypeRef::Enum(n) => n.clone(),
         TypeRef::Optional(inner) => format!("std::optional<{}>", cpp_type(inner)),
-        TypeRef::List(inner) => format!("std::vector<{}>", cpp_type(inner)),
+        TypeRef::List(inner) | TypeRef::Iterator(inner) => {
+            format!("std::vector<{}>", cpp_type(inner))
+        }
         TypeRef::Map(k, v) => {
             format!("std::unordered_map<{}, {}>", cpp_type(k), cpp_type(v))
         }
@@ -619,6 +625,7 @@ fn render_cpp_getter(out: &mut String, struct_name: &str, module: &str, field: &
             render_getter_map(out, k, v, &getter, &cast, module);
         }
         TypeRef::Callback(_) => todo!("callback C++ getter"),
+        TypeRef::Iterator(_) => unreachable!("iterator not valid as struct field"),
     }
 
     out.push_str("    }\n\n");
@@ -890,6 +897,7 @@ fn param_to_c_args(ty: &TypeRef, name: &str, module: &str) -> (Vec<String>, Vec<
             )
         }
         TypeRef::Callback(_) => todo!("callback C++ param"),
+        TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
     }
 }
 
@@ -930,7 +938,7 @@ fn render_cpp_function(
 
     if let Some(ret) = &func.returns {
         match ret {
-            TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) => {
+            TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) | TypeRef::Iterator(_) => {
                 setup.push("size_t out_len = 0;".into());
                 c_args.push("&out_len".into());
             }
@@ -1043,7 +1051,7 @@ fn render_cpp_return(out: &mut String, ty: &TypeRef) {
                 }
             }
         }
-        TypeRef::List(inner) => match inner.as_ref() {
+        TypeRef::List(inner) | TypeRef::Iterator(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                 out.push_str("    std::vector<std::string> ret;\n");
                 out.push_str("    ret.reserve(out_len);\n");
@@ -1248,7 +1256,7 @@ fn render_async_set_value(out: &mut String, ty: &TypeRef) {
             }
             out.push_str("            }\n");
         }
-        TypeRef::List(inner) => match inner.as_ref() {
+        TypeRef::List(inner) | TypeRef::Iterator(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                 out.push_str("            std::vector<std::string> ret;\n");
                 out.push_str("            ret.reserve(result_len);\n");

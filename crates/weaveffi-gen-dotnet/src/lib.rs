@@ -95,6 +95,7 @@ fn cs_type(ty: &TypeRef) -> String {
             _ => format!("{}?", cs_type(inner)),
         },
         TypeRef::List(inner) => format!("{}[]", cs_type(inner)),
+        TypeRef::Iterator(inner) => format!("IEnumerable<{}>", cs_type(inner)),
         TypeRef::Map(k, v) => format!("Dictionary<{}, {}>", cs_type(k), cs_type(v)),
         TypeRef::Callback(_) => todo!("callback .NET type"),
     }
@@ -114,6 +115,7 @@ fn pinvoke_type(ty: &TypeRef) -> String {
         | TypeRef::Struct(_)
         | TypeRef::Optional(_)
         | TypeRef::List(_)
+        | TypeRef::Iterator(_)
         | TypeRef::Map(_, _) => "IntPtr".into(),
         TypeRef::Handle => "ulong".into(),
         TypeRef::TypedHandle(_) => "IntPtr".into(),
@@ -154,7 +156,9 @@ fn pinvoke_return_info(ty: &TypeRef) -> (String, Vec<String>) {
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             ("IntPtr".into(), vec!["out UIntPtr out_len".into()])
         }
-        TypeRef::List(_) => ("IntPtr".into(), vec!["out UIntPtr out_len".into()]),
+        TypeRef::List(_) | TypeRef::Iterator(_) => {
+            ("IntPtr".into(), vec!["out UIntPtr out_len".into()])
+        }
         TypeRef::Map(_, _) => (
             "void".into(),
             vec![
@@ -532,6 +536,7 @@ fn render_struct_getter(out: &mut String, prefix: &str, field: &StructField) {
             out.push_str("                return dict;\n");
         }
         TypeRef::Callback(_) => todo!("callback struct getter"),
+        TypeRef::Iterator(_) => unreachable!("iterator not valid as struct field"),
     }
 
     out.push_str("            }\n        }\n\n");
@@ -688,7 +693,7 @@ fn render_function_pinvoke(out: &mut String, module_name: &str, f: &Function) {
 fn async_cb_delegate_result_params(ret: &Option<TypeRef>) -> String {
     match ret {
         None => String::new(),
-        Some(TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_)) => {
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) | TypeRef::Iterator(_)) => {
             ", IntPtr result, UIntPtr resultLen".into()
         }
         Some(TypeRef::Map(_, _)) => {
@@ -701,7 +706,7 @@ fn async_cb_delegate_result_params(ret: &Option<TypeRef>) -> String {
 fn async_cb_lambda_params(ret: &Option<TypeRef>) -> &'static str {
     match ret {
         None => "(context, err)",
-        Some(TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_)) => {
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) | TypeRef::Iterator(_)) => {
             "(context, err, result, resultLen)"
         }
         Some(TypeRef::Map(_, _)) => "(context, err, resultKeys, resultValues, resultLen)",
@@ -1094,7 +1099,7 @@ fn render_pinvoke_call_and_return(out: &mut String, module_path: &str, f: &Funct
     let has_out_len = f.returns.as_ref().is_some_and(|r| {
         matches!(
             r,
-            TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_)
+            TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) | TypeRef::Iterator(_)
         ) || matches!(
             r,
             TypeRef::Optional(inner)
@@ -1210,7 +1215,7 @@ fn render_return_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
         TypeRef::Optional(inner) => {
             render_optional_return_conversion(out, inner, indent);
         }
-        TypeRef::List(inner) => {
+        TypeRef::List(inner) | TypeRef::Iterator(inner) => {
             render_list_return(out, inner, indent);
         }
         TypeRef::Map(_, _) => {}
