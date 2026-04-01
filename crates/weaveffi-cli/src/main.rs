@@ -174,54 +174,105 @@ fn cmd_new(name: &str, quiet: bool) -> Result<()> {
         .wrap_err_with(|| format!("failed to create project directory: {}", name))?;
 
     let module_name = sanitize_module_name(name);
+
     let idl_path = project_dir.join("weaveffi.yml");
     let idl_contents = format!(
         concat!(
             "version: \"0.1.0\"\n",
             "modules:\n",
             "  - name: {module}\n",
+            "    structs:\n",
+            "      - name: Item\n",
+            "        fields:\n",
+            "          - {{ name: id, type: i64 }}\n",
+            "          - {{ name: name, type: string }}\n",
+            "          - {{ name: description, type: \"string?\" }}\n",
             "    functions:\n",
-            "      - name: add\n",
+            "      - name: create_item\n",
             "        params:\n",
-            "          - {{ name: a, type: i32 }}\n",
-            "          - {{ name: b, type: i32 }}\n",
-            "        return: i32\n",
-            "      - name: mul\n",
+            "          - {{ name: name, type: string }}\n",
+            "          - {{ name: description, type: \"string?\" }}\n",
+            "        return: handle\n",
+            "      - name: get_item\n",
             "        params:\n",
-            "          - {{ name: a, type: i32 }}\n",
-            "          - {{ name: b, type: i32 }}\n",
-            "        return: i32\n",
-            "      - name: echo\n",
+            "          - {{ name: id, type: handle }}\n",
+            "        return: Item\n",
+            "      - name: list_items\n",
+            "        params: []\n",
+            "        return: \"[Item]\"\n",
+            "      - name: delete_item\n",
             "        params:\n",
-            "          - {{ name: s, type: string }}\n",
-            "        return: string\n"
+            "          - {{ name: id, type: handle }}\n",
+            "        return: bool\n",
         ),
         module = module_name
     );
-    std::fs::write(idl_path.as_std_path(), idl_contents)
+    std::fs::write(idl_path.as_std_path(), &idl_contents)
         .wrap_err_with(|| format!("failed to write {}", idl_path))?;
+
+    let mut api = parse_api_str(&idl_contents, "yaml").wrap_err("failed to parse generated IDL")?;
+    validate_api(&mut api).wrap_err("generated IDL failed validation")?;
+
+    let cargo_toml_path = project_dir.join("Cargo.toml");
+    let cargo_toml = format!(
+        concat!(
+            "[package]\n",
+            "name = \"{name}\"\n",
+            "version = \"0.1.0\"\n",
+            "edition = \"2021\"\n",
+            "publish = false\n",
+            "\n",
+            "[lib]\n",
+            "crate-type = [\"cdylib\"]\n",
+            "\n",
+            "[dependencies]\n",
+            "weaveffi-abi = \"0.2\"\n",
+            "\n",
+            "[lints.rust]\n",
+            "unsafe_code = \"allow\"\n",
+        ),
+        name = name,
+    );
+    std::fs::write(cargo_toml_path.as_std_path(), &cargo_toml)
+        .wrap_err_with(|| format!("failed to write {}", cargo_toml_path))?;
+
+    let src_dir = project_dir.join("src");
+    std::fs::create_dir_all(src_dir.as_std_path())
+        .wrap_err_with(|| format!("failed to create {}", src_dir))?;
+    let lib_rs_path = src_dir.join("lib.rs");
+    let lib_contents = scaffold::render_scaffold(&api);
+    std::fs::write(lib_rs_path.as_std_path(), &lib_contents)
+        .wrap_err_with(|| format!("failed to write {}", lib_rs_path))?;
 
     let readme_path = project_dir.join("README.md");
     let readme = format!(
         concat!(
             "# {name}\n\n",
-            "This project was bootstrapped with WeaveFFI.\n\n",
-            "- Edit `weaveffi.yml` to define your API.\n",
-            "- Generate outputs: `weaveffi generate weaveffi.yml -o ../generated` (or choose any out dir).\n",
-            "- See docs for memory/error model and platform specifics.\n"
+            "A WeaveFFI project.\n\n",
+            "## Getting Started\n\n",
+            "1. Implement the `todo!()` stubs in `src/lib.rs`.\n",
+            "2. Build the shared library:\n\n",
+            "   ```sh\n",
+            "   cargo build\n",
+            "   ```\n\n",
+            "3. Generate foreign-language bindings:\n\n",
+            "   ```sh\n",
+            "   weaveffi generate weaveffi.yml -o generated\n",
+            "   ```\n\n",
+            "4. Use the generated bindings from Swift, Kotlin, Node.js, Python, .NET, or WASM.\n",
         ),
-        name = name
+        name = name,
     );
-    std::fs::write(readme_path.as_std_path(), readme)
+    std::fs::write(readme_path.as_std_path(), &readme)
         .wrap_err_with(|| format!("failed to write {}", readme_path))?;
 
     if !quiet {
         println!("Initialized WeaveFFI project at {}", project_dir);
-        println!("- IDL: {}", idl_path);
-        println!(
-            "Next: run `weaveffi generate {}/weaveffi.yml -o generated`",
-            name
-        );
+        println!("Next steps:");
+        println!("  cd {name}");
+        println!("  # Implement the todo!() stubs in src/lib.rs");
+        println!("  cargo build");
+        println!("  weaveffi generate weaveffi.yml -o generated");
     }
     Ok(())
 }
@@ -1185,6 +1236,54 @@ mod tests {
         assert!(
             stdout.contains("compdef"),
             "zsh completions should contain 'compdef': {stdout}"
+        );
+    }
+
+    #[test]
+    fn new_creates_cargo_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .current_dir(dir.path())
+            .args(["new", "test_proj"])
+            .output()
+            .expect("failed to run weaveffi new");
+
+        assert!(
+            cmd.status.success(),
+            "weaveffi new failed: {}",
+            String::from_utf8_lossy(&cmd.stderr)
+        );
+        let cargo_toml = dir.path().join("test_proj/Cargo.toml");
+        assert!(cargo_toml.exists(), "Cargo.toml should exist");
+        let contents = std::fs::read_to_string(&cargo_toml).unwrap();
+        assert!(
+            contents.contains("cdylib"),
+            "Cargo.toml should contain cdylib: {contents}"
+        );
+    }
+
+    #[test]
+    fn new_creates_lib_rs() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .current_dir(dir.path())
+            .args(["new", "test_proj"])
+            .output()
+            .expect("failed to run weaveffi new");
+
+        assert!(
+            cmd.status.success(),
+            "weaveffi new failed: {}",
+            String::from_utf8_lossy(&cmd.stderr)
+        );
+        let lib_rs = dir.path().join("test_proj/src/lib.rs");
+        assert!(lib_rs.exists(), "src/lib.rs should exist");
+        let contents = std::fs::read_to_string(&lib_rs).unwrap();
+        assert!(
+            contents.contains("todo!()"),
+            "lib.rs should contain todo!() stubs: {contents}"
         );
     }
 
