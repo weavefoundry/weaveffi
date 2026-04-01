@@ -1954,4 +1954,405 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn generate_cpp_basic() {
+        let h = render_cpp_header(&minimal_api(), "weaveffi");
+        assert!(
+            h.contains(
+                "int32_t weaveffi_calculator_add(int32_t a, int32_t b, weaveffi_error* out_err);"
+            ),
+            "extern C should declare add: {h}"
+        );
+        assert!(
+            h.contains("inline int32_t calculator_add(int32_t a, int32_t b) {"),
+            "namespace should have wrapper: {h}"
+        );
+        assert!(
+            h.contains("auto result = weaveffi_calculator_add(a, b, &err);"),
+            "wrapper should call C function: {h}"
+        );
+        assert!(
+            h.contains("weaveffi_error err{};"),
+            "wrapper should declare error struct: {h}"
+        );
+        assert!(
+            h.contains("if (err.code != 0)"),
+            "wrapper should check error code: {h}"
+        );
+        assert!(
+            h.contains("return result;"),
+            "wrapper should return result: {h}"
+        );
+    }
+
+    #[test]
+    fn generate_cpp_with_structs() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "db".into(),
+                functions: vec![],
+                structs: vec![StructDef {
+                    name: "User".into(),
+                    doc: None,
+                    fields: vec![
+                        StructField {
+                            name: "name".into(),
+                            ty: TypeRef::StringUtf8,
+                            doc: None,
+                        },
+                        StructField {
+                            name: "age".into(),
+                            ty: TypeRef::I32,
+                            doc: None,
+                        },
+                    ],
+                }],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        let h = render_cpp_header(&api, "weaveffi");
+
+        assert!(h.contains("class User {"), "missing RAII class");
+        assert!(h.contains("~User()"), "missing destructor");
+        assert!(
+            h.contains("weaveffi_db_User_destroy(static_cast<weaveffi_db_User*>(handle_))"),
+            "destructor should call C destroy"
+        );
+        assert!(
+            h.contains("User(const User&) = delete;"),
+            "copy constructor should be deleted"
+        );
+        assert!(
+            h.contains("User& operator=(const User&) = delete;"),
+            "copy assignment should be deleted"
+        );
+        assert!(
+            h.contains("User(User&& other) noexcept"),
+            "missing move constructor"
+        );
+        assert!(
+            h.contains("User& operator=(User&& other) noexcept"),
+            "missing move assignment"
+        );
+        assert!(
+            h.contains("other.handle_ = nullptr;"),
+            "move should null out source handle"
+        );
+        assert!(
+            h.contains("std::string name() const {"),
+            "missing string property getter"
+        );
+        assert!(
+            h.contains("int32_t age() const {"),
+            "missing i32 property getter"
+        );
+    }
+
+    #[test]
+    fn generate_cpp_with_enums() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "status".into(),
+                functions: vec![],
+                structs: vec![],
+                enums: vec![EnumDef {
+                    name: "Priority".into(),
+                    doc: None,
+                    variants: vec![
+                        EnumVariant {
+                            name: "Low".into(),
+                            value: 0,
+                            doc: None,
+                        },
+                        EnumVariant {
+                            name: "Medium".into(),
+                            value: 1,
+                            doc: None,
+                        },
+                        EnumVariant {
+                            name: "High".into(),
+                            value: 2,
+                            doc: None,
+                        },
+                    ],
+                }],
+                errors: None,
+            }],
+        };
+        let h = render_cpp_header(&api, "weaveffi");
+
+        assert!(
+            h.contains("enum class Priority : int32_t {"),
+            "missing enum class declaration"
+        );
+        assert!(h.contains("Low = 0,"), "missing Low variant");
+        assert!(h.contains("Medium = 1,"), "missing Medium variant");
+        assert!(h.contains("High = 2"), "missing High variant");
+
+        assert!(
+            h.contains("weaveffi_status_Priority_Low = 0"),
+            "extern C should have C enum variant"
+        );
+        assert!(
+            h.contains("} weaveffi_status_Priority;"),
+            "extern C should have C typedef"
+        );
+    }
+
+    #[test]
+    fn generate_cpp_with_optionals() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "store".into(),
+                functions: vec![Function {
+                    name: "lookup".into(),
+                    params: vec![Param {
+                        name: "key".into(),
+                        ty: TypeRef::StringUtf8,
+                    }],
+                    returns: Some(TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![StructDef {
+                    name: "Config".into(),
+                    doc: None,
+                    fields: vec![StructField {
+                        name: "label".into(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                        doc: None,
+                    }],
+                }],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        let h = render_cpp_header(&api, "weaveffi");
+
+        assert!(
+            h.contains("inline std::optional<std::string> store_lookup(const std::string& key)"),
+            "function should return std::optional: {h}"
+        );
+        assert!(
+            h.contains("if (!result) return std::nullopt;"),
+            "should check null for optional return: {h}"
+        );
+        assert!(
+            h.contains("std::optional<std::string> label() const {"),
+            "getter should return std::optional: {h}"
+        );
+    }
+
+    #[test]
+    fn generate_cpp_with_lists() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "data".into(),
+                functions: vec![Function {
+                    name: "get_names".into(),
+                    params: vec![Param {
+                        name: "ids".into(),
+                        ty: TypeRef::List(Box::new(TypeRef::I32)),
+                    }],
+                    returns: Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![StructDef {
+                    name: "Record".into(),
+                    doc: None,
+                    fields: vec![StructField {
+                        name: "values".into(),
+                        ty: TypeRef::List(Box::new(TypeRef::F64)),
+                        doc: None,
+                    }],
+                }],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        let h = render_cpp_header(&api, "weaveffi");
+
+        assert!(
+            h.contains(
+                "inline std::vector<std::string> data_get_names(const std::vector<int32_t>& ids)"
+            ),
+            "function should use std::vector param and return: {h}"
+        );
+        assert!(
+            h.contains("ids.data()"),
+            "list param should pass .data(): {h}"
+        );
+        assert!(
+            h.contains("ids.size()"),
+            "list param should pass .size(): {h}"
+        );
+        assert!(
+            h.contains("std::vector<double> values() const {"),
+            "getter should return std::vector: {h}"
+        );
+    }
+
+    #[test]
+    fn generate_cpp_with_maps() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "kv".into(),
+                functions: vec![Function {
+                    name: "get_all".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::Map(
+                        Box::new(TypeRef::StringUtf8),
+                        Box::new(TypeRef::I32),
+                    )),
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![StructDef {
+                    name: "Settings".into(),
+                    doc: None,
+                    fields: vec![StructField {
+                        name: "props".into(),
+                        ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
+                        doc: None,
+                    }],
+                }],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        let h = render_cpp_header(&api, "weaveffi");
+
+        assert!(
+            h.contains("inline std::unordered_map<std::string, int32_t> kv_get_all()"),
+            "function should return std::unordered_map: {h}"
+        );
+        assert!(
+            h.contains("std::unordered_map<std::string, int32_t> ret;"),
+            "should build unordered_map: {h}"
+        );
+        assert!(
+            h.contains("std::unordered_map<std::string, int32_t> props() const {"),
+            "getter should return std::unordered_map: {h}"
+        );
+    }
+
+    #[test]
+    fn generate_cpp_with_typed_handle() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "session".into(),
+                functions: vec![Function {
+                    name: "execute".into(),
+                    params: vec![Param {
+                        name: "sess".into(),
+                        ty: TypeRef::TypedHandle("Session".into()),
+                    }],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![StructDef {
+                    name: "Session".into(),
+                    doc: None,
+                    fields: vec![],
+                }],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        let h = render_cpp_header(&api, "weaveffi");
+
+        assert!(
+            h.contains("inline int32_t session_execute(Session& sess)"),
+            "typed handle param should use class reference: {h}"
+        );
+        assert!(
+            h.contains("static_cast<weaveffi_session_Session*>(sess.handle())"),
+            "should extract and cast handle: {h}"
+        );
+        assert!(
+            h.contains("weaveffi_session_Session* sess"),
+            "extern C should declare typed handle pointer param: {h}"
+        );
+    }
+
+    #[test]
+    fn generate_cpp_full_contacts() {
+        let h = render_cpp_header(&contacts_api(), "weaveffi");
+
+        assert!(h.contains("#pragma once"), "missing pragma once");
+        assert!(h.contains("extern \"C\" {"), "missing extern C block");
+        assert!(h.contains("namespace weaveffi {"), "missing namespace");
+
+        assert!(
+            h.contains("typedef struct weaveffi_contacts_Contact weaveffi_contacts_Contact;"),
+            "missing opaque struct typedef"
+        );
+        assert!(
+            h.contains("weaveffi_contacts_Contact* weaveffi_contacts_Contact_create("),
+            "missing struct create"
+        );
+        assert!(
+            h.contains("void weaveffi_contacts_Contact_destroy(weaveffi_contacts_Contact* ptr);"),
+            "missing struct destroy"
+        );
+
+        assert!(
+            h.contains("weaveffi_contacts_ContactType_Personal = 0"),
+            "missing C enum variant Personal"
+        );
+        assert!(
+            h.contains("weaveffi_contacts_ContactType_Work = 1"),
+            "missing C enum variant Work"
+        );
+
+        assert!(
+            h.contains("enum class ContactType : int32_t {"),
+            "missing C++ enum class"
+        );
+        assert!(h.contains("class Contact {"), "missing RAII class");
+        assert!(h.contains("~Contact()"), "missing destructor");
+        assert!(
+            h.contains("Contact(Contact&& other) noexcept"),
+            "missing move constructor"
+        );
+
+        assert!(
+            h.contains("std::string name() const {"),
+            "missing name getter"
+        );
+        assert!(h.contains("int32_t age() const {"), "missing age getter");
+        assert!(
+            h.contains("std::optional<std::string> email() const {"),
+            "missing optional email getter"
+        );
+        assert!(
+            h.contains("ContactType contact_type() const {"),
+            "missing enum getter"
+        );
+
+        assert!(
+            h.contains("inline Contact contacts_get_contact(void* id)"),
+            "missing get_contact wrapper"
+        );
+        assert!(
+            h.contains("inline void contacts_delete_contact(void* id)"),
+            "missing delete_contact wrapper"
+        );
+
+        assert!(h.contains("} // extern \"C\""), "missing extern C close");
+        assert!(
+            h.contains("} // namespace weaveffi"),
+            "missing namespace close"
+        );
+    }
 }
