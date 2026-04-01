@@ -1942,6 +1942,7 @@ dependencies = [
  "weaveffi-gen-cpp",
  "weaveffi-gen-dart",
  "weaveffi-gen-dotnet",
+ "weaveffi-gen-go",
  "weaveffi-gen-node",
  "weaveffi-gen-python",
  "weaveffi-gen-swift",
@@ -2009,6 +2010,17 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-dotnet"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "camino",
+ "heck",
+ "weaveffi-core",
+ "weaveffi-ir",
+]
+
+[[package]]
+name = "weaveffi-gen-go"
 version = "0.2.0"
 dependencies = [
  "anyhow",
