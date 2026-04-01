@@ -18,6 +18,7 @@ use weaveffi_core::validate::{collect_warnings, validate_api, ValidationError};
 use weaveffi_gen_android::AndroidGenerator;
 use weaveffi_gen_c::CGenerator;
 use weaveffi_gen_cpp::CppGenerator;
+use weaveffi_gen_dart::DartGenerator;
 use weaveffi_gen_dotnet::DotnetGenerator;
 use weaveffi_gen_node::NodeGenerator;
 use weaveffi_gen_python::PythonGenerator;
@@ -48,7 +49,7 @@ enum Commands {
         /// Output directory for generated artifacts
         #[arg(short, long, default_value = "./generated")]
         out: String,
-        /// Comma-separated list of targets to generate (c, cpp, swift, android, node, wasm, python, dotnet)
+        /// Comma-separated list of targets to generate (c, cpp, swift, android, node, wasm, python, dotnet, dart)
         #[arg(short, long)]
         target: Option<String>,
         /// Also generate a scaffold.rs with Rust FFI function stubs
@@ -389,7 +390,10 @@ fn cmd_generate(
     let wasm = WasmGenerator;
     let python = PythonGenerator;
     let dotnet = DotnetGenerator;
-    let all: Vec<&dyn Generator> = vec![&c, &cpp, &swift, &android, &node, &wasm, &python, &dotnet];
+    let dart = DartGenerator;
+    let all: Vec<&dyn Generator> = vec![
+        &c, &cpp, &swift, &android, &node, &wasm, &python, &dotnet, &dart,
+    ];
 
     let filter: Option<Vec<&str>> = targets.map(|t| t.split(',').map(str::trim).collect());
 
@@ -557,7 +561,10 @@ fn cmd_diff(input: &str, out: Option<&str>, quiet: bool) -> Result<()> {
     let wasm = WasmGenerator;
     let python = PythonGenerator;
     let dotnet = DotnetGenerator;
-    let all: Vec<&dyn Generator> = vec![&c, &cpp, &swift, &android, &node, &wasm, &python, &dotnet];
+    let dart = DartGenerator;
+    let all: Vec<&dyn Generator> = vec![
+        &c, &cpp, &swift, &android, &node, &wasm, &python, &dotnet, &dart,
+    ];
 
     let config = GeneratorConfig::default();
     let mut orchestrator = Orchestrator::new();
@@ -1290,8 +1297,10 @@ mod tests {
         let wasm = WasmGenerator;
         let python = PythonGenerator;
         let dotnet = DotnetGenerator;
-        let all: Vec<&dyn Generator> =
-            vec![&c, &cpp, &swift, &android, &node, &wasm, &python, &dotnet];
+        let dart = DartGenerator;
+        let all: Vec<&dyn Generator> = vec![
+            &c, &cpp, &swift, &android, &node, &wasm, &python, &dotnet, &dart,
+        ];
 
         let mut files: Vec<String> = Vec::new();
         for gen in &all {

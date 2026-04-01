@@ -11,6 +11,7 @@ members = [
     "crates/weaveffi-gen-python",
     "crates/weaveffi-gen-dotnet",
     "crates/weaveffi-gen-cpp",
+    "crates/weaveffi-gen-dart",
     "crates/weaveffi-cli",
     "samples/calculator",
     "samples/node-addon",
