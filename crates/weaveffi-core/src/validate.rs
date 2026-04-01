@@ -388,7 +388,7 @@ fn validate_param(p: &Param) -> Result<(), ValidationError> {
 
 fn validate_type_ref(ty: &TypeRef, known: &BTreeSet<&str>) -> Result<(), ValidationError> {
     match ty {
-        TypeRef::Struct(name) | TypeRef::Enum(name) => {
+        TypeRef::Struct(name) | TypeRef::Enum(name) | TypeRef::TypedHandle(name) => {
             if !known.contains(name.as_str()) {
                 return Err(ValidationError::UnknownTypeRef { name: name.clone() });
             }
@@ -1825,5 +1825,56 @@ mod tests {
             api.modules[0].structs[0].fields[0].ty,
             TypeRef::Enum("Color".to_string())
         );
+    }
+
+    #[test]
+    fn typed_handle_valid_struct_passes() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "get_session".to_string(),
+                    params: vec![Param {
+                        name: "h".to_string(),
+                        ty: TypeRef::TypedHandle("Session".to_string()),
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![simple_struct("Session")],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        assert!(validate_api(&mut api).is_ok());
+    }
+
+    #[test]
+    fn typed_handle_unknown_struct_rejected() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "get_session".to_string(),
+                    params: vec![Param {
+                        name: "h".to_string(),
+                        ty: TypeRef::TypedHandle("Nonexistent".to_string()),
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        assert!(matches!(
+            validate_api(&mut api).unwrap_err(),
+            ValidationError::UnknownTypeRef { name } if name == "Nonexistent"
+        ));
     }
 }

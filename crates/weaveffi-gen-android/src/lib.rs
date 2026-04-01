@@ -124,7 +124,7 @@ fn kotlin_type(t: &TypeRef) -> String {
         TypeRef::Bool => "Boolean".to_string(),
         TypeRef::StringUtf8 => "String".to_string(),
         TypeRef::Bytes => "ByteArray".to_string(),
-        TypeRef::Handle => "Long".to_string(),
+        TypeRef::TypedHandle(_) | TypeRef::Handle => "Long".to_string(),
         TypeRef::Struct(_) => "Long".to_string(),
         TypeRef::Enum(_) => "Int".to_string(),
         TypeRef::Optional(inner) => format!("{}?", kotlin_type(inner)),
@@ -136,9 +136,11 @@ fn kotlin_type(t: &TypeRef) -> String {
 fn kotlin_list_type(inner: &TypeRef) -> String {
     match inner {
         TypeRef::I32 | TypeRef::Enum(_) => "IntArray".to_string(),
-        TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::Struct(_) => {
-            "LongArray".to_string()
-        }
+        TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Handle
+        | TypeRef::Struct(_) => "LongArray".to_string(),
         TypeRef::F64 => "DoubleArray".to_string(),
         TypeRef::Bool => "BooleanArray".to_string(),
         TypeRef::StringUtf8 => "Array<String>".to_string(),
@@ -150,7 +152,11 @@ fn kotlin_list_type(inner: &TypeRef) -> String {
 fn jni_param_type(t: &TypeRef) -> String {
     match t {
         TypeRef::I32 | TypeRef::Enum(_) => "jint".to_string(),
-        TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::Struct(_) => "jlong".to_string(),
+        TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Handle
+        | TypeRef::Struct(_) => "jlong".to_string(),
         TypeRef::F64 => "jdouble".to_string(),
         TypeRef::Bool => "jboolean".to_string(),
         TypeRef::StringUtf8 => "jstring".to_string(),
@@ -168,9 +174,11 @@ fn jni_param_type(t: &TypeRef) -> String {
 fn jni_array_type(inner: &TypeRef) -> String {
     match inner {
         TypeRef::I32 | TypeRef::Enum(_) => "jintArray".to_string(),
-        TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::Struct(_) => {
-            "jlongArray".to_string()
-        }
+        TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Handle
+        | TypeRef::Struct(_) => "jlongArray".to_string(),
         TypeRef::F64 => "jdoubleArray".to_string(),
         TypeRef::Bool => "jbooleanArray".to_string(),
         _ => "jobjectArray".to_string(),
@@ -191,7 +199,7 @@ fn c_type_for_return(t: &TypeRef) -> &'static str {
         TypeRef::I64 => "int64_t",
         TypeRef::F64 => "double",
         TypeRef::Bool => "bool",
-        TypeRef::Handle => "weaveffi_handle_t",
+        TypeRef::TypedHandle(_) | TypeRef::Handle => "weaveffi_handle_t",
         TypeRef::StringUtf8 => "const char*",
         TypeRef::Bytes => "const uint8_t*",
         TypeRef::Struct(_) | TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
@@ -204,7 +212,9 @@ fn jni_default_return(t: Option<&TypeRef>) -> &'static str {
     match t {
         None => "",
         Some(TypeRef::I32 | TypeRef::Enum(_)) => "return 0;",
-        Some(TypeRef::U32 | TypeRef::I64 | TypeRef::Handle) => "return 0;",
+        Some(TypeRef::U32 | TypeRef::I64 | TypeRef::TypedHandle(_) | TypeRef::Handle) => {
+            "return 0;"
+        }
         Some(TypeRef::F64) => "return 0.0;",
         Some(TypeRef::Bool) => "return JNI_FALSE;",
         Some(TypeRef::StringUtf8) => "return NULL;",
@@ -217,7 +227,7 @@ fn jni_default_return(t: Option<&TypeRef>) -> &'static str {
 fn jni_cast_for(t: &TypeRef) -> &'static str {
     match t {
         TypeRef::I32 | TypeRef::Enum(_) => "(jint)",
-        TypeRef::U32 | TypeRef::I64 | TypeRef::Handle => "(jlong)",
+        TypeRef::U32 | TypeRef::I64 | TypeRef::TypedHandle(_) | TypeRef::Handle => "(jlong)",
         TypeRef::F64 => "(jdouble)",
         TypeRef::Struct(_) => "(jlong)(intptr_t)",
         _ => "",
@@ -590,7 +600,11 @@ fn write_optional_acquire(out: &mut String, name: &str, inner: &TypeRef) {
             let _ = writeln!(out, "        {n}_ptr = &{n}_val;", n = name);
             let _ = writeln!(out, "    }}");
         }
-        TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::Struct(_) => {
+        TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Handle
+        | TypeRef::Struct(_) => {
             let _ = writeln!(out, "    int64_t {n}_val = 0;", n = name);
             let _ = writeln!(out, "    const int64_t* {n}_ptr = NULL;", n = name);
             let _ = writeln!(out, "    if ({n} != NULL) {{", n = name);
@@ -674,7 +688,11 @@ fn write_list_acquire(out: &mut String, name: &str, inner: &TypeRef) {
                 n = name
             );
         }
-        TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::Struct(_) => {
+        TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Handle
+        | TypeRef::Struct(_) => {
             let _ = writeln!(
                 out,
                 "    jlong* {n}_elems = (*env)->GetLongArrayElements(env, {n}, NULL);",
@@ -724,7 +742,7 @@ fn map_elem_c_type(ty: &TypeRef) -> &'static str {
     match ty {
         TypeRef::I32 | TypeRef::Enum(_) => "int32_t",
         TypeRef::U32 => "uint32_t",
-        TypeRef::I64 | TypeRef::Handle => "int64_t",
+        TypeRef::I64 | TypeRef::TypedHandle(_) | TypeRef::Handle => "int64_t",
         TypeRef::F64 => "double",
         TypeRef::Bool => "jboolean",
         TypeRef::StringUtf8 => "const char*",
@@ -736,7 +754,7 @@ fn map_elem_c_call_cast(ty: &TypeRef) -> &'static str {
     match ty {
         TypeRef::I32 | TypeRef::Enum(_) => "(const int32_t*)",
         TypeRef::U32 => "(const uint32_t*)",
-        TypeRef::I64 | TypeRef::Handle => "(const int64_t*)",
+        TypeRef::I64 | TypeRef::TypedHandle(_) | TypeRef::Handle => "(const int64_t*)",
         TypeRef::F64 => "(const double*)",
         TypeRef::Bool => "(const bool*)",
         TypeRef::StringUtf8 => "(const char* const*)",
@@ -841,7 +859,7 @@ fn write_map_unbox_setup(out: &mut String, name: &str, suffix: &str, ty: &TypeRe
                 s = suffix
             );
         }
-        TypeRef::U32 | TypeRef::I64 | TypeRef::Handle => {
+        TypeRef::U32 | TypeRef::I64 | TypeRef::TypedHandle(_) | TypeRef::Handle => {
             let _ = writeln!(
                 out,
                 "    jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Long\");",
@@ -932,7 +950,7 @@ fn write_map_elem_extract(
                 s = suffix
             );
         }
-        TypeRef::I64 | TypeRef::Handle => {
+        TypeRef::I64 | TypeRef::TypedHandle(_) | TypeRef::Handle => {
             let _ = writeln!(
                 out,
                 "        {n}_{a}[{n}_i] = (int64_t)(*env)->CallLongMethod(env, {obj}, {n}_{s}m);",
@@ -981,7 +999,9 @@ fn build_c_call_args(args: &mut Vec<String>, name: &str, ty: &TypeRef, module: &
         TypeRef::U32 => args.push(format!("(uint32_t){}", name)),
         TypeRef::I64 => args.push(format!("(int64_t){}", name)),
         TypeRef::F64 => args.push(format!("(double){}", name)),
-        TypeRef::Handle => args.push(format!("(weaveffi_handle_t){}", name)),
+        TypeRef::TypedHandle(_) | TypeRef::Handle => {
+            args.push(format!("(weaveffi_handle_t){}", name))
+        }
         TypeRef::Struct(sname) => {
             args.push(format!(
                 "(const weaveffi_{}_{}*)(intptr_t){}",
@@ -1017,7 +1037,7 @@ fn build_c_call_args(args: &mut Vec<String>, name: &str, ty: &TypeRef, module: &
                 TypeRef::Bool => {
                     args.push(format!("(const bool*){n}_elems", n = name));
                 }
-                TypeRef::Handle => {
+                TypeRef::TypedHandle(_) | TypeRef::Handle => {
                     args.push(format!("(const weaveffi_handle_t*){n}_elems", n = name));
                 }
                 _ => {
@@ -1147,7 +1167,11 @@ fn write_optional_return(
                 "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jint)*rv);"
             );
         }
-        TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::Struct(_) => {
+        TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Handle
+        | TypeRef::Struct(_) => {
             let _ = writeln!(
                 out,
                 "    const int64_t* rv = (const int64_t*){}({}, &err);",
@@ -1238,7 +1262,11 @@ fn write_list_return(
             let _ = writeln!(out, "    if (result && rv) {{ (*env)->SetIntArrayRegion(env, result, 0, (jsize)out_len, (const jint*)rv); }}");
             let _ = writeln!(out, "    return result;");
         }
-        TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::Struct(_) => {
+        TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Handle
+        | TypeRef::Struct(_) => {
             let _ = writeln!(
                 out,
                 "    const int64_t* rv = (const int64_t*){}({}, &out_len, &err);",
@@ -1365,7 +1393,7 @@ fn write_map_box_elem(out: &mut String, ty: &TypeRef, var: &str, arr: &str) {
                 a = arr
             );
         }
-        TypeRef::U32 | TypeRef::I64 | TypeRef::Handle => {
+        TypeRef::U32 | TypeRef::I64 | TypeRef::TypedHandle(_) | TypeRef::Handle => {
             let _ = writeln!(
                 out,
                 "        jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Long\");",
@@ -1464,7 +1492,11 @@ fn release_jni_resources(out: &mut String, params: &[weaveffi_ir::ir::Param]) {
                         n = p.name
                     );
                 }
-                TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::Struct(_) => {
+                TypeRef::U32
+                | TypeRef::I64
+                | TypeRef::TypedHandle(_)
+                | TypeRef::Handle
+                | TypeRef::Struct(_) => {
                     let _ = writeln!(
                         out,
                         "    (*env)->ReleaseLongArrayElements(env, {n}, {n}_elems, 0);",
@@ -1810,7 +1842,7 @@ fn write_struct_optional_getter(out: &mut String, inner: &TypeRef, getter_c: &st
                 "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jint)*rv);"
             );
         }
-        TypeRef::Struct(_) | TypeRef::Handle => {
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Handle => {
             let _ = writeln!(
                 out,
                 "    const void* rv = {}((const {}*)(intptr_t)handle);",
@@ -1847,7 +1879,11 @@ fn write_struct_list_getter(out: &mut String, inner: &TypeRef, getter_c: &str, p
             let _ = writeln!(out, "    if (jout && rv) {{ (*env)->SetIntArrayRegion(env, jout, 0, (jsize)out_len, (const jint*)rv); }}");
             let _ = writeln!(out, "    return jout;");
         }
-        TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::Struct(_) => {
+        TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Handle
+        | TypeRef::Struct(_) => {
             let _ = writeln!(out, "    size_t out_len = 0;");
             let _ = writeln!(
                 out,
@@ -1954,7 +1990,11 @@ fn release_jni_resources_single(out: &mut String, name: &str, ty: &TypeRef) {
                     n = name
                 );
             }
-            TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::Struct(_) => {
+            TypeRef::U32
+            | TypeRef::I64
+            | TypeRef::TypedHandle(_)
+            | TypeRef::Handle
+            | TypeRef::Struct(_) => {
                 let _ = writeln!(
                     out,
                     "    (*env)->ReleaseLongArrayElements(env, {n}, {n}_elems, 0);",

@@ -104,7 +104,7 @@ fn swift_type_for(t: &TypeRef) -> String {
         TypeRef::Bool => "Bool".to_string(),
         TypeRef::StringUtf8 => "String".to_string(),
         TypeRef::Bytes => "Data".to_string(),
-        TypeRef::Handle => "UInt64".to_string(),
+        TypeRef::TypedHandle(_) | TypeRef::Handle => "UInt64".to_string(),
         TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
         TypeRef::Optional(inner) => format!("{}?", swift_type_for(inner)),
         TypeRef::List(inner) => format!("[{}]", swift_type_for(inner)),
@@ -121,6 +121,7 @@ fn is_c_value_type(ty: &TypeRef) -> bool {
             | TypeRef::F64
             | TypeRef::Bool
             | TypeRef::Handle
+            | TypeRef::TypedHandle(_)
             | TypeRef::Enum(_)
     )
 }
@@ -619,7 +620,7 @@ fn swift_c_ptr_element(ty: &TypeRef) -> String {
         TypeRef::I64 => "Int64".to_string(),
         TypeRef::F64 => "Double".to_string(),
         TypeRef::Bool => "Bool".to_string(),
-        TypeRef::Handle => "UInt64".to_string(),
+        TypeRef::TypedHandle(_) | TypeRef::Handle => "UInt64".to_string(),
         TypeRef::StringUtf8 => "UnsafePointer<CChar>?".to_string(),
         TypeRef::Bytes => "UInt8".to_string(),
         TypeRef::Enum(_) => "Int32".to_string(),

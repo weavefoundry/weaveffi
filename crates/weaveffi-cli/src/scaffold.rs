@@ -20,7 +20,7 @@ fn rust_scalar_type(ty: &TypeRef, module: &str) -> String {
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 => "c_char".into(),
         TypeRef::Bytes => "u8".into(),
-        TypeRef::Handle => "u64".into(),
+        TypeRef::TypedHandle(_) | TypeRef::Handle => "u64".into(),
         TypeRef::Struct(s) => format!("weaveffi_{module}_{s}"),
         TypeRef::Enum(_) => "i32".into(),
         TypeRef::Optional(inner) | TypeRef::List(inner) => rust_scalar_type(inner, module),
@@ -39,7 +39,7 @@ fn rust_param_fragments(name: &str, ty: &TypeRef, module: &str) -> Vec<String> {
             format!("{name}_ptr: *const u8"),
             format!("{name}_len: usize"),
         ],
-        TypeRef::Handle => vec![format!("{name}: u64")],
+        TypeRef::TypedHandle(_) | TypeRef::Handle => vec![format!("{name}: u64")],
         TypeRef::Struct(s) => vec![format!("{name}: *const weaveffi_{module}_{s}")],
         TypeRef::Enum(_) => vec![format!("{name}: i32")],
         TypeRef::Optional(inner) => {
@@ -91,7 +91,7 @@ fn rust_return_type(ty: &TypeRef, module: &str) -> (String, bool) {
         TypeRef::Bool => ("bool".into(), false),
         TypeRef::StringUtf8 => ("*const c_char".into(), false),
         TypeRef::Bytes => ("*mut u8".into(), true),
-        TypeRef::Handle => ("u64".into(), false),
+        TypeRef::TypedHandle(_) | TypeRef::Handle => ("u64".into(), false),
         TypeRef::Struct(s) => (format!("*mut weaveffi_{module}_{s}"), false),
         TypeRef::Enum(_) => ("i32".into(), false),
         TypeRef::Optional(inner) => {

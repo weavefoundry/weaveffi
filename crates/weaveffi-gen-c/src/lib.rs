@@ -67,7 +67,7 @@ fn c_element_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
         TypeRef::I64 => "int64_t".to_string(),
         TypeRef::F64 => "double".to_string(),
         TypeRef::Bool => "bool".to_string(),
-        TypeRef::Handle => format!("{prefix}_handle_t"),
+        TypeRef::TypedHandle(_) | TypeRef::Handle => format!("{prefix}_handle_t"),
         TypeRef::StringUtf8 => "const char*".to_string(),
         TypeRef::Bytes => "const uint8_t*".to_string(),
         TypeRef::Struct(s) => format!("{prefix}_{module}_{s}*"),
@@ -86,7 +86,7 @@ fn c_type_for_param(ty: &TypeRef, name: &str, module: &str, prefix: &str) -> Str
         TypeRef::Bool => format!("bool {name}"),
         TypeRef::StringUtf8 => format!("const char* {name}"),
         TypeRef::Bytes => format!("const uint8_t* {name}_ptr, size_t {name}_len"),
-        TypeRef::Handle => format!("{prefix}_handle_t {name}"),
+        TypeRef::TypedHandle(_) | TypeRef::Handle => format!("{prefix}_handle_t {name}"),
         TypeRef::Struct(s) => format!("const {prefix}_{module}_{s}* {name}"),
         TypeRef::Enum(e) => format!("{prefix}_{module}_{e} {name}"),
         TypeRef::Optional(inner) => {
@@ -135,7 +135,7 @@ fn c_ret_type(ty: &TypeRef, module: &str, prefix: &str) -> (String, Vec<String>)
             "const uint8_t*".to_string(),
             vec!["size_t* out_len".to_string()],
         ),
-        TypeRef::Handle => (format!("{prefix}_handle_t"), vec![]),
+        TypeRef::TypedHandle(_) | TypeRef::Handle => (format!("{prefix}_handle_t"), vec![]),
         TypeRef::Struct(s) => (format!("{prefix}_{module}_{s}*"), vec![]),
         TypeRef::Enum(e) => (format!("{prefix}_{module}_{e}"), vec![]),
         TypeRef::Optional(inner) => {
