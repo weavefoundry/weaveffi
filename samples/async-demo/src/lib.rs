@@ -283,6 +283,28 @@ mod tests {
     }
 
     #[test]
+    fn cancel_task_stops_execution() {
+        let mut err = weaveffi_error::default();
+        let cancelled = weaveffi_tasks_cancel_task(999, &mut err);
+        assert_eq!(err.code, 0);
+        assert_eq!(cancelled, 0);
+
+        let (tx, rx) = mpsc::channel::<TaskCbMsg>();
+        let name = CString::new("post-cancel").unwrap();
+        weaveffi_tasks_run_task_async(name.as_ptr(), task_callback, &tx as *const _ as *mut c_void);
+
+        let (had_error, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!had_error);
+        assert!(!result.is_null());
+
+        let r = unsafe { &*result };
+        assert!(r.success);
+        assert!(r.value.contains("post-cancel"));
+
+        weaveffi_tasks_TaskResult_destroy(result);
+    }
+
+    #[test]
     fn task_result_getters() {
         let result = Box::into_raw(Box::new(TaskResult {
             id: 42,
