@@ -19,6 +19,8 @@ pub struct GeneratorConfig {
     pub cpp_standard: Option<String>,
     pub dart_package_name: Option<String>,
     pub go_module_path: Option<String>,
+    pub ruby_module_name: Option<String>,
+    pub ruby_gem_name: Option<String>,
     #[serde(default)]
     pub strip_module_prefix: bool,
     pub template_dir: Option<String>,
@@ -74,6 +76,14 @@ impl GeneratorConfig {
     pub fn go_module_path(&self) -> &str {
         self.go_module_path.as_deref().unwrap_or("weaveffi")
     }
+
+    pub fn ruby_module_name(&self) -> &str {
+        self.ruby_module_name.as_deref().unwrap_or("WeaveFFI")
+    }
+
+    pub fn ruby_gem_name(&self) -> &str {
+        self.ruby_gem_name.as_deref().unwrap_or("weaveffi")
+    }
 }
 
 #[cfg(test)]
@@ -96,6 +106,8 @@ mod tests {
         assert_eq!(cfg.cpp_standard(), "17");
         assert_eq!(cfg.dart_package_name(), "weaveffi");
         assert_eq!(cfg.go_module_path(), "weaveffi");
+        assert_eq!(cfg.ruby_module_name(), "WeaveFFI");
+        assert_eq!(cfg.ruby_gem_name(), "weaveffi");
         assert!(!cfg.strip_module_prefix);
     }
 
@@ -114,6 +126,8 @@ mod tests {
             cpp_standard: Some("20".into()),
             dart_package_name: Some("my_dart_pkg".into()),
             go_module_path: Some("github.com/myorg/mylib".into()),
+            ruby_module_name: Some("MyRubyMod".into()),
+            ruby_gem_name: Some("my_ruby_gem".into()),
             strip_module_prefix: true,
             template_dir: None,
             pre_generate: None,
@@ -132,6 +146,8 @@ mod tests {
         assert_eq!(cfg.cpp_standard(), "20");
         assert_eq!(cfg.dart_package_name(), "my_dart_pkg");
         assert_eq!(cfg.go_module_path(), "github.com/myorg/mylib");
+        assert_eq!(cfg.ruby_module_name(), "MyRubyMod");
+        assert_eq!(cfg.ruby_gem_name(), "my_ruby_gem");
         assert!(cfg.strip_module_prefix);
     }
 
@@ -150,6 +166,8 @@ mod tests {
             cpp_standard: None,
             dart_package_name: None,
             go_module_path: None,
+            ruby_module_name: None,
+            ruby_gem_name: None,
             strip_module_prefix: true,
             template_dir: None,
             pre_generate: None,
@@ -168,6 +186,8 @@ mod tests {
         assert_eq!(back.cpp_standard(), "17");
         assert_eq!(back.dart_package_name(), "weaveffi");
         assert_eq!(back.go_module_path(), "weaveffi");
+        assert_eq!(back.ruby_module_name(), "WeaveFFI");
+        assert_eq!(back.ruby_gem_name(), "weaveffi");
         assert!(back.strip_module_prefix);
     }
 

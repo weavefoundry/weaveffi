@@ -2,10 +2,32 @@ use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToShoutySnakeCase, ToSnakeCase};
 use weaveffi_core::codegen::Generator;
+use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::c_symbol_name;
 use weaveffi_ir::ir::{Api, EnumDef, Function, StructDef, StructField, TypeRef};
 
 pub struct RubyGenerator;
+
+impl RubyGenerator {
+    fn generate_impl(
+        &self,
+        api: &Api,
+        out_dir: &Utf8Path,
+        module_name: &str,
+        gem_name: &str,
+    ) -> Result<()> {
+        let dir = out_dir.join("ruby");
+        let lib_dir = dir.join("lib");
+        std::fs::create_dir_all(&lib_dir)?;
+        std::fs::write(
+            lib_dir.join("weaveffi.rb"),
+            render_ruby_module(api, module_name),
+        )?;
+        std::fs::write(dir.join("weaveffi.gemspec"), render_gemspec(gem_name))?;
+        std::fs::write(dir.join("README.md"), render_readme())?;
+        Ok(())
+    }
+}
 
 impl Generator for RubyGenerator {
     fn name(&self) -> &'static str {
@@ -13,13 +35,21 @@ impl Generator for RubyGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        let dir = out_dir.join("ruby");
-        let lib_dir = dir.join("lib");
-        std::fs::create_dir_all(&lib_dir)?;
-        std::fs::write(lib_dir.join("weaveffi.rb"), render_ruby_module(api))?;
-        std::fs::write(dir.join("weaveffi.gemspec"), render_gemspec())?;
-        std::fs::write(dir.join("README.md"), render_readme())?;
-        Ok(())
+        self.generate_impl(api, out_dir, "WeaveFFI", "weaveffi")
+    }
+
+    fn generate_with_config(
+        &self,
+        api: &Api,
+        out_dir: &Utf8Path,
+        config: &GeneratorConfig,
+    ) -> Result<()> {
+        self.generate_impl(
+            api,
+            out_dir,
+            config.ruby_module_name(),
+            config.ruby_gem_name(),
+        )
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
@@ -210,9 +240,9 @@ fn rb_element_expr(var: &str, ty: &TypeRef) -> String {
 
 // ── Rendering ──
 
-fn render_ruby_module(api: &Api) -> String {
+fn render_ruby_module(api: &Api, module_name: &str) -> String {
     let mut out = String::new();
-    render_preamble(&mut out);
+    render_preamble(&mut out, module_name);
     for m in &api.modules {
         out.push_str(&format!("\n  # === Module: {} ===\n", m.name));
         for e in &m.enums {
@@ -227,7 +257,7 @@ fn render_ruby_module(api: &Api) -> String {
             }
         }
         for s in &m.structs {
-            render_struct_class(&mut out, &m.name, s);
+            render_struct_class(&mut out, &m.name, s, module_name);
         }
         for f in &m.functions {
             if !f.r#async {
@@ -239,14 +269,14 @@ fn render_ruby_module(api: &Api) -> String {
     out
 }
 
-fn render_preamble(out: &mut String) {
-    out.push_str(
+fn render_preamble(out: &mut String, module_name: &str) {
+    out.push_str(&format!(
         "# frozen_string_literal: true
-# WeaveFFI Ruby FFI bindings (auto-generated)
+# {module_name} Ruby FFI bindings (auto-generated)
 
 require 'ffi'
 
-module WeaveFFI
+module {module_name}
   extend FFI::Library
 
   case FFI::Platform::OS
@@ -284,8 +314,8 @@ module WeaveFFI
     weaveffi_error_clear(err.to_ptr)
     raise Error.new(code, msg)
   end
-",
-    );
+"
+    ));
 }
 
 fn render_enum(out: &mut String, e: &EnumDef) {
@@ -342,12 +372,17 @@ fn render_attach_function(out: &mut String, module_name: &str, f: &Function) {
     ));
 }
 
-fn render_struct_class(out: &mut String, module_name: &str, s: &StructDef) {
-    let prefix = format!("weaveffi_{}_{}", module_name, s.name);
+fn render_struct_class(
+    out: &mut String,
+    api_module_name: &str,
+    s: &StructDef,
+    rb_module_name: &str,
+) {
+    let prefix = format!("weaveffi_{}_{}", api_module_name, s.name);
 
     out.push_str(&format!("\n  class {}Ptr < FFI::AutoPointer\n", s.name));
     out.push_str(&format!(
-        "    def self.release(ptr)\n      WeaveFFI.{prefix}_destroy(ptr)\n    end\n"
+        "    def self.release(ptr)\n      {rb_module_name}.{prefix}_destroy(ptr)\n    end\n"
     ));
     out.push_str("  end\n\n");
 
@@ -363,13 +398,13 @@ fn render_struct_class(out: &mut String, module_name: &str, s: &StructDef) {
     );
 
     for field in &s.fields {
-        render_getter(out, &prefix, field);
+        render_getter(out, &prefix, field, rb_module_name);
     }
 
     out.push_str("  end\n");
 }
 
-fn render_getter(out: &mut String, prefix: &str, field: &StructField) {
+fn render_getter(out: &mut String, prefix: &str, field: &StructField, rb_module_name: &str) {
     let getter = format!("{prefix}_get_{}", field.name);
     let ind = "      ";
 
@@ -387,7 +422,7 @@ fn render_getter(out: &mut String, prefix: &str, field: &StructField) {
         ));
         out.push_str(&format!("{ind}out_len = FFI::MemoryPointer.new(:size_t)\n"));
         out.push_str(&format!(
-            "{ind}WeaveFFI.{getter}(@handle, out_keys, out_values, out_len)\n"
+            "{ind}{rb_module_name}.{getter}(@handle, out_keys, out_values, out_len)\n"
         ));
         let (k, v) = get_map_kv(&field.ty).unwrap();
         let is_optional = matches!(&field.ty, TypeRef::Optional(_));
@@ -395,12 +430,14 @@ fn render_getter(out: &mut String, prefix: &str, field: &StructField) {
     } else if !out_params.is_empty() {
         out.push_str(&format!("{ind}out_len = FFI::MemoryPointer.new(:size_t)\n"));
         out.push_str(&format!(
-            "{ind}result = WeaveFFI.{getter}(@handle, out_len)\n"
+            "{ind}result = {rb_module_name}.{getter}(@handle, out_len)\n"
         ));
-        render_return_code(out, &field.ty, ind, true);
+        render_return_code(out, &field.ty, ind, Some(rb_module_name));
     } else {
-        out.push_str(&format!("{ind}result = WeaveFFI.{getter}(@handle)\n"));
-        render_return_code(out, &field.ty, ind, true);
+        out.push_str(&format!(
+            "{ind}result = {rb_module_name}.{getter}(@handle)\n"
+        ));
+        render_return_code(out, &field.ty, ind, Some(rb_module_name));
     }
 
     out.push_str("    end\n");
@@ -469,7 +506,7 @@ fn render_function_wrapper(out: &mut String, module_name: &str, f: &Function) {
             let is_optional = matches!(ret_ty, TypeRef::Optional(_));
             render_map_return_code(out, k, v, ind, is_optional);
         } else {
-            render_return_code(out, ret_ty, ind, false);
+            render_return_code(out, ret_ty, ind, None);
         }
     }
 
@@ -592,8 +629,8 @@ fn render_map_buf(out: &mut String, name: &str, k: &TypeRef, v: &TypeRef, ind: &
 
 // ── Return value rendering ──
 
-fn render_return_code(out: &mut String, ty: &TypeRef, ind: &str, in_struct: bool) {
-    let m = if in_struct { "WeaveFFI." } else { "" };
+fn render_return_code(out: &mut String, ty: &TypeRef, ind: &str, qualifier: Option<&str>) {
+    let m = qualifier.map(|q| format!("{q}.")).unwrap_or_default();
     match ty {
         TypeRef::I32
         | TypeRef::U32
@@ -625,7 +662,7 @@ fn render_return_code(out: &mut String, ty: &TypeRef, ind: &str, in_struct: bool
             ));
             out.push_str(&format!("{ind}{name}.new(result)\n"));
         }
-        TypeRef::Optional(inner) => render_optional_return_code(out, inner, ind, in_struct),
+        TypeRef::Optional(inner) => render_optional_return_code(out, inner, ind, qualifier),
         TypeRef::List(inner) => {
             out.push_str(&format!("{ind}return [] if result.null?\n"));
             render_list_return_body(out, inner, ind);
@@ -636,8 +673,13 @@ fn render_return_code(out: &mut String, ty: &TypeRef, ind: &str, in_struct: bool
     }
 }
 
-fn render_optional_return_code(out: &mut String, inner: &TypeRef, ind: &str, in_struct: bool) {
-    let m = if in_struct { "WeaveFFI." } else { "" };
+fn render_optional_return_code(
+    out: &mut String,
+    inner: &TypeRef,
+    ind: &str,
+    qualifier: Option<&str>,
+) {
+    let m = qualifier.map(|q| format!("{q}.")).unwrap_or_default();
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             out.push_str(&format!("{ind}return nil if result.null?\n"));
@@ -719,17 +761,19 @@ fn render_map_return_code(out: &mut String, k: &TypeRef, v: &TypeRef, ind: &str,
     ));
 }
 
-fn render_gemspec() -> &'static str {
-    r#"Gem::Specification.new do |s|
-  s.name        = 'weaveffi'
+fn render_gemspec(gem_name: &str) -> String {
+    format!(
+        "Gem::Specification.new do |s|
+  s.name        = '{gem_name}'
   s.version     = '0.1.0'
-  s.summary     = 'Ruby FFI bindings for WeaveFFI (auto-generated)'
+  s.summary     = 'Ruby FFI bindings for {gem_name} (auto-generated)'
   s.files       = Dir['lib/**/*.rb']
   s.require_paths = ['lib']
 
   s.add_dependency 'ffi', '~> 1.15'
 end
-"#
+"
+    )
 }
 
 fn render_readme() -> &'static str {
@@ -761,6 +805,7 @@ require 'weaveffi'
 mod tests {
     use super::*;
     use camino::Utf8Path;
+    use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{
         Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
     };
@@ -900,7 +945,7 @@ mod tests {
             errors: None,
         }]);
 
-        let code = render_ruby_module(&api);
+        let code = render_ruby_module(&api, "WeaveFFI");
         assert!(code.contains("module Color"), "enum module: {code}");
         assert!(code.contains("RED = 0"), "RED: {code}");
         assert!(code.contains("DARK_BLUE = 1"), "DARK_BLUE: {code}");
@@ -931,7 +976,7 @@ mod tests {
             errors: None,
         }]);
 
-        let code = render_ruby_module(&api);
+        let code = render_ruby_module(&api, "WeaveFFI");
         assert!(
             code.contains("class ContactPtr < FFI::AutoPointer"),
             "AutoPointer: {code}"
@@ -970,7 +1015,7 @@ mod tests {
             errors: None,
         }]);
 
-        let code = render_ruby_module(&api);
+        let code = render_ruby_module(&api, "WeaveFFI");
         assert!(
             code.contains("WeaveFFI.weaveffi_free_string(result)"),
             "free_string in getter: {code}"
@@ -1000,7 +1045,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api);
+        let code = render_ruby_module(&api, "WeaveFFI");
         assert!(code.contains("err = ErrorStruct.new"), "err alloc: {code}");
         assert!(code.contains("check_error!(err)"), "check_error: {code}");
     }
@@ -1019,7 +1064,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api);
+        let code = render_ruby_module(&api, "WeaveFFI");
         assert!(code.contains("result.read_string"), "read_string: {code}");
         assert!(
             code.contains("weaveffi_free_string(result)"),
@@ -1048,7 +1093,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api);
+        let code = render_ruby_module(&api, "WeaveFFI");
         assert!(
             code.contains("value_c = value ? 1 : 0"),
             "bool param: {code}"
@@ -1070,7 +1115,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api);
+        let code = render_ruby_module(&api, "WeaveFFI");
         assert!(
             code.contains("return nil if result.null?"),
             "optional nil: {code}"
@@ -1091,7 +1136,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api);
+        let code = render_ruby_module(&api, "WeaveFFI");
         assert!(
             code.contains("return [] if result.null?"),
             "empty array: {code}"
@@ -1116,7 +1161,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api);
+        let code = render_ruby_module(&api, "WeaveFFI");
         assert!(code.contains("out_keys"), "out_keys: {code}");
         assert!(code.contains("out_values"), "out_values: {code}");
         assert!(code.contains("each_with_object"), "hash build: {code}");
@@ -1150,7 +1195,7 @@ mod tests {
             errors: None,
         }]);
 
-        let code = render_ruby_module(&api);
+        let code = render_ruby_module(&api, "WeaveFFI");
         assert!(code.contains("Item.new(result)"), "struct wrap: {code}");
         assert!(
             code.contains("raise Error.new(-1, 'null pointer') if result.null?"),
@@ -1172,7 +1217,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api);
+        let code = render_ruby_module(&api, "WeaveFFI");
         assert!(
             !code.contains("def self.read"),
             "async should be skipped: {code}"
@@ -1185,7 +1230,7 @@ mod tests {
 
     #[test]
     fn preamble_has_platform_detection() {
-        let code = render_ruby_module(&make_api(vec![]));
+        let code = render_ruby_module(&make_api(vec![]), "WeaveFFI");
         assert!(code.contains("FFI::Platform::OS"), "platform: {code}");
         assert!(code.contains("libweaveffi.dylib"), "darwin: {code}");
         assert!(code.contains("weaveffi.dll"), "windows: {code}");
@@ -1194,7 +1239,7 @@ mod tests {
 
     #[test]
     fn error_class_structure() {
-        let code = render_ruby_module(&make_api(vec![]));
+        let code = render_ruby_module(&make_api(vec![]), "WeaveFFI");
         assert!(
             code.contains("class Error < StandardError"),
             "Error class: {code}"
@@ -1216,7 +1261,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api);
+        let code = render_ruby_module(&api, "WeaveFFI");
         assert!(code.contains(":uint64"), "handle type: {code}");
     }
 
@@ -1266,7 +1311,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api);
+        let code = render_ruby_module(&api, "WeaveFFI");
         assert!(code.contains(":int32"), "enum type: {code}");
     }
 
@@ -1284,7 +1329,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api);
+        let code = render_ruby_module(&api, "WeaveFFI");
         assert!(code.contains(":void"), "void return: {code}");
         assert!(
             !code.contains("result = weaveffi_store_clear"),
@@ -1317,7 +1362,7 @@ mod tests {
             errors: None,
         }]);
 
-        let code = render_ruby_module(&api);
+        let code = render_ruby_module(&api, "WeaveFFI");
         assert!(code.contains("Item.new(p)"), "struct list element: {code}");
     }
 
@@ -1338,7 +1383,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api);
+        let code = render_ruby_module(&api, "WeaveFFI");
         assert!(
             code.contains("return nil if result.null?"),
             "optional struct nil: {code}"
@@ -1346,6 +1391,481 @@ mod tests {
         assert!(
             code.contains("Item.new(result)"),
             "optional struct wrap: {code}"
+        );
+    }
+
+    // ── Comprehensive tests ──
+
+    fn contacts_api() -> Api {
+        Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "contacts".into(),
+                functions: vec![
+                    Function {
+                        name: "create_contact".into(),
+                        params: vec![
+                            Param {
+                                name: "first_name".into(),
+                                ty: TypeRef::StringUtf8,
+                            },
+                            Param {
+                                name: "last_name".into(),
+                                ty: TypeRef::StringUtf8,
+                            },
+                            Param {
+                                name: "email".into(),
+                                ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                            },
+                            Param {
+                                name: "contact_type".into(),
+                                ty: TypeRef::Enum("ContactType".into()),
+                            },
+                        ],
+                        returns: Some(TypeRef::Handle),
+                        doc: None,
+                        r#async: false,
+                        cancellable: false,
+                    },
+                    Function {
+                        name: "get_contact".into(),
+                        params: vec![Param {
+                            name: "id".into(),
+                            ty: TypeRef::Handle,
+                        }],
+                        returns: Some(TypeRef::Struct("Contact".into())),
+                        doc: None,
+                        r#async: false,
+                        cancellable: false,
+                    },
+                    Function {
+                        name: "list_contacts".into(),
+                        params: vec![],
+                        returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
+                        doc: None,
+                        r#async: false,
+                        cancellable: false,
+                    },
+                    Function {
+                        name: "delete_contact".into(),
+                        params: vec![Param {
+                            name: "id".into(),
+                            ty: TypeRef::Handle,
+                        }],
+                        returns: Some(TypeRef::Bool),
+                        doc: None,
+                        r#async: false,
+                        cancellable: false,
+                    },
+                    Function {
+                        name: "count_contacts".into(),
+                        params: vec![],
+                        returns: Some(TypeRef::I32),
+                        doc: None,
+                        r#async: false,
+                        cancellable: false,
+                    },
+                ],
+                structs: vec![StructDef {
+                    name: "Contact".into(),
+                    doc: None,
+                    fields: vec![
+                        StructField {
+                            name: "id".into(),
+                            ty: TypeRef::I64,
+                            doc: None,
+                        },
+                        StructField {
+                            name: "first_name".into(),
+                            ty: TypeRef::StringUtf8,
+                            doc: None,
+                        },
+                        StructField {
+                            name: "last_name".into(),
+                            ty: TypeRef::StringUtf8,
+                            doc: None,
+                        },
+                        StructField {
+                            name: "email".into(),
+                            ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                            doc: None,
+                        },
+                        StructField {
+                            name: "contact_type".into(),
+                            ty: TypeRef::Enum("ContactType".into()),
+                            doc: None,
+                        },
+                    ],
+                }],
+                enums: vec![EnumDef {
+                    name: "ContactType".into(),
+                    doc: None,
+                    variants: vec![
+                        EnumVariant {
+                            name: "Personal".into(),
+                            value: 0,
+                            doc: None,
+                        },
+                        EnumVariant {
+                            name: "Work".into(),
+                            value: 1,
+                            doc: None,
+                        },
+                        EnumVariant {
+                            name: "Other".into(),
+                            value: 2,
+                            doc: None,
+                        },
+                    ],
+                }],
+                errors: None,
+            }],
+            generators: None,
+        }
+    }
+
+    #[test]
+    fn generate_ruby_basic() {
+        let api = make_api(vec![simple_module(
+            "math",
+            vec![Function {
+                name: "add".into(),
+                params: vec![
+                    Param {
+                        name: "a".into(),
+                        ty: TypeRef::I32,
+                    },
+                    Param {
+                        name: "b".into(),
+                        ty: TypeRef::I32,
+                    },
+                ],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+        )]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(tmp.path()).expect("valid UTF-8");
+
+        RubyGenerator
+            .generate_with_config(&api, out_dir, &GeneratorConfig::default())
+            .unwrap();
+
+        let rb = std::fs::read_to_string(tmp.path().join("ruby/lib/weaveffi.rb")).unwrap();
+        assert!(rb.contains("module WeaveFFI"), "module name: {rb}");
+        assert!(
+            rb.contains("attach_function :weaveffi_math_add"),
+            "attach_function: {rb}"
+        );
+        assert!(rb.contains("def self.add(a, b)"), "wrapper fn: {rb}");
+        assert!(rb.contains("check_error!(err)"), "error check: {rb}");
+    }
+
+    #[test]
+    fn generate_ruby_with_structs() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "get_contact".into(),
+                params: vec![Param {
+                    name: "id".into(),
+                    ty: TypeRef::Handle,
+                }],
+                returns: Some(TypeRef::Struct("Contact".into())),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![
+                    StructField {
+                        name: "first_name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "last_name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    },
+                ],
+            }],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(tmp.path()).expect("valid UTF-8");
+
+        RubyGenerator
+            .generate_with_config(&api, out_dir, &GeneratorConfig::default())
+            .unwrap();
+
+        let rb = std::fs::read_to_string(tmp.path().join("ruby/lib/weaveffi.rb")).unwrap();
+        assert!(
+            rb.contains("class ContactPtr < FFI::AutoPointer"),
+            "auto pointer: {rb}"
+        );
+        assert!(rb.contains("class Contact"), "struct class: {rb}");
+        assert!(rb.contains("attr_reader :handle"), "handle attr: {rb}");
+        assert!(rb.contains("def first_name"), "getter: {rb}");
+        assert!(rb.contains("def last_name"), "getter: {rb}");
+        assert!(
+            rb.contains("Contact.new(result)"),
+            "struct return wrap: {rb}"
+        );
+    }
+
+    #[test]
+    fn generate_ruby_with_enums() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "classify".into(),
+                params: vec![Param {
+                    name: "ct".into(),
+                    ty: TypeRef::Enum("ContactType".into()),
+                }],
+                returns: Some(TypeRef::Enum("ContactType".into())),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+            structs: vec![],
+            enums: vec![EnumDef {
+                name: "ContactType".into(),
+                doc: None,
+                variants: vec![
+                    EnumVariant {
+                        name: "Personal".into(),
+                        value: 0,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Work".into(),
+                        value: 1,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Other".into(),
+                        value: 2,
+                        doc: None,
+                    },
+                ],
+            }],
+            errors: None,
+        }]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(tmp.path()).expect("valid UTF-8");
+
+        RubyGenerator
+            .generate_with_config(&api, out_dir, &GeneratorConfig::default())
+            .unwrap();
+
+        let rb = std::fs::read_to_string(tmp.path().join("ruby/lib/weaveffi.rb")).unwrap();
+        assert!(rb.contains("module ContactType"), "enum module: {rb}");
+        assert!(rb.contains("PERSONAL = 0"), "variant 0: {rb}");
+        assert!(rb.contains("WORK = 1"), "variant 1: {rb}");
+        assert!(rb.contains("OTHER = 2"), "variant 2: {rb}");
+        assert!(rb.contains(":int32"), "enum ffi type: {rb}");
+    }
+
+    #[test]
+    fn generate_ruby_with_optionals() {
+        let api = make_api(vec![simple_module(
+            "data",
+            vec![
+                Function {
+                    name: "find_name".into(),
+                    params: vec![Param {
+                        name: "id".into(),
+                        ty: TypeRef::I64,
+                    }],
+                    returns: Some(TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                },
+                Function {
+                    name: "find_count".into(),
+                    params: vec![Param {
+                        name: "key".into(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::I32)),
+                    }],
+                    returns: Some(TypeRef::Optional(Box::new(TypeRef::I32))),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                },
+            ],
+        )]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(tmp.path()).expect("valid UTF-8");
+
+        RubyGenerator
+            .generate_with_config(&api, out_dir, &GeneratorConfig::default())
+            .unwrap();
+
+        let rb = std::fs::read_to_string(tmp.path().join("ruby/lib/weaveffi.rb")).unwrap();
+        assert!(
+            rb.contains("return nil if result.null?"),
+            "nil return for optional string: {rb}"
+        );
+        assert!(
+            rb.contains("FFI::Pointer::NULL"),
+            "optional scalar encoding: {rb}"
+        );
+    }
+
+    #[test]
+    fn generate_ruby_with_lists() {
+        let api = make_api(vec![simple_module(
+            "data",
+            vec![
+                Function {
+                    name: "list_ids".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::List(Box::new(TypeRef::I32))),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                },
+                Function {
+                    name: "set_names".into(),
+                    params: vec![Param {
+                        name: "names".into(),
+                        ty: TypeRef::List(Box::new(TypeRef::StringUtf8)),
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                },
+            ],
+        )]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(tmp.path()).expect("valid UTF-8");
+
+        RubyGenerator
+            .generate_with_config(&api, out_dir, &GeneratorConfig::default())
+            .unwrap();
+
+        let rb = std::fs::read_to_string(tmp.path().join("ruby/lib/weaveffi.rb")).unwrap();
+        assert!(
+            rb.contains("return [] if result.null?"),
+            "empty list fallback: {rb}"
+        );
+        assert!(
+            rb.contains("read_array_of_int32"),
+            "list return reader: {rb}"
+        );
+        assert!(
+            rb.contains("FFI::MemoryPointer.new(:pointer, names.length)"),
+            "list param buffer: {rb}"
+        );
+    }
+
+    #[test]
+    fn generate_ruby_full_contacts() {
+        let api = contacts_api();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(tmp.path()).expect("valid UTF-8");
+
+        RubyGenerator
+            .generate_with_config(&api, out_dir, &GeneratorConfig::default())
+            .unwrap();
+
+        let rb = std::fs::read_to_string(tmp.path().join("ruby/lib/weaveffi.rb")).unwrap();
+
+        assert!(rb.contains("module WeaveFFI"), "module: {rb}");
+        assert!(rb.contains("module ContactType"), "enum: {rb}");
+        assert!(rb.contains("PERSONAL = 0"), "enum variant: {rb}");
+        assert!(rb.contains("class Contact"), "struct class: {rb}");
+        assert!(
+            rb.contains("def self.create_contact(first_name, last_name, email, contact_type)"),
+            "create fn: {rb}"
+        );
+        assert!(rb.contains("def self.get_contact(id)"), "get fn: {rb}");
+        assert!(rb.contains("def self.list_contacts"), "list fn: {rb}");
+        assert!(
+            rb.contains("def self.delete_contact(id)"),
+            "delete fn: {rb}"
+        );
+        assert!(rb.contains("def self.count_contacts"), "count fn: {rb}");
+        assert!(rb.contains("def id"), "id getter: {rb}");
+        assert!(rb.contains("def first_name"), "first_name getter: {rb}");
+        assert!(rb.contains("def email"), "email getter: {rb}");
+        assert!(rb.contains("def contact_type"), "contact_type getter: {rb}");
+
+        let gemspec = std::fs::read_to_string(tmp.path().join("ruby/weaveffi.gemspec")).unwrap();
+        assert!(
+            gemspec.contains("s.name        = 'weaveffi'"),
+            "gem name: {gemspec}"
+        );
+
+        let readme = std::fs::read_to_string(tmp.path().join("ruby/README.md")).unwrap();
+        assert!(readme.contains("Ruby"), "readme: {readme}");
+    }
+
+    #[test]
+    fn ruby_custom_module_name() {
+        let api = make_api(vec![simple_module(
+            "math",
+            vec![Function {
+                name: "add".into(),
+                params: vec![
+                    Param {
+                        name: "a".into(),
+                        ty: TypeRef::I32,
+                    },
+                    Param {
+                        name: "b".into(),
+                        ty: TypeRef::I32,
+                    },
+                ],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+        )]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(tmp.path()).expect("valid UTF-8");
+
+        let config = GeneratorConfig {
+            ruby_module_name: Some("MyBindings".into()),
+            ruby_gem_name: Some("my_bindings".into()),
+            ..Default::default()
+        };
+        RubyGenerator
+            .generate_with_config(&api, out_dir, &config)
+            .unwrap();
+
+        let rb = std::fs::read_to_string(tmp.path().join("ruby/lib/weaveffi.rb")).unwrap();
+        assert!(rb.contains("module MyBindings"), "custom module name: {rb}");
+        assert!(
+            !rb.contains("module WeaveFFI"),
+            "should not contain default module name: {rb}"
+        );
+
+        let gemspec = std::fs::read_to_string(tmp.path().join("ruby/weaveffi.gemspec")).unwrap();
+        assert!(
+            gemspec.contains("s.name        = 'my_bindings'"),
+            "custom gem name: {gemspec}"
+        );
+        assert!(
+            !gemspec.contains("s.name        = 'weaveffi'"),
+            "should not contain default gem name: {gemspec}"
         );
     }
 }
