@@ -1381,4 +1381,102 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn dart_no_double_free_on_error() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                }],
+            }],
+            enums: vec![],
+            functions: vec![Function {
+                name: "find_contact".into(),
+                params: vec![Param {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                }],
+                returns: Some(TypeRef::Struct("Contact".into())),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+            errors: None,
+        }]);
+
+        let dart = render_dart_module(&api);
+
+        assert!(
+            !dart.contains("weaveffi_free_string(namePtr"),
+            "borrowed string param must not be freed via weaveffi_free_string: {dart}"
+        );
+
+        let fn_start = dart
+            .find("Contact findContact(")
+            .expect("findContact wrapper");
+        let fn_body = &dart[fn_start..];
+
+        let err_check = fn_body
+            .find("_checkError(err)")
+            .expect("_checkError in findContact");
+        let contact_wrap = fn_body
+            .find("Contact._(result)")
+            .expect("Contact._ in findContact");
+        assert!(
+            err_check < contact_wrap,
+            "error must be checked before wrapping struct return: {dart}"
+        );
+
+        assert!(
+            dart.contains("void dispose()") && dart.contains("_destroy"),
+            "struct return type should have dispose calling destroy: {dart}"
+        );
+    }
+
+    #[test]
+    fn dart_null_check_on_optional_return() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "find_contact".into(),
+                params: vec![Param {
+                    name: "id".into(),
+                    ty: TypeRef::I32,
+                }],
+                returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                    "Contact".into(),
+                )))),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let dart = render_dart_module(&api);
+
+        let fn_start = dart
+            .find("Contact? findContact(")
+            .expect("findContact wrapper");
+        let fn_body = &dart[fn_start..];
+
+        let null_check = fn_body
+            .find("if (result == nullptr) return null")
+            .expect("null check in findContact");
+        let contact_wrap = fn_body
+            .find("Contact._(result)")
+            .expect("Contact._ in findContact");
+        assert!(
+            null_check < contact_wrap,
+            "optional struct return should check null before wrapping: {dart}"
+        );
+    }
 }
