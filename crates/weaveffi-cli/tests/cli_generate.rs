@@ -76,6 +76,38 @@ fn generate_with_target_filter() {
 }
 
 #[test]
+fn generate_cpp_target_filter() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
+    let input = repo_root.join("samples/calculator/calculator.yml");
+
+    let out_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let out_path = out_dir.path();
+
+    assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args([
+            "generate",
+            input.to_str().unwrap(),
+            "-o",
+            out_path.to_str().unwrap(),
+            "--target",
+            "cpp",
+        ])
+        .assert()
+        .success();
+
+    assert!(
+        out_path.join("cpp").exists(),
+        "cpp/ should exist when --target cpp is used"
+    );
+    assert!(
+        !out_path.join("c").exists(),
+        "c/ should not exist when --target cpp is used"
+    );
+}
+
+#[test]
 fn validate_command_succeeds() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
