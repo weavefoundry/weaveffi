@@ -309,6 +309,7 @@ fn render_wasm_dts(api: &Api) -> String {
                     Some(ty) => ts_type_for(ty),
                     None => "void".into(),
                 };
+                out.push_str("    /** @throws {Error} if the native call fails */\n");
                 out.push_str(&format!(
                     "    {}({}): {};\n",
                     func.name,
@@ -1064,5 +1065,16 @@ mod tests {
         let js = render_wasm_js_stub(&api);
         assert!(js.contains("const _err = _allocError(wasm)"));
         assert!(js.contains("_checkError(wasm, _err)"));
+    }
+
+    #[test]
+    fn wasm_dts_has_throws_doc() {
+        let api = sample_api();
+        let dts = render_wasm_dts(&api);
+        assert!(
+            dts.contains("@throws"),
+            "Expected .d.ts to contain @throws JSDoc comment"
+        );
+        assert!(dts.contains("/** @throws {Error} if the native call fails */"));
     }
 }
