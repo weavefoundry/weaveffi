@@ -16,6 +16,7 @@ members = [
     "samples/node-addon",
     "samples/contacts",
     "samples/inventory",
+    "samples/async-demo",
 ]
 resolver = "2"
 
