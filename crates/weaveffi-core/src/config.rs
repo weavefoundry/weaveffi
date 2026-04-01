@@ -14,6 +14,9 @@ pub struct GeneratorConfig {
     pub c_prefix: Option<String>,
     pub python_package_name: Option<String>,
     pub dotnet_namespace: Option<String>,
+    pub cpp_namespace: Option<String>,
+    pub cpp_header_name: Option<String>,
+    pub cpp_standard: Option<String>,
     #[serde(default)]
     pub strip_module_prefix: bool,
 }
@@ -46,6 +49,18 @@ impl GeneratorConfig {
     pub fn dotnet_namespace(&self) -> &str {
         self.dotnet_namespace.as_deref().unwrap_or("WeaveFFI")
     }
+
+    pub fn cpp_namespace(&self) -> &str {
+        self.cpp_namespace.as_deref().unwrap_or("weaveffi")
+    }
+
+    pub fn cpp_header_name(&self) -> &str {
+        self.cpp_header_name.as_deref().unwrap_or("weaveffi.hpp")
+    }
+
+    pub fn cpp_standard(&self) -> &str {
+        self.cpp_standard.as_deref().unwrap_or("17")
+    }
 }
 
 #[cfg(test)]
@@ -63,6 +78,9 @@ mod tests {
         assert_eq!(cfg.c_prefix(), "weaveffi");
         assert_eq!(cfg.python_package_name(), "weaveffi");
         assert_eq!(cfg.dotnet_namespace(), "WeaveFFI");
+        assert_eq!(cfg.cpp_namespace(), "weaveffi");
+        assert_eq!(cfg.cpp_header_name(), "weaveffi.hpp");
+        assert_eq!(cfg.cpp_standard(), "17");
         assert!(!cfg.strip_module_prefix);
     }
 
@@ -76,6 +94,9 @@ mod tests {
             c_prefix: Some("myffi".into()),
             python_package_name: Some("my_python_pkg".into()),
             dotnet_namespace: Some("MyCompany.Bindings".into()),
+            cpp_namespace: Some("mylib".into()),
+            cpp_header_name: Some("mylib.hpp".into()),
+            cpp_standard: Some("20".into()),
             strip_module_prefix: true,
         };
 
@@ -86,6 +107,9 @@ mod tests {
         assert_eq!(cfg.c_prefix(), "myffi");
         assert_eq!(cfg.python_package_name(), "my_python_pkg");
         assert_eq!(cfg.dotnet_namespace(), "MyCompany.Bindings");
+        assert_eq!(cfg.cpp_namespace(), "mylib");
+        assert_eq!(cfg.cpp_header_name(), "mylib.hpp");
+        assert_eq!(cfg.cpp_standard(), "20");
         assert!(cfg.strip_module_prefix);
     }
 
@@ -99,6 +123,9 @@ mod tests {
             c_prefix: None,
             python_package_name: Some("mypkg".into()),
             dotnet_namespace: None,
+            cpp_namespace: Some("myns".into()),
+            cpp_header_name: None,
+            cpp_standard: None,
             strip_module_prefix: true,
         };
 
@@ -109,6 +136,9 @@ mod tests {
         assert_eq!(back.android_package(), "com.weaveffi");
         assert_eq!(back.python_package_name(), "mypkg");
         assert_eq!(back.dotnet_namespace(), "WeaveFFI");
+        assert_eq!(back.cpp_namespace(), "myns");
+        assert_eq!(back.cpp_header_name(), "weaveffi.hpp");
+        assert_eq!(back.cpp_standard(), "17");
         assert!(back.strip_module_prefix);
     }
 
