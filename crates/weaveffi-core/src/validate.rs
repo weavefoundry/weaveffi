@@ -230,49 +230,133 @@ pub fn validate_api(api: &mut Api) -> Result<(), ValidationError> {
         if !module_names.insert(m.name.clone()) {
             return Err(ValidationError::DuplicateModuleName(m.name.clone()));
         }
-        validate_module(m)?;
+        validate_module(m, &api.modules)?;
     }
     resolve_type_refs(api);
     Ok(())
 }
 
 pub fn resolve_type_refs(api: &mut Api) {
+    let mut global_types: BTreeMap<String, (String, bool)> = BTreeMap::new();
+    for module in &api.modules {
+        for s in &module.structs {
+            global_types
+                .entry(s.name.clone())
+                .or_insert((module.name.clone(), false));
+        }
+        for e in &module.enums {
+            global_types
+                .entry(e.name.clone())
+                .or_insert((module.name.clone(), true));
+        }
+    }
+
     for module in &mut api.modules {
-        let enum_names: BTreeSet<&str> = module.enums.iter().map(|e| e.name.as_str()).collect();
+        let local_enum_names: BTreeSet<String> =
+            module.enums.iter().map(|e| e.name.clone()).collect();
+        let local_struct_names: BTreeSet<String> =
+            module.structs.iter().map(|s| s.name.clone()).collect();
+        let module_name = module.name.clone();
         for f in &mut module.functions {
             for p in &mut f.params {
-                resolve_single_type_ref(&mut p.ty, &enum_names);
+                resolve_single_type_ref(
+                    &mut p.ty,
+                    &local_enum_names,
+                    &local_struct_names,
+                    &module_name,
+                    &global_types,
+                );
             }
             if let Some(ret) = &mut f.returns {
-                resolve_single_type_ref(ret, &enum_names);
+                resolve_single_type_ref(
+                    ret,
+                    &local_enum_names,
+                    &local_struct_names,
+                    &module_name,
+                    &global_types,
+                );
             }
         }
         for s in &mut module.structs {
             for field in &mut s.fields {
-                resolve_single_type_ref(&mut field.ty, &enum_names);
+                resolve_single_type_ref(
+                    &mut field.ty,
+                    &local_enum_names,
+                    &local_struct_names,
+                    &module_name,
+                    &global_types,
+                );
             }
         }
     }
 }
 
-fn resolve_single_type_ref(ty: &mut TypeRef, enum_names: &BTreeSet<&str>) {
+fn resolve_single_type_ref(
+    ty: &mut TypeRef,
+    local_enum_names: &BTreeSet<String>,
+    local_struct_names: &BTreeSet<String>,
+    current_module: &str,
+    global_types: &BTreeMap<String, (String, bool)>,
+) {
     match ty {
-        TypeRef::Struct(name) if enum_names.contains(name.as_str()) => {
+        TypeRef::Struct(name) if local_enum_names.contains(name.as_str()) => {
             let name = std::mem::take(name);
             *ty = TypeRef::Enum(name);
         }
+        TypeRef::Struct(name) if !local_struct_names.contains(name.as_str()) => {
+            if let Some((mod_name, is_enum)) = global_types.get(name.as_str()) {
+                if mod_name != current_module {
+                    let qualified = format!("{mod_name}.{name}");
+                    if *is_enum {
+                        *ty = TypeRef::Enum(qualified);
+                    } else {
+                        *name = qualified;
+                    }
+                }
+            }
+        }
         TypeRef::Optional(inner) | TypeRef::List(inner) => {
-            resolve_single_type_ref(inner, enum_names);
+            resolve_single_type_ref(
+                inner,
+                local_enum_names,
+                local_struct_names,
+                current_module,
+                global_types,
+            );
         }
         TypeRef::Map(k, v) => {
-            resolve_single_type_ref(k, enum_names);
-            resolve_single_type_ref(v, enum_names);
+            resolve_single_type_ref(
+                k,
+                local_enum_names,
+                local_struct_names,
+                current_module,
+                global_types,
+            );
+            resolve_single_type_ref(
+                v,
+                local_enum_names,
+                local_struct_names,
+                current_module,
+                global_types,
+            );
         }
         _ => {}
     }
 }
 
-fn validate_module(module: &Module) -> Result<(), ValidationError> {
+pub fn find_type_in_api(api: &Api, name: &str) -> Option<(String, bool)> {
+    for module in &api.modules {
+        if module.structs.iter().any(|s| s.name == name) {
+            return Some((module.name.clone(), false));
+        }
+        if module.enums.iter().any(|e| e.name == name) {
+            return Some((module.name.clone(), true));
+        }
+    }
+    None
+}
+
+fn validate_module(module: &Module, all_modules: &[Module]) -> Result<(), ValidationError> {
     if module.name.trim().is_empty() {
         return Err(ValidationError::NoModuleName);
     }
@@ -371,12 +455,12 @@ fn validate_module(module: &Module) -> Result<(), ValidationError> {
                     location: format!("field '{}' of struct '{}'", f.name, s.name),
                 });
             }
-            validate_type_ref(&f.ty, &known_types)?;
+            validate_type_ref(&f.ty, &known_types, all_modules, &module.name)?;
         }
     }
     for f in &module.functions {
         for p in &f.params {
-            validate_type_ref(&p.ty, &known_types)?;
+            validate_type_ref(&p.ty, &known_types, all_modules, &module.name)?;
         }
         if let Some(ret) = &f.returns {
             if let Some(ty) = contains_borrowed(ret) {
@@ -385,7 +469,7 @@ fn validate_module(module: &Module) -> Result<(), ValidationError> {
                     location: format!("return type of {}::{}", module.name, f.name),
                 });
             }
-            validate_type_ref(ret, &known_types)?;
+            validate_type_ref(ret, &known_types, all_modules, &module.name)?;
         }
     }
 
@@ -429,15 +513,29 @@ fn contains_borrowed(ty: &TypeRef) -> Option<&'static str> {
     }
 }
 
-fn validate_type_ref(ty: &TypeRef, known: &BTreeSet<&str>) -> Result<(), ValidationError> {
+fn validate_type_ref(
+    ty: &TypeRef,
+    known: &BTreeSet<&str>,
+    all_modules: &[Module],
+    current_module: &str,
+) -> Result<(), ValidationError> {
     match ty {
         TypeRef::Struct(name) | TypeRef::Enum(name) | TypeRef::TypedHandle(name) => {
             if !known.contains(name.as_str()) {
-                return Err(ValidationError::UnknownTypeRef { name: name.clone() });
+                let found_elsewhere = all_modules.iter().any(|m| {
+                    m.name != current_module
+                        && (m.structs.iter().any(|s| s.name == *name)
+                            || m.enums.iter().any(|e| e.name == *name))
+                });
+                if !found_elsewhere {
+                    return Err(ValidationError::UnknownTypeRef { name: name.clone() });
+                }
             }
             Ok(())
         }
-        TypeRef::Optional(inner) | TypeRef::List(inner) => validate_type_ref(inner, known),
+        TypeRef::Optional(inner) | TypeRef::List(inner) => {
+            validate_type_ref(inner, known, all_modules, current_module)
+        }
         TypeRef::Map(k, v) => {
             let bad_key = match k.as_ref() {
                 TypeRef::Struct(name) => Some(format!("struct {name}")),
@@ -448,8 +546,8 @@ fn validate_type_ref(ty: &TypeRef, known: &BTreeSet<&str>) -> Result<(), Validat
             if let Some(key_type) = bad_key {
                 return Err(ValidationError::InvalidMapKey { key_type });
             }
-            validate_type_ref(k, known)?;
-            validate_type_ref(v, known)
+            validate_type_ref(k, known, all_modules, current_module)?;
+            validate_type_ref(v, known, all_modules, current_module)
         }
         _ => Ok(()),
     }
@@ -2334,5 +2432,162 @@ mod tests {
             ValidationError::BorrowedTypeInInvalidPosition { ty, .. }
                 if ty == "&str"
         ));
+    }
+
+    #[test]
+    fn cross_module_struct_ref_passes() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![
+                Module {
+                    name: "orders".to_string(),
+                    functions: vec![Function {
+                        name: "place_order".to_string(),
+                        params: vec![Param {
+                            name: "item".to_string(),
+                            ty: TypeRef::Struct("Product".to_string()),
+                        }],
+                        returns: None,
+                        doc: None,
+                        r#async: false,
+                        cancellable: false,
+                    }],
+                    structs: vec![],
+                    enums: vec![],
+                    errors: None,
+                },
+                Module {
+                    name: "catalog".to_string(),
+                    functions: vec![simple_function("list_products")],
+                    structs: vec![simple_struct("Product")],
+                    enums: vec![],
+                    errors: None,
+                },
+            ],
+            generators: None,
+        };
+        validate_api(&mut api).unwrap();
+        assert_eq!(
+            api.modules[0].functions[0].params[0].ty,
+            TypeRef::Struct("catalog.Product".to_string())
+        );
+    }
+
+    #[test]
+    fn cross_module_enum_ref_passes() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![
+                Module {
+                    name: "orders".to_string(),
+                    functions: vec![Function {
+                        name: "get_status".to_string(),
+                        params: vec![],
+                        returns: Some(TypeRef::Struct("Status".to_string())),
+                        doc: None,
+                        r#async: false,
+                        cancellable: false,
+                    }],
+                    structs: vec![],
+                    enums: vec![],
+                    errors: None,
+                },
+                Module {
+                    name: "shared".to_string(),
+                    functions: vec![simple_function("noop")],
+                    structs: vec![],
+                    enums: vec![simple_enum("Status")],
+                    errors: None,
+                },
+            ],
+            generators: None,
+        };
+        validate_api(&mut api).unwrap();
+        assert_eq!(
+            api.modules[0].functions[0].returns,
+            Some(TypeRef::Enum("shared.Status".to_string()))
+        );
+    }
+
+    #[test]
+    fn cross_module_unknown_still_rejected() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![
+                Module {
+                    name: "orders".to_string(),
+                    functions: vec![Function {
+                        name: "do_stuff".to_string(),
+                        params: vec![Param {
+                            name: "x".to_string(),
+                            ty: TypeRef::Struct("Nonexistent".to_string()),
+                        }],
+                        returns: None,
+                        doc: None,
+                        r#async: false,
+                        cancellable: false,
+                    }],
+                    structs: vec![],
+                    enums: vec![],
+                    errors: None,
+                },
+                Module {
+                    name: "catalog".to_string(),
+                    functions: vec![simple_function("list_products")],
+                    structs: vec![simple_struct("Product")],
+                    enums: vec![],
+                    errors: None,
+                },
+            ],
+            generators: None,
+        };
+        assert!(matches!(
+            validate_api(&mut api).unwrap_err(),
+            ValidationError::UnknownTypeRef { name } if name == "Nonexistent"
+        ));
+    }
+
+    #[test]
+    fn find_type_in_api_finds_struct() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "catalog".to_string(),
+                functions: vec![],
+                structs: vec![simple_struct("Product")],
+                enums: vec![],
+                errors: None,
+            }],
+            generators: None,
+        };
+        let result = find_type_in_api(&api, "Product");
+        assert_eq!(result, Some(("catalog".to_string(), false)));
+    }
+
+    #[test]
+    fn find_type_in_api_finds_enum() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "shared".to_string(),
+                functions: vec![],
+                structs: vec![],
+                enums: vec![simple_enum("Status")],
+                errors: None,
+            }],
+            generators: None,
+        };
+        let result = find_type_in_api(&api, "Status");
+        assert_eq!(result, Some(("shared".to_string(), true)));
+    }
+
+    #[test]
+    fn find_type_in_api_returns_none_for_unknown() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![simple_module("mymod")],
+            generators: None,
+        };
+        assert_eq!(find_type_in_api(&api, "Nonexistent"), None);
     }
 }
