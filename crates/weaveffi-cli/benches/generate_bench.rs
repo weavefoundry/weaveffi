@@ -158,7 +158,7 @@ fn bench_generate_all_large_api(c: &mut Criterion) {
             let dir = tempfile::tempdir().unwrap();
             let out = Utf8Path::from_path(dir.path()).unwrap();
             orchestrator
-                .run(black_box(&api), out, &config, true)
+                .run(black_box(&api), out, &config, true, None)
                 .unwrap();
         });
     });

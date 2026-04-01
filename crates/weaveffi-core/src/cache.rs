@@ -147,7 +147,7 @@ mod tests {
         };
 
         let orch = Orchestrator::new().with_generator(&gen);
-        orch.run(&api, out_dir, &config, false).unwrap();
+        orch.run(&api, out_dir, &config, false, None).unwrap();
 
         assert!(out_dir.join(CACHE_FILE).exists());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -165,10 +165,10 @@ mod tests {
         };
 
         let orch = Orchestrator::new().with_generator(&gen);
-        orch.run(&api, out_dir, &config, false).unwrap();
+        orch.run(&api, out_dir, &config, false, None).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        orch.run(&api, out_dir, &config, false).unwrap();
+        orch.run(&api, out_dir, &config, false, None).unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -188,7 +188,7 @@ mod tests {
         };
 
         let orch = Orchestrator::new().with_generator(&gen);
-        orch.run(&api, out_dir, &config, false).unwrap();
+        orch.run(&api, out_dir, &config, false, None).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let mut modified_api = api;
@@ -209,7 +209,8 @@ mod tests {
             r#async: false,
         });
 
-        orch.run(&modified_api, out_dir, &config, false).unwrap();
+        orch.run(&modified_api, out_dir, &config, false, None)
+            .unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
@@ -229,10 +230,10 @@ mod tests {
         };
 
         let orch = Orchestrator::new().with_generator(&gen);
-        orch.run(&api, out_dir, &config, true).unwrap();
+        orch.run(&api, out_dir, &config, true, None).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        orch.run(&api, out_dir, &config, true).unwrap();
+        orch.run(&api, out_dir, &config, true, None).unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,

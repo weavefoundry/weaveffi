@@ -19,6 +19,7 @@ pub struct GeneratorConfig {
     pub cpp_standard: Option<String>,
     #[serde(default)]
     pub strip_module_prefix: bool,
+    pub template_dir: Option<String>,
 }
 
 impl GeneratorConfig {
@@ -98,6 +99,7 @@ mod tests {
             cpp_header_name: Some("mylib.hpp".into()),
             cpp_standard: Some("20".into()),
             strip_module_prefix: true,
+            template_dir: None,
         };
 
         assert_eq!(cfg.swift_module_name(), "MySwift");
@@ -127,6 +129,7 @@ mod tests {
             cpp_header_name: None,
             cpp_standard: None,
             strip_module_prefix: true,
+            template_dir: None,
         };
 
         let json = serde_json::to_string(&cfg).unwrap();
