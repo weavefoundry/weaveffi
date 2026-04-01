@@ -1,6 +1,7 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use weaveffi_core::codegen::Generator;
+use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::c_symbol_name;
 use weaveffi_ir::ir::{Api, EnumDef, Function, StructDef, StructField, TypeRef};
 
@@ -34,6 +35,15 @@ impl Generator for PythonGenerator {
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
         self.generate_impl(api, out_dir, "weaveffi")
+    }
+
+    fn generate_with_config(
+        &self,
+        api: &Api,
+        out_dir: &Utf8Path,
+        config: &GeneratorConfig,
+    ) -> Result<()> {
+        self.generate_impl(api, out_dir, config.python_package_name())
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
@@ -783,6 +793,7 @@ fn render_pyi_function(out: &mut String, f: &Function) {
 mod tests {
     use super::*;
     use camino::Utf8Path;
+    use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{
         Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
     };
@@ -2692,5 +2703,66 @@ mod tests {
             py.contains("def _bytes_to_string("),
             "missing _bytes_to_string helper"
         );
+    }
+
+    #[test]
+    fn python_custom_package_name() {
+        let api = make_api(vec![simple_module(vec![Function {
+            name: "add".into(),
+            params: vec![
+                Param {
+                    name: "a".into(),
+                    ty: TypeRef::I32,
+                },
+                Param {
+                    name: "b".into(),
+                    ty: TypeRef::I32,
+                },
+            ],
+            returns: Some(TypeRef::I32),
+            doc: None,
+            r#async: false,
+        }])]);
+
+        let config = GeneratorConfig {
+            python_package_name: Some("my_bindings".into()),
+            ..Default::default()
+        };
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_py_custom_pkg");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        PythonGenerator
+            .generate_with_config(&api, out_dir, &config)
+            .unwrap();
+
+        assert!(
+            tmp.join("python/my_bindings/__init__.py").exists(),
+            "package dir should use custom name"
+        );
+        assert!(
+            tmp.join("python/my_bindings/weaveffi.py").exists(),
+            "module file should be inside custom package dir"
+        );
+
+        let pyproject = std::fs::read_to_string(tmp.join("python/pyproject.toml")).unwrap();
+        assert!(
+            pyproject.contains("name = \"my_bindings\""),
+            "pyproject.toml should use custom name: {pyproject}"
+        );
+        assert!(
+            pyproject.contains("packages = [\"my_bindings\"]"),
+            "pyproject.toml packages should use custom name: {pyproject}"
+        );
+
+        let setup = std::fs::read_to_string(tmp.join("python/setup.py")).unwrap();
+        assert!(
+            setup.contains("name=\"my_bindings\""),
+            "setup.py should use custom name: {setup}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

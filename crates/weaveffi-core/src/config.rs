@@ -12,6 +12,8 @@ pub struct GeneratorConfig {
     pub node_package_name: Option<String>,
     pub wasm_module_name: Option<String>,
     pub c_prefix: Option<String>,
+    pub python_package_name: Option<String>,
+    pub dotnet_namespace: Option<String>,
     #[serde(default)]
     pub strip_module_prefix: bool,
 }
@@ -36,6 +38,14 @@ impl GeneratorConfig {
     pub fn c_prefix(&self) -> &str {
         self.c_prefix.as_deref().unwrap_or("weaveffi")
     }
+
+    pub fn python_package_name(&self) -> &str {
+        self.python_package_name.as_deref().unwrap_or("weaveffi")
+    }
+
+    pub fn dotnet_namespace(&self) -> &str {
+        self.dotnet_namespace.as_deref().unwrap_or("WeaveFFI")
+    }
 }
 
 #[cfg(test)]
@@ -51,6 +61,8 @@ mod tests {
         assert_eq!(cfg.node_package_name(), "weaveffi");
         assert_eq!(cfg.wasm_module_name(), "weaveffi_wasm");
         assert_eq!(cfg.c_prefix(), "weaveffi");
+        assert_eq!(cfg.python_package_name(), "weaveffi");
+        assert_eq!(cfg.dotnet_namespace(), "WeaveFFI");
         assert!(!cfg.strip_module_prefix);
     }
 
@@ -62,6 +74,8 @@ mod tests {
             node_package_name: Some("my-node-pkg".into()),
             wasm_module_name: Some("my_wasm".into()),
             c_prefix: Some("myffi".into()),
+            python_package_name: Some("my_python_pkg".into()),
+            dotnet_namespace: Some("MyCompany.Bindings".into()),
             strip_module_prefix: true,
         };
 
@@ -70,6 +84,8 @@ mod tests {
         assert_eq!(cfg.node_package_name(), "my-node-pkg");
         assert_eq!(cfg.wasm_module_name(), "my_wasm");
         assert_eq!(cfg.c_prefix(), "myffi");
+        assert_eq!(cfg.python_package_name(), "my_python_pkg");
+        assert_eq!(cfg.dotnet_namespace(), "MyCompany.Bindings");
         assert!(cfg.strip_module_prefix);
     }
 
@@ -81,6 +97,8 @@ mod tests {
             node_package_name: None,
             wasm_module_name: None,
             c_prefix: None,
+            python_package_name: Some("mypkg".into()),
+            dotnet_namespace: None,
             strip_module_prefix: true,
         };
 
@@ -89,6 +107,8 @@ mod tests {
 
         assert_eq!(back.swift_module_name(), "S");
         assert_eq!(back.android_package(), "com.weaveffi");
+        assert_eq!(back.python_package_name(), "mypkg");
+        assert_eq!(back.dotnet_namespace(), "WeaveFFI");
         assert!(back.strip_module_prefix);
     }
 
