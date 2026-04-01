@@ -57,6 +57,7 @@ mod tests {
                     returns: Some(TypeRef::I32),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![],
                 enums: vec![],
@@ -111,6 +112,7 @@ mod tests {
             returns: Some(TypeRef::I32),
             doc: None,
             r#async: false,
+            cancellable: false,
         });
         let h2 = hash_api(&api);
 
@@ -208,6 +210,7 @@ mod tests {
             returns: Some(TypeRef::I32),
             doc: None,
             r#async: false,
+            cancellable: false,
         });
 
         orch.run(&modified_api, out_dir, &config, false, None)

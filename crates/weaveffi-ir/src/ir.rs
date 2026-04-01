@@ -36,6 +36,8 @@ pub struct Function {
     pub doc: Option<String>,
     #[serde(default, rename = "async")]
     pub r#async: bool,
+    #[serde(default)]
+    pub cancellable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -162,6 +162,7 @@ fn extract_function(item: &syn::ItemFn) -> Result<Function> {
         returns,
         doc: extract_doc(&item.attrs),
         r#async: false,
+        cancellable: false,
     })
 }
 

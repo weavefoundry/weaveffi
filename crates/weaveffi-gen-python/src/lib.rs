@@ -191,6 +191,270 @@ fn get_map_kv(ty: &TypeRef) -> Option<(&TypeRef, &TypeRef)> {
     }
 }
 
+/// `(param_name, ctypes_type)` pairs for async C callback parameters after `(context, err)`.
+fn py_async_cb_trailing_fields(ret: &Option<TypeRef>) -> Vec<(String, String)> {
+    match ret {
+        None => vec![],
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => vec![
+            ("result".into(), "ctypes.POINTER(ctypes.c_uint8)".into()),
+            ("result_len".into(), "ctypes.c_size_t".into()),
+        ],
+        Some(TypeRef::List(inner)) => vec![
+            (
+                "result".into(),
+                format!("ctypes.POINTER({})", py_ctypes_scalar(inner)),
+            ),
+            ("result_len".into(), "ctypes.c_size_t".into()),
+        ],
+        Some(TypeRef::Map(k, v)) => vec![
+            (
+                "result_keys".into(),
+                format!("ctypes.POINTER({})", py_ctypes_scalar(k)),
+            ),
+            (
+                "result_values".into(),
+                format!("ctypes.POINTER({})", py_ctypes_scalar(v)),
+            ),
+            ("result_len".into(), "ctypes.c_size_t".into()),
+        ],
+        Some(TypeRef::Optional(inner)) => {
+            if is_c_pointer_type(inner) {
+                py_async_cb_trailing_fields(&Some(*inner.clone()))
+            } else {
+                vec![(
+                    "result".into(),
+                    format!("ctypes.POINTER({})", py_ctypes_scalar(inner)),
+                )]
+            }
+        }
+        Some(TypeRef::Callback(_)) => todo!("async Python callback return type"),
+        Some(ty) => vec![("result".into(), py_ctypes_scalar(ty).to_string())],
+    }
+}
+
+fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &str) {
+    match ret {
+        None => {
+            out.push_str(&format!("{ind}_state[\"val\"] = None\n"));
+        }
+        Some(TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle) => {
+            out.push_str(&format!("{ind}_state[\"val\"] = result\n"));
+        }
+        Some(TypeRef::Bool) => {
+            out.push_str(&format!("{ind}_state[\"val\"] = bool(result)\n"));
+        }
+        Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
+            out.push_str(&format!(
+                "{ind}_s = _bytes_to_string(result) or \"\" if result else \"\"\n"
+            ));
+            out.push_str(&format!("{ind}if result:\n"));
+            out.push_str(&format!("{ind}    _lib.weaveffi_free_string(result)\n"));
+            out.push_str(&format!("{ind}_state[\"val\"] = _s\n"));
+        }
+        Some(TypeRef::Enum(name)) => {
+            out.push_str(&format!("{ind}_state[\"val\"] = {name}(result)\n"));
+        }
+        Some(TypeRef::Struct(name) | TypeRef::TypedHandle(name)) => {
+            out.push_str(&format!("{ind}if result is None:\n"));
+            out.push_str(&format!(
+                "{ind}    _state[\"err\"] = WeaveffiError(-1, \"null pointer\")\n"
+            ));
+            out.push_str(&format!("{ind}else:\n"));
+            out.push_str(&format!("{ind}    _state[\"val\"] = {name}(result)\n"));
+        }
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
+            out.push_str(&format!("{ind}if not result:\n"));
+            out.push_str(&format!("{ind}    _state[\"val\"] = b\"\"\n"));
+            out.push_str(&format!("{ind}else:\n"));
+            out.push_str(&format!("{ind}    _n = int(result_len)\n"));
+            out.push_str(&format!("{ind}    _state[\"val\"] = bytes(result[:_n])\n"));
+            out.push_str(&format!(
+                "{ind}    _lib.weaveffi_free_bytes(result, ctypes.c_size_t(_n))\n"
+            ));
+        }
+        Some(TypeRef::List(inner)) => {
+            let elem = py_read_element("result[_i]", inner);
+            out.push_str(&format!("{ind}if not result:\n"));
+            out.push_str(&format!("{ind}    _state[\"val\"] = []\n"));
+            out.push_str(&format!("{ind}else:\n"));
+            out.push_str(&format!("{ind}    _rl = int(result_len)\n"));
+            out.push_str(&format!(
+                "{ind}    _state[\"val\"] = [{elem} for _i in range(_rl)]\n"
+            ));
+        }
+        Some(TypeRef::Map(k, v)) => {
+            let kread = py_read_element("result_keys[_i]", k);
+            let vread = py_read_element("result_values[_i]", v);
+            out.push_str(&format!("{ind}if not result_keys or not result_values:\n"));
+            out.push_str(&format!("{ind}    _state[\"val\"] = {{}}\n"));
+            out.push_str(&format!("{ind}else:\n"));
+            out.push_str(&format!("{ind}    _ml = int(result_len)\n"));
+            out.push_str(&format!(
+                "{ind}    _state[\"val\"] = {{{kread}: {vread} for _i in range(_ml)}}\n"
+            ));
+        }
+        Some(TypeRef::Optional(inner)) => {
+            if is_c_pointer_type(inner) {
+                match inner.as_ref() {
+                    TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                        out.push_str(&format!("{ind}if not result:\n"));
+                        out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
+                        out.push_str(&format!("{ind}else:\n"));
+                        out.push_str(&format!("{ind}    _s = _bytes_to_string(result)\n"));
+                        out.push_str(&format!("{ind}    _lib.weaveffi_free_string(result)\n"));
+                        out.push_str(&format!("{ind}    _state[\"val\"] = _s\n"));
+                    }
+                    TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+                        out.push_str(&format!("{ind}if not result:\n"));
+                        out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
+                        out.push_str(&format!("{ind}else:\n"));
+                        out.push_str(&format!("{ind}    _state[\"val\"] = {name}(result)\n"));
+                    }
+                    TypeRef::Bytes | TypeRef::BorrowedBytes => {
+                        out.push_str(&format!("{ind}if not result:\n"));
+                        out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
+                        out.push_str(&format!("{ind}else:\n"));
+                        out.push_str(&format!("{ind}    _n = int(result_len)\n"));
+                        out.push_str(&format!("{ind}    _b = bytes(result[:_n])\n"));
+                        out.push_str(&format!(
+                            "{ind}    _lib.weaveffi_free_bytes(result, ctypes.c_size_t(_n))\n"
+                        ));
+                        out.push_str(&format!("{ind}    _state[\"val\"] = _b\n"));
+                    }
+                    TypeRef::List(elem) => {
+                        let read = py_read_element("result[_i]", elem);
+                        out.push_str(&format!("{ind}if not result:\n"));
+                        out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
+                        out.push_str(&format!("{ind}else:\n"));
+                        out.push_str(&format!("{ind}    _rl = int(result_len)\n"));
+                        out.push_str(&format!(
+                            "{ind}    _state[\"val\"] = [{read} for _i in range(_rl)]\n"
+                        ));
+                    }
+                    TypeRef::Map(k, v) => {
+                        let kread = py_read_element("result_keys[_i]", k);
+                        let vread = py_read_element("result_values[_i]", v);
+                        out.push_str(&format!("{ind}if not result_keys or not result_values:\n"));
+                        out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
+                        out.push_str(&format!("{ind}else:\n"));
+                        out.push_str(&format!("{ind}    _ml = int(result_len)\n"));
+                        out.push_str(&format!(
+                            "{ind}    _state[\"val\"] = {{{kread}: {vread} for _i in range(_ml)}}\n"
+                        ));
+                    }
+                    _ => append_async_success_handler(out, &Some(*inner.clone()), ind),
+                }
+            } else {
+                match inner.as_ref() {
+                    TypeRef::Bool => {
+                        out.push_str(&format!("{ind}if not result:\n"));
+                        out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
+                        out.push_str(&format!("{ind}else:\n"));
+                        out.push_str(&format!("{ind}    _state[\"val\"] = bool(result[0])\n"));
+                    }
+                    TypeRef::Enum(name) => {
+                        out.push_str(&format!("{ind}if not result:\n"));
+                        out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
+                        out.push_str(&format!("{ind}else:\n"));
+                        out.push_str(&format!("{ind}    _state[\"val\"] = {name}(result[0])\n"));
+                    }
+                    _ => {
+                        out.push_str(&format!("{ind}if not result:\n"));
+                        out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
+                        out.push_str(&format!("{ind}else:\n"));
+                        out.push_str(&format!("{ind}    _state[\"val\"] = result[0]\n"));
+                    }
+                }
+            }
+        }
+        Some(TypeRef::Callback(_)) => todo!("async Python callback return type"),
+    }
+}
+
+fn render_async_ffi_call_body(out: &mut String, module_name: &str, f: &Function) {
+    let c_sym = c_symbol_name(module_name, &f.name);
+    let c_async = format!("{c_sym}_async");
+    let ind = "    ";
+
+    out.push_str(&format!("{ind}_fn = _lib.{c_async}\n"));
+    out.push_str(&format!("{ind}_ev = threading.Event()\n"));
+    out.push_str(&format!("{ind}_state = {{\"err\": None, \"val\": None}}\n"));
+
+    let trailing = py_async_cb_trailing_fields(&f.returns);
+    let mut cb_param_list: Vec<String> = vec!["context".into(), "err".into()];
+    cb_param_list.extend(trailing.iter().map(|(n, _)| n.clone()));
+    let cb_params_joined = cb_param_list.join(", ");
+
+    out.push_str(&format!("{ind}def _cb_impl({cb_params_joined}):\n"));
+    out.push_str(&format!("{ind}    try:\n"));
+    out.push_str(&format!(
+        "{ind}        if err and err.contents.code != 0:\n"
+    ));
+    out.push_str(&format!("{ind}            _code = err.contents.code\n"));
+    out.push_str(&format!(
+        "{ind}            _msg = err.contents.message.decode(\"utf-8\") if err.contents.message else \"\"\n"
+    ));
+    out.push_str(&format!(
+        "{ind}            _lib.weaveffi_error_clear(ctypes.byref(err.contents))\n"
+    ));
+    out.push_str(&format!(
+        "{ind}            _state[\"err\"] = WeaveffiError(_code, _msg)\n"
+    ));
+    out.push_str(&format!("{ind}        else:\n"));
+    append_async_success_handler(out, &f.returns, "            ");
+    out.push_str(&format!("{ind}    finally:\n"));
+    out.push_str(&format!("{ind}        _ev.set()\n"));
+
+    let mut cf_parts: Vec<String> = vec![
+        "ctypes.c_void_p".into(),
+        "ctypes.POINTER(_WeaveffiErrorStruct)".into(),
+    ];
+    cf_parts.extend(trailing.iter().map(|(_, t)| t.clone()));
+    out.push_str(&format!(
+        "{ind}_cb_type = ctypes.CFUNCTYPE(None, {})\n",
+        cf_parts.join(", ")
+    ));
+    out.push_str(&format!("{ind}_cb = _cb_type(_cb_impl)\n"));
+
+    let mut argtypes: Vec<String> = Vec::new();
+    for p in &f.params {
+        argtypes.extend(py_param_argtypes(&p.ty));
+    }
+    if f.cancellable {
+        argtypes.push("ctypes.c_void_p".into());
+    }
+    argtypes.push("_cb_type".into());
+    argtypes.push("ctypes.c_void_p".into());
+
+    out.push_str(&format!("{ind}_fn.argtypes = [{}]\n", argtypes.join(", ")));
+    out.push_str(&format!("{ind}_fn.restype = None\n"));
+
+    for p in &f.params {
+        for line in py_param_conversion(&p.name, &p.ty, ind) {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+
+    let mut call_args: Vec<String> = Vec::new();
+    for p in &f.params {
+        call_args.extend(py_param_call_args(&p.name, &p.ty));
+    }
+    if f.cancellable {
+        call_args.push("None".into());
+    }
+    call_args.push("_cb".into());
+    call_args.push("None".into());
+
+    out.push_str(&format!("{ind}_fn({})\n", call_args.join(", ")));
+    out.push_str(&format!("{ind}_ev.wait()\n"));
+    out.push_str(&format!("{ind}if _state[\"err\"] is not None:\n"));
+    out.push_str(&format!("{ind}    raise _state[\"err\"]\n"));
+    if f.returns.is_some() {
+        out.push_str(&format!("{ind}return _state[\"val\"]\n"));
+    }
+}
+
 // ── Rendering ──
 
 fn render_python_module(api: &Api, strip_module_prefix: bool) -> String {
@@ -201,7 +465,7 @@ fn render_python_module(api: &Api, strip_module_prefix: bool) -> String {
         .iter()
         .any(|m| m.functions.iter().any(|f| f.r#async));
     if has_async {
-        out.push_str("\nimport asyncio\n");
+        out.push_str("\nimport asyncio\nimport threading\n");
     }
     for m in &api.modules {
         out.push_str(&format!("\n\n# === Module: {} ===", m.name));
@@ -403,80 +667,84 @@ fn render_function(out: &mut String, module_name: &str, f: &Function, strip_modu
         ret_hint
     ));
 
-    let c_sym = c_symbol_name(module_name, &f.name);
     let ind = "    ";
 
-    out.push_str(&format!("{ind}_fn = _lib.{c_sym}\n"));
-
-    let mut argtypes: Vec<String> = Vec::new();
-    for p in &f.params {
-        argtypes.extend(py_param_argtypes(&p.ty));
-    }
-    let mut out_ret_argtypes = Vec::new();
-    let restype;
-    if let Some(ret_ty) = &f.returns {
-        let (rt, oat) = py_return_info(ret_ty);
-        argtypes.extend(oat.iter().cloned());
-        restype = rt;
-        out_ret_argtypes = oat;
+    if f.r#async {
+        render_async_ffi_call_body(out, module_name, f);
     } else {
-        restype = "None".to_string();
-    }
-    argtypes.push("ctypes.POINTER(_WeaveffiErrorStruct)".into());
+        let c_sym = c_symbol_name(module_name, &f.name);
+        out.push_str(&format!("{ind}_fn = _lib.{c_sym}\n"));
 
-    out.push_str(&format!("{ind}_fn.argtypes = [{}]\n", argtypes.join(", ")));
-    out.push_str(&format!("{ind}_fn.restype = {restype}\n"));
-
-    for p in &f.params {
-        for line in py_param_conversion(&p.name, &p.ty, ind) {
-            out.push_str(&line);
-            out.push('\n');
+        let mut argtypes: Vec<String> = Vec::new();
+        for p in &f.params {
+            argtypes.extend(py_param_argtypes(&p.ty));
         }
-    }
+        let mut out_ret_argtypes = Vec::new();
+        let restype;
+        if let Some(ret_ty) = &f.returns {
+            let (rt, oat) = py_return_info(ret_ty);
+            argtypes.extend(oat.iter().cloned());
+            restype = rt;
+            out_ret_argtypes = oat;
+        } else {
+            restype = "None".to_string();
+        }
+        argtypes.push("ctypes.POINTER(_WeaveffiErrorStruct)".into());
 
-    out.push_str(&format!("{ind}_err = _WeaveffiErrorStruct()\n"));
+        out.push_str(&format!("{ind}_fn.argtypes = [{}]\n", argtypes.join(", ")));
+        out.push_str(&format!("{ind}_fn.restype = {restype}\n"));
 
-    let is_map_ret = f.returns.as_ref().and_then(get_map_kv).is_some();
-    let has_out_len = !out_ret_argtypes.is_empty() && !is_map_ret;
+        for p in &f.params {
+            for line in py_param_conversion(&p.name, &p.ty, ind) {
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
 
-    if let Some((k, v)) = f.returns.as_ref().and_then(get_map_kv) {
-        out.push_str(&format!(
-            "{ind}_out_keys = ctypes.POINTER({})()\n",
-            py_ctypes_scalar(k)
-        ));
-        out.push_str(&format!(
-            "{ind}_out_values = ctypes.POINTER({})()\n",
-            py_ctypes_scalar(v)
-        ));
-        out.push_str(&format!("{ind}_out_len = ctypes.c_size_t(0)\n"));
-    } else if has_out_len {
-        out.push_str(&format!("{ind}_out_len = ctypes.c_size_t(0)\n"));
-    }
+        out.push_str(&format!("{ind}_err = _WeaveffiErrorStruct()\n"));
 
-    let mut call_args: Vec<String> = Vec::new();
-    for p in &f.params {
-        call_args.extend(py_param_call_args(&p.name, &p.ty));
-    }
-    if is_map_ret {
-        call_args.push("ctypes.byref(_out_keys)".into());
-        call_args.push("ctypes.byref(_out_values)".into());
-        call_args.push("ctypes.byref(_out_len)".into());
-    } else if has_out_len {
-        call_args.push("ctypes.byref(_out_len)".into());
-    }
-    call_args.push("ctypes.byref(_err)".into());
+        let is_map_ret = f.returns.as_ref().and_then(get_map_kv).is_some();
+        let has_out_len = !out_ret_argtypes.is_empty() && !is_map_ret;
 
-    let call_expr = format!("_fn({})", call_args.join(", "));
-    if f.returns.is_some() && !is_map_ret {
-        out.push_str(&format!("{ind}_result = {call_expr}\n"));
-    } else {
-        out.push_str(&format!("{ind}{call_expr}\n"));
-    }
+        if let Some((k, v)) = f.returns.as_ref().and_then(get_map_kv) {
+            out.push_str(&format!(
+                "{ind}_out_keys = ctypes.POINTER({})()\n",
+                py_ctypes_scalar(k)
+            ));
+            out.push_str(&format!(
+                "{ind}_out_values = ctypes.POINTER({})()\n",
+                py_ctypes_scalar(v)
+            ));
+            out.push_str(&format!("{ind}_out_len = ctypes.c_size_t(0)\n"));
+        } else if has_out_len {
+            out.push_str(&format!("{ind}_out_len = ctypes.c_size_t(0)\n"));
+        }
 
-    out.push_str(&format!("{ind}_check_error(_err)\n"));
+        let mut call_args: Vec<String> = Vec::new();
+        for p in &f.params {
+            call_args.extend(py_param_call_args(&p.name, &p.ty));
+        }
+        if is_map_ret {
+            call_args.push("ctypes.byref(_out_keys)".into());
+            call_args.push("ctypes.byref(_out_values)".into());
+            call_args.push("ctypes.byref(_out_len)".into());
+        } else if has_out_len {
+            call_args.push("ctypes.byref(_out_len)".into());
+        }
+        call_args.push("ctypes.byref(_err)".into());
 
-    if let Some(ret_ty) = &f.returns {
-        render_return_value(out, ret_ty, ind);
+        let call_expr = format!("_fn({})", call_args.join(", "));
+        if f.returns.is_some() && !is_map_ret {
+            out.push_str(&format!("{ind}_result = {call_expr}\n"));
+        } else {
+            out.push_str(&format!("{ind}{call_expr}\n"));
+        }
+
+        out.push_str(&format!("{ind}_check_error(_err)\n"));
+
+        if let Some(ret_ty) = &f.returns {
+            render_return_value(out, ret_ty, ind);
+        }
     }
 
     if f.r#async {
@@ -917,6 +1185,7 @@ mod tests {
             returns: Some(TypeRef::I32),
             doc: None,
             r#async: false,
+            cancellable: false,
         }])]);
 
         let tmp = std::env::temp_dir().join("weaveffi_test_python_gen_output");
@@ -1004,6 +1273,7 @@ mod tests {
             returns: Some(TypeRef::I32),
             doc: None,
             r#async: false,
+            cancellable: false,
         }])]);
 
         let py = render_python_module(&api, true);
@@ -1043,6 +1313,7 @@ mod tests {
                 returns: Some(TypeRef::StringUtf8),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             structs: vec![],
             enums: vec![],
@@ -1073,6 +1344,7 @@ mod tests {
             returns: None,
             doc: None,
             r#async: false,
+            cancellable: false,
         }])]);
 
         let py = render_python_module(&api, true);
@@ -1147,6 +1419,7 @@ mod tests {
                 returns: Some(TypeRef::Enum("Color".into())),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             structs: vec![],
             enums: vec![],
@@ -1241,6 +1514,7 @@ mod tests {
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             structs: vec![],
             enums: vec![],
@@ -1273,6 +1547,7 @@ mod tests {
             returns: Some(TypeRef::Bool),
             doc: None,
             r#async: false,
+            cancellable: false,
         }])]);
 
         let py = render_python_module(&api, true);
@@ -1300,6 +1575,7 @@ mod tests {
             returns: Some(TypeRef::Handle),
             doc: None,
             r#async: false,
+            cancellable: false,
         }])]);
 
         let py = render_python_module(&api, true);
@@ -1322,6 +1598,7 @@ mod tests {
                 returns: Some(TypeRef::Bytes),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             structs: vec![],
             enums: vec![],
@@ -1352,6 +1629,7 @@ mod tests {
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::I32))),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             structs: vec![],
             enums: vec![],
@@ -1392,6 +1670,7 @@ mod tests {
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             structs: vec![],
             enums: vec![],
@@ -1423,6 +1702,7 @@ mod tests {
                     returns: None,
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "get_ids".into(),
@@ -1430,6 +1710,7 @@ mod tests {
                     returns: Some(TypeRef::List(Box::new(TypeRef::I32))),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
             ],
             structs: vec![],
@@ -1468,6 +1749,7 @@ mod tests {
                     returns: None,
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "get_scores".into(),
@@ -1478,6 +1760,7 @@ mod tests {
                     )),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
             ],
             structs: vec![],
@@ -1626,6 +1909,7 @@ mod tests {
                     returns: Some(TypeRef::Handle),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "get_contact".into(),
@@ -1636,6 +1920,7 @@ mod tests {
                     returns: Some(TypeRef::Struct("Contact".into())),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "list_contacts".into(),
@@ -1643,6 +1928,7 @@ mod tests {
                     returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "count_contacts".into(),
@@ -1650,6 +1936,7 @@ mod tests {
                     returns: Some(TypeRef::I32),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
             ],
             errors: None,
@@ -1744,6 +2031,7 @@ mod tests {
                 returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Item".into())))),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             structs: vec![],
             enums: vec![],
@@ -1861,6 +2149,7 @@ mod tests {
                     returns: Some(TypeRef::Handle),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "get_contact".into(),
@@ -1871,6 +2160,7 @@ mod tests {
                     returns: Some(TypeRef::Struct("Contact".into())),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "delete_contact".into(),
@@ -1881,6 +2171,7 @@ mod tests {
                     returns: None,
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
             ],
             errors: None,
@@ -1972,6 +2263,7 @@ mod tests {
             returns: Some(TypeRef::I32),
             doc: None,
             r#async: false,
+            cancellable: false,
         }])]);
 
         let tmp = std::env::temp_dir().join("weaveffi_test_py_basic");
@@ -2075,6 +2367,7 @@ mod tests {
                 returns: Some(TypeRef::Enum("ContactType".into())),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             structs: vec![],
             enums: vec![EnumDef {
@@ -2139,6 +2432,7 @@ mod tests {
                     returns: Some(TypeRef::Optional(Box::new(TypeRef::I32))),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "find_name".into(),
@@ -2149,6 +2443,7 @@ mod tests {
                     returns: Some(TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "find_contact".into(),
@@ -2158,6 +2453,7 @@ mod tests {
                     )))),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "find_flag".into(),
@@ -2165,6 +2461,7 @@ mod tests {
                     returns: Some(TypeRef::Optional(Box::new(TypeRef::Bool))),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
             ],
             structs: vec![],
@@ -2237,6 +2534,7 @@ mod tests {
                     returns: None,
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "get_names".into(),
@@ -2244,6 +2542,7 @@ mod tests {
                     returns: Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "get_items".into(),
@@ -2251,6 +2550,7 @@ mod tests {
                     returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Item".into())))),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
             ],
             structs: vec![],
@@ -2304,6 +2604,7 @@ mod tests {
                     returns: None,
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "get_config".into(),
@@ -2314,6 +2615,7 @@ mod tests {
                     )),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
             ],
             structs: vec![],
@@ -2442,6 +2744,7 @@ mod tests {
                     returns: Some(TypeRef::Handle),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "get_contact".into(),
@@ -2452,6 +2755,7 @@ mod tests {
                     returns: Some(TypeRef::Struct("Contact".into())),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "list_contacts".into(),
@@ -2459,6 +2763,7 @@ mod tests {
                     returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "delete_contact".into(),
@@ -2469,6 +2774,7 @@ mod tests {
                     returns: None,
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
             ],
             errors: None,
@@ -2577,6 +2883,7 @@ mod tests {
                     returns: Some(TypeRef::Handle),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "get_contact".into(),
@@ -2587,6 +2894,7 @@ mod tests {
                     returns: Some(TypeRef::Struct("Contact".into())),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "list_contacts".into(),
@@ -2594,6 +2902,7 @@ mod tests {
                     returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "delete_contact".into(),
@@ -2604,6 +2913,7 @@ mod tests {
                     returns: Some(TypeRef::Bool),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
                 Function {
                     name: "count_contacts".into(),
@@ -2611,6 +2921,7 @@ mod tests {
                     returns: Some(TypeRef::I32),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 },
             ],
             errors: None,
@@ -2701,6 +3012,7 @@ mod tests {
             returns: Some(TypeRef::I32),
             doc: None,
             r#async: false,
+            cancellable: false,
         }])]);
 
         let tmp = std::env::temp_dir().join("weaveffi_test_python_packaging");
@@ -2802,6 +3114,7 @@ mod tests {
             returns: Some(TypeRef::I32),
             doc: None,
             r#async: false,
+            cancellable: false,
         }])]);
 
         let config = GeneratorConfig {
@@ -2859,6 +3172,7 @@ mod tests {
                 returns: Some(TypeRef::I32),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             structs: vec![],
             enums: vec![],
@@ -2940,6 +3254,7 @@ mod tests {
                 returns: None,
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             structs: vec![StructDef {
                 name: "Contact".into(),
@@ -2976,6 +3291,7 @@ mod tests {
                 returns: None,
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             structs: vec![],
             enums: vec![],
@@ -3004,6 +3320,7 @@ mod tests {
                 returns: None,
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             structs: vec![StructDef {
                 name: "Contact".into(),
@@ -3059,6 +3376,7 @@ mod tests {
                     returns: None,
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![StructDef {
                     name: "Contact".into(),
@@ -3102,6 +3420,7 @@ mod tests {
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             structs: vec![StructDef {
                 name: "Contact".into(),
@@ -3188,6 +3507,7 @@ mod tests {
                 )))),
                 doc: None,
                 r#async: false,
+                cancellable: false,
             }],
             structs: vec![StructDef {
                 name: "Contact".into(),
@@ -3231,6 +3551,7 @@ mod tests {
             returns: Some(TypeRef::StringUtf8),
             doc: None,
             r#async: true,
+            cancellable: false,
         }])]);
         let code = render_python_module(&api, true);
         assert!(
@@ -3266,6 +3587,7 @@ mod tests {
             returns: Some(TypeRef::StringUtf8),
             doc: None,
             r#async: true,
+            cancellable: false,
         }])]);
         let stubs = render_pyi_module(&api, true);
         assert!(

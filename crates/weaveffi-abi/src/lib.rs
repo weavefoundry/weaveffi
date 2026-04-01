@@ -8,6 +8,7 @@ pub mod arena;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Public opaque handle type exposed to foreign callers.
 pub type weaveffi_handle_t = u64;
@@ -119,6 +120,53 @@ pub fn free_bytes(ptr: *mut u8, len: usize) {
 /// Clear an error by freeing any message and zeroing fields.
 pub fn error_clear(err: *mut weaveffi_error) {
     error_set_ok(err);
+}
+
+/// Opaque cancellation token passed across the C ABI boundary.
+///
+/// Foreign callers obtain a token via `weaveffi_cancel_token_create`, signal
+/// cancellation with `weaveffi_cancel_token_cancel`, and release it with
+/// `weaveffi_cancel_token_destroy`.
+#[repr(C)]
+pub struct weaveffi_cancel_token {
+    cancelled: AtomicBool,
+}
+
+/// Allocate a new cancel token. The caller owns the returned pointer and must
+/// eventually call `weaveffi_cancel_token_destroy`.
+pub fn cancel_token_create() -> *mut weaveffi_cancel_token {
+    Box::into_raw(Box::new(weaveffi_cancel_token {
+        cancelled: AtomicBool::new(false),
+    }))
+}
+
+/// Signal cancellation on the token (thread-safe).
+pub fn cancel_token_cancel(token: *mut weaveffi_cancel_token) {
+    if token.is_null() {
+        return;
+    }
+    // SAFETY: pointer checked for null above
+    let t = unsafe { &*token };
+    t.cancelled.store(true, Ordering::Release);
+}
+
+/// Check whether the token has been cancelled (thread-safe).
+pub fn cancel_token_is_cancelled(token: *const weaveffi_cancel_token) -> bool {
+    if token.is_null() {
+        return false;
+    }
+    // SAFETY: pointer checked for null above
+    let t = unsafe { &*token };
+    t.cancelled.load(Ordering::Acquire)
+}
+
+/// Destroy a cancel token previously created by `cancel_token_create`.
+pub fn cancel_token_destroy(token: *mut weaveffi_cancel_token) {
+    if token.is_null() {
+        return;
+    }
+    // SAFETY: pointer was returned from `Box::into_raw` in `cancel_token_create`
+    unsafe { drop(Box::from_raw(token)) };
 }
 
 /// Convert a NUL-terminated C string pointer to an owned `String`.
@@ -242,5 +290,22 @@ mod tests {
     #[test]
     fn c_ptr_to_string_null_returns_none() {
         assert_eq!(c_ptr_to_string(ptr::null()), None);
+    }
+
+    #[test]
+    fn cancel_token_lifecycle() {
+        let token = cancel_token_create();
+        assert!(!token.is_null());
+        assert!(!cancel_token_is_cancelled(token));
+        cancel_token_cancel(token);
+        assert!(cancel_token_is_cancelled(token));
+        cancel_token_destroy(token);
+    }
+
+    #[test]
+    fn cancel_token_null_is_safe() {
+        cancel_token_cancel(ptr::null_mut());
+        assert!(!cancel_token_is_cancelled(ptr::null()));
+        cancel_token_destroy(ptr::null_mut());
     }
 }

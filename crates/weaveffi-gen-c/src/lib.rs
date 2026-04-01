@@ -228,6 +228,21 @@ fn render_c_header(api: &Api, prefix: &str) -> String {
     out.push_str(&format!(
         "void {prefix}_free_bytes(uint8_t* ptr, size_t len);\n\n"
     ));
+    out.push_str(&format!(
+        "typedef struct {prefix}_cancel_token {prefix}_cancel_token;\n"
+    ));
+    out.push_str(&format!(
+        "{prefix}_cancel_token* {prefix}_cancel_token_create(void);\n"
+    ));
+    out.push_str(&format!(
+        "void {prefix}_cancel_token_cancel({prefix}_cancel_token* token);\n"
+    ));
+    out.push_str(&format!(
+        "bool {prefix}_cancel_token_is_cancelled(const {prefix}_cancel_token* token);\n"
+    ));
+    out.push_str(&format!(
+        "void {prefix}_cancel_token_destroy({prefix}_cancel_token* token);\n\n"
+    ));
     out.push_str("/*\n");
     out.push_str(" * Map convention: Maps are passed as parallel arrays of keys and values.\n");
     out.push_str(" * A map parameter {K:V} named \"m\" expands to:\n");
@@ -316,6 +331,9 @@ fn render_module_header(out: &mut String, module: &Module, prefix: &str) {
             out.push_str(" */\n");
 
             let mut params_sig = c_params_sig(&f.params, &module.name, prefix);
+            if f.cancellable {
+                params_sig.push(format!("{prefix}_cancel_token* cancel_token"));
+            }
             params_sig.push(format!("{cb_name} callback"));
             params_sig.push("void* context".to_string());
             out.push_str(&format!(
@@ -380,6 +398,7 @@ mod tests {
                         returns: Some(TypeRef::I32),
                         doc: None,
                         r#async: false,
+                        cancellable: false,
                     },
                     Function {
                         name: "echo".to_string(),
@@ -390,6 +409,7 @@ mod tests {
                         returns: Some(TypeRef::StringUtf8),
                         doc: None,
                         r#async: false,
+                        cancellable: false,
                     },
                 ],
                 errors: None,
@@ -730,6 +750,7 @@ mod tests {
                         returns: Some(TypeRef::Optional(Box::new(TypeRef::I32))),
                         doc: None,
                         r#async: false,
+                        cancellable: false,
                     },
                     Function {
                         name: "list_ids".to_string(),
@@ -740,6 +761,7 @@ mod tests {
                         returns: Some(TypeRef::List(Box::new(TypeRef::I32))),
                         doc: None,
                         r#async: false,
+                        cancellable: false,
                     },
                 ],
                 structs: vec![],
@@ -844,6 +866,7 @@ mod tests {
                         returns: Some(TypeRef::Handle),
                         doc: None,
                         r#async: false,
+                        cancellable: false,
                     },
                     Function {
                         name: "get_contact".to_string(),
@@ -854,6 +877,7 @@ mod tests {
                         returns: Some(TypeRef::Struct("Contact".to_string())),
                         doc: None,
                         r#async: false,
+                        cancellable: false,
                     },
                     Function {
                         name: "list_contacts".to_string(),
@@ -863,6 +887,7 @@ mod tests {
                         )))),
                         doc: None,
                         r#async: false,
+                        cancellable: false,
                     },
                     Function {
                         name: "delete_contact".to_string(),
@@ -873,6 +898,7 @@ mod tests {
                         returns: Some(TypeRef::Bool),
                         doc: None,
                         r#async: false,
+                        cancellable: false,
                     },
                     Function {
                         name: "count_contacts".to_string(),
@@ -880,6 +906,7 @@ mod tests {
                         returns: Some(TypeRef::I32),
                         doc: None,
                         r#async: false,
+                        cancellable: false,
                     },
                 ],
                 errors: None,
@@ -999,6 +1026,7 @@ mod tests {
                     returns: Some(TypeRef::Enum("Color".into())),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![],
                 enums: vec![EnumDef {
@@ -1080,6 +1108,7 @@ mod tests {
                     returns: None,
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![],
                 enums: vec![],
@@ -1122,6 +1151,7 @@ mod tests {
                     returns: Some(TypeRef::I32),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![],
                 enums: vec![],
@@ -1177,6 +1207,7 @@ mod tests {
                     returns: None,
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![StructDef {
                     name: "Contact".into(),
@@ -1225,6 +1256,7 @@ mod tests {
                     returns: None,
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![],
                 enums: vec![],
@@ -1262,6 +1294,7 @@ mod tests {
                     returns: Some(TypeRef::TypedHandle("Contact".into())),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![StructDef {
                     name: "Contact".into(),
@@ -1321,6 +1354,7 @@ mod tests {
                     returns: None,
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![],
                 enums: vec![],
@@ -1362,6 +1396,7 @@ mod tests {
                     returns: None,
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![StructDef {
                     name: "Contact".into(),
@@ -1427,6 +1462,7 @@ mod tests {
                     returns: Some(TypeRef::Struct("Contact".to_string())),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![StructDef {
                     name: "Contact".to_string(),
@@ -1483,6 +1519,7 @@ mod tests {
                         returns: Some(TypeRef::I32),
                         doc: None,
                         r#async: true,
+                        cancellable: false,
                     },
                     Function {
                         name: "fire".to_string(),
@@ -1490,6 +1527,7 @@ mod tests {
                         returns: None,
                         doc: None,
                         r#async: true,
+                        cancellable: false,
                     },
                 ],
                 structs: vec![],
@@ -1527,6 +1565,7 @@ mod tests {
                     returns: Some(TypeRef::I32),
                     doc: None,
                     r#async: true,
+                    cancellable: false,
                 }],
                 structs: vec![],
                 enums: vec![],
@@ -1567,6 +1606,7 @@ mod tests {
                     )))),
                     doc: None,
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![],
                 enums: vec![],
@@ -1588,6 +1628,70 @@ mod tests {
         assert!(
             !header.contains("bool*"),
             "optional struct should not add bool* out-param: {header}"
+        );
+    }
+
+    #[test]
+    fn c_cancellable_async_has_token() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "tasks".to_string(),
+                functions: vec![
+                    Function {
+                        name: "run".to_string(),
+                        params: vec![Param {
+                            name: "id".to_string(),
+                            ty: TypeRef::I32,
+                        }],
+                        returns: Some(TypeRef::I32),
+                        doc: None,
+                        r#async: true,
+                        cancellable: true,
+                    },
+                    Function {
+                        name: "fire".to_string(),
+                        params: vec![],
+                        returns: None,
+                        doc: None,
+                        r#async: true,
+                        cancellable: false,
+                    },
+                ],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+            generators: None,
+        };
+
+        let header = render_c_header(&api, "weaveffi");
+
+        assert!(
+            header.contains("weaveffi_cancel_token* cancel_token"),
+            "cancellable async should have cancel_token param: {header}"
+        );
+        assert!(
+            header.contains("void weaveffi_tasks_run_async(int32_t id, weaveffi_cancel_token* cancel_token, weaveffi_tasks_run_callback callback, void* context);"),
+            "cancellable async should have cancel_token before callback: {header}"
+        );
+
+        let fire_line = header
+            .lines()
+            .find(|l| l.contains("weaveffi_tasks_fire_async"))
+            .expect("fire_async should be present");
+        assert!(
+            !fire_line.contains("cancel_token"),
+            "non-cancellable async should NOT have cancel_token: {fire_line}"
+        );
+
+        assert!(
+            header.contains("weaveffi_cancel_token_create"),
+            "header should declare cancel_token_create: {header}"
+        );
+        assert!(
+            header.contains("weaveffi_cancel_token_destroy"),
+            "header should declare cancel_token_destroy: {header}"
         );
     }
 }

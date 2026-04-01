@@ -245,6 +245,7 @@ mod tests {
                     returns: Some(TypeRef::I32),
                     doc: Some("Add two numbers".into()),
                     r#async: false,
+                    cancellable: false,
                 }],
                 structs: vec![StructDef {
                     name: "Point".into(),
