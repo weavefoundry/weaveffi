@@ -408,7 +408,7 @@ fn cmd_generate(
 
     if dry_run {
         for gen in &selected {
-            for path in gen.output_files(&api, out_dir) {
+            for path in gen.output_files_with_config(&api, out_dir, &config) {
                 println!("{path}");
             }
         }
