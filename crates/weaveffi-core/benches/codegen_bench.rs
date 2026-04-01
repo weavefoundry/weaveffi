@@ -27,6 +27,8 @@ fn calculator_api() -> Api {
                     returns: Some(TypeRef::I32),
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 },
                 Function {
                     name: "mul".to_string(),
@@ -46,6 +48,8 @@ fn calculator_api() -> Api {
                     returns: Some(TypeRef::I32),
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 },
                 Function {
                     name: "div".to_string(),
@@ -65,6 +69,8 @@ fn calculator_api() -> Api {
                     returns: Some(TypeRef::I32),
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 },
                 Function {
                     name: "echo".to_string(),
@@ -77,6 +83,8 @@ fn calculator_api() -> Api {
                     returns: Some(TypeRef::StringUtf8),
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 },
             ],
             structs: vec![],
@@ -103,16 +111,19 @@ fn large_api() -> Api {
                             name: "id".to_string(),
                             ty: TypeRef::I32,
                             doc: None,
+                            default: None,
                         },
                         StructField {
                             name: "name".to_string(),
                             ty: TypeRef::StringUtf8,
                             doc: None,
+                            default: None,
                         },
                         StructField {
                             name: "active".to_string(),
                             ty: TypeRef::Bool,
                             doc: None,
+                            default: None,
                         },
                     ],
                     builder: false,
@@ -169,6 +180,8 @@ fn large_api() -> Api {
                     )))),
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 })
                 .collect();
 

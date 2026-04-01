@@ -392,6 +392,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
             vec![],
         );
@@ -419,6 +421,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
             vec![],
         );
@@ -441,6 +445,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
             vec![],
         );
@@ -465,6 +471,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
             vec![],
         );
@@ -487,11 +495,13 @@ mod tests {
                         name: "x".into(),
                         ty: TypeRef::F64,
                         doc: None,
+                        default: None,
                     },
                     StructField {
                         name: "y".into(),
                         ty: TypeRef::F64,
                         doc: None,
+                        default: None,
                     },
                 ],
                 builder: false,
@@ -532,6 +542,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
+                    default: None,
                 }],
                 builder: false,
             }],
@@ -557,6 +568,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
             vec![],
         );
@@ -581,6 +594,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
             vec![],
         );
@@ -605,6 +620,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
             vec![],
         );
@@ -626,6 +643,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
             vec![],
         );
@@ -648,6 +667,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
             vec![],
         );
@@ -672,6 +693,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
             vec![],
         );
@@ -716,6 +739,8 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
             vec![],
         );
@@ -744,6 +769,8 @@ mod tests {
                 doc: None,
                 r#async: true,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
             vec![],
         );
@@ -784,6 +811,8 @@ mod tests {
                 doc: None,
                 r#async: true,
                 cancellable: false,
+                deprecated: None,
+                since: None,
             }],
             vec![],
         );
@@ -814,6 +843,8 @@ mod tests {
                         doc: None,
                         r#async: false,
                         cancellable: false,
+                        deprecated: None,
+                        since: None,
                     }],
                     structs: vec![],
                     enums: vec![],
@@ -831,6 +862,8 @@ mod tests {
                         doc: None,
                         r#async: false,
                         cancellable: false,
+                        deprecated: None,
+                        since: None,
                     }],
                     structs: vec![],
                     enums: vec![],

@@ -151,6 +151,8 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 }],
                 structs: vec![],
                 enums: vec![],

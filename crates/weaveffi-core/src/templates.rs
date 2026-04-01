@@ -255,6 +255,8 @@ mod tests {
                     doc: Some("Add two numbers".into()),
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 }],
                 structs: vec![StructDef {
                     name: "Point".into(),
@@ -263,6 +265,7 @@ mod tests {
                         name: "x".into(),
                         ty: TypeRef::F64,
                         doc: None,
+                        default: None,
                     }],
                     builder: false,
                 }],

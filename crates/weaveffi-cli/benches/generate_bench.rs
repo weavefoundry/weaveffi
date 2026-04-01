@@ -30,16 +30,19 @@ fn build_large_api() -> Api {
                             name: "id".into(),
                             ty: TypeRef::I32,
                             doc: None,
+                            default: None,
                         },
                         StructField {
                             name: "name".into(),
                             ty: TypeRef::StringUtf8,
                             doc: None,
+                            default: None,
                         },
                         StructField {
                             name: "active".into(),
                             ty: TypeRef::Bool,
                             doc: None,
+                            default: None,
                         },
                     ],
                     builder: false,
@@ -96,6 +99,8 @@ fn build_large_api() -> Api {
                     )))),
                     r#async: false,
                     cancellable: false,
+                    deprecated: None,
+                    since: None,
                 })
                 .collect();
 
