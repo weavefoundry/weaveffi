@@ -13,14 +13,21 @@ impl Generator for DartGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        let dir = out_dir.join("dart/lib");
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join("weaveffi.dart"), render_dart_module(api))?;
+        let dart_dir = out_dir.join("dart");
+        let lib_dir = dart_dir.join("lib");
+        std::fs::create_dir_all(&lib_dir)?;
+        std::fs::write(lib_dir.join("weaveffi.dart"), render_dart_module(api))?;
+        std::fs::write(dart_dir.join("pubspec.yaml"), render_pubspec())?;
+        std::fs::write(dart_dir.join("README.md"), render_readme())?;
         Ok(())
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
-        vec![out_dir.join("dart/lib/weaveffi.dart").to_string()]
+        vec![
+            out_dir.join("dart/lib/weaveffi.dart").to_string(),
+            out_dir.join("dart/pubspec.yaml").to_string(),
+            out_dir.join("dart/README.md").to_string(),
+        ]
     }
 }
 
@@ -90,6 +97,45 @@ fn emit_typedef_and_lookup(
     out.push_str(&format!(
         "final _{var} = _lib.lookupFunction<\n    _Native{td}, _Dart{td}>('{c_sym}');\n"
     ));
+}
+
+fn render_pubspec() -> String {
+    r#"name: weaveffi
+version: 0.1.0
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+dependencies:
+  ffi: ^2.0.0
+"#
+    .into()
+}
+
+fn render_readme() -> String {
+    r#"# WeaveFFI Dart Bindings
+
+Auto-generated Dart bindings using `dart:ffi`.
+
+## Usage
+
+1. Place the compiled shared library (`libweaveffi.dylib`, `libweaveffi.so`,
+   or `weaveffi.dll`) where the Dart process can find it.
+
+2. Add this package as a dependency and import the bindings:
+
+```dart
+import 'package:weaveffi/weaveffi.dart';
+```
+
+3. Call the generated functions directly. The bindings use `dart:ffi` to load
+   the native library at runtime via `DynamicLibrary.open` and resolve symbols
+   with `lookupFunction`.
+
+## Requirements
+
+- Dart SDK >= 3.0.0
+- The `ffi` package (`^2.0.0`) for `Utf8` and `calloc` helpers.
+"#
+    .into()
 }
 
 fn render_dart_module(api: &Api) -> String {
@@ -440,7 +486,14 @@ mod tests {
         let api = make_api(vec![]);
         let out = Utf8Path::new("/tmp/out");
         let files = DartGenerator.output_files(&api, out);
-        assert_eq!(files, vec!["/tmp/out/dart/lib/weaveffi.dart"]);
+        assert_eq!(
+            files,
+            vec![
+                "/tmp/out/dart/lib/weaveffi.dart",
+                "/tmp/out/dart/pubspec.yaml",
+                "/tmp/out/dart/README.md",
+            ]
+        );
     }
 
     #[test]
@@ -910,5 +963,46 @@ mod tests {
             dart.contains("Int64 Function("),
             "missing Int64 for Handle: {dart}"
         );
+    }
+
+    #[test]
+    fn dart_generates_pubspec() {
+        let api = make_api(vec![simple_module(vec![])]);
+        let tmp = std::env::temp_dir().join("weaveffi_test_dart_pubspec");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        DartGenerator.generate(&api, out_dir).unwrap();
+
+        let pubspec_path = tmp.join("dart/pubspec.yaml");
+        assert!(pubspec_path.exists(), "pubspec.yaml should exist");
+        let pubspec = std::fs::read_to_string(&pubspec_path).unwrap();
+        assert!(
+            pubspec.contains("name: weaveffi"),
+            "missing name: {pubspec}"
+        );
+        assert!(
+            pubspec.contains("version: 0.1.0"),
+            "missing version: {pubspec}"
+        );
+        assert!(
+            pubspec.contains("sdk: '>=3.0.0 <4.0.0'"),
+            "missing sdk constraint: {pubspec}"
+        );
+        assert!(
+            pubspec.contains("ffi: ^2.0.0"),
+            "missing ffi dependency: {pubspec}"
+        );
+
+        let readme_path = tmp.join("dart/README.md");
+        assert!(readme_path.exists(), "README.md should exist");
+        let readme = std::fs::read_to_string(&readme_path).unwrap();
+        assert!(
+            readme.contains("dart:ffi"),
+            "README should mention dart:ffi: {readme}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
