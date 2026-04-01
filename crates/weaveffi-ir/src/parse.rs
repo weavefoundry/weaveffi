@@ -881,7 +881,7 @@ modules:
         assert_eq!(orders.name, "orders");
         assert_eq!(orders.enums.len(), 0);
         assert_eq!(orders.structs.len(), 2);
-        assert_eq!(orders.functions.len(), 3);
+        assert_eq!(orders.functions.len(), 4);
 
         let order_item = &orders.structs[0];
         assert_eq!(order_item.name, "OrderItem");
@@ -904,6 +904,16 @@ modules:
         );
         assert_eq!(orders.functions[2].name, "cancel_order");
         assert_eq!(orders.functions[2].returns, Some(TypeRef::Bool));
+        assert_eq!(orders.functions[3].name, "add_product_to_order");
+        assert_eq!(orders.functions[3].returns, Some(TypeRef::Bool));
+        assert_eq!(orders.functions[3].params.len(), 2);
+        assert_eq!(orders.functions[3].params[0].name, "order_id");
+        assert_eq!(orders.functions[3].params[0].ty, TypeRef::Handle);
+        assert_eq!(orders.functions[3].params[1].name, "product");
+        assert_eq!(
+            orders.functions[3].params[1].ty,
+            TypeRef::Struct("Product".to_string())
+        );
     }
 
     #[test]
