@@ -1468,18 +1468,16 @@ mod tests {
     fn output_files_lists_all() {
         let api = make_api(vec![]);
         let out = Utf8Path::new("/tmp/out");
-        let py = out.join("python");
-        let pkg = py.join("weaveffi");
         let files = PythonGenerator.output_files(&api, out);
         assert_eq!(
             files,
             vec![
-                pkg.join("__init__.py").to_string(),
-                pkg.join("weaveffi.py").to_string(),
-                pkg.join("weaveffi.pyi").to_string(),
-                py.join("pyproject.toml").to_string(),
-                py.join("setup.py").to_string(),
-                py.join("README.md").to_string(),
+                out.join("python/weaveffi/__init__.py").to_string(),
+                out.join("python/weaveffi/weaveffi.py").to_string(),
+                out.join("python/weaveffi/weaveffi.pyi").to_string(),
+                out.join("python/pyproject.toml").to_string(),
+                out.join("python/setup.py").to_string(),
+                out.join("python/README.md").to_string(),
             ]
         );
     }

@@ -1551,15 +1551,14 @@ mod tests {
     fn output_files_lists_all() {
         let api = make_api(vec![]);
         let out = Utf8Path::new("/tmp/out");
-        let dotnet = out.join("dotnet");
         let files = DotnetGenerator.output_files(&api, out);
         assert_eq!(
             files,
             vec![
-                dotnet.join("WeaveFFI.cs").to_string(),
-                dotnet.join("WeaveFFI.csproj").to_string(),
-                dotnet.join("WeaveFFI.nuspec").to_string(),
-                dotnet.join("README.md").to_string(),
+                out.join("dotnet/WeaveFFI.cs").to_string(),
+                out.join("dotnet/WeaveFFI.csproj").to_string(),
+                out.join("dotnet/WeaveFFI.nuspec").to_string(),
+                out.join("dotnet/README.md").to_string(),
             ]
         );
     }

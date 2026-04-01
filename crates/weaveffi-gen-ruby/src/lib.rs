@@ -962,14 +962,13 @@ mod tests {
     fn output_files_returns_correct_path() {
         let api = make_api(vec![]);
         let out_dir = Utf8Path::new("/tmp/out");
-        let ruby = out_dir.join("ruby");
         let files = RubyGenerator.output_files(&api, out_dir);
         assert_eq!(
             files,
             vec![
-                ruby.join("lib/weaveffi.rb").to_string(),
-                ruby.join("weaveffi.gemspec").to_string(),
-                ruby.join("README.md").to_string(),
+                out_dir.join("ruby/lib/weaveffi.rb").to_string(),
+                out_dir.join("ruby/weaveffi.gemspec").to_string(),
+                out_dir.join("ruby/README.md").to_string(),
             ]
         );
     }

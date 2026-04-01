@@ -1563,14 +1563,13 @@ mod tests {
     fn output_files_lists_hpp() {
         let api = minimal_api();
         let out_dir = Utf8Path::new("/tmp/out");
-        let cpp = out_dir.join("cpp");
         let files = CppGenerator.output_files(&api, out_dir);
         assert_eq!(
             files,
             vec![
-                cpp.join("weaveffi.hpp").to_string(),
-                cpp.join("CMakeLists.txt").to_string(),
-                cpp.join("README.md").to_string(),
+                out_dir.join("cpp/weaveffi.hpp").to_string(),
+                out_dir.join("cpp/CMakeLists.txt").to_string(),
+                out_dir.join("cpp/README.md").to_string(),
             ]
         );
     }
