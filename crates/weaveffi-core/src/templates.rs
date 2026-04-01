@@ -5,15 +5,14 @@ use camino::Utf8Path;
 use tera::Tera;
 use weaveffi_ir::ir::{Api, TypeRef};
 
+#[derive(Default)]
 pub struct TemplateEngine {
     tera: Tera,
 }
 
 impl TemplateEngine {
     pub fn new() -> Self {
-        Self {
-            tera: Tera::default(),
-        }
+        Self::default()
     }
 
     pub fn load_builtin(&mut self, name: &str, content: &str) -> Result<()> {

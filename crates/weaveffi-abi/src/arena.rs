@@ -132,7 +132,11 @@ mod tests {
     #[test]
     fn arena_null_register_is_safe() {
         unsafe extern "C" fn noop(_ptr: *mut c_void) {}
-        weaveffi_arena_register(std::ptr::null_mut(), 1 as *mut c_void, noop);
+        weaveffi_arena_register(
+            std::ptr::null_mut(),
+            std::ptr::dangling_mut::<c_void>(),
+            noop,
+        );
     }
 
     #[test]
