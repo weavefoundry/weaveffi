@@ -56,11 +56,11 @@ fn generate_inventory_all_targets() {
     let weaveffi_py = std::fs::read_to_string(out_path.join("python/weaveffi/weaveffi.py"))
         .expect("missing python/weaveffi/weaveffi.py");
     assert!(
-        weaveffi_py.contains("def create_product"),
+        weaveffi_py.contains("def products_create_product"),
         "weaveffi.py should contain products module function"
     );
     assert!(
-        weaveffi_py.contains("def create_order"),
+        weaveffi_py.contains("def orders_create_order"),
         "weaveffi.py should contain orders module function"
     );
 }

@@ -25,15 +25,15 @@ fn generate_python_contacts() {
     let weaveffi_py = std::fs::read_to_string(out_path.join("python/weaveffi/weaveffi.py"))
         .expect("missing python/weaveffi/weaveffi.py");
     assert!(
-        weaveffi_py.contains("def create_contact"),
-        "weaveffi.py should contain def create_contact"
+        weaveffi_py.contains("def contacts_create_contact"),
+        "weaveffi.py should contain def contacts_create_contact"
     );
 
     let weaveffi_pyi = std::fs::read_to_string(out_path.join("python/weaveffi/weaveffi.pyi"))
         .expect("missing python/weaveffi/weaveffi.pyi");
     assert!(
-        weaveffi_pyi.contains("def create_contact("),
-        "weaveffi.pyi should contain create_contact stub"
+        weaveffi_pyi.contains("def contacts_create_contact("),
+        "weaveffi.pyi should contain contacts_create_contact stub"
     );
     assert!(
         weaveffi_pyi.contains("-> int: ..."),

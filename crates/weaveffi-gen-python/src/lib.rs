@@ -2,13 +2,19 @@ use anyhow::Result;
 use camino::Utf8Path;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
-use weaveffi_core::utils::c_symbol_name;
+use weaveffi_core::utils::{c_symbol_name, wrapper_name};
 use weaveffi_ir::ir::{Api, EnumDef, Function, StructDef, StructField, TypeRef};
 
 pub struct PythonGenerator;
 
 impl PythonGenerator {
-    fn generate_impl(&self, api: &Api, out_dir: &Utf8Path, package_name: &str) -> Result<()> {
+    fn generate_impl(
+        &self,
+        api: &Api,
+        out_dir: &Utf8Path,
+        package_name: &str,
+        strip_module_prefix: bool,
+    ) -> Result<()> {
         let dir = out_dir.join("python");
         let pkg_dir = dir.join(package_name);
         std::fs::create_dir_all(&pkg_dir)?;
@@ -16,8 +22,14 @@ impl PythonGenerator {
             pkg_dir.join("__init__.py"),
             "from .weaveffi import *  # noqa: F401,F403\n",
         )?;
-        std::fs::write(pkg_dir.join("weaveffi.py"), render_python_module(api))?;
-        std::fs::write(pkg_dir.join("weaveffi.pyi"), render_pyi_module(api))?;
+        std::fs::write(
+            pkg_dir.join("weaveffi.py"),
+            render_python_module(api, strip_module_prefix),
+        )?;
+        std::fs::write(
+            pkg_dir.join("weaveffi.pyi"),
+            render_pyi_module(api, strip_module_prefix),
+        )?;
         std::fs::write(
             dir.join("pyproject.toml"),
             render_pyproject_toml(package_name),
@@ -34,7 +46,7 @@ impl Generator for PythonGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "weaveffi")
+        self.generate_impl(api, out_dir, "weaveffi", true)
     }
 
     fn generate_with_config(
@@ -43,7 +55,12 @@ impl Generator for PythonGenerator {
         out_dir: &Utf8Path,
         config: &GeneratorConfig,
     ) -> Result<()> {
-        self.generate_impl(api, out_dir, config.python_package_name())
+        self.generate_impl(
+            api,
+            out_dir,
+            config.python_package_name(),
+            config.strip_module_prefix,
+        )
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
@@ -169,7 +186,7 @@ fn get_map_kv(ty: &TypeRef) -> Option<(&TypeRef, &TypeRef)> {
 
 // ── Rendering ──
 
-fn render_python_module(api: &Api) -> String {
+fn render_python_module(api: &Api, strip_module_prefix: bool) -> String {
     let mut out = String::new();
     render_preamble(&mut out);
     for m in &api.modules {
@@ -181,7 +198,7 @@ fn render_python_module(api: &Api) -> String {
             render_struct(&mut out, &m.name, s);
         }
         for f in &m.functions {
-            render_function(&mut out, &m.name, f);
+            render_function(&mut out, &m.name, f, strip_module_prefix);
         }
     }
     out.push('\n');
@@ -346,7 +363,8 @@ fn render_getter(out: &mut String, prefix: &str, field: &StructField) {
     render_return_value(out, &field.ty, ind);
 }
 
-fn render_function(out: &mut String, module_name: &str, f: &Function) {
+fn render_function(out: &mut String, module_name: &str, f: &Function, strip_module_prefix: bool) {
+    let func_name = wrapper_name(module_name, &f.name, strip_module_prefix);
     let params_sig: Vec<String> = f
         .params
         .iter()
@@ -360,7 +378,7 @@ fn render_function(out: &mut String, module_name: &str, f: &Function) {
 
     out.push_str(&format!(
         "\n\ndef {}({}) -> {}:\n",
-        f.name,
+        func_name,
         params_sig.join(", "),
         ret_hint
     ));
@@ -735,7 +753,7 @@ from weaveffi import *
 
 // ── Type stub (.pyi) rendering ──
 
-fn render_pyi_module(api: &Api) -> String {
+fn render_pyi_module(api: &Api, strip_module_prefix: bool) -> String {
     let mut out =
         String::from("from enum import IntEnum\nfrom typing import Dict, List, Optional\n");
     for m in &api.modules {
@@ -746,7 +764,7 @@ fn render_pyi_module(api: &Api) -> String {
             render_pyi_struct(&mut out, s);
         }
         for f in &m.functions {
-            render_pyi_function(&mut out, f);
+            render_pyi_function(&mut out, &m.name, f, strip_module_prefix);
         }
     }
     out
@@ -770,7 +788,13 @@ fn render_pyi_struct(out: &mut String, s: &StructDef) {
     }
 }
 
-fn render_pyi_function(out: &mut String, f: &Function) {
+fn render_pyi_function(
+    out: &mut String,
+    module_name: &str,
+    f: &Function,
+    strip_module_prefix: bool,
+) {
+    let func_name = wrapper_name(module_name, &f.name, strip_module_prefix);
     let params: Vec<String> = f
         .params
         .iter()
@@ -783,7 +807,7 @@ fn render_pyi_function(out: &mut String, f: &Function) {
         .unwrap_or_else(|| "None".into());
     out.push_str(&format!(
         "\ndef {}({}) -> {}: ...\n",
-        f.name,
+        func_name,
         params.join(", "),
         ret
     ));
@@ -877,7 +901,7 @@ mod tests {
     #[test]
     fn preamble_has_load_library() {
         let api = make_api(vec![]);
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
         assert!(py.contains("def _load_library()"), "missing _load_library");
         assert!(
             py.contains("libweaveffi.dylib"),
@@ -891,7 +915,7 @@ mod tests {
     #[test]
     fn preamble_has_error_handling() {
         let api = make_api(vec![]);
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
         assert!(
             py.contains("class WeaveffiError(Exception):"),
             "missing error class"
@@ -926,7 +950,7 @@ mod tests {
             r#async: false,
         }])]);
 
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
         assert!(
             py.contains("def add(a: int, b: int) -> int:"),
             "missing function signature: {py}"
@@ -969,7 +993,7 @@ mod tests {
             errors: None,
         }]);
 
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
         assert!(
             py.contains("def echo(msg: str) -> str:"),
             "missing signature: {py}"
@@ -995,7 +1019,7 @@ mod tests {
             r#async: false,
         }])]);
 
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
         assert!(
             py.contains("def reset() -> None:"),
             "missing void signature: {py}"
@@ -1040,7 +1064,7 @@ mod tests {
             errors: None,
         }]);
 
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
         assert!(
             py.contains("class Color(IntEnum):"),
             "missing IntEnum class: {py}"
@@ -1073,7 +1097,7 @@ mod tests {
             errors: None,
         }]);
 
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
         assert!(py.contains("a: \"Color\""), "missing enum param hint: {py}");
         assert!(
             py.contains("-> \"Color\":"),
@@ -1111,7 +1135,7 @@ mod tests {
             errors: None,
         }]);
 
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
         assert!(py.contains("class Contact:"), "missing class: {py}");
         assert!(
             py.contains("def __init__(self, _ptr: int)"),
@@ -1167,7 +1191,7 @@ mod tests {
             errors: None,
         }]);
 
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
         assert!(
             py.contains("-> \"Contact\":"),
             "missing struct return hint: {py}"
@@ -1195,7 +1219,7 @@ mod tests {
             r#async: false,
         }])]);
 
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
         assert!(py.contains("flag: bool"), "missing bool param: {py}");
         assert!(py.contains("-> bool:"), "missing bool return: {py}");
         assert!(
@@ -1222,7 +1246,7 @@ mod tests {
             r#async: false,
         }])]);
 
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
         assert!(
             py.contains("ctypes.c_uint64"),
             "missing c_uint64 for Handle: {py}"
@@ -1248,7 +1272,7 @@ mod tests {
             errors: None,
         }]);
 
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
         assert!(py.contains("data: bytes"), "missing bytes param: {py}");
         assert!(py.contains("-> bytes:"), "missing bytes return: {py}");
         assert!(
@@ -1278,7 +1302,7 @@ mod tests {
             errors: None,
         }]);
 
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
         assert!(
             py.contains("id: Optional[int]"),
             "missing optional param: {py}"
@@ -1318,7 +1342,7 @@ mod tests {
             errors: None,
         }]);
 
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
         assert!(
             py.contains("-> Optional[str]:"),
             "missing optional str return: {py}"
@@ -1357,7 +1381,7 @@ mod tests {
             errors: None,
         }]);
 
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
         assert!(py.contains("ids: List[int]"), "missing list param: {py}");
         assert!(py.contains("-> List[int]:"), "missing list return: {py}");
         assert!(
@@ -1405,7 +1429,7 @@ mod tests {
             errors: None,
         }]);
 
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
         assert!(
             py.contains("scores: Dict[str, int]"),
             "missing map param: {py}"
@@ -1440,7 +1464,7 @@ mod tests {
             errors: None,
         }]);
 
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
         assert!(
             py.contains("def email(self) -> Optional[str]:"),
             "missing optional getter: {py}"
@@ -1469,7 +1493,7 @@ mod tests {
             errors: None,
         }]);
 
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
         assert!(
             py.contains("def role(self) -> \"Role\":"),
             "missing enum getter: {py}"
@@ -1670,7 +1694,7 @@ mod tests {
             errors: None,
         }]);
 
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
         assert!(
             py.contains("-> List[\"Item\"]:"),
             "missing list struct return: {py}"
@@ -1699,7 +1723,7 @@ mod tests {
             errors: None,
         }]);
 
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
         assert!(
             py.contains("def data(self) -> bytes:"),
             "missing bytes getter: {py}"
@@ -1956,7 +1980,7 @@ mod tests {
             errors: None,
         }]);
 
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
 
         assert!(py.contains("class Contact:"), "missing class decl");
         assert!(
@@ -2021,7 +2045,7 @@ mod tests {
             errors: None,
         }]);
 
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
 
         assert!(py.contains("class ContactType(IntEnum):"));
         assert!(py.contains("\"\"\"Type of contact\"\"\""));
@@ -2092,7 +2116,7 @@ mod tests {
             errors: None,
         }]);
 
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
 
         assert!(
             py.contains("key: Optional[int]"),
@@ -2178,7 +2202,7 @@ mod tests {
             errors: None,
         }]);
 
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
 
         assert!(py.contains("ids: List[int]"), "missing List[int] param");
         assert!(
@@ -2241,7 +2265,7 @@ mod tests {
             errors: None,
         }]);
 
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
 
         assert!(
             py.contains("settings: Dict[str, int]"),
@@ -2394,7 +2418,7 @@ mod tests {
             errors: None,
         }]);
 
-        let pyi = render_pyi_module(&api);
+        let pyi = render_pyi_module(&api, true);
 
         assert!(pyi.contains("from enum import IntEnum"));
         assert!(pyi.contains("from typing import Dict, List, Optional"));
@@ -2682,7 +2706,7 @@ mod tests {
     #[test]
     fn python_has_memory_helpers() {
         let api = make_api(vec![]);
-        let py = render_python_module(&api);
+        let py = render_python_module(&api, true);
         assert!(
             py.contains("import contextlib"),
             "missing contextlib import"
@@ -2764,5 +2788,84 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn python_strip_module_prefix() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "create_contact".into(),
+                params: vec![Param {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let config = GeneratorConfig {
+            strip_module_prefix: true,
+            ..Default::default()
+        };
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_python_strip_prefix");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        PythonGenerator
+            .generate_with_config(&api, out_dir, &config)
+            .unwrap();
+
+        let py = std::fs::read_to_string(tmp.join("python/weaveffi/weaveffi.py")).unwrap();
+        assert!(
+            py.contains("def create_contact("),
+            "stripped name should be create_contact: {py}"
+        );
+        assert!(
+            !py.contains("def contacts_create_contact("),
+            "should not contain module-prefixed name: {py}"
+        );
+        assert!(
+            py.contains("weaveffi_contacts_create_contact"),
+            "C ABI call should still use full name: {py}"
+        );
+
+        let pyi = std::fs::read_to_string(tmp.join("python/weaveffi/weaveffi.pyi")).unwrap();
+        assert!(
+            pyi.contains("def create_contact("),
+            "pyi stripped name should be create_contact: {pyi}"
+        );
+
+        let no_strip = GeneratorConfig::default();
+        let tmp2 = std::env::temp_dir().join("weaveffi_test_python_no_strip_prefix");
+        let _ = std::fs::remove_dir_all(&tmp2);
+        std::fs::create_dir_all(&tmp2).unwrap();
+        let out_dir2 = Utf8Path::from_path(&tmp2).expect("valid UTF-8");
+
+        PythonGenerator
+            .generate_with_config(&api, out_dir2, &no_strip)
+            .unwrap();
+
+        let py2 = std::fs::read_to_string(tmp2.join("python/weaveffi/weaveffi.py")).unwrap();
+        assert!(
+            py2.contains("def contacts_create_contact("),
+            "default should use module-prefixed name: {py2}"
+        );
+
+        let pyi2 = std::fs::read_to_string(tmp2.join("python/weaveffi/weaveffi.pyi")).unwrap();
+        assert!(
+            pyi2.contains("def contacts_create_contact("),
+            "pyi default should use module-prefixed name: {pyi2}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp2);
     }
 }
