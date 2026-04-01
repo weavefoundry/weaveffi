@@ -81,54 +81,58 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    static DESTROY_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-    unsafe extern "C" fn test_dtor(_ptr: *mut c_void) {
-        DESTROY_COUNT.fetch_add(1, Ordering::SeqCst);
+    /// Destructor that increments the `AtomicUsize` counter at the given pointer.
+    unsafe extern "C" fn counting_dtor(ptr: *mut c_void) {
+        let counter = ptr as *const AtomicUsize;
+        (*counter).fetch_add(1, Ordering::SeqCst);
     }
 
     #[test]
     fn arena_destroys_all_handles() {
-        DESTROY_COUNT.store(0, Ordering::SeqCst);
+        let counter = AtomicUsize::new(0);
+        let counter_ptr = &counter as *const AtomicUsize as *mut c_void;
 
         let mut arena = HandleArena::new();
-        for i in 1..=5 {
-            arena.register(i as *mut c_void, test_dtor);
+        for _ in 0..5 {
+            arena.register(counter_ptr, counting_dtor);
         }
 
-        assert_eq!(DESTROY_COUNT.load(Ordering::SeqCst), 0);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
         arena.destroy_all();
-        assert_eq!(DESTROY_COUNT.load(Ordering::SeqCst), 5);
+        assert_eq!(counter.load(Ordering::SeqCst), 5);
     }
 
     #[test]
     fn arena_destroy_all_is_idempotent() {
-        DESTROY_COUNT.store(0, Ordering::SeqCst);
+        let counter = AtomicUsize::new(0);
+        let counter_ptr = &counter as *const AtomicUsize as *mut c_void;
 
         let mut arena = HandleArena::new();
-        arena.register(1 as *mut c_void, test_dtor);
+        arena.register(counter_ptr, counting_dtor);
         arena.destroy_all();
         arena.destroy_all();
-        assert_eq!(DESTROY_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn arena_c_api_roundtrip() {
-        DESTROY_COUNT.store(0, Ordering::SeqCst);
+        let counter = AtomicUsize::new(0);
+        let counter_ptr = &counter as *const AtomicUsize as *mut c_void;
 
         let arena = weaveffi_arena_create();
         assert!(!arena.is_null());
 
-        weaveffi_arena_register(arena, 1 as *mut c_void, test_dtor);
-        weaveffi_arena_register(arena, 2 as *mut c_void, test_dtor);
+        weaveffi_arena_register(arena, counter_ptr, counting_dtor);
+        weaveffi_arena_register(arena, counter_ptr, counting_dtor);
 
         weaveffi_arena_destroy(arena);
-        assert_eq!(DESTROY_COUNT.load(Ordering::SeqCst), 2);
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
     }
 
     #[test]
     fn arena_null_register_is_safe() {
-        weaveffi_arena_register(std::ptr::null_mut(), 1 as *mut c_void, test_dtor);
+        unsafe extern "C" fn noop(_ptr: *mut c_void) {}
+        weaveffi_arena_register(std::ptr::null_mut(), 1 as *mut c_void, noop);
     }
 
     #[test]
