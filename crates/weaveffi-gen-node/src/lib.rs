@@ -4,7 +4,7 @@ use heck::ToUpperCamelCase;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_abi_struct_name, local_type_name, wrapper_name};
-use weaveffi_ir::ir::{Api, Function, Module, TypeRef};
+use weaveffi_ir::ir::{Api, Function, Module, StructDef, TypeRef};
 
 pub struct NodeGenerator;
 
@@ -1043,6 +1043,18 @@ fn ts_type_for(ty: &TypeRef) -> String {
     }
 }
 
+fn render_struct_builder_dts(out: &mut String, s: &StructDef) {
+    let name = &s.name;
+    out.push_str(&format!("export interface {}Builder {{\n", s.name));
+    for field in &s.fields {
+        let method = format!("with{}", field.name.to_upper_camel_case());
+        let ts = ts_type_for(&field.ty);
+        out.push_str(&format!("  {method}(value: {ts}): {name}Builder;\n"));
+    }
+    out.push_str(&format!("  build(): {name};\n"));
+    out.push_str("}\n");
+}
+
 fn render_node_dts(api: &Api, strip_module_prefix: bool) -> String {
     let mut out = String::from("// Generated types for WeaveFFI functions\n");
     for (m, path) in collect_modules_with_path(&api.modules) {
@@ -1052,6 +1064,9 @@ fn render_node_dts(api: &Api, strip_module_prefix: bool) -> String {
                 out.push_str(&format!("  {}: {};\n", field.name, ts_type_for(&field.ty)));
             }
             out.push_str("}\n");
+            if s.builder {
+                render_struct_builder_dts(&mut out, s);
+            }
         }
         for e in &m.enums {
             out.push_str(&format!("export enum {} {{\n", e.name));
@@ -1187,6 +1202,7 @@ mod tests {
                     doc: None,
                 },
             ],
+            builder: false,
         });
         m.enums.push(EnumDef {
             name: "Color".into(),
@@ -1394,6 +1410,7 @@ mod tests {
                         doc: None,
                     },
                 ],
+                builder: false,
             }],
             enums: vec![EnumDef {
                 name: "Color".to_string(),
@@ -1779,6 +1796,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             });
             m.functions.push(Function {
                 name: "get_info".into(),
@@ -1825,6 +1843,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -1897,6 +1916,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![EnumDef {
                 name: "Color".into(),
@@ -1943,6 +1963,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             });
             m.functions.push(Function {
                 name: "find_contact".into(),
@@ -2002,6 +2023,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             });
             m.functions.push(Function {
                 name: "find_contact".into(),

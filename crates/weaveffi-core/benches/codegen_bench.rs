@@ -108,6 +108,7 @@ fn large_api() -> Api {
                             doc: None,
                         },
                     ],
+                    builder: false,
                 })
                 .collect();
 

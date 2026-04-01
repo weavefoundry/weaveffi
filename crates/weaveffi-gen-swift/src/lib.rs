@@ -261,6 +261,9 @@ fn render_swift_module_types(out: &mut String, m: &Module, module_path: &str) {
     }
     for s in &m.structs {
         render_swift_struct(out, module_path, s);
+        if s.builder {
+            render_swift_builder(out, module_path, s);
+        }
     }
     for sub in &m.modules {
         let sub_path = format!("{module_path}_{}", sub.name);
@@ -325,6 +328,74 @@ fn render_swift_struct(out: &mut String, module_name: &str, s: &StructDef) {
     }
 
     out.push_str("}\n\n");
+}
+
+fn struct_fields_as_params(fields: &[StructField]) -> Vec<Param> {
+    fields
+        .iter()
+        .map(|f| Param {
+            name: f.name.clone(),
+            ty: f.ty.clone(),
+        })
+        .collect()
+}
+
+fn render_swift_builder(out: &mut String, module_name: &str, s: &StructDef) {
+    let prefix = format!("weaveffi_{}_{}", module_name, s.name);
+    let class_name = local_type_name(&s.name);
+    let builder_name = format!("{class_name}Builder");
+
+    out.push_str(&format!("public class {} {{\n", builder_name));
+    for field in &s.fields {
+        let swift_ty = swift_type_for(&field.ty);
+        out.push_str(&format!("    private var _{}: {}?\n", field.name, swift_ty));
+    }
+    out.push_str("\n    public init() {}\n\n");
+
+    for field in &s.fields {
+        let pascal = field.name.to_upper_camel_case();
+        let swift_ty = swift_type_for(&field.ty);
+        out.push_str("    @discardableResult\n");
+        out.push_str(&format!(
+            "    public func with{}(_ value: {}) -> Self {{\n        self._{} = value\n        return self\n    }}\n\n",
+            pascal, swift_ty, field.name
+        ));
+    }
+
+    let params = struct_fields_as_params(&s.fields);
+    out.push_str(&format!(
+        "    public func build() throws -> {} {{\n",
+        class_name
+    ));
+    for field in &s.fields {
+        out.push_str(&format!(
+            "        guard let {} = _{} else {{ fatalError(\"missing field: {}\") }}\n",
+            field.name, field.name, field.name
+        ));
+    }
+    out.push_str("        var err = weaveffi_error(code: 0, message: nil)\n");
+
+    if !has_buffer_params(&params) {
+        let create_sym = format!("{}_create", prefix);
+        let call_args = build_c_call_args(&params, module_name);
+        if call_args.is_empty() {
+            out.push_str(&format!("        let ptr = {}(&err)\n", create_sym));
+        } else {
+            out.push_str(&format!(
+                "        let ptr = {}({}, &err)\n",
+                create_sym, call_args
+            ));
+        }
+        out.push_str("        try check(&err)\n");
+        out.push_str(
+            "        guard let ptr = ptr else { throw WeaveFFIError.error(code: -1, message: \"null pointer\") }\n",
+        );
+        out.push_str(&format!("        return {}(ptr: ptr)\n", class_name));
+    } else {
+        render_buffered_struct_create(out, module_name, &prefix, &params, class_name);
+    }
+
+    out.push_str("    }\n}\n\n");
 }
 
 fn render_swift_getter(out: &mut String, prefix: &str, field: &StructField) {
@@ -1773,11 +1844,250 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
     }
 }
 
+/// Like `render_buffered_call`, but calls `{struct_prefix}_create` and always returns a struct pointer.
+fn render_buffered_struct_create(
+    out: &mut String,
+    module_name: &str,
+    struct_prefix: &str,
+    params: &[Param],
+    struct_class_name: &str,
+) {
+    for p in params {
+        match &p.ty {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                out.push_str(&format!(
+                    "        let {n}_bytes = Array({n}.utf8)\n",
+                    n = p.name
+                ));
+            }
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
+                out.push_str(&format!("        let {n}_bytes = Array({n})\n", n = p.name));
+            }
+            TypeRef::Optional(inner) => {
+                if let TypeRef::Enum(enum_name) = inner.as_ref() {
+                    out.push_str(&format!(
+                        "        let {n}_c: weaveffi_{m}_{e}? = {n}.map {{ weaveffi_{m}_{e}($0.rawValue) }}\n",
+                        n = p.name,
+                        m = module_name,
+                        e = enum_name
+                    ));
+                }
+            }
+            TypeRef::List(inner) => match inner.as_ref() {
+                TypeRef::Enum(enum_name) => {
+                    out.push_str(&format!(
+                        "        let {n}_raw = {n}.map {{ weaveffi_{m}_{e}($0.rawValue) }}\n",
+                        n = p.name,
+                        m = module_name,
+                        e = enum_name
+                    ));
+                }
+                TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+                    out.push_str(&format!(
+                        "        let {n}_ptrs = {n}.map {{ $0.ptr }}\n",
+                        n = p.name
+                    ));
+                }
+                _ => {}
+            },
+            TypeRef::Map(k, v) => {
+                out.push_str(&format!(
+                    "        let {n}_keys = Array({n}.keys)\n",
+                    n = p.name
+                ));
+                out.push_str(&format!(
+                    "        let {n}_values = {n}_keys.map {{ {n}[$0]! }}\n",
+                    n = p.name
+                ));
+                match k.as_ref() {
+                    TypeRef::Enum(e) => {
+                        out.push_str(&format!(
+                            "        let {n}_keysRaw = {n}_keys.map {{ weaveffi_{m}_{e}($0.rawValue) }}\n",
+                            n = p.name,
+                            m = module_name,
+                            e = e
+                        ));
+                    }
+                    TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+                        out.push_str(&format!(
+                            "        let {n}_keysPtrs = {n}_keys.map {{ $0.ptr }}\n",
+                            n = p.name
+                        ));
+                    }
+                    _ => {}
+                }
+                match v.as_ref() {
+                    TypeRef::Enum(e) => {
+                        out.push_str(&format!(
+                            "        let {n}_valuesRaw = {n}_values.map {{ weaveffi_{m}_{e}($0.rawValue) }}\n",
+                            n = p.name,
+                            m = module_name,
+                            e = e
+                        ));
+                    }
+                    TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+                        out.push_str(&format!(
+                            "        let {n}_valuesPtrs = {n}_values.map {{ $0.ptr }}\n",
+                            n = p.name
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let closure_params: Vec<&Param> = params.iter().filter(|p| needs_closure(&p.ty)).collect();
+
+    let ret_type = "OpaquePointer?";
+    let needs_return = true;
+
+    let mut closure_depth: usize = 0;
+    for p in &closure_params {
+        let indent = "        ".to_string() + &"    ".repeat(closure_depth);
+        let is_first = closure_depth == 0;
+        match &p.ty {
+            TypeRef::StringUtf8
+            | TypeRef::BorrowedStr
+            | TypeRef::Bytes
+            | TypeRef::BorrowedBytes => {
+                if needs_return && is_first {
+                    out.push_str(&format!(
+                        "{}let result: {} = {}_bytes.withUnsafeBufferPointer {{ {}_buf in\n",
+                        indent, ret_type, p.name, p.name
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "{}{}_bytes.withUnsafeBufferPointer {{ {}_buf in\n",
+                        indent, p.name, p.name
+                    ));
+                }
+                out.push_str(&format!(
+                    "{}    let {}_ptr = {}_buf.baseAddress!\n",
+                    indent, p.name, p.name
+                ));
+                out.push_str(&format!(
+                    "{}    let {}_len = {}_buf.count\n",
+                    indent, p.name, p.name
+                ));
+                closure_depth += 1;
+            }
+            TypeRef::Optional(inner) if is_c_value_type(inner) => {
+                let source = if matches!(inner.as_ref(), TypeRef::Enum(_)) {
+                    format!("{}_c", p.name)
+                } else {
+                    p.name.clone()
+                };
+                if needs_return && is_first {
+                    out.push_str(&format!(
+                        "{}let result: {} = withOptionalPointer(to: {}) {{ {}_ptr in\n",
+                        indent, ret_type, source, p.name
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "{}withOptionalPointer(to: {}) {{ {}_ptr in\n",
+                        indent, source, p.name
+                    ));
+                }
+                closure_depth += 1;
+            }
+            TypeRef::List(inner) => {
+                let source = match inner.as_ref() {
+                    TypeRef::Enum(_) => format!("{}_raw", p.name),
+                    TypeRef::Struct(_) | TypeRef::TypedHandle(_) => format!("{}_ptrs", p.name),
+                    _ => p.name.clone(),
+                };
+                if needs_return && is_first {
+                    out.push_str(&format!(
+                        "{}let result: {} = {}.withUnsafeBufferPointer {{ {}_buf in\n",
+                        indent, ret_type, source, p.name
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "{}{}.withUnsafeBufferPointer {{ {}_buf in\n",
+                        indent, source, p.name
+                    ));
+                }
+                out.push_str(&format!(
+                    "{}    let {}_ptr = {}_buf.baseAddress\n",
+                    indent, p.name, p.name
+                ));
+                out.push_str(&format!(
+                    "{}    let {}_len = {}_buf.count\n",
+                    indent, p.name, p.name
+                ));
+                closure_depth += 1;
+            }
+            TypeRef::Map(k, v) => {
+                let keys_source = map_array_source(k, &p.name, "keys");
+                let values_source = map_array_source(v, &p.name, "values");
+                if needs_return && is_first {
+                    out.push_str(&format!(
+                        "{}let result: {} = {}.withUnsafeBufferPointer {{ {}_keys_buf in\n",
+                        indent, ret_type, keys_source, p.name
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "{}{}.withUnsafeBufferPointer {{ {}_keys_buf in\n",
+                        indent, keys_source, p.name
+                    ));
+                }
+                out.push_str(&format!(
+                    "{}    let {}_keys_ptr = {}_keys_buf.baseAddress\n",
+                    indent, p.name, p.name
+                ));
+                closure_depth += 1;
+                let vind = "        ".to_string() + &"    ".repeat(closure_depth);
+                out.push_str(&format!(
+                    "{}{}.withUnsafeBufferPointer {{ {}_values_buf in\n",
+                    vind, values_source, p.name
+                ));
+                out.push_str(&format!(
+                    "{}    let {}_values_ptr = {}_values_buf.baseAddress\n",
+                    vind, p.name, p.name
+                ));
+                out.push_str(&format!(
+                    "{}    let {}_len = {}_values_buf.count\n",
+                    vind, p.name, p.name
+                ));
+                closure_depth += 1;
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    let inner_indent = "        ".to_string() + &"    ".repeat(closure_depth);
+    let create_sym = format!("{struct_prefix}_create");
+    let call_args = build_c_call_args(params, module_name);
+    let call_with_err = if call_args.is_empty() {
+        format!("{}(&err)", create_sym)
+    } else {
+        format!("{}({}, &err)", create_sym, call_args)
+    };
+
+    out.push_str(&format!("{}    return {}\n", inner_indent, call_with_err));
+
+    for i in (0..closure_depth).rev() {
+        let indent = "        ".to_string() + &"    ".repeat(i);
+        out.push_str(&format!("{}}}\n", indent));
+    }
+
+    out.push_str("        try check(&err)\n");
+    out.push_str(
+        "        guard let result = result else { throw WeaveFFIError.error(code: -1, message: \"null pointer\") }\n",
+    );
+    out.push_str(&format!(
+        "        return {}(ptr: result)\n",
+        struct_class_name
+    ));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use weaveffi_ir::ir::{
-        EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param, StructDef,
+        Api, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param, StructDef,
         StructField,
     };
 
@@ -2232,6 +2542,7 @@ mod tests {
                         doc: None,
                     },
                 ],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -2281,6 +2592,63 @@ mod tests {
             out.contains("weaveffi_contacts_Contact_get_age(ptr)"),
             "missing age getter call: {out}"
         );
+    }
+
+    #[test]
+    fn swift_builder_generated() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "contacts".into(),
+                functions: vec![],
+                structs: vec![StructDef {
+                    name: "Contact".into(),
+                    doc: None,
+                    fields: vec![
+                        StructField {
+                            name: "name".into(),
+                            ty: TypeRef::StringUtf8,
+                            doc: None,
+                        },
+                        StructField {
+                            name: "age".into(),
+                            ty: TypeRef::I32,
+                            doc: None,
+                        },
+                    ],
+                    builder: true,
+                }],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let tmp = std::env::temp_dir().join("weaveffi_test_swift_builder");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+        SwiftGenerator.generate(&api, out_dir).unwrap();
+        let swift = std::fs::read_to_string(
+            tmp.join("swift")
+                .join("Sources")
+                .join("WeaveFFI")
+                .join("WeaveFFI.swift"),
+        )
+        .unwrap();
+        assert!(
+            swift.contains("public class ContactBuilder"),
+            "missing builder class: {swift}"
+        );
+        assert!(
+            swift.contains("func withName("),
+            "missing withName: {swift}"
+        );
+        assert!(swift.contains("func withAge("), "missing withAge: {swift}");
+        assert!(swift.contains("func build()"), "missing build: {swift}");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -2364,6 +2732,7 @@ mod tests {
                     ty: TypeRef::Bytes,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -2396,6 +2765,7 @@ mod tests {
                     ty: TypeRef::Struct("Point".into()),
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -2484,6 +2854,7 @@ mod tests {
                         doc: None,
                     },
                 ],
+                builder: false,
             }],
             enums: vec![EnumDef {
                 name: "Color".to_string(),
@@ -2709,6 +3080,7 @@ mod tests {
                         doc: None,
                     },
                 ],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -2945,6 +3317,7 @@ mod tests {
                         doc: None,
                     },
                 ],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -3089,6 +3462,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -3161,6 +3535,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![EnumDef {
                 name: "Color".into(),
@@ -3296,6 +3671,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -3326,6 +3702,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -3495,6 +3872,7 @@ mod tests {
                         ty: TypeRef::StringUtf8,
                         doc: None,
                     }],
+                    builder: false,
                 }],
                 enums: vec![],
                 callbacks: vec![],

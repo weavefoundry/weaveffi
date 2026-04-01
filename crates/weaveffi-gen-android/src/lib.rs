@@ -411,6 +411,9 @@ fn render_kotlin(api: &Api, package: &str, strip_module_prefix: bool) -> String 
         }
         for s in &m.structs {
             render_kotlin_struct(&mut kotlin, s);
+            if s.builder {
+                render_kotlin_builder(&mut kotlin, s);
+            }
         }
     }
     render_kotlin_error_types(&mut kotlin, api);
@@ -1933,6 +1936,48 @@ fn render_kotlin_struct(out: &mut String, s: &StructDef) {
     let _ = writeln!(out, "}}");
 }
 
+fn render_kotlin_builder(out: &mut String, s: &StructDef) {
+    if !s.builder {
+        return;
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out, "class {}Builder {{", s.name);
+    for f in &s.fields {
+        let kt_getter = kotlin_getter_type(&f.ty);
+        let _ = writeln!(out, "    private var {}: {}? = null", f.name, kt_getter);
+    }
+    for f in &s.fields {
+        let pascal = to_pascal_case(&f.name);
+        let kt_getter = kotlin_getter_type(&f.ty);
+        let _ = writeln!(
+            out,
+            "    fun with{}({}: {}): {}Builder {{",
+            pascal, f.name, kt_getter, s.name
+        );
+        let _ = writeln!(out, "        this.{} = {}", f.name, f.name);
+        let _ = writeln!(out, "        return this");
+        let _ = writeln!(out, "    }}");
+    }
+    let _ = writeln!(out, "    fun build(): {} {{", s.name);
+    if s.fields.is_empty() {
+        let _ = writeln!(out, "        return {}.create()", s.name);
+    } else {
+        let _ = writeln!(out, "        return {}.create(", s.name);
+        let n = s.fields.len();
+        for (i, f) in s.fields.iter().enumerate() {
+            let arg = format!(
+                "{} ?: throw IllegalStateException(\"missing field: {}\")",
+                f.name, f.name
+            );
+            let suffix = if i + 1 < n { "," } else { "" };
+            let _ = writeln!(out, "            {}{}", arg, suffix);
+        }
+        let _ = writeln!(out, "        )");
+    }
+    let _ = writeln!(out, "    }}");
+    let _ = writeln!(out, "}}");
+}
+
 fn render_jni_struct(out: &mut String, module_name: &str, s: &StructDef, jni_prefix: &str) {
     let prefix = format!("weaveffi_{}_{}", module_name, s.name);
 
@@ -2304,8 +2349,8 @@ fn release_jni_resources_single(out: &mut String, name: &str, ty: &TypeRef) {
 mod tests {
     use super::*;
     use weaveffi_ir::ir::{
-        EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param, StructDef,
-        StructField,
+        Api, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param, StructDef,
+        StructField, TypeRef,
     };
 
     fn make_api(modules: Vec<Module>) -> Api {
@@ -2335,6 +2380,7 @@ mod tests {
                         doc: None,
                     },
                 ],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -2451,6 +2497,56 @@ mod tests {
     }
 
     #[test]
+    fn kotlin_builder_generated() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "contacts".into(),
+                functions: vec![],
+                structs: vec![StructDef {
+                    name: "Contact".into(),
+                    doc: None,
+                    fields: vec![
+                        StructField {
+                            name: "name".into(),
+                            ty: TypeRef::StringUtf8,
+                            doc: None,
+                        },
+                        StructField {
+                            name: "age".into(),
+                            ty: TypeRef::I32,
+                            doc: None,
+                        },
+                    ],
+                    builder: true,
+                }],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let out = Utf8Path::from_path(dir.path()).unwrap();
+        AndroidGenerator.generate(&api, out).unwrap();
+        let kotlin =
+            std::fs::read_to_string(out.join("android/src/main/kotlin/com/weaveffi/WeaveFFI.kt"))
+                .unwrap();
+        assert!(
+            kotlin.contains("class ContactBuilder"),
+            "missing builder class: {kotlin}"
+        );
+        assert!(
+            kotlin.contains("fun withName("),
+            "missing withName: {kotlin}"
+        );
+        assert!(kotlin.contains("fun withAge("), "missing withAge: {kotlin}");
+        assert!(kotlin.contains("fun build()"), "missing build: {kotlin}");
+    }
+
+    #[test]
     fn jni_struct_native_create() {
         let api = make_struct_api();
         let jni = render_jni_c(&api, "com.weaveffi", true);
@@ -2551,6 +2647,7 @@ mod tests {
                     ty: TypeRef::Bytes,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -2589,6 +2686,7 @@ mod tests {
                     ty: TypeRef::Struct("Point".into()),
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -3312,6 +3410,7 @@ mod tests {
                         doc: None,
                     },
                 ],
+                builder: false,
             }],
             enums: vec![EnumDef {
                 name: "Color".to_string(),
@@ -3854,6 +3953,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -3926,6 +4026,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![EnumDef {
                 name: "Color".into(),
@@ -3983,6 +4084,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -4020,6 +4122,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -4092,6 +4195,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],

@@ -820,6 +820,9 @@ fn validation_suggestion(err: &ValidationError) -> &'static str {
         ValidationError::IteratorInInvalidPosition { .. } => {
             "iterator types can only be used as function return types, not as parameters or struct fields"
         }
+        ValidationError::BuilderStructEmpty { .. } => {
+            "builder structs must have at least one field; add a field or set builder: false"
+        }
     }
 }
 

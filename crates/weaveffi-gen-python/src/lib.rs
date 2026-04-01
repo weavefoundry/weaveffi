@@ -548,6 +548,9 @@ fn render_python_module_content(
     }
     for s in &m.structs {
         render_struct(out, module_path, s);
+        if s.builder {
+            render_builder(out, s);
+        }
     }
     for f in &m.functions {
         render_function(out, module_path, f, strip_module_prefix);
@@ -673,6 +676,41 @@ fn render_struct(out: &mut String, module_name: &str, s: &StructDef) {
         render_getter(out, &prefix, field);
     }
     out.push('\n');
+}
+
+fn render_builder(out: &mut String, s: &StructDef) {
+    let builder_name = format!("{}Builder", s.name);
+    out.push_str(&format!("\n\nclass {}:", builder_name));
+    out.push_str("\n    def __init__(self) -> None:");
+    for field in &s.fields {
+        let py_ty = py_type_hint(&field.ty);
+        out.push_str(&format!(
+            "\n        self._{}: Optional[{}] = None",
+            field.name, py_ty
+        ));
+    }
+    for field in &s.fields {
+        let py_ty = py_type_hint(&field.ty);
+        out.push_str(&format!(
+            "\n\n    def with_{}(self, value: {}) -> \"{}\":",
+            field.name, py_ty, builder_name
+        ));
+        out.push_str(&format!("\n        self._{} = value", field.name));
+        out.push_str("\n        return self");
+    }
+    let ret_ty = py_type_hint(&TypeRef::Struct(s.name.clone()));
+    out.push_str(&format!("\n\n    def build(self) -> {}:", ret_ty));
+    for field in &s.fields {
+        out.push_str(&format!(
+            "\n        if self._{} is None:\n            raise ValueError(\"missing field: {}\")",
+            field.name, field.name
+        ));
+    }
+    out.push_str(&format!(
+        "\n        raise NotImplementedError(\"{}Builder.build requires FFI backing\")",
+        s.name
+    ));
+    out.push_str("\n");
 }
 
 fn render_getter(out: &mut String, prefix: &str, field: &StructField) {
@@ -1678,6 +1716,7 @@ mod tests {
                         doc: None,
                     },
                 ],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -1721,6 +1760,51 @@ mod tests {
             py.contains("weaveffi_contacts_Contact_get_age"),
             "missing age getter C call: {py}"
         );
+    }
+
+    #[test]
+    fn python_builder_generated() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "contacts".into(),
+                functions: vec![],
+                structs: vec![StructDef {
+                    name: "Contact".into(),
+                    doc: None,
+                    fields: vec![
+                        StructField {
+                            name: "name".into(),
+                            ty: TypeRef::StringUtf8,
+                            doc: None,
+                        },
+                        StructField {
+                            name: "age".into(),
+                            ty: TypeRef::I32,
+                            doc: None,
+                        },
+                    ],
+                    builder: true,
+                }],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let out = Utf8Path::from_path(dir.path()).unwrap();
+        PythonGenerator.generate(&api, out).unwrap();
+        let py = std::fs::read_to_string(out.join("python/weaveffi/weaveffi.py")).unwrap();
+        assert!(
+            py.contains("class ContactBuilder"),
+            "missing builder class: {py}"
+        );
+        assert!(py.contains("def with_name("), "missing with_name: {py}");
+        assert!(py.contains("def with_age("), "missing with_age: {py}");
+        assert!(py.contains("def build("), "missing build: {py}");
     }
 
     #[test]
@@ -2038,6 +2122,7 @@ mod tests {
                     ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -2070,6 +2155,7 @@ mod tests {
                     ty: TypeRef::Enum("Role".into()),
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -2136,6 +2222,7 @@ mod tests {
                         doc: None,
                     },
                 ],
+                builder: false,
             }],
             functions: vec![
                 Function {
@@ -2314,6 +2401,7 @@ mod tests {
                     ty: TypeRef::Bytes,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -2389,6 +2477,7 @@ mod tests {
                         doc: None,
                     },
                 ],
+                builder: false,
             }],
             functions: vec![
                 Function {
@@ -2581,6 +2670,7 @@ mod tests {
                         doc: None,
                     },
                 ],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -3002,6 +3092,7 @@ mod tests {
                         doc: None,
                     },
                 ],
+                builder: false,
             }],
             functions: vec![
                 Function {
@@ -3136,6 +3227,7 @@ mod tests {
                         doc: None,
                     },
                 ],
+                builder: false,
             }],
             functions: vec![
                 Function {
@@ -3546,6 +3638,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -3618,6 +3711,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![EnumDef {
                 name: "Color".into(),
@@ -3677,6 +3771,7 @@ mod tests {
                         ty: TypeRef::StringUtf8,
                         doc: None,
                     }],
+                    builder: false,
                 }],
                 enums: vec![],
                 callbacks: vec![],
@@ -3724,6 +3819,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -3814,6 +3910,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -3910,6 +4007,7 @@ mod tests {
                         ty: TypeRef::StringUtf8,
                         doc: None,
                     }],
+                    builder: false,
                 }],
                 enums: vec![],
                 callbacks: vec![],

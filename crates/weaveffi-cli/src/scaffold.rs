@@ -491,6 +491,7 @@ mod tests {
                         doc: None,
                     },
                 ],
+                builder: false,
             }],
         );
         let out = render_scaffold(&api);
@@ -529,6 +530,7 @@ mod tests {
                     ty: TypeRef::StringUtf8,
                     doc: None,
                 }],
+                builder: false,
             }],
         );
         let out = render_scaffold(&api);

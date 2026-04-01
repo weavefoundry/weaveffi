@@ -286,6 +286,9 @@ fn render_ruby_module(api: &Api, module_name: &str) -> String {
         }
         for s in &m.structs {
             render_struct_class(&mut out, &path, s, module_name);
+            if s.builder {
+                render_ruby_builder_class(&mut out, s);
+            }
         }
         for f in &m.functions {
             if !f.r#async {
@@ -429,6 +432,36 @@ fn render_struct_class(
         render_getter(out, &prefix, field, rb_module_name);
     }
 
+    out.push_str("  end\n");
+}
+
+fn render_ruby_builder_class(out: &mut String, s: &StructDef) {
+    let builder = format!("{}Builder", s.name);
+    out.push_str(&format!("\n  class {builder}\n"));
+    out.push_str("    def initialize\n");
+    for field in &s.fields {
+        out.push_str(&format!("      @{} = nil\n", field.name));
+    }
+    out.push_str("    end\n\n");
+
+    for field in &s.fields {
+        out.push_str(&format!(
+            "    def with_{}(value)\n      @{} = value\n      self\n    end\n\n",
+            field.name, field.name
+        ));
+    }
+
+    out.push_str("    def build\n");
+    for field in &s.fields {
+        out.push_str(&format!(
+            "      raise \"missing field: {}\" if @{}.nil?\n",
+            field.name, field.name
+        ));
+    }
+    out.push_str(&format!(
+        "      raise NotImplementedError, \"{builder}.build requires FFI backing\"\n"
+    ));
+    out.push_str("    end\n");
     out.push_str("  end\n");
 }
 
@@ -1009,6 +1042,7 @@ mod tests {
             structs: vec![StructDef {
                 name: "Contact".into(),
                 doc: None,
+                builder: false,
                 fields: vec![
                     StructField {
                         name: "id".into(),
@@ -1051,6 +1085,37 @@ mod tests {
     }
 
     #[test]
+    fn renders_struct_builder_class() {
+        let api = make_api(vec![Module {
+            name: "geo".into(),
+            functions: vec![],
+            structs: vec![StructDef {
+                name: "Point".into(),
+                doc: None,
+                builder: true,
+                fields: vec![StructField {
+                    name: "x".into(),
+                    ty: TypeRef::F64,
+                    doc: None,
+                }],
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let code = render_ruby_module(&api, "WeaveFFI");
+        assert!(code.contains("class PointBuilder"), "builder class: {code}");
+        assert!(code.contains("def with_x(value)"), "with_x: {code}");
+        assert!(
+            code.contains("NotImplementedError, \"PointBuilder.build requires FFI backing\""),
+            "build stub: {code}"
+        );
+    }
+
+    #[test]
     fn struct_getter_frees_string() {
         let api = make_api(vec![Module {
             name: "data".into(),
@@ -1058,6 +1123,7 @@ mod tests {
             structs: vec![StructDef {
                 name: "Item".into(),
                 doc: None,
+                builder: false,
                 fields: vec![StructField {
                     name: "label".into(),
                     ty: TypeRef::StringUtf8,
@@ -1241,6 +1307,7 @@ mod tests {
             structs: vec![StructDef {
                 name: "Item".into(),
                 doc: None,
+                builder: false,
                 fields: vec![StructField {
                     name: "id".into(),
                     ty: TypeRef::I64,
@@ -1411,6 +1478,7 @@ mod tests {
             structs: vec![StructDef {
                 name: "Item".into(),
                 doc: None,
+                builder: false,
                 fields: vec![StructField {
                     name: "id".into(),
                     ty: TypeRef::I64,
@@ -1531,6 +1599,7 @@ mod tests {
                 structs: vec![StructDef {
                     name: "Contact".into(),
                     doc: None,
+                    builder: false,
                     fields: vec![
                         StructField {
                             name: "id".into(),
@@ -1647,6 +1716,7 @@ mod tests {
             structs: vec![StructDef {
                 name: "Contact".into(),
                 doc: None,
+                builder: false,
                 fields: vec![
                     StructField {
                         name: "first_name".into(),
@@ -1947,6 +2017,7 @@ mod tests {
             structs: vec![StructDef {
                 name: "Contact".into(),
                 doc: None,
+                builder: false,
                 fields: vec![StructField {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,

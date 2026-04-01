@@ -192,6 +192,7 @@ fn extract_struct(item: &syn::ItemStruct) -> Result<StructDef> {
         name,
         doc: extract_doc(&item.attrs),
         fields,
+        builder: false,
     })
 }
 

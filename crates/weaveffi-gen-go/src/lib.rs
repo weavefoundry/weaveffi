@@ -297,6 +297,9 @@ fn render_go(api: &Api) -> String {
         }
         for s in &m.structs {
             render_struct(&mut out, &path, s);
+            if s.builder {
+                render_go_builder(&mut out, s);
+            }
         }
         for f in &m.functions {
             if !f.r#async {
@@ -341,6 +344,29 @@ fn render_struct(out: &mut String, module: &str, s: &StructDef) {
     out.push_str("\t\ts.ptr = nil\n");
     out.push_str("\t}\n");
     out.push_str("}\n\n");
+}
+
+fn render_go_builder(out: &mut String, s: &StructDef) {
+    let name = s.name.to_upper_camel_case();
+    out.push_str(&format!("type {name}Builder struct {{\n"));
+    out.push_str("\tfields map[string]interface{}\n");
+    out.push_str("}\n\n");
+    out.push_str(&format!("func New{name}Builder() *{name}Builder {{\n"));
+    out.push_str(&format!(
+        "\treturn &{name}Builder{{fields: make(map[string]interface{{}})}}\n"
+    ));
+    out.push_str("}\n\n");
+
+    for field in &s.fields {
+        let method = field.name.to_upper_camel_case();
+        let gt = go_type(&field.ty);
+        out.push_str(&format!(
+            "func (b *{name}Builder) With{method}(value {gt}) *{name}Builder {{\n"
+        ));
+        out.push_str(&format!("\tb.fields[\"{}\"] = value\n", field.name));
+        out.push_str("\treturn b\n");
+        out.push_str("}\n\n");
+    }
 }
 
 fn render_getter(
@@ -1050,6 +1076,7 @@ mod tests {
                 structs: vec![StructDef {
                     name: "Contact".into(),
                     doc: None,
+                    builder: false,
                     fields: vec![
                         StructField {
                             name: "name".into(),
@@ -1097,6 +1124,51 @@ mod tests {
             go.contains("s.ptr = nil"),
             "missing nil assignment after destroy: {go}"
         );
+    }
+
+    #[test]
+    fn struct_builder_type_and_setters() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "geo".into(),
+                functions: vec![],
+                structs: vec![StructDef {
+                    name: "Point".into(),
+                    doc: None,
+                    builder: true,
+                    fields: vec![StructField {
+                        name: "x".into(),
+                        ty: TypeRef::F64,
+                        doc: None,
+                    }],
+                }],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let go = render_go(&api);
+        assert!(
+            go.contains("type PointBuilder struct {"),
+            "builder type: {go}"
+        );
+        assert!(
+            go.contains("fields map[string]interface{}"),
+            "fields map: {go}"
+        );
+        assert!(
+            go.contains("func NewPointBuilder() *PointBuilder"),
+            "constructor: {go}"
+        );
+        assert!(
+            go.contains("func (b *PointBuilder) WithX(value float64) *PointBuilder"),
+            "WithX: {go}"
+        );
+        assert!(go.contains("b.fields[\"x\"] = value"), "field assign: {go}");
     }
 
     #[test]
@@ -1278,6 +1350,7 @@ mod tests {
                 structs: vec![StructDef {
                     name: "Contact".into(),
                     doc: None,
+                    builder: false,
                     fields: vec![StructField {
                         name: "name".into(),
                         ty: TypeRef::StringUtf8,
@@ -1432,6 +1505,7 @@ mod tests {
                 structs: vec![StructDef {
                     name: "Contact".into(),
                     doc: None,
+                    builder: false,
                     fields: vec![StructField {
                         name: "name".into(),
                         ty: TypeRef::StringUtf8,
@@ -1589,6 +1663,7 @@ mod tests {
                 structs: vec![StructDef {
                     name: "Contact".into(),
                     doc: None,
+                    builder: false,
                     fields: vec![StructField {
                         name: "email".into(),
                         ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
@@ -1663,6 +1738,7 @@ mod tests {
                 structs: vec![StructDef {
                     name: "Contact".into(),
                     doc: None,
+                    builder: false,
                     fields: vec![StructField {
                         name: "contact_type".into(),
                         ty: TypeRef::Enum("ContactType".into()),
@@ -1744,6 +1820,7 @@ mod tests {
                 structs: vec![StructDef {
                     name: "Contact".into(),
                     doc: None,
+                    builder: false,
                     fields: vec![
                         StructField {
                             name: "first_name".into(),
@@ -2041,6 +2118,7 @@ mod tests {
                 structs: vec![StructDef {
                     name: "Contact".into(),
                     doc: None,
+                    builder: false,
                     fields: vec![
                         StructField {
                             name: "id".into(),
@@ -2208,6 +2286,7 @@ mod tests {
                 structs: vec![StructDef {
                     name: "Contact".into(),
                     doc: None,
+                    builder: false,
                     fields: vec![StructField {
                         name: "name".into(),
                         ty: TypeRef::StringUtf8,
