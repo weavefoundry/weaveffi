@@ -32,7 +32,7 @@ a stable C ABI contract consumed by language-specific wrappers.
 
 ## What works today
 
-- **CLI** with commands: `generate`, `new`, `validate`, `extract`, `lint`, `diff`, `doctor`, `upgrade`, `completions`, `schema-version`
+- **CLI** with commands: `generate`, `new`, `validate`, `extract`, `lint`, `diff`, `doctor`, `completions`, `schema-version`
 - **IR parsing** from YAML, JSON, and TOML with validation (name collisions, reserved keywords, unsupported shapes)
 - **Code generators** for C, C++, Swift, Android, Node.js, WASM, Python, .NET, Dart, Go, and Ruby targets
 - **Rich type system**: primitives, strings, bytes, handles, typed handles, structs, enums, optionals, lists, maps, iterators, callbacks
@@ -49,7 +49,7 @@ a stable C ABI contract consumed by language-specific wrappers.
 - **Validation warnings** — `--warn` and `lint` command for non-fatal diagnostics
 - **Diff mode** — compare generated output against existing files
 - **Shell completions** — `weaveffi completions <shell>` for bash, zsh, fish, PowerShell
-- **Schema versioning** — IR version field with `weaveffi upgrade` for migration and `schema-version` for querying
+- **Schema versioning** — IR version field with `schema-version` for querying
 - **Async IR model** — async functions with completion callback convention and cancellation support
 - **Advanced IR features** — sub-modules, builder pattern, deprecated/since annotations, mutable params, default field values, borrowed types
 
@@ -79,8 +79,7 @@ a stable C ABI contract consumed by language-specific wrappers.
 - [x] Template engine (Tera) with user-overridable templates and template directory discovery
 - [x] Pre-generation and post-generation hook commands
 - [x] Inline `[generators.<target>]` sections in IDL files for per-target configuration
-- [x] IR schema version field with documented compatibility guarantees
-- [x] `weaveffi upgrade` command for migrating IDL files between schema versions
+- [x] IR schema version field
 - [x] Shell auto-completions (`weaveffi completions <shell>` for bash, zsh, fish, PowerShell)
 - [x] Improved `weaveffi new` with full project scaffold (Cargo.toml, lib.rs, IDL, README)
 - [x] Typed handles (`handle<Name>`) replacing raw `u64` for type-safe handle usage

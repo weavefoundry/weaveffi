@@ -1,12 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
-use weaveffi_ir::ir::{Api, ErrorDomain, Function, Module, Param, TypeRef, SUPPORTED_VERSIONS};
+use weaveffi_ir::ir::{Api, ErrorDomain, Function, Module, Param, TypeRef};
 
 #[derive(Debug, Clone)]
 pub enum ValidationWarning {
-    DeprecatedHandleType {
-        module: String,
-        function: String,
-    },
     LargeEnumVariantCount {
         enum_name: String,
         count: usize,
@@ -37,12 +33,6 @@ pub enum ValidationWarning {
 impl std::fmt::Display for ValidationWarning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::DeprecatedHandleType { module, function } => {
-                write!(
-                    f,
-                    "deprecated untyped 'handle' in {module}::{function}; use 'handle<StructName>' for type safety"
-                )
-            }
             Self::LargeEnumVariantCount { enum_name, count } => {
                 write!(f, "enum '{enum_name}' has {count} variants (>100)")
             }
@@ -85,15 +75,6 @@ impl std::fmt::Display for ValidationWarning {
 pub fn collect_warnings(api: &Api) -> Vec<ValidationWarning> {
     let mut warnings = Vec::new();
     for module in &api.modules {
-        for f in &module.functions {
-            if function_uses_handle(f) {
-                warnings.push(ValidationWarning::DeprecatedHandleType {
-                    module: module.name.clone(),
-                    function: f.name.clone(),
-                });
-            }
-        }
-
         for e in &module.enums {
             if e.variants.len() > 100 {
                 warnings.push(ValidationWarning::LargeEnumVariantCount {
@@ -185,22 +166,6 @@ fn is_value_type(ty: &TypeRef) -> bool {
     )
 }
 
-fn function_uses_handle(f: &Function) -> bool {
-    f.params.iter().any(|p| contains_handle(&p.ty))
-        || f.returns.as_ref().is_some_and(contains_handle)
-}
-
-fn contains_handle(ty: &TypeRef) -> bool {
-    match ty {
-        TypeRef::Handle => true,
-        TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
-            contains_handle(inner)
-        }
-        TypeRef::Map(k, v) => contains_handle(k) || contains_handle(v),
-        _ => false,
-    }
-}
-
 fn nesting_depth(ty: &TypeRef) -> usize {
     match ty {
         TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
@@ -213,8 +178,6 @@ fn nesting_depth(ty: &TypeRef) -> usize {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
-    #[error("unsupported schema version '{version}'; supported versions: {supported}")]
-    UnsupportedSchemaVersion { version: String, supported: String },
     #[error("module has no name")]
     NoModuleName,
     #[error("duplicate module name: {0}")]
@@ -311,13 +274,6 @@ fn check_identifier(name: &str) -> Result<(), ValidationError> {
 }
 
 pub fn validate_api(api: &mut Api) -> Result<(), ValidationError> {
-    if !SUPPORTED_VERSIONS.contains(&api.version.as_str()) {
-        return Err(ValidationError::UnsupportedSchemaVersion {
-            version: api.version.clone(),
-            supported: SUPPORTED_VERSIONS.join(", "),
-        });
-    }
-
     let mut module_names = BTreeSet::new();
     for m in &api.modules {
         if !module_names.insert(m.name.clone()) {
@@ -2041,185 +1997,6 @@ mod tests {
     }
 
     #[test]
-    fn warning_deprecated_handle_in_param() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "mymod".to_string(),
-                functions: vec![Function {
-                    name: "get_thing".to_string(),
-                    params: vec![Param {
-                        name: "h".to_string(),
-                        ty: TypeRef::Handle,
-                        mutable: false,
-                    }],
-                    returns: None,
-                    doc: Some("documented".to_string()),
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-        let warnings = collect_warnings(&api);
-        assert_eq!(warnings.len(), 1);
-        assert!(matches!(
-            &warnings[0],
-            ValidationWarning::DeprecatedHandleType { module, function }
-                if module == "mymod" && function == "get_thing"
-        ));
-    }
-
-    #[test]
-    fn warning_deprecated_handle_in_return() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "mymod".to_string(),
-                functions: vec![Function {
-                    name: "create".to_string(),
-                    params: vec![],
-                    returns: Some(TypeRef::Handle),
-                    doc: Some("documented".to_string()),
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-        let warnings = collect_warnings(&api);
-        assert!(warnings.iter().any(|w| matches!(
-            w,
-            ValidationWarning::DeprecatedHandleType { function, .. } if function == "create"
-        )));
-    }
-
-    #[test]
-    fn warning_deprecated_handle_nested() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "mymod".to_string(),
-                functions: vec![Function {
-                    name: "find".to_string(),
-                    params: vec![],
-                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Handle))),
-                    doc: Some("documented".to_string()),
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-        let warnings = collect_warnings(&api);
-        assert!(warnings.iter().any(|w| matches!(
-            w,
-            ValidationWarning::DeprecatedHandleType { function, .. } if function == "find"
-        )));
-    }
-
-    #[test]
-    fn warning_suggests_typed_handle() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "mymod".to_string(),
-                functions: vec![Function {
-                    name: "get_thing".to_string(),
-                    params: vec![Param {
-                        name: "h".to_string(),
-                        ty: TypeRef::Handle,
-                        mutable: false,
-                    }],
-                    returns: None,
-                    doc: Some("documented".to_string()),
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-        let warnings = collect_warnings(&api);
-        assert_eq!(warnings.len(), 1);
-        let msg = warnings[0].to_string();
-        assert!(
-            msg.contains("handle<"),
-            "expected warning to suggest handle<StructName> syntax, got: {msg}"
-        );
-        assert!(
-            msg.contains("deprecated untyped 'handle'"),
-            "expected deprecation phrasing, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn warning_no_handle_no_warning() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "mymod".to_string(),
-                functions: vec![Function {
-                    name: "add".to_string(),
-                    params: vec![Param {
-                        name: "x".to_string(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                    }],
-                    returns: Some(TypeRef::I32),
-                    doc: Some("documented".to_string()),
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-        let warnings = collect_warnings(&api);
-        assert!(!warnings
-            .iter()
-            .any(|w| matches!(w, ValidationWarning::DeprecatedHandleType { .. })));
-    }
-
-    #[test]
     fn warning_large_enum_variant_count() {
         let variants: Vec<EnumVariant> = (0..101)
             .map(|i| EnumVariant {
@@ -2836,39 +2613,6 @@ mod tests {
             ValidationError::BorrowedTypeInInvalidPosition { ty, location }
                 if ty == "&[u8]" && location.contains("struct")
         ));
-    }
-
-    #[test]
-    fn unsupported_version_rejected() {
-        let mut api = Api {
-            version: "9.9.9".to_string(),
-            modules: vec![simple_module("mymod")],
-            generators: None,
-        };
-        let err = validate_api(&mut api).unwrap_err();
-        assert!(matches!(
-            &err,
-            ValidationError::UnsupportedSchemaVersion { version, supported }
-                if version == "9.9.9" && supported.contains("0.1.0") && supported.contains("0.2.0")
-        ));
-        assert!(err
-            .to_string()
-            .contains("unsupported schema version '9.9.9'"));
-    }
-
-    #[test]
-    fn supported_version_passes() {
-        for v in weaveffi_ir::ir::SUPPORTED_VERSIONS {
-            let mut api = Api {
-                version: v.to_string(),
-                modules: vec![simple_module("mymod")],
-                generators: None,
-            };
-            assert!(
-                validate_api(&mut api).is_ok(),
-                "expected version '{v}' to be accepted"
-            );
-        }
     }
 
     #[test]
