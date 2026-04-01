@@ -43,11 +43,11 @@ needing WeaveFFI tooling or runtime dependencies.
 - **Template engine** — override built-in code generation with custom [Tera](https://keats.github.io/tera/) templates via `--templates`
 - **Hook commands** — run arbitrary shell commands before and after generation via `pre_generate` / `post_generate` in the config
 - **Inline generator config** — embed per-target configuration directly in your IDL file via a `generators` section
-- **Validation** — catches duplicate names, unknown type references, reserved keywords, invalid identifiers, and unsupported schema versions before code generation
+- **Validation** — catches duplicate names, unknown type references, reserved keywords, and invalid identifiers before code generation
 - **Extract** — `weaveffi extract` reads annotated Rust source files and produces an API definition, so you don't have to write IDL by hand
 - **Scaffolding** — `--scaffold` flag emits a Rust `extern "C"` stub file so you can fill in the implementation
 - **Generator configuration** — customise Swift module names, Android package, C prefix, C++ namespace, Dart/Go/Ruby package names, and more via a TOML config file (see [docs](https://weavefoundry.github.io/weaveffi/guides/config.html))
-- **Schema versioning** — formal version checking with `weaveffi upgrade` for migrating between schema versions
+- **Schema versioning** — IR version field with `weaveffi schema-version` for querying the current version
 - **Doctor** — `weaveffi doctor` checks for required toolchains (Rust, Xcode, NDK, Node)
 
 ## Supported targets
@@ -145,7 +145,6 @@ weaveffi_contacts_Contact* weaveffi_contacts_create_contact(
 | `weaveffi lint <file>` | Lint an API definition and report warnings |
 | `weaveffi diff <file>` | Show a diff of what would change if bindings were regenerated |
 | `weaveffi doctor` | Check for required toolchains (Rust, Xcode, NDK, Node) |
-| `weaveffi upgrade <file>` | Migrate an API definition to the latest schema version |
 | `weaveffi completions <shell>` | Print shell completion scripts (bash, zsh, fish, etc.) |
 | `weaveffi schema-version` | Print the current IR schema version |
 

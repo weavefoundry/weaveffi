@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 pub const CURRENT_SCHEMA_VERSION: &str = "0.2.0";
-pub const SUPPORTED_VERSIONS: &[&str] = &["0.1.0", "0.2.0"];
 
 /// `Eq` is omitted because `toml::Value` contains `f64`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

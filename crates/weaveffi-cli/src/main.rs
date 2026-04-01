@@ -26,7 +26,7 @@ use weaveffi_gen_python::PythonGenerator;
 use weaveffi_gen_ruby::RubyGenerator;
 use weaveffi_gen_swift::SwiftGenerator;
 use weaveffi_gen_wasm::WasmGenerator;
-use weaveffi_ir::ir::{CURRENT_SCHEMA_VERSION, SUPPORTED_VERSIONS};
+use weaveffi_ir::ir::CURRENT_SCHEMA_VERSION;
 use weaveffi_ir::parse::{parse_api_str, ParseError};
 
 #[derive(Parser, Debug)]
@@ -102,13 +102,6 @@ enum Commands {
         out: Option<String>,
     },
     Doctor,
-    Upgrade {
-        /// Input IDL/IR file to upgrade
-        input: String,
-        /// Output file (defaults to overwriting input)
-        #[arg(short, long)]
-        output: Option<String>,
-    },
     Completions {
         /// Shell to generate completions for
         shell: clap_complete::Shell,
@@ -175,7 +168,6 @@ fn main() -> Result<()> {
             }
         }
         Commands::Diff { input, out } => cmd_diff(&input, out.as_deref(), quiet)?,
-        Commands::Upgrade { input, output } => cmd_upgrade(&input, output.as_deref(), quiet)?,
         Commands::Doctor => cmd_doctor()?,
         Commands::Completions { shell } => cmd_completions(shell),
         Commands::SchemaVersion => println!("{CURRENT_SCHEMA_VERSION}"),
@@ -629,48 +621,6 @@ fn cmd_diff(input: &str, out: Option<&str>, quiet: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_upgrade(input: &str, output: Option<&str>, quiet: bool) -> Result<()> {
-    let contents = std::fs::read_to_string(input)
-        .wrap_err_with(|| format!("failed to read input file: {}", input))?;
-
-    let mut doc: serde_yaml::Value =
-        serde_yaml::from_str(&contents).wrap_err("failed to parse input as YAML")?;
-
-    let version = doc
-        .get("version")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| eyre!("missing or non-string 'version' field in input"))?
-        .to_owned();
-
-    if version == CURRENT_SCHEMA_VERSION {
-        if !quiet {
-            println!("Already up to date.");
-        }
-        return Ok(());
-    }
-
-    if !SUPPORTED_VERSIONS.contains(&version.as_str()) {
-        bail!(
-            "unsupported schema version '{}'; supported versions: {}",
-            version,
-            SUPPORTED_VERSIONS.join(", ")
-        );
-    }
-
-    doc["version"] = serde_yaml::Value::String(CURRENT_SCHEMA_VERSION.to_owned());
-
-    let upgraded = serde_yaml::to_string(&doc).wrap_err("failed to serialize upgraded YAML")?;
-
-    let dest = output.unwrap_or(input);
-    std::fs::write(dest, &upgraded)
-        .wrap_err_with(|| format!("failed to write output file: {}", dest))?;
-
-    if !quiet {
-        println!("Upgraded {} -> {}", version, CURRENT_SCHEMA_VERSION);
-    }
-    Ok(())
-}
-
 fn collect_relative_files(base: &Utf8Path) -> Result<BTreeSet<String>> {
     let mut files = BTreeSet::new();
     walk_dir(base, base, &mut files)?;
@@ -741,9 +691,6 @@ fn format_validation_error(err: ValidationError) -> Report {
 
 fn validation_suggestion(err: &ValidationError) -> &'static str {
     match err {
-        ValidationError::UnsupportedSchemaVersion { .. } => {
-            "update the 'version' field in your API definition to a supported version, or run 'weaveffi upgrade' to migrate"
-        }
         ValidationError::NoModuleName => "every module must have a non-empty 'name' field",
         ValidationError::DuplicateModuleName(_) => {
             "module names must be unique within an API definition; rename or merge the duplicate"
@@ -1041,10 +988,6 @@ mod tests {
     #[test]
     fn validation_suggestion_covers_all_variants() {
         let cases: Vec<ValidationError> = vec![
-            ValidationError::UnsupportedSchemaVersion {
-                version: "0.0.1".into(),
-                supported: "0.1.0, 0.2.0".into(),
-            },
             ValidationError::NoModuleName,
             ValidationError::DuplicateModuleName("m".into()),
             ValidationError::InvalidModuleName("123".into(), "bad"),
@@ -1504,101 +1447,6 @@ mod tests {
         assert!(
             contents.contains("todo!()"),
             "lib.rs should contain todo!() stubs: {contents}"
-        );
-    }
-
-    #[test]
-    fn upgrade_updates_version() {
-        let _ = color_eyre::install();
-        let dir = tempfile::tempdir().unwrap();
-        let yml = dir.path().join("api.yml");
-        std::fs::write(
-            &yml,
-            concat!(
-                "version: \"0.1.0\"\n",
-                "modules:\n",
-                "  - name: math\n",
-                "    functions:\n",
-                "      - name: add\n",
-                "        params:\n",
-                "          - { name: a, type: i32 }\n",
-                "          - { name: b, type: i32 }\n",
-                "        return: i32\n",
-            ),
-        )
-        .unwrap();
-
-        let out = dir.path().join("upgraded.yml");
-        cmd_upgrade(yml.to_str().unwrap(), Some(out.to_str().unwrap()), false).unwrap();
-
-        let contents = std::fs::read_to_string(&out).unwrap();
-        let doc: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
-        assert_eq!(
-            doc["version"].as_str().unwrap(),
-            "0.2.0",
-            "version should be upgraded to 0.2.0"
-        );
-    }
-
-    #[test]
-    fn upgrade_already_current() {
-        let _ = color_eyre::install();
-        let dir = tempfile::tempdir().unwrap();
-        let yml = dir.path().join("api.yml");
-        std::fs::write(
-            &yml,
-            concat!(
-                "version: \"0.2.0\"\n",
-                "modules:\n",
-                "  - name: math\n",
-                "    functions:\n",
-                "      - name: add\n",
-                "        params:\n",
-                "          - { name: a, type: i32 }\n",
-                "          - { name: b, type: i32 }\n",
-                "        return: i32\n",
-            ),
-        )
-        .unwrap();
-
-        let out = dir.path().join("upgraded.yml");
-        cmd_upgrade(yml.to_str().unwrap(), Some(out.to_str().unwrap()), false).unwrap();
-
-        assert!(
-            !out.exists(),
-            "no output should be written when already current"
-        );
-    }
-
-    #[test]
-    fn upgrade_overwrites_input_when_no_output() {
-        let _ = color_eyre::install();
-        let dir = tempfile::tempdir().unwrap();
-        let yml = dir.path().join("api.yml");
-        std::fs::write(
-            &yml,
-            concat!(
-                "version: \"0.1.0\"\n",
-                "modules:\n",
-                "  - name: math\n",
-                "    functions:\n",
-                "      - name: add\n",
-                "        params:\n",
-                "          - { name: a, type: i32 }\n",
-                "          - { name: b, type: i32 }\n",
-                "        return: i32\n",
-            ),
-        )
-        .unwrap();
-
-        cmd_upgrade(yml.to_str().unwrap(), None, false).unwrap();
-
-        let contents = std::fs::read_to_string(&yml).unwrap();
-        let doc: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
-        assert_eq!(
-            doc["version"].as_str().unwrap(),
-            "0.2.0",
-            "input file should be upgraded in-place"
         );
     }
 
