@@ -938,10 +938,16 @@ mod tests {
     #[test]
     fn output_files_correct() {
         let api = calculator_api();
-        let files = GoGenerator.output_files(&api, Utf8Path::new("out"));
+        let out = Utf8Path::new("out");
+        let go = out.join("go");
+        let files = GoGenerator.output_files(&api, out);
         assert_eq!(
             files,
-            vec!["out/go/weaveffi.go", "out/go/go.mod", "out/go/README.md",]
+            vec![
+                go.join("weaveffi.go").to_string(),
+                go.join("go.mod").to_string(),
+                go.join("README.md").to_string(),
+            ]
         );
     }
 

@@ -607,13 +607,14 @@ mod tests {
     fn output_files_lists_dart_file() {
         let api = make_api(vec![]);
         let out = Utf8Path::new("/tmp/out");
+        let dart = out.join("dart");
         let files = DartGenerator.output_files(&api, out);
         assert_eq!(
             files,
             vec![
-                "/tmp/out/dart/lib/weaveffi.dart",
-                "/tmp/out/dart/pubspec.yaml",
-                "/tmp/out/dart/README.md",
+                dart.join("lib/weaveffi.dart").to_string(),
+                dart.join("pubspec.yaml").to_string(),
+                dart.join("README.md").to_string(),
             ]
         );
     }
