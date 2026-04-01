@@ -16,11 +16,17 @@ impl Generator for GoGenerator {
         let dir = out_dir.join("go");
         std::fs::create_dir_all(&dir)?;
         std::fs::write(dir.join("weaveffi.go"), render_go(api))?;
+        std::fs::write(dir.join("go.mod"), render_go_mod())?;
+        std::fs::write(dir.join("README.md"), render_readme())?;
         Ok(())
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
-        vec![out_dir.join("go/weaveffi.go").to_string()]
+        vec![
+            out_dir.join("go/weaveffi.go").to_string(),
+            out_dir.join("go/go.mod").to_string(),
+            out_dir.join("go/README.md").to_string(),
+        ]
     }
 }
 
@@ -158,6 +164,52 @@ fn scan_imports(api: &Api) -> (bool, bool, bool) {
     });
 
     (needs_fmt, needs_unsafe, needs_bool)
+}
+
+// ── Packaging scaffold ──
+
+fn render_go_mod() -> String {
+    "module weaveffi\n\ngo 1.21\n".into()
+}
+
+fn render_readme() -> String {
+    r#"# WeaveFFI Go Bindings
+
+Auto-generated Go bindings using CGo.
+
+## Prerequisites
+
+- Go >= 1.21
+- A C compiler (gcc or clang) accessible to CGo
+- The compiled shared library (`libweaveffi.so`, `libweaveffi.dylib`,
+  or `weaveffi.dll`) and the C header (`weaveffi.h`)
+
+## Build
+
+1. Place `libweaveffi.so` (or the platform-specific equivalent) and
+   `weaveffi.h` where the linker and CGo can find them. For example,
+   install them into `/usr/local/lib` and `/usr/local/include`, or set
+   `CGO_LDFLAGS` and `CGO_CFLAGS`:
+
+```sh
+export CGO_CFLAGS="-I/path/to/headers"
+export CGO_LDFLAGS="-L/path/to/lib -lweaveffi"
+```
+
+2. Build or run your Go project that imports this module:
+
+```sh
+go build ./...
+```
+
+## How It Works
+
+The generated `weaveffi.go` file uses a CGo preamble to `#include "weaveffi.h"`
+and link against `-lweaveffi`. Each API function is exposed as an idiomatic Go
+function that marshals arguments to C types, calls the C ABI function, and
+converts the result back to Go types. Errors are returned as Go `error` values.
+"#
+    .into()
 }
 
 // ── Top-level rendering ──
@@ -777,7 +829,10 @@ mod tests {
     fn output_files_correct() {
         let api = calculator_api();
         let files = GoGenerator.output_files(&api, Utf8Path::new("out"));
-        assert_eq!(files, vec!["out/go/weaveffi.go"]);
+        assert_eq!(
+            files,
+            vec!["out/go/weaveffi.go", "out/go/go.mod", "out/go/README.md",]
+        );
     }
 
     #[test]
@@ -1339,6 +1394,40 @@ mod tests {
         assert!(
             contents.contains("package weaveffi"),
             "file should contain package declaration"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn go_generates_go_mod() {
+        let api = calculator_api();
+        let tmp = std::env::temp_dir().join("weaveffi_test_go_mod");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        GoGenerator.generate(&api, out_dir).unwrap();
+
+        let go_mod_path = tmp.join("go/go.mod");
+        assert!(go_mod_path.exists(), "go/go.mod should exist");
+        let go_mod = std::fs::read_to_string(&go_mod_path).unwrap();
+        assert!(
+            go_mod.contains("module weaveffi"),
+            "missing module directive: {go_mod}"
+        );
+        assert!(go_mod.contains("go 1.21"), "missing go version: {go_mod}");
+
+        let readme_path = tmp.join("go/README.md");
+        assert!(readme_path.exists(), "go/README.md should exist");
+        let readme = std::fs::read_to_string(&readme_path).unwrap();
+        assert!(
+            readme.contains("CGo"),
+            "README should mention CGo: {readme}"
+        );
+        assert!(
+            readme.contains("go build"),
+            "README should mention go build: {readme}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
