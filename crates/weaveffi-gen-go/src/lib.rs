@@ -2,10 +2,22 @@ use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_core::codegen::Generator;
+use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::c_symbol_name;
 use weaveffi_ir::ir::{Api, EnumDef, Function, StructDef, StructField, TypeRef};
 
 pub struct GoGenerator;
+
+impl GoGenerator {
+    fn generate_impl(&self, api: &Api, out_dir: &Utf8Path, module_path: &str) -> Result<()> {
+        let dir = out_dir.join("go");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("weaveffi.go"), render_go(api))?;
+        std::fs::write(dir.join("go.mod"), render_go_mod(module_path))?;
+        std::fs::write(dir.join("README.md"), render_readme())?;
+        Ok(())
+    }
+}
 
 impl Generator for GoGenerator {
     fn name(&self) -> &'static str {
@@ -13,12 +25,16 @@ impl Generator for GoGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        let dir = out_dir.join("go");
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join("weaveffi.go"), render_go(api))?;
-        std::fs::write(dir.join("go.mod"), render_go_mod())?;
-        std::fs::write(dir.join("README.md"), render_readme())?;
-        Ok(())
+        self.generate_impl(api, out_dir, "weaveffi")
+    }
+
+    fn generate_with_config(
+        &self,
+        api: &Api,
+        out_dir: &Utf8Path,
+        config: &GeneratorConfig,
+    ) -> Result<()> {
+        self.generate_impl(api, out_dir, config.go_module_path())
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
@@ -168,8 +184,8 @@ fn scan_imports(api: &Api) -> (bool, bool, bool) {
 
 // ── Packaging scaffold ──
 
-fn render_go_mod() -> String {
-    "module weaveffi\n\ngo 1.21\n".into()
+fn render_go_mod(module_path: &str) -> String {
+    format!("module {module_path}\n\ngo 1.21\n")
 }
 
 fn render_readme() -> String {
@@ -773,6 +789,7 @@ mod tests {
     use super::*;
     use camino::Utf8Path;
     use weaveffi_core::codegen::Generator;
+    use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{
         Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
     };
@@ -1569,5 +1586,500 @@ mod tests {
             go.contains("func (s *Contact) ContactType() ContactType"),
             "missing enum field getter: {go}"
         );
+    }
+
+    #[test]
+    fn generate_go_basic() {
+        let api = calculator_api();
+        let tmp = std::env::temp_dir().join("weaveffi_test_go_basic");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        GoGenerator
+            .generate_with_config(&api, out_dir, &GeneratorConfig::default())
+            .unwrap();
+
+        let go = std::fs::read_to_string(tmp.join("go/weaveffi.go")).unwrap();
+        assert!(go.contains("package weaveffi"), "missing package: {go}");
+        assert!(
+            go.contains("func CalculatorAdd(a int32, b int32) (int32, error)"),
+            "missing add function: {go}"
+        );
+        assert!(
+            go.contains("func CalculatorEcho(msg string) (string, error)"),
+            "missing echo function: {go}"
+        );
+
+        let go_mod = std::fs::read_to_string(tmp.join("go/go.mod")).unwrap();
+        assert!(
+            go_mod.contains("module weaveffi"),
+            "go.mod should have default module path: {go_mod}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn generate_go_with_structs() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "contacts".into(),
+                functions: vec![Function {
+                    name: "get_contact".into(),
+                    params: vec![Param {
+                        name: "id".into(),
+                        ty: TypeRef::Handle,
+                    }],
+                    returns: Some(TypeRef::Struct("Contact".into())),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                }],
+                structs: vec![StructDef {
+                    name: "Contact".into(),
+                    doc: None,
+                    fields: vec![
+                        StructField {
+                            name: "first_name".into(),
+                            ty: TypeRef::StringUtf8,
+                            doc: None,
+                        },
+                        StructField {
+                            name: "last_name".into(),
+                            ty: TypeRef::StringUtf8,
+                            doc: None,
+                        },
+                        StructField {
+                            name: "age".into(),
+                            ty: TypeRef::I32,
+                            doc: None,
+                        },
+                    ],
+                }],
+                enums: vec![],
+                errors: None,
+            }],
+            generators: None,
+        };
+        let tmp = std::env::temp_dir().join("weaveffi_test_go_structs");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        GoGenerator
+            .generate_with_config(&api, out_dir, &GeneratorConfig::default())
+            .unwrap();
+
+        let go = std::fs::read_to_string(tmp.join("go/weaveffi.go")).unwrap();
+        assert!(go.contains("type Contact struct {"), "missing struct: {go}");
+        assert!(
+            go.contains("ptr *C.weaveffi_contacts_Contact"),
+            "missing ptr field: {go}"
+        );
+        assert!(
+            go.contains("func (s *Contact) FirstName() string"),
+            "missing FirstName getter: {go}"
+        );
+        assert!(
+            go.contains("func (s *Contact) LastName() string"),
+            "missing LastName getter: {go}"
+        );
+        assert!(
+            go.contains("func (s *Contact) Age() int32"),
+            "missing Age getter: {go}"
+        );
+        assert!(
+            go.contains("func (s *Contact) Close()"),
+            "missing Close: {go}"
+        );
+        assert!(
+            go.contains("(*Contact, error)"),
+            "missing struct return type: {go}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn generate_go_with_enums() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "contacts".into(),
+                functions: vec![Function {
+                    name: "classify".into(),
+                    params: vec![Param {
+                        name: "ct".into(),
+                        ty: TypeRef::Enum("ContactType".into()),
+                    }],
+                    returns: Some(TypeRef::Enum("ContactType".into())),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                }],
+                structs: vec![],
+                enums: vec![EnumDef {
+                    name: "ContactType".into(),
+                    doc: None,
+                    variants: vec![
+                        EnumVariant {
+                            name: "Personal".into(),
+                            value: 0,
+                            doc: None,
+                        },
+                        EnumVariant {
+                            name: "Work".into(),
+                            value: 1,
+                            doc: None,
+                        },
+                        EnumVariant {
+                            name: "Other".into(),
+                            value: 2,
+                            doc: None,
+                        },
+                    ],
+                }],
+                errors: None,
+            }],
+            generators: None,
+        };
+        let tmp = std::env::temp_dir().join("weaveffi_test_go_enums");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        GoGenerator
+            .generate_with_config(&api, out_dir, &GeneratorConfig::default())
+            .unwrap();
+
+        let go = std::fs::read_to_string(tmp.join("go/weaveffi.go")).unwrap();
+        assert!(
+            go.contains("type ContactType int32"),
+            "missing enum type: {go}"
+        );
+        assert!(
+            go.contains("ContactTypePersonal ContactType = 0"),
+            "missing Personal variant: {go}"
+        );
+        assert!(
+            go.contains("ContactTypeWork ContactType = 1"),
+            "missing Work variant: {go}"
+        );
+        assert!(
+            go.contains("ContactTypeOther ContactType = 2"),
+            "missing Other variant: {go}"
+        );
+        assert!(
+            go.contains("func ContactsClassify(ct ContactType) (ContactType, error)"),
+            "missing classify function: {go}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn generate_go_error_handling() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "store".into(),
+                functions: vec![
+                    Function {
+                        name: "save".into(),
+                        params: vec![Param {
+                            name: "data".into(),
+                            ty: TypeRef::StringUtf8,
+                        }],
+                        returns: Some(TypeRef::I32),
+                        doc: None,
+                        r#async: false,
+                        cancellable: false,
+                    },
+                    Function {
+                        name: "clear".into(),
+                        params: vec![],
+                        returns: None,
+                        doc: None,
+                        r#async: false,
+                        cancellable: false,
+                    },
+                ],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+            generators: None,
+        };
+        let tmp = std::env::temp_dir().join("weaveffi_test_go_errors");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        GoGenerator
+            .generate_with_config(&api, out_dir, &GeneratorConfig::default())
+            .unwrap();
+
+        let go = std::fs::read_to_string(tmp.join("go/weaveffi.go")).unwrap();
+        assert!(
+            go.contains("func StoreSave(data string) (int32, error)"),
+            "missing save sig: {go}"
+        );
+        assert!(
+            go.contains("func StoreClear() error"),
+            "missing void clear sig: {go}"
+        );
+        assert!(
+            go.contains("var cErr C.weaveffi_error"),
+            "missing error var: {go}"
+        );
+        assert!(
+            go.contains("if cErr.code != 0"),
+            "missing error check: {go}"
+        );
+        assert!(
+            go.contains("C.weaveffi_error_clear(&cErr)"),
+            "missing error clear: {go}"
+        );
+        assert!(
+            go.contains("return 0, goErr"),
+            "missing zero-value error return for i32: {go}"
+        );
+        assert!(
+            go.contains("return goErr"),
+            "missing void error return: {go}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn generate_go_full_contacts() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "contacts".into(),
+                functions: vec![
+                    Function {
+                        name: "create_contact".into(),
+                        params: vec![
+                            Param {
+                                name: "first_name".into(),
+                                ty: TypeRef::StringUtf8,
+                            },
+                            Param {
+                                name: "last_name".into(),
+                                ty: TypeRef::StringUtf8,
+                            },
+                            Param {
+                                name: "email".into(),
+                                ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                            },
+                            Param {
+                                name: "contact_type".into(),
+                                ty: TypeRef::Enum("ContactType".into()),
+                            },
+                        ],
+                        returns: Some(TypeRef::Handle),
+                        doc: None,
+                        r#async: false,
+                        cancellable: false,
+                    },
+                    Function {
+                        name: "get_contact".into(),
+                        params: vec![Param {
+                            name: "id".into(),
+                            ty: TypeRef::Handle,
+                        }],
+                        returns: Some(TypeRef::Struct("Contact".into())),
+                        doc: None,
+                        r#async: false,
+                        cancellable: false,
+                    },
+                    Function {
+                        name: "list_contacts".into(),
+                        params: vec![],
+                        returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
+                        doc: None,
+                        r#async: false,
+                        cancellable: false,
+                    },
+                    Function {
+                        name: "delete_contact".into(),
+                        params: vec![Param {
+                            name: "id".into(),
+                            ty: TypeRef::Handle,
+                        }],
+                        returns: Some(TypeRef::Bool),
+                        doc: None,
+                        r#async: false,
+                        cancellable: false,
+                    },
+                    Function {
+                        name: "count_contacts".into(),
+                        params: vec![],
+                        returns: Some(TypeRef::I32),
+                        doc: None,
+                        r#async: false,
+                        cancellable: false,
+                    },
+                ],
+                structs: vec![StructDef {
+                    name: "Contact".into(),
+                    doc: None,
+                    fields: vec![
+                        StructField {
+                            name: "id".into(),
+                            ty: TypeRef::I64,
+                            doc: None,
+                        },
+                        StructField {
+                            name: "first_name".into(),
+                            ty: TypeRef::StringUtf8,
+                            doc: None,
+                        },
+                        StructField {
+                            name: "last_name".into(),
+                            ty: TypeRef::StringUtf8,
+                            doc: None,
+                        },
+                        StructField {
+                            name: "email".into(),
+                            ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                            doc: None,
+                        },
+                        StructField {
+                            name: "contact_type".into(),
+                            ty: TypeRef::Enum("ContactType".into()),
+                            doc: None,
+                        },
+                    ],
+                }],
+                enums: vec![EnumDef {
+                    name: "ContactType".into(),
+                    doc: None,
+                    variants: vec![
+                        EnumVariant {
+                            name: "Personal".into(),
+                            value: 0,
+                            doc: None,
+                        },
+                        EnumVariant {
+                            name: "Work".into(),
+                            value: 1,
+                            doc: None,
+                        },
+                        EnumVariant {
+                            name: "Other".into(),
+                            value: 2,
+                            doc: None,
+                        },
+                    ],
+                }],
+                errors: None,
+            }],
+            generators: None,
+        };
+        let tmp = std::env::temp_dir().join("weaveffi_test_go_full_contacts");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        GoGenerator
+            .generate_with_config(&api, out_dir, &GeneratorConfig::default())
+            .unwrap();
+
+        let go = std::fs::read_to_string(tmp.join("go/weaveffi.go")).unwrap();
+
+        assert!(
+            go.contains("type ContactType int32"),
+            "missing ContactType enum: {go}"
+        );
+        assert!(
+            go.contains("ContactTypePersonal ContactType = 0"),
+            "missing Personal: {go}"
+        );
+        assert!(
+            go.contains("type Contact struct {"),
+            "missing Contact struct: {go}"
+        );
+        assert!(
+            go.contains("func (s *Contact) Id() int64"),
+            "missing Id getter: {go}"
+        );
+        assert!(
+            go.contains("func (s *Contact) FirstName() string"),
+            "missing FirstName getter: {go}"
+        );
+        assert!(
+            go.contains("func (s *Contact) Email() *string"),
+            "missing optional Email getter: {go}"
+        );
+        assert!(
+            go.contains("func (s *Contact) ContactType() ContactType"),
+            "missing ContactType getter: {go}"
+        );
+        assert!(
+            go.contains("func ContactsCreateContact("),
+            "missing create_contact: {go}"
+        );
+        assert!(
+            go.contains("(int64, error)"),
+            "create_contact should return handle: {go}"
+        );
+        assert!(
+            go.contains("func ContactsGetContact(id int64) (*Contact, error)"),
+            "missing get_contact: {go}"
+        );
+        assert!(
+            go.contains("func ContactsListContacts() ([]*Contact, error)"),
+            "missing list_contacts: {go}"
+        );
+        assert!(
+            go.contains("func ContactsDeleteContact(id int64) (bool, error)"),
+            "missing delete_contact: {go}"
+        );
+        assert!(
+            go.contains("func ContactsCountContacts() (int32, error)"),
+            "missing count_contacts: {go}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn go_custom_module_path() {
+        let api = calculator_api();
+        let tmp = std::env::temp_dir().join("weaveffi_test_go_custom_mod");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        let config = GeneratorConfig {
+            go_module_path: Some("github.com/myorg/mylib".into()),
+            ..Default::default()
+        };
+        GoGenerator
+            .generate_with_config(&api, out_dir, &config)
+            .unwrap();
+
+        let go_mod = std::fs::read_to_string(tmp.join("go/go.mod")).unwrap();
+        assert!(
+            go_mod.contains("module github.com/myorg/mylib"),
+            "go.mod should use custom module path: {go_mod}"
+        );
+        assert!(
+            !go_mod.contains("module weaveffi"),
+            "go.mod should not use default path: {go_mod}"
+        );
+
+        let go = std::fs::read_to_string(tmp.join("go/weaveffi.go")).unwrap();
+        assert!(
+            go.contains("package weaveffi"),
+            "Go source should still use weaveffi package: {go}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
