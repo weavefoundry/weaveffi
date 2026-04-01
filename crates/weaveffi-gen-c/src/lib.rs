@@ -183,6 +183,31 @@ fn c_params_sig(params: &[Param], module: &str, prefix: &str) -> Vec<String> {
         .collect()
 }
 
+fn c_callback_result_params(ty: &TypeRef, module: &str, prefix: &str) -> Vec<String> {
+    match ty {
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            vec!["const uint8_t* result".into(), "size_t result_len".into()]
+        }
+        TypeRef::List(inner) => {
+            let elem = c_element_type(inner, module, prefix);
+            vec![format!("{elem}* result"), "size_t result_len".into()]
+        }
+        TypeRef::Map(k, v) => {
+            let key_elem = c_element_type(k, module, prefix);
+            let val_elem = c_element_type(v, module, prefix);
+            vec![
+                format!("{key_elem}* result_keys"),
+                format!("{val_elem}* result_values"),
+                "size_t result_len".into(),
+            ]
+        }
+        _ => {
+            let (ret_ty, _) = c_ret_type(ty, module, prefix);
+            vec![format!("{ret_ty} result")]
+        }
+    }
+}
+
 fn render_c_header(api: &Api, prefix: &str) -> String {
     let guard = format!("{}_H", prefix.to_uppercase());
     let mut out = String::new();
@@ -270,22 +295,51 @@ fn render_module_header(out: &mut String, module: &Module, prefix: &str) {
         render_struct_header(out, &module.name, s, prefix);
     }
     for f in &module.functions {
-        let mut params_sig = c_params_sig(&f.params, &module.name, prefix);
-        let ret_sig = if let Some(ret) = &f.returns {
-            let (ret_ty, out_params) = c_ret_type(ret, &module.name, prefix);
-            params_sig.extend(out_params);
-            ret_ty
+        if f.r#async {
+            let fn_base = format!("{prefix}_{}_{}", module.name, f.name);
+            let cb_name = format!("{fn_base}_callback");
+
+            let mut cb_params = vec!["void* context".to_string(), format!("{prefix}_error* err")];
+            if let Some(ret) = &f.returns {
+                cb_params.extend(c_callback_result_params(ret, &module.name, prefix));
+            }
+            out.push_str(&format!(
+                "typedef void (*{cb_name})({});\n",
+                cb_params.join(", ")
+            ));
+
+            out.push_str("/*\n");
+            out.push_str(&format!(" * Async: {fn_base}\n"));
+            out.push_str(" * The callback is called exactly once, on any thread.\n");
+            out.push_str(" * On success, err is NULL and result (if any) is valid.\n");
+            out.push_str(" * On failure, err is non-NULL with a non-zero code.\n");
+            out.push_str(" */\n");
+
+            let mut params_sig = c_params_sig(&f.params, &module.name, prefix);
+            params_sig.push(format!("{cb_name} callback"));
+            params_sig.push("void* context".to_string());
+            out.push_str(&format!(
+                "void {fn_base}_async({});\n",
+                params_sig.join(", ")
+            ));
         } else {
-            "void".to_string()
-        };
-        params_sig.push(format!("{prefix}_error* out_err"));
-        let fn_name = format!("{prefix}_{}_{}", module.name, f.name);
-        out.push_str(&format!(
-            "{} {}({});\n",
-            ret_sig,
-            fn_name,
-            params_sig.join(", ")
-        ));
+            let mut params_sig = c_params_sig(&f.params, &module.name, prefix);
+            let ret_sig = if let Some(ret) = &f.returns {
+                let (ret_ty, out_params) = c_ret_type(ret, &module.name, prefix);
+                params_sig.extend(out_params);
+                ret_ty
+            } else {
+                "void".to_string()
+            };
+            params_sig.push(format!("{prefix}_error* out_err"));
+            let fn_name = format!("{prefix}_{}_{}", module.name, f.name);
+            out.push_str(&format!(
+                "{} {}({});\n",
+                ret_sig,
+                fn_name,
+                params_sig.join(", ")
+            ));
+        }
     }
     out.push('\n');
 }
@@ -1410,6 +1464,89 @@ mod tests {
         assert!(
             header.contains("weaveffi_contacts_Contact* weaveffi_contacts_find_contact("),
             "struct return should be opaque pointer: {header}"
+        );
+    }
+
+    #[test]
+    fn c_async_function_has_callback_typedef() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "tasks".to_string(),
+                functions: vec![
+                    Function {
+                        name: "run".to_string(),
+                        params: vec![Param {
+                            name: "id".to_string(),
+                            ty: TypeRef::I32,
+                        }],
+                        returns: Some(TypeRef::I32),
+                        doc: None,
+                        r#async: true,
+                    },
+                    Function {
+                        name: "fire".to_string(),
+                        params: vec![],
+                        returns: None,
+                        doc: None,
+                        r#async: true,
+                    },
+                ],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+            generators: None,
+        };
+
+        let header = render_c_header(&api, "weaveffi");
+        assert!(
+            header.contains("typedef void (*weaveffi_tasks_run_callback)(void* context, weaveffi_error* err, int32_t result);"),
+            "missing callback typedef with result param: {header}"
+        );
+        assert!(
+            header.contains(
+                "typedef void (*weaveffi_tasks_fire_callback)(void* context, weaveffi_error* err);"
+            ),
+            "missing callback typedef without result param: {header}"
+        );
+    }
+
+    #[test]
+    fn c_async_function_signature() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "tasks".to_string(),
+                functions: vec![Function {
+                    name: "run".to_string(),
+                    params: vec![Param {
+                        name: "id".to_string(),
+                        ty: TypeRef::I32,
+                    }],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: true,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+            generators: None,
+        };
+
+        let header = render_c_header(&api, "weaveffi");
+        assert!(
+            header.contains("void weaveffi_tasks_run_async(int32_t id, weaveffi_tasks_run_callback callback, void* context);"),
+            "missing async function signature: {header}"
+        );
+        assert!(
+            !header.contains("int32_t weaveffi_tasks_run("),
+            "async function should not have sync signature: {header}"
+        );
+        assert!(
+            header.contains("callback is called exactly once"),
+            "missing callback contract comment: {header}"
         );
     }
 
