@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use weaveffi_ir::ir::{Api, ErrorDomain, Function, Module, Param, TypeRef};
+use weaveffi_ir::ir::{Api, ErrorDomain, Function, Module, Param, TypeRef, SUPPORTED_VERSIONS};
 
 #[derive(Debug, Clone)]
 pub enum ValidationWarning {
@@ -120,6 +120,8 @@ fn nesting_depth(ty: &TypeRef) -> usize {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
+    #[error("unsupported schema version '{version}'; supported versions: {supported}")]
+    UnsupportedSchemaVersion { version: String, supported: String },
     #[error("module has no name")]
     NoModuleName,
     #[error("duplicate module name: {0}")]
@@ -202,6 +204,13 @@ fn check_identifier(name: &str) -> Result<(), ValidationError> {
 }
 
 pub fn validate_api(api: &mut Api) -> Result<(), ValidationError> {
+    if !SUPPORTED_VERSIONS.contains(&api.version.as_str()) {
+        return Err(ValidationError::UnsupportedSchemaVersion {
+            version: api.version.clone(),
+            supported: SUPPORTED_VERSIONS.join(", "),
+        });
+    }
+
     let mut module_names = BTreeSet::new();
     for m in &api.modules {
         if !module_names.insert(m.name.clone()) {
@@ -2146,6 +2155,39 @@ mod tests {
             ValidationError::BorrowedTypeInInvalidPosition { ty, location }
                 if ty == "&[u8]" && location.contains("struct")
         ));
+    }
+
+    #[test]
+    fn unsupported_version_rejected() {
+        let mut api = Api {
+            version: "9.9.9".to_string(),
+            modules: vec![simple_module("mymod")],
+            generators: None,
+        };
+        let err = validate_api(&mut api).unwrap_err();
+        assert!(matches!(
+            &err,
+            ValidationError::UnsupportedSchemaVersion { version, supported }
+                if version == "9.9.9" && supported.contains("0.1.0") && supported.contains("0.2.0")
+        ));
+        assert!(err
+            .to_string()
+            .contains("unsupported schema version '9.9.9'"));
+    }
+
+    #[test]
+    fn supported_version_passes() {
+        for v in weaveffi_ir::ir::SUPPORTED_VERSIONS {
+            let mut api = Api {
+                version: v.to_string(),
+                modules: vec![simple_module("mymod")],
+                generators: None,
+            };
+            assert!(
+                validate_api(&mut api).is_ok(),
+                "expected version '{v}' to be accepted"
+            );
+        }
     }
 
     #[test]
