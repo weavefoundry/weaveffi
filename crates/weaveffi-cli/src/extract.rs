@@ -147,6 +147,7 @@ fn extract_function(item: &syn::ItemFn) -> Result<Function> {
             Ok(Param {
                 name: param_name,
                 ty: map_type(&pt.ty)?,
+                mutable: false,
             })
         })
         .collect::<Result<_>>()?;

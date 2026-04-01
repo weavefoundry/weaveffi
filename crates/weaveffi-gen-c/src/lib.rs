@@ -104,32 +104,37 @@ fn iter_type_name(func_name: &str, module: &str, prefix: &str) -> String {
     format!("{prefix}_{module}_{pascal}Iterator")
 }
 
-fn c_type_for_param(ty: &TypeRef, name: &str, module: &str, prefix: &str) -> String {
+fn c_type_for_param(ty: &TypeRef, name: &str, module: &str, prefix: &str, mutable: bool) -> String {
+    let q = if mutable { "" } else { "const " };
     match ty {
         TypeRef::I32 => format!("int32_t {name}"),
         TypeRef::U32 => format!("uint32_t {name}"),
         TypeRef::I64 => format!("int64_t {name}"),
         TypeRef::F64 => format!("double {name}"),
         TypeRef::Bool => format!("bool {name}"),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("const char* {name}"),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("{q}char* {name}"),
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            format!("const uint8_t* {name}_ptr, size_t {name}_len")
+            format!("{q}uint8_t* {name}_ptr, size_t {name}_len")
         }
         TypeRef::Handle => format!("{prefix}_handle_t {name}"),
         TypeRef::TypedHandle(n) => format!("{prefix}_{module}_{n}* {name}"),
-        TypeRef::Struct(s) => format!("const {}* {name}", c_abi_struct_name(s, module, prefix)),
+        TypeRef::Struct(s) => {
+            format!("{q}{}* {name}", c_abi_struct_name(s, module, prefix))
+        }
         TypeRef::Enum(e) => format!("{prefix}_{module}_{e} {name}"),
         TypeRef::Optional(inner) => {
             if is_c_pointer_type(inner) {
-                c_type_for_param(inner, name, module, prefix)
+                c_type_for_param(inner, name, module, prefix, mutable)
             } else {
                 let base = c_element_type(inner, module, prefix);
-                format!("const {base}* {name}")
+                format!("{q}{base}* {name}")
             }
         }
         TypeRef::List(inner) => {
             let elem = c_element_type(inner, module, prefix);
-            if is_c_pointer_type(inner) {
+            if mutable {
+                format!("{elem}* {name}, size_t {name}_len")
+            } else if is_c_pointer_type(inner) {
                 format!("{elem} const* {name}, size_t {name}_len")
             } else {
                 format!("const {elem}* {name}, size_t {name}_len")
@@ -138,17 +143,21 @@ fn c_type_for_param(ty: &TypeRef, name: &str, module: &str, prefix: &str) -> Str
         TypeRef::Map(k, v) => {
             let key_elem = c_element_type(k, module, prefix);
             let val_elem = c_element_type(v, module, prefix);
-            let keys_part = if is_c_pointer_type(k) {
-                format!("{key_elem} const* {name}_keys")
+            if mutable {
+                format!("{key_elem}* {name}_keys, {val_elem}* {name}_values, size_t {name}_len")
             } else {
-                format!("const {key_elem}* {name}_keys")
-            };
-            let vals_part = if is_c_pointer_type(v) {
-                format!("{val_elem} const* {name}_values")
-            } else {
-                format!("const {val_elem}* {name}_values")
-            };
-            format!("{keys_part}, {vals_part}, size_t {name}_len")
+                let keys_part = if is_c_pointer_type(k) {
+                    format!("{key_elem} const* {name}_keys")
+                } else {
+                    format!("const {key_elem}* {name}_keys")
+                };
+                let vals_part = if is_c_pointer_type(v) {
+                    format!("{val_elem} const* {name}_values")
+                } else {
+                    format!("const {val_elem}* {name}_values")
+                };
+                format!("{keys_part}, {vals_part}, size_t {name}_len")
+            }
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
         TypeRef::Callback(_) => todo!("callback C type"),
@@ -203,7 +212,7 @@ fn c_ret_type(ty: &TypeRef, module: &str, prefix: &str) -> (String, Vec<String>)
 fn c_params_sig(params: &[Param], module: &str, prefix: &str) -> Vec<String> {
     params
         .iter()
-        .map(|p| c_type_for_param(&p.ty, &p.name, module, prefix))
+        .map(|p| c_type_for_param(&p.ty, &p.name, module, prefix, p.mutable))
         .collect()
 }
 
@@ -292,7 +301,7 @@ fn render_struct_header(out: &mut String, module_name: &str, s: &StructDef, pref
     let mut params: Vec<String> = s
         .fields
         .iter()
-        .map(|f| c_type_for_param(&f.ty, &f.name, module_name, prefix))
+        .map(|f| c_type_for_param(&f.ty, &f.name, module_name, prefix, false))
         .collect();
     params.push(format!("{prefix}_error* out_err"));
     out.push_str(&format!("{tag}* {tag}_create({});\n", params.join(", ")));
@@ -318,7 +327,7 @@ fn render_builder_header(out: &mut String, module_name: &str, s: &StructDef, pre
     out.push_str(&format!("typedef struct {builder_ty} {builder_ty};\n"));
     out.push_str(&format!("{builder_ty}* {tag}_Builder_new(void);\n"));
     for field in &s.fields {
-        let param = c_type_for_param(&field.ty, "value", module_name, prefix);
+        let param = c_type_for_param(&field.ty, "value", module_name, prefix, false);
         out.push_str(&format!(
             "void {tag}_Builder_set_{}({builder_ty}* builder, {});\n",
             field.name, param
@@ -362,7 +371,7 @@ fn render_module_header(out: &mut String, module: &Module, prefix: &str, module_
         let mut params: Vec<String> = cb
             .params
             .iter()
-            .map(|p| c_type_for_param(&p.ty, &p.name, module_path, prefix))
+            .map(|p| c_type_for_param(&p.ty, &p.name, module_path, prefix, p.mutable))
             .collect();
         params.push("void* context".to_string());
         out.push_str(&format!(
@@ -493,10 +502,12 @@ mod tests {
                             Param {
                                 name: "a".to_string(),
                                 ty: TypeRef::I32,
+                                mutable: false,
                             },
                             Param {
                                 name: "b".to_string(),
                                 ty: TypeRef::I32,
+                                mutable: false,
                             },
                         ],
                         returns: Some(TypeRef::I32),
@@ -509,6 +520,7 @@ mod tests {
                         params: vec![Param {
                             name: "msg".to_string(),
                             ty: TypeRef::StringUtf8,
+                            mutable: false,
                         }],
                         returns: Some(TypeRef::StringUtf8),
                         doc: None,
@@ -731,6 +743,7 @@ mod tests {
             "person",
             "contacts",
             "weaveffi",
+            false,
         );
         assert_eq!(result, "const weaveffi_contacts_Contact* person");
     }
@@ -742,6 +755,7 @@ mod tests {
             "color",
             "contacts",
             "weaveffi",
+            false,
         );
         assert_eq!(result, "weaveffi_contacts_Color color");
     }
@@ -750,7 +764,7 @@ mod tests {
     fn c_type_optional_value_param() {
         let ty = TypeRef::Optional(Box::new(TypeRef::I32));
         assert_eq!(
-            c_type_for_param(&ty, "val", "m", "weaveffi"),
+            c_type_for_param(&ty, "val", "m", "weaveffi", false),
             "const int32_t* val"
         );
     }
@@ -759,7 +773,7 @@ mod tests {
     fn c_type_optional_pointer_param() {
         let ty = TypeRef::Optional(Box::new(TypeRef::StringUtf8));
         assert_eq!(
-            c_type_for_param(&ty, "name", "m", "weaveffi"),
+            c_type_for_param(&ty, "name", "m", "weaveffi", false),
             "const char* name"
         );
     }
@@ -768,7 +782,7 @@ mod tests {
     fn c_type_optional_struct_param() {
         let ty = TypeRef::Optional(Box::new(TypeRef::Struct("Contact".into())));
         assert_eq!(
-            c_type_for_param(&ty, "person", "contacts", "weaveffi"),
+            c_type_for_param(&ty, "person", "contacts", "weaveffi", false),
             "const weaveffi_contacts_Contact* person"
         );
     }
@@ -777,7 +791,7 @@ mod tests {
     fn c_type_optional_enum_param() {
         let ty = TypeRef::Optional(Box::new(TypeRef::Enum("Color".into())));
         assert_eq!(
-            c_type_for_param(&ty, "color", "contacts", "weaveffi"),
+            c_type_for_param(&ty, "color", "contacts", "weaveffi", false),
             "const weaveffi_contacts_Color* color"
         );
     }
@@ -786,7 +800,7 @@ mod tests {
     fn c_type_list_value_param() {
         let ty = TypeRef::List(Box::new(TypeRef::I32));
         assert_eq!(
-            c_type_for_param(&ty, "items", "m", "weaveffi"),
+            c_type_for_param(&ty, "items", "m", "weaveffi", false),
             "const int32_t* items, size_t items_len"
         );
     }
@@ -795,7 +809,7 @@ mod tests {
     fn c_type_list_struct_param() {
         let ty = TypeRef::List(Box::new(TypeRef::Struct("Contact".into())));
         assert_eq!(
-            c_type_for_param(&ty, "items", "contacts", "weaveffi"),
+            c_type_for_param(&ty, "items", "contacts", "weaveffi", false),
             "weaveffi_contacts_Contact* const* items, size_t items_len"
         );
     }
@@ -864,6 +878,7 @@ mod tests {
                         params: vec![Param {
                             name: "id".to_string(),
                             ty: TypeRef::Optional(Box::new(TypeRef::I32)),
+                            mutable: false,
                         }],
                         returns: Some(TypeRef::Optional(Box::new(TypeRef::I32))),
                         doc: None,
@@ -875,6 +890,7 @@ mod tests {
                         params: vec![Param {
                             name: "tags".to_string(),
                             ty: TypeRef::List(Box::new(TypeRef::I32)),
+                            mutable: false,
                         }],
                         returns: Some(TypeRef::List(Box::new(TypeRef::I32))),
                         doc: None,
@@ -973,18 +989,22 @@ mod tests {
                             Param {
                                 name: "first_name".to_string(),
                                 ty: TypeRef::StringUtf8,
+                                mutable: false,
                             },
                             Param {
                                 name: "last_name".to_string(),
                                 ty: TypeRef::StringUtf8,
+                                mutable: false,
                             },
                             Param {
                                 name: "email".to_string(),
                                 ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                                mutable: false,
                             },
                             Param {
                                 name: "contact_type".to_string(),
                                 ty: TypeRef::Enum("ContactType".to_string()),
+                                mutable: false,
                             },
                         ],
                         returns: Some(TypeRef::Handle),
@@ -997,6 +1017,7 @@ mod tests {
                         params: vec![Param {
                             name: "id".to_string(),
                             ty: TypeRef::Handle,
+                            mutable: false,
                         }],
                         returns: Some(TypeRef::Struct("Contact".to_string())),
                         doc: None,
@@ -1018,6 +1039,7 @@ mod tests {
                         params: vec![Param {
                             name: "id".to_string(),
                             ty: TypeRef::Handle,
+                            mutable: false,
                         }],
                         returns: Some(TypeRef::Bool),
                         doc: None,
@@ -1147,6 +1169,7 @@ mod tests {
                     params: vec![Param {
                         name: "a".to_string(),
                         ty: TypeRef::Enum("Color".into()),
+                        mutable: false,
                     }],
                     returns: Some(TypeRef::Enum("Color".into())),
                     doc: None,
@@ -1196,6 +1219,7 @@ mod tests {
             "scores",
             "m",
             "weaveffi",
+            false,
         );
         assert_eq!(
             result,
@@ -1232,6 +1256,7 @@ mod tests {
                     params: vec![Param {
                         name: "scores".to_string(),
                         ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
+                        mutable: false,
                     }],
                     returns: None,
                     doc: None,
@@ -1273,10 +1298,12 @@ mod tests {
                         Param {
                             name: "a".to_string(),
                             ty: TypeRef::I32,
+                            mutable: false,
                         },
                         Param {
                             name: "b".to_string(),
                             ty: TypeRef::I32,
+                            mutable: false,
                         },
                     ],
                     returns: Some(TypeRef::I32),
@@ -1347,6 +1374,7 @@ mod tests {
                         ty: TypeRef::Optional(Box::new(TypeRef::List(Box::new(
                             TypeRef::Optional(Box::new(TypeRef::Struct("Contact".into()))),
                         )))),
+                        mutable: false,
                     }],
                     returns: None,
                     doc: None,
@@ -1400,6 +1428,7 @@ mod tests {
                             Box::new(TypeRef::StringUtf8),
                             Box::new(TypeRef::List(Box::new(TypeRef::I32))),
                         ),
+                        mutable: false,
                     }],
                     returns: None,
                     doc: None,
@@ -1441,6 +1470,7 @@ mod tests {
                     params: vec![Param {
                         name: "contact".into(),
                         ty: TypeRef::TypedHandle("Contact".into()),
+                        mutable: false,
                     }],
                     returns: Some(TypeRef::TypedHandle("Contact".into())),
                     doc: None,
@@ -1478,13 +1508,13 @@ mod tests {
 
     #[test]
     fn c_type_borrowed_str_param() {
-        let result = c_type_for_param(&TypeRef::BorrowedStr, "msg", "io", "weaveffi");
+        let result = c_type_for_param(&TypeRef::BorrowedStr, "msg", "io", "weaveffi", false);
         assert_eq!(result, "const char* msg");
     }
 
     #[test]
     fn c_type_borrowed_bytes_param() {
-        let result = c_type_for_param(&TypeRef::BorrowedBytes, "data", "io", "weaveffi");
+        let result = c_type_for_param(&TypeRef::BorrowedBytes, "data", "io", "weaveffi", false);
         assert_eq!(result, "const uint8_t* data_ptr, size_t data_len");
     }
 
@@ -1500,10 +1530,12 @@ mod tests {
                         Param {
                             name: "msg".to_string(),
                             ty: TypeRef::BorrowedStr,
+                            mutable: false,
                         },
                         Param {
                             name: "raw".to_string(),
                             ty: TypeRef::BorrowedBytes,
+                            mutable: false,
                         },
                     ],
                     returns: None,
@@ -1550,6 +1582,7 @@ mod tests {
                             Box::new(TypeRef::Enum("Color".into())),
                             Box::new(TypeRef::Struct("Contact".into())),
                         ),
+                        mutable: false,
                     }],
                     returns: None,
                     doc: None,
@@ -1620,6 +1653,7 @@ mod tests {
                     params: vec![Param {
                         name: "name".to_string(),
                         ty: TypeRef::StringUtf8,
+                        mutable: false,
                     }],
                     returns: Some(TypeRef::Struct("Contact".to_string())),
                     doc: None,
@@ -1681,6 +1715,7 @@ mod tests {
                         params: vec![Param {
                             name: "id".to_string(),
                             ty: TypeRef::I32,
+                            mutable: false,
                         }],
                         returns: Some(TypeRef::I32),
                         doc: None,
@@ -1730,6 +1765,7 @@ mod tests {
                     params: vec![Param {
                         name: "id".to_string(),
                         ty: TypeRef::I32,
+                        mutable: false,
                     }],
                     returns: Some(TypeRef::I32),
                     doc: None,
@@ -1772,6 +1808,7 @@ mod tests {
                     params: vec![Param {
                         name: "id".to_string(),
                         ty: TypeRef::I32,
+                        mutable: false,
                     }],
                     returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                         "Contact".to_string(),
@@ -1818,6 +1855,7 @@ mod tests {
                         params: vec![Param {
                             name: "id".to_string(),
                             ty: TypeRef::I32,
+                            mutable: false,
                         }],
                         returns: Some(TypeRef::I32),
                         doc: None,
@@ -1904,6 +1942,7 @@ mod tests {
                         params: vec![Param {
                             name: "id".to_string(),
                             ty: TypeRef::I32,
+                            mutable: false,
                         }],
                         returns: Some(TypeRef::Struct("types.Name".to_string())),
                         doc: None,
@@ -1948,6 +1987,7 @@ mod tests {
                     params: vec![Param {
                         name: "x".to_string(),
                         ty: TypeRef::I32,
+                        mutable: false,
                     }],
                     returns: Some(TypeRef::I32),
                     doc: None,
@@ -1966,6 +2006,7 @@ mod tests {
                         params: vec![Param {
                             name: "y".to_string(),
                             ty: TypeRef::I32,
+                            mutable: false,
                         }],
                         returns: Some(TypeRef::I32),
                         doc: None,
@@ -2017,10 +2058,12 @@ mod tests {
                         Param {
                             name: "payload".to_string(),
                             ty: TypeRef::StringUtf8,
+                            mutable: false,
                         },
                         Param {
                             name: "len".to_string(),
                             ty: TypeRef::I32,
+                            mutable: false,
                         },
                     ],
                     doc: None,
@@ -2052,6 +2095,7 @@ mod tests {
                     params: vec![Param {
                         name: "payload".to_string(),
                         ty: TypeRef::StringUtf8,
+                        mutable: false,
                     }],
                     doc: None,
                 }],
@@ -2159,6 +2203,7 @@ mod tests {
                     params: vec![Param {
                         name: "filter".to_string(),
                         ty: TypeRef::StringUtf8,
+                        mutable: false,
                     }],
                     returns: Some(TypeRef::Iterator(Box::new(TypeRef::Struct(
                         "Contact".to_string(),
@@ -2305,6 +2350,189 @@ mod tests {
         assert!(
             !header.contains("Builder"),
             "should not contain Builder when builder=false: {header}"
+        );
+    }
+
+    #[test]
+    fn c_type_mutable_string_param() {
+        let result = c_type_for_param(&TypeRef::StringUtf8, "buf", "io", "weaveffi", true);
+        assert_eq!(result, "char* buf");
+    }
+
+    #[test]
+    fn c_type_mutable_bytes_param() {
+        let result = c_type_for_param(&TypeRef::BorrowedBytes, "data", "io", "weaveffi", true);
+        assert_eq!(result, "uint8_t* data_ptr, size_t data_len");
+    }
+
+    #[test]
+    fn c_type_mutable_struct_param() {
+        let result = c_type_for_param(
+            &TypeRef::Struct("Contact".into()),
+            "person",
+            "contacts",
+            "weaveffi",
+            true,
+        );
+        assert_eq!(result, "weaveffi_contacts_Contact* person");
+    }
+
+    #[test]
+    fn c_type_immutable_struct_param_has_const() {
+        let result = c_type_for_param(
+            &TypeRef::Struct("Contact".into()),
+            "person",
+            "contacts",
+            "weaveffi",
+            false,
+        );
+        assert_eq!(result, "const weaveffi_contacts_Contact* person");
+    }
+
+    #[test]
+    fn c_type_mutable_list_param() {
+        let ty = TypeRef::List(Box::new(TypeRef::I32));
+        let result = c_type_for_param(&ty, "items", "m", "weaveffi", true);
+        assert_eq!(result, "int32_t* items, size_t items_len");
+    }
+
+    #[test]
+    fn c_type_mutable_optional_value_param() {
+        let ty = TypeRef::Optional(Box::new(TypeRef::I32));
+        let result = c_type_for_param(&ty, "val", "m", "weaveffi", true);
+        assert_eq!(result, "int32_t* val");
+    }
+
+    #[test]
+    fn c_header_mutable_param_omits_const() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "io".to_string(),
+                functions: vec![Function {
+                    name: "fill_buffer".to_string(),
+                    params: vec![Param {
+                        name: "buf".to_string(),
+                        ty: TypeRef::Bytes,
+                        mutable: true,
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let header = render_c_header(&api, "weaveffi");
+        assert!(
+            header.contains("uint8_t* buf_ptr"),
+            "mutable bytes should omit const: {header}"
+        );
+        assert!(
+            !header.contains("const uint8_t* buf_ptr"),
+            "mutable bytes should not have const: {header}"
+        );
+    }
+
+    #[test]
+    fn c_header_immutable_param_has_const() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "io".to_string(),
+                functions: vec![Function {
+                    name: "read_data".to_string(),
+                    params: vec![Param {
+                        name: "buf".to_string(),
+                        ty: TypeRef::Bytes,
+                        mutable: false,
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let header = render_c_header(&api, "weaveffi");
+        assert!(
+            header.contains("const uint8_t* buf_ptr"),
+            "immutable bytes should have const: {header}"
+        );
+    }
+
+    #[test]
+    fn c_header_mixed_mutable_and_immutable_params() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "io".to_string(),
+                functions: vec![Function {
+                    name: "transform".to_string(),
+                    params: vec![
+                        Param {
+                            name: "input".to_string(),
+                            ty: TypeRef::StringUtf8,
+                            mutable: false,
+                        },
+                        Param {
+                            name: "output".to_string(),
+                            ty: TypeRef::Struct("Buffer".into()),
+                            mutable: true,
+                        },
+                    ],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                }],
+                structs: vec![StructDef {
+                    name: "Buffer".to_string(),
+                    doc: None,
+                    fields: vec![StructField {
+                        name: "data".to_string(),
+                        ty: TypeRef::Bytes,
+                        doc: None,
+                    }],
+                    builder: false,
+                }],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let header = render_c_header(&api, "weaveffi");
+        assert!(
+            header.contains("const char* input"),
+            "immutable string should have const: {header}"
+        );
+        assert!(
+            header.contains("weaveffi_io_Buffer* output"),
+            "mutable struct should omit const: {header}"
+        );
+        assert!(
+            !header.contains("const weaveffi_io_Buffer* output"),
+            "mutable struct should not have const: {header}"
         );
     }
 }

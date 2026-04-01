@@ -16,10 +16,12 @@ fn calculator_api() -> Api {
                         Param {
                             name: "a".to_string(),
                             ty: TypeRef::I32,
+                            mutable: false,
                         },
                         Param {
                             name: "b".to_string(),
                             ty: TypeRef::I32,
+                            mutable: false,
                         },
                     ],
                     returns: Some(TypeRef::I32),
@@ -33,10 +35,12 @@ fn calculator_api() -> Api {
                         Param {
                             name: "a".to_string(),
                             ty: TypeRef::I32,
+                            mutable: false,
                         },
                         Param {
                             name: "b".to_string(),
                             ty: TypeRef::I32,
+                            mutable: false,
                         },
                     ],
                     returns: Some(TypeRef::I32),
@@ -50,10 +54,12 @@ fn calculator_api() -> Api {
                         Param {
                             name: "a".to_string(),
                             ty: TypeRef::I32,
+                            mutable: false,
                         },
                         Param {
                             name: "b".to_string(),
                             ty: TypeRef::I32,
+                            mutable: false,
                         },
                     ],
                     returns: Some(TypeRef::I32),
@@ -66,6 +72,7 @@ fn calculator_api() -> Api {
                     params: vec![Param {
                         name: "s".to_string(),
                         ty: TypeRef::StringUtf8,
+                        mutable: false,
                     }],
                     returns: Some(TypeRef::StringUtf8),
                     r#async: false,
@@ -144,14 +151,17 @@ fn large_api() -> Api {
                         Param {
                             name: "a".to_string(),
                             ty: TypeRef::I32,
+                            mutable: false,
                         },
                         Param {
                             name: "b".to_string(),
                             ty: TypeRef::StringUtf8,
+                            mutable: false,
                         },
                         Param {
                             name: "c".to_string(),
                             ty: TypeRef::Struct("Struct0".to_string()),
+                            mutable: false,
                         },
                     ],
                     returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(

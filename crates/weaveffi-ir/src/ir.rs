@@ -51,6 +51,8 @@ pub struct Param {
     pub name: String,
     #[serde(rename = "type")]
     pub ty: TypeRef,
+    #[serde(default)]
+    pub mutable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1010,6 +1012,7 @@ modules:
             params: vec![Param {
                 name: "data".to_string(),
                 ty: TypeRef::I32,
+                mutable: false,
             }],
             doc: Some("event callback".to_string()),
         };
@@ -1085,5 +1088,58 @@ modules:
         }"#;
         let api: Api = serde_json::from_str(json).unwrap();
         assert!(!api.modules[0].structs[0].builder);
+    }
+
+    #[test]
+    fn param_mutable_defaults_to_false() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: io
+    functions:
+      - name: write
+        params:
+          - name: data
+            type: string
+"#;
+        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        assert!(!api.modules[0].functions[0].params[0].mutable);
+    }
+
+    #[test]
+    fn param_mutable_true_round_trip() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: io
+    functions:
+      - name: fill_buffer
+        params:
+          - name: buf
+            type: bytes
+            mutable: true
+"#;
+        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        assert!(api.modules[0].functions[0].params[0].mutable);
+
+        let json = serde_json::to_string(&api).unwrap();
+        let back: Api = serde_json::from_str(&json).unwrap();
+        assert!(back.modules[0].functions[0].params[0].mutable);
+    }
+
+    #[test]
+    fn param_mutable_false_explicit() {
+        let json = r#"{
+            "version": "0.1.0",
+            "modules": [{
+                "name": "io",
+                "functions": [{
+                    "name": "read",
+                    "params": [{"name": "buf", "type": "bytes", "mutable": false}]
+                }]
+            }]
+        }"#;
+        let api: Api = serde_json::from_str(json).unwrap();
+        assert!(!api.modules[0].functions[0].params[0].mutable);
     }
 }

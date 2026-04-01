@@ -1019,10 +1019,12 @@ mod tests {
                     Param {
                         name: "a".into(),
                         ty: TypeRef::I32,
+                        mutable: false,
                     },
                     Param {
                         name: "b".into(),
                         ty: TypeRef::I32,
+                        mutable: false,
                     },
                 ],
                 returns: Some(TypeRef::I32),
@@ -1300,6 +1302,7 @@ mod tests {
                 params: vec![Param {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
+                    mutable: false,
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                     "Contact".into(),
@@ -1347,6 +1350,7 @@ mod tests {
                 params: vec![Param {
                     name: "msg".into(),
                     ty: TypeRef::StringUtf8,
+                    mutable: false,
                 }],
                 returns: None,
                 doc: None,
@@ -1461,6 +1465,7 @@ mod tests {
                 params: vec![Param {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
+                    mutable: false,
                 }],
                 returns: Some(TypeRef::StringUtf8),
                 doc: None,
@@ -1552,6 +1557,7 @@ mod tests {
                 params: vec![Param {
                     name: "contact".into(),
                     ty: TypeRef::TypedHandle("Contact".into()),
+                    mutable: false,
                 }],
                 returns: None,
                 doc: None,
@@ -1597,6 +1603,7 @@ mod tests {
                     ty: TypeRef::Optional(Box::new(TypeRef::List(Box::new(TypeRef::Optional(
                         Box::new(TypeRef::Struct("Contact".into())),
                     ))))),
+                    mutable: false,
                 }],
                 returns: None,
                 doc: None,
@@ -1638,6 +1645,7 @@ mod tests {
                         Box::new(TypeRef::StringUtf8),
                         Box::new(TypeRef::List(Box::new(TypeRef::I32))),
                     ),
+                    mutable: false,
                 }],
                 returns: None,
                 doc: None,
@@ -1670,6 +1678,7 @@ mod tests {
                         Box::new(TypeRef::Enum("Color".into())),
                         Box::new(TypeRef::Struct("Contact".into())),
                     ),
+                    mutable: false,
                 }],
                 returns: None,
                 doc: None,
@@ -1728,6 +1737,7 @@ mod tests {
                 params: vec![Param {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
+                    mutable: false,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -1784,6 +1794,7 @@ mod tests {
                 params: vec![Param {
                     name: "id".into(),
                     ty: TypeRef::I32,
+                    mutable: false,
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                     "Contact".into(),
@@ -1824,6 +1835,7 @@ mod tests {
                 params: vec![Param {
                     name: "x".into(),
                     ty: TypeRef::I32,
+                    mutable: false,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -1878,6 +1890,7 @@ mod tests {
                     params: vec![Param {
                         name: "x".into(),
                         ty: TypeRef::I32,
+                        mutable: false,
                     }],
                     returns: Some(TypeRef::I32),
                     doc: None,
@@ -1890,10 +1903,12 @@ mod tests {
                         Param {
                             name: "a".into(),
                             ty: TypeRef::I32,
+                            mutable: false,
                         },
                         Param {
                             name: "b".into(),
                             ty: TypeRef::I32,
+                            mutable: false,
                         },
                     ],
                     returns: Some(TypeRef::I32),
