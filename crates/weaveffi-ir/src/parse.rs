@@ -906,6 +906,53 @@ modules:
     }
 
     #[test]
+    fn parse_async_demo_sample() {
+        let yaml = std::fs::read_to_string("../../samples/async-demo/async_demo.yml").unwrap();
+        let api = parse_api_str(&yaml, "yml").unwrap();
+        assert_eq!(api.version, "0.2.0");
+        assert_eq!(api.modules.len(), 1);
+
+        let m = &api.modules[0];
+        assert_eq!(m.name, "tasks");
+
+        assert_eq!(m.structs.len(), 1);
+        let s = &m.structs[0];
+        assert_eq!(s.name, "TaskResult");
+        assert_eq!(s.fields.len(), 3);
+        assert_eq!(s.fields[0].name, "id");
+        assert_eq!(s.fields[0].ty, TypeRef::I64);
+        assert_eq!(s.fields[1].name, "value");
+        assert_eq!(s.fields[1].ty, TypeRef::StringUtf8);
+        assert_eq!(s.fields[2].name, "success");
+        assert_eq!(s.fields[2].ty, TypeRef::Bool);
+
+        assert_eq!(m.functions.len(), 3);
+
+        let run_task = &m.functions[0];
+        assert_eq!(run_task.name, "run_task");
+        assert!(run_task.r#async);
+        assert_eq!(
+            run_task.returns,
+            Some(TypeRef::Struct("TaskResult".to_string()))
+        );
+
+        let run_batch = &m.functions[1];
+        assert_eq!(run_batch.name, "run_batch");
+        assert!(run_batch.r#async);
+        assert_eq!(
+            run_batch.returns,
+            Some(TypeRef::List(Box::new(TypeRef::Struct(
+                "TaskResult".to_string()
+            ))))
+        );
+
+        let cancel_task = &m.functions[2];
+        assert_eq!(cancel_task.name, "cancel_task");
+        assert!(!cancel_task.r#async);
+        assert_eq!(cancel_task.returns, Some(TypeRef::Bool));
+    }
+
+    #[test]
     fn parse_idl_doc_map_example() {
         let yaml = r#"
 version: "0.1.0"
