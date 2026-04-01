@@ -110,6 +110,7 @@ enum Commands {
         /// Shell to generate completions for
         shell: clap_complete::Shell,
     },
+    SchemaVersion,
 }
 
 fn main() -> Result<()> {
@@ -174,6 +175,7 @@ fn main() -> Result<()> {
         Commands::Upgrade { input, output } => cmd_upgrade(&input, output.as_deref(), quiet)?,
         Commands::Doctor => cmd_doctor()?,
         Commands::Completions { shell } => cmd_completions(shell),
+        Commands::SchemaVersion => println!("{CURRENT_SCHEMA_VERSION}"),
     }
     Ok(())
 }
@@ -1552,6 +1554,19 @@ mod tests {
             "0.2.0",
             "input file should be upgraded in-place"
         );
+    }
+
+    #[test]
+    fn schema_version_prints_current() {
+        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .arg("schema-version")
+            .output()
+            .expect("failed to run weaveffi schema-version");
+
+        let stdout = String::from_utf8_lossy(&cmd.stdout);
+        assert!(cmd.status.success(), "schema-version failed: {stdout}");
+        assert_eq!(stdout.trim(), CURRENT_SCHEMA_VERSION);
     }
 
     #[test]
