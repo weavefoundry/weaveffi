@@ -817,6 +817,9 @@ fn validation_suggestion(err: &ValidationError) -> &'static str {
         ValidationError::DuplicateListenerName { .. } => {
             "listener names must be unique within a module; rename the duplicate"
         }
+        ValidationError::IteratorInInvalidPosition { .. } => {
+            "iterator types can only be used as function return types, not as parameters or struct fields"
+        }
     }
 }
 

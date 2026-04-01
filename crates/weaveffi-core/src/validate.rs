@@ -120,7 +120,9 @@ fn function_uses_handle(f: &Function) -> bool {
 fn contains_handle(ty: &TypeRef) -> bool {
     match ty {
         TypeRef::Handle => true,
-        TypeRef::Optional(inner) | TypeRef::List(inner) => contains_handle(inner),
+        TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
+            contains_handle(inner)
+        }
         TypeRef::Map(k, v) => contains_handle(k) || contains_handle(v),
         _ => false,
     }
@@ -128,7 +130,9 @@ fn contains_handle(ty: &TypeRef) -> bool {
 
 fn nesting_depth(ty: &TypeRef) -> usize {
     match ty {
-        TypeRef::Optional(inner) | TypeRef::List(inner) => 1 + nesting_depth(inner),
+        TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
+            1 + nesting_depth(inner)
+        }
         TypeRef::Map(k, v) => nesting_depth(k).max(nesting_depth(v)),
         _ => 0,
     }
@@ -200,6 +204,8 @@ pub enum ValidationError {
     },
     #[error("duplicate listener name in module '{module}': {name}")]
     DuplicateListenerName { module: String, name: String },
+    #[error("iterator type is only valid as a function return type, found in {location}")]
+    IteratorInInvalidPosition { location: String },
 }
 
 const RESERVED: &[&str] = &[
@@ -327,7 +333,7 @@ fn resolve_single_type_ref(
                 }
             }
         }
-        TypeRef::Optional(inner) | TypeRef::List(inner) => {
+        TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
             resolve_single_type_ref(
                 inner,
                 local_enum_names,
@@ -467,11 +473,24 @@ fn validate_module(module: &Module, all_modules: &[Module]) -> Result<(), Valida
                     location: format!("field '{}' of struct '{}'", f.name, s.name),
                 });
             }
+            if contains_iterator(&f.ty) {
+                return Err(ValidationError::IteratorInInvalidPosition {
+                    location: format!("field '{}' of struct '{}'", f.name, s.name),
+                });
+            }
             validate_type_ref(&f.ty, &known_types, all_modules, &module.name)?;
         }
     }
     for f in &module.functions {
         for p in &f.params {
+            if contains_iterator(&p.ty) {
+                return Err(ValidationError::IteratorInInvalidPosition {
+                    location: format!(
+                        "param '{}' of function '{}::{}'",
+                        p.name, module.name, f.name
+                    ),
+                });
+            }
             validate_type_ref(&p.ty, &known_types, all_modules, &module.name)?;
         }
         if let Some(ret) = &f.returns {
@@ -559,9 +578,20 @@ fn contains_borrowed(ty: &TypeRef) -> Option<&'static str> {
     match ty {
         TypeRef::BorrowedStr => Some("&str"),
         TypeRef::BorrowedBytes => Some("&[u8]"),
-        TypeRef::Optional(inner) | TypeRef::List(inner) => contains_borrowed(inner),
+        TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
+            contains_borrowed(inner)
+        }
         TypeRef::Map(k, v) => contains_borrowed(k).or_else(|| contains_borrowed(v)),
         _ => None,
+    }
+}
+
+fn contains_iterator(ty: &TypeRef) -> bool {
+    match ty {
+        TypeRef::Iterator(_) => true,
+        TypeRef::Optional(inner) | TypeRef::List(inner) => contains_iterator(inner),
+        TypeRef::Map(k, v) => contains_iterator(k) || contains_iterator(v),
+        _ => false,
     }
 }
 
@@ -585,7 +615,7 @@ fn validate_type_ref(
             }
             Ok(())
         }
-        TypeRef::Optional(inner) | TypeRef::List(inner) => {
+        TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
             validate_type_ref(inner, known, all_modules, current_module)
         }
         TypeRef::Map(k, v) => {
@@ -3004,6 +3034,94 @@ mod tests {
             validate_api(&mut api).unwrap_err(),
             ValidationError::DuplicateListenerName { module, name }
                 if module == "events" && name == "watcher"
+        ));
+    }
+
+    #[test]
+    fn iterator_valid_as_return_type() {
+        let mut api = Api {
+            version: "0.2.0".to_string(),
+            modules: vec![Module {
+                name: "data".to_string(),
+                functions: vec![Function {
+                    name: "list_items".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::Iterator(Box::new(TypeRef::I32))),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        assert!(validate_api(&mut api).is_ok());
+    }
+
+    #[test]
+    fn iterator_rejected_as_param() {
+        let mut api = Api {
+            version: "0.2.0".to_string(),
+            modules: vec![Module {
+                name: "data".to_string(),
+                functions: vec![Function {
+                    name: "consume".to_string(),
+                    params: vec![Param {
+                        name: "items".to_string(),
+                        ty: TypeRef::Iterator(Box::new(TypeRef::I32)),
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        assert!(matches!(
+            validate_api(&mut api).unwrap_err(),
+            ValidationError::IteratorInInvalidPosition { .. }
+        ));
+    }
+
+    #[test]
+    fn iterator_rejected_in_struct_field() {
+        let mut api = Api {
+            version: "0.2.0".to_string(),
+            modules: vec![Module {
+                name: "data".to_string(),
+                functions: vec![],
+                structs: vec![StructDef {
+                    name: "Container".to_string(),
+                    doc: None,
+                    fields: vec![StructField {
+                        name: "items".to_string(),
+                        ty: TypeRef::Iterator(Box::new(TypeRef::I32)),
+                        doc: None,
+                    }],
+                }],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        assert!(matches!(
+            validate_api(&mut api).unwrap_err(),
+            ValidationError::IteratorInInvalidPosition { .. }
         ));
     }
 }

@@ -122,6 +122,13 @@ pub fn type_ref_to_map(ty: &TypeRef) -> HashMap<String, tera::Value> {
                 serde_json::to_value(type_ref_to_map(value)).unwrap(),
             );
         }
+        TypeRef::Iterator(inner) => {
+            map.insert("kind".into(), "iterator".into());
+            map.insert(
+                "inner".into(),
+                serde_json::to_value(type_ref_to_map(inner)).unwrap(),
+            );
+        }
         TypeRef::Callback(_) => todo!("callback template type"),
     }
     map

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use camino::Utf8Path;
+use heck::ToUpperCamelCase;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_abi_struct_name, local_type_name, wrapper_name};
@@ -108,6 +109,7 @@ fn is_c_ptr_type(ty: &TypeRef) -> bool {
             | TypeRef::Struct(_)
             | TypeRef::List(_)
             | TypeRef::Map(_, _)
+            | TypeRef::Iterator(_)
     )
 }
 
@@ -123,7 +125,9 @@ fn c_elem_type(ty: &TypeRef, module: &str) -> String {
         TypeRef::Bytes | TypeRef::BorrowedBytes => "const uint8_t*".into(),
         TypeRef::Struct(s) => format!("{}*", c_abi_struct_name(s, module, "weaveffi")),
         TypeRef::Enum(e) => format!("weaveffi_{module}_{e}"),
-        TypeRef::Optional(inner) | TypeRef::List(inner) => c_elem_type(inner, module),
+        TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
+            c_elem_type(inner, module)
+        }
         TypeRef::Map(_, _) => "void*".into(),
         TypeRef::Callback(_) => todo!("callback Node type"),
     }
@@ -150,6 +154,7 @@ fn c_ret_type_str(ty: &TypeRef, module: &str) -> String {
         }
         TypeRef::List(inner) => format!("{}*", c_elem_type(inner, module)),
         TypeRef::Map(_, _) => "void".into(),
+        TypeRef::Iterator(_) => "void*".into(),
         TypeRef::Callback(_) => todo!("callback Node type"),
     }
 }
@@ -294,6 +299,9 @@ fn emit_async_resolve_value(out: &mut String, ret: Option<&TypeRef>) {
         Some(TypeRef::Enum(_)) => {
             out.push_str("        napi_create_int32(ctx->env, (int32_t)result, &val);\n");
         }
+        Some(TypeRef::Iterator(_)) => {
+            out.push_str("        napi_create_int64(ctx->env, (int64_t)(intptr_t)result, &val);\n");
+        }
         _ => out.push_str("        napi_get_undefined(ctx->env, &val);\n"),
     }
     out.push_str("        napi_resolve_deferred(ctx->env, ctx->deferred, val);\n");
@@ -407,7 +415,7 @@ fn render_napi_body(out: &mut String, f: &Function, c_name: &str, module: &str) 
     out.push_str("  }\n");
 
     match &f.returns {
-        Some(ret) => emit_ret_to_napi(out, ret, module),
+        Some(ret) => emit_ret_to_napi(out, ret, module, &f.name),
         None => {
             out.push_str("  napi_value ret;\n");
             out.push_str("  napi_get_undefined(env, &ret);\n");
@@ -489,6 +497,7 @@ fn emit_param(
         TypeRef::Map(k, v) => {
             emit_map_param(out, c_args, cleanups, k, v, name, idx, module);
         }
+        TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
         TypeRef::Callback(_) => todo!("callback Node param"),
     }
 }
@@ -821,7 +830,7 @@ fn emit_ret_out_params(out: &mut String, c_args: &mut Vec<String>, ty: &TypeRef,
     }
 }
 
-fn emit_ret_to_napi(out: &mut String, ty: &TypeRef, module: &str) {
+fn emit_ret_to_napi(out: &mut String, ty: &TypeRef, module: &str, fn_name: &str) {
     out.push_str("  napi_value ret;\n");
     match ty {
         TypeRef::I32 => out.push_str("  napi_create_int32(env, result, &ret);\n"),
@@ -862,6 +871,55 @@ fn emit_ret_to_napi(out: &mut String, ty: &TypeRef, module: &str) {
         TypeRef::List(inner) => emit_list_ret(out, inner, module, "  "),
         TypeRef::Map(_, _) => {
             out.push_str("  napi_create_object(env, &ret);\n");
+        }
+        TypeRef::Iterator(inner) => {
+            let fn_pascal = fn_name.to_upper_camel_case();
+            let iter_type = format!("weaveffi_{module}_{fn_pascal}Iterator");
+            let et = c_elem_type(inner, module);
+            out.push_str("  napi_create_array(env, &ret);\n");
+            out.push_str("  uint32_t iter_idx = 0;\n");
+            out.push_str(&format!("  {et} iter_item;\n"));
+            out.push_str(&format!(
+                "  while ({iter_type}_next(result, &iter_item)) {{\n"
+            ));
+            out.push_str("    napi_value elem;\n");
+            match inner.as_ref() {
+                TypeRef::I32 => {
+                    out.push_str("    napi_create_int32(env, iter_item, &elem);\n");
+                }
+                TypeRef::U32 => {
+                    out.push_str("    napi_create_uint32(env, iter_item, &elem);\n");
+                }
+                TypeRef::I64 => {
+                    out.push_str("    napi_create_int64(env, iter_item, &elem);\n");
+                }
+                TypeRef::F64 => {
+                    out.push_str("    napi_create_double(env, iter_item, &elem);\n");
+                }
+                TypeRef::Bool => {
+                    out.push_str("    napi_get_boolean(env, iter_item, &elem);\n");
+                }
+                TypeRef::TypedHandle(_) | TypeRef::Handle => {
+                    out.push_str("    napi_create_int64(env, (int64_t)iter_item, &elem);\n");
+                }
+                TypeRef::StringUtf8 => {
+                    out.push_str(
+                        "    napi_create_string_utf8(env, iter_item, NAPI_AUTO_LENGTH, &elem);\n",
+                    );
+                    out.push_str("    weaveffi_free_string(iter_item);\n");
+                }
+                TypeRef::Struct(_) | TypeRef::Enum(_) => {
+                    out.push_str(
+                        "    napi_create_int64(env, (int64_t)(intptr_t)iter_item, &elem);\n",
+                    );
+                }
+                _ => {
+                    out.push_str("    napi_create_int64(env, (int64_t)iter_item, &elem);\n");
+                }
+            }
+            out.push_str("    napi_set_element(env, ret, iter_idx++, elem);\n");
+            out.push_str("  }\n");
+            out.push_str(&format!("  {iter_type}_destroy(result);\n"));
         }
         TypeRef::Callback(_) => todo!("callback Node return"),
     }
@@ -977,6 +1035,10 @@ fn ts_type_for(ty: &TypeRef) -> String {
             }
         }
         TypeRef::Map(k, v) => format!("Record<{}, {}>", ts_type_for(k), ts_type_for(v)),
+        TypeRef::Iterator(inner) => {
+            let t = ts_type_for(inner);
+            format!("{t}[]")
+        }
         TypeRef::Callback(_) => todo!("callback Node type"),
     }
 }

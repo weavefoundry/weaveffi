@@ -1,5 +1,6 @@
 use anyhow::Result;
 use camino::Utf8Path;
+use heck::ToUpperCamelCase;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::c_abi_struct_name;
@@ -90,10 +91,17 @@ fn c_element_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
         TypeRef::Bytes | TypeRef::BorrowedBytes => "const uint8_t*".to_string(),
         TypeRef::Struct(s) => format!("{}*", c_abi_struct_name(s, module, prefix)),
         TypeRef::Enum(e) => format!("{prefix}_{module}_{e}"),
-        TypeRef::Optional(inner) | TypeRef::List(inner) => c_element_type(inner, module, prefix),
+        TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
+            c_element_type(inner, module, prefix)
+        }
         TypeRef::Map(_, _) => "void*".to_string(),
         TypeRef::Callback(_) => todo!("callback C type"),
     }
+}
+
+fn iter_type_name(func_name: &str, module: &str, prefix: &str) -> String {
+    let pascal = func_name.to_upper_camel_case();
+    format!("{prefix}_{module}_{pascal}Iterator")
 }
 
 fn c_type_for_param(ty: &TypeRef, name: &str, module: &str, prefix: &str) -> String {
@@ -142,6 +150,7 @@ fn c_type_for_param(ty: &TypeRef, name: &str, module: &str, prefix: &str) -> Str
             };
             format!("{keys_part}, {vals_part}, size_t {name}_len")
         }
+        TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
         TypeRef::Callback(_) => todo!("callback C type"),
     }
 }
@@ -186,6 +195,7 @@ fn c_ret_type(ty: &TypeRef, module: &str, prefix: &str) -> (String, Vec<String>)
                 ],
             )
         }
+        TypeRef::Iterator(_) => unreachable!("iterator return handled specially"),
         TypeRef::Callback(_) => todo!("callback C return type"),
     }
 }
@@ -346,6 +356,35 @@ fn render_module_header(out: &mut String, module: &Module, prefix: &str, module_
         out.push_str(&format!("void {unreg_fn}(uint64_t id);\n"));
     }
     for f in &module.functions {
+        if let Some(TypeRef::Iterator(inner)) = &f.returns {
+            let iter_tag = iter_type_name(&f.name, module_path, prefix);
+            out.push_str(&format!("typedef struct {iter_tag} {iter_tag};\n"));
+
+            let mut params_sig = c_params_sig(&f.params, module_path, prefix);
+            params_sig.push(format!("{prefix}_error* out_err"));
+            out.push_str(&format!(
+                "{iter_tag}* {prefix}_{module_path}_{}({});\n",
+                f.name,
+                params_sig.join(", ")
+            ));
+
+            let (item_ty, item_out_params) = c_ret_type(inner, module_path, prefix);
+            let mut next_params = vec![format!("{iter_tag}* iter")];
+            if item_out_params.is_empty() {
+                next_params.push(format!("{item_ty}* out_item"));
+            } else {
+                next_params.push(format!("{item_ty}* out_item"));
+                next_params.extend(item_out_params);
+            }
+            next_params.push(format!("{prefix}_error* out_err"));
+            out.push_str(&format!(
+                "int32_t {iter_tag}_next({});\n",
+                next_params.join(", ")
+            ));
+
+            out.push_str(&format!("void {iter_tag}_destroy({iter_tag}* iter);\n"));
+            continue;
+        }
         if f.r#async {
             let fn_base = format!("{prefix}_{module_path}_{}", f.name);
             let cb_name = format!("{fn_base}_callback");
@@ -2029,6 +2068,107 @@ mod tests {
         assert!(
             header.contains("typedef void (*weaveffi_lifecycle_on_ready_fn)(void* context);"),
             "callback with no params should only have context: {header}"
+        );
+    }
+
+    #[test]
+    fn c_iterator_return_generates_opaque_and_next_and_destroy() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "data".to_string(),
+                functions: vec![Function {
+                    name: "list_items".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::Iterator(Box::new(TypeRef::I32))),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let header = render_c_header(&api, "weaveffi");
+        assert!(
+            header.contains(
+                "typedef struct weaveffi_data_ListItemsIterator weaveffi_data_ListItemsIterator;"
+            ),
+            "missing iterator opaque typedef: {header}"
+        );
+        assert!(
+            header.contains("weaveffi_data_ListItemsIterator* weaveffi_data_list_items(weaveffi_error* out_err);"),
+            "missing iterator-returning function: {header}"
+        );
+        assert!(
+            header.contains("int32_t weaveffi_data_ListItemsIterator_next(weaveffi_data_ListItemsIterator* iter, int32_t* out_item, weaveffi_error* out_err);"),
+            "missing _next function: {header}"
+        );
+        assert!(
+            header.contains("void weaveffi_data_ListItemsIterator_destroy(weaveffi_data_ListItemsIterator* iter);"),
+            "missing _destroy function: {header}"
+        );
+    }
+
+    #[test]
+    fn c_iterator_with_struct_item() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "contacts".to_string(),
+                functions: vec![Function {
+                    name: "list_contacts".to_string(),
+                    params: vec![Param {
+                        name: "filter".to_string(),
+                        ty: TypeRef::StringUtf8,
+                    }],
+                    returns: Some(TypeRef::Iterator(Box::new(TypeRef::Struct(
+                        "Contact".to_string(),
+                    )))),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                }],
+                structs: vec![StructDef {
+                    name: "Contact".to_string(),
+                    doc: None,
+                    fields: vec![StructField {
+                        name: "name".to_string(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    }],
+                }],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let header = render_c_header(&api, "weaveffi");
+        assert!(
+            header.contains("typedef struct weaveffi_contacts_ListContactsIterator weaveffi_contacts_ListContactsIterator;"),
+            "missing iterator typedef: {header}"
+        );
+        assert!(
+            header.contains("weaveffi_contacts_ListContactsIterator* weaveffi_contacts_list_contacts(const char* filter, weaveffi_error* out_err);"),
+            "missing function returning iterator: {header}"
+        );
+        assert!(
+            header.contains("weaveffi_contacts_Contact** out_item"),
+            "struct iterator next should have pointer-to-pointer out param: {header}"
+        );
+        assert!(
+            header.contains("weaveffi_contacts_ListContactsIterator_destroy("),
+            "missing destroy: {header}"
         );
     }
 }
