@@ -14,12 +14,66 @@ impl Generator for CppGenerator {
         let dir = out_dir.join("cpp");
         std::fs::create_dir_all(&dir)?;
         std::fs::write(dir.join("weaveffi.hpp"), render_cpp_header(api))?;
+        std::fs::write(dir.join("CMakeLists.txt"), render_cmake())?;
+        std::fs::write(dir.join("README.md"), render_readme())?;
         Ok(())
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
-        vec![out_dir.join("cpp/weaveffi.hpp").to_string()]
+        vec![
+            out_dir.join("cpp/weaveffi.hpp").to_string(),
+            out_dir.join("cpp/CMakeLists.txt").to_string(),
+            out_dir.join("cpp/README.md").to_string(),
+        ]
     }
+}
+
+fn render_cmake() -> String {
+    "\
+cmake_minimum_required(VERSION 3.14)
+project(weaveffi_cpp)
+add_library(weaveffi_cpp INTERFACE)
+target_include_directories(weaveffi_cpp INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(weaveffi_cpp INTERFACE weaveffi)
+target_compile_features(weaveffi_cpp INTERFACE cxx_std_17)
+"
+    .to_string()
+}
+
+fn render_readme() -> String {
+    "\
+# WeaveFFI C++ Bindings
+
+## Prerequisites
+
+- CMake 3.14+
+- C++17 compiler
+- The `weaveffi` static/shared library built from the Rust crate
+
+## Usage with CMake
+
+Add the generated `cpp/` directory as a subdirectory in your `CMakeLists.txt` and
+link against `weaveffi_cpp`:
+
+```cmake
+add_subdirectory(path/to/generated/cpp)
+add_executable(myapp main.cpp)
+target_link_libraries(myapp weaveffi_cpp)
+```
+
+The `weaveffi_cpp` target is an INTERFACE library that:
+
+- Adds the generated header directory to your include path
+- Links against the `weaveffi` library
+- Requires C++17
+
+Then include the header in your code:
+
+```cpp
+#include \"weaveffi.hpp\"
+```
+"
+    .to_string()
 }
 
 fn render_cpp_header(api: &Api) -> String {
@@ -1003,7 +1057,14 @@ mod tests {
         let api = minimal_api();
         let out_dir = Utf8Path::new("/tmp/out");
         let files = CppGenerator.output_files(&api, out_dir);
-        assert_eq!(files, vec!["/tmp/out/cpp/weaveffi.hpp"]);
+        assert_eq!(
+            files,
+            vec![
+                "/tmp/out/cpp/weaveffi.hpp",
+                "/tmp/out/cpp/CMakeLists.txt",
+                "/tmp/out/cpp/README.md",
+            ]
+        );
     }
 
     #[test]
@@ -1027,6 +1088,43 @@ mod tests {
         );
         assert!(content.contains("extern \"C\""), "missing extern C block");
         assert!(content.contains("namespace weaveffi"), "missing namespace");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cpp_generates_cmake() {
+        let api = minimal_api();
+        let tmp = std::env::temp_dir().join("weaveffi_test_cpp_cmake");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        CppGenerator.generate(&api, out_dir).unwrap();
+
+        let cmake = tmp.join("cpp").join("CMakeLists.txt");
+        assert!(cmake.exists(), "CMakeLists.txt should be created");
+
+        let content = std::fs::read_to_string(&cmake).unwrap();
+        assert!(
+            content.contains("cmake_minimum_required"),
+            "missing cmake_minimum_required"
+        );
+        assert!(
+            content.contains("project(weaveffi_cpp)"),
+            "missing project declaration"
+        );
+        assert!(
+            content.contains("add_library(weaveffi_cpp INTERFACE)"),
+            "missing interface library"
+        );
+        assert!(
+            content.contains("target_compile_features(weaveffi_cpp INTERFACE cxx_std_17)"),
+            "missing C++17 requirement"
+        );
+
+        let readme = tmp.join("cpp").join("README.md");
+        assert!(readme.exists(), "README.md should be created");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
