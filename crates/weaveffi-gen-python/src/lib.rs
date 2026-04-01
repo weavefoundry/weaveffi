@@ -196,6 +196,13 @@ fn get_map_kv(ty: &TypeRef) -> Option<(&TypeRef, &TypeRef)> {
 fn render_python_module(api: &Api, strip_module_prefix: bool) -> String {
     let mut out = String::new();
     render_preamble(&mut out);
+    let has_async = api
+        .modules
+        .iter()
+        .any(|m| m.functions.iter().any(|f| f.r#async));
+    if has_async {
+        out.push_str("\nimport asyncio\n");
+    }
     for m in &api.modules {
         out.push_str(&format!("\n\n# === Module: {} ===", m.name));
         for e in &m.enums {
@@ -383,9 +390,15 @@ fn render_function(out: &mut String, module_name: &str, f: &Function, strip_modu
         .map(py_type_hint)
         .unwrap_or_else(|| "None".to_string());
 
+    let def_name = if f.r#async {
+        format!("_{func_name}_sync")
+    } else {
+        func_name.clone()
+    };
+
     out.push_str(&format!(
         "\n\ndef {}({}) -> {}:\n",
-        func_name,
+        def_name,
         params_sig.join(", "),
         ret_hint
     ));
@@ -464,6 +477,30 @@ fn render_function(out: &mut String, module_name: &str, f: &Function, strip_modu
 
     if let Some(ret_ty) = &f.returns {
         render_return_value(out, ret_ty, ind);
+    }
+
+    if f.r#async {
+        let params_joined = params_sig.join(", ");
+        out.push_str(&format!(
+            "\n\nasync def {}({}) -> {}:\n",
+            func_name, params_joined, ret_hint
+        ));
+        out.push_str("    _loop = asyncio.get_event_loop()\n");
+        let arg_names: Vec<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
+        let executor_args = if arg_names.is_empty() {
+            def_name
+        } else {
+            format!("{def_name}, {}", arg_names.join(", "))
+        };
+        if f.returns.is_some() {
+            out.push_str(&format!(
+                "    return await _loop.run_in_executor(None, {executor_args})\n"
+            ));
+        } else {
+            out.push_str(&format!(
+                "    await _loop.run_in_executor(None, {executor_args})\n"
+            ));
+        }
     }
 }
 
@@ -822,8 +859,9 @@ fn render_pyi_function(
         .as_ref()
         .map(py_type_hint)
         .unwrap_or_else(|| "None".into());
+    let async_kw = if f.r#async { "async " } else { "" };
     out.push_str(&format!(
-        "\ndef {}({}) -> {}: ...\n",
+        "\n{async_kw}def {}({}) -> {}: ...\n",
         func_name,
         params.join(", "),
         ret
@@ -3179,6 +3217,60 @@ mod tests {
         assert!(
             wrap > none_check,
             "Contact(_result) should appear after null check: {py}"
+        );
+    }
+
+    #[test]
+    fn python_async_function_is_async_def() {
+        let api = make_api(vec![simple_module(vec![Function {
+            name: "fetch_data".into(),
+            params: vec![Param {
+                name: "id".into(),
+                ty: TypeRef::I32,
+            }],
+            returns: Some(TypeRef::StringUtf8),
+            doc: None,
+            r#async: true,
+        }])]);
+        let code = render_python_module(&api, true);
+        assert!(
+            code.contains("import asyncio"),
+            "should import asyncio: {code}"
+        );
+        assert!(
+            code.contains("def _fetch_data_sync(id: int) -> str:"),
+            "should have sync helper: {code}"
+        );
+        assert!(
+            code.contains("async def fetch_data(id: int) -> str:"),
+            "should have async wrapper: {code}"
+        );
+        assert!(
+            code.contains("asyncio.get_event_loop()"),
+            "should use get_event_loop: {code}"
+        );
+        assert!(
+            code.contains("run_in_executor(None, _fetch_data_sync, id)"),
+            "should use run_in_executor with sync fn and args: {code}"
+        );
+    }
+
+    #[test]
+    fn python_pyi_async_function() {
+        let api = make_api(vec![simple_module(vec![Function {
+            name: "fetch_data".into(),
+            params: vec![Param {
+                name: "id".into(),
+                ty: TypeRef::I32,
+            }],
+            returns: Some(TypeRef::StringUtf8),
+            doc: None,
+            r#async: true,
+        }])]);
+        let stubs = render_pyi_module(&api, true);
+        assert!(
+            stubs.contains("async def fetch_data(id: int) -> str: ..."),
+            "pyi should declare async def: {stubs}"
         );
     }
 }
