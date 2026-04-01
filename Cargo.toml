@@ -37,6 +37,7 @@ toml = "0.8"
 thiserror = "1.0"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
 camino = "1.1"
 sha2 = "0.10"
 heck = "0.5"

@@ -2,7 +2,7 @@ mod extract;
 mod scaffold;
 
 use camino::Utf8Path;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use color_eyre::eyre::{bail, eyre, Report, Result, WrapErr};
 use color_eyre::Section;
 use similar::TextDiff;
@@ -93,6 +93,10 @@ enum Commands {
         out: Option<String>,
     },
     Doctor,
+    Completions {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
+    },
 }
 
 fn main() -> Result<()> {
@@ -153,6 +157,7 @@ fn main() -> Result<()> {
         }
         Commands::Diff { input, out } => cmd_diff(&input, out.as_deref(), quiet)?,
         Commands::Doctor => cmd_doctor()?,
+        Commands::Completions { shell } => cmd_completions(shell),
     }
     Ok(())
 }
@@ -747,6 +752,15 @@ fn cmd_doctor() -> Result<()> {
     Ok(())
 }
 
+fn cmd_completions(shell: clap_complete::Shell) {
+    clap_complete::generate(
+        shell,
+        &mut Cli::command(),
+        "weaveffi",
+        &mut std::io::stdout(),
+    );
+}
+
 fn sanitize_module_name(name: &str) -> String {
     let lowered = name.to_lowercase();
     let mut out = String::with_capacity(lowered.len());
@@ -1131,6 +1145,46 @@ mod tests {
         assert!(
             stdout.contains("wasm-bindgen-cli"),
             "missing wasm-bindgen-cli check: {stdout}"
+        );
+    }
+
+    #[test]
+    fn completions_bash() {
+        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .args(["completions", "bash"])
+            .output()
+            .expect("failed to run weaveffi completions bash");
+
+        let stdout = String::from_utf8_lossy(&cmd.stdout);
+        assert!(cmd.status.success(), "completions bash failed: {stdout}");
+        assert!(
+            stdout.contains("weaveffi"),
+            "bash completions should reference weaveffi: {stdout}"
+        );
+        assert!(
+            stdout.contains("complete"),
+            "bash completions should contain 'complete': {stdout}"
+        );
+    }
+
+    #[test]
+    fn completions_zsh() {
+        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .args(["completions", "zsh"])
+            .output()
+            .expect("failed to run weaveffi completions zsh");
+
+        let stdout = String::from_utf8_lossy(&cmd.stdout);
+        assert!(cmd.status.success(), "completions zsh failed: {stdout}");
+        assert!(
+            stdout.contains("weaveffi"),
+            "zsh completions should reference weaveffi: {stdout}"
+        );
+        assert!(
+            stdout.contains("compdef"),
+            "zsh completions should contain 'compdef': {stdout}"
         );
     }
 
