@@ -119,8 +119,9 @@ a stable C ABI contract consumed by language-specific wrappers.
 
 ### Documentation and benchmarks
 
-- [ ] Published performance benchmarks for codegen throughput
-- [ ] Feature-complete documentation with per-target tutorials and cookbook recipes
+- [ ] Benchmark results published on documentation site
+- [ ] Per-target tutorials for C, C++, Dart, Go, Ruby, WASM, and .NET
+- [ ] Cookbook recipes for common integration patterns
 
 ## Design principle: standalone generated packages
 
