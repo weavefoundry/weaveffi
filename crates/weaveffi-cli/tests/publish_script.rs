@@ -39,6 +39,9 @@ fn publish_script_contains_all_publishable_crates() {
         "weaveffi-gen-wasm",
         "weaveffi-gen-python",
         "weaveffi-gen-dotnet",
+        "weaveffi-gen-cpp",
+        "weaveffi-gen-dart",
+        "weaveffi-gen-go",
         "weaveffi-gen-ruby",
         "weaveffi-cli",
     ];
