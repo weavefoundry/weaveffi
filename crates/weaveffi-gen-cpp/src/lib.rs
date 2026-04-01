@@ -116,7 +116,15 @@ fn render_cpp_header(api: &Api, namespace: &str) -> String {
     out.push_str("#include <optional>\n");
     out.push_str("#include <unordered_map>\n");
     out.push_str("#include <memory>\n");
-    out.push_str("#include <stdexcept>\n\n");
+    out.push_str("#include <stdexcept>\n");
+    if api
+        .modules
+        .iter()
+        .any(|m| m.functions.iter().any(|f| f.r#async))
+    {
+        out.push_str("#include <future>\n");
+    }
+    out.push_str("\n");
 
     out.push_str("extern \"C\" {\n\n");
     render_extern_c(&mut out, api);
@@ -265,6 +273,31 @@ fn c_ret_type(ty: &TypeRef, module: &str) -> (String, Vec<String>) {
     }
 }
 
+fn c_callback_result_params(ty: &TypeRef, module: &str) -> Vec<String> {
+    match ty {
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            vec!["const uint8_t* result".into(), "size_t result_len".into()]
+        }
+        TypeRef::List(inner) => {
+            let elem = c_element_type(inner, module);
+            vec![format!("{elem}* result"), "size_t result_len".into()]
+        }
+        TypeRef::Map(k, v) => {
+            let ke = c_element_type(k, module);
+            let ve = c_element_type(v, module);
+            vec![
+                format!("{ke}* result_keys"),
+                format!("{ve}* result_values"),
+                "size_t result_len".into(),
+            ]
+        }
+        _ => {
+            let (ret_ty, _) = c_ret_type(ty, module);
+            vec![format!("{ret_ty} result")]
+        }
+    }
+}
+
 // ── extern "C" block ──
 
 fn render_extern_c(out: &mut String, api: &Api) {
@@ -316,25 +349,52 @@ fn render_extern_c(out: &mut String, api: &Api) {
         }
 
         for f in &module.functions {
-            let mut p: Vec<String> = f
-                .params
-                .iter()
-                .map(|p| c_param_type(&p.ty, &p.name, &module.name))
-                .collect();
-            let ret = if let Some(r) = &f.returns {
-                let (rt, extra) = c_ret_type(r, &module.name);
-                p.extend(extra);
-                rt
+            if f.r#async {
+                let fn_base = format!("weaveffi_{}_{}", module.name, f.name);
+                let cb_name = format!("{fn_base}_callback");
+                let mut cb_params = vec![
+                    "void* context".to_string(),
+                    "weaveffi_error* err".to_string(),
+                ];
+                if let Some(ret) = &f.returns {
+                    cb_params.extend(c_callback_result_params(ret, &module.name));
+                }
+                out.push_str(&format!(
+                    "typedef void (*{cb_name})({});\n",
+                    cb_params.join(", ")
+                ));
+                let mut params_sig: Vec<String> = f
+                    .params
+                    .iter()
+                    .map(|p| c_param_type(&p.ty, &p.name, &module.name))
+                    .collect();
+                params_sig.push(format!("{cb_name} callback"));
+                params_sig.push("void* context".to_string());
+                out.push_str(&format!(
+                    "void {fn_base}_async({});\n",
+                    params_sig.join(", ")
+                ));
             } else {
-                "void".into()
-            };
-            p.push("weaveffi_error* out_err".into());
-            out.push_str(&format!(
-                "{ret} weaveffi_{}_{}({});\n",
-                module.name,
-                f.name,
-                p.join(", ")
-            ));
+                let mut p: Vec<String> = f
+                    .params
+                    .iter()
+                    .map(|p| c_param_type(&p.ty, &p.name, &module.name))
+                    .collect();
+                let ret = if let Some(r) = &f.returns {
+                    let (rt, extra) = c_ret_type(r, &module.name);
+                    p.extend(extra);
+                    rt
+                } else {
+                    "void".into()
+                };
+                p.push("weaveffi_error* out_err".into());
+                out.push_str(&format!(
+                    "{ret} weaveffi_{}_{}({});\n",
+                    module.name,
+                    f.name,
+                    p.join(", ")
+                ));
+            }
         }
 
         out.push('\n');
@@ -627,7 +687,11 @@ fn render_getter_map(
 
 fn render_cpp_functions(out: &mut String, module: &Module, error_codes: &[&ErrorCode]) {
     for func in &module.functions {
-        render_cpp_function(out, func, module, error_codes);
+        if func.r#async {
+            render_cpp_async_function(out, func, module);
+        } else {
+            render_cpp_function(out, func, module, error_codes);
+        }
     }
 }
 
@@ -970,6 +1034,200 @@ fn render_cpp_return(out: &mut String, ty: &TypeRef) {
             out.push_str("    return ret;\n");
         }
         TypeRef::Callback(_) => todo!("callback C++ return"),
+    }
+}
+
+fn render_cpp_async_function(out: &mut String, func: &Function, module: &Module) {
+    let cpp_ret = func
+        .returns
+        .as_ref()
+        .map_or("void".to_string(), |ty| cpp_type(ty));
+    let cpp_params: Vec<String> = func
+        .params
+        .iter()
+        .map(|p| cpp_param_decl(&p.ty, &p.name))
+        .collect();
+    let fn_name = format!("{}_{}", module.name, func.name);
+
+    out.push_str(&format!(
+        "inline std::future<{cpp_ret}> {fn_name}({}) {{\n",
+        cpp_params.join(", ")
+    ));
+
+    let mut setup = Vec::new();
+    let mut c_args = Vec::new();
+    for p in &func.params {
+        let (s, a) = param_to_c_args(&p.ty, &p.name, &module.name);
+        setup.extend(s);
+        c_args.extend(a);
+    }
+
+    out.push_str(&format!(
+        "    auto* promise_ptr = new std::promise<{cpp_ret}>();\n"
+    ));
+    out.push_str("    auto future = promise_ptr->get_future();\n");
+
+    for line in &setup {
+        out.push_str(&format!("    {line}\n"));
+    }
+
+    let mut cb_params = vec![
+        "void* context".to_string(),
+        "weaveffi_error* err".to_string(),
+    ];
+    if let Some(ret) = &func.returns {
+        cb_params.extend(c_callback_result_params(ret, &module.name));
+    }
+
+    let c_fn = format!("weaveffi_{}_{}_async", module.name, func.name);
+    if c_args.is_empty() {
+        out.push_str(&format!("    {c_fn}([]({}) {{\n", cb_params.join(", ")));
+    } else {
+        out.push_str(&format!(
+            "    {c_fn}({}, []({}) {{\n",
+            c_args.join(", "),
+            cb_params.join(", ")
+        ));
+    }
+
+    out.push_str(&format!(
+        "        auto* p = static_cast<std::promise<{cpp_ret}>*>(context);\n"
+    ));
+    out.push_str("        if (err && err->code != 0) {\n");
+    out.push_str("            std::string msg(err->message ? err->message : \"unknown error\");\n");
+    out.push_str(
+        "            p->set_exception(std::make_exception_ptr(WeaveFFIError(err->code, msg)));\n",
+    );
+    out.push_str("        } else {\n");
+
+    if let Some(ret) = &func.returns {
+        render_async_set_value(out, ret);
+    } else {
+        out.push_str("            p->set_value();\n");
+    }
+
+    out.push_str("        }\n");
+    out.push_str("        delete p;\n");
+    out.push_str("    }, static_cast<void*>(promise_ptr));\n");
+    out.push_str("    return future;\n");
+    out.push_str("}\n\n");
+}
+
+fn render_async_set_value(out: &mut String, ty: &TypeRef) {
+    match ty {
+        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Bool => {
+            out.push_str("            p->set_value(result);\n");
+        }
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            out.push_str("            std::string ret(result);\n");
+            out.push_str("            weaveffi_free_string(result);\n");
+            out.push_str("            p->set_value(std::move(ret));\n");
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            out.push_str(
+                "            p->set_value(std::vector<uint8_t>(result, result + result_len));\n",
+            );
+        }
+        TypeRef::Handle => {
+            out.push_str(
+                "            p->set_value(reinterpret_cast<void*>(static_cast<uintptr_t>(result)));\n",
+            );
+        }
+        TypeRef::TypedHandle(n) | TypeRef::Struct(n) => {
+            out.push_str(&format!("            p->set_value({n}(result));\n"));
+        }
+        TypeRef::Enum(n) => {
+            out.push_str(&format!(
+                "            p->set_value(static_cast<{n}>(result));\n"
+            ));
+        }
+        TypeRef::Optional(inner) => {
+            out.push_str("            if (!result) {\n");
+            out.push_str("                p->set_value(std::nullopt);\n");
+            out.push_str("            } else {\n");
+            match inner.as_ref() {
+                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                    out.push_str("                std::string ret(result);\n");
+                    out.push_str("                weaveffi_free_string(result);\n");
+                    out.push_str("                p->set_value(std::move(ret));\n");
+                }
+                TypeRef::Struct(n) | TypeRef::TypedHandle(n) => {
+                    out.push_str(&format!("                p->set_value({n}(result));\n"));
+                }
+                TypeRef::Enum(n) => {
+                    out.push_str(&format!(
+                        "                p->set_value(static_cast<{n}>(*result));\n"
+                    ));
+                }
+                _ if !is_c_pointer_type(inner) => {
+                    out.push_str("                p->set_value(*result);\n");
+                }
+                _ => {
+                    out.push_str(&format!(
+                        "                p->set_value({}(result));\n",
+                        cpp_type(inner)
+                    ));
+                }
+            }
+            out.push_str("            }\n");
+        }
+        TypeRef::List(inner) => match inner.as_ref() {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                out.push_str("            std::vector<std::string> ret;\n");
+                out.push_str("            ret.reserve(result_len);\n");
+                out.push_str(
+                    "            for (size_t i = 0; i < result_len; ++i) ret.emplace_back(result[i]);\n",
+                );
+                out.push_str("            p->set_value(std::move(ret));\n");
+            }
+            TypeRef::Struct(n) => {
+                out.push_str(&format!("            std::vector<{n}> ret;\n"));
+                out.push_str("            ret.reserve(result_len);\n");
+                out.push_str(&format!(
+                    "            for (size_t i = 0; i < result_len; ++i) ret.emplace_back({n}(result[i]));\n"
+                ));
+                out.push_str("            p->set_value(std::move(ret));\n");
+            }
+            TypeRef::Enum(n) => {
+                out.push_str(&format!("            std::vector<{n}> ret;\n"));
+                out.push_str("            ret.reserve(result_len);\n");
+                out.push_str(&format!(
+                    "            for (size_t i = 0; i < result_len; ++i) ret.emplace_back(static_cast<{n}>(result[i]));\n"
+                ));
+                out.push_str("            p->set_value(std::move(ret));\n");
+            }
+            _ => {
+                out.push_str(&format!(
+                    "            p->set_value(std::vector<{}>(result, result + result_len));\n",
+                    cpp_type(inner)
+                ));
+            }
+        },
+        TypeRef::Map(k, v) => {
+            let ck = cpp_type(k);
+            let cv = cpp_type(v);
+            out.push_str(&format!(
+                "            std::unordered_map<{ck}, {cv}> ret;\n"
+            ));
+            out.push_str("            for (size_t i = 0; i < result_len; ++i) {\n");
+            let ke = match k.as_ref() {
+                TypeRef::StringUtf8 | TypeRef::BorrowedStr => "std::string(result_keys[i])".into(),
+                TypeRef::Enum(n) => format!("static_cast<{n}>(result_keys[i])"),
+                _ => "result_keys[i]".into(),
+            };
+            let ve = match v.as_ref() {
+                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                    "std::string(result_values[i])".into()
+                }
+                TypeRef::Enum(n) => format!("static_cast<{n}>(result_values[i])"),
+                TypeRef::Struct(n) => format!("{n}(result_values[i])"),
+                _ => "result_values[i]".into(),
+            };
+            out.push_str(&format!("                ret[{ke}] = {ve};\n"));
+            out.push_str("            }\n");
+            out.push_str("            p->set_value(std::move(ret));\n");
+        }
+        TypeRef::Callback(_) => todo!("callback C++ async return"),
     }
 }
 
@@ -2379,6 +2637,112 @@ mod tests {
         assert!(
             h.contains("} // namespace weaveffi"),
             "missing namespace close"
+        );
+    }
+
+    #[test]
+    fn cpp_async_returns_future() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "tasks".into(),
+                functions: vec![Function {
+                    name: "run".into(),
+                    params: vec![Param {
+                        name: "id".into(),
+                        ty: TypeRef::I32,
+                    }],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: true,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+            generators: None,
+        };
+        let h = render_cpp_header(&api, "weaveffi");
+
+        assert!(
+            h.contains("#include <future>"),
+            "missing future include: {h}"
+        );
+        assert!(
+            h.contains("typedef void (*weaveffi_tasks_run_callback)(void* context, weaveffi_error* err, int32_t result);"),
+            "missing callback typedef: {h}"
+        );
+        assert!(
+            h.contains("void weaveffi_tasks_run_async(int32_t id, weaveffi_tasks_run_callback callback, void* context);"),
+            "missing async C function: {h}"
+        );
+        assert!(
+            !h.contains("int32_t weaveffi_tasks_run("),
+            "async function should not have sync signature: {h}"
+        );
+        assert!(
+            h.contains("inline std::future<int32_t> tasks_run(int32_t id)"),
+            "missing future wrapper: {h}"
+        );
+        assert!(h.contains("return future;"), "should return future: {h}");
+    }
+
+    #[test]
+    fn cpp_async_uses_promise() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "tasks".into(),
+                functions: vec![
+                    Function {
+                        name: "run".into(),
+                        params: vec![Param {
+                            name: "id".into(),
+                            ty: TypeRef::I32,
+                        }],
+                        returns: Some(TypeRef::I32),
+                        doc: None,
+                        r#async: true,
+                    },
+                    Function {
+                        name: "fire".into(),
+                        params: vec![],
+                        returns: None,
+                        doc: None,
+                        r#async: true,
+                    },
+                ],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+            generators: None,
+        };
+        let h = render_cpp_header(&api, "weaveffi");
+
+        assert!(
+            h.contains("new std::promise<int32_t>()"),
+            "should create int32 promise: {h}"
+        );
+        assert!(
+            h.contains("promise_ptr->get_future()"),
+            "should get future from promise: {h}"
+        );
+        assert!(
+            h.contains("p->set_value(result)"),
+            "should set promise value: {h}"
+        );
+        assert!(
+            h.contains("p->set_exception(std::make_exception_ptr(WeaveFFIError("),
+            "should set promise exception: {h}"
+        );
+        assert!(
+            h.contains("inline std::future<void> tasks_fire()"),
+            "missing void future wrapper: {h}"
+        );
+        assert!(
+            h.contains("new std::promise<void>()"),
+            "should create void promise: {h}"
         );
     }
 }
