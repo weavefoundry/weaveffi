@@ -88,7 +88,9 @@ fn is_c_pointer_type(ty: &TypeRef) -> bool {
     matches!(
         ty,
         TypeRef::StringUtf8
+            | TypeRef::BorrowedStr
             | TypeRef::Bytes
+            | TypeRef::BorrowedBytes
             | TypeRef::Struct(_)
             | TypeRef::TypedHandle(_)
             | TypeRef::List(_)
@@ -103,10 +105,10 @@ fn py_ctypes_scalar(ty: &TypeRef) -> &'static str {
         TypeRef::I64 => "ctypes.c_int64",
         TypeRef::F64 => "ctypes.c_double",
         TypeRef::Bool => "ctypes.c_int32",
-        TypeRef::StringUtf8 => "ctypes.c_char_p",
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "ctypes.c_char_p",
         TypeRef::Handle => "ctypes.c_uint64",
         TypeRef::TypedHandle(_) => "ctypes.c_void_p",
-        TypeRef::Bytes => "ctypes.c_uint8",
+        TypeRef::Bytes | TypeRef::BorrowedBytes => "ctypes.c_uint8",
         TypeRef::Struct(_) => "ctypes.c_void_p",
         TypeRef::Enum(_) => "ctypes.c_int32",
         TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) => "ctypes.c_void_p",
@@ -119,8 +121,8 @@ fn py_type_hint(ty: &TypeRef) -> String {
         TypeRef::TypedHandle(name) => format!("\"{}\"", name),
         TypeRef::F64 => "float".into(),
         TypeRef::Bool => "bool".into(),
-        TypeRef::StringUtf8 => "str".into(),
-        TypeRef::Bytes => "bytes".into(),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "str".into(),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => "bytes".into(),
         TypeRef::Struct(name) | TypeRef::Enum(name) => format!("\"{}\"", name),
         TypeRef::Optional(inner) => format!("Optional[{}]", py_type_hint(inner)),
         TypeRef::List(inner) => format!("List[{}]", py_type_hint(inner)),
@@ -130,7 +132,7 @@ fn py_type_hint(ty: &TypeRef) -> String {
 
 fn py_param_argtypes(ty: &TypeRef) -> Vec<String> {
     match ty {
-        TypeRef::Bytes => vec![
+        TypeRef::Bytes | TypeRef::BorrowedBytes => vec![
             "ctypes.POINTER(ctypes.c_uint8)".into(),
             "ctypes.c_size_t".into(),
         ],
@@ -154,7 +156,7 @@ fn py_param_argtypes(ty: &TypeRef) -> Vec<String> {
 /// Returns `(restype, out_param_argtypes)` for a return type.
 fn py_return_info(ty: &TypeRef) -> (String, Vec<String>) {
     match ty {
-        TypeRef::Bytes => (
+        TypeRef::Bytes | TypeRef::BorrowedBytes => (
             "ctypes.POINTER(ctypes.c_uint8)".into(),
             vec!["ctypes.POINTER(ctypes.c_size_t)".into()],
         ),
@@ -467,7 +469,9 @@ fn render_function(out: &mut String, module_name: &str, f: &Function, strip_modu
 
 fn py_list_convert_expr(name: &str, elem: &TypeRef) -> String {
     match elem {
-        TypeRef::StringUtf8 => format!("*[_string_to_bytes(v) for v in {name}]"),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            format!("*[_string_to_bytes(v) for v in {name}]")
+        }
         TypeRef::Struct(_) | TypeRef::TypedHandle(_) => format!("*[v._ptr for v in {name}]"),
         TypeRef::Enum(_) => format!("*[v.value for v in {name}]"),
         TypeRef::Bool => format!("*[1 if v else 0 for v in {name}]"),
@@ -477,7 +481,9 @@ fn py_list_convert_expr(name: &str, elem: &TypeRef) -> String {
 
 fn py_map_elem_convert(list_name: &str, ty: &TypeRef, var: &str) -> String {
     match ty {
-        TypeRef::StringUtf8 => format!("*[_string_to_bytes({var}) for {var} in {list_name}]"),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            format!("*[_string_to_bytes({var}) for {var} in {list_name}]")
+        }
         TypeRef::Enum(_) => format!("*[{var}.value for {var} in {list_name}]"),
         TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
             format!("*[{var}._ptr for {var} in {list_name}]")
@@ -489,7 +495,7 @@ fn py_map_elem_convert(list_name: &str, ty: &TypeRef, var: &str) -> String {
 
 fn py_param_conversion(name: &str, ty: &TypeRef, ind: &str) -> Vec<String> {
     match ty {
-        TypeRef::Bytes => {
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
             let s = py_ctypes_scalar(&TypeRef::Bytes);
             vec![format!("{ind}_{name}_arr = ({s} * len({name}))(*{name})")]
         }
@@ -505,7 +511,7 @@ fn py_param_conversion(name: &str, ty: &TypeRef, ind: &str) -> Vec<String> {
                     "{ind}_{name}_c = ctypes.byref(ctypes.c_int32(1 if {name} else 0)) if {name} is not None else None"
                 )]
             }
-            TypeRef::StringUtf8 => {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                 vec![format!("{ind}_{name}_c = _string_to_bytes({name})")]
             }
             TypeRef::Enum(_) => {
@@ -513,7 +519,7 @@ fn py_param_conversion(name: &str, ty: &TypeRef, ind: &str) -> Vec<String> {
                     "{ind}_{name}_c = ctypes.byref(ctypes.c_int32({name}.value)) if {name} is not None else None"
                 )]
             }
-            TypeRef::Bytes => {
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 let s = py_ctypes_scalar(&TypeRef::Bytes);
                 vec![
                     format!("{ind}if {name} is not None:"),
@@ -565,16 +571,18 @@ fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
             vec![name.to_string()]
         }
         TypeRef::Bool => vec![format!("1 if {name} else 0")],
-        TypeRef::StringUtf8 => vec![format!("_string_to_bytes({name})")],
-        TypeRef::Bytes => vec![format!("_{name}_arr"), format!("len({name})")],
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![format!("_string_to_bytes({name})")],
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            vec![format!("_{name}_arr"), format!("len({name})")]
+        }
         TypeRef::Struct(_) | TypeRef::TypedHandle(_) => vec![format!("{name}._ptr")],
         TypeRef::Enum(_) => vec![format!("{name}.value")],
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 => vec![format!("_{name}_c")],
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![format!("_{name}_c")],
             TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
                 vec![format!("{name}._ptr if {name} is not None else None")]
             }
-            TypeRef::Bytes | TypeRef::List(_) => {
+            TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) => {
                 vec![format!("_{name}_arr"), format!("_{name}_len")]
             }
             TypeRef::Map(_, _) => vec![
@@ -598,7 +606,7 @@ fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
 
 fn py_read_element(expr: &str, ty: &TypeRef) -> String {
     match ty {
-        TypeRef::StringUtf8 => format!("_bytes_to_string({expr})"),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("_bytes_to_string({expr})"),
         TypeRef::Struct(name) | TypeRef::TypedHandle(name) => format!("{name}({expr})"),
         TypeRef::Enum(name) => format!("{name}({expr})"),
         TypeRef::Bool => format!("bool({expr})"),
@@ -614,10 +622,10 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
         TypeRef::Bool => {
             out.push_str(&format!("{ind}return bool(_result)\n"));
         }
-        TypeRef::StringUtf8 => {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             out.push_str(&format!("{ind}return _bytes_to_string(_result) or \"\"\n"));
         }
-        TypeRef::Bytes => {
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
             out.push_str(&format!("{ind}if not _result:\n"));
             out.push_str(&format!("{ind}    return b\"\"\n"));
             out.push_str(&format!("{ind}return bytes(_result[:_out_len.value])\n"));
@@ -640,10 +648,10 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
 
 fn render_optional_return(out: &mut String, inner: &TypeRef, ind: &str) {
     match inner {
-        TypeRef::StringUtf8 => {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             out.push_str(&format!("{ind}return _bytes_to_string(_result)\n"));
         }
-        TypeRef::Bytes => {
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
             out.push_str(&format!("{ind}if not _result:\n"));
             out.push_str(&format!("{ind}    return None\n"));
             out.push_str(&format!("{ind}return bytes(_result[:_out_len.value])\n"));

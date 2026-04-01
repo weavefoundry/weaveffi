@@ -119,8 +119,8 @@ fn c_elem_type(ty: &TypeRef, module: &str) -> String {
         TypeRef::F64 => "double".into(),
         TypeRef::Bool => "bool".into(),
         TypeRef::TypedHandle(_) | TypeRef::Handle => "weaveffi_handle_t".into(),
-        TypeRef::StringUtf8 => "const char*".into(),
-        TypeRef::Bytes => "const uint8_t*".into(),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*".into(),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => "const uint8_t*".into(),
         TypeRef::Struct(s) => format!("weaveffi_{module}_{s}*"),
         TypeRef::Enum(e) => format!("weaveffi_{module}_{e}"),
         TypeRef::Optional(inner) | TypeRef::List(inner) => c_elem_type(inner, module),
@@ -135,8 +135,8 @@ fn c_ret_type_str(ty: &TypeRef, module: &str) -> String {
         TypeRef::I64 => "int64_t".into(),
         TypeRef::F64 => "double".into(),
         TypeRef::Bool => "bool".into(),
-        TypeRef::StringUtf8 => "const char*".into(),
-        TypeRef::Bytes => "const uint8_t*".into(),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*".into(),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => "const uint8_t*".into(),
         TypeRef::TypedHandle(_) | TypeRef::Handle => "weaveffi_handle_t".into(),
         TypeRef::Struct(s) => format!("weaveffi_{module}_{s}*"),
         TypeRef::Enum(e) => format!("weaveffi_{module}_{e}"),
@@ -279,7 +279,7 @@ fn emit_param(
             out.push_str(&format!("  {getter}(env, args[{idx}], &{name});\n"));
             c_args.push(name.into());
         }
-        TypeRef::StringUtf8 => {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             out.push_str(&format!("  size_t {name}_len;\n"));
             out.push_str(&format!(
                 "  napi_get_value_string_utf8(env, args[{idx}], NULL, 0, &{name}_len);\n"
@@ -324,7 +324,7 @@ fn emit_param(
         TypeRef::List(inner) => {
             emit_list_param(out, c_args, cleanups, inner, name, idx, module);
         }
-        TypeRef::Bytes => {
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
             out.push_str(&format!("  void* {name}_raw;\n"));
             out.push_str(&format!("  size_t {name}_len;\n"));
             out.push_str(&format!(
@@ -678,6 +678,9 @@ fn emit_ret_to_napi(out: &mut String, ty: &TypeRef, module: &str) {
             out.push_str("  napi_create_string_utf8(env, result, NAPI_AUTO_LENGTH, &ret);\n");
             out.push_str("  weaveffi_free_string(result);\n");
         }
+        TypeRef::BorrowedStr => {
+            out.push_str("  napi_create_string_utf8(env, result, NAPI_AUTO_LENGTH, &ret);\n");
+        }
         TypeRef::TypedHandle(_) | TypeRef::Handle => {
             out.push_str("  napi_create_int64(env, (int64_t)result, &ret);\n");
         }
@@ -690,6 +693,9 @@ fn emit_ret_to_napi(out: &mut String, ty: &TypeRef, module: &str) {
         TypeRef::Bytes => {
             out.push_str("  napi_create_buffer_copy(env, out_len, result, NULL, &ret);\n");
             out.push_str("  weaveffi_free_bytes((uint8_t*)result, out_len);\n");
+        }
+        TypeRef::BorrowedBytes => {
+            out.push_str("  napi_create_buffer_copy(env, out_len, result, NULL, &ret);\n");
         }
         TypeRef::Optional(inner) => {
             out.push_str("  if (result == NULL) {\n");
@@ -799,8 +805,8 @@ fn ts_type_for(ty: &TypeRef) -> String {
     match ty {
         TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 => "number".into(),
         TypeRef::Bool => "boolean".into(),
-        TypeRef::StringUtf8 => "string".into(),
-        TypeRef::Bytes => "Buffer".into(),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string".into(),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => "Buffer".into(),
         TypeRef::Handle => "bigint".into(),
         TypeRef::TypedHandle(name) | TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
         TypeRef::Optional(inner) => format!("{} | null", ts_type_for(inner)),

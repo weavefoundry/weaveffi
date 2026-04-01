@@ -683,6 +683,9 @@ fn validation_suggestion(err: &ValidationError) -> &'static str {
         ValidationError::InvalidMapKey { .. } => {
             "map keys must be primitive types (i32, u32, i64, f64, bool, string); structs, lists, and maps cannot be keys"
         }
+        ValidationError::BorrowedTypeInInvalidPosition { .. } => {
+            "borrowed types (&str, &[u8]) can only be used as function parameters, not return types or struct fields"
+        }
     }
 }
 

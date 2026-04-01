@@ -168,6 +168,10 @@ pub enum ValidationError {
     UnknownTypeRef { name: String },
     #[error("invalid map key type: {key_type}; only primitive types and strings are allowed as map keys")]
     InvalidMapKey { key_type: String },
+    #[error(
+        "borrowed type '{ty}' is not valid in {location}; only function parameters are allowed"
+    )]
+    BorrowedTypeInInvalidPosition { ty: String, location: String },
 }
 
 const RESERVED: &[&str] = &[
@@ -338,6 +342,12 @@ fn validate_module(module: &Module) -> Result<(), ValidationError> {
         .collect();
     for s in &module.structs {
         for f in &s.fields {
+            if let Some(ty) = contains_borrowed(&f.ty) {
+                return Err(ValidationError::BorrowedTypeInInvalidPosition {
+                    ty: ty.to_string(),
+                    location: format!("field '{}' of struct '{}'", f.name, s.name),
+                });
+            }
             validate_type_ref(&f.ty, &known_types)?;
         }
     }
@@ -346,6 +356,12 @@ fn validate_module(module: &Module) -> Result<(), ValidationError> {
             validate_type_ref(&p.ty, &known_types)?;
         }
         if let Some(ret) = &f.returns {
+            if let Some(ty) = contains_borrowed(ret) {
+                return Err(ValidationError::BorrowedTypeInInvalidPosition {
+                    ty: ty.to_string(),
+                    location: format!("return type of {}::{}", module.name, f.name),
+                });
+            }
             validate_type_ref(ret, &known_types)?;
         }
     }
@@ -384,6 +400,16 @@ fn validate_function(module: &Module, f: &Function) -> Result<(), ValidationErro
 fn validate_param(p: &Param) -> Result<(), ValidationError> {
     check_identifier(&p.name)?;
     Ok(())
+}
+
+fn contains_borrowed(ty: &TypeRef) -> Option<&'static str> {
+    match ty {
+        TypeRef::BorrowedStr => Some("&str"),
+        TypeRef::BorrowedBytes => Some("&[u8]"),
+        TypeRef::Optional(inner) | TypeRef::List(inner) => contains_borrowed(inner),
+        TypeRef::Map(k, v) => contains_borrowed(k).or_else(|| contains_borrowed(v)),
+        _ => None,
+    }
 }
 
 fn validate_type_ref(ty: &TypeRef, known: &BTreeSet<&str>) -> Result<(), ValidationError> {
@@ -1909,6 +1935,183 @@ mod tests {
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
             ValidationError::UnknownTypeRef { name } if name == "Nonexistent"
+        ));
+    }
+
+    #[test]
+    fn borrowed_str_param_accepted() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "io".to_string(),
+                functions: vec![Function {
+                    name: "write".to_string(),
+                    params: vec![Param {
+                        name: "data".to_string(),
+                        ty: TypeRef::BorrowedStr,
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        assert!(validate_api(&mut api).is_ok());
+    }
+
+    #[test]
+    fn borrowed_bytes_param_accepted() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "io".to_string(),
+                functions: vec![Function {
+                    name: "upload".to_string(),
+                    params: vec![Param {
+                        name: "raw".to_string(),
+                        ty: TypeRef::BorrowedBytes,
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        assert!(validate_api(&mut api).is_ok());
+    }
+
+    #[test]
+    fn borrowed_str_in_return_rejected() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "io".to_string(),
+                functions: vec![Function {
+                    name: "read".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::BorrowedStr),
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        assert!(matches!(
+            validate_api(&mut api).unwrap_err(),
+            ValidationError::BorrowedTypeInInvalidPosition { ty, location }
+                if ty == "&str" && location.contains("return type")
+        ));
+    }
+
+    #[test]
+    fn borrowed_bytes_in_return_rejected() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "io".to_string(),
+                functions: vec![Function {
+                    name: "read_raw".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::BorrowedBytes),
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        assert!(matches!(
+            validate_api(&mut api).unwrap_err(),
+            ValidationError::BorrowedTypeInInvalidPosition { ty, location }
+                if ty == "&[u8]" && location.contains("return type")
+        ));
+    }
+
+    #[test]
+    fn borrowed_str_in_struct_field_rejected() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "data".to_string(),
+                functions: vec![],
+                structs: vec![StructDef {
+                    name: "Msg".to_string(),
+                    fields: vec![StructField {
+                        name: "text".to_string(),
+                        ty: TypeRef::BorrowedStr,
+                        doc: None,
+                    }],
+                    doc: None,
+                }],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        assert!(matches!(
+            validate_api(&mut api).unwrap_err(),
+            ValidationError::BorrowedTypeInInvalidPosition { ty, location }
+                if ty == "&str" && location.contains("struct")
+        ));
+    }
+
+    #[test]
+    fn borrowed_bytes_in_struct_field_rejected() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "data".to_string(),
+                functions: vec![],
+                structs: vec![StructDef {
+                    name: "Blob".to_string(),
+                    fields: vec![StructField {
+                        name: "content".to_string(),
+                        ty: TypeRef::BorrowedBytes,
+                        doc: None,
+                    }],
+                    doc: None,
+                }],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        assert!(matches!(
+            validate_api(&mut api).unwrap_err(),
+            ValidationError::BorrowedTypeInInvalidPosition { ty, location }
+                if ty == "&[u8]" && location.contains("struct")
+        ));
+    }
+
+    #[test]
+    fn borrowed_str_nested_in_optional_return_rejected() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "io".to_string(),
+                functions: vec![Function {
+                    name: "maybe_read".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::Optional(Box::new(TypeRef::BorrowedStr))),
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        assert!(matches!(
+            validate_api(&mut api).unwrap_err(),
+            ValidationError::BorrowedTypeInInvalidPosition { ty, .. }
+                if ty == "&str"
         ));
     }
 }

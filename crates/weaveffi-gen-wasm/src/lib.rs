@@ -62,7 +62,11 @@ fn wasm_type(ty: &TypeRef) -> &'static str {
         | TypeRef::Struct(_)
         | TypeRef::Map(_, _) => "i64",
         TypeRef::F64 => "f64",
-        TypeRef::StringUtf8 | TypeRef::Bytes | TypeRef::List(_) => "i32, i32",
+        TypeRef::StringUtf8
+        | TypeRef::BorrowedStr
+        | TypeRef::Bytes
+        | TypeRef::BorrowedBytes
+        | TypeRef::List(_) => "i32, i32",
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::Struct(_) | TypeRef::Handle | TypeRef::TypedHandle(_) | TypeRef::Map(_, _) => {
                 "i64"
@@ -79,7 +83,9 @@ fn wasm_type_note(ty: &TypeRef) -> &'static str {
         TypeRef::I64 => "native WASM i64",
         TypeRef::F64 => "native WASM f64",
         TypeRef::Bool => "0 = false, 1 = true",
-        TypeRef::StringUtf8 | TypeRef::Bytes => "ptr + len in linear memory",
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr | TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            "ptr + len in linear memory"
+        }
         TypeRef::TypedHandle(_) | TypeRef::Handle => "opaque pointer",
         TypeRef::Struct(_) => "opaque handle in linear memory",
         TypeRef::Enum(_) => "variant discriminant",
@@ -101,8 +107,8 @@ fn type_display(ty: &TypeRef) -> String {
         TypeRef::I64 => "i64".into(),
         TypeRef::F64 => "f64".into(),
         TypeRef::Bool => "bool".into(),
-        TypeRef::StringUtf8 => "string".into(),
-        TypeRef::Bytes => "bytes".into(),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string".into(),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => "bytes".into(),
         TypeRef::TypedHandle(_) | TypeRef::Handle => "handle".into(),
         TypeRef::Struct(n) | TypeRef::Enum(n) => n.clone(),
         TypeRef::Optional(inner) => format!("{}?", type_display(inner)),
@@ -279,8 +285,8 @@ fn ts_type_for(ty: &TypeRef) -> String {
     match ty {
         TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 => "number".into(),
         TypeRef::Bool => "boolean".into(),
-        TypeRef::StringUtf8 => "string".into(),
-        TypeRef::Bytes => "Buffer".into(),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string".into(),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => "Buffer".into(),
         TypeRef::Handle => "bigint".into(),
         TypeRef::TypedHandle(name) | TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
         TypeRef::Optional(inner) => format!("{} | null", ts_type_for(inner)),

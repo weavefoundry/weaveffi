@@ -102,8 +102,8 @@ fn swift_type_for(t: &TypeRef) -> String {
         TypeRef::I64 => "Int64".to_string(),
         TypeRef::F64 => "Double".to_string(),
         TypeRef::Bool => "Bool".to_string(),
-        TypeRef::StringUtf8 => "String".to_string(),
-        TypeRef::Bytes => "Data".to_string(),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "String".to_string(),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => "Data".to_string(),
         TypeRef::Handle => "UInt64".to_string(),
         TypeRef::TypedHandle(name) | TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
         TypeRef::Optional(inner) => format!("{}?", swift_type_for(inner)),
@@ -127,7 +127,12 @@ fn is_c_value_type(ty: &TypeRef) -> bool {
 
 fn needs_closure(ty: &TypeRef) -> bool {
     match ty {
-        TypeRef::StringUtf8 | TypeRef::Bytes | TypeRef::List(_) | TypeRef::Map(_, _) => true,
+        TypeRef::StringUtf8
+        | TypeRef::BorrowedStr
+        | TypeRef::Bytes
+        | TypeRef::BorrowedBytes
+        | TypeRef::List(_)
+        | TypeRef::Map(_, _) => true,
         TypeRef::Optional(inner) => is_c_value_type(inner),
         _ => false,
     }
@@ -392,7 +397,10 @@ fn build_c_call_args(params: &[Param], module_name: &str) -> String {
     let mut args: Vec<String> = Vec::new();
     for p in params {
         match &p.ty {
-            TypeRef::StringUtf8 | TypeRef::Bytes => {
+            TypeRef::StringUtf8
+            | TypeRef::BorrowedStr
+            | TypeRef::Bytes
+            | TypeRef::BorrowedBytes => {
                 args.push(format!("{}_ptr", p.name));
                 args.push(format!("{}_len", p.name));
             }
@@ -405,7 +413,10 @@ fn build_c_call_args(params: &[Param], module_name: &str) -> String {
                 TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
                     args.push(format!("{}?.ptr", p.name))
                 }
-                TypeRef::StringUtf8 | TypeRef::Bytes => {
+                TypeRef::StringUtf8
+                | TypeRef::BorrowedStr
+                | TypeRef::Bytes
+                | TypeRef::BorrowedBytes => {
                     args.push(format!("{}_ptr", p.name));
                     args.push(format!("{}_len", p.name));
                 }
@@ -622,8 +633,8 @@ fn swift_c_ptr_element(ty: &TypeRef) -> String {
         TypeRef::F64 => "Double".to_string(),
         TypeRef::Bool => "Bool".to_string(),
         TypeRef::Handle => "UInt64".to_string(),
-        TypeRef::StringUtf8 => "UnsafePointer<CChar>?".to_string(),
-        TypeRef::Bytes => "UInt8".to_string(),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "UnsafePointer<CChar>?".to_string(),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => "UInt8".to_string(),
         TypeRef::Enum(_) => "Int32".to_string(),
         TypeRef::TypedHandle(_) | TypeRef::Struct(_) => "OpaquePointer?".to_string(),
         TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
@@ -714,13 +725,13 @@ fn map_array_source(ty: &TypeRef, name: &str, suffix: &str) -> String {
 fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module_name: &str) {
     for p in params {
         match &p.ty {
-            TypeRef::StringUtf8 => {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                 out.push_str(&format!(
                     "        let {n}_bytes = Array({n}.utf8)\n",
                     n = p.name
                 ));
             }
-            TypeRef::Bytes => {
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 out.push_str(&format!("        let {n}_bytes = Array({n})\n", n = p.name));
             }
             TypeRef::Optional(inner) => {
@@ -833,7 +844,10 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
         let indent = "        ".to_string() + &"    ".repeat(closure_depth);
         let is_first = closure_depth == 0;
         match &p.ty {
-            TypeRef::StringUtf8 | TypeRef::Bytes => {
+            TypeRef::StringUtf8
+            | TypeRef::BorrowedStr
+            | TypeRef::Bytes
+            | TypeRef::BorrowedBytes => {
                 if needs_return && is_first {
                     out.push_str(&format!(
                         "{}let result: {} = {}_bytes.withUnsafeBufferPointer {{ {}_buf in\n",
@@ -2335,6 +2349,76 @@ mod tests {
         assert!(
             swift.contains("[Color: Contact]"),
             "should contain enum-keyed map type: {swift}"
+        );
+    }
+
+    #[test]
+    fn swift_type_for_borrowed_str() {
+        assert_eq!(swift_type_for(&TypeRef::BorrowedStr), "String");
+    }
+
+    #[test]
+    fn swift_type_for_borrowed_bytes() {
+        assert_eq!(swift_type_for(&TypeRef::BorrowedBytes), "Data");
+    }
+
+    #[test]
+    fn swift_function_with_borrowed_str_param() {
+        let api = make_api(vec![Module {
+            name: "io".to_string(),
+            functions: vec![Function {
+                name: "write".to_string(),
+                params: vec![Param {
+                    name: "msg".to_string(),
+                    ty: TypeRef::BorrowedStr,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let out = render_swift_wrapper(&api, true);
+        assert!(
+            out.contains("_ msg: String"),
+            "BorrowedStr param should use String type: {out}"
+        );
+        assert!(
+            out.contains("weaveffi_io_write"),
+            "should call the C function: {out}"
+        );
+    }
+
+    #[test]
+    fn swift_function_with_borrowed_bytes_param() {
+        let api = make_api(vec![Module {
+            name: "io".to_string(),
+            functions: vec![Function {
+                name: "upload".to_string(),
+                params: vec![Param {
+                    name: "data".to_string(),
+                    ty: TypeRef::BorrowedBytes,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let out = render_swift_wrapper(&api, true);
+        assert!(
+            out.contains("_ data: Data"),
+            "BorrowedBytes param should use Data type: {out}"
+        );
+        assert!(
+            out.contains("weaveffi_io_upload"),
+            "should call the C function: {out}"
         );
     }
 
