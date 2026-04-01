@@ -20,6 +20,7 @@ members = [
     "samples/contacts",
     "samples/inventory",
     "samples/async-demo",
+    "samples/events",
 ]
 resolver = "2"
 
