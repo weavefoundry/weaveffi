@@ -257,6 +257,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
 
         let ctx = api_to_context(&api);

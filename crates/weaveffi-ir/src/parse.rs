@@ -75,6 +75,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         }
     }
 

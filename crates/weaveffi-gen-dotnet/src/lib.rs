@@ -1187,6 +1187,7 @@ mod tests {
         Api {
             version: "0.1.0".into(),
             modules,
+            generators: None,
         }
     }
 
@@ -3087,6 +3088,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let cs = render_csharp(&api, "WeaveFFI", true);
         assert!(

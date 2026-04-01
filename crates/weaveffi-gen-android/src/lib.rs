@@ -2049,6 +2049,7 @@ mod tests {
         Api {
             version: "0.1.0".to_string(),
             modules,
+            generators: None,
         }
     }
 
