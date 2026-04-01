@@ -45,12 +45,25 @@ impl Generator for WasmGenerator {
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
-        vec![
-            out_dir.join("wasm/README.md").to_string(),
-            out_dir.join("wasm/weaveffi_wasm.js").to_string(),
-            out_dir.join("wasm/weaveffi_wasm.d.ts").to_string(),
-        ]
+        output_file_list(out_dir, DEFAULT_MODULE_NAME)
     }
+
+    fn output_files_with_config(
+        &self,
+        _api: &Api,
+        out_dir: &Utf8Path,
+        config: &GeneratorConfig,
+    ) -> Vec<String> {
+        output_file_list(out_dir, config.wasm_module_name())
+    }
+}
+
+fn output_file_list(out_dir: &Utf8Path, module_name: &str) -> Vec<String> {
+    vec![
+        out_dir.join("wasm/README.md").to_string(),
+        out_dir.join(format!("wasm/{module_name}.js")).to_string(),
+        out_dir.join(format!("wasm/{module_name}.d.ts")).to_string(),
+    ]
 }
 
 fn wasm_type(ty: &TypeRef) -> &'static str {
@@ -1370,6 +1383,10 @@ mod tests {
         let dts = std::fs::read_to_string(out.join("wasm/my_bindings.d.ts")).unwrap();
         assert!(dts.contains("MyBindingsModule"));
         assert!(dts.contains("loadMyBindings"));
+
+        let files = WasmGenerator.output_files_with_config(&api, out, &config);
+        assert!(files.iter().any(|f| f.contains("my_bindings.js")));
+        assert!(files.iter().any(|f| f.contains("my_bindings.d.ts")));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
