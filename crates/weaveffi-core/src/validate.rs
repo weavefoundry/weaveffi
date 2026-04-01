@@ -138,7 +138,7 @@ pub enum ValidationError {
     ReservedKeyword(String),
     #[error("invalid identifier '{0}': {1}")]
     InvalidIdentifier(String, &'static str),
-    #[error("async functions are not supported in 0.1.0: {module}::{function}")]
+    #[error("async functions are not yet supported: {module}::{function}")]
     AsyncNotSupported { module: String, function: String },
     #[error("error domain missing name in module '{0}'")]
     ErrorDomainMissingName(String),
@@ -584,10 +584,12 @@ mod tests {
                 errors: None,
             }],
         };
-        assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
-            ValidationError::AsyncNotSupported { .. }
-        ));
+        let err = validate_api(&mut api).unwrap_err();
+        assert!(matches!(err, ValidationError::AsyncNotSupported { .. }));
+        assert_eq!(
+            err.to_string(),
+            "async functions are not yet supported: mymod::do_async"
+        );
     }
 
     #[test]

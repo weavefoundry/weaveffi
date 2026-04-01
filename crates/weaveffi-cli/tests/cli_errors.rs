@@ -141,7 +141,7 @@ modules:
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
     assert!(
-        stderr.contains("async functions are not supported"),
+        stderr.contains("async functions are not yet supported"),
         "expected async rejection message, got: {stderr}"
     );
     assert!(
