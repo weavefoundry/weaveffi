@@ -1407,6 +1407,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }
     }
 
@@ -1689,6 +1690,7 @@ mod tests {
                 ],
             }],
             errors: None,
+            modules: vec![],
         }]);
 
         let cs = render_csharp(&api, "WeaveFFI", true);
@@ -1730,6 +1732,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let cs = render_csharp(&api, "WeaveFFI", true);
@@ -1784,6 +1787,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let cs = render_csharp(&api, "WeaveFFI", true);
@@ -1836,6 +1840,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let cs = render_csharp(&api, "WeaveFFI", true);
@@ -1877,6 +1882,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let cs = render_csharp(&api, "WeaveFFI", true);
@@ -1920,6 +1926,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let cs = render_csharp(&api, "WeaveFFI", true);
@@ -2057,6 +2064,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let cs = render_csharp(&api, "WeaveFFI", true);
@@ -2085,6 +2093,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let cs = render_csharp(&api, "WeaveFFI", true);
@@ -2114,6 +2123,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let cs = render_csharp(&api, "WeaveFFI", true);
@@ -2145,6 +2155,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let cs = render_csharp(&api, "WeaveFFI", true);
@@ -2186,6 +2197,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let cs = render_csharp(&api, "WeaveFFI", true);
@@ -2296,6 +2308,7 @@ mod tests {
                 },
             ],
             errors: None,
+            modules: vec![],
         }]);
 
         let tmp = std::env::temp_dir().join("weaveffi_test_dotnet_contacts_v2");
@@ -2431,6 +2444,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let cs = render_csharp(&api, "WeaveFFI", true);
@@ -2543,6 +2557,7 @@ mod tests {
                 ],
             }],
             errors: None,
+            modules: vec![],
         }]);
 
         let cs = render_csharp(&api, "WeaveFFI", true);
@@ -2622,6 +2637,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let cs = render_csharp(&api, "WeaveFFI", true);
@@ -2707,6 +2723,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let cs = render_csharp(&api, "WeaveFFI", true);
@@ -2882,6 +2899,7 @@ mod tests {
                 },
             ],
             errors: None,
+            modules: vec![],
         }]);
 
         let tmp = std::env::temp_dir().join("weaveffi_test_dotnet_full_contacts");
@@ -3128,6 +3146,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let config = GeneratorConfig {
@@ -3206,6 +3225,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let cs = render_csharp(&api, "WeaveFFI", true);
         assert!(
@@ -3235,6 +3255,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let cs = render_csharp(&api, "WeaveFFI", true);
         assert!(
@@ -3292,6 +3313,7 @@ mod tests {
                 ],
             }],
             errors: None,
+            modules: vec![],
         }]);
         let cs = render_csharp(&api, "WeaveFFI", true);
         assert!(
@@ -3328,6 +3350,7 @@ mod tests {
                 }],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -3364,6 +3387,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let cs = render_csharp(&api, "WeaveFFI", true);
         assert!(
@@ -3428,6 +3452,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let cs = render_csharp(&api, "WeaveFFI", true);
         assert!(
@@ -3454,6 +3479,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let cs = render_csharp(&api, "WeaveFFI", true);
         assert!(
@@ -3480,6 +3506,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let cs = render_csharp(&api, "WeaveFFI", true);
         assert!(

@@ -477,6 +477,14 @@ fn validate_module(module: &Module, all_modules: &[Module]) -> Result<(), Valida
         validate_error_domain(module, errors, &function_names)?;
     }
 
+    let mut sub_module_names = BTreeSet::new();
+    for sub in &module.modules {
+        if !sub_module_names.insert(sub.name.clone()) {
+            return Err(ValidationError::DuplicateModuleName(sub.name.clone()));
+        }
+        validate_module(sub, all_modules)?;
+    }
+
     Ok(())
 }
 
@@ -622,6 +630,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }
     }
 
@@ -662,6 +671,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -682,6 +692,7 @@ mod tests {
                     structs: vec![],
                     enums: vec![],
                     errors: None,
+                    modules: vec![],
                 }],
                 generators: None,
             };
@@ -703,6 +714,7 @@ mod tests {
                     structs: vec![],
                     enums: vec![],
                     errors: None,
+                    modules: vec![],
                 }],
                 generators: None,
             };
@@ -730,6 +742,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -756,6 +769,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -779,6 +793,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -807,6 +822,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -826,6 +842,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -893,6 +910,7 @@ mod tests {
                         },
                     ],
                 }),
+                modules: vec![],
             }],
             generators: None,
         };
@@ -916,6 +934,7 @@ mod tests {
                         message: "should fail".to_string(),
                     }],
                 }),
+                modules: vec![],
             }],
             generators: None,
         };
@@ -943,6 +962,7 @@ mod tests {
                         message: "failed".to_string(),
                     }],
                 }),
+                modules: vec![],
             }],
             generators: None,
         };
@@ -977,6 +997,7 @@ mod tests {
                         },
                     ],
                 }),
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1011,6 +1032,7 @@ mod tests {
                         },
                     ],
                 }),
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1042,6 +1064,7 @@ mod tests {
                 structs: vec![simple_struct("Point"), simple_struct("Point")],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1066,6 +1089,7 @@ mod tests {
                 }],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1101,6 +1125,7 @@ mod tests {
                 }],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1140,6 +1165,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![simple_enum("Color"), simple_enum("Color")],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1164,6 +1190,7 @@ mod tests {
                     variants: vec![],
                 }],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1199,6 +1226,7 @@ mod tests {
                     ],
                 }],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1234,6 +1262,7 @@ mod tests {
                     ],
                 }],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1264,6 +1293,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1293,6 +1323,7 @@ mod tests {
                 structs: vec![simple_struct("Point")],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1319,6 +1350,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1345,6 +1377,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1372,6 +1405,7 @@ mod tests {
                 }],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1409,6 +1443,7 @@ mod tests {
                 }],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1435,6 +1470,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![simple_enum("Color")],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1468,6 +1504,7 @@ mod tests {
                 }],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1499,6 +1536,7 @@ mod tests {
                     ],
                 }],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1522,6 +1560,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![simple_enum("Color")],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1548,6 +1587,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![simple_enum("Color")],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1578,6 +1618,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![simple_enum("Color")],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1608,6 +1649,7 @@ mod tests {
                 structs: vec![simple_struct("Contact")],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1638,6 +1680,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1664,6 +1707,7 @@ mod tests {
                 structs: vec![simple_struct("Point")],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1693,6 +1737,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![simple_enum("Color")],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1719,6 +1764,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1748,6 +1794,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1775,6 +1822,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1805,6 +1853,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1841,6 +1890,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1871,6 +1921,7 @@ mod tests {
                     variants,
                 }],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1903,6 +1954,7 @@ mod tests {
                     variants,
                 }],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1935,6 +1987,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1969,6 +2022,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1999,6 +2053,7 @@ mod tests {
                 }],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2037,6 +2092,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2074,6 +2130,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2093,6 +2150,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2122,6 +2180,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![simple_enum("Color")],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2147,6 +2206,7 @@ mod tests {
                 }],
                 enums: vec![simple_enum("Color")],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2177,6 +2237,7 @@ mod tests {
                 structs: vec![simple_struct("Session")],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2203,6 +2264,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2232,6 +2294,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2258,6 +2321,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2281,6 +2345,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2308,6 +2373,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2336,6 +2402,7 @@ mod tests {
                 }],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2364,6 +2431,7 @@ mod tests {
                 }],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2424,6 +2492,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2455,6 +2524,7 @@ mod tests {
                     structs: vec![],
                     enums: vec![],
                     errors: None,
+                    modules: vec![],
                 },
                 Module {
                     name: "catalog".to_string(),
@@ -2462,6 +2532,7 @@ mod tests {
                     structs: vec![simple_struct("Product")],
                     enums: vec![],
                     errors: None,
+                    modules: vec![],
                 },
             ],
             generators: None,
@@ -2491,6 +2562,7 @@ mod tests {
                     structs: vec![],
                     enums: vec![],
                     errors: None,
+                    modules: vec![],
                 },
                 Module {
                     name: "shared".to_string(),
@@ -2498,6 +2570,7 @@ mod tests {
                     structs: vec![],
                     enums: vec![simple_enum("Status")],
                     errors: None,
+                    modules: vec![],
                 },
             ],
             generators: None,
@@ -2530,6 +2603,7 @@ mod tests {
                     structs: vec![],
                     enums: vec![],
                     errors: None,
+                    modules: vec![],
                 },
                 Module {
                     name: "catalog".to_string(),
@@ -2537,6 +2611,7 @@ mod tests {
                     structs: vec![simple_struct("Product")],
                     enums: vec![],
                     errors: None,
+                    modules: vec![],
                 },
             ],
             generators: None,
@@ -2557,6 +2632,7 @@ mod tests {
                 structs: vec![simple_struct("Product")],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2574,6 +2650,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![simple_enum("Status")],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2589,5 +2666,29 @@ mod tests {
             generators: None,
         };
         assert_eq!(find_type_in_api(&api, "Nonexistent"), None);
+    }
+
+    #[test]
+    fn validate_nested_module_passes() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "parent".to_string(),
+                functions: vec![simple_function("top_fn")],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+                modules: vec![Module {
+                    name: "child".to_string(),
+                    functions: vec![simple_function("inner_fn")],
+                    structs: vec![],
+                    enums: vec![],
+                    errors: None,
+                    modules: vec![],
+                }],
+            }],
+            generators: None,
+        };
+        assert!(validate_api(&mut api).is_ok());
     }
 }

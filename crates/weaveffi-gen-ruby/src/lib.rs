@@ -842,6 +842,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }
     }
 
@@ -960,6 +961,7 @@ mod tests {
                 ],
             }],
             errors: None,
+            modules: vec![],
         }]);
 
         let code = render_ruby_module(&api, "WeaveFFI");
@@ -991,6 +993,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let code = render_ruby_module(&api, "WeaveFFI");
@@ -1030,6 +1033,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let code = render_ruby_module(&api, "WeaveFFI");
@@ -1210,6 +1214,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let code = render_ruby_module(&api, "WeaveFFI");
@@ -1377,6 +1382,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let code = render_ruby_module(&api, "WeaveFFI");
@@ -1536,6 +1542,7 @@ mod tests {
                     ],
                 }],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         }
@@ -1614,6 +1621,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1676,6 +1684,7 @@ mod tests {
                 ],
             }],
             errors: None,
+            modules: vec![],
         }]);
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1912,6 +1921,7 @@ mod tests {
                 cancellable: false,
             }],
             errors: None,
+            modules: vec![],
         }]);
 
         let rb = render_ruby_module(&api, "WeaveFFI");
@@ -1966,6 +1976,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let rb = render_ruby_module(&api, "WeaveFFI");

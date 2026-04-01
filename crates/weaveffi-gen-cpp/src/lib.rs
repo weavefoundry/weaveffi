@@ -1317,6 +1317,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         }
@@ -1394,6 +1395,7 @@ mod tests {
                     },
                 ],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         }
@@ -1766,6 +1768,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1798,6 +1801,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1836,6 +1840,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1886,6 +1891,7 @@ mod tests {
                     ],
                 }],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1929,6 +1935,7 @@ mod tests {
                 }],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1963,6 +1970,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -1995,6 +2003,7 @@ mod tests {
                 }],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2023,6 +2032,7 @@ mod tests {
                 }],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2104,6 +2114,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2139,6 +2150,7 @@ mod tests {
                 }],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2202,6 +2214,7 @@ mod tests {
                         },
                     ],
                 }),
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2352,6 +2365,7 @@ mod tests {
                 }],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2423,6 +2437,7 @@ mod tests {
                     ],
                 }],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2474,6 +2489,7 @@ mod tests {
                 }],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2521,6 +2537,7 @@ mod tests {
                 }],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2574,6 +2591,7 @@ mod tests {
                 }],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2617,6 +2635,7 @@ mod tests {
                 }],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2727,6 +2746,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2785,6 +2805,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2844,6 +2865,7 @@ mod tests {
                     cancellable: false,
                 }],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };
@@ -2901,6 +2923,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         };

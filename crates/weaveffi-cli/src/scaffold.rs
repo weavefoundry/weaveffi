@@ -332,6 +332,7 @@ mod tests {
                 structs,
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             }],
             generators: None,
         }
@@ -800,6 +801,7 @@ mod tests {
                     structs: vec![],
                     enums: vec![],
                     errors: None,
+                    modules: vec![],
                 },
                 Module {
                     name: "io".into(),
@@ -814,6 +816,7 @@ mod tests {
                     structs: vec![],
                     enums: vec![],
                     errors: None,
+                    modules: vec![],
                 },
             ],
             generators: None,

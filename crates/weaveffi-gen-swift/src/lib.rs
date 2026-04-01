@@ -1672,6 +1672,7 @@ mod tests {
                 ],
             }],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -1710,6 +1711,7 @@ mod tests {
                 ],
             }],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -1741,6 +1743,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -1777,6 +1780,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -1809,6 +1813,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -1840,6 +1845,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -1868,6 +1874,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -1903,6 +1910,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -1933,6 +1941,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -1971,6 +1980,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -2021,6 +2031,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -2084,6 +2095,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -2115,6 +2127,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -2144,6 +2157,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -2173,6 +2187,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -2204,6 +2219,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -2275,6 +2291,7 @@ mod tests {
                 ],
             }],
             errors: None,
+            modules: vec![],
         }]);
 
         let tmp = std::env::temp_dir().join("weaveffi_test_swift_structs_and_enums");
@@ -2375,6 +2392,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -2420,6 +2438,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -2471,6 +2490,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -2535,6 +2555,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let config = GeneratorConfig {
@@ -2621,6 +2642,7 @@ mod tests {
                     },
                 ],
             }),
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -2698,6 +2720,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -2747,6 +2770,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let config = GeneratorConfig {
@@ -2836,6 +2860,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let swift = render_swift_wrapper(&api, true);
         assert!(
@@ -2865,6 +2890,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let swift = render_swift_wrapper(&api, true);
         assert!(
@@ -2922,6 +2948,7 @@ mod tests {
                 ],
             }],
             errors: None,
+            modules: vec![],
         }]);
         let swift = render_swift_wrapper(&api, true);
         assert!(
@@ -2958,6 +2985,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -2989,6 +3017,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -3028,6 +3057,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let swift = render_swift_wrapper(&api, true);
         assert!(
@@ -3066,6 +3096,7 @@ mod tests {
                 cancellable: false,
             }],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -3116,6 +3147,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -3143,6 +3175,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -3174,6 +3207,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
 
         let out = render_swift_wrapper(&api, true);
@@ -3212,6 +3246,7 @@ mod tests {
                 }],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             },
             Module {
                 name: "ops".to_string(),
@@ -3229,6 +3264,7 @@ mod tests {
                 structs: vec![],
                 enums: vec![],
                 errors: None,
+                modules: vec![],
             },
         ]);
 

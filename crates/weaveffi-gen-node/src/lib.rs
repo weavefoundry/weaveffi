@@ -1028,6 +1028,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }
     }
 
@@ -1329,6 +1330,7 @@ mod tests {
                 ],
             }],
             errors: None,
+            modules: vec![],
         }]);
 
         let tmp = std::env::temp_dir().join("weaveffi_test_node_structs_and_enums");
@@ -1737,6 +1739,7 @@ mod tests {
             }],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let dts = render_node_dts(&api, true);
         assert!(
@@ -1766,6 +1769,7 @@ mod tests {
             structs: vec![],
             enums: vec![],
             errors: None,
+            modules: vec![],
         }]);
         let dts = render_node_dts(&api, true);
         assert!(
@@ -1823,6 +1827,7 @@ mod tests {
                 ],
             }],
             errors: None,
+            modules: vec![],
         }]);
         let dts = render_node_dts(&api, true);
         assert!(
