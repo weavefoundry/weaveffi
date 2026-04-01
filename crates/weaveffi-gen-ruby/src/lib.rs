@@ -866,6 +866,8 @@ mod tests {
             functions,
             structs: vec![],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }
@@ -985,6 +987,8 @@ mod tests {
                     },
                 ],
             }],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -1017,6 +1021,8 @@ mod tests {
                 ],
             }],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -1057,6 +1063,8 @@ mod tests {
                 }],
             }],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -1238,6 +1246,8 @@ mod tests {
                 }],
             }],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -1406,6 +1416,8 @@ mod tests {
                 }],
             }],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -1566,6 +1578,8 @@ mod tests {
                         },
                     ],
                 }],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1645,6 +1659,8 @@ mod tests {
                 ],
             }],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -1708,6 +1724,8 @@ mod tests {
                     },
                 ],
             }],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -1934,6 +1952,8 @@ mod tests {
                 }],
             }],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             functions: vec![Function {
                 name: "find_contact".into(),
                 params: vec![Param {
@@ -2000,6 +2020,8 @@ mod tests {
             }],
             structs: vec![],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);

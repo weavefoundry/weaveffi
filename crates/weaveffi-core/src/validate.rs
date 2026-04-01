@@ -188,6 +188,18 @@ pub enum ValidationError {
         "borrowed type '{ty}' is not valid in {location}; only function parameters are allowed"
     )]
     BorrowedTypeInInvalidPosition { ty: String, location: String },
+    #[error("duplicate callback name in module '{module}': {name}")]
+    DuplicateCallbackName { module: String, name: String },
+    #[error(
+        "listener '{listener}' in module '{module}' references undefined callback '{callback}'"
+    )]
+    ListenerCallbackNotFound {
+        module: String,
+        listener: String,
+        callback: String,
+    },
+    #[error("duplicate listener name in module '{module}': {name}")]
+    DuplicateListenerName { module: String, name: String },
 }
 
 const RESERVED: &[&str] = &[
@@ -473,6 +485,38 @@ fn validate_module(module: &Module, all_modules: &[Module]) -> Result<(), Valida
         }
     }
 
+    let mut callback_names = BTreeSet::new();
+    for cb in &module.callbacks {
+        check_identifier(&cb.name)?;
+        if !callback_names.insert(cb.name.clone()) {
+            return Err(ValidationError::DuplicateCallbackName {
+                module: module.name.clone(),
+                name: cb.name.clone(),
+            });
+        }
+        for p in &cb.params {
+            validate_param(p)?;
+        }
+    }
+
+    let mut listener_names = BTreeSet::new();
+    for l in &module.listeners {
+        check_identifier(&l.name)?;
+        if !listener_names.insert(l.name.clone()) {
+            return Err(ValidationError::DuplicateListenerName {
+                module: module.name.clone(),
+                name: l.name.clone(),
+            });
+        }
+        if !callback_names.contains(&l.event_callback) {
+            return Err(ValidationError::ListenerCallbackNotFound {
+                module: module.name.clone(),
+                listener: l.name.clone(),
+                callback: l.event_callback.clone(),
+            });
+        }
+    }
+
     if let Some(errors) = &module.errors {
         validate_error_domain(module, errors, &function_names)?;
     }
@@ -605,8 +649,8 @@ fn validate_error_domain(
 mod tests {
     use super::*;
     use weaveffi_ir::ir::{
-        Api, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param, StructDef,
-        StructField, TypeRef,
+        Api, CallbackDef, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, ListenerDef,
+        Module, Param, StructDef, StructField, TypeRef,
     };
 
     fn simple_function(name: &str) -> Function {
@@ -629,6 +673,8 @@ mod tests {
             functions: vec![simple_function("do_stuff")],
             structs: vec![],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }
@@ -670,6 +716,8 @@ mod tests {
                 functions: vec![simple_function("same"), simple_function("same")],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -691,6 +739,8 @@ mod tests {
                     functions: vec![simple_function("ok_fn")],
                     structs: vec![],
                     enums: vec![],
+                    callbacks: vec![],
+                    listeners: vec![],
                     errors: None,
                     modules: vec![],
                 }],
@@ -713,6 +763,8 @@ mod tests {
                     functions: vec![simple_function("ok_fn")],
                     structs: vec![],
                     enums: vec![],
+                    callbacks: vec![],
+                    listeners: vec![],
                     errors: None,
                     modules: vec![],
                 }],
@@ -741,6 +793,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -768,6 +822,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -792,6 +848,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -821,6 +879,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -841,6 +901,8 @@ mod tests {
                 functions: vec![simple_function("ok_fn")],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -890,6 +952,8 @@ mod tests {
                 ],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: Some(ErrorDomain {
                     name: "ContactErrors".to_string(),
                     codes: vec![
@@ -926,6 +990,8 @@ mod tests {
                 functions: vec![simple_function("ok_fn")],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: Some(ErrorDomain {
                     name: "MyErrors".to_string(),
                     codes: vec![ErrorCode {
@@ -954,6 +1020,8 @@ mod tests {
                 functions: vec![simple_function("do_stuff")],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: Some(ErrorDomain {
                     name: "do_stuff".to_string(),
                     codes: vec![ErrorCode {
@@ -982,6 +1050,8 @@ mod tests {
                 functions: vec![simple_function("ok_fn")],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: Some(ErrorDomain {
                     name: "MyErrors".to_string(),
                     codes: vec![
@@ -1017,6 +1087,8 @@ mod tests {
                 functions: vec![simple_function("ok_fn")],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: Some(ErrorDomain {
                     name: "MyErrors".to_string(),
                     codes: vec![
@@ -1063,6 +1135,8 @@ mod tests {
                 functions: vec![simple_function("ok_fn")],
                 structs: vec![simple_struct("Point"), simple_struct("Point")],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1088,6 +1162,8 @@ mod tests {
                     fields: vec![],
                 }],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1124,6 +1200,8 @@ mod tests {
                     ],
                 }],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1164,6 +1242,8 @@ mod tests {
                 functions: vec![simple_function("ok_fn")],
                 structs: vec![],
                 enums: vec![simple_enum("Color"), simple_enum("Color")],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1189,6 +1269,8 @@ mod tests {
                     doc: None,
                     variants: vec![],
                 }],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1225,6 +1307,8 @@ mod tests {
                         },
                     ],
                 }],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1261,6 +1345,8 @@ mod tests {
                         },
                     ],
                 }],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1292,6 +1378,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1322,6 +1410,8 @@ mod tests {
                 }],
                 structs: vec![simple_struct("Point")],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1349,6 +1439,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1376,6 +1468,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1404,6 +1498,8 @@ mod tests {
                     }],
                 }],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1442,6 +1538,8 @@ mod tests {
                     }],
                 }],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1469,6 +1567,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![simple_enum("Color")],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1503,6 +1603,8 @@ mod tests {
                     }],
                 }],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1535,6 +1637,8 @@ mod tests {
                         },
                     ],
                 }],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1559,6 +1663,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![simple_enum("Color")],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1586,6 +1692,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![simple_enum("Color")],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1617,6 +1725,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![simple_enum("Color")],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1648,6 +1758,8 @@ mod tests {
                 }],
                 structs: vec![simple_struct("Contact")],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1679,6 +1791,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1706,6 +1820,8 @@ mod tests {
                 }],
                 structs: vec![simple_struct("Point")],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1736,6 +1852,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![simple_enum("Color")],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1763,6 +1881,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1793,6 +1913,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1821,6 +1943,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1852,6 +1976,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1889,6 +2015,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1920,6 +2048,8 @@ mod tests {
                     doc: None,
                     variants,
                 }],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1953,6 +2083,8 @@ mod tests {
                     doc: None,
                     variants,
                 }],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1986,6 +2118,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -2021,6 +2155,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -2052,6 +2188,8 @@ mod tests {
                     }],
                 }],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -2091,6 +2229,8 @@ mod tests {
                 ],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -2129,6 +2269,8 @@ mod tests {
                 ],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -2149,6 +2291,8 @@ mod tests {
                 functions: vec![],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -2179,6 +2323,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![simple_enum("Color")],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -2205,6 +2351,8 @@ mod tests {
                     }],
                 }],
                 enums: vec![simple_enum("Color")],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -2236,6 +2384,8 @@ mod tests {
                 }],
                 structs: vec![simple_struct("Session")],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -2263,6 +2413,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -2293,6 +2445,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -2320,6 +2474,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -2344,6 +2500,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -2372,6 +2530,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -2401,6 +2561,8 @@ mod tests {
                     doc: None,
                 }],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -2430,6 +2592,8 @@ mod tests {
                     doc: None,
                 }],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -2491,6 +2655,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -2523,6 +2689,8 @@ mod tests {
                     }],
                     structs: vec![],
                     enums: vec![],
+                    callbacks: vec![],
+                    listeners: vec![],
                     errors: None,
                     modules: vec![],
                 },
@@ -2531,6 +2699,8 @@ mod tests {
                     functions: vec![simple_function("list_products")],
                     structs: vec![simple_struct("Product")],
                     enums: vec![],
+                    callbacks: vec![],
+                    listeners: vec![],
                     errors: None,
                     modules: vec![],
                 },
@@ -2561,6 +2731,8 @@ mod tests {
                     }],
                     structs: vec![],
                     enums: vec![],
+                    callbacks: vec![],
+                    listeners: vec![],
                     errors: None,
                     modules: vec![],
                 },
@@ -2569,6 +2741,8 @@ mod tests {
                     functions: vec![simple_function("noop")],
                     structs: vec![],
                     enums: vec![simple_enum("Status")],
+                    callbacks: vec![],
+                    listeners: vec![],
                     errors: None,
                     modules: vec![],
                 },
@@ -2602,6 +2776,8 @@ mod tests {
                     }],
                     structs: vec![],
                     enums: vec![],
+                    callbacks: vec![],
+                    listeners: vec![],
                     errors: None,
                     modules: vec![],
                 },
@@ -2610,6 +2786,8 @@ mod tests {
                     functions: vec![simple_function("list_products")],
                     structs: vec![simple_struct("Product")],
                     enums: vec![],
+                    callbacks: vec![],
+                    listeners: vec![],
                     errors: None,
                     modules: vec![],
                 },
@@ -2631,6 +2809,8 @@ mod tests {
                 functions: vec![],
                 structs: vec![simple_struct("Product")],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -2649,6 +2829,8 @@ mod tests {
                 functions: vec![],
                 structs: vec![],
                 enums: vec![simple_enum("Status")],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -2677,12 +2859,16 @@ mod tests {
                 functions: vec![simple_function("top_fn")],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![Module {
                     name: "child".to_string(),
                     functions: vec![simple_function("inner_fn")],
                     structs: vec![],
                     enums: vec![],
+                    callbacks: vec![],
+                    listeners: vec![],
                     errors: None,
                     modules: vec![],
                 }],
@@ -2690,5 +2876,134 @@ mod tests {
             generators: None,
         };
         assert!(validate_api(&mut api).is_ok());
+    }
+
+    #[test]
+    fn duplicate_callback_names_rejected() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "events".to_string(),
+                functions: vec![],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![
+                    CallbackDef {
+                        name: "on_data".to_string(),
+                        params: vec![],
+                        doc: None,
+                    },
+                    CallbackDef {
+                        name: "on_data".to_string(),
+                        params: vec![],
+                        doc: None,
+                    },
+                ],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        assert!(matches!(
+            validate_api(&mut api).unwrap_err(),
+            ValidationError::DuplicateCallbackName { module, name }
+                if module == "events" && name == "on_data"
+        ));
+    }
+
+    #[test]
+    fn listener_referencing_undefined_callback_rejected() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "events".to_string(),
+                functions: vec![],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![ListenerDef {
+                    name: "watcher".to_string(),
+                    event_callback: "nonexistent".to_string(),
+                    doc: None,
+                }],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        assert!(matches!(
+            validate_api(&mut api).unwrap_err(),
+            ValidationError::ListenerCallbackNotFound { module, listener, callback }
+                if module == "events" && listener == "watcher" && callback == "nonexistent"
+        ));
+    }
+
+    #[test]
+    fn listener_referencing_defined_callback_passes() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "events".to_string(),
+                functions: vec![],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![CallbackDef {
+                    name: "on_data".to_string(),
+                    params: vec![Param {
+                        name: "payload".to_string(),
+                        ty: TypeRef::StringUtf8,
+                    }],
+                    doc: None,
+                }],
+                listeners: vec![ListenerDef {
+                    name: "data_stream".to_string(),
+                    event_callback: "on_data".to_string(),
+                    doc: Some("Subscribe to data".to_string()),
+                }],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        assert!(validate_api(&mut api).is_ok());
+    }
+
+    #[test]
+    fn duplicate_listener_names_rejected() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "events".to_string(),
+                functions: vec![],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![CallbackDef {
+                    name: "on_data".to_string(),
+                    params: vec![],
+                    doc: None,
+                }],
+                listeners: vec![
+                    ListenerDef {
+                        name: "watcher".to_string(),
+                        event_callback: "on_data".to_string(),
+                        doc: None,
+                    },
+                    ListenerDef {
+                        name: "watcher".to_string(),
+                        event_callback: "on_data".to_string(),
+                        doc: None,
+                    },
+                ],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        assert!(matches!(
+            validate_api(&mut api).unwrap_err(),
+            ValidationError::DuplicateListenerName { module, name }
+                if module == "events" && name == "watcher"
+        ));
     }
 }

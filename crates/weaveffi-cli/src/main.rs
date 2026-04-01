@@ -808,6 +808,15 @@ fn validation_suggestion(err: &ValidationError) -> &'static str {
         ValidationError::BorrowedTypeInInvalidPosition { .. } => {
             "borrowed types (&str, &[u8]) can only be used as function parameters, not return types or struct fields"
         }
+        ValidationError::DuplicateCallbackName { .. } => {
+            "callback names must be unique within a module; rename the duplicate"
+        }
+        ValidationError::ListenerCallbackNotFound { .. } => {
+            "listener event_callback must reference a callback defined in the same module"
+        }
+        ValidationError::DuplicateListenerName { .. } => {
+            "listener names must be unique within a module; rename the duplicate"
+        }
     }
 }
 
@@ -1092,6 +1101,23 @@ mod tests {
             ValidationError::UnknownTypeRef { name: "Foo".into() },
             ValidationError::InvalidMapKey {
                 key_type: "struct Foo".into(),
+            },
+            ValidationError::BorrowedTypeInInvalidPosition {
+                ty: "&str".into(),
+                location: "return type".into(),
+            },
+            ValidationError::DuplicateCallbackName {
+                module: "m".into(),
+                name: "cb".into(),
+            },
+            ValidationError::ListenerCallbackNotFound {
+                module: "m".into(),
+                listener: "l".into(),
+                callback: "cb".into(),
+            },
+            ValidationError::DuplicateListenerName {
+                module: "m".into(),
+                name: "l".into(),
             },
         ];
 

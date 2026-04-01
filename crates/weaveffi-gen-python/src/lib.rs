@@ -1230,6 +1230,8 @@ mod tests {
             functions,
             structs: vec![],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }
@@ -1389,6 +1391,8 @@ mod tests {
             }],
             structs: vec![],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -1462,6 +1466,8 @@ mod tests {
                     },
                 ],
             }],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -1497,6 +1503,8 @@ mod tests {
             }],
             structs: vec![],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -1536,6 +1544,8 @@ mod tests {
                 ],
             }],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -1594,6 +1604,8 @@ mod tests {
             }],
             structs: vec![],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -1679,6 +1691,8 @@ mod tests {
             }],
             structs: vec![],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -1711,6 +1725,8 @@ mod tests {
             }],
             structs: vec![],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -1753,6 +1769,8 @@ mod tests {
             }],
             structs: vec![],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -1795,6 +1813,8 @@ mod tests {
             ],
             structs: vec![],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -1846,6 +1866,8 @@ mod tests {
             ],
             structs: vec![],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -1882,6 +1904,8 @@ mod tests {
                 }],
             }],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -1912,6 +1936,8 @@ mod tests {
                 }],
             }],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -1947,6 +1973,8 @@ mod tests {
                     },
                 ],
             }],
+            callbacks: vec![],
+            listeners: vec![],
             structs: vec![StructDef {
                 name: "Contact".into(),
                 doc: None,
@@ -2120,6 +2148,8 @@ mod tests {
             }],
             structs: vec![],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -2150,6 +2180,8 @@ mod tests {
                 }],
             }],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -2189,6 +2221,8 @@ mod tests {
                     },
                 ],
             }],
+            callbacks: vec![],
+            listeners: vec![],
             structs: vec![StructDef {
                 name: "Contact".into(),
                 doc: None,
@@ -2413,6 +2447,8 @@ mod tests {
                 ],
             }],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -2480,6 +2516,8 @@ mod tests {
                     },
                 ],
             }],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -2556,6 +2594,8 @@ mod tests {
             ],
             structs: vec![],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -2646,6 +2686,8 @@ mod tests {
             ],
             structs: vec![],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -2712,6 +2754,8 @@ mod tests {
             ],
             structs: vec![],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -2790,6 +2834,8 @@ mod tests {
                     },
                 ],
             }],
+            callbacks: vec![],
+            listeners: vec![],
             structs: vec![StructDef {
                 name: "Contact".into(),
                 doc: None,
@@ -2922,6 +2968,8 @@ mod tests {
                     },
                 ],
             }],
+            callbacks: vec![],
+            listeners: vec![],
             structs: vec![StructDef {
                 name: "Contact".into(),
                 doc: None,
@@ -3271,6 +3319,8 @@ mod tests {
             }],
             structs: vec![],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -3362,6 +3412,8 @@ mod tests {
                 }],
             }],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -3392,6 +3444,8 @@ mod tests {
             }],
             structs: vec![],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -3450,6 +3504,8 @@ mod tests {
                     },
                 ],
             }],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -3487,6 +3543,8 @@ mod tests {
                     }],
                 }],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -3532,6 +3590,8 @@ mod tests {
                 }],
             }],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -3620,6 +3680,8 @@ mod tests {
                 }],
             }],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -3714,6 +3776,8 @@ mod tests {
                     }],
                 }],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             },
@@ -3732,6 +3796,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             },
@@ -3772,6 +3838,8 @@ mod tests {
             }],
             structs: vec![],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![Module {
                 name: "child".to_string(),
@@ -3785,6 +3853,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],

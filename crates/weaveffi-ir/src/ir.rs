@@ -23,6 +23,10 @@ pub struct Module {
     #[serde(default)]
     pub enums: Vec<EnumDef>,
     #[serde(default)]
+    pub callbacks: Vec<CallbackDef>,
+    #[serde(default)]
+    pub listeners: Vec<ListenerDef>,
+    #[serde(default)]
     pub errors: Option<ErrorDomain>,
     #[serde(default)]
     pub modules: Vec<Module>,
@@ -50,13 +54,13 @@ pub struct Param {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CallbackDef {
+pub struct CallbackSignature {
     pub params: Vec<Param>,
     #[serde(rename = "return", default)]
     pub returns: Option<TypeRef>,
 }
 
-impl std::hash::Hash for CallbackDef {
+impl std::hash::Hash for CallbackSignature {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.params.len().hash(state);
         for p in &self.params {
@@ -65,6 +69,22 @@ impl std::hash::Hash for CallbackDef {
         }
         self.returns.hash(state);
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallbackDef {
+    pub name: String,
+    pub params: Vec<Param>,
+    #[serde(default)]
+    pub doc: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListenerDef {
+    pub name: String,
+    pub event_callback: String,
+    #[serde(default)]
+    pub doc: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -85,7 +105,7 @@ pub enum TypeRef {
     Optional(Box<TypeRef>),
     List(Box<TypeRef>),
     Map(Box<TypeRef>, Box<TypeRef>),
-    Callback(Box<CallbackDef>),
+    Callback(Box<CallbackSignature>),
 }
 
 pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
@@ -872,5 +892,94 @@ modules:
         assert_eq!(json, r#""handle<Connection>""#);
         let back: TypeRef = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ty);
+    }
+
+    #[test]
+    fn callback_def_round_trip_yaml() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: events
+    functions: []
+    callbacks:
+      - name: on_data
+        params:
+          - name: payload
+            type: string
+        doc: "Fired when data arrives"
+"#;
+        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        let m = &api.modules[0];
+        assert_eq!(m.callbacks.len(), 1);
+        let cb = &m.callbacks[0];
+        assert_eq!(cb.name, "on_data");
+        assert_eq!(cb.params.len(), 1);
+        assert_eq!(cb.params[0].name, "payload");
+        assert_eq!(cb.params[0].ty, TypeRef::StringUtf8);
+        assert_eq!(cb.doc.as_deref(), Some("Fired when data arrives"));
+    }
+
+    #[test]
+    fn listener_def_round_trip_yaml() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: events
+    functions: []
+    callbacks:
+      - name: on_data
+        params: []
+    listeners:
+      - name: data_stream
+        event_callback: on_data
+        doc: "Subscribe to data events"
+"#;
+        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        let m = &api.modules[0];
+        assert_eq!(m.listeners.len(), 1);
+        let l = &m.listeners[0];
+        assert_eq!(l.name, "data_stream");
+        assert_eq!(l.event_callback, "on_data");
+        assert_eq!(l.doc.as_deref(), Some("Subscribe to data events"));
+    }
+
+    #[test]
+    fn callbacks_and_listeners_default_to_empty() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: math
+    functions: []
+"#;
+        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        assert!(api.modules[0].callbacks.is_empty());
+        assert!(api.modules[0].listeners.is_empty());
+    }
+
+    #[test]
+    fn callback_def_json_round_trip() {
+        let cb = CallbackDef {
+            name: "on_event".to_string(),
+            params: vec![Param {
+                name: "data".to_string(),
+                ty: TypeRef::I32,
+            }],
+            doc: Some("event callback".to_string()),
+        };
+        let json = serde_json::to_string(&cb).unwrap();
+        let back: CallbackDef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cb);
+    }
+
+    #[test]
+    fn listener_def_json_round_trip() {
+        let l = ListenerDef {
+            name: "watcher".to_string(),
+            event_callback: "on_change".to_string(),
+            doc: None,
+        };
+        let json = serde_json::to_string(&l).unwrap();
+        let back: ListenerDef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, l);
     }
 }

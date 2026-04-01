@@ -1050,6 +1050,8 @@ mod tests {
             functions: vec![],
             structs: vec![],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }
@@ -1352,6 +1354,8 @@ mod tests {
                     },
                 ],
             }],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -1761,6 +1765,8 @@ mod tests {
                 }],
             }],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -1791,6 +1797,8 @@ mod tests {
             }],
             structs: vec![],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -1849,6 +1857,8 @@ mod tests {
                     },
                 ],
             }],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
             modules: vec![],
         }]);
