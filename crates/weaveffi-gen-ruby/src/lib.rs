@@ -1868,4 +1868,107 @@ mod tests {
             "should not contain default gem name: {gemspec}"
         );
     }
+
+    #[test]
+    fn ruby_no_double_free_on_error() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                }],
+            }],
+            enums: vec![],
+            functions: vec![Function {
+                name: "find_contact".into(),
+                params: vec![Param {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                }],
+                returns: Some(TypeRef::Struct("Contact".into())),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+            errors: None,
+        }]);
+
+        let rb = render_ruby_module(&api, "WeaveFFI");
+
+        let fn_start = rb
+            .find("def self.find_contact(name)")
+            .expect("find_contact wrapper");
+        let fn_body = &rb[fn_start..];
+        let fn_end = fn_body.find("\n  end\n").unwrap();
+        let fn_text = &fn_body[..fn_end];
+
+        assert!(
+            !fn_text.contains("weaveffi_free_string(name"),
+            "borrowed string param must not be freed by wrapper: {fn_text}"
+        );
+
+        let err_check = fn_text
+            .find("check_error!(err)")
+            .expect("check_error in find_contact");
+        let contact_wrap = fn_text
+            .find("Contact.new(result)")
+            .expect("Contact.new in find_contact");
+        assert!(
+            err_check < contact_wrap,
+            "error must be checked before wrapping struct return: {fn_text}"
+        );
+
+        assert!(
+            rb.contains("class ContactPtr < FFI::AutoPointer")
+                && rb.contains("weaveffi_contacts_Contact_destroy"),
+            "struct return type should use AutoPointer with destroy: {rb}"
+        );
+    }
+
+    #[test]
+    fn ruby_null_check_on_optional_return() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "find_contact".into(),
+                params: vec![Param {
+                    name: "id".into(),
+                    ty: TypeRef::I64,
+                }],
+                returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                    "Contact".into(),
+                )))),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let rb = render_ruby_module(&api, "WeaveFFI");
+
+        let fn_start = rb
+            .find("def self.find_contact(id)")
+            .expect("find_contact wrapper");
+        let fn_body = &rb[fn_start..];
+        let fn_end = fn_body.find("\n  end\n").unwrap();
+        let fn_text = &fn_body[..fn_end];
+
+        let null_check = fn_text
+            .find("return nil if result.null?")
+            .expect("nil check in find_contact");
+        let contact_wrap = fn_text
+            .find("Contact.new(result)")
+            .expect("Contact.new in find_contact");
+        assert!(
+            null_check < contact_wrap,
+            "optional struct return should check nil before wrapping: {fn_text}"
+        );
+    }
 }

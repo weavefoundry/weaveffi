@@ -2778,4 +2778,114 @@ mod tests {
             "should create void promise: {h}"
         );
     }
+
+    #[test]
+    fn cpp_no_double_free_on_error() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "contacts".into(),
+                structs: vec![StructDef {
+                    name: "Contact".into(),
+                    doc: None,
+                    fields: vec![StructField {
+                        name: "name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    }],
+                }],
+                enums: vec![],
+                functions: vec![Function {
+                    name: "find_contact".into(),
+                    params: vec![Param {
+                        name: "name".into(),
+                        ty: TypeRef::StringUtf8,
+                    }],
+                    returns: Some(TypeRef::Struct("Contact".into())),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                }],
+                errors: None,
+            }],
+            generators: None,
+        };
+
+        let h = render_cpp_header(&api, "weaveffi");
+
+        let fn_start = h
+            .find("inline Contact contacts_find_contact")
+            .expect("find_contact wrapper");
+        let fn_body = &h[fn_start..];
+        let fn_end = fn_body.find("\n}\n").unwrap() + fn_start;
+        let fn_text = &h[fn_start..fn_end];
+
+        assert!(
+            !fn_text.contains("weaveffi_free_string(name"),
+            "borrowed string param must not be freed by wrapper: {fn_text}"
+        );
+
+        let err_check = fn_text
+            .find("if (err.code != 0)")
+            .expect("error check in find_contact");
+        let contact_wrap = fn_text
+            .find("return Contact(result)")
+            .expect("Contact wrap in find_contact");
+        assert!(
+            err_check < contact_wrap,
+            "error must be checked before wrapping struct return: {fn_text}"
+        );
+
+        assert!(
+            h.contains("~Contact()") && h.contains("_destroy"),
+            "struct return type should use RAII class with destroy in destructor: {h}"
+        );
+    }
+
+    #[test]
+    fn cpp_null_check_on_optional_return() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "contacts".into(),
+                functions: vec![Function {
+                    name: "find_contact".into(),
+                    params: vec![Param {
+                        name: "id".into(),
+                        ty: TypeRef::I32,
+                    }],
+                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                        "Contact".into(),
+                    )))),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+            generators: None,
+        };
+
+        let h = render_cpp_header(&api, "weaveffi");
+
+        let fn_start = h
+            .find("inline std::optional<Contact> contacts_find_contact")
+            .expect("find_contact wrapper");
+        let fn_body = &h[fn_start..];
+        let fn_end = fn_body.find("\n}\n").unwrap() + fn_start;
+        let fn_text = &h[fn_start..fn_end];
+
+        let null_check = fn_text
+            .find("if (!result) return std::nullopt")
+            .expect("null check in find_contact");
+        let contact_wrap = fn_text
+            .find("Contact(result)")
+            .expect("Contact wrap in find_contact");
+        assert!(
+            null_check < contact_wrap,
+            "optional struct return should check null before wrapping: {fn_text}"
+        );
+    }
 }
