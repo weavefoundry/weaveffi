@@ -78,14 +78,17 @@ fn build_large_api() -> Api {
                         Param {
                             name: "a".into(),
                             ty: TypeRef::I32,
+                            mutable: false,
                         },
                         Param {
                             name: "b".into(),
                             ty: TypeRef::StringUtf8,
+                            mutable: false,
                         },
                         Param {
                             name: "c".into(),
                             ty: TypeRef::Struct("Struct0".into()),
+                            mutable: false,
                         },
                     ],
                     returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(

@@ -48,10 +48,12 @@ mod tests {
                         Param {
                             name: "a".to_string(),
                             ty: TypeRef::I32,
+                            mutable: false,
                         },
                         Param {
                             name: "b".to_string(),
                             ty: TypeRef::I32,
+                            mutable: false,
                         },
                     ],
                     returns: Some(TypeRef::I32),
@@ -106,10 +108,12 @@ mod tests {
                 Param {
                     name: "a".to_string(),
                     ty: TypeRef::I32,
+                    mutable: false,
                 },
                 Param {
                     name: "b".to_string(),
                     ty: TypeRef::I32,
+                    mutable: false,
                 },
             ],
             returns: Some(TypeRef::I32),
@@ -204,10 +208,12 @@ mod tests {
                 Param {
                     name: "a".to_string(),
                     ty: TypeRef::I32,
+                    mutable: false,
                 },
                 Param {
                     name: "b".to_string(),
                     ty: TypeRef::I32,
+                    mutable: false,
                 },
             ],
             returns: Some(TypeRef::I32),

@@ -3,11 +3,30 @@ use weaveffi_ir::ir::{Api, ErrorDomain, Function, Module, Param, TypeRef, SUPPOR
 
 #[derive(Debug, Clone)]
 pub enum ValidationWarning {
-    DeprecatedHandleType { module: String, function: String },
-    LargeEnumVariantCount { enum_name: String, count: usize },
-    DeepNesting { location: String, depth: usize },
-    EmptyModuleDoc { module: String },
-    AsyncVoidFunction { module: String, function: String },
+    DeprecatedHandleType {
+        module: String,
+        function: String,
+    },
+    LargeEnumVariantCount {
+        enum_name: String,
+        count: usize,
+    },
+    DeepNesting {
+        location: String,
+        depth: usize,
+    },
+    EmptyModuleDoc {
+        module: String,
+    },
+    AsyncVoidFunction {
+        module: String,
+        function: String,
+    },
+    MutableOnValueType {
+        module: String,
+        function: String,
+        param: String,
+    },
 }
 
 impl std::fmt::Display for ValidationWarning {
@@ -35,6 +54,16 @@ impl std::fmt::Display for ValidationWarning {
                 write!(
                     f,
                     "async function {module}::{function} has no return type; async void is unusual"
+                )
+            }
+            Self::MutableOnValueType {
+                module,
+                function,
+                param,
+            } => {
+                write!(
+                    f,
+                    "'mutable' on value-type parameter {module}::{function}::{param} has no effect; only meaningful for pointer/reference types (struct, string, bytes)"
                 )
             }
         }
@@ -101,6 +130,15 @@ pub fn collect_warnings(api: &Api) -> Vec<ValidationWarning> {
                     function: f.name.clone(),
                 });
             }
+            for p in &f.params {
+                if p.mutable && is_value_type(&p.ty) {
+                    warnings.push(ValidationWarning::MutableOnValueType {
+                        module: module.name.clone(),
+                        function: f.name.clone(),
+                        param: p.name.clone(),
+                    });
+                }
+            }
         }
 
         if !module.functions.is_empty() && module.functions.iter().all(|f| f.doc.is_none()) {
@@ -110,6 +148,19 @@ pub fn collect_warnings(api: &Api) -> Vec<ValidationWarning> {
         }
     }
     warnings
+}
+
+fn is_value_type(ty: &TypeRef) -> bool {
+    matches!(
+        ty,
+        TypeRef::I32
+            | TypeRef::U32
+            | TypeRef::I64
+            | TypeRef::F64
+            | TypeRef::Bool
+            | TypeRef::Enum(_)
+            | TypeRef::Handle
+    )
 }
 
 fn function_uses_handle(f: &Function) -> bool {
@@ -697,6 +748,7 @@ mod tests {
             params: vec![Param {
                 name: "x".to_string(),
                 ty: TypeRef::I32,
+                mutable: false,
             }],
             returns: Some(TypeRef::I32),
             doc: None,
@@ -852,6 +904,7 @@ mod tests {
                     params: vec![Param {
                         name: "url".to_string(),
                         ty: TypeRef::StringUtf8,
+                        mutable: false,
                     }],
                     returns: Some(TypeRef::StringUtf8),
                     doc: None,
@@ -965,10 +1018,12 @@ mod tests {
                             Param {
                                 name: "name".to_string(),
                                 ty: TypeRef::StringUtf8,
+                                mutable: false,
                             },
                             Param {
                                 name: "email".to_string(),
                                 ty: TypeRef::StringUtf8,
+                                mutable: false,
                             },
                         ],
                         returns: Some(TypeRef::Handle),
@@ -981,6 +1036,7 @@ mod tests {
                         params: vec![Param {
                             name: "id".to_string(),
                             ty: TypeRef::Handle,
+                            mutable: false,
                         }],
                         returns: Some(TypeRef::StringUtf8),
                         doc: None,
@@ -1411,6 +1467,7 @@ mod tests {
                     params: vec![Param {
                         name: "x".to_string(),
                         ty: TypeRef::Struct("Foo".to_string()),
+                        mutable: false,
                     }],
                     returns: None,
                     doc: None,
@@ -1443,6 +1500,7 @@ mod tests {
                     params: vec![Param {
                         name: "p".to_string(),
                         ty: TypeRef::Struct("Point".to_string()),
+                        mutable: false,
                     }],
                     returns: None,
                     doc: None,
@@ -1472,6 +1530,7 @@ mod tests {
                     params: vec![Param {
                         name: "x".to_string(),
                         ty: TypeRef::Optional(Box::new(TypeRef::Struct("Bar".to_string()))),
+                        mutable: false,
                     }],
                     returns: None,
                     doc: None,
@@ -1564,6 +1623,7 @@ mod tests {
                     params: vec![Param {
                         name: "c".to_string(),
                         ty: TypeRef::Optional(Box::new(TypeRef::Struct("Contact".to_string()))),
+                        mutable: false,
                     }],
                     returns: None,
                     doc: None,
@@ -1602,6 +1662,7 @@ mod tests {
                     params: vec![Param {
                         name: "colors".to_string(),
                         ty: TypeRef::List(Box::new(TypeRef::Enum("Color".to_string()))),
+                        mutable: false,
                     }],
                     returns: None,
                     doc: None,
@@ -1728,6 +1789,7 @@ mod tests {
                     params: vec![Param {
                         name: "color".to_string(),
                         ty: TypeRef::Struct("Color".to_string()),
+                        mutable: false,
                     }],
                     returns: None,
                     doc: None,
@@ -1761,6 +1823,7 @@ mod tests {
                     params: vec![Param {
                         name: "color".to_string(),
                         ty: TypeRef::Optional(Box::new(TypeRef::Struct("Color".to_string()))),
+                        mutable: false,
                     }],
                     returns: None,
                     doc: None,
@@ -1794,6 +1857,7 @@ mod tests {
                     params: vec![Param {
                         name: "c".to_string(),
                         ty: TypeRef::Struct("Contact".to_string()),
+                        mutable: false,
                     }],
                     returns: None,
                     doc: None,
@@ -1917,6 +1981,7 @@ mod tests {
                     params: vec![Param {
                         name: "h".to_string(),
                         ty: TypeRef::Handle,
+                        mutable: false,
                     }],
                     returns: None,
                     doc: Some("documented".to_string()),
@@ -2012,6 +2077,7 @@ mod tests {
                     params: vec![Param {
                         name: "h".to_string(),
                         ty: TypeRef::Handle,
+                        mutable: false,
                     }],
                     returns: None,
                     doc: Some("documented".to_string()),
@@ -2051,6 +2117,7 @@ mod tests {
                     params: vec![Param {
                         name: "x".to_string(),
                         ty: TypeRef::I32,
+                        mutable: false,
                     }],
                     returns: Some(TypeRef::I32),
                     doc: Some("documented".to_string()),
@@ -2154,6 +2221,7 @@ mod tests {
                     params: vec![Param {
                         name: "data".to_string(),
                         ty: deep,
+                        mutable: false,
                     }],
                     returns: None,
                     doc: Some("documented".to_string()),
@@ -2191,6 +2259,7 @@ mod tests {
                     params: vec![Param {
                         name: "data".to_string(),
                         ty: nested,
+                        mutable: false,
                     }],
                     returns: None,
                     doc: Some("documented".to_string()),
@@ -2360,6 +2429,7 @@ mod tests {
                     params: vec![Param {
                         name: "x".to_string(),
                         ty: TypeRef::I32,
+                        mutable: false,
                     }],
                     returns: Some(TypeRef::I32),
                     doc: Some("Adds numbers".to_string()),
@@ -2422,6 +2492,7 @@ mod tests {
                     params: vec![Param {
                         name: "h".to_string(),
                         ty: TypeRef::TypedHandle("Session".to_string()),
+                        mutable: false,
                     }],
                     returns: None,
                     doc: None,
@@ -2451,6 +2522,7 @@ mod tests {
                     params: vec![Param {
                         name: "h".to_string(),
                         ty: TypeRef::TypedHandle("Nonexistent".to_string()),
+                        mutable: false,
                     }],
                     returns: None,
                     doc: None,
@@ -2483,6 +2555,7 @@ mod tests {
                     params: vec![Param {
                         name: "data".to_string(),
                         ty: TypeRef::BorrowedStr,
+                        mutable: false,
                     }],
                     returns: None,
                     doc: None,
@@ -2512,6 +2585,7 @@ mod tests {
                     params: vec![Param {
                         name: "raw".to_string(),
                         ty: TypeRef::BorrowedBytes,
+                        mutable: false,
                     }],
                     returns: None,
                     doc: None,
@@ -2729,6 +2803,7 @@ mod tests {
                         params: vec![Param {
                             name: "item".to_string(),
                             ty: TypeRef::Struct("Product".to_string()),
+                            mutable: false,
                         }],
                         returns: None,
                         doc: None,
@@ -2816,6 +2891,7 @@ mod tests {
                         params: vec![Param {
                             name: "x".to_string(),
                             ty: TypeRef::Struct("Nonexistent".to_string()),
+                            mutable: false,
                         }],
                         returns: None,
                         doc: None,
@@ -3001,6 +3077,7 @@ mod tests {
                     params: vec![Param {
                         name: "payload".to_string(),
                         ty: TypeRef::StringUtf8,
+                        mutable: false,
                     }],
                     doc: None,
                 }],
@@ -3092,6 +3169,7 @@ mod tests {
                     params: vec![Param {
                         name: "items".to_string(),
                         ty: TypeRef::Iterator(Box::new(TypeRef::I32)),
+                        mutable: false,
                     }],
                     returns: None,
                     doc: None,
@@ -3170,5 +3248,160 @@ mod tests {
             matches!(err, ValidationError::BuilderStructEmpty { .. }),
             "expected BuilderStructEmpty, got: {err}"
         );
+    }
+
+    #[test]
+    fn warning_mutable_on_value_type() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "math".to_string(),
+                functions: vec![Function {
+                    name: "add".to_string(),
+                    params: vec![Param {
+                        name: "x".to_string(),
+                        ty: TypeRef::I32,
+                        mutable: true,
+                    }],
+                    returns: Some(TypeRef::I32),
+                    doc: Some("add".to_string()),
+                    r#async: false,
+                    cancellable: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let warnings = collect_warnings(&api);
+        assert!(warnings.iter().any(|w| matches!(
+            w,
+            ValidationWarning::MutableOnValueType {
+                param,
+                ..
+            } if param == "x"
+        )));
+    }
+
+    #[test]
+    fn no_warning_mutable_on_pointer_type() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "io".to_string(),
+                functions: vec![Function {
+                    name: "fill".to_string(),
+                    params: vec![
+                        Param {
+                            name: "buf".to_string(),
+                            ty: TypeRef::Bytes,
+                            mutable: true,
+                        },
+                        Param {
+                            name: "msg".to_string(),
+                            ty: TypeRef::StringUtf8,
+                            mutable: true,
+                        },
+                        Param {
+                            name: "obj".to_string(),
+                            ty: TypeRef::Struct("Thing".into()),
+                            mutable: true,
+                        },
+                    ],
+                    returns: None,
+                    doc: Some("fill".to_string()),
+                    r#async: false,
+                    cancellable: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let warnings = collect_warnings(&api);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| matches!(w, ValidationWarning::MutableOnValueType { .. })),
+            "pointer types should not trigger mutable warning"
+        );
+    }
+
+    #[test]
+    fn no_warning_mutable_false_on_value_type() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "math".to_string(),
+                functions: vec![Function {
+                    name: "add".to_string(),
+                    params: vec![Param {
+                        name: "x".to_string(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                    }],
+                    returns: Some(TypeRef::I32),
+                    doc: Some("add".to_string()),
+                    r#async: false,
+                    cancellable: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let warnings = collect_warnings(&api);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| matches!(w, ValidationWarning::MutableOnValueType { .. })),
+            "mutable=false should not trigger warning"
+        );
+    }
+
+    #[test]
+    fn warning_mutable_on_enum_type() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "paint".to_string(),
+                functions: vec![Function {
+                    name: "set_color".to_string(),
+                    params: vec![Param {
+                        name: "color".to_string(),
+                        ty: TypeRef::Enum("Color".into()),
+                        mutable: true,
+                    }],
+                    returns: None,
+                    doc: Some("set".to_string()),
+                    r#async: false,
+                    cancellable: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let warnings = collect_warnings(&api);
+        assert!(warnings.iter().any(|w| matches!(
+            w,
+            ValidationWarning::MutableOnValueType { param, .. } if param == "color"
+        )));
     }
 }

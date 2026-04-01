@@ -380,10 +380,12 @@ mod tests {
                     Param {
                         name: "a".into(),
                         ty: TypeRef::I32,
+                        mutable: false,
                     },
                     Param {
                         name: "b".into(),
                         ty: TypeRef::I32,
+                        mutable: false,
                     },
                 ],
                 returns: Some(TypeRef::I32),
@@ -411,6 +413,7 @@ mod tests {
                 params: vec![Param {
                     name: "s".into(),
                     ty: TypeRef::StringUtf8,
+                    mutable: false,
                 }],
                 returns: Some(TypeRef::StringUtf8),
                 doc: None,
@@ -548,6 +551,7 @@ mod tests {
                 params: vec![Param {
                     name: "id".into(),
                     ty: TypeRef::Optional(Box::new(TypeRef::I32)),
+                    mutable: false,
                 }],
                 returns: None,
                 doc: None,
@@ -571,6 +575,7 @@ mod tests {
                 params: vec![Param {
                     name: "items".into(),
                     ty: TypeRef::List(Box::new(TypeRef::I32)),
+                    mutable: false,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -594,6 +599,7 @@ mod tests {
                 params: vec![Param {
                     name: "color".into(),
                     ty: TypeRef::Enum("Color".into()),
+                    mutable: false,
                 }],
                 returns: Some(TypeRef::Enum("Color".into())),
                 doc: None,
@@ -657,6 +663,7 @@ mod tests {
                 params: vec![Param {
                     name: "grades".into(),
                     ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
+                    mutable: false,
                 }],
                 returns: Some(TypeRef::Map(
                     Box::new(TypeRef::StringUtf8),
@@ -703,6 +710,7 @@ mod tests {
                 params: vec![Param {
                     name: "contact".into(),
                     ty: TypeRef::TypedHandle("Contact".into()),
+                    mutable: false,
                 }],
                 returns: Some(TypeRef::TypedHandle("Contact".into())),
                 doc: None,
@@ -730,6 +738,7 @@ mod tests {
                 params: vec![Param {
                     name: "url".into(),
                     ty: TypeRef::StringUtf8,
+                    mutable: false,
                 }],
                 returns: Some(TypeRef::StringUtf8),
                 doc: None,

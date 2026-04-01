@@ -336,6 +336,7 @@ fn struct_fields_as_params(fields: &[StructField]) -> Vec<Param> {
         .map(|f| Param {
             name: f.name.clone(),
             ty: f.ty.clone(),
+            mutable: false,
         })
         .collect()
 }
@@ -2232,6 +2233,7 @@ mod tests {
                 params: vec![Param {
                     name: "a".to_string(),
                     ty: TypeRef::Enum("Color".into()),
+                    mutable: false,
                 }],
                 returns: Some(TypeRef::Enum("Color".into())),
                 doc: None,
@@ -2271,6 +2273,7 @@ mod tests {
                 params: vec![Param {
                     name: "id".to_string(),
                     ty: TypeRef::Optional(Box::new(TypeRef::I32)),
+                    mutable: false,
                 }],
                 returns: None,
                 doc: None,
@@ -2306,6 +2309,7 @@ mod tests {
                 params: vec![Param {
                     name: "person".to_string(),
                     ty: TypeRef::Optional(Box::new(TypeRef::Struct("Contact".into()))),
+                    mutable: false,
                 }],
                 returns: None,
                 doc: None,
@@ -2340,6 +2344,7 @@ mod tests {
                 params: vec![Param {
                     name: "key".to_string(),
                     ty: TypeRef::I32,
+                    mutable: false,
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::I32))),
                 doc: None,
@@ -2409,6 +2414,7 @@ mod tests {
                 params: vec![Param {
                     name: "ids".to_string(),
                     ty: TypeRef::List(Box::new(TypeRef::I32)),
+                    mutable: false,
                 }],
                 returns: None,
                 doc: None,
@@ -2481,6 +2487,7 @@ mod tests {
                 params: vec![Param {
                     name: "id".to_string(),
                     ty: TypeRef::I32,
+                    mutable: false,
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                     "Contact".into(),
@@ -2660,6 +2667,7 @@ mod tests {
                 params: vec![Param {
                     name: "age".to_string(),
                     ty: TypeRef::I32,
+                    mutable: false,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -2694,6 +2702,7 @@ mod tests {
                 params: vec![Param {
                     name: "contact".to_string(),
                     ty: TypeRef::Struct("Contact".into()),
+                    mutable: false,
                 }],
                 returns: None,
                 doc: None,
@@ -2794,6 +2803,7 @@ mod tests {
                 params: vec![Param {
                     name: "query".to_string(),
                     ty: TypeRef::StringUtf8,
+                    mutable: false,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -2828,6 +2838,7 @@ mod tests {
                 params: vec![Param {
                     name: "id".to_string(),
                     ty: TypeRef::I32,
+                    mutable: false,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -2972,6 +2983,7 @@ mod tests {
                 params: vec![Param {
                     name: "scores".to_string(),
                     ty: TypeRef::Map(Box::new(TypeRef::I32), Box::new(TypeRef::F64)),
+                    mutable: false,
                 }],
                 returns: None,
                 doc: None,
@@ -3137,10 +3149,12 @@ mod tests {
                     Param {
                         name: "a".to_string(),
                         ty: TypeRef::I32,
+                        mutable: false,
                     },
                     Param {
                         name: "b".to_string(),
                         ty: TypeRef::I32,
+                        mutable: false,
                     },
                 ],
                 returns: Some(TypeRef::I32),
@@ -3217,6 +3231,7 @@ mod tests {
                 params: vec![Param {
                     name: "id".to_string(),
                     ty: TypeRef::I32,
+                    mutable: false,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -3364,6 +3379,7 @@ mod tests {
                 params: vec![Param {
                     name: "name".to_string(),
                     ty: TypeRef::StringUtf8,
+                    mutable: false,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -3448,6 +3464,7 @@ mod tests {
                     ty: TypeRef::Optional(Box::new(TypeRef::List(Box::new(TypeRef::Optional(
                         Box::new(TypeRef::Struct("Contact".into())),
                     ))))),
+                    mutable: false,
                 }],
                 returns: None,
                 doc: None,
@@ -3489,6 +3506,7 @@ mod tests {
                         Box::new(TypeRef::StringUtf8),
                         Box::new(TypeRef::List(Box::new(TypeRef::I32))),
                     ),
+                    mutable: false,
                 }],
                 returns: None,
                 doc: None,
@@ -3521,6 +3539,7 @@ mod tests {
                         Box::new(TypeRef::Enum("Color".into())),
                         Box::new(TypeRef::Struct("Contact".into())),
                     ),
+                    mutable: false,
                 }],
                 returns: None,
                 doc: None,
@@ -3589,6 +3608,7 @@ mod tests {
                 params: vec![Param {
                     name: "msg".to_string(),
                     ty: TypeRef::BorrowedStr,
+                    mutable: false,
                 }],
                 returns: None,
                 doc: None,
@@ -3623,6 +3643,7 @@ mod tests {
                 params: vec![Param {
                     name: "data".to_string(),
                     ty: TypeRef::BorrowedBytes,
+                    mutable: false,
                 }],
                 returns: None,
                 doc: None,
@@ -3657,6 +3678,7 @@ mod tests {
                 params: vec![Param {
                     name: "contact".into(),
                     ty: TypeRef::TypedHandle("Contact".into()),
+                    mutable: false,
                 }],
                 returns: None,
                 doc: None,
@@ -3712,6 +3734,7 @@ mod tests {
                 params: vec![Param {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
+                    mutable: false,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -3759,6 +3782,7 @@ mod tests {
                 params: vec![Param {
                     name: "id".into(),
                     ty: TypeRef::I32,
+                    mutable: false,
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                     "Contact".into(),
@@ -3791,6 +3815,7 @@ mod tests {
                 params: vec![Param {
                     name: "id".to_string(),
                     ty: TypeRef::I32,
+                    mutable: false,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -3825,6 +3850,7 @@ mod tests {
                 params: vec![Param {
                     name: "id".to_string(),
                     ty: TypeRef::I32,
+                    mutable: false,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -3887,6 +3913,7 @@ mod tests {
                     params: vec![Param {
                         name: "id".to_string(),
                         ty: TypeRef::I32,
+                        mutable: false,
                     }],
                     returns: Some(TypeRef::Struct("types.Name".to_string())),
                     doc: None,
