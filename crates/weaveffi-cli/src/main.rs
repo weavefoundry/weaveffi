@@ -1584,6 +1584,38 @@ mod tests {
     }
 
     #[test]
+    fn generate_cpp_target_filter() {
+        let _ = color_eyre::install();
+        let dir = tempfile::tempdir().unwrap();
+        let sample = format!(
+            "{}/../../samples/calculator/calculator.yml",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let out = dir.path().join("out");
+
+        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .args([
+                "generate",
+                &sample,
+                "-o",
+                out.to_str().unwrap(),
+                "--target",
+                "cpp",
+            ])
+            .output()
+            .expect("failed to run weaveffi generate --target cpp");
+
+        assert!(
+            cmd.status.success(),
+            "generate --target cpp failed: {}",
+            String::from_utf8_lossy(&cmd.stderr)
+        );
+        assert!(out.join("cpp").exists(), "cpp/ should exist in output");
+        assert!(!out.join("c").exists(), "c/ should NOT exist in output");
+    }
+
+    #[test]
     fn diff_shows_new_files() {
         let _ = color_eyre::install();
         let dir = tempfile::tempdir().unwrap();
