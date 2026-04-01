@@ -13,14 +13,21 @@ impl Generator for RubyGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        let dir = out_dir.join("ruby/lib");
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join("weaveffi.rb"), render_ruby_module(api))?;
+        let dir = out_dir.join("ruby");
+        let lib_dir = dir.join("lib");
+        std::fs::create_dir_all(&lib_dir)?;
+        std::fs::write(lib_dir.join("weaveffi.rb"), render_ruby_module(api))?;
+        std::fs::write(dir.join("weaveffi.gemspec"), render_gemspec())?;
+        std::fs::write(dir.join("README.md"), render_readme())?;
         Ok(())
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
-        vec![out_dir.join("ruby/lib/weaveffi.rb").to_string()]
+        vec![
+            out_dir.join("ruby/lib/weaveffi.rb").to_string(),
+            out_dir.join("ruby/weaveffi.gemspec").to_string(),
+            out_dir.join("ruby/README.md").to_string(),
+        ]
     }
 }
 
@@ -712,6 +719,44 @@ fn render_map_return_code(out: &mut String, k: &TypeRef, v: &TypeRef, ind: &str,
     ));
 }
 
+fn render_gemspec() -> &'static str {
+    r#"Gem::Specification.new do |s|
+  s.name        = 'weaveffi'
+  s.version     = '0.1.0'
+  s.summary     = 'Ruby FFI bindings for WeaveFFI (auto-generated)'
+  s.files       = Dir['lib/**/*.rb']
+  s.require_paths = ['lib']
+
+  s.add_dependency 'ffi', '~> 1.15'
+end
+"#
+}
+
+fn render_readme() -> &'static str {
+    r#"# WeaveFFI Ruby Bindings
+
+Auto-generated Ruby bindings using the [ffi](https://github.com/ffi/ffi) gem.
+
+## Prerequisites
+
+- Ruby >= 2.7
+- The compiled shared library (`libweaveffi.so`, `libweaveffi.dylib`, or `weaveffi.dll`) available on your library search path.
+
+## Install
+
+```bash
+gem build weaveffi.gemspec
+gem install weaveffi-0.1.0.gem
+```
+
+## Usage
+
+```ruby
+require 'weaveffi'
+```
+"#
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -784,7 +829,50 @@ mod tests {
         let api = make_api(vec![]);
         let out_dir = Utf8Path::new("/tmp/out");
         let files = RubyGenerator.output_files(&api, out_dir);
-        assert_eq!(files, vec!["/tmp/out/ruby/lib/weaveffi.rb"]);
+        assert_eq!(
+            files,
+            vec![
+                "/tmp/out/ruby/lib/weaveffi.rb",
+                "/tmp/out/ruby/weaveffi.gemspec",
+                "/tmp/out/ruby/README.md",
+            ]
+        );
+    }
+
+    #[test]
+    fn ruby_generates_gemspec() {
+        let api = make_api(vec![simple_module("math", vec![])]);
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
+        RubyGenerator.generate(&api, out_dir).unwrap();
+
+        let gemspec = out_dir.join("ruby/weaveffi.gemspec");
+        assert!(gemspec.exists(), "gemspec should exist");
+        let contents = std::fs::read_to_string(&gemspec).unwrap();
+        assert!(
+            contents.contains("Gem::Specification.new do |s|"),
+            "gemspec header: {contents}"
+        );
+        assert!(contents.contains("s.name"), "name field: {contents}");
+        assert!(contents.contains("s.version"), "version field: {contents}");
+        assert!(contents.contains("s.summary"), "summary field: {contents}");
+        assert!(contents.contains("s.files"), "files field: {contents}");
+        assert!(
+            contents.contains("s.require_paths"),
+            "require_paths: {contents}"
+        );
+        assert!(
+            contents.contains("s.add_dependency 'ffi', '~> 1.15'"),
+            "ffi dependency: {contents}"
+        );
+
+        let readme = out_dir.join("ruby/README.md");
+        assert!(readme.exists(), "README should exist");
+        let readme_contents = std::fs::read_to_string(&readme).unwrap();
+        assert!(
+            readme_contents.contains("gem build"),
+            "usage instructions: {readme_contents}"
+        );
     }
 
     #[test]
