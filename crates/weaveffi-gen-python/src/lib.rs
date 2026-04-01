@@ -3044,4 +3044,135 @@ mod tests {
             "TypedHandle ctypes type should be c_void_p: {py}"
         );
     }
+
+    #[test]
+    fn python_no_double_free_on_error() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "find_contact".into(),
+                params: vec![Param {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                }],
+                returns: Some(TypeRef::Struct("Contact".into())),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                }],
+            }],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let py = render_python_module(&api, true);
+
+        assert!(
+            py.contains("_string_to_bytes(name)"),
+            "string param should use _string_to_bytes(name): {py}"
+        );
+        assert!(
+            !py.contains("weaveffi_free_string(name"),
+            "input string param must not be freed with weaveffi_free_string(name): {py}"
+        );
+        assert!(
+            !py.contains("free(name"),
+            "input string param must not be passed to free(name: {py}"
+        );
+
+        let fn_sig = "def find_contact(name: str) -> \"Contact\":";
+        let start = py
+            .find(fn_sig)
+            .unwrap_or_else(|| panic!("missing find_contact signature: {py}"));
+        let rest = &py[start..];
+        let end_offset = rest[1..]
+            .find("\n\ndef ")
+            .or_else(|| rest[1..].find("\n\nclass "))
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..end_offset];
+        let err_pos = body
+            .find("_check_error(_err)")
+            .expect("_check_error should appear in find_contact");
+        let contact_pos = body
+            .find("return Contact(_result)")
+            .expect("return Contact(_result) should appear in find_contact");
+        assert!(
+            err_pos < contact_pos,
+            "_check_error(_err) should precede return Contact(_result): {body}"
+        );
+
+        let class_start = py
+            .find("class Contact:")
+            .expect("Contact class should be defined");
+        let after_class = &py[class_start..];
+        let class_end = after_class[1..]
+            .find("\n\nclass ")
+            .or_else(|| after_class[1..].find("\n\ndef "))
+            .map(|i| i + 1)
+            .unwrap_or(after_class.len());
+        let contact_class = &after_class[..class_end];
+        assert!(
+            contact_class.contains("def __del__(self)"),
+            "Contact should define __del__: {contact_class}"
+        );
+        assert!(
+            contact_class.contains("_destroy"),
+            "Contact.__del__ should call _destroy: {contact_class}"
+        );
+    }
+
+    #[test]
+    fn python_null_check_on_optional_return() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "find_contact".into(),
+                params: vec![Param {
+                    name: "id".into(),
+                    ty: TypeRef::I32,
+                }],
+                returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                    "Contact".into(),
+                )))),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                }],
+            }],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let py = render_python_module(&api, true);
+
+        assert!(
+            py.contains("if _result is None:\n        return None"),
+            "optional struct return should null-check before wrap: {py}"
+        );
+        let none_check = py
+            .find("if _result is None:\n        return None")
+            .expect("null-check block");
+        let wrap = py
+            .find("return Contact(_result)")
+            .expect("Contact(_result) wrap");
+        assert!(
+            wrap > none_check,
+            "Contact(_result) should appear after null check: {py}"
+        );
+    }
 }

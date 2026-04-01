@@ -3094,4 +3094,100 @@ mod tests {
             "TypedHandle should use class type not ulong: {cs}"
         );
     }
+
+    #[test]
+    fn dotnet_no_double_free_on_error() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "find_contact".into(),
+                params: vec![Param {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                }],
+                returns: Some(TypeRef::Struct("Contact".into())),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                }],
+            }],
+            enums: vec![],
+            errors: None,
+        }]);
+        let cs = render_csharp(&api, "WeaveFFI", true);
+        assert!(
+            cs.contains("StringToCoTaskMemUTF8"),
+            "string param should be marshalled to unmanaged memory: {cs}"
+        );
+        assert!(
+            cs.contains("finally") && cs.contains("FreeCoTaskMem"),
+            "marshalled string should be freed in finally (no double-free of managed string): {cs}"
+        );
+        let find = cs.find("FindContact").expect("FindContact wrapper");
+        let slice = &cs[find..];
+        let check_rel = slice
+            .find("WeaveffiError.Check(err)")
+            .expect("WeaveffiError.Check in FindContact");
+        let ret_rel = slice
+            .find("return new Contact(result)")
+            .expect("return new Contact(result) in FindContact");
+        assert!(
+            check_rel < ret_rel,
+            "error must be checked before wrapping result: {cs}"
+        );
+        assert!(
+            cs.contains("public class Contact : IDisposable"),
+            "struct return should be disposable: {cs}"
+        );
+        assert!(
+            cs.contains("~Contact()"),
+            "Contact should have finalizer for dispose pattern: {cs}"
+        );
+        assert!(
+            cs.contains("weaveffi_contacts_Contact_destroy"),
+            "Dispose should call native destroy: {cs}"
+        );
+    }
+
+    #[test]
+    fn dotnet_null_check_on_optional_return() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "find_contact".into(),
+                params: vec![Param {
+                    name: "id".into(),
+                    ty: TypeRef::I32,
+                }],
+                returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                    "Contact".into(),
+                )))),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                }],
+            }],
+            enums: vec![],
+            errors: None,
+        }]);
+        let cs = render_csharp(&api, "WeaveFFI", true);
+        assert!(
+            cs.contains("result == IntPtr.Zero ? null : new Contact(result)"),
+            "optional struct return should null-check before wrap: {cs}"
+        );
+    }
 }

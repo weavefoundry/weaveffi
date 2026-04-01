@@ -3617,4 +3617,110 @@ mod tests {
             "TypedHandle should use class type not Long: {kt}"
         );
     }
+
+    #[test]
+    fn android_no_double_free_on_error() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "find_contact".into(),
+                params: vec![Param {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                }],
+                returns: Some(TypeRef::Struct("Contact".into())),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                }],
+            }],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let jni = render_jni_c(&api, "com.weaveffi", true);
+        assert!(
+            jni.contains("GetStringUTFChars"),
+            "input StringUtf8 should use GetStringUTFChars: {jni}"
+        );
+        assert!(
+            jni.contains("ReleaseStringUTFChars"),
+            "input StringUtf8 should release JVM chars: {jni}"
+        );
+        assert!(
+            !jni.contains("weaveffi_free_string(name"),
+            "input string param must not be freed via WeaveFFI: {jni}"
+        );
+
+        let start = jni
+            .find("Java_com_weaveffi_WeaveFFI_find_contact")
+            .expect("find_contact JNI symbol");
+        let rest = &jni[start..];
+        let end = rest.find("\nJNIEXPORT ").unwrap_or(rest.len());
+        let fn_body = &rest[..end];
+        let err_pos = fn_body
+            .find("if (err.code != 0)")
+            .expect("error check before using return value");
+        let ret_pos = fn_body
+            .find("(jlong)(intptr_t)rv")
+            .expect("struct return as jlong handle");
+        assert!(
+            err_pos < ret_pos,
+            "err check must precede struct return: {jni}"
+        );
+        assert!(
+            fn_body.contains("throw_weaveffi_error"),
+            "error path should throw: {jni}"
+        );
+
+        let kt = render_kotlin(&api, "com.weaveffi", true);
+        assert!(kt.contains("class Contact"), "struct class Contact: {kt}");
+    }
+
+    #[test]
+    fn android_null_check_on_optional_return() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "find_contact".into(),
+                params: vec![Param {
+                    name: "id".into(),
+                    ty: TypeRef::I32,
+                }],
+                returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                    "Contact".into(),
+                )))),
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                }],
+            }],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let jni = render_jni_c(&api, "com.weaveffi", true);
+        assert!(
+            jni.contains("if (rv == NULL)"),
+            "optional struct return needs null check: {jni}"
+        );
+        assert!(
+            jni.contains("return NULL"),
+            "optional null should return NULL: {jni}"
+        );
+    }
 }

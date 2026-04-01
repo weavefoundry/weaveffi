@@ -1340,4 +1340,98 @@ mod tests {
             "should reference Color enum: {header}"
         );
     }
+
+    #[test]
+    fn c_no_double_free_on_error() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "contacts".to_string(),
+                functions: vec![Function {
+                    name: "find_contact".to_string(),
+                    params: vec![Param {
+                        name: "name".to_string(),
+                        ty: TypeRef::StringUtf8,
+                    }],
+                    returns: Some(TypeRef::Struct("Contact".to_string())),
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![StructDef {
+                    name: "Contact".to_string(),
+                    doc: None,
+                    fields: vec![StructField {
+                        name: "name".to_string(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    }],
+                }],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+
+        let header = render_c_header(&api, "weaveffi");
+
+        assert!(
+            header.contains("const char* name"),
+            "string param should be borrowed const pointer: {header}"
+        );
+        assert!(
+            header.contains(
+                "weaveffi_contacts_Contact* weaveffi_contacts_find_contact(const char* name, weaveffi_error* out_err);"
+            ),
+            "find_contact should take borrowed name and use out_err as last param: {header}"
+        );
+        assert!(
+            header.contains(
+                "void weaveffi_contacts_Contact_destroy(weaveffi_contacts_Contact* ptr);"
+            ),
+            "struct should have _destroy for lifecycle: {header}"
+        );
+        assert!(
+            header.contains("weaveffi_contacts_Contact* weaveffi_contacts_find_contact("),
+            "struct return should be opaque pointer: {header}"
+        );
+    }
+
+    #[test]
+    fn c_null_check_on_optional_return() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "contacts".to_string(),
+                functions: vec![Function {
+                    name: "find_contact".to_string(),
+                    params: vec![Param {
+                        name: "id".to_string(),
+                        ty: TypeRef::I32,
+                    }],
+                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                        "Contact".to_string(),
+                    )))),
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+
+        let header = render_c_header(&api, "weaveffi");
+
+        assert!(
+            header.contains("weaveffi_contacts_Contact* weaveffi_contacts_find_contact(int32_t id, weaveffi_error* out_err);"),
+            "optional struct return should use same pointer type as non-optional: {header}"
+        );
+        assert!(
+            !header.contains("out_is_present"),
+            "optional struct should not use separate is-present out-param: {header}"
+        );
+        assert!(
+            !header.contains("bool*"),
+            "optional struct should not add bool* out-param: {header}"
+        );
+    }
 }
