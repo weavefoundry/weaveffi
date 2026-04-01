@@ -46,6 +46,19 @@ impl Generator for CGenerator {
             out_dir.join("c/weaveffi.c").to_string(),
         ]
     }
+
+    fn output_files_with_config(
+        &self,
+        _api: &Api,
+        out_dir: &Utf8Path,
+        config: &GeneratorConfig,
+    ) -> Vec<String> {
+        let prefix = config.c_prefix();
+        vec![
+            out_dir.join(format!("c/{prefix}.h")).to_string(),
+            out_dir.join(format!("c/{prefix}.c")).to_string(),
+        ]
+    }
 }
 
 fn is_c_pointer_type(ty: &TypeRef) -> bool {
@@ -1185,6 +1198,16 @@ mod tests {
         assert!(
             !header.contains("weaveffi_"),
             "should not contain default prefix"
+        );
+
+        let files = CGenerator.output_files_with_config(&api, out_dir, &config);
+        assert!(
+            files.iter().any(|f| f.ends_with("mylib.h")),
+            "output_files_with_config should list mylib.h"
+        );
+        assert!(
+            files.iter().any(|f| f.ends_with("mylib.c")),
+            "output_files_with_config should list mylib.c"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
