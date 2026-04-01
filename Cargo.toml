@@ -47,6 +47,7 @@ syn = { version = "2.0", features = ["full", "parsing", "visit"] }
 quote = "1.0"
 similar = "2.0"
 tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
