@@ -17,6 +17,7 @@ pub struct GeneratorConfig {
     pub cpp_namespace: Option<String>,
     pub cpp_header_name: Option<String>,
     pub cpp_standard: Option<String>,
+    pub dart_package_name: Option<String>,
     #[serde(default)]
     pub strip_module_prefix: bool,
     pub template_dir: Option<String>,
@@ -64,6 +65,10 @@ impl GeneratorConfig {
     pub fn cpp_standard(&self) -> &str {
         self.cpp_standard.as_deref().unwrap_or("17")
     }
+
+    pub fn dart_package_name(&self) -> &str {
+        self.dart_package_name.as_deref().unwrap_or("weaveffi")
+    }
 }
 
 #[cfg(test)]
@@ -84,6 +89,7 @@ mod tests {
         assert_eq!(cfg.cpp_namespace(), "weaveffi");
         assert_eq!(cfg.cpp_header_name(), "weaveffi.hpp");
         assert_eq!(cfg.cpp_standard(), "17");
+        assert_eq!(cfg.dart_package_name(), "weaveffi");
         assert!(!cfg.strip_module_prefix);
     }
 
@@ -100,6 +106,7 @@ mod tests {
             cpp_namespace: Some("mylib".into()),
             cpp_header_name: Some("mylib.hpp".into()),
             cpp_standard: Some("20".into()),
+            dart_package_name: Some("my_dart_pkg".into()),
             strip_module_prefix: true,
             template_dir: None,
             pre_generate: None,
@@ -116,6 +123,7 @@ mod tests {
         assert_eq!(cfg.cpp_namespace(), "mylib");
         assert_eq!(cfg.cpp_header_name(), "mylib.hpp");
         assert_eq!(cfg.cpp_standard(), "20");
+        assert_eq!(cfg.dart_package_name(), "my_dart_pkg");
         assert!(cfg.strip_module_prefix);
     }
 
@@ -132,6 +140,7 @@ mod tests {
             cpp_namespace: Some("myns".into()),
             cpp_header_name: None,
             cpp_standard: None,
+            dart_package_name: None,
             strip_module_prefix: true,
             template_dir: None,
             pre_generate: None,
@@ -148,6 +157,7 @@ mod tests {
         assert_eq!(back.cpp_namespace(), "myns");
         assert_eq!(back.cpp_header_name(), "weaveffi.hpp");
         assert_eq!(back.cpp_standard(), "17");
+        assert_eq!(back.dart_package_name(), "weaveffi");
         assert!(back.strip_module_prefix);
     }
 

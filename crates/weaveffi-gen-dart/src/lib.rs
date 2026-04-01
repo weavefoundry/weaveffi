@@ -2,10 +2,23 @@ use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_core::codegen::Generator;
+use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::c_symbol_name;
 use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, TypeRef};
 
 pub struct DartGenerator;
+
+impl DartGenerator {
+    fn generate_impl(&self, api: &Api, out_dir: &Utf8Path, package_name: &str) -> Result<()> {
+        let dart_dir = out_dir.join("dart");
+        let lib_dir = dart_dir.join("lib");
+        std::fs::create_dir_all(&lib_dir)?;
+        std::fs::write(lib_dir.join("weaveffi.dart"), render_dart_module(api))?;
+        std::fs::write(dart_dir.join("pubspec.yaml"), render_pubspec(package_name))?;
+        std::fs::write(dart_dir.join("README.md"), render_readme())?;
+        Ok(())
+    }
+}
 
 impl Generator for DartGenerator {
     fn name(&self) -> &'static str {
@@ -13,13 +26,16 @@ impl Generator for DartGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        let dart_dir = out_dir.join("dart");
-        let lib_dir = dart_dir.join("lib");
-        std::fs::create_dir_all(&lib_dir)?;
-        std::fs::write(lib_dir.join("weaveffi.dart"), render_dart_module(api))?;
-        std::fs::write(dart_dir.join("pubspec.yaml"), render_pubspec())?;
-        std::fs::write(dart_dir.join("README.md"), render_readme())?;
-        Ok(())
+        self.generate_impl(api, out_dir, "weaveffi")
+    }
+
+    fn generate_with_config(
+        &self,
+        api: &Api,
+        out_dir: &Utf8Path,
+        config: &GeneratorConfig,
+    ) -> Result<()> {
+        self.generate_impl(api, out_dir, config.dart_package_name())
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
@@ -99,15 +115,15 @@ fn emit_typedef_and_lookup(
     ));
 }
 
-fn render_pubspec() -> String {
-    r#"name: weaveffi
-version: 0.1.0
-environment:
-  sdk: '>=3.0.0 <4.0.0'
-dependencies:
-  ffi: ^2.0.0
-"#
-    .into()
+fn render_pubspec(package_name: &str) -> String {
+    format!(
+        "name: {package_name}\n\
+         version: 0.1.0\n\
+         environment:\n\
+         \x20 sdk: '>=3.0.0 <4.0.0'\n\
+         dependencies:\n\
+         \x20 ffi: ^2.0.0\n"
+    )
 }
 
 fn render_readme() -> String {
@@ -454,6 +470,7 @@ fn emit_result_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
 mod tests {
     use super::*;
     use camino::Utf8Path;
+    use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{
         Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
     };
@@ -1001,6 +1018,365 @@ mod tests {
         assert!(
             readme.contains("dart:ffi"),
             "README should mention dart:ffi: {readme}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn generate_dart_with_optionals() {
+        let api = make_api(vec![Module {
+            name: "users".into(),
+            functions: vec![Function {
+                name: "find_user".into(),
+                params: vec![Param {
+                    name: "id".into(),
+                    ty: TypeRef::I64,
+                }],
+                returns: Some(TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let dart = render_dart_module(&api);
+        assert!(
+            dart.contains("String? findUser(int id)"),
+            "missing optional return type: {dart}"
+        );
+        assert!(
+            dart.contains("if (result == nullptr) return null;"),
+            "missing null check: {dart}"
+        );
+        assert!(
+            dart.contains("result.toDartString()"),
+            "missing toDartString for optional: {dart}"
+        );
+    }
+
+    #[test]
+    fn generate_dart_with_lists() {
+        let api = make_api(vec![Module {
+            name: "data".into(),
+            functions: vec![Function {
+                name: "get_scores".into(),
+                params: vec![Param {
+                    name: "items".into(),
+                    ty: TypeRef::List(Box::new(TypeRef::I32)),
+                }],
+                returns: Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let dart = render_dart_module(&api);
+        assert!(
+            dart.contains("List<String> getScores(List<int> items)"),
+            "missing list signature: {dart}"
+        );
+        assert!(
+            dart.contains("Pointer<Void>"),
+            "missing Pointer<Void> for list FFI type: {dart}"
+        );
+    }
+
+    #[test]
+    fn generate_dart_with_maps() {
+        let api = make_api(vec![Module {
+            name: "cache".into(),
+            functions: vec![Function {
+                name: "get_entries".into(),
+                params: vec![],
+                returns: Some(TypeRef::Map(
+                    Box::new(TypeRef::StringUtf8),
+                    Box::new(TypeRef::I32),
+                )),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+            }],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let dart = render_dart_module(&api);
+        assert!(
+            dart.contains("Map<String, int> getEntries()"),
+            "missing map return type: {dart}"
+        );
+    }
+
+    #[test]
+    fn generate_dart_with_typed_handle() {
+        let api = make_api(vec![Module {
+            name: "sessions".into(),
+            functions: vec![
+                Function {
+                    name: "create_session".into(),
+                    params: vec![Param {
+                        name: "name".into(),
+                        ty: TypeRef::StringUtf8,
+                    }],
+                    returns: Some(TypeRef::TypedHandle("Session".into())),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                },
+                Function {
+                    name: "close_session".into(),
+                    params: vec![Param {
+                        name: "session".into(),
+                        ty: TypeRef::TypedHandle("Session".into()),
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                },
+            ],
+            structs: vec![],
+            enums: vec![],
+            errors: None,
+        }]);
+
+        let dart = render_dart_module(&api);
+        assert!(
+            dart.contains("Session createSession(String name)"),
+            "missing typed handle return: {dart}"
+        );
+        assert!(
+            dart.contains("Session._(result)"),
+            "missing typed handle wrapping: {dart}"
+        );
+        assert!(
+            dart.contains("void closeSession(Session session)"),
+            "missing typed handle param: {dart}"
+        );
+        assert!(
+            dart.contains("session._handle"),
+            "missing _handle access for typed handle param: {dart}"
+        );
+    }
+
+    #[test]
+    fn generate_dart_full_contacts() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![
+                Function {
+                    name: "create_contact".into(),
+                    params: vec![
+                        Param {
+                            name: "first_name".into(),
+                            ty: TypeRef::StringUtf8,
+                        },
+                        Param {
+                            name: "last_name".into(),
+                            ty: TypeRef::StringUtf8,
+                        },
+                        Param {
+                            name: "email".into(),
+                            ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                        },
+                        Param {
+                            name: "contact_type".into(),
+                            ty: TypeRef::Enum("ContactType".into()),
+                        },
+                    ],
+                    returns: Some(TypeRef::Handle),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                },
+                Function {
+                    name: "get_contact".into(),
+                    params: vec![Param {
+                        name: "id".into(),
+                        ty: TypeRef::Handle,
+                    }],
+                    returns: Some(TypeRef::Struct("Contact".into())),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                },
+                Function {
+                    name: "list_contacts".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                },
+                Function {
+                    name: "delete_contact".into(),
+                    params: vec![Param {
+                        name: "id".into(),
+                        ty: TypeRef::Handle,
+                    }],
+                    returns: Some(TypeRef::Bool),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                },
+                Function {
+                    name: "count_contacts".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                },
+            ],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: Some("A contact record".into()),
+                fields: vec![
+                    StructField {
+                        name: "id".into(),
+                        ty: TypeRef::I64,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "first_name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "last_name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    },
+                    StructField {
+                        name: "email".into(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                        doc: None,
+                    },
+                    StructField {
+                        name: "contact_type".into(),
+                        ty: TypeRef::Enum("ContactType".into()),
+                        doc: None,
+                    },
+                ],
+            }],
+            enums: vec![EnumDef {
+                name: "ContactType".into(),
+                doc: None,
+                variants: vec![
+                    EnumVariant {
+                        name: "Personal".into(),
+                        value: 0,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Work".into(),
+                        value: 1,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Other".into(),
+                        value: 2,
+                        doc: None,
+                    },
+                ],
+            }],
+            errors: None,
+        }]);
+
+        let dart = render_dart_module(&api);
+
+        assert!(
+            dart.contains("enum ContactType {"),
+            "missing ContactType enum: {dart}"
+        );
+        assert!(
+            dart.contains("personal(0)"),
+            "missing personal variant: {dart}"
+        );
+        assert!(dart.contains("work(1)"), "missing work variant: {dart}");
+        assert!(dart.contains("other(2)"), "missing other variant: {dart}");
+
+        assert!(
+            dart.contains("class Contact {"),
+            "missing Contact class: {dart}"
+        );
+        assert!(
+            dart.contains("/// A contact record"),
+            "missing doc comment: {dart}"
+        );
+        assert!(dart.contains("int get id"), "missing id getter: {dart}");
+        assert!(
+            dart.contains("String get firstName"),
+            "missing firstName getter: {dart}"
+        );
+        assert!(
+            dart.contains("String get lastName"),
+            "missing lastName getter: {dart}"
+        );
+        assert!(
+            dart.contains("String? get email"),
+            "missing optional email getter: {dart}"
+        );
+        assert!(
+            dart.contains("ContactType get contactType"),
+            "missing contactType getter: {dart}"
+        );
+
+        assert!(
+            dart.contains("int createContact("),
+            "missing createContact: {dart}"
+        );
+        assert!(
+            dart.contains("Contact getContact(int id)"),
+            "missing getContact: {dart}"
+        );
+        assert!(
+            dart.contains("List<Contact> listContacts()"),
+            "missing listContacts: {dart}"
+        );
+        assert!(
+            dart.contains("bool deleteContact(int id)"),
+            "missing deleteContact: {dart}"
+        );
+        assert!(
+            dart.contains("int countContacts()"),
+            "missing countContacts: {dart}"
+        );
+    }
+
+    #[test]
+    fn dart_custom_package_name() {
+        let api = make_api(vec![simple_module(vec![])]);
+        let tmp = std::env::temp_dir().join("weaveffi_test_dart_custom_pkg");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        let config = GeneratorConfig {
+            dart_package_name: Some("my_custom_dart".into()),
+            ..Default::default()
+        };
+        DartGenerator
+            .generate_with_config(&api, out_dir, &config)
+            .unwrap();
+
+        let pubspec = std::fs::read_to_string(tmp.join("dart/pubspec.yaml")).unwrap();
+        assert!(
+            pubspec.contains("name: my_custom_dart"),
+            "pubspec should use custom package name: {pubspec}"
+        );
+        assert!(
+            !pubspec.contains("name: weaveffi"),
+            "pubspec should not use default name: {pubspec}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
