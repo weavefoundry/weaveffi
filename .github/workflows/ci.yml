@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
       - name: Checkout
@@ -49,15 +49,19 @@ jobs:
         run: cargo build -p weaveffi-cli --release
 
       - name: Generate bindings from calculator IDL
+        if: runner.os != 'Windows'
         run: target/release/weaveffi generate samples/calculator/calculator.yml -o generated
 
       - name: Build calculator cdylib (debug)
+        if: runner.os != 'Windows'
         run: cargo build -p calculator
 
       - name: Compile C example
+        if: runner.os != 'Windows'
         run: cc -I generated/c examples/c/main.c -L target/debug -lcalculator -o c_example
 
       - name: Run C example
+        if: runner.os != 'Windows'
         run: |
           if [ "${{ runner.os }}" = "macOS" ]; then
             DYLD_LIBRARY_PATH=target/debug ./c_example
@@ -66,9 +70,11 @@ jobs:
           fi
 
       - name: Build Node addon (debug)
+        if: runner.os != 'Windows'
         run: cargo build -p weaveffi-node-addon
 
       - name: Place Node addon next to generated loader
+        if: runner.os != 'Windows'
         run: |
           if [ "${{ runner.os }}" = "macOS" ]; then
             cp target/debug/libindex.dylib generated/node/index.node
@@ -77,6 +83,7 @@ jobs:
           fi
 
       - name: Smoke run Node example
+        if: runner.os != 'Windows'
         run: |
           if [ "${{ runner.os }}" = "macOS" ]; then
             export DYLD_LIBRARY_PATH="$PWD/target/debug"
@@ -89,8 +96,64 @@ jobs:
 
       - name: Upload CLI artifact
         uses: actions/upload-artifact@v4
+        if: runner.os != 'Windows'
         with:
           name: weaveffi-cli-${{ runner.os }}
           path: target/release/weaveffi
           if-no-files-found: error
           retention-days: 7
+
+      - name: Upload CLI artifact (Windows)
+        uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: weaveffi-cli-Windows
+          path: target/release/weaveffi.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-e2e:
+    name: Windows E2E
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: true
+
+      - name: Build CLI (release)
+        run: cargo build -p weaveffi-cli --release
+
+      - name: Build calculator cdylib (debug)
+        run: cargo build -p calculator
+
+      - name: Generate bindings from calculator IDL
+        run: ./target/release/weaveffi.exe generate samples/calculator/calculator.yml -o generated
+
+      - name: Verify generated bindings
+        shell: pwsh
+        run: |
+          $expected = @(
+            "generated/c/weaveffi.h",
+            "generated/swift/Package.swift",
+            "generated/node/types.d.ts",
+            "generated/android/build.gradle",
+            "generated/python/weaveffi/weaveffi.py",
+            "generated/dotnet/WeaveFFI.cs",
+            "generated/wasm/README.md"
+          )
+          $missing = @()
+          foreach ($f in $expected) {
+            if (!(Test-Path $f)) { $missing += $f }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Error "Missing files: $($missing -join ', ')"
+            exit 1
+          }
+          Write-Host "All expected generated files present"

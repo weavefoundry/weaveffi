@@ -7,10 +7,16 @@ use crate::config::GeneratorConfig;
 use crate::templates::TemplateEngine;
 
 fn run_hook(label: &str, cmd: &str) -> Result<()> {
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .status()?;
+    let status = if cfg!(target_os = "windows") {
+        std::process::Command::new("cmd")
+            .args(["/C", cmd])
+            .status()?
+    } else {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .status()?
+    };
     if !status.success() {
         bail!("{label} hook failed with {status}");
     }
@@ -250,7 +256,7 @@ mod tests {
         let out_dir = Utf8Path::from_path(dir.path()).unwrap();
         let api = test_api();
         let config = GeneratorConfig {
-            pre_generate: Some("echo pre > /dev/null".into()),
+            pre_generate: Some("echo ok".into()),
             ..Default::default()
         };
         let calls = Arc::new(AtomicUsize::new(0));
@@ -289,7 +295,7 @@ mod tests {
         let out_dir = Utf8Path::from_path(dir.path()).unwrap();
         let api = test_api();
         let config = GeneratorConfig {
-            post_generate: Some("echo post > /dev/null".into()),
+            post_generate: Some("echo ok".into()),
             ..Default::default()
         };
         let calls = Arc::new(AtomicUsize::new(0));
