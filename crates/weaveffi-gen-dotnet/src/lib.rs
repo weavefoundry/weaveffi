@@ -3,7 +3,7 @@ use camino::Utf8Path;
 use heck::ToUpperCamelCase;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
-use weaveffi_core::utils::{c_symbol_name, wrapper_name};
+use weaveffi_core::utils::{c_symbol_name, local_type_name, wrapper_name};
 use weaveffi_ir::ir::{Api, EnumDef, Function, Module, Param, StructDef, StructField, TypeRef};
 
 pub struct DotnetGenerator;
@@ -79,7 +79,8 @@ fn cs_type(ty: &TypeRef) -> String {
         TypeRef::Handle => "ulong".into(),
         TypeRef::TypedHandle(name) => name.clone(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "byte[]".into(),
-        TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
+        TypeRef::Struct(name) => local_type_name(name).into(),
+        TypeRef::Enum(name) => name.clone(),
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::I32 => "int?".into(),
             TypeRef::U32 => "uint?".into(),
@@ -90,7 +91,7 @@ fn cs_type(ty: &TypeRef) -> String {
             TypeRef::TypedHandle(name) => format!("{name}?"),
             TypeRef::Enum(name) => format!("{name}?"),
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string?".into(),
-            TypeRef::Struct(name) => format!("{name}?"),
+            TypeRef::Struct(name) => format!("{}?", local_type_name(name)),
             _ => format!("{}?", cs_type(inner)),
         },
         TypeRef::List(inner) => format!("{}[]", cs_type(inner)),
@@ -406,8 +407,9 @@ fn render_struct_getter(out: &mut String, prefix: &str, field: &StructField) {
             ));
         }
         TypeRef::Struct(name) => {
+            let cn = local_type_name(name);
             out.push_str(&format!(
-                "                return new {name}(NativeMethods.{getter_sym}(_handle));\n"
+                "                return new {cn}(NativeMethods.{getter_sym}(_handle));\n"
             ));
         }
         TypeRef::Optional(inner)
@@ -434,8 +436,9 @@ fn render_struct_getter(out: &mut String, prefix: &str, field: &StructField) {
                     out.push_str("                return str;\n");
                 }
                 TypeRef::Struct(name) => {
+                    let cn = local_type_name(name);
                     out.push_str(&format!(
-                        "                return ptr == IntPtr.Zero ? null : new {name}(ptr);\n"
+                        "                return ptr == IntPtr.Zero ? null : new {cn}(ptr);\n"
                     ));
                 }
                 TypeRef::I32 => {
@@ -532,12 +535,13 @@ fn render_list_unmarshal(out: &mut String, inner: &TypeRef, indent: &str) {
             out.push_str(&format!("{indent}return arr;\n"));
         }
         TypeRef::Struct(name) => {
-            out.push_str(&format!("{indent}var arr = new {name}[(int)len];\n"));
+            let cn = local_type_name(name);
+            out.push_str(&format!("{indent}var arr = new {cn}[(int)len];\n"));
             out.push_str(&format!(
                 "{indent}for (int i = 0; i < (int)len; i++)\n{indent}{{\n"
             ));
             out.push_str(&format!(
-                "{indent}    arr[i] = new {name}(Marshal.ReadIntPtr(ptr, i * IntPtr.Size));\n"
+                "{indent}    arr[i] = new {cn}(Marshal.ReadIntPtr(ptr, i * IntPtr.Size));\n"
             ));
             out.push_str(&format!("{indent}}}\n"));
             out.push_str(&format!("{indent}return arr;\n"));
@@ -903,7 +907,11 @@ fn render_async_set_result(out: &mut String, ret: &Option<TypeRef>, indent: &str
         Some(TypeRef::Enum(name)) => {
             out.push_str(&format!("{indent}tcs.SetResult(({name})result);\n"));
         }
-        Some(TypeRef::Struct(name) | TypeRef::TypedHandle(name)) => {
+        Some(TypeRef::Struct(name)) => {
+            let cn = local_type_name(name);
+            out.push_str(&format!("{indent}tcs.SetResult(new {cn}(result));\n"));
+        }
+        Some(TypeRef::TypedHandle(name)) => {
             out.push_str(&format!("{indent}tcs.SetResult(new {name}(result));\n"));
         }
         _ => {
@@ -1117,7 +1125,11 @@ fn render_return_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
         TypeRef::Enum(name) => {
             out.push_str(&format!("{indent}return ({name})result;\n"));
         }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+        TypeRef::Struct(name) => {
+            let cn = local_type_name(name);
+            out.push_str(&format!("{indent}return new {cn}(result);\n"));
+        }
+        TypeRef::TypedHandle(name) => {
             out.push_str(&format!("{indent}return new {name}(result);\n"));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
@@ -1161,8 +1173,9 @@ fn render_optional_return_conversion(out: &mut String, inner: &TypeRef, indent: 
             out.push_str(&format!("{indent}return str;\n"));
         }
         TypeRef::Struct(name) => {
+            let cn = local_type_name(name);
             out.push_str(&format!(
-                "{indent}return result == IntPtr.Zero ? null : new {name}(result);\n"
+                "{indent}return result == IntPtr.Zero ? null : new {cn}(result);\n"
             ));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
@@ -1267,12 +1280,13 @@ fn render_list_return(out: &mut String, inner: &TypeRef, indent: &str) {
             out.push_str(&format!("{indent}return arr;\n"));
         }
         TypeRef::Struct(name) => {
-            out.push_str(&format!("{indent}var arr = new {name}[(int)outLen];\n"));
+            let cn = local_type_name(name);
+            out.push_str(&format!("{indent}var arr = new {cn}[(int)outLen];\n"));
             out.push_str(&format!(
                 "{indent}for (int i = 0; i < (int)outLen; i++)\n{indent}{{\n"
             ));
             out.push_str(&format!(
-                "{indent}    arr[i] = new {name}(Marshal.ReadIntPtr(result, i * IntPtr.Size));\n"
+                "{indent}    arr[i] = new {cn}(Marshal.ReadIntPtr(result, i * IntPtr.Size));\n"
             ));
             out.push_str(&format!("{indent}}}\n"));
             out.push_str(&format!("{indent}return arr;\n"));
@@ -1352,7 +1366,8 @@ fn marshal_read_element(ty: &TypeRef, arr: &str, idx: &str) -> String {
             format!("({name})Marshal.ReadInt32({arr} + {idx} * sizeof(int))")
         }
         TypeRef::Struct(name) => {
-            format!("new {name}(Marshal.ReadIntPtr({arr}, {idx} * IntPtr.Size))")
+            let cn = local_type_name(name);
+            format!("new {cn}(Marshal.ReadIntPtr({arr}, {idx} * IntPtr.Size))")
         }
         _ => "default".into(),
     }

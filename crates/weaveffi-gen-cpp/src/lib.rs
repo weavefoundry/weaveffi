@@ -2,6 +2,7 @@ use anyhow::Result;
 use camino::Utf8Path;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
+use weaveffi_core::utils::{c_abi_struct_name, local_type_name};
 use weaveffi_ir::ir::{Api, ErrorCode, Function, Module, StructField, TypeRef};
 
 pub struct CppGenerator;
@@ -177,7 +178,7 @@ fn c_element_type(ty: &TypeRef, module: &str) -> String {
         TypeRef::TypedHandle(n) => format!("weaveffi_{module}_{n}*"),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "const uint8_t*".into(),
-        TypeRef::Struct(s) => format!("weaveffi_{module}_{s}*"),
+        TypeRef::Struct(s) => format!("{}*", c_abi_struct_name(s, module, "weaveffi")),
         TypeRef::Enum(e) => format!("weaveffi_{module}_{e}"),
         TypeRef::Optional(inner) | TypeRef::List(inner) => c_element_type(inner, module),
         TypeRef::Map(_, _) => "void*".into(),
@@ -198,7 +199,7 @@ fn c_param_type(ty: &TypeRef, name: &str, module: &str) -> String {
         }
         TypeRef::Handle => format!("weaveffi_handle_t {name}"),
         TypeRef::TypedHandle(n) => format!("weaveffi_{module}_{n}* {name}"),
-        TypeRef::Struct(s) => format!("const weaveffi_{module}_{s}* {name}"),
+        TypeRef::Struct(s) => format!("const {}* {name}", c_abi_struct_name(s, module, "weaveffi")),
         TypeRef::Enum(e) => format!("weaveffi_{module}_{e} {name}"),
         TypeRef::Optional(inner) => {
             if is_c_pointer_type(inner) {
@@ -248,7 +249,10 @@ fn c_ret_type(ty: &TypeRef, module: &str) -> (String, Vec<String>) {
         }
         TypeRef::Handle => ("weaveffi_handle_t".into(), vec![]),
         TypeRef::TypedHandle(n) => (format!("weaveffi_{module}_{n}*"), vec![]),
-        TypeRef::Struct(s) => (format!("weaveffi_{module}_{s}*"), vec![]),
+        TypeRef::Struct(s) => (
+            format!("{}*", c_abi_struct_name(s, module, "weaveffi")),
+            vec![],
+        ),
         TypeRef::Enum(e) => (format!("weaveffi_{module}_{e}"), vec![]),
         TypeRef::Optional(inner) => {
             if is_c_pointer_type(inner) {
@@ -421,7 +425,8 @@ fn cpp_type(ty: &TypeRef) -> String {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "std::string".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "std::vector<uint8_t>".into(),
         TypeRef::Handle => "void*".into(),
-        TypeRef::TypedHandle(n) | TypeRef::Struct(n) => n.clone(),
+        TypeRef::TypedHandle(n) => n.clone(),
+        TypeRef::Struct(n) => local_type_name(n).to_string(),
         TypeRef::Enum(n) => n.clone(),
         TypeRef::Optional(inner) => format!("std::optional<{}>", cpp_type(inner)),
         TypeRef::List(inner) => format!("std::vector<{}>", cpp_type(inner)),
@@ -439,7 +444,7 @@ fn cpp_param_decl(ty: &TypeRef, name: &str) -> String {
             format!("const std::vector<uint8_t>& {name}")
         }
         TypeRef::TypedHandle(n) => format!("{n}& {name}"),
-        TypeRef::Struct(n) => format!("const {n}& {name}"),
+        TypeRef::Struct(n) => format!("const {}& {name}", local_type_name(n)),
         TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
             format!("const {}& {name}", cpp_type(ty))
         }
@@ -570,8 +575,12 @@ fn render_cpp_getter(out: &mut String, struct_name: &str, module: &str, field: &
                 "        return reinterpret_cast<void*>(static_cast<uintptr_t>({getter}({cast})));\n"
             ));
         }
-        TypeRef::TypedHandle(n) | TypeRef::Struct(n) => {
+        TypeRef::TypedHandle(n) => {
             out.push_str(&format!("        return {n}({getter}({cast}));\n"));
+        }
+        TypeRef::Struct(n) => {
+            let ln = local_type_name(n);
+            out.push_str(&format!("        return {ln}({getter}({cast}));\n"));
         }
         TypeRef::Enum(n) => {
             out.push_str(&format!(
@@ -602,8 +611,12 @@ fn render_getter_optional(out: &mut String, inner: &TypeRef, getter: &str, cast:
             out.push_str("        weaveffi_free_string(raw);\n");
             out.push_str("        return ret;\n");
         }
-        TypeRef::Struct(n) | TypeRef::TypedHandle(n) => {
+        TypeRef::TypedHandle(n) => {
             out.push_str(&format!("        return {n}(raw);\n"));
+        }
+        TypeRef::Struct(n) => {
+            let ln = local_type_name(n);
+            out.push_str(&format!("        return {ln}(raw);\n"));
         }
         TypeRef::Enum(n) => {
             out.push_str(&format!("        return static_cast<{n}>(*raw);\n"));
@@ -628,10 +641,11 @@ fn render_getter_list(out: &mut String, inner: &TypeRef, getter: &str, cast: &st
             out.push_str("        return ret;\n");
         }
         TypeRef::Struct(n) => {
-            out.push_str(&format!("        std::vector<{n}> ret;\n"));
+            let ln = local_type_name(n);
+            out.push_str(&format!("        std::vector<{ln}> ret;\n"));
             out.push_str("        ret.reserve(len);\n");
             out.push_str(&format!(
-                "        for (size_t i = 0; i < len; ++i) ret.emplace_back({n}(raw[i]));\n"
+                "        for (size_t i = 0; i < len; ++i) ret.emplace_back({ln}(raw[i]));\n"
             ));
             out.push_str("        return ret;\n");
         }
@@ -683,7 +697,7 @@ fn render_getter_map(
     let ve = match v {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "std::string(out_values[i])".into(),
         TypeRef::Enum(n) => format!("static_cast<{n}>(out_values[i])"),
-        TypeRef::Struct(n) => format!("{n}(out_values[i])"),
+        TypeRef::Struct(n) => format!("{}(out_values[i])", local_type_name(n)),
         _ => "out_values[i]".into(),
     };
     out.push_str(&format!("            ret[{ke}] = {ve};\n"));
@@ -729,7 +743,8 @@ fn param_to_c_args(ty: &TypeRef, name: &str, module: &str) -> (Vec<String>, Vec<
         TypeRef::Struct(s) => (
             vec![],
             vec![format!(
-                "static_cast<const weaveffi_{module}_{s}*>({name}.handle())"
+                "static_cast<const {}*>({name}.handle())",
+                c_abi_struct_name(s, module, "weaveffi")
             )],
         ),
         TypeRef::Enum(e) => (
@@ -750,7 +765,8 @@ fn param_to_c_args(ty: &TypeRef, name: &str, module: &str) -> (Vec<String>, Vec<
                     TypeRef::Struct(s) => (
                         vec![],
                         vec![format!(
-                            "{name}.has_value() ? static_cast<const weaveffi_{module}_{s}*>({name}.value().handle()) : nullptr"
+                            "{name}.has_value() ? static_cast<const {}*>({name}.value().handle()) : nullptr",
+                            c_abi_struct_name(s, module, "weaveffi")
                         )],
                     ),
                     _ => param_to_c_args(inner, name, module),
@@ -788,7 +804,7 @@ fn param_to_c_args(ty: &TypeRef, name: &str, module: &str) -> (Vec<String>, Vec<
                 ],
             ),
             TypeRef::Struct(s) => {
-                let c_ptr = format!("const weaveffi_{module}_{s}*");
+                let c_ptr = format!("const {}*", c_abi_struct_name(s, module, "weaveffi"));
                 (
                     vec![
                         format!("std::vector<{c_ptr}> {name}_ptrs;"),
@@ -824,7 +840,10 @@ fn param_to_c_args(ty: &TypeRef, name: &str, module: &str) -> (Vec<String>, Vec<
                     format!("static_cast<weaveffi_{module}_{e}>(static_cast<int32_t>(kv.second))")
                 }
                 TypeRef::Struct(s) => {
-                    format!("static_cast<const weaveffi_{module}_{s}*>(kv.second.handle())")
+                    format!(
+                        "static_cast<const {}*>(kv.second.handle())",
+                        c_abi_struct_name(s, module, "weaveffi")
+                    )
                 }
                 _ => "kv.second".into(),
             };
@@ -961,8 +980,12 @@ fn render_cpp_return(out: &mut String, ty: &TypeRef) {
         TypeRef::Handle => {
             out.push_str("    return reinterpret_cast<void*>(static_cast<uintptr_t>(result));\n");
         }
-        TypeRef::TypedHandle(n) | TypeRef::Struct(n) => {
+        TypeRef::TypedHandle(n) => {
             out.push_str(&format!("    return {n}(result);\n"));
+        }
+        TypeRef::Struct(n) => {
+            let ln = local_type_name(n);
+            out.push_str(&format!("    return {ln}(result);\n"));
         }
         TypeRef::Enum(n) => {
             out.push_str(&format!("    return static_cast<{n}>(result);\n"));
@@ -975,8 +998,12 @@ fn render_cpp_return(out: &mut String, ty: &TypeRef) {
                     out.push_str("    weaveffi_free_string(result);\n");
                     out.push_str("    return ret;\n");
                 }
-                TypeRef::Struct(n) | TypeRef::TypedHandle(n) => {
+                TypeRef::TypedHandle(n) => {
                     out.push_str(&format!("    return {n}(result);\n"));
+                }
+                TypeRef::Struct(n) => {
+                    let ln = local_type_name(n);
+                    out.push_str(&format!("    return {ln}(result);\n"));
                 }
                 TypeRef::Enum(n) => {
                     out.push_str(&format!("    return static_cast<{n}>(*result);\n"));
@@ -999,10 +1026,11 @@ fn render_cpp_return(out: &mut String, ty: &TypeRef) {
                 out.push_str("    return ret;\n");
             }
             TypeRef::Struct(n) => {
-                out.push_str(&format!("    std::vector<{n}> ret;\n"));
+                let ln = local_type_name(n);
+                out.push_str(&format!("    std::vector<{ln}> ret;\n"));
                 out.push_str("    ret.reserve(out_len);\n");
                 out.push_str(&format!(
-                    "    for (size_t i = 0; i < out_len; ++i) ret.emplace_back({n}(result[i]));\n"
+                    "    for (size_t i = 0; i < out_len; ++i) ret.emplace_back({ln}(result[i]));\n"
                 ));
                 out.push_str("    return ret;\n");
             }
@@ -1034,7 +1062,7 @@ fn render_cpp_return(out: &mut String, ty: &TypeRef) {
             let ve = match v.as_ref() {
                 TypeRef::StringUtf8 | TypeRef::BorrowedStr => "std::string(out_values[i])".into(),
                 TypeRef::Enum(n) => format!("static_cast<{n}>(out_values[i])"),
-                TypeRef::Struct(n) => format!("{n}(out_values[i])"),
+                TypeRef::Struct(n) => format!("{}(out_values[i])", local_type_name(n)),
                 _ => "out_values[i]".into(),
             };
             out.push_str(&format!("        ret[{ke}] = {ve};\n"));
@@ -1147,8 +1175,12 @@ fn render_async_set_value(out: &mut String, ty: &TypeRef) {
                 "            p->set_value(reinterpret_cast<void*>(static_cast<uintptr_t>(result)));\n",
             );
         }
-        TypeRef::TypedHandle(n) | TypeRef::Struct(n) => {
+        TypeRef::TypedHandle(n) => {
             out.push_str(&format!("            p->set_value({n}(result));\n"));
+        }
+        TypeRef::Struct(n) => {
+            let ln = local_type_name(n);
+            out.push_str(&format!("            p->set_value({ln}(result));\n"));
         }
         TypeRef::Enum(n) => {
             out.push_str(&format!(
@@ -1165,8 +1197,12 @@ fn render_async_set_value(out: &mut String, ty: &TypeRef) {
                     out.push_str("                weaveffi_free_string(result);\n");
                     out.push_str("                p->set_value(std::move(ret));\n");
                 }
-                TypeRef::Struct(n) | TypeRef::TypedHandle(n) => {
+                TypeRef::TypedHandle(n) => {
                     out.push_str(&format!("                p->set_value({n}(result));\n"));
+                }
+                TypeRef::Struct(n) => {
+                    let ln = local_type_name(n);
+                    out.push_str(&format!("                p->set_value({ln}(result));\n"));
                 }
                 TypeRef::Enum(n) => {
                     out.push_str(&format!(
@@ -1195,10 +1231,11 @@ fn render_async_set_value(out: &mut String, ty: &TypeRef) {
                 out.push_str("            p->set_value(std::move(ret));\n");
             }
             TypeRef::Struct(n) => {
-                out.push_str(&format!("            std::vector<{n}> ret;\n"));
+                let ln = local_type_name(n);
+                out.push_str(&format!("            std::vector<{ln}> ret;\n"));
                 out.push_str("            ret.reserve(result_len);\n");
                 out.push_str(&format!(
-                    "            for (size_t i = 0; i < result_len; ++i) ret.emplace_back({n}(result[i]));\n"
+                    "            for (size_t i = 0; i < result_len; ++i) ret.emplace_back({ln}(result[i]));\n"
                 ));
                 out.push_str("            p->set_value(std::move(ret));\n");
             }
@@ -1234,7 +1271,7 @@ fn render_async_set_value(out: &mut String, ty: &TypeRef) {
                     "std::string(result_values[i])".into()
                 }
                 TypeRef::Enum(n) => format!("static_cast<{n}>(result_values[i])"),
-                TypeRef::Struct(n) => format!("{n}(result_values[i])"),
+                TypeRef::Struct(n) => format!("{}(result_values[i])", local_type_name(n)),
                 _ => "result_values[i]".into(),
             };
             out.push_str(&format!("                ret[{ke}] = {ve};\n"));

@@ -3,6 +3,7 @@ use camino::Utf8Path;
 use heck::ToUpperCamelCase;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
+use weaveffi_core::utils::local_type_name;
 use weaveffi_ir::ir::{Api, EnumDef, Function, StructDef, TypeRef};
 
 pub struct WasmGenerator;
@@ -125,7 +126,8 @@ fn type_display(ty: &TypeRef) -> String {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "bytes".into(),
         TypeRef::TypedHandle(_) | TypeRef::Handle => "handle".into(),
-        TypeRef::Struct(n) | TypeRef::Enum(n) => n.clone(),
+        TypeRef::Struct(n) => local_type_name(n).to_string(),
+        TypeRef::Enum(n) => n.clone(),
         TypeRef::Optional(inner) => format!("{}?", type_display(inner)),
         TypeRef::List(inner) => format!("[{}]", type_display(inner)),
         TypeRef::Map(k, v) => format!("{{{}:{}}}", type_display(k), type_display(v)),
@@ -304,7 +306,8 @@ fn ts_type_for(ty: &TypeRef) -> String {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "Buffer".into(),
         TypeRef::Handle => "bigint".into(),
-        TypeRef::TypedHandle(name) | TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
+        TypeRef::TypedHandle(name) | TypeRef::Enum(name) => name.clone(),
+        TypeRef::Struct(name) => local_type_name(name).to_string(),
         TypeRef::Optional(inner) => format!("{} | null", ts_type_for(inner)),
         TypeRef::List(inner) => {
             let inner_ts = ts_type_for(inner);
@@ -676,16 +679,18 @@ fn emit_js_function_wrapper(out: &mut String, module_name: &str, func: &Function
             out.push_str(&format!("{indent}return _decodeString(wasm, view.getInt32(retptr, true), view.getInt32(retptr + 4, true));\n"));
         }
         Some(TypeRef::Struct(name)) => {
+            let cls = local_type_name(name);
             out.push_str(&format!("{indent}const _result = {wasm_call};\n"));
             out.push_str(&format!("{indent}_checkError(wasm, _err);\n"));
-            out.push_str(&format!("{indent}return new {name}(wasm, _result);\n"));
+            out.push_str(&format!("{indent}return new {cls}(wasm, _result);\n"));
         }
         Some(TypeRef::Optional(inner)) => match inner.as_ref() {
             TypeRef::Struct(name) => {
+                let cls = local_type_name(name);
                 out.push_str(&format!("{indent}const result = {wasm_call};\n"));
                 out.push_str(&format!("{indent}_checkError(wasm, _err);\n"));
                 out.push_str(&format!(
-                    "{indent}return result === 0n ? null : new {name}(wasm, result);\n"
+                    "{indent}return result === 0n ? null : new {cls}(wasm, result);\n"
                 ));
             }
             _ => {
@@ -794,14 +799,16 @@ fn emit_js_async_function_wrapper(out: &mut String, module_name: &str, func: &Fu
             out.push_str(&format!("{indent2}}} }});\n"));
         }
         Some(TypeRef::Struct(name)) => {
+            let cls = local_type_name(name);
             out.push_str(&format!(
-                "{indent2}_asyncContexts.set(ctxId, {{ resolve, reject, unwrap: (w, handle) => new {name}(w, handle) }});\n"
+                "{indent2}_asyncContexts.set(ctxId, {{ resolve, reject, unwrap: (w, handle) => new {cls}(w, handle) }});\n"
             ));
         }
         Some(TypeRef::Optional(inner)) => match inner.as_ref() {
             TypeRef::Struct(name) => {
+                let cls = local_type_name(name);
                 out.push_str(&format!(
-                    "{indent2}_asyncContexts.set(ctxId, {{ resolve, reject, unwrap: (w, handle) => handle === 0n ? null : new {name}(w, handle) }});\n"
+                    "{indent2}_asyncContexts.set(ctxId, {{ resolve, reject, unwrap: (w, handle) => handle === 0n ? null : new {cls}(w, handle) }});\n"
                 ));
             }
             _ => {

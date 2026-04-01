@@ -3,7 +3,7 @@ use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
-use weaveffi_core::utils::{c_symbol_name, wrapper_name};
+use weaveffi_core::utils::{c_symbol_name, local_type_name, wrapper_name};
 use weaveffi_ir::ir::{Api, EnumDef, Function, Param, StructDef, StructField, TypeRef};
 
 pub struct SwiftGenerator;
@@ -105,7 +105,8 @@ fn swift_type_for(t: &TypeRef) -> String {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "String".to_string(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "Data".to_string(),
         TypeRef::Handle => "UInt64".to_string(),
-        TypeRef::TypedHandle(name) | TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
+        TypeRef::TypedHandle(name) | TypeRef::Enum(name) => name.clone(),
+        TypeRef::Struct(name) => local_type_name(name).to_string(),
         TypeRef::Optional(inner) => format!("{}?", swift_type_for(inner)),
         TypeRef::List(inner) => format!("[{}]", swift_type_for(inner)),
         TypeRef::Map(k, v) => format!("[{}: {}]", swift_type_for(k), swift_type_for(v)),
@@ -299,7 +300,11 @@ fn render_swift_getter(out: &mut String, prefix: &str, field: &StructField) {
             out.push_str("        defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: raw), outLen) }\n");
             out.push_str("        return Data(bytes: raw, count: outLen)\n");
         }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+        TypeRef::Struct(name) => {
+            let name = local_type_name(name);
+            out.push_str(&format!("        return {}(ptr: {}(ptr)!)\n", name, getter));
+        }
+        TypeRef::TypedHandle(name) => {
             out.push_str(&format!("        return {}(ptr: {}(ptr)!)\n", name, getter));
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
@@ -316,7 +321,12 @@ fn render_swift_getter(out: &mut String, prefix: &str, field: &StructField) {
                 out.push_str("        defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: p), outLen) }\n");
                 out.push_str("        return Data(bytes: p, count: outLen)\n");
             }
-            TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+            TypeRef::Struct(name) => {
+                let name = local_type_name(name);
+                out.push_str(&format!("        let p = {}(ptr)\n", getter));
+                out.push_str(&format!("        return p.map {{ {}(ptr: $0) }}\n", name));
+            }
+            TypeRef::TypedHandle(name) => {
                 out.push_str(&format!("        let p = {}(ptr)\n", getter));
                 out.push_str(&format!("        return p.map {{ {}(ptr: $0) }}\n", name));
             }
@@ -346,7 +356,14 @@ fn render_swift_getter(out: &mut String, prefix: &str, field: &StructField) {
                         name
                     ));
                 }
-                TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+                TypeRef::Struct(name) => {
+                    let name = local_type_name(name);
+                    out.push_str(&format!(
+                        "        return (0..<outLen).map {{ {}(ptr: rv[$0]!) }}\n",
+                        name
+                    ));
+                }
+                TypeRef::TypedHandle(name) => {
                     out.push_str(&format!(
                         "        return (0..<outLen).map {{ {}(ptr: rv[$0]!) }}\n",
                         name
@@ -713,7 +730,21 @@ fn render_async_resume_result(out: &mut String, returns: &Option<TypeRef>, inden
             ));
             out.push_str(&format!("{}contRef.value.resume(returning: str)\n", indent));
         }
-        Some(TypeRef::Struct(name) | TypeRef::TypedHandle(name)) => {
+        Some(TypeRef::Struct(name)) => {
+            let name = local_type_name(name);
+            out.push_str(&format!("{}guard let result = result else {{\n", indent));
+            out.push_str(&format!(
+                "{}    contRef.value.resume(throwing: WeaveFFIError.error(code: -1, message: \"null pointer\"))\n",
+                indent
+            ));
+            out.push_str(&format!("{}    return\n", indent));
+            out.push_str(&format!("{}}}\n", indent));
+            out.push_str(&format!(
+                "{}contRef.value.resume(returning: {}(ptr: result))\n",
+                indent, name
+            ));
+        }
+        Some(TypeRef::TypedHandle(name)) => {
             out.push_str(&format!("{}guard let result = result else {{\n", indent));
             out.push_str(&format!(
                 "{}    contRef.value.resume(throwing: WeaveFFIError.error(code: -1, message: \"null pointer\"))\n",
@@ -754,7 +785,14 @@ fn render_async_resume_result(out: &mut String, returns: &Option<TypeRef>, inden
                 ));
                 out.push_str(&format!("{}}}\n", indent));
             }
-            TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+            TypeRef::Struct(name) => {
+                let name = local_type_name(name);
+                out.push_str(&format!(
+                    "{}contRef.value.resume(returning: result.map {{ {}(ptr: $0) }})\n",
+                    indent, name
+                ));
+            }
+            TypeRef::TypedHandle(name) => {
                 out.push_str(&format!(
                     "{}contRef.value.resume(returning: result.map {{ {}(ptr: $0) }})\n",
                     indent, name
@@ -808,7 +846,14 @@ fn render_async_resume_result(out: &mut String, returns: &Option<TypeRef>, inden
                         indent, name
                     ));
                 }
-                TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+                TypeRef::Struct(name) => {
+                    let name = local_type_name(name);
+                    out.push_str(&format!(
+                        "{}contRef.value.resume(returning: (0..<len).map {{ {}(ptr: result[$0]!) }})\n",
+                        indent, name
+                    ));
+                }
+                TypeRef::TypedHandle(name) => {
                     out.push_str(&format!(
                         "{}contRef.value.resume(returning: (0..<len).map {{ {}(ptr: result[$0]!) }})\n",
                         indent, name
@@ -930,7 +975,14 @@ fn render_direct_call(out: &mut String, f: &Function, call_with_err: &str) {
             out.push_str("        defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen) }\n");
             out.push_str("        return Data(bytes: rv, count: outLen)\n");
         }
-        Some(TypeRef::Struct(name) | TypeRef::TypedHandle(name)) => {
+        Some(TypeRef::Struct(name)) => {
+            let name = local_type_name(name);
+            out.push_str(&format!("        let rv = {}\n", call_with_err));
+            out.push_str("        try check(&err)\n");
+            out.push_str("        guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: \"null pointer\") }\n");
+            out.push_str(&format!("        return {}(ptr: rv)\n", name));
+        }
+        Some(TypeRef::TypedHandle(name)) => {
             out.push_str(&format!("        let rv = {}\n", call_with_err));
             out.push_str("        try check(&err)\n");
             out.push_str("        guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: \"null pointer\") }\n");
@@ -970,7 +1022,13 @@ fn render_optional_return(out: &mut String, call_with_err: &str, inner: &TypeRef
             out.push_str("        defer { weaveffi_free_string(rv) }\n");
             out.push_str("        return String(cString: rv)\n");
         }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+        TypeRef::Struct(name) => {
+            let name = local_type_name(name);
+            out.push_str(&format!("        let rv = {}\n", call_with_err));
+            out.push_str("        try check(&err)\n");
+            out.push_str(&format!("        return rv.map {{ {}(ptr: $0) }}\n", name));
+        }
+        TypeRef::TypedHandle(name) => {
             out.push_str(&format!("        let rv = {}\n", call_with_err));
             out.push_str("        try check(&err)\n");
             out.push_str(&format!("        return rv.map {{ {}(ptr: $0) }}\n", name));
@@ -1009,7 +1067,14 @@ fn render_list_return(out: &mut String, call_with_err: &str, inner: &TypeRef) {
                 name
             ));
         }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+        TypeRef::Struct(name) => {
+            let name = local_type_name(name);
+            out.push_str(&format!(
+                "        return (0..<outLen).map {{ {}(ptr: rv[$0]!) }}\n",
+                name
+            ));
+        }
+        TypeRef::TypedHandle(name) => {
             out.push_str(&format!(
                 "        return (0..<outLen).map {{ {}(ptr: rv[$0]!) }}\n",
                 name
@@ -1036,7 +1101,16 @@ fn render_optional_return_inner(out: &mut String, call: &str, inner: &TypeRef, i
             ));
             out.push_str(&format!("{}    return String(cString: rv)\n", indent));
         }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+        TypeRef::Struct(name) => {
+            let name = local_type_name(name);
+            out.push_str(&format!("{}    let rv = {}\n", indent, call));
+            out.push_str(&format!("{}    try check(&err)\n", indent));
+            out.push_str(&format!(
+                "{}    return rv.map {{ {}(ptr: $0) }}\n",
+                indent, name
+            ));
+        }
+        TypeRef::TypedHandle(name) => {
             out.push_str(&format!("{}    let rv = {}\n", indent, call));
             out.push_str(&format!("{}    try check(&err)\n", indent));
             out.push_str(&format!(
@@ -1079,7 +1153,14 @@ fn render_list_return_inner(out: &mut String, call: &str, inner: &TypeRef, inden
                 indent, name
             ));
         }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+        TypeRef::Struct(name) => {
+            let name = local_type_name(name);
+            out.push_str(&format!(
+                "{}    return (0..<outLen).map {{ {}(ptr: rv[$0]!) }}\n",
+                indent, name
+            ));
+        }
+        TypeRef::TypedHandle(name) => {
             out.push_str(&format!(
                 "{}    return (0..<outLen).map {{ {}(ptr: rv[$0]!) }}\n",
                 indent, name
@@ -1117,7 +1198,8 @@ fn map_element_read(ty: &TypeRef, expr: &str) -> String {
     match ty {
         TypeRef::StringUtf8 => format!("String(cString: {}!)", expr),
         TypeRef::Enum(name) => format!("{}(rawValue: {}.rawValue)!", name, expr),
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => format!("{}(ptr: {}!)", name, expr),
+        TypeRef::Struct(name) => format!("{}(ptr: {}!)", local_type_name(name), expr),
+        TypeRef::TypedHandle(name) => format!("{}(ptr: {}!)", name, expr),
         _ => expr.to_string(),
     }
 }
@@ -1490,7 +1572,12 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
 
     if f.returns.is_none() {
         out.push_str("        try check(&err)\n");
-    } else if let Some(TypeRef::Struct(name) | TypeRef::TypedHandle(name)) = &f.returns {
+    } else if let Some(TypeRef::Struct(name)) = &f.returns {
+        let name = local_type_name(name);
+        out.push_str("        try check(&err)\n");
+        out.push_str("        guard let result = result else { throw WeaveFFIError.error(code: -1, message: \"null pointer\") }\n");
+        out.push_str(&format!("        return {}(ptr: result)\n", name));
+    } else if let Some(TypeRef::TypedHandle(name)) = &f.returns {
         out.push_str("        try check(&err)\n");
         out.push_str("        guard let result = result else { throw WeaveFFIError.error(code: -1, message: \"null pointer\") }\n");
         out.push_str(&format!("        return {}(ptr: result)\n", name));
@@ -3105,6 +3192,59 @@ mod tests {
         assert!(
             out.contains("weaveffi_tasks_run_async"),
             "missing async C function call: {out}"
+        );
+    }
+
+    #[test]
+    fn swift_cross_module_struct() {
+        let api = make_api(vec![
+            Module {
+                name: "types".to_string(),
+                functions: vec![],
+                structs: vec![StructDef {
+                    name: "Name".to_string(),
+                    doc: None,
+                    fields: vec![StructField {
+                        name: "value".to_string(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    }],
+                }],
+                enums: vec![],
+                errors: None,
+            },
+            Module {
+                name: "ops".to_string(),
+                functions: vec![Function {
+                    name: "get_name".to_string(),
+                    params: vec![Param {
+                        name: "id".to_string(),
+                        ty: TypeRef::I32,
+                    }],
+                    returns: Some(TypeRef::Struct("types.Name".to_string())),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            },
+        ]);
+
+        let out = render_swift_wrapper(&api, true);
+
+        assert!(
+            out.contains("-> Name"),
+            "cross-module return type should use local name 'Name': {out}"
+        );
+        assert!(
+            out.contains("Name(ptr:"),
+            "cross-module struct constructor should use local name 'Name': {out}"
+        );
+        assert!(
+            !out.contains("types.Name"),
+            "dot-qualified name should not appear in generated Swift code: {out}"
         );
     }
 }
