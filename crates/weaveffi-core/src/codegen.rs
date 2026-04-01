@@ -1,10 +1,21 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use camino::Utf8Path;
 use weaveffi_ir::ir::Api;
 
 use crate::cache;
 use crate::config::GeneratorConfig;
 use crate::templates::TemplateEngine;
+
+fn run_hook(label: &str, cmd: &str) -> Result<()> {
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .status()?;
+    if !status.success() {
+        bail!("{label} hook failed with {status}");
+    }
+    Ok(())
+}
 
 pub trait Generator {
     fn name(&self) -> &'static str;
@@ -68,8 +79,16 @@ impl<'a> Orchestrator<'a> {
             }
         }
 
+        if let Some(cmd) = &config.pre_generate {
+            run_hook("pre_generate", cmd)?;
+        }
+
         for g in &self.generators {
             g.generate_with_templates(api, out_dir, config, templates)?;
+        }
+
+        if let Some(cmd) = &config.post_generate {
+            run_hook("post_generate", cmd)?;
         }
 
         cache::write_cache(out_dir, &hash)?;
@@ -205,5 +224,83 @@ mod tests {
         orch.run(&api, out_dir, &config, true, Some(&engine))
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pre_hook_runs_before_generate() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
+        let api = test_api();
+        let config = GeneratorConfig {
+            pre_generate: Some("echo pre > /dev/null".into()),
+            ..Default::default()
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gen = CountingGenerator {
+            calls: Arc::clone(&calls),
+        };
+
+        let orch = Orchestrator::new().with_generator(&gen);
+        orch.run(&api, out_dir, &config, true, None).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pre_hook_failure_aborts() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
+        let api = test_api();
+        let config = GeneratorConfig {
+            pre_generate: Some("exit 1".into()),
+            ..Default::default()
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gen = CountingGenerator {
+            calls: Arc::clone(&calls),
+        };
+
+        let orch = Orchestrator::new().with_generator(&gen);
+        let result = orch.run(&api, out_dir, &config, true, None);
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "generator should not run");
+    }
+
+    #[test]
+    fn post_hook_runs_after_generate() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
+        let api = test_api();
+        let config = GeneratorConfig {
+            post_generate: Some("echo post > /dev/null".into()),
+            ..Default::default()
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gen = CountingGenerator {
+            calls: Arc::clone(&calls),
+        };
+
+        let orch = Orchestrator::new().with_generator(&gen);
+        orch.run(&api, out_dir, &config, true, None).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn post_hook_failure_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
+        let api = test_api();
+        let config = GeneratorConfig {
+            post_generate: Some("exit 42".into()),
+            ..Default::default()
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gen = CountingGenerator {
+            calls: Arc::clone(&calls),
+        };
+
+        let orch = Orchestrator::new().with_generator(&gen);
+        let result = orch.run(&api, out_dir, &config, true, None);
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "generator should have run");
     }
 }
