@@ -167,42 +167,110 @@ fn render_module(out: &mut String, module: &Module) {
         for p in &f.params {
             params.extend(rust_param_fragments(&p.name, &p.ty, mod_name));
         }
-        let ret_sig = if let Some(ret) = &f.returns {
-            if let TypeRef::Map(key_ty, val_ty) = ret {
-                let k = rust_scalar_type(key_ty, mod_name);
-                let v = rust_scalar_type(val_ty, mod_name);
-                if is_pointer_type(key_ty) {
-                    params.push(format!("out_keys: *mut *mut {k}"));
-                } else {
-                    params.push(format!("out_keys: *mut {k}"));
-                }
-                if is_pointer_type(val_ty) {
-                    params.push(format!("out_values: *mut *mut {v}"));
-                } else {
-                    params.push(format!("out_values: *mut {v}"));
-                }
-                params.push("out_map_len: *mut usize".into());
-                String::new()
-            } else {
-                let (ret_ty, needs_len) = rust_return_type(ret, mod_name);
-                if needs_len {
-                    params.push("out_len: *mut usize".into());
-                }
-                format!(" -> {ret_ty}")
-            }
-        } else {
-            String::new()
-        };
-        params.push("out_err: *mut weaveffi_error".into());
 
-        out.push_str("#[no_mangle]\n");
-        out.push_str(&format!(
-            "pub extern \"C\" fn {fn_name}({}){ret_sig} {{\n",
-            params.join(", ")
-        ));
-        out.push_str("    todo!()\n");
-        out.push_str("}\n\n");
+        if f.r#async {
+            render_async_function(out, &fn_name, &params, f.returns.as_ref(), mod_name);
+        } else {
+            render_sync_function(out, &fn_name, &mut params, f.returns.as_ref(), mod_name);
+        }
     }
+}
+
+fn render_sync_function(
+    out: &mut String,
+    fn_name: &str,
+    params: &mut Vec<String>,
+    returns: Option<&TypeRef>,
+    mod_name: &str,
+) {
+    let ret_sig = if let Some(ret) = returns {
+        if let TypeRef::Map(key_ty, val_ty) = ret {
+            let k = rust_scalar_type(key_ty, mod_name);
+            let v = rust_scalar_type(val_ty, mod_name);
+            if is_pointer_type(key_ty) {
+                params.push(format!("out_keys: *mut *mut {k}"));
+            } else {
+                params.push(format!("out_keys: *mut {k}"));
+            }
+            if is_pointer_type(val_ty) {
+                params.push(format!("out_values: *mut *mut {v}"));
+            } else {
+                params.push(format!("out_values: *mut {v}"));
+            }
+            params.push("out_map_len: *mut usize".into());
+            String::new()
+        } else {
+            let (ret_ty, needs_len) = rust_return_type(ret, mod_name);
+            if needs_len {
+                params.push("out_len: *mut usize".into());
+            }
+            format!(" -> {ret_ty}")
+        }
+    } else {
+        String::new()
+    };
+    params.push("out_err: *mut weaveffi_error".into());
+
+    out.push_str("#[no_mangle]\n");
+    out.push_str(&format!(
+        "pub extern \"C\" fn {fn_name}({}){ret_sig} {{\n",
+        params.join(", ")
+    ));
+    out.push_str("    todo!()\n");
+    out.push_str("}\n\n");
+}
+
+fn render_async_function(
+    out: &mut String,
+    fn_name: &str,
+    params: &[String],
+    returns: Option<&TypeRef>,
+    mod_name: &str,
+) {
+    let mut cb_params = Vec::new();
+    if let Some(ret) = returns {
+        if let TypeRef::Map(key_ty, val_ty) = ret {
+            let k = rust_scalar_type(key_ty, mod_name);
+            let v = rust_scalar_type(val_ty, mod_name);
+            cb_params.push(if is_pointer_type(key_ty) {
+                format!("*mut *mut {k}")
+            } else {
+                format!("*mut {k}")
+            });
+            cb_params.push(if is_pointer_type(val_ty) {
+                format!("*mut *mut {v}")
+            } else {
+                format!("*mut {v}")
+            });
+            cb_params.push("usize".into());
+        } else {
+            let (ret_ty, needs_len) = rust_return_type(ret, mod_name);
+            cb_params.push(ret_ty);
+            if needs_len {
+                cb_params.push("usize".into());
+            }
+        }
+    }
+    cb_params.push("*mut weaveffi_error".into());
+    cb_params.push("*mut std::ffi::c_void".into());
+
+    let cb_type = format!("{fn_name}_callback");
+    out.push_str(&format!(
+        "pub type {cb_type} = extern \"C\" fn({});\n\n",
+        cb_params.join(", ")
+    ));
+
+    let mut fn_params = params.to_vec();
+    fn_params.push(format!("callback: {cb_type}"));
+    fn_params.push("context: *mut std::ffi::c_void".into());
+
+    out.push_str("#[no_mangle]\n");
+    out.push_str(&format!(
+        "pub extern \"C\" fn {fn_name}({}) {{\n",
+        fn_params.join(", ")
+    ));
+    out.push_str("    todo!(\"spawn async work and call callback with result\")\n");
+    out.push_str("}\n\n");
 }
 
 fn render_struct_scaffold(out: &mut String, module: &str, s: &StructDef) {
@@ -631,6 +699,73 @@ mod tests {
         assert!(
             out.contains("-> *mut Contact"),
             "TypedHandle return should be *mut Contact: {out}"
+        );
+    }
+
+    #[test]
+    fn scaffold_async_function() {
+        let api = minimal_api(
+            vec![Function {
+                name: "fetch".into(),
+                params: vec![Param {
+                    name: "url".into(),
+                    ty: TypeRef::StringUtf8,
+                }],
+                returns: Some(TypeRef::StringUtf8),
+                doc: None,
+                r#async: true,
+            }],
+            vec![],
+        );
+        let out = render_scaffold(&api);
+        assert!(
+            out.contains("pub type weaveffi_calc_fetch_callback = extern \"C\" fn("),
+            "missing callback type alias: {out}"
+        );
+        assert!(
+            out.contains("callback: weaveffi_calc_fetch_callback"),
+            "missing callback parameter: {out}"
+        );
+        assert!(
+            out.contains("context: *mut std::ffi::c_void"),
+            "missing context parameter: {out}"
+        );
+        assert!(
+            out.contains("todo!(\"spawn async work and call callback with result\")"),
+            "missing async todo body: {out}"
+        );
+        assert!(
+            !out.contains("out_err: *mut weaveffi_error"),
+            "async function should not have out_err param: {out}"
+        );
+        assert!(
+            !out.contains("-> *const c_char"),
+            "async function should not have a return type: {out}"
+        );
+    }
+
+    #[test]
+    fn scaffold_async_void_function() {
+        let api = minimal_api(
+            vec![Function {
+                name: "sync_data".into(),
+                params: vec![],
+                returns: None,
+                doc: None,
+                r#async: true,
+            }],
+            vec![],
+        );
+        let out = render_scaffold(&api);
+        assert!(
+            out.contains(
+                "pub type weaveffi_calc_sync_data_callback = extern \"C\" fn(*mut weaveffi_error, *mut std::ffi::c_void);"
+            ),
+            "void async callback should only have error + context: {out}"
+        );
+        assert!(
+            out.contains("callback: weaveffi_calc_sync_data_callback"),
+            "missing callback parameter: {out}"
         );
     }
 
