@@ -262,6 +262,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         }
     }
 
@@ -662,6 +663,7 @@ mod tests {
                     errors: None,
                 },
             ],
+            generators: None,
         };
         let out = render_scaffold(&api);
         assert!(out.contains("weaveffi_math_add"), "missing math module");

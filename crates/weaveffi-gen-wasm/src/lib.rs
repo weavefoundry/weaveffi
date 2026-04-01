@@ -637,6 +637,7 @@ mod tests {
         Api {
             version: "0.1.0".into(),
             modules: vec![],
+            generators: None,
         }
     }
 
@@ -644,6 +645,7 @@ mod tests {
         Api {
             version: "0.1.0".into(),
             modules,
+            generators: None,
         }
     }
 

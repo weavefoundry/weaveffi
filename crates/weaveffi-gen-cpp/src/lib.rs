@@ -1001,6 +1001,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         }
     }
 
@@ -1075,6 +1076,7 @@ mod tests {
                 ],
                 errors: None,
             }],
+            generators: None,
         }
     }
 
@@ -1445,6 +1447,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let h = render_cpp_header(&api, "weaveffi");
         assert!(
@@ -1475,6 +1478,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let h = render_cpp_header(&api, "weaveffi");
         assert!(
@@ -1511,6 +1515,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let h = render_cpp_header(&api, "weaveffi");
         assert!(
@@ -1559,6 +1564,7 @@ mod tests {
                 }],
                 errors: None,
             }],
+            generators: None,
         };
         let h = render_cpp_header(&api, "weaveffi");
         assert!(
@@ -1600,6 +1606,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let h = render_cpp_header(&api, "weaveffi");
         assert!(
@@ -1632,6 +1639,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let h = render_cpp_header(&api, "weaveffi");
         assert!(
@@ -1663,6 +1671,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let h = render_cpp_header(&api, "weaveffi");
         assert!(
@@ -1690,6 +1699,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let h = render_cpp_header(&api, "weaveffi");
         assert!(
@@ -1769,6 +1779,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let h = render_cpp_header(&api, "weaveffi");
         assert!(
@@ -1802,6 +1813,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let h = render_cpp_header(&api, "weaveffi");
         assert!(
@@ -1863,6 +1875,7 @@ mod tests {
                     ],
                 }),
             }],
+            generators: None,
         };
         let h = render_cpp_header(&api, "weaveffi");
         assert!(
@@ -2012,6 +2025,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let h = render_cpp_header(&api, "weaveffi");
 
@@ -2082,6 +2096,7 @@ mod tests {
                 }],
                 errors: None,
             }],
+            generators: None,
         };
         let h = render_cpp_header(&api, "weaveffi");
 
@@ -2131,6 +2146,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let h = render_cpp_header(&api, "weaveffi");
 
@@ -2176,6 +2192,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let h = render_cpp_header(&api, "weaveffi");
 
@@ -2227,6 +2244,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let h = render_cpp_header(&api, "weaveffi");
 
@@ -2268,6 +2286,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let h = render_cpp_header(&api, "weaveffi");
 

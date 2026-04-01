@@ -876,6 +876,7 @@ mod tests {
         Api {
             version: "0.1.0".into(),
             modules,
+            generators: None,
         }
     }
 

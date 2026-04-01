@@ -1,9 +1,14 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `Eq` is omitted because `toml::Value` contains `f64`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Api {
     pub version: String,
     pub modules: Vec<Module>,
+    #[serde(default)]
+    pub generators: Option<HashMap<String, toml::Value>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -798,6 +803,39 @@ modules:
             Ok(TypeRef::TypedHandle("Session".into()))
         );
         assert_eq!(parse_type_ref("handle"), Ok(TypeRef::Handle));
+    }
+
+    #[test]
+    fn generators_field_parses_from_yaml() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: math
+    functions: []
+generators:
+  swift:
+    module_name: MySwiftModule
+  android:
+    package: com.example.app
+"#;
+        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        let generators = api.generators.as_ref().unwrap();
+        let swift = generators["swift"].as_table().unwrap();
+        assert_eq!(swift["module_name"].as_str(), Some("MySwiftModule"));
+        let android = generators["android"].as_table().unwrap();
+        assert_eq!(android["package"].as_str(), Some("com.example.app"));
+    }
+
+    #[test]
+    fn generators_defaults_to_none() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: math
+    functions: []
+"#;
+        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        assert!(api.generators.is_none());
     }
 
     #[test]

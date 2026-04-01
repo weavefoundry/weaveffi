@@ -6,7 +6,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use color_eyre::eyre::{bail, eyre, Report, Result, WrapErr};
 use color_eyre::Section;
 use similar::TextDiff;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::ffi::OsStr;
 use std::process::Command;
@@ -296,6 +296,34 @@ fn load_config(path: Option<&str>) -> Result<GeneratorConfig> {
     }
 }
 
+fn merge_inline_generators(
+    config: &mut GeneratorConfig,
+    generators: &HashMap<String, toml::Value>,
+) {
+    for (target, value) in generators {
+        let Some(table) = value.as_table() else {
+            continue;
+        };
+        for (key, val) in table {
+            let Some(s) = val.as_str() else { continue };
+            let field = format!("{target}_{key}");
+            match field.as_str() {
+                "swift_module_name" => config.swift_module_name = Some(s.to_owned()),
+                "android_package" => config.android_package = Some(s.to_owned()),
+                "node_package_name" => config.node_package_name = Some(s.to_owned()),
+                "wasm_module_name" => config.wasm_module_name = Some(s.to_owned()),
+                "c_prefix" => config.c_prefix = Some(s.to_owned()),
+                "python_package_name" => config.python_package_name = Some(s.to_owned()),
+                "dotnet_namespace" => config.dotnet_namespace = Some(s.to_owned()),
+                "cpp_namespace" => config.cpp_namespace = Some(s.to_owned()),
+                "cpp_header_name" => config.cpp_header_name = Some(s.to_owned()),
+                "cpp_standard" => config.cpp_standard = Some(s.to_owned()),
+                _ => {}
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_generate(
     input: &str,
@@ -309,7 +337,7 @@ fn cmd_generate(
     templates_path: Option<&str>,
     quiet: bool,
 ) -> Result<()> {
-    let config = load_config(config_path)?;
+    let mut config = load_config(config_path)?;
 
     let in_path = Utf8Path::new(input);
     let ext = in_path.extension().unwrap_or("");
@@ -329,6 +357,10 @@ fn cmd_generate(
         .wrap_err_with(|| format!("failed to read input file: {}", input))?;
     let mut api = parse_api_str(&contents, format).map_err(|e| format_parse_error(input, e))?;
     validate_api(&mut api).map_err(format_validation_error)?;
+
+    if let Some(ref generators) = api.generators {
+        merge_inline_generators(&mut config, generators);
+    }
 
     if warn {
         for w in collect_warnings(&api) {
@@ -1093,6 +1125,60 @@ mod tests {
             cmd_lint(&sample, false).unwrap(),
             "calculator sample should be lint-clean"
         );
+    }
+
+    #[test]
+    fn inline_generator_config() {
+        let yaml = concat!(
+            "version: \"0.1.0\"\n",
+            "modules:\n",
+            "  - name: math\n",
+            "    functions:\n",
+            "      - name: add\n",
+            "        params:\n",
+            "          - { name: a, type: i32 }\n",
+            "          - { name: b, type: i32 }\n",
+            "        return: i32\n",
+            "generators:\n",
+            "  swift:\n",
+            "    module_name: MySwiftModule\n",
+        );
+        let api: weaveffi_ir::ir::Api = serde_yaml::from_str(yaml).unwrap();
+        assert!(api.generators.is_some());
+
+        let mut config = GeneratorConfig::default();
+        merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
+        assert_eq!(config.swift_module_name, Some("MySwiftModule".to_string()));
+    }
+
+    #[test]
+    fn inline_generator_config_overrides_file() {
+        let yaml = concat!(
+            "version: \"0.1.0\"\n",
+            "modules:\n",
+            "  - name: math\n",
+            "    functions:\n",
+            "      - name: add\n",
+            "        params:\n",
+            "          - { name: a, type: i32 }\n",
+            "          - { name: b, type: i32 }\n",
+            "        return: i32\n",
+            "generators:\n",
+            "  swift:\n",
+            "    module_name: FromIDL\n",
+            "  android:\n",
+            "    package: com.idl.app\n",
+        );
+        let api: weaveffi_ir::ir::Api = serde_yaml::from_str(yaml).unwrap();
+
+        let mut config = GeneratorConfig {
+            swift_module_name: Some("FromFile".into()),
+            android_package: Some("com.file.app".into()),
+            ..Default::default()
+        };
+        merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
+        assert_eq!(config.swift_module_name, Some("FromIDL".to_string()));
+        assert_eq!(config.android_package, Some("com.idl.app".to_string()));
     }
 
     #[test]

@@ -513,6 +513,7 @@ mod tests {
         Api {
             version: "0.1.0".to_string(),
             modules: vec![simple_module("mymod")],
+            generators: None,
         }
     }
 
@@ -527,6 +528,7 @@ mod tests {
         let mut api = Api {
             version: "0.1.0".to_string(),
             modules: vec![simple_module("dup"), simple_module("dup")],
+            generators: None,
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
@@ -545,6 +547,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
@@ -564,6 +567,7 @@ mod tests {
                     enums: vec![],
                     errors: None,
                 }],
+                generators: None,
             };
             assert!(
                 validate_api(&mut api).is_err(),
@@ -584,6 +588,7 @@ mod tests {
                     enums: vec![],
                     errors: None,
                 }],
+                generators: None,
             };
             assert!(
                 validate_api(&mut api).is_err(),
@@ -609,6 +614,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let err = validate_api(&mut api).unwrap_err();
         assert!(matches!(err, ValidationError::AsyncNotSupported { .. }));
@@ -629,6 +635,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
@@ -693,6 +700,7 @@ mod tests {
                     ],
                 }),
             }],
+            generators: None,
         };
         assert!(validate_api(&mut api).is_ok());
     }
@@ -715,6 +723,7 @@ mod tests {
                     }],
                 }),
             }],
+            generators: None,
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
@@ -741,6 +750,7 @@ mod tests {
                     }],
                 }),
             }],
+            generators: None,
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
@@ -774,6 +784,7 @@ mod tests {
                     ],
                 }),
             }],
+            generators: None,
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
@@ -807,6 +818,7 @@ mod tests {
                     ],
                 }),
             }],
+            generators: None,
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
@@ -837,6 +849,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
@@ -860,6 +873,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
@@ -894,6 +908,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
@@ -932,6 +947,7 @@ mod tests {
                 enums: vec![simple_enum("Color"), simple_enum("Color")],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
@@ -955,6 +971,7 @@ mod tests {
                 }],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
@@ -989,6 +1006,7 @@ mod tests {
                 }],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
@@ -1023,6 +1041,7 @@ mod tests {
                 }],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
@@ -1051,6 +1070,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
@@ -1078,6 +1098,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(validate_api(&mut api).is_ok());
     }
@@ -1102,6 +1123,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
@@ -1126,6 +1148,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
@@ -1152,6 +1175,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
@@ -1187,6 +1211,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(validate_api(&mut api).is_ok());
     }
@@ -1211,6 +1236,7 @@ mod tests {
                 enums: vec![simple_enum("Color")],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(validate_api(&mut api).is_ok());
     }
@@ -1242,6 +1268,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(validate_api(&mut api).is_ok());
     }
@@ -1272,6 +1299,7 @@ mod tests {
                 }],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(validate_api(&mut api).is_ok());
     }
@@ -1293,6 +1321,7 @@ mod tests {
                 enums: vec![simple_enum("Color")],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(validate_api(&mut api).is_ok());
     }
@@ -1317,6 +1346,7 @@ mod tests {
                 enums: vec![simple_enum("Color")],
                 errors: None,
             }],
+            generators: None,
         };
         validate_api(&mut api).unwrap();
         assert_eq!(
@@ -1345,6 +1375,7 @@ mod tests {
                 enums: vec![simple_enum("Color")],
                 errors: None,
             }],
+            generators: None,
         };
         validate_api(&mut api).unwrap();
         assert_eq!(
@@ -1373,6 +1404,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         validate_api(&mut api).unwrap();
         assert_eq!(
@@ -1401,6 +1433,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(validate_api(&mut api).is_ok());
     }
@@ -1425,6 +1458,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
@@ -1452,6 +1486,7 @@ mod tests {
                 enums: vec![simple_enum("Color")],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(validate_api(&mut api).is_ok());
     }
@@ -1476,6 +1511,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let warnings = collect_warnings(&api);
         assert_eq!(warnings.len(), 1);
@@ -1503,6 +1539,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let warnings = collect_warnings(&api);
         assert!(warnings.iter().any(|w| matches!(
@@ -1528,6 +1565,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let warnings = collect_warnings(&api);
         assert!(warnings.iter().any(|w| matches!(
@@ -1556,6 +1594,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let warnings = collect_warnings(&api);
         assert_eq!(warnings.len(), 1);
@@ -1590,6 +1629,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let warnings = collect_warnings(&api);
         assert!(!warnings
@@ -1619,6 +1659,7 @@ mod tests {
                 }],
                 errors: None,
             }],
+            generators: None,
         };
         let warnings = collect_warnings(&api);
         assert!(warnings.iter().any(|w| matches!(
@@ -1650,6 +1691,7 @@ mod tests {
                 }],
                 errors: None,
             }],
+            generators: None,
         };
         let warnings = collect_warnings(&api);
         assert!(!warnings
@@ -1680,6 +1722,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let warnings = collect_warnings(&api);
         assert!(warnings.iter().any(|w| matches!(
@@ -1712,6 +1755,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let warnings = collect_warnings(&api);
         assert!(!warnings
@@ -1741,6 +1785,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let warnings = collect_warnings(&api);
         assert!(warnings.iter().any(|w| matches!(
@@ -1776,6 +1821,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let warnings = collect_warnings(&api);
         assert!(warnings.iter().any(|w| matches!(
@@ -1810,6 +1856,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let warnings = collect_warnings(&api);
         assert!(!warnings
@@ -1828,6 +1875,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         let warnings = collect_warnings(&api);
         assert!(!warnings
@@ -1855,6 +1903,7 @@ mod tests {
                 enums: vec![simple_enum("Color")],
                 errors: None,
             }],
+            generators: None,
         };
         let warnings = collect_warnings(&api);
         assert!(warnings.is_empty());
@@ -1879,6 +1928,7 @@ mod tests {
                 enums: vec![simple_enum("Color")],
                 errors: None,
             }],
+            generators: None,
         };
         validate_api(&mut api).unwrap();
         assert_eq!(
@@ -1907,6 +1957,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(validate_api(&mut api).is_ok());
     }
@@ -1931,6 +1982,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
@@ -1958,6 +2010,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(validate_api(&mut api).is_ok());
     }
@@ -1982,6 +2035,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(validate_api(&mut api).is_ok());
     }
@@ -2003,6 +2057,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
@@ -2028,6 +2083,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
@@ -2055,6 +2111,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
@@ -2082,6 +2139,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
@@ -2107,6 +2165,7 @@ mod tests {
                 enums: vec![],
                 errors: None,
             }],
+            generators: None,
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
