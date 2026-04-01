@@ -149,7 +149,7 @@ fn render_cpp_header(api: &Api, namespace: &str) -> String {
     {
         out.push_str("#include <future>\n");
     }
-    out.push_str("\n");
+    out.push('\n');
 
     out.push_str("extern \"C\" {\n\n");
     render_extern_c(&mut out, api);
@@ -1002,10 +1002,7 @@ fn render_cpp_function(
     abi_module: &str,
     error_codes: &[&ErrorCode],
 ) {
-    let cpp_ret = func
-        .returns
-        .as_ref()
-        .map_or("void".to_string(), |ty| cpp_type(ty));
+    let cpp_ret = func.returns.as_ref().map_or("void".to_string(), cpp_type);
     let cpp_params: Vec<String> = func
         .params
         .iter()
@@ -1034,7 +1031,7 @@ fn render_cpp_function(
     let is_void_c = func
         .returns
         .as_ref()
-        .map_or(true, |r| matches!(r, TypeRef::Map(_, _)));
+        .is_none_or(|r| matches!(r, TypeRef::Map(_, _)));
 
     if let Some(ret) = &func.returns {
         match ret {
@@ -1209,10 +1206,7 @@ fn render_cpp_return(out: &mut String, ty: &TypeRef) {
 }
 
 fn render_cpp_async_function(out: &mut String, func: &Function, abi_module: &str) {
-    let cpp_ret = func
-        .returns
-        .as_ref()
-        .map_or("void".to_string(), |ty| cpp_type(ty));
+    let cpp_ret = func.returns.as_ref().map_or("void".to_string(), cpp_type);
     let mut cpp_params: Vec<String> = func
         .params
         .iter()

@@ -254,7 +254,7 @@ fn render_csharp(api: &Api, namespace: &str, strip_module_prefix: bool) -> Strin
     {
         out.push_str("using System.Threading.Tasks;\n");
     }
-    out.push_str("\n");
+    out.push('\n');
     out.push_str(&format!("namespace {namespace}\n{{\n"));
 
     render_exception_class(&mut out);
@@ -408,7 +408,7 @@ fn render_builder_class(out: &mut String, module_name: &str, s: &StructDef) {
         let fname = safe_cs_name(&field.name);
         out.push_str(&format!("        private {storage} _{fname};\n"));
     }
-    out.push_str("\n");
+    out.push('\n');
     for field in &s.fields {
         let pascal = field.name.to_upper_camel_case();
         let param_ty = cs_type(&field.ty);

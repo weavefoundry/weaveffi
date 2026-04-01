@@ -710,7 +710,7 @@ fn render_builder(out: &mut String, s: &StructDef) {
         "\n        raise NotImplementedError(\"{}Builder.build requires FFI backing\")",
         s.name
     ));
-    out.push_str("\n");
+    out.push('\n');
 }
 
 fn render_getter(out: &mut String, prefix: &str, field: &StructField) {
@@ -1221,7 +1221,7 @@ fn render_iterator_class(out: &mut String, module_name: &str, func_name: &str, i
 
     out.push_str("\n\n    def __del__(self):");
     out.push_str("\n        self._destroy()");
-    out.push_str("\n");
+    out.push('\n');
 }
 
 fn render_iterator_return(
