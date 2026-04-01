@@ -280,7 +280,11 @@ fn cmd_new(name: &str, quiet: bool) -> Result<()> {
             "   ```sh\n",
             "   weaveffi generate weaveffi.yml -o generated\n",
             "   ```\n\n",
-            "4. Use the generated bindings from Swift, Kotlin, Node.js, Python, .NET, or WASM.\n",
+            "4. Test your library:\n\n",
+            "   ```sh\n",
+            "   cargo test\n",
+            "   ```\n\n",
+            "5. Use the generated bindings from Swift, Kotlin, Node.js, Python, .NET, or WASM.\n",
         ),
         name = name,
     );

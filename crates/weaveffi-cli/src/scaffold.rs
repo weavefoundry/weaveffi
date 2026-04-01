@@ -130,7 +130,7 @@ pub fn render_scaffold(api: &Api) -> String {
     out.push_str("#![allow(unsafe_code)]\n");
     out.push_str("#![allow(clippy::not_unsafe_ptr_arg_deref)]\n\n");
     out.push_str("use std::os::raw::c_char;\n");
-    out.push_str("use weaveffi_abi::{self as abi, weaveffi_error};\n\n");
+    out.push_str("use weaveffi_abi::*;\n\n");
 
     for m in &api.modules {
         render_module(&mut out, m);
@@ -138,17 +138,17 @@ pub fn render_scaffold(api: &Api) -> String {
 
     out.push_str("#[no_mangle]\n");
     out.push_str("pub extern \"C\" fn weaveffi_free_string(ptr: *const c_char) {\n");
-    out.push_str("    abi::free_string(ptr);\n");
+    out.push_str("    free_string(ptr);\n");
     out.push_str("}\n\n");
 
     out.push_str("#[no_mangle]\n");
     out.push_str("pub extern \"C\" fn weaveffi_free_bytes(ptr: *mut u8, len: usize) {\n");
-    out.push_str("    abi::free_bytes(ptr, len);\n");
+    out.push_str("    free_bytes(ptr, len);\n");
     out.push_str("}\n\n");
 
     out.push_str("#[no_mangle]\n");
     out.push_str("pub extern \"C\" fn weaveffi_error_clear(err: *mut weaveffi_error) {\n");
-    out.push_str("    abi::error_clear(err);\n");
+    out.push_str("    error_clear(err);\n");
     out.push_str("}\n");
 
     out
@@ -348,7 +348,7 @@ mod tests {
     fn scaffold_imports_abi() {
         let api = minimal_api(vec![], vec![]);
         let out = render_scaffold(&api);
-        assert!(out.contains("use weaveffi_abi::{self as abi, weaveffi_error};"));
+        assert!(out.contains("use weaveffi_abi::*;"));
     }
 
     #[test]
@@ -359,7 +359,7 @@ mod tests {
         assert!(out.contains("fn weaveffi_free_bytes("));
         assert!(out.contains("fn weaveffi_error_clear("));
         assert!(
-            out.contains("abi::free_string(ptr);"),
+            out.contains("free_string(ptr);"),
             "runtime exports should delegate to abi"
         );
     }
