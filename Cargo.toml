@@ -10,6 +10,7 @@ members = [
     "crates/weaveffi-gen-wasm",
     "crates/weaveffi-gen-python",
     "crates/weaveffi-gen-dotnet",
+    "crates/weaveffi-gen-cpp",
     "crates/weaveffi-cli",
     "samples/calculator",
     "samples/node-addon",
