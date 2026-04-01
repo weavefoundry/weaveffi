@@ -1568,6 +1568,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "color-eyre",
+ "criterion",
  "predicates",
  "quote",
  "serde_json",
