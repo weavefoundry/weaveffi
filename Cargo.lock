@@ -1581,6 +1581,7 @@ dependencies = [
  "weaveffi-core",
  "weaveffi-gen-android",
  "weaveffi-gen-c",
+ "weaveffi-gen-cpp",
  "weaveffi-gen-dotnet",
  "weaveffi-gen-node",
  "weaveffi-gen-python",
@@ -1620,6 +1621,17 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "camino",
+ "weaveffi-core",
+ "weaveffi-ir",
+]
+
+[[package]]
+name = "weaveffi-gen-cpp"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "camino",
+ "heck",
  "weaveffi-core",
  "weaveffi-ir",
 ]
