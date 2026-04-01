@@ -104,8 +104,8 @@ fn swift_type_for(t: &TypeRef) -> String {
         TypeRef::Bool => "Bool".to_string(),
         TypeRef::StringUtf8 => "String".to_string(),
         TypeRef::Bytes => "Data".to_string(),
-        TypeRef::TypedHandle(_) | TypeRef::Handle => "UInt64".to_string(),
-        TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
+        TypeRef::Handle => "UInt64".to_string(),
+        TypeRef::TypedHandle(name) | TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
         TypeRef::Optional(inner) => format!("{}?", swift_type_for(inner)),
         TypeRef::List(inner) => format!("[{}]", swift_type_for(inner)),
         TypeRef::Map(k, v) => format!("[{}: {}]", swift_type_for(k), swift_type_for(v)),
@@ -121,7 +121,6 @@ fn is_c_value_type(ty: &TypeRef) -> bool {
             | TypeRef::F64
             | TypeRef::Bool
             | TypeRef::Handle
-            | TypeRef::TypedHandle(_)
             | TypeRef::Enum(_)
     )
 }
@@ -279,7 +278,7 @@ fn render_swift_getter(out: &mut String, prefix: &str, field: &StructField) {
             out.push_str("        defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: raw), outLen) }\n");
             out.push_str("        return Data(bytes: raw, count: outLen)\n");
         }
-        TypeRef::Struct(name) => {
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
             out.push_str(&format!("        return {}(ptr: {}(ptr)!)\n", name, getter));
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
@@ -296,7 +295,7 @@ fn render_swift_getter(out: &mut String, prefix: &str, field: &StructField) {
                 out.push_str("        defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: p), outLen) }\n");
                 out.push_str("        return Data(bytes: p, count: outLen)\n");
             }
-            TypeRef::Struct(name) => {
+            TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
                 out.push_str(&format!("        let p = {}(ptr)\n", getter));
                 out.push_str(&format!("        return p.map {{ {}(ptr: $0) }}\n", name));
             }
@@ -326,7 +325,7 @@ fn render_swift_getter(out: &mut String, prefix: &str, field: &StructField) {
                         name
                     ));
                 }
-                TypeRef::Struct(name) => {
+                TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
                     out.push_str(&format!(
                         "        return (0..<outLen).map {{ {}(ptr: rv[$0]!) }}\n",
                         name
@@ -397,13 +396,15 @@ fn build_c_call_args(params: &[Param], module_name: &str) -> String {
                 args.push(format!("{}_ptr", p.name));
                 args.push(format!("{}_len", p.name));
             }
-            TypeRef::Struct(_) => args.push(format!("{}.ptr", p.name)),
+            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => args.push(format!("{}.ptr", p.name)),
             TypeRef::Enum(enum_name) => args.push(format!(
                 "weaveffi_{}_{}({}.rawValue)",
                 module_name, enum_name, p.name
             )),
             TypeRef::Optional(inner) => match inner.as_ref() {
-                TypeRef::Struct(_) => args.push(format!("{}?.ptr", p.name)),
+                TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+                    args.push(format!("{}?.ptr", p.name))
+                }
                 TypeRef::StringUtf8 | TypeRef::Bytes => {
                     args.push(format!("{}_ptr", p.name));
                     args.push(format!("{}_len", p.name));
@@ -449,7 +450,7 @@ fn render_direct_call(out: &mut String, f: &Function, call_with_err: &str) {
             out.push_str("        defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen) }\n");
             out.push_str("        return Data(bytes: rv, count: outLen)\n");
         }
-        Some(TypeRef::Struct(name)) => {
+        Some(TypeRef::Struct(name) | TypeRef::TypedHandle(name)) => {
             out.push_str(&format!("        let rv = {}\n", call_with_err));
             out.push_str("        try check(&err)\n");
             out.push_str("        guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: \"null pointer\") }\n");
@@ -489,7 +490,7 @@ fn render_optional_return(out: &mut String, call_with_err: &str, inner: &TypeRef
             out.push_str("        defer { weaveffi_free_string(rv) }\n");
             out.push_str("        return String(cString: rv)\n");
         }
-        TypeRef::Struct(name) => {
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
             out.push_str(&format!("        let rv = {}\n", call_with_err));
             out.push_str("        try check(&err)\n");
             out.push_str(&format!("        return rv.map {{ {}(ptr: $0) }}\n", name));
@@ -528,7 +529,7 @@ fn render_list_return(out: &mut String, call_with_err: &str, inner: &TypeRef) {
                 name
             ));
         }
-        TypeRef::Struct(name) => {
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
             out.push_str(&format!(
                 "        return (0..<outLen).map {{ {}(ptr: rv[$0]!) }}\n",
                 name
@@ -555,7 +556,7 @@ fn render_optional_return_inner(out: &mut String, call: &str, inner: &TypeRef, i
             ));
             out.push_str(&format!("{}    return String(cString: rv)\n", indent));
         }
-        TypeRef::Struct(name) => {
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
             out.push_str(&format!("{}    let rv = {}\n", indent, call));
             out.push_str(&format!("{}    try check(&err)\n", indent));
             out.push_str(&format!(
@@ -598,7 +599,7 @@ fn render_list_return_inner(out: &mut String, call: &str, inner: &TypeRef, inden
                 indent, name
             ));
         }
-        TypeRef::Struct(name) => {
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
             out.push_str(&format!(
                 "{}    return (0..<outLen).map {{ {}(ptr: rv[$0]!) }}\n",
                 indent, name
@@ -620,11 +621,11 @@ fn swift_c_ptr_element(ty: &TypeRef) -> String {
         TypeRef::I64 => "Int64".to_string(),
         TypeRef::F64 => "Double".to_string(),
         TypeRef::Bool => "Bool".to_string(),
-        TypeRef::TypedHandle(_) | TypeRef::Handle => "UInt64".to_string(),
+        TypeRef::Handle => "UInt64".to_string(),
         TypeRef::StringUtf8 => "UnsafePointer<CChar>?".to_string(),
         TypeRef::Bytes => "UInt8".to_string(),
         TypeRef::Enum(_) => "Int32".to_string(),
-        TypeRef::Struct(_) => "OpaquePointer?".to_string(),
+        TypeRef::TypedHandle(_) | TypeRef::Struct(_) => "OpaquePointer?".to_string(),
         TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
             "OpaquePointer?".to_string()
         }
@@ -635,7 +636,7 @@ fn map_element_read(ty: &TypeRef, expr: &str) -> String {
     match ty {
         TypeRef::StringUtf8 => format!("String(cString: {}!)", expr),
         TypeRef::Enum(name) => format!("{}(rawValue: {}.rawValue)!", name, expr),
-        TypeRef::Struct(name) => format!("{}(ptr: {}!)", name, expr),
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => format!("{}(ptr: {}!)", name, expr),
         _ => expr.to_string(),
     }
 }
@@ -705,7 +706,7 @@ fn render_map_return_inner(out: &mut String, call: &str, k: &TypeRef, v: &TypeRe
 fn map_array_source(ty: &TypeRef, name: &str, suffix: &str) -> String {
     match ty {
         TypeRef::Enum(_) => format!("{name}_{suffix}Raw"),
-        TypeRef::Struct(_) => format!("{name}_{suffix}Ptrs"),
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => format!("{name}_{suffix}Ptrs"),
         _ => format!("{name}_{suffix}"),
     }
 }
@@ -739,7 +740,7 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
                         e = enum_name
                     ));
                 }
-                TypeRef::Struct(_) => {
+                TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
                     out.push_str(&format!(
                         "        let {n}_ptrs = {n}.map {{ $0.ptr }}\n",
                         n = p.name
@@ -763,7 +764,7 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
                             n = p.name, m = module_name, e = e
                         ));
                     }
-                    TypeRef::Struct(_) => {
+                    TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
                         out.push_str(&format!(
                             "        let {n}_keysPtrs = {n}_keys.map {{ $0.ptr }}\n",
                             n = p.name
@@ -778,7 +779,7 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
                             n = p.name, m = module_name, e = e
                         ));
                     }
-                    TypeRef::Struct(_) => {
+                    TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
                         out.push_str(&format!(
                             "        let {n}_valuesPtrs = {n}_values.map {{ $0.ptr }}\n",
                             n = p.name
@@ -821,7 +822,7 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
     );
 
     let ret_type = match &f.returns {
-        Some(TypeRef::Struct(_)) => "OpaquePointer?".to_string(),
+        Some(TypeRef::Struct(_) | TypeRef::TypedHandle(_)) => "OpaquePointer?".to_string(),
         Some(ty) => swift_type_for(ty),
         None => "Void".to_string(),
     };
@@ -876,7 +877,7 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
             TypeRef::List(inner) => {
                 let source = match inner.as_ref() {
                     TypeRef::Enum(_) => format!("{}_raw", p.name),
-                    TypeRef::Struct(_) => format!("{}_ptrs", p.name),
+                    TypeRef::Struct(_) | TypeRef::TypedHandle(_) => format!("{}_ptrs", p.name),
                     _ => p.name.clone(),
                 };
                 if needs_return && is_first {
@@ -1005,7 +1006,7 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
 
     if f.returns.is_none() {
         out.push_str("        try check(&err)\n");
-    } else if let Some(TypeRef::Struct(name)) = &f.returns {
+    } else if let Some(TypeRef::Struct(name) | TypeRef::TypedHandle(name)) = &f.returns {
         out.push_str("        try check(&err)\n");
         out.push_str("        guard let result = result else { throw WeaveFFIError.error(code: -1, message: \"null pointer\") }\n");
         out.push_str(&format!("        return {}(ptr: result)\n", name));
@@ -2334,6 +2335,43 @@ mod tests {
         assert!(
             swift.contains("[Color: Contact]"),
             "should contain enum-keyed map type: {swift}"
+        );
+    }
+
+    #[test]
+    fn swift_typed_handle_type() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "get_info".into(),
+                params: vec![Param {
+                    name: "contact".into(),
+                    ty: TypeRef::TypedHandle("Contact".into()),
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                }],
+            }],
+            enums: vec![],
+            errors: None,
+        }]);
+        let swift = render_swift_wrapper(&api, true);
+        assert!(
+            swift.contains("_ contact: Contact"),
+            "TypedHandle should use class type not UInt64: {swift}"
+        );
+        assert!(
+            swift.contains("contact.ptr"),
+            "TypedHandle should extract .ptr: {swift}"
         );
     }
 }

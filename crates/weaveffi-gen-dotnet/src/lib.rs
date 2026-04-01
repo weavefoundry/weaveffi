@@ -76,7 +76,8 @@ fn cs_type(ty: &TypeRef) -> String {
         TypeRef::F64 => "double".into(),
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 => "string".into(),
-        TypeRef::TypedHandle(_) | TypeRef::Handle => "ulong".into(),
+        TypeRef::Handle => "ulong".into(),
+        TypeRef::TypedHandle(name) => name.clone(),
         TypeRef::Bytes => "byte[]".into(),
         TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
         TypeRef::Optional(inner) => match inner.as_ref() {
@@ -85,7 +86,8 @@ fn cs_type(ty: &TypeRef) -> String {
             TypeRef::I64 => "long?".into(),
             TypeRef::F64 => "double?".into(),
             TypeRef::Bool => "bool?".into(),
-            TypeRef::TypedHandle(_) | TypeRef::Handle => "ulong?".into(),
+            TypeRef::Handle => "ulong?".into(),
+            TypeRef::TypedHandle(name) => format!("{name}?"),
             TypeRef::Enum(name) => format!("{name}?"),
             TypeRef::StringUtf8 => "string?".into(),
             TypeRef::Struct(name) => format!("{name}?"),
@@ -109,7 +111,8 @@ fn pinvoke_type(ty: &TypeRef) -> String {
         | TypeRef::Optional(_)
         | TypeRef::List(_)
         | TypeRef::Map(_, _) => "IntPtr".into(),
-        TypeRef::TypedHandle(_) | TypeRef::Handle => "ulong".into(),
+        TypeRef::Handle => "ulong".into(),
+        TypeRef::TypedHandle(_) => "IntPtr".into(),
         TypeRef::Enum(_) => "int".into(),
     }
 }
@@ -344,14 +347,14 @@ fn render_struct_getter(out: &mut String, prefix: &str, field: &StructField) {
     ));
 
     match &field.ty {
-        TypeRef::I32
-        | TypeRef::U32
-        | TypeRef::I64
-        | TypeRef::F64
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Handle => {
+        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => {
             out.push_str(&format!(
                 "                return NativeMethods.{getter_sym}(_handle);\n"
+            ));
+        }
+        TypeRef::TypedHandle(name) => {
+            out.push_str(&format!(
+                "                return new {name}(NativeMethods.{getter_sym}(_handle));\n"
             ));
         }
         TypeRef::Bool => {
@@ -433,9 +436,14 @@ fn render_struct_getter(out: &mut String, prefix: &str, field: &StructField) {
                     out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
                     out.push_str("                return Marshal.ReadInt32(ptr) != 0;\n");
                 }
-                TypeRef::TypedHandle(_) | TypeRef::Handle => {
+                TypeRef::Handle => {
                     out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
                     out.push_str("                return (ulong)Marshal.ReadInt64(ptr);\n");
+                }
+                TypeRef::TypedHandle(name) => {
+                    out.push_str(&format!(
+                        "                return ptr == IntPtr.Zero ? null : new {name}(ptr);\n"
+                    ));
                 }
                 TypeRef::Enum(name) => {
                     out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
@@ -646,7 +654,6 @@ fn param_needs_marshal(ty: &TypeRef) -> bool {
                 | TypeRef::I64
                 | TypeRef::F64
                 | TypeRef::Bool
-                | TypeRef::TypedHandle(_)
                 | TypeRef::Handle
                 | TypeRef::Enum(_)
         ),
@@ -731,14 +738,14 @@ fn render_marshal_setup(out: &mut String, p: &Param, indent: &str) {
                 ));
                 out.push_str(&format!("{indent}}}\n"));
             }
-            TypeRef::I64 | TypeRef::TypedHandle(_) | TypeRef::Handle | TypeRef::F64 => {
+            TypeRef::I64 | TypeRef::Handle | TypeRef::F64 => {
                 out.push_str(&format!("{indent}var {name}Ptr = IntPtr.Zero;\n"));
                 out.push_str(&format!("{indent}if ({name}.HasValue)\n{indent}{{\n"));
                 out.push_str(&format!(
                     "{indent}    {name}Ptr = Marshal.AllocHGlobal(sizeof(long));\n"
                 ));
                 let val = match inner.as_ref() {
-                    TypeRef::TypedHandle(_) | TypeRef::Handle => format!("(long){name}.Value"),
+                    TypeRef::Handle => format!("(long){name}.Value"),
                     TypeRef::F64 => {
                         format!("BitConverter.DoubleToInt64Bits({name}.Value)")
                     }
@@ -780,7 +787,6 @@ fn render_marshal_cleanup(out: &mut String, p: &Param, indent: &str) {
             | TypeRef::I64
             | TypeRef::F64
             | TypeRef::Bool
-            | TypeRef::TypedHandle(_)
             | TypeRef::Handle
             | TypeRef::Enum(_) => {
                 out.push_str(&format!(
@@ -847,13 +853,13 @@ fn build_call_args(params: &[Param]) -> String {
                 TypeRef::Bool => vec![format!("{name} ? 1 : 0")],
                 TypeRef::Enum(_) => vec![format!("(int){name}")],
                 TypeRef::StringUtf8 => vec![format!("{name}Ptr")],
-                TypeRef::Struct(_) => vec![format!("{name}.Handle")],
+                TypeRef::Struct(_) | TypeRef::TypedHandle(_) => vec![format!("{name}.Handle")],
                 TypeRef::Bytes => vec![
                     format!("{name}Pin.AddrOfPinnedObject()"),
                     format!("(UIntPtr){name}.Length"),
                 ],
                 TypeRef::Optional(inner) => match inner.as_ref() {
-                    TypeRef::Struct(_) => {
+                    TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
                         vec![format!("{name}?.Handle ?? IntPtr.Zero")]
                     }
                     TypeRef::Bytes => vec![
@@ -866,7 +872,6 @@ fn build_call_args(params: &[Param]) -> String {
                     | TypeRef::I64
                     | TypeRef::F64
                     | TypeRef::Bool
-                    | TypeRef::TypedHandle(_)
                     | TypeRef::Handle
                     | TypeRef::Enum(_) => vec![format!("{name}Ptr")],
                     _ => vec![name],
@@ -895,7 +900,7 @@ fn render_return_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
         TypeRef::Enum(name) => {
             out.push_str(&format!("{indent}return ({name})result;\n"));
         }
-        TypeRef::Struct(name) => {
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
             out.push_str(&format!("{indent}return new {name}(result);\n"));
         }
         TypeRef::Bytes => {
@@ -990,12 +995,17 @@ fn render_optional_return_conversion(out: &mut String, inner: &TypeRef, indent: 
             ));
             out.push_str(&format!("{indent}return Marshal.ReadInt32(result) != 0;\n"));
         }
-        TypeRef::TypedHandle(_) | TypeRef::Handle => {
+        TypeRef::Handle => {
             out.push_str(&format!(
                 "{indent}if (result == IntPtr.Zero) return null;\n"
             ));
             out.push_str(&format!(
                 "{indent}return (ulong)Marshal.ReadInt64(result);\n"
+            ));
+        }
+        TypeRef::TypedHandle(name) => {
+            out.push_str(&format!(
+                "{indent}return result == IntPtr.Zero ? null : new {name}(result);\n"
             ));
         }
         TypeRef::Enum(name) => {
@@ -1112,8 +1122,11 @@ fn marshal_read_element(ty: &TypeRef, arr: &str, idx: &str) -> String {
         TypeRef::Bool => {
             format!("Marshal.ReadInt32({arr} + {idx} * sizeof(int)) != 0")
         }
-        TypeRef::TypedHandle(_) | TypeRef::Handle => {
+        TypeRef::Handle => {
             format!("(ulong)Marshal.ReadInt64({arr} + {idx} * sizeof(long))")
+        }
+        TypeRef::TypedHandle(name) => {
+            format!("new {name}(Marshal.ReadIntPtr({arr}, {idx} * IntPtr.Size))")
         }
         TypeRef::StringUtf8 => {
             format!("Marshal.PtrToStringUTF8(Marshal.ReadIntPtr({arr}, {idx} * IntPtr.Size))")
@@ -3020,6 +3033,42 @@ mod tests {
         assert!(
             cs.contains("Dictionary<Color, Contact>"),
             "should contain enum-keyed map type: {cs}"
+        );
+    }
+
+    #[test]
+    fn dotnet_typed_handle_type() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "contacts".into(),
+                functions: vec![Function {
+                    name: "get_info".into(),
+                    params: vec![Param {
+                        name: "contact".into(),
+                        ty: TypeRef::TypedHandle("Contact".into()),
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![StructDef {
+                    name: "Contact".into(),
+                    doc: None,
+                    fields: vec![StructField {
+                        name: "name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                    }],
+                }],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        let cs = render_csharp(&api, "WeaveFFI", true);
+        assert!(
+            cs.contains("Contact contact"),
+            "TypedHandle should use class type not ulong: {cs}"
         );
     }
 }
