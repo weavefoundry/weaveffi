@@ -20,6 +20,8 @@ pub struct GeneratorConfig {
     #[serde(default)]
     pub strip_module_prefix: bool,
     pub template_dir: Option<String>,
+    pub pre_generate: Option<String>,
+    pub post_generate: Option<String>,
 }
 
 impl GeneratorConfig {
@@ -100,6 +102,8 @@ mod tests {
             cpp_standard: Some("20".into()),
             strip_module_prefix: true,
             template_dir: None,
+            pre_generate: None,
+            post_generate: None,
         };
 
         assert_eq!(cfg.swift_module_name(), "MySwift");
@@ -130,6 +134,8 @@ mod tests {
             cpp_standard: None,
             strip_module_prefix: true,
             template_dir: None,
+            pre_generate: None,
+            post_generate: None,
         };
 
         let json = serde_json::to_string(&cfg).unwrap();
