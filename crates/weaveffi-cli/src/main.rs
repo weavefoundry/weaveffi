@@ -671,6 +671,9 @@ fn format_validation_error(err: ValidationError) -> Report {
 
 fn validation_suggestion(err: &ValidationError) -> &'static str {
     match err {
+        ValidationError::UnsupportedSchemaVersion { .. } => {
+            "update the 'version' field in your API definition to a supported version, or run 'weaveffi upgrade' to migrate"
+        }
         ValidationError::NoModuleName => "every module must have a non-empty 'name' field",
         ValidationError::DuplicateModuleName(_) => {
             "module names must be unique within an API definition; rename or merge the duplicate"
@@ -956,6 +959,10 @@ mod tests {
     #[test]
     fn validation_suggestion_covers_all_variants() {
         let cases: Vec<ValidationError> = vec![
+            ValidationError::UnsupportedSchemaVersion {
+                version: "0.0.1".into(),
+                supported: "0.1.0, 0.2.0".into(),
+            },
             ValidationError::NoModuleName,
             ValidationError::DuplicateModuleName("m".into()),
             ValidationError::InvalidModuleName("123".into(), "bad"),
