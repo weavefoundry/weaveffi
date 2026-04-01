@@ -15,7 +15,7 @@ impl std::fmt::Display for ValidationWarning {
             Self::DeprecatedHandleType { module, function } => {
                 write!(
                     f,
-                    "deprecated 'handle' type in {module}::{function}; consider using typed handles"
+                    "deprecated untyped 'handle' in {module}::{function}; use 'handle<StructName>' for type safety"
                 )
             }
             Self::LargeEnumVariantCount { enum_name, count } => {
@@ -1508,6 +1508,40 @@ mod tests {
             w,
             ValidationWarning::DeprecatedHandleType { function, .. } if function == "find"
         )));
+    }
+
+    #[test]
+    fn warning_suggests_typed_handle() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "mymod".to_string(),
+                functions: vec![Function {
+                    name: "get_thing".to_string(),
+                    params: vec![Param {
+                        name: "h".to_string(),
+                        ty: TypeRef::Handle,
+                    }],
+                    returns: None,
+                    doc: Some("documented".to_string()),
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: None,
+            }],
+        };
+        let warnings = collect_warnings(&api);
+        assert_eq!(warnings.len(), 1);
+        let msg = warnings[0].to_string();
+        assert!(
+            msg.contains("handle<"),
+            "expected warning to suggest handle<StructName> syntax, got: {msg}"
+        );
+        assert!(
+            msg.contains("deprecated untyped 'handle'"),
+            "expected deprecation phrasing, got: {msg}"
+        );
     }
 
     #[test]
