@@ -74,7 +74,10 @@ fn calculator_api() -> Api {
             ],
             structs: vec![],
             enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
             errors: None,
+            modules: vec![],
         }],
         generators: None,
     }
@@ -163,7 +166,10 @@ fn large_api() -> Api {
                 functions,
                 structs,
                 enums,
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
+                modules: vec![],
             }
         })
         .collect();

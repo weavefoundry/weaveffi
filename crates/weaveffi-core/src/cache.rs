@@ -61,6 +61,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],

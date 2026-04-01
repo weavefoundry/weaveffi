@@ -100,7 +100,10 @@ fn build_large_api() -> Api {
                 functions,
                 structs,
                 enums,
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
+                modules: vec![],
             }
         })
         .collect();

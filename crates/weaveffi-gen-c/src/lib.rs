@@ -323,6 +323,28 @@ fn render_module_header(out: &mut String, module: &Module, prefix: &str, module_
     for s in &module.structs {
         render_struct_header(out, module_path, s, prefix);
     }
+    for cb in &module.callbacks {
+        let cb_type = format!("{prefix}_{module_path}_{}_fn", cb.name);
+        let mut params: Vec<String> = cb
+            .params
+            .iter()
+            .map(|p| c_type_for_param(&p.ty, &p.name, module_path, prefix))
+            .collect();
+        params.push("void* context".to_string());
+        out.push_str(&format!(
+            "typedef void (*{cb_type})({});\n",
+            params.join(", ")
+        ));
+    }
+    for l in &module.listeners {
+        let cb_type = format!("{prefix}_{module_path}_{}_fn", l.event_callback);
+        let reg_fn = format!("{prefix}_{module_path}_register_{}", l.name);
+        let unreg_fn = format!("{prefix}_{module_path}_unregister_{}", l.name);
+        out.push_str(&format!(
+            "uint64_t {reg_fn}({cb_type} callback, void* context);\n"
+        ));
+        out.push_str(&format!("void {unreg_fn}(uint64_t id);\n"));
+    }
     for f in &module.functions {
         if f.r#async {
             let fn_base = format!("{prefix}_{module_path}_{}", f.name);
@@ -391,7 +413,8 @@ mod tests {
     use weaveffi_core::codegen::Generator;
     use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{
-        Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
+        Api, CallbackDef, EnumDef, EnumVariant, Function, ListenerDef, Module, Param, StructDef,
+        StructField, TypeRef,
     };
 
     #[test]
@@ -433,6 +456,8 @@ mod tests {
                 errors: None,
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 modules: vec![],
             }],
             generators: None,
@@ -488,6 +513,8 @@ mod tests {
                     ],
                 }],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -566,6 +593,8 @@ mod tests {
                         },
                     ],
                 }],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -617,6 +646,8 @@ mod tests {
                         doc: None,
                     }],
                 }],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -788,6 +819,8 @@ mod tests {
                 ],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -834,6 +867,8 @@ mod tests {
                         },
                     ],
                 }],
+                callbacks: vec![],
+                listeners: vec![],
                 structs: vec![StructDef {
                     name: "Contact".to_string(),
                     doc: None,
@@ -1069,6 +1104,8 @@ mod tests {
                         },
                     ],
                 }],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1137,6 +1174,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1181,6 +1220,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1256,6 +1297,8 @@ mod tests {
                     }],
                 }],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1298,6 +1341,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1345,6 +1390,8 @@ mod tests {
                     }],
                 }],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1398,6 +1445,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1469,6 +1518,8 @@ mod tests {
                         },
                     ],
                 }],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1516,6 +1567,8 @@ mod tests {
                     }],
                 }],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1575,6 +1628,8 @@ mod tests {
                 ],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1613,6 +1668,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1655,6 +1712,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1706,6 +1765,8 @@ mod tests {
                 ],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -1760,6 +1821,8 @@ mod tests {
                         }],
                     }],
                     enums: vec![],
+                    callbacks: vec![],
+                    listeners: vec![],
                     errors: None,
                     modules: vec![],
                 },
@@ -1778,6 +1841,8 @@ mod tests {
                     }],
                     structs: vec![],
                     enums: vec![],
+                    callbacks: vec![],
+                    listeners: vec![],
                     errors: None,
                     modules: vec![],
                 },
@@ -1820,6 +1885,8 @@ mod tests {
                 }],
                 structs: vec![],
                 enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
                 errors: None,
                 modules: vec![Module {
                     name: "child".to_string(),
@@ -1836,6 +1903,8 @@ mod tests {
                     }],
                     structs: vec![],
                     enums: vec![],
+                    callbacks: vec![],
+                    listeners: vec![],
                     errors: None,
                     modules: vec![],
                 }],
@@ -1859,6 +1928,107 @@ mod tests {
         assert!(
             header.contains("// Module: parent_child\n"),
             "nested module comment: {header}"
+        );
+    }
+
+    #[test]
+    fn c_callback_typedef_generated() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "events".to_string(),
+                functions: vec![],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![CallbackDef {
+                    name: "on_data".to_string(),
+                    params: vec![
+                        Param {
+                            name: "payload".to_string(),
+                            ty: TypeRef::StringUtf8,
+                        },
+                        Param {
+                            name: "len".to_string(),
+                            ty: TypeRef::I32,
+                        },
+                    ],
+                    doc: None,
+                }],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let header = render_c_header(&api, "weaveffi");
+        assert!(
+            header.contains("typedef void (*weaveffi_events_on_data_fn)(const char* payload, int32_t len, void* context);"),
+            "missing callback typedef: {header}"
+        );
+    }
+
+    #[test]
+    fn c_listener_register_unregister_generated() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "events".to_string(),
+                functions: vec![],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![CallbackDef {
+                    name: "on_data".to_string(),
+                    params: vec![Param {
+                        name: "payload".to_string(),
+                        ty: TypeRef::StringUtf8,
+                    }],
+                    doc: None,
+                }],
+                listeners: vec![ListenerDef {
+                    name: "data_stream".to_string(),
+                    event_callback: "on_data".to_string(),
+                    doc: None,
+                }],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let header = render_c_header(&api, "weaveffi");
+        assert!(
+            header.contains("uint64_t weaveffi_events_register_data_stream(weaveffi_events_on_data_fn callback, void* context);"),
+            "missing register function: {header}"
+        );
+        assert!(
+            header.contains("void weaveffi_events_unregister_data_stream(uint64_t id);"),
+            "missing unregister function: {header}"
+        );
+    }
+
+    #[test]
+    fn c_callback_no_params() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "lifecycle".to_string(),
+                functions: vec![],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![CallbackDef {
+                    name: "on_ready".to_string(),
+                    params: vec![],
+                    doc: None,
+                }],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let header = render_c_header(&api, "weaveffi");
+        assert!(
+            header.contains("typedef void (*weaveffi_lifecycle_on_ready_fn)(void* context);"),
+            "callback with no params should only have context: {header}"
         );
     }
 }
