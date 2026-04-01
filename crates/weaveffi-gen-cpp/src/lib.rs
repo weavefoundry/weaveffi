@@ -1,7 +1,7 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use weaveffi_core::codegen::Generator;
-use weaveffi_ir::ir::{Api, Function, Module, StructField, TypeRef};
+use weaveffi_ir::ir::{Api, ErrorCode, Function, Module, StructField, TypeRef};
 
 pub struct CppGenerator;
 
@@ -39,10 +39,19 @@ fn render_cpp_header(api: &Api) -> String {
     out.push_str("} // extern \"C\"\n\n");
 
     out.push_str("namespace weaveffi {\n\n");
+
+    let error_codes: Vec<_> = api
+        .modules
+        .iter()
+        .filter_map(|m| m.errors.as_ref())
+        .flat_map(|e| &e.codes)
+        .collect();
+    render_cpp_error_classes(&mut out, &error_codes);
+
     for module in &api.modules {
         render_cpp_enums(&mut out, module);
         render_cpp_classes(&mut out, module);
-        render_cpp_functions(&mut out, module);
+        render_cpp_functions(&mut out, module, &error_codes);
     }
     out.push_str("} // namespace weaveffi\n");
 
@@ -282,6 +291,30 @@ fn cpp_param_decl(ty: &TypeRef, name: &str) -> String {
     }
 }
 
+// ── Namespace: error classes ──
+
+fn render_cpp_error_classes(out: &mut String, error_codes: &[&ErrorCode]) {
+    out.push_str("class WeaveFFIError : public std::runtime_error {\n");
+    out.push_str("    int32_t code_;\n\n");
+    out.push_str("public:\n");
+    out.push_str("    WeaveFFIError(int32_t code, const std::string& msg) : std::runtime_error(msg), code_(code) {}\n");
+    out.push_str("    int32_t code() const { return code_; }\n");
+    out.push_str("};\n\n");
+
+    for ec in error_codes {
+        out.push_str(&format!(
+            "class {}Error : public WeaveFFIError {{\n",
+            ec.name
+        ));
+        out.push_str("public:\n");
+        out.push_str(&format!(
+            "    {}Error(const std::string& msg) : WeaveFFIError({}, msg) {{}}\n",
+            ec.name, ec.code
+        ));
+        out.push_str("};\n\n");
+    }
+}
+
 // ── Namespace: enums ──
 
 fn render_cpp_enums(out: &mut String, module: &Module) {
@@ -503,9 +536,9 @@ fn render_getter_map(
 
 // ── Namespace: free function wrappers ──
 
-fn render_cpp_functions(out: &mut String, module: &Module) {
+fn render_cpp_functions(out: &mut String, module: &Module, error_codes: &[&ErrorCode]) {
     for func in &module.functions {
-        render_cpp_function(out, func, module);
+        render_cpp_function(out, func, module, error_codes);
     }
 }
 
@@ -652,7 +685,12 @@ fn param_to_c_args(ty: &TypeRef, name: &str, module: &str) -> (Vec<String>, Vec<
     }
 }
 
-fn render_cpp_function(out: &mut String, func: &Function, module: &Module) {
+fn render_cpp_function(
+    out: &mut String,
+    func: &Function,
+    module: &Module,
+    error_codes: &[&ErrorCode],
+) {
     let cpp_ret = func
         .returns
         .as_ref()
@@ -719,8 +757,21 @@ fn render_cpp_function(out: &mut String, func: &Function, module: &Module) {
 
     out.push_str("    if (err.code != 0) {\n");
     out.push_str("        std::string msg(err.message ? err.message : \"unknown error\");\n");
+    out.push_str("        int32_t code = err.code;\n");
     out.push_str("        weaveffi_error_clear(&err);\n");
-    out.push_str("        throw std::runtime_error(msg);\n");
+    if error_codes.is_empty() {
+        out.push_str("        throw WeaveFFIError(code, msg);\n");
+    } else {
+        out.push_str("        switch (code) {\n");
+        for ec in error_codes {
+            out.push_str(&format!(
+                "        case {}: throw {}Error(msg);\n",
+                ec.code, ec.name
+            ));
+        }
+        out.push_str("        default: throw WeaveFFIError(code, msg);\n");
+        out.push_str("        }\n");
+    }
     out.push_str("    }\n");
 
     if let Some(ret) = &func.returns {
@@ -836,7 +887,8 @@ mod tests {
     use super::*;
     use weaveffi_core::codegen::Generator;
     use weaveffi_ir::ir::{
-        Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
+        Api, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param, StructDef,
+        StructField, TypeRef,
     };
 
     fn minimal_api() -> Api {
@@ -1187,7 +1239,7 @@ mod tests {
             "should call C function: {h}"
         );
         assert!(
-            h.contains("throw std::runtime_error(msg)"),
+            h.contains("throw WeaveFFIError(code, msg)"),
             "should throw on error: {h}"
         );
         assert!(h.contains("return result;"), "should return result: {h}");
@@ -1628,5 +1680,81 @@ mod tests {
             "TypedHandle param should be ref: {h}"
         );
         assert!(h.contains("conn.handle()"), "should extract handle: {h}");
+    }
+
+    #[test]
+    fn cpp_has_error_class() {
+        let h = render_cpp_header(&minimal_api());
+        assert!(
+            h.contains("class WeaveFFIError : public std::runtime_error"),
+            "missing WeaveFFIError class: {h}"
+        );
+        assert!(h.contains("int32_t code_"), "missing code_ member: {h}");
+        assert!(
+            h.contains("WeaveFFIError(int32_t code, const std::string& msg) : std::runtime_error(msg), code_(code) {}"),
+            "missing constructor: {h}"
+        );
+        assert!(
+            h.contains("int32_t code() const { return code_; }"),
+            "missing code() getter: {h}"
+        );
+    }
+
+    #[test]
+    fn cpp_error_domains_generate_subclasses() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "auth".into(),
+                functions: vec![Function {
+                    name: "login".into(),
+                    params: vec![Param {
+                        name: "user".into(),
+                        ty: TypeRef::StringUtf8,
+                    }],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                }],
+                structs: vec![],
+                enums: vec![],
+                errors: Some(ErrorDomain {
+                    name: "AuthError".into(),
+                    codes: vec![
+                        ErrorCode {
+                            name: "NotFound".into(),
+                            code: 1,
+                            message: "not found".into(),
+                        },
+                        ErrorCode {
+                            name: "InvalidCredentials".into(),
+                            code: 2,
+                            message: "invalid credentials".into(),
+                        },
+                    ],
+                }),
+            }],
+        };
+        let h = render_cpp_header(&api);
+        assert!(
+            h.contains("class NotFoundError : public WeaveFFIError"),
+            "missing NotFoundError subclass: {h}"
+        );
+        assert!(
+            h.contains("class InvalidCredentialsError : public WeaveFFIError"),
+            "missing InvalidCredentialsError subclass: {h}"
+        );
+        assert!(
+            h.contains("case 1: throw NotFoundError(msg);"),
+            "missing NotFound throw case: {h}"
+        );
+        assert!(
+            h.contains("case 2: throw InvalidCredentialsError(msg);"),
+            "missing InvalidCredentials throw case: {h}"
+        );
+        assert!(
+            h.contains("default: throw WeaveFFIError(code, msg);"),
+            "missing default throw case: {h}"
+        );
     }
 }
