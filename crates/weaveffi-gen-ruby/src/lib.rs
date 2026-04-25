@@ -92,7 +92,9 @@ fn rb_ffi_scalar(ty: &TypeRef) -> &'static str {
 
 fn rb_param_ffi_types(ty: &TypeRef) -> Vec<&'static str> {
     match ty {
-        TypeRef::Bytes | TypeRef::BorrowedBytes => vec![":pointer", ":size_t"],
+        TypeRef::StringUtf8 | TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            vec![":pointer", ":size_t"]
+        }
         TypeRef::Optional(inner) if !is_c_pointer_type(inner) => vec![":pointer"],
         TypeRef::Optional(inner) => rb_param_ffi_types(inner),
         TypeRef::List(_) => vec![":pointer", ":size_t"],
@@ -194,20 +196,19 @@ fn rb_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
         | TypeRef::F64
         | TypeRef::Handle
         | TypeRef::Enum(_)
-        | TypeRef::StringUtf8
         | TypeRef::BorrowedStr => {
             vec![name.to_string()]
         }
         TypeRef::Bool => vec![format!("{name}_c")],
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+        TypeRef::StringUtf8 | TypeRef::Bytes | TypeRef::BorrowedBytes => {
             vec![format!("{name}_buf"), format!("{name}.bytesize")]
         }
         TypeRef::Struct(_) | TypeRef::TypedHandle(_) => vec![format!("{name}.handle")],
         TypeRef::Optional(inner) if !is_c_pointer_type(inner) => vec![format!("{name}_c")],
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![name.to_string()],
+            TypeRef::BorrowedStr => vec![name.to_string()],
             TypeRef::Struct(_) | TypeRef::TypedHandle(_) => vec![format!("{name}&.handle")],
-            TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            TypeRef::StringUtf8 | TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 vec![format!("{name}_buf"), format!("{name}_len")]
             }
             TypeRef::List(_) => vec![format!("{name}_buf"), format!("{name}_len")],
@@ -586,6 +587,11 @@ fn render_param_conversion(out: &mut String, name: &str, ty: &TypeRef, ind: &str
         TypeRef::Bool => {
             out.push_str(&format!("{ind}{name}_c = {name} ? 1 : 0\n"));
         }
+        TypeRef::StringUtf8 => {
+            out.push_str(&format!(
+                "{ind}{name}_buf = FFI::MemoryPointer.from_string({name}.b)\n"
+            ));
+        }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             out.push_str(&format!(
                 "{ind}{name}_buf = FFI::MemoryPointer.new(:uint8, {name}.bytesize)\n"
@@ -605,6 +611,17 @@ fn render_param_conversion(out: &mut String, name: &str, ty: &TypeRef, ind: &str
             ));
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::StringUtf8 => {
+                out.push_str(&format!("{ind}if {name}.nil?\n"));
+                out.push_str(&format!("{ind}  {name}_buf = FFI::Pointer::NULL\n"));
+                out.push_str(&format!("{ind}  {name}_len = 0\n"));
+                out.push_str(&format!("{ind}else\n"));
+                out.push_str(&format!(
+                    "{ind}  {name}_buf = FFI::MemoryPointer.from_string({name}.b)\n"
+                ));
+                out.push_str(&format!("{ind}  {name}_len = {name}.bytesize\n"));
+                out.push_str(&format!("{ind}end\n"));
+            }
             TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 out.push_str(&format!("{ind}if {name}.nil?\n"));
                 out.push_str(&format!("{ind}  {name}_buf = FFI::Pointer::NULL\n"));
@@ -2170,6 +2187,90 @@ mod tests {
             rb.contains("class ContactPtr < FFI::AutoPointer")
                 && rb.contains("weaveffi_contacts_Contact_destroy"),
             "struct return type should use AutoPointer with destroy: {rb}"
+        );
+    }
+
+    #[test]
+    fn ruby_string_param_uses_pointer_and_length() {
+        let api = make_api(vec![simple_module(
+            "data",
+            vec![Function {
+                name: "set_name".into(),
+                params: vec![Param {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+        )]);
+
+        let code = render_ruby_module(&api, "WeaveFFI");
+
+        assert!(
+            code.contains(
+                "attach_function :weaveffi_data_set_name, [:pointer, :size_t, :pointer], :void"
+            ),
+            "StringUtf8 param attach_function uses pointer + size_t: {code}"
+        );
+        assert!(
+            !code.contains("attach_function :weaveffi_data_set_name, [:string"),
+            "StringUtf8 param must not use :string: {code}"
+        );
+        assert!(
+            code.contains("name_buf = FFI::MemoryPointer.from_string(name.b)"),
+            "wrapper allocates buffer via MemoryPointer.from_string with .b: {code}"
+        );
+        assert!(
+            code.contains("weaveffi_data_set_name(name_buf, name.bytesize, err)"),
+            "wrapper calls C with (buf, bytesize, err): {code}"
+        );
+    }
+
+    #[test]
+    fn ruby_optional_string_param_uses_pointer_and_length() {
+        let api = make_api(vec![simple_module(
+            "data",
+            vec![Function {
+                name: "maybe_set".into(),
+                params: vec![Param {
+                    name: "name".into(),
+                    ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+        )]);
+
+        let code = render_ruby_module(&api, "WeaveFFI");
+
+        assert!(
+            code.contains(
+                "attach_function :weaveffi_data_maybe_set, [:pointer, :size_t, :pointer], :void"
+            ),
+            "Optional<StringUtf8> param attach_function uses pointer + size_t: {code}"
+        );
+        assert!(
+            code.contains("name_buf = FFI::Pointer::NULL"),
+            "nil branch passes NULL pointer: {code}"
+        );
+        assert!(
+            code.contains("name_buf = FFI::MemoryPointer.from_string(name.b)"),
+            "non-nil branch allocates via MemoryPointer.from_string with .b: {code}"
+        );
+        assert!(
+            code.contains("weaveffi_data_maybe_set(name_buf, name_len, err)"),
+            "wrapper calls C with (buf, len, err): {code}"
         );
     }
 
