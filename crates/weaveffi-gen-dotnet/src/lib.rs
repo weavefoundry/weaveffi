@@ -126,6 +126,10 @@ fn pinvoke_type(ty: &TypeRef) -> String {
 
 fn pinvoke_param_list(p: &Param) -> Vec<String> {
     match &p.ty {
+        TypeRef::StringUtf8 => vec![
+            format!("IntPtr {}_ptr", p.name),
+            format!("UIntPtr {}_len", p.name),
+        ],
         TypeRef::Bytes | TypeRef::BorrowedBytes => vec![
             format!("IntPtr {}_ptr", p.name),
             format!("UIntPtr {}_len", p.name),
@@ -140,7 +144,10 @@ fn pinvoke_param_list(p: &Param) -> Vec<String> {
             format!("UIntPtr {}_len", p.name),
         ],
         TypeRef::Optional(inner)
-            if matches!(inner.as_ref(), TypeRef::Bytes | TypeRef::BorrowedBytes) =>
+            if matches!(
+                inner.as_ref(),
+                TypeRef::StringUtf8 | TypeRef::Bytes | TypeRef::BorrowedBytes
+            ) =>
         {
             vec![
                 format!("IntPtr {}_ptr", p.name),
@@ -334,6 +341,15 @@ fn render_helpers_class(out: &mut String) {
     out.push_str("        }\n\n");
     out.push_str("        internal static void FreePtr(IntPtr ptr)\n        {\n");
     out.push_str("            Marshal.FreeCoTaskMem(ptr);\n");
+    out.push_str("        }\n\n");
+    out.push_str(
+        "        internal static (GCHandle handle, IntPtr ptr, UIntPtr len) PinUtf8(string s)\n        {\n",
+    );
+    out.push_str("            var bytes = System.Text.Encoding.UTF8.GetBytes(s);\n");
+    out.push_str("            var handle = GCHandle.Alloc(bytes, GCHandleType.Pinned);\n");
+    out.push_str(
+        "            return (handle, handle.AddrOfPinnedObject(), (UIntPtr)bytes.Length);\n",
+    );
     out.push_str("        }\n");
     out.push_str("    }\n\n");
 }
@@ -1052,7 +1068,12 @@ fn render_async_set_result(out: &mut String, ret: &Option<TypeRef>, indent: &str
 fn render_marshal_setup(out: &mut String, p: &Param, indent: &str) {
     let name = safe_cs_name(&p.name);
     match &p.ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+        TypeRef::StringUtf8 => {
+            out.push_str(&format!(
+                "{indent}var ({name}Pin, {name}Ptr, {name}Len) = WeaveFFIHelpers.PinUtf8({name});\n"
+            ));
+        }
+        TypeRef::BorrowedStr => {
             out.push_str(&format!(
                 "{indent}var {name}Ptr = Marshal.StringToCoTaskMemUTF8({name});\n"
             ));
@@ -1063,7 +1084,17 @@ fn render_marshal_setup(out: &mut String, p: &Param, indent: &str) {
             ));
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            TypeRef::StringUtf8 => {
+                out.push_str(&format!("{indent}GCHandle {name}Pin = default;\n"));
+                out.push_str(&format!("{indent}IntPtr {name}Ptr = IntPtr.Zero;\n"));
+                out.push_str(&format!("{indent}UIntPtr {name}Len = UIntPtr.Zero;\n"));
+                out.push_str(&format!("{indent}if ({name} != null)\n{indent}{{\n"));
+                out.push_str(&format!(
+                    "{indent}    ({name}Pin, {name}Ptr, {name}Len) = WeaveFFIHelpers.PinUtf8({name});\n"
+                ));
+                out.push_str(&format!("{indent}}}\n"));
+            }
+            TypeRef::BorrowedStr => {
                 out.push_str(&format!(
                     "{indent}var {name}Ptr = {name} != null ? Marshal.StringToCoTaskMemUTF8({name}) : IntPtr.Zero;\n"
                 ));
@@ -1117,14 +1148,20 @@ fn render_marshal_setup(out: &mut String, p: &Param, indent: &str) {
 fn render_marshal_cleanup(out: &mut String, p: &Param, indent: &str) {
     let name = safe_cs_name(&p.name);
     match &p.ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+        TypeRef::StringUtf8 => {
+            out.push_str(&format!("{indent}{name}Pin.Free();\n"));
+        }
+        TypeRef::BorrowedStr => {
             out.push_str(&format!("{indent}Marshal.FreeCoTaskMem({name}Ptr);\n"));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             out.push_str(&format!("{indent}{name}Pin.Free();\n"));
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            TypeRef::StringUtf8 => {
+                out.push_str(&format!("{indent}if ({name} != null) {name}Pin.Free();\n"));
+            }
+            TypeRef::BorrowedStr => {
                 out.push_str(&format!(
                     "{indent}if ({name}Ptr != IntPtr.Zero) Marshal.FreeCoTaskMem({name}Ptr);\n"
                 ));
@@ -1205,7 +1242,8 @@ fn build_call_args(params: &[Param]) -> String {
             match &p.ty {
                 TypeRef::Bool => vec![format!("{name} ? 1 : 0")],
                 TypeRef::Enum(_) => vec![format!("(int){name}")],
-                TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![format!("{name}Ptr")],
+                TypeRef::StringUtf8 => vec![format!("{name}Ptr"), format!("{name}Len")],
+                TypeRef::BorrowedStr => vec![format!("{name}Ptr")],
                 TypeRef::Struct(_) | TypeRef::TypedHandle(_) => vec![format!("{name}.Handle")],
                 TypeRef::Bytes | TypeRef::BorrowedBytes => vec![
                     format!("{name}Pin.AddrOfPinnedObject()"),
@@ -1219,8 +1257,8 @@ fn build_call_args(params: &[Param]) -> String {
                         format!("{name} != null ? {name}Pin.AddrOfPinnedObject() : IntPtr.Zero"),
                         format!("{name} != null ? (UIntPtr){name}.Length : UIntPtr.Zero"),
                     ],
-                    TypeRef::StringUtf8
-                    | TypeRef::BorrowedStr
+                    TypeRef::StringUtf8 => vec![format!("{name}Ptr"), format!("{name}Len")],
+                    TypeRef::BorrowedStr
                     | TypeRef::I32
                     | TypeRef::U32
                     | TypeRef::I64
@@ -2164,12 +2202,12 @@ mod tests {
             "missing PtrToStringUTF8: {cs}"
         );
         assert!(
-            cs.contains("Marshal.StringToCoTaskMemUTF8(msg)"),
-            "missing StringToCoTaskMemUTF8: {cs}"
+            cs.contains("WeaveFFIHelpers.PinUtf8(msg)"),
+            "missing PinUtf8 call for string param: {cs}"
         );
         assert!(
-            cs.contains("Marshal.FreeCoTaskMem(msgPtr)"),
-            "missing FreeCoTaskMem: {cs}"
+            cs.contains("msgPin.Free()"),
+            "missing Pin.Free() in cleanup: {cs}"
         );
         assert!(
             cs.contains("weaveffi_free_string(result)"),
@@ -2460,20 +2498,20 @@ mod tests {
 
         let cs = render_csharp(&api, "WeaveFFI", true);
         assert!(
-            cs.contains("StringToCoTaskMemUTF8(name)"),
-            "missing name marshal: {cs}"
+            cs.contains("WeaveFFIHelpers.PinUtf8(name)"),
+            "missing PinUtf8 call for required string: {cs}"
         );
         assert!(
-            cs.contains("email != null ? Marshal.StringToCoTaskMemUTF8(email) : IntPtr.Zero"),
-            "missing optional string marshal: {cs}"
+            cs.contains("if (email != null)") && cs.contains("WeaveFFIHelpers.PinUtf8(email)"),
+            "missing conditional PinUtf8 for optional string: {cs}"
         );
         assert!(
-            cs.contains("FreeCoTaskMem(namePtr)"),
-            "missing name cleanup: {cs}"
+            cs.contains("namePin.Free()"),
+            "missing required string Pin.Free() cleanup: {cs}"
         );
         assert!(
-            cs.contains("emailPtr != IntPtr.Zero"),
-            "missing optional cleanup guard: {cs}"
+            cs.contains("if (email != null) emailPin.Free()"),
+            "missing optional string Pin.Free() cleanup guard: {cs}"
         );
     }
 
@@ -3772,12 +3810,12 @@ mod tests {
         }]);
         let cs = render_csharp(&api, "WeaveFFI", true);
         assert!(
-            cs.contains("StringToCoTaskMemUTF8"),
-            "string param should be marshalled to unmanaged memory: {cs}"
+            cs.contains("WeaveFFIHelpers.PinUtf8(name)"),
+            "string param should be pinned via PinUtf8 helper: {cs}"
         );
         assert!(
-            cs.contains("finally") && cs.contains("FreeCoTaskMem"),
-            "marshalled string should be freed in finally (no double-free of managed string): {cs}"
+            cs.contains("finally") && cs.contains("namePin.Free()"),
+            "pinned string should be released in finally (no leak on error path): {cs}"
         );
         let find = cs.find("FindContact").expect("FindContact wrapper");
         let slice = &cs[find..];
@@ -3998,6 +4036,109 @@ mod tests {
         assert!(
             cs.contains("[Obsolete(\"Use AddV2 instead\")]"),
             "missing Obsolete attribute: {cs}"
+        );
+    }
+
+    #[test]
+    fn dotnet_string_param_uses_pinned_byteslice() {
+        let api = make_api(vec![Module {
+            name: "io".into(),
+            functions: vec![Function {
+                name: "log".into(),
+                params: vec![Param {
+                    name: "msg".into(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let cs = render_csharp(&api, "WeaveFFI", true);
+
+        assert!(
+            cs.contains("(GCHandle handle, IntPtr ptr, UIntPtr len) PinUtf8(string s)"),
+            "preamble should define PinUtf8 helper returning a pinned triple: {cs}"
+        );
+        assert!(
+            cs.contains("GCHandle.Alloc(bytes, GCHandleType.Pinned)"),
+            "PinUtf8 helper should manually pin the byte buffer: {cs}"
+        );
+
+        assert!(
+            cs.contains(
+                "internal static extern void weaveffi_io_log(IntPtr msg_ptr, UIntPtr msg_len, ref WeaveffiError err);"
+            ),
+            "P/Invoke declaration should expand StringUtf8 into (IntPtr msg_ptr, UIntPtr msg_len, ref WeaveffiError err): {cs}"
+        );
+        assert!(
+            !cs.contains("weaveffi_io_log(IntPtr msg, ref WeaveffiError err)"),
+            "P/Invoke declaration must not pass StringUtf8 as a single IntPtr: {cs}"
+        );
+
+        assert!(
+            cs.contains("var (msgPin, msgPtr, msgLen) = WeaveFFIHelpers.PinUtf8(msg);"),
+            "wrapper should call PinUtf8 to pin the UTF-8 bytes: {cs}"
+        );
+        assert!(
+            cs.contains("try") && cs.contains("finally") && cs.contains("msgPin.Free();"),
+            "wrapper must release the GCHandle inside a try/finally block: {cs}"
+        );
+        assert!(
+            cs.contains("NativeMethods.weaveffi_io_log(msgPtr, msgLen, ref err);"),
+            "wrapper should pass (msgPtr, msgLen) to the P/Invoke call: {cs}"
+        );
+    }
+
+    #[test]
+    fn dotnet_struct_create_string_field_uses_pinned_byteslice() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![
+                    StructField {
+                        name: "name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                        default: None,
+                    },
+                    StructField {
+                        name: "age".into(),
+                        ty: TypeRef::I32,
+                        doc: None,
+                        default: None,
+                    },
+                ],
+                builder: true,
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let cs = render_csharp(&api, "WeaveFFI", true);
+
+        assert!(
+            cs.contains(
+                "internal static extern IntPtr weaveffi_contacts_Contact_create(IntPtr name_ptr, UIntPtr name_len, int age, ref WeaveffiError err);"
+            ),
+            "struct create P/Invoke should expand string field to (IntPtr ptr, UIntPtr len): {cs}"
         );
     }
 }
