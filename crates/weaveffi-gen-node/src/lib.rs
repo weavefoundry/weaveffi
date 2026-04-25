@@ -441,7 +441,22 @@ fn emit_param(
             out.push_str(&format!("  {getter}(env, args[{idx}], &{name});\n"));
             c_args.push(name.into());
         }
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+        TypeRef::StringUtf8 => {
+            out.push_str(&format!("  size_t {name}_len;\n"));
+            out.push_str(&format!(
+                "  napi_get_value_string_utf8(env, args[{idx}], NULL, 0, &{name}_len);\n"
+            ));
+            out.push_str(&format!(
+                "  char* {name} = (char*)malloc({name}_len + 1);\n"
+            ));
+            out.push_str(&format!(
+                "  napi_get_value_string_utf8(env, args[{idx}], {name}, {name}_len + 1, &{name}_len);\n"
+            ));
+            c_args.push(format!("(const uint8_t*){name}"));
+            c_args.push(format!("(size_t){name}_len"));
+            cleanups.push(format!("  free({name});\n"));
+        }
+        TypeRef::BorrowedStr => {
             out.push_str(&format!("  size_t {name}_len;\n"));
             out.push_str(&format!(
                 "  napi_get_value_string_utf8(env, args[{idx}], NULL, 0, &{name}_len);\n"
@@ -581,10 +596,10 @@ fn emit_optional_param(
         }
         TypeRef::StringUtf8 => {
             out.push_str(&format!("  char* {name} = NULL;\n"));
+            out.push_str(&format!("  size_t {name}_len = 0;\n"));
             out.push_str(&format!(
                 "  if ({name}_type != napi_null && {name}_type != napi_undefined) {{\n"
             ));
-            out.push_str(&format!("    size_t {name}_len;\n"));
             out.push_str(&format!(
                 "    napi_get_value_string_utf8(env, args[{idx}], NULL, 0, &{name}_len);\n"
             ));
@@ -593,7 +608,8 @@ fn emit_optional_param(
                 "    napi_get_value_string_utf8(env, args[{idx}], {name}, {name}_len + 1, &{name}_len);\n"
             ));
             out.push_str("  }\n");
-            c_args.push(name.into());
+            c_args.push(format!("(const uint8_t*){name}"));
+            c_args.push(format!("(size_t){name}_len"));
             cleanups.push(format!("  free({name});\n"));
         }
         TypeRef::Struct(s) => {
@@ -1661,21 +1677,14 @@ mod tests {
     #[test]
     fn node_addon_extracts_args() {
         let api = make_api(vec![{
-            let mut m = make_module("math");
+            let mut m = make_module("greet");
             m.functions.push(Function {
-                name: "add".into(),
-                params: vec![
-                    Param {
-                        name: "a".into(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                    },
-                    Param {
-                        name: "b".into(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                    },
-                ],
+                name: "hello".into(),
+                params: vec![Param {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                }],
                 returns: Some(TypeRef::I32),
                 doc: None,
                 r#async: false,
@@ -1689,6 +1698,55 @@ mod tests {
         assert!(
             addon.contains("napi_get_cb_info"),
             "generated addon.c should call napi_get_cb_info: {addon}"
+        );
+        assert!(
+            addon.contains("napi_get_value_string_utf8(env, args[0], NULL, 0, &name_len)"),
+            "should query string length first: {addon}"
+        );
+        assert!(
+            addon.contains("char* name = (char*)malloc(name_len + 1)"),
+            "should allocate name_len + 1 bytes: {addon}"
+        );
+        assert!(
+            addon.contains("weaveffi_greet_hello((const uint8_t*)name, (size_t)name_len, &err);"),
+            "string param should be passed to C as (const uint8_t*)name, (size_t)name_len: {addon}"
+        );
+        assert!(
+            !addon.contains("weaveffi_greet_hello(name, &err)"),
+            "string param must not be passed as a single char* arg: {addon}"
+        );
+    }
+
+    #[test]
+    fn node_optional_string_param_uses_ptr_and_len() {
+        let api = make_api(vec![{
+            let mut m = make_module("greet");
+            m.functions.push(Function {
+                name: "maybe_hello".into(),
+                params: vec![Param {
+                    name: "name".into(),
+                    ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            });
+            m
+        }]);
+        let addon = render_addon_c(&api, true);
+        assert!(
+            addon.contains("size_t name_len = 0;"),
+            "optional string len must be zero-initialised outside the if block: {addon}"
+        );
+        assert!(
+            addon.contains(
+                "weaveffi_greet_maybe_hello((const uint8_t*)name, (size_t)name_len, &err);"
+            ),
+            "optional string param should also be passed as ptr+len pair: {addon}"
         );
     }
 
