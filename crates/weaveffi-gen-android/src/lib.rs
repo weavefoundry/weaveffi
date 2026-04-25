@@ -4394,4 +4394,61 @@ mod tests {
             "should import suspendCancellableCoroutine: {kt}"
         );
     }
+
+    #[test]
+    fn android_jni_string_param_uses_ptr_and_len() {
+        // The C ABI expands a `string` parameter named `msg` to the pair
+        // `(const uint8_t* msg_ptr, size_t msg_len)`, plus the trailing
+        // `weaveffi_error* err`. The JNI bridge must acquire the UTF-8 chars
+        // and length via JNI, then forward them to the C function with the
+        // matching `(const uint8_t*)msg_chars, (size_t)msg_len, &err` casts.
+        let api = make_api(vec![Module {
+            name: "echo".to_string(),
+            functions: vec![Function {
+                name: "shout".to_string(),
+                params: vec![Param {
+                    name: "msg".to_string(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let jni = render_jni_c(&api, "com.weaveffi", true);
+
+        assert!(
+            jni.contains("const char* msg_chars = (*env)->GetStringUTFChars(env, msg, NULL);"),
+            "JNI bridge must acquire UTF-8 chars from the jstring: {jni}"
+        );
+        assert!(
+            jni.contains("jsize msg_len = (*env)->GetStringUTFLength(env, msg);"),
+            "JNI bridge must read the UTF-8 byte length from the jstring: {jni}"
+        );
+        assert!(
+            jni.contains(
+                "weaveffi_echo_shout((const uint8_t*)msg_chars, (size_t)msg_len, &err);"
+            ),
+            "C call must pass ((const uint8_t*)msg_chars, (size_t)msg_len, &err) matching the new (const uint8_t*, size_t) C signature: {jni}"
+        );
+        assert!(
+            !jni.contains("weaveffi_echo_shout(msg_chars, &err)"),
+            "C call must NOT use the old single-pointer NUL-terminated form: {jni}"
+        );
+        assert!(
+            jni.contains("(*env)->ReleaseStringUTFChars(env, msg, msg_chars);"),
+            "JNI bridge must release the UTF-8 chars after the C call: {jni}"
+        );
+    }
 }
