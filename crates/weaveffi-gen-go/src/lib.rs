@@ -533,7 +533,23 @@ fn emit_param(pre: &mut String, args: &mut Vec<String>, name: &str, ty: &TypeRef
         TypeRef::Enum(n) => args.push(format!("C.weaveffi_{module}_{n}({name})")),
         TypeRef::TypedHandle(_) | TypeRef::Struct(_) => args.push(format!("{name}.ptr")),
 
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+        TypeRef::StringUtf8 => {
+            let bv = format!("{name}Bytes");
+            let pv = format!("c{}Ptr", name.to_upper_camel_case());
+            let lv = format!("c{}Len", name.to_upper_camel_case());
+            pre.push_str(&format!("\t{bv} := []byte({name})\n"));
+            pre.push_str(&format!("\tvar {pv} *C.uint8_t\n"));
+            pre.push_str(&format!("\t{lv} := C.size_t(len({bv}))\n"));
+            pre.push_str(&format!("\tif len({bv}) > 0 {{\n"));
+            pre.push_str(&format!(
+                "\t\t{pv} = (*C.uint8_t)(unsafe.Pointer(&{bv}[0]))\n"
+            ));
+            pre.push_str("\t}\n");
+            args.push(pv);
+            args.push(lv);
+        }
+
+        TypeRef::BorrowedStr => {
             let cv = format!("c{}", name.to_upper_camel_case());
             pre.push_str(&format!("\t{cv} := C.CString({name})\n"));
             pre.push_str(&format!("\tdefer C.free(unsafe.Pointer({cv}))\n"));
@@ -576,7 +592,26 @@ fn emit_optional_param(
     let cv = format!("c{}", name.to_upper_camel_case());
 
     match inner {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+        TypeRef::StringUtf8 => {
+            let bv = format!("{name}Bytes");
+            let pv = format!("c{}Ptr", name.to_upper_camel_case());
+            let lv = format!("c{}Len", name.to_upper_camel_case());
+            pre.push_str(&format!("\tvar {bv} []byte\n"));
+            pre.push_str(&format!("\tvar {pv} *C.uint8_t\n"));
+            pre.push_str(&format!("\tvar {lv} C.size_t\n"));
+            pre.push_str(&format!("\tif {name} != nil {{\n"));
+            pre.push_str(&format!("\t\t{bv} = []byte(*{name})\n"));
+            pre.push_str(&format!("\t\t{lv} = C.size_t(len({bv}))\n"));
+            pre.push_str(&format!("\t\tif len({bv}) > 0 {{\n"));
+            pre.push_str(&format!(
+                "\t\t\t{pv} = (*C.uint8_t)(unsafe.Pointer(&{bv}[0]))\n"
+            ));
+            pre.push_str("\t\t}\n");
+            pre.push_str("\t}\n");
+            args.push(pv);
+            args.push(lv);
+        }
+        TypeRef::BorrowedStr => {
             pre.push_str(&format!("\tvar {cv} *C.char\n"));
             pre.push_str(&format!("\tif {name} != nil {{\n"));
             pre.push_str(&format!("\t\t{cv} = C.CString(*{name})\n"));
@@ -997,10 +1032,21 @@ mod tests {
             go.contains("func CalculatorEcho(msg string) (string, error)"),
             "missing echo sig: {go}"
         );
-        assert!(go.contains("C.CString(msg)"), "missing CString: {go}");
         assert!(
-            go.contains("defer C.free(unsafe.Pointer("),
-            "missing defer free: {go}"
+            go.contains("msgBytes := []byte(msg)"),
+            "missing []byte conversion: {go}"
+        );
+        assert!(
+            go.contains("cMsgPtr = (*C.uint8_t)(unsafe.Pointer(&msgBytes[0]))"),
+            "missing ptr from byte slice: {go}"
+        );
+        assert!(
+            go.contains("cMsgLen := C.size_t(len(msgBytes))"),
+            "missing length: {go}"
+        );
+        assert!(
+            go.contains("C.weaveffi_calculator_echo(cMsgPtr, cMsgLen, &cErr)"),
+            "string param should be passed as (ptr, len, &cErr): {go}"
         );
         assert!(go.contains("C.GoString(result)"), "missing GoString: {go}");
         assert!(
@@ -1449,8 +1495,16 @@ mod tests {
             "missing nil check for optional: {go}"
         );
         assert!(
-            go.contains("C.CString(*query)"),
-            "missing CString dereference: {go}"
+            go.contains("queryBytes = []byte(*query)"),
+            "missing []byte conversion of dereferenced optional: {go}"
+        );
+        assert!(
+            go.contains("cQueryPtr = (*C.uint8_t)(unsafe.Pointer(&queryBytes[0]))"),
+            "missing ptr from byte slice for optional: {go}"
+        );
+        assert!(
+            go.contains("C.weaveffi_store_find(cQueryPtr, cQueryLen, &cErr)"),
+            "optional string param should call C with (ptr, len, &cErr): {go}"
         );
     }
 
@@ -2490,6 +2544,129 @@ mod tests {
         assert!(
             null_check < contact_wrap,
             "optional struct return should check nil before wrapping: {fn_text}"
+        );
+    }
+
+    #[test]
+    fn go_string_param_uses_byteslice_pointer_and_length() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "io".into(),
+                functions: vec![
+                    Function {
+                        name: "log".into(),
+                        params: vec![Param {
+                            name: "msg".into(),
+                            ty: TypeRef::StringUtf8,
+                            mutable: false,
+                        }],
+                        returns: None,
+                        doc: None,
+                        r#async: false,
+                        cancellable: false,
+                        deprecated: None,
+                        since: None,
+                    },
+                    Function {
+                        name: "find".into(),
+                        params: vec![Param {
+                            name: "query".into(),
+                            ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                            mutable: false,
+                        }],
+                        returns: None,
+                        doc: None,
+                        r#async: false,
+                        cancellable: false,
+                        deprecated: None,
+                        since: None,
+                    },
+                ],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let go = render_go(&api);
+
+        let log_start = go.find("func IoLog(").expect("IoLog wrapper");
+        let log_body = &go[log_start..];
+        let log_text = &log_body[..log_body.find("\n}\n").unwrap()];
+
+        assert!(
+            log_text.contains("msgBytes := []byte(msg)"),
+            "required string param should be converted to []byte: {log_text}"
+        );
+        assert!(
+            log_text.contains("var cMsgPtr *C.uint8_t"),
+            "required string param should declare *C.uint8_t pointer var: {log_text}"
+        );
+        assert!(
+            log_text.contains("cMsgLen := C.size_t(len(msgBytes))"),
+            "required string param should compute C.size_t length: {log_text}"
+        );
+        assert!(
+            log_text.contains("if len(msgBytes) > 0 {"),
+            "required string param should guard pointer with len > 0: {log_text}"
+        );
+        assert!(
+            log_text.contains("cMsgPtr = (*C.uint8_t)(unsafe.Pointer(&msgBytes[0]))"),
+            "required string param should compute ptr from &msgBytes[0]: {log_text}"
+        );
+        assert!(
+            log_text.contains("C.weaveffi_io_log(cMsgPtr, cMsgLen, &cErr)"),
+            "required string param should call C with (ptr, len, &cErr): {log_text}"
+        );
+        assert!(
+            !log_text.contains("C.CString(msg)"),
+            "required string param must not use C.CString: {log_text}"
+        );
+        assert!(
+            !log_text.contains("defer C.free"),
+            "required string param must not defer C.free (Go GC owns the byte slice): {log_text}"
+        );
+
+        let find_start = go.find("func IoFind(").expect("IoFind wrapper");
+        let find_body = &go[find_start..];
+        let find_text = &find_body[..find_body.find("\n}\n").unwrap()];
+
+        assert!(
+            find_text.contains("var queryBytes []byte"),
+            "optional string param should declare empty byte slice: {find_text}"
+        );
+        assert!(
+            find_text.contains("var cQueryPtr *C.uint8_t"),
+            "optional string param should declare *C.uint8_t pointer var: {find_text}"
+        );
+        assert!(
+            find_text.contains("var cQueryLen C.size_t"),
+            "optional string param should declare C.size_t length var: {find_text}"
+        );
+        assert!(
+            find_text.contains("if query != nil {"),
+            "optional string param should guard on query != nil: {find_text}"
+        );
+        assert!(
+            find_text.contains("queryBytes = []byte(*query)"),
+            "optional string param should encode dereferenced *string: {find_text}"
+        );
+        assert!(
+            find_text.contains("cQueryPtr = (*C.uint8_t)(unsafe.Pointer(&queryBytes[0]))"),
+            "optional string param should compute ptr from &queryBytes[0]: {find_text}"
+        );
+        assert!(
+            find_text.contains("C.weaveffi_io_find(cQueryPtr, cQueryLen, &cErr)"),
+            "optional string param should call C with (ptr, len, &cErr): {find_text}"
+        );
+        assert!(
+            !find_text.contains("C.CString(*query)"),
+            "optional string param must not use C.CString: {find_text}"
         );
     }
 }
