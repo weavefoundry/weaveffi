@@ -112,7 +112,8 @@ fn c_type_for_param(ty: &TypeRef, name: &str, module: &str, prefix: &str, mutabl
         TypeRef::I64 => format!("int64_t {name}"),
         TypeRef::F64 => format!("double {name}"),
         TypeRef::Bool => format!("bool {name}"),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("{q}char* {name}"),
+        TypeRef::StringUtf8 => format!("{q}uint8_t* {name}_ptr, size_t {name}_len"),
+        TypeRef::BorrowedStr => format!("{q}char* {name}"),
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             format!("{q}uint8_t* {name}_ptr, size_t {name}_len")
         }
@@ -282,6 +283,14 @@ fn render_c_header(api: &Api, prefix: &str) -> String {
     out.push_str(" *   const K* m_keys, const V* m_values, size_t m_len\n");
     out.push_str(" * A map return value expands to out-parameters:\n");
     out.push_str(" *   K* out_keys, V* out_values, size_t* out_len\n");
+    out.push_str(" *\n");
+    out.push_str(" * String convention:\n");
+    out.push_str(" *   String parameters are passed as `(const uint8_t* X_ptr, size_t X_len)`\n");
+    out.push_str(" *   byte slices, not NUL-terminated.\n");
+    out.push_str(" *   String returns are NUL-terminated `const char*` allocated by the\n");
+    out.push_str(&format!(
+        " *   callee and freed by the caller via `{prefix}_free_string`.\n"
+    ));
     out.push_str(" */\n\n");
 
     for m in &api.modules {
@@ -787,7 +796,7 @@ mod tests {
         let ty = TypeRef::Optional(Box::new(TypeRef::StringUtf8));
         assert_eq!(
             c_type_for_param(&ty, "name", "m", "weaveffi", false),
-            "const char* name"
+            "const uint8_t* name_ptr, size_t name_len"
         );
     }
 
@@ -1736,14 +1745,14 @@ mod tests {
         let header = render_c_header(&api, "weaveffi");
 
         assert!(
-            header.contains("const char* name"),
-            "string param should be borrowed const pointer: {header}"
+            header.contains("const uint8_t* name_ptr, size_t name_len"),
+            "string param should be borrowed ptr+len pair: {header}"
         );
         assert!(
             header.contains(
-                "weaveffi_contacts_Contact* weaveffi_contacts_find_contact(const char* name, weaveffi_error* out_err);"
+                "weaveffi_contacts_Contact* weaveffi_contacts_find_contact(const uint8_t* name_ptr, size_t name_len, weaveffi_error* out_err);"
             ),
-            "find_contact should take borrowed name and use out_err as last param: {header}"
+            "find_contact should take borrowed name as ptr+len and use out_err as last param: {header}"
         );
         assert!(
             header.contains(
@@ -2149,7 +2158,7 @@ mod tests {
         };
         let header = render_c_header(&api, "weaveffi");
         assert!(
-            header.contains("typedef void (*weaveffi_events_on_data_fn)(const char* payload, int32_t len, void* context);"),
+            header.contains("typedef void (*weaveffi_events_on_data_fn)(const uint8_t* payload_ptr, size_t payload_len, int32_t len, void* context);"),
             "missing callback typedef: {header}"
         );
     }
@@ -2315,7 +2324,7 @@ mod tests {
             "missing iterator typedef: {header}"
         );
         assert!(
-            header.contains("weaveffi_contacts_ListContactsIterator* weaveffi_contacts_list_contacts(const char* filter, weaveffi_error* out_err);"),
+            header.contains("weaveffi_contacts_ListContactsIterator* weaveffi_contacts_list_contacts(const uint8_t* filter_ptr, size_t filter_len, weaveffi_error* out_err);"),
             "missing function returning iterator: {header}"
         );
         assert!(
@@ -2437,7 +2446,7 @@ mod tests {
     #[test]
     fn c_type_mutable_string_param() {
         let result = c_type_for_param(&TypeRef::StringUtf8, "buf", "io", "weaveffi", true);
-        assert_eq!(result, "char* buf");
+        assert_eq!(result, "uint8_t* buf_ptr, size_t buf_len");
     }
 
     #[test]
@@ -2611,8 +2620,8 @@ mod tests {
 
         let header = render_c_header(&api, "weaveffi");
         assert!(
-            header.contains("const char* input"),
-            "immutable string should have const: {header}"
+            header.contains("const uint8_t* input_ptr, size_t input_len"),
+            "immutable string should have const ptr+len pair: {header}"
         );
         assert!(
             header.contains("weaveffi_io_Buffer* output"),
@@ -2668,6 +2677,187 @@ mod tests {
         assert!(
             header.contains("weaveffi_math_add_old"),
             "missing function declaration: {header}"
+        );
+    }
+
+    #[test]
+    fn c_string_param_uses_ptr_and_len() {
+        let result = c_type_for_param(&TypeRef::StringUtf8, "msg", "io", "weaveffi", false);
+        assert_eq!(result, "const uint8_t* msg_ptr, size_t msg_len");
+
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "io".to_string(),
+                functions: vec![Function {
+                    name: "log".to_string(),
+                    params: vec![Param {
+                        name: "msg".to_string(),
+                        ty: TypeRef::StringUtf8,
+                        mutable: false,
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let header = render_c_header(&api, "weaveffi");
+        assert!(
+            header.contains(
+                "void weaveffi_io_log(const uint8_t* msg_ptr, size_t msg_len, weaveffi_error* out_err);"
+            ),
+            "string param should expand to const uint8_t* + size_t pair: {header}"
+        );
+        assert!(
+            !header.contains("const char* msg"),
+            "string param should NOT use const char* form: {header}"
+        );
+    }
+
+    #[test]
+    fn c_string_return_uses_const_char_ptr() {
+        let (ret_ty, out_params) = c_ret_type(&TypeRef::StringUtf8, "io", "weaveffi");
+        assert_eq!(ret_ty, "const char*");
+        assert!(out_params.is_empty());
+
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "io".to_string(),
+                functions: vec![Function {
+                    name: "greet".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::StringUtf8),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let header = render_c_header(&api, "weaveffi");
+        assert!(
+            header.contains("const char* weaveffi_io_greet(weaveffi_error* out_err);"),
+            "string return should remain const char* (NUL-terminated, callee-allocated): {header}"
+        );
+        assert!(
+            header.contains("weaveffi_free_string"),
+            "header should declare weaveffi_free_string for caller cleanup: {header}"
+        );
+    }
+
+    #[test]
+    fn c_struct_string_field_setter_uses_ptr_and_len() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "contacts".to_string(),
+                functions: vec![],
+                structs: vec![StructDef {
+                    name: "Contact".to_string(),
+                    doc: None,
+                    fields: vec![
+                        StructField {
+                            name: "name".to_string(),
+                            ty: TypeRef::StringUtf8,
+                            doc: None,
+                            default: None,
+                        },
+                        StructField {
+                            name: "age".to_string(),
+                            ty: TypeRef::I32,
+                            doc: None,
+                            default: None,
+                        },
+                    ],
+                    builder: false,
+                }],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let header = render_c_header(&api, "weaveffi");
+        assert!(
+            header.contains("weaveffi_contacts_Contact* weaveffi_contacts_Contact_create(const uint8_t* name_ptr, size_t name_len, int32_t age, weaveffi_error* out_err);"),
+            "struct create should accept string field as ptr+len pair: {header}"
+        );
+        assert!(
+            header.contains(
+                "const char* weaveffi_contacts_Contact_get_name(const weaveffi_contacts_Contact* ptr);"
+            ),
+            "string getter should still return const char* (NUL-terminated): {header}"
+        );
+    }
+
+    #[test]
+    fn c_builder_string_field_setter_uses_ptr_and_len() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "contacts".to_string(),
+                functions: vec![],
+                structs: vec![StructDef {
+                    name: "Contact".to_string(),
+                    doc: None,
+                    fields: vec![
+                        StructField {
+                            name: "name".to_string(),
+                            ty: TypeRef::StringUtf8,
+                            doc: None,
+                            default: None,
+                        },
+                        StructField {
+                            name: "age".to_string(),
+                            ty: TypeRef::I32,
+                            doc: None,
+                            default: None,
+                        },
+                    ],
+                    builder: true,
+                }],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let header = render_c_header(&api, "weaveffi");
+        assert!(
+            header.contains("void weaveffi_contacts_Contact_Builder_set_name(weaveffi_contacts_ContactBuilder* builder, const uint8_t* value_ptr, size_t value_len);"),
+            "builder string setter should accept ptr+len pair: {header}"
+        );
+        assert!(
+            header.contains("void weaveffi_contacts_Contact_Builder_set_age(weaveffi_contacts_ContactBuilder* builder, int32_t value);"),
+            "builder int setter should be unchanged: {header}"
         );
     }
 }
