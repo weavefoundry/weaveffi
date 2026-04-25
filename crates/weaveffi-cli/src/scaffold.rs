@@ -830,6 +830,98 @@ mod tests {
     }
 
     #[test]
+    fn scaffold_string_param_emits_ptr_and_len() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "io".into(),
+                functions: vec![Function {
+                    name: "send".into(),
+                    params: vec![
+                        Param {
+                            name: "msg".into(),
+                            ty: TypeRef::StringUtf8,
+                            mutable: false,
+                        },
+                        Param {
+                            name: "tag".into(),
+                            ty: TypeRef::BorrowedStr,
+                            mutable: false,
+                        },
+                    ],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![StructDef {
+                    name: "Message".into(),
+                    doc: None,
+                    fields: vec![
+                        StructField {
+                            name: "body".into(),
+                            ty: TypeRef::StringUtf8,
+                            doc: None,
+                            default: None,
+                        },
+                        StructField {
+                            name: "label".into(),
+                            ty: TypeRef::BorrowedStr,
+                            doc: None,
+                            default: None,
+                        },
+                    ],
+                    builder: true,
+                }],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let out = render_scaffold(&api);
+
+        assert!(
+            out.contains("msg_ptr: *const u8, msg_len: usize"),
+            "StringUtf8 function param should expand to ptr+len: {out}"
+        );
+        assert!(
+            out.contains("tag_ptr: *const u8, tag_len: usize"),
+            "BorrowedStr function param should expand to ptr+len: {out}"
+        );
+
+        assert!(
+            out.contains("body_ptr: *const u8, body_len: usize"),
+            "StringUtf8 struct field setter should expand to ptr+len: {out}"
+        );
+        assert!(
+            out.contains("label_ptr: *const u8, label_len: usize"),
+            "BorrowedStr struct field setter should expand to ptr+len: {out}"
+        );
+
+        assert!(
+            !out.contains("msg: *const c_char"),
+            "StringUtf8 param must not use legacy *const c_char: {out}"
+        );
+        assert!(
+            !out.contains("tag: *const c_char"),
+            "BorrowedStr param must not use legacy *const c_char: {out}"
+        );
+        assert!(
+            !out.contains("body: *const c_char"),
+            "StringUtf8 struct field setter must not use legacy *const c_char: {out}"
+        );
+        assert!(
+            !out.contains("label: *const c_char"),
+            "BorrowedStr struct field setter must not use legacy *const c_char: {out}"
+        );
+    }
+
+    #[test]
     fn scaffold_multiple_modules() {
         let api = Api {
             version: "0.1.0".into(),
