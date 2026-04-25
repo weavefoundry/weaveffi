@@ -219,7 +219,8 @@ fn c_param_type(ty: &TypeRef, name: &str, module: &str) -> String {
         TypeRef::I64 => format!("int64_t {name}"),
         TypeRef::F64 => format!("double {name}"),
         TypeRef::Bool => format!("bool {name}"),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("const char* {name}"),
+        TypeRef::StringUtf8 => format!("const uint8_t* {name}_ptr, size_t {name}_len"),
+        TypeRef::BorrowedStr => format!("const char* {name}"),
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             format!("const uint8_t* {name}_ptr, size_t {name}_len")
         }
@@ -852,7 +853,14 @@ fn param_to_c_args(ty: &TypeRef, name: &str, module: &str) -> (Vec<String>, Vec<
         TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Bool => {
             (vec![], vec![name.into()])
         }
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => (vec![], vec![format!("{name}.c_str()")]),
+        TypeRef::StringUtf8 => (
+            vec![],
+            vec![
+                format!("reinterpret_cast<const uint8_t*>({name}.data())"),
+                format!("{name}.size()"),
+            ],
+        ),
+        TypeRef::BorrowedStr => (vec![], vec![format!("{name}.c_str()")]),
         TypeRef::Bytes | TypeRef::BorrowedBytes => (
             vec![],
             vec![format!("{name}.data()"), format!("{name}.size()")],
@@ -885,7 +893,16 @@ fn param_to_c_args(ty: &TypeRef, name: &str, module: &str) -> (Vec<String>, Vec<
         TypeRef::Optional(inner) => {
             if is_c_pointer_type(inner) {
                 match inner.as_ref() {
-                    TypeRef::StringUtf8 | TypeRef::BorrowedStr => (
+                    TypeRef::StringUtf8 => (
+                        vec![],
+                        vec![
+                            format!(
+                                "{name}.has_value() ? reinterpret_cast<const uint8_t*>({name}.value().data()) : nullptr"
+                            ),
+                            format!("{name}.has_value() ? {name}.value().size() : 0"),
+                        ],
+                    ),
+                    TypeRef::BorrowedStr => (
                         vec![],
                         vec![format!(
                             "{name}.has_value() ? {name}.value().c_str() : nullptr"
@@ -1935,7 +1952,11 @@ mod tests {
             h.contains("inline std::string io_echo(const std::string& msg)"),
             "string param should be const ref: {h}"
         );
-        assert!(h.contains("msg.c_str()"), "should pass c_str: {h}");
+        assert!(
+            h.contains("reinterpret_cast<const uint8_t*>(msg.data())"),
+            "should pass ptr+len pair to raw C function: {h}"
+        );
+        assert!(h.contains("msg.size()"), "should pass length: {h}");
         assert!(
             h.contains("weaveffi_free_string(result)"),
             "should free returned string: {h}"
@@ -3258,6 +3279,129 @@ mod tests {
         assert!(
             null_check < contact_wrap,
             "optional struct return should check null before wrapping: {fn_text}"
+        );
+    }
+
+    #[test]
+    fn cpp_string_param_calls_raw_with_ptr_and_len() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "io".into(),
+                functions: vec![Function {
+                    name: "log".into(),
+                    params: vec![Param {
+                        name: "msg".into(),
+                        ty: TypeRef::StringUtf8,
+                        mutable: false,
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let h = render_cpp_header(&api, "weaveffi");
+
+        assert!(
+            h.contains(
+                "void weaveffi_io_log(const uint8_t* msg_ptr, size_t msg_len, weaveffi_error* out_err);"
+            ),
+            "extern C declaration should use ptr+len pair for string param: {h}"
+        );
+        assert!(
+            !h.contains("const char* msg,"),
+            "extern C should NOT declare string param as const char*: {h}"
+        );
+
+        assert!(
+            h.contains("inline void io_log(const std::string& msg)"),
+            "C++ wrapper should accept const std::string&: {h}"
+        );
+        assert!(
+            h.contains(
+                "weaveffi_io_log(reinterpret_cast<const uint8_t*>(msg.data()), msg.size(), &err);"
+            ),
+            "wrapper should call raw C function with reinterpret_cast ptr + size: {h}"
+        );
+        assert!(
+            !h.contains("msg.c_str()"),
+            "wrapper must not pass c_str() for StringUtf8 param: {h}"
+        );
+    }
+
+    #[test]
+    fn cpp_struct_setter_string_uses_ptr_and_len() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "contacts".into(),
+                functions: vec![],
+                structs: vec![StructDef {
+                    name: "Contact".into(),
+                    doc: None,
+                    builder: true,
+                    fields: vec![
+                        StructField {
+                            name: "name".into(),
+                            ty: TypeRef::StringUtf8,
+                            doc: None,
+                            default: None,
+                        },
+                        StructField {
+                            name: "age".into(),
+                            ty: TypeRef::I32,
+                            doc: None,
+                            default: None,
+                        },
+                    ],
+                }],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let h = render_cpp_header(&api, "weaveffi");
+
+        assert!(
+            h.contains(
+                "weaveffi_contacts_Contact* weaveffi_contacts_Contact_create(const uint8_t* name_ptr, size_t name_len, int32_t age, weaveffi_error* out_err);"
+            ),
+            "extern C struct create should declare string field as ptr+len pair: {h}"
+        );
+        assert!(
+            h.contains(
+                "void weaveffi_contacts_Contact_Builder_set_name(weaveffi_contacts_ContactBuilder* builder, const uint8_t* value_ptr, size_t value_len);"
+            ),
+            "extern C builder setter should declare string value as ptr+len pair: {h}"
+        );
+        assert!(
+            h.contains(
+                "void weaveffi_contacts_Contact_Builder_set_age(weaveffi_contacts_ContactBuilder* builder, int32_t value);"
+            ),
+            "extern C builder setter for int field should be unchanged: {h}"
+        );
+
+        assert!(
+            h.contains(
+                "weaveffi_contacts_Contact_Builder_set_name(static_cast<weaveffi_contacts_ContactBuilder*>(handle_), reinterpret_cast<const uint8_t*>(value.data()), value.size());"
+            ),
+            "C++ builder setter should call raw C function with reinterpret_cast ptr + size: {h}"
         );
     }
 }
