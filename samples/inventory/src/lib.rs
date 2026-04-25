@@ -42,16 +42,29 @@ pub struct Product {
 static PRODUCT_STORE: Mutex<Vec<Product>> = Mutex::new(Vec::new());
 static NEXT_PRODUCT_ID: AtomicI64 = AtomicI64::new(1);
 
+// ── Helpers ─────────────────────────────────────────────────
+
+/// Convert a (ptr, len) UTF-8 byte slice to an owned `String`.
+/// Returns `None` if the pointer is null or the bytes are not valid UTF-8.
+fn slice_to_string(ptr: *const u8, len: usize) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+    std::str::from_utf8(slice).ok().map(str::to_owned)
+}
+
 // ── Products: module functions ──────────────────────────────
 
 #[no_mangle]
 pub extern "C" fn weaveffi_products_create_product(
-    name: *const c_char,
+    name_ptr: *const u8,
+    name_len: usize,
     price: f64,
     category: i32,
     out_err: *mut weaveffi_error,
 ) -> weaveffi_handle_t {
-    let name = match abi::c_ptr_to_string(name) {
+    let name = match slice_to_string(name_ptr, name_len) {
         Some(s) => s,
         None => {
             abi::error_set(out_err, 1, "name is null or invalid UTF-8");
@@ -241,9 +254,13 @@ pub extern "C" fn weaveffi_products_Product_set_id(product: *mut Product, id: i6
 }
 
 #[no_mangle]
-pub extern "C" fn weaveffi_products_Product_set_name(product: *mut Product, name: *const c_char) {
+pub extern "C" fn weaveffi_products_Product_set_name(
+    product: *mut Product,
+    name_ptr: *const u8,
+    name_len: usize,
+) {
     assert!(!product.is_null());
-    if let Some(s) = abi::c_ptr_to_string(name) {
+    if let Some(s) = slice_to_string(name_ptr, name_len) {
         unsafe { (*product).name = s };
     }
 }
@@ -251,10 +268,11 @@ pub extern "C" fn weaveffi_products_Product_set_name(product: *mut Product, name
 #[no_mangle]
 pub extern "C" fn weaveffi_products_Product_set_description(
     product: *mut Product,
-    description: *const c_char,
+    description_ptr: *const u8,
+    description_len: usize,
 ) {
     assert!(!product.is_null());
-    unsafe { (*product).description = abi::c_ptr_to_string(description) };
+    unsafe { (*product).description = slice_to_string(description_ptr, description_len) };
 }
 
 #[no_mangle]
@@ -597,9 +615,13 @@ pub extern "C" fn weaveffi_orders_Order_set_total(order: *mut Order, total: f64)
 }
 
 #[no_mangle]
-pub extern "C" fn weaveffi_orders_Order_set_status(order: *mut Order, status: *const c_char) {
+pub extern "C" fn weaveffi_orders_Order_set_status(
+    order: *mut Order,
+    status_ptr: *const u8,
+    status_len: usize,
+) {
     assert!(!order.is_null());
-    if let Some(s) = abi::c_ptr_to_string(status) {
+    if let Some(s) = slice_to_string(status_ptr, status_len) {
         unsafe { (*order).status = s };
     }
 }
@@ -673,10 +695,11 @@ mod tests {
     fn create_and_get_product() {
         let _g = setup();
         let mut err = new_err();
-        let name = CString::new("Widget").unwrap();
+        let name = "Widget";
 
         let handle = weaveffi_products_create_product(
             name.as_ptr(),
+            name.len(),
             9.99,
             Category::Electronics as i32,
             &mut err,
@@ -703,7 +726,7 @@ mod tests {
         let _g = setup();
         let mut err = new_err();
 
-        let handle = weaveffi_products_create_product(std::ptr::null(), 9.99, 0, &mut err);
+        let handle = weaveffi_products_create_product(std::ptr::null(), 0, 9.99, 0, &mut err);
         assert_eq!(handle, 0);
         assert_ne!(err.code, 0);
         abi::error_clear(&mut err);
@@ -713,9 +736,10 @@ mod tests {
     fn create_product_invalid_category() {
         let _g = setup();
         let mut err = new_err();
-        let name = CString::new("Bad").unwrap();
+        let name = "Bad";
 
-        let handle = weaveffi_products_create_product(name.as_ptr(), 9.99, 99, &mut err);
+        let handle =
+            weaveffi_products_create_product(name.as_ptr(), name.len(), 9.99, 99, &mut err);
         assert_eq!(handle, 0);
         assert_ne!(err.code, 0);
         abi::error_clear(&mut err);
@@ -735,19 +759,27 @@ mod tests {
     fn search_products_by_category() {
         let _g = setup();
         let mut err = new_err();
-        let n1 = CString::new("Laptop").unwrap();
-        let n2 = CString::new("Shirt").unwrap();
-        let n3 = CString::new("Phone").unwrap();
+        let n1 = "Laptop";
+        let n2 = "Shirt";
+        let n3 = "Phone";
 
         weaveffi_products_create_product(
             n1.as_ptr(),
+            n1.len(),
             999.99,
             Category::Electronics as i32,
             &mut err,
         );
-        weaveffi_products_create_product(n2.as_ptr(), 29.99, Category::Clothing as i32, &mut err);
+        weaveffi_products_create_product(
+            n2.as_ptr(),
+            n2.len(),
+            29.99,
+            Category::Clothing as i32,
+            &mut err,
+        );
         weaveffi_products_create_product(
             n3.as_ptr(),
+            n3.len(),
             499.99,
             Category::Electronics as i32,
             &mut err,
@@ -790,9 +822,9 @@ mod tests {
     fn update_product_price() {
         let _g = setup();
         let mut err = new_err();
-        let name = CString::new("Item").unwrap();
+        let name = "Item";
 
-        let handle = weaveffi_products_create_product(name.as_ptr(), 10.0, 0, &mut err);
+        let handle = weaveffi_products_create_product(name.as_ptr(), name.len(), 10.0, 0, &mut err);
         assert_eq!(weaveffi_products_update_price(handle, 20.0, &mut err), 1);
 
         let product = weaveffi_products_get_product(handle, &mut err);
@@ -811,9 +843,9 @@ mod tests {
     fn delete_product() {
         let _g = setup();
         let mut err = new_err();
-        let name = CString::new("Del").unwrap();
+        let name = "Del";
 
-        let handle = weaveffi_products_create_product(name.as_ptr(), 10.0, 0, &mut err);
+        let handle = weaveffi_products_create_product(name.as_ptr(), name.len(), 10.0, 0, &mut err);
         assert_eq!(weaveffi_products_delete_product(handle, &mut err), 1);
         assert_eq!(weaveffi_products_delete_product(handle, &mut err), 0);
     }
@@ -822,10 +854,15 @@ mod tests {
     fn product_getters_and_setters() {
         let _g = setup();
         let mut err = new_err();
-        let name = CString::new("Test").unwrap();
+        let name = "Test";
 
-        let handle =
-            weaveffi_products_create_product(name.as_ptr(), 5.0, Category::Food as i32, &mut err);
+        let handle = weaveffi_products_create_product(
+            name.as_ptr(),
+            name.len(),
+            5.0,
+            Category::Food as i32,
+            &mut err,
+        );
         let product = weaveffi_products_get_product(handle, &mut err);
         assert!(!product.is_null());
 
@@ -851,19 +888,19 @@ mod tests {
         weaveffi_products_Product_set_id(product, 42);
         assert_eq!(weaveffi_products_Product_get_id(product), 42);
 
-        let new_name = CString::new("Updated").unwrap();
-        weaveffi_products_Product_set_name(product, new_name.as_ptr());
+        let new_name = "Updated";
+        weaveffi_products_Product_set_name(product, new_name.as_ptr(), new_name.len());
         let n = weaveffi_products_Product_get_name(product);
         assert_eq!(abi::c_ptr_to_string(n).unwrap(), "Updated");
         abi::free_string(n);
 
-        let desc = CString::new("A description").unwrap();
-        weaveffi_products_Product_set_description(product, desc.as_ptr());
+        let desc = "A description";
+        weaveffi_products_Product_set_description(product, desc.as_ptr(), desc.len());
         let d = weaveffi_products_Product_get_description(product);
         assert_eq!(abi::c_ptr_to_string(d).unwrap(), "A description");
         abi::free_string(d);
 
-        weaveffi_products_Product_set_description(product, std::ptr::null());
+        weaveffi_products_Product_set_description(product, std::ptr::null(), 0);
         assert!(weaveffi_products_Product_get_description(product).is_null());
 
         weaveffi_products_Product_set_price(product, 99.99);
@@ -1062,8 +1099,8 @@ mod tests {
         weaveffi_orders_Order_set_total(order, 99.99);
         assert_eq!(weaveffi_orders_Order_get_total(order), 99.99);
 
-        let new_status = CString::new("shipped").unwrap();
-        weaveffi_orders_Order_set_status(order, new_status.as_ptr());
+        let new_status = "shipped";
+        weaveffi_orders_Order_set_status(order, new_status.as_ptr(), new_status.len());
         let s = weaveffi_orders_Order_get_status(order);
         assert_eq!(abi::c_ptr_to_string(s).unwrap(), "shipped");
         abi::free_string(s);
@@ -1117,10 +1154,11 @@ mod tests {
     fn add_product_to_order_success() {
         let _g = setup();
         let mut err = new_err();
-        let name = CString::new("Gadget").unwrap();
+        let name = "Gadget";
 
         let product_handle = weaveffi_products_create_product(
             name.as_ptr(),
+            name.len(),
             49.99,
             Category::Electronics as i32,
             &mut err,
@@ -1185,15 +1223,96 @@ mod tests {
     }
 
     #[test]
+    fn create_product_accepts_multibyte_utf8() {
+        let _g = setup();
+        let mut err = new_err();
+        let name = "café au lait ☕";
+
+        let handle = weaveffi_products_create_product(
+            name.as_ptr(),
+            name.len(),
+            3.50,
+            Category::Food as i32,
+            &mut err,
+        );
+        assert_eq!(err.code, 0);
+
+        let product = weaveffi_products_get_product(handle, &mut err);
+        assert_eq!(unsafe { &*product }.name, "café au lait ☕");
+        weaveffi_products_Product_destroy(product);
+    }
+
+    #[test]
+    fn create_product_does_not_read_past_len() {
+        let _g = setup();
+        let mut err = new_err();
+        let buf = "WidgetIGNORED";
+
+        let handle = weaveffi_products_create_product(
+            buf.as_ptr(),
+            6,
+            10.0,
+            Category::Electronics as i32,
+            &mut err,
+        );
+        assert_eq!(err.code, 0);
+
+        let product = weaveffi_products_get_product(handle, &mut err);
+        assert_eq!(unsafe { &*product }.name, "Widget");
+        weaveffi_products_Product_destroy(product);
+    }
+
+    #[test]
+    fn create_product_invalid_utf8_name() {
+        let _g = setup();
+        let mut err = new_err();
+        let bad: [u8; 3] = [0xFF, 0xFE, 0xFD];
+
+        let handle = weaveffi_products_create_product(bad.as_ptr(), bad.len(), 1.0, 0, &mut err);
+        assert_eq!(handle, 0);
+        assert_ne!(err.code, 0);
+        abi::error_clear(&mut err);
+    }
+
+    #[test]
+    fn set_description_uses_byteslice() {
+        let _g = setup();
+        let mut err = new_err();
+        let name = "Item";
+        let handle = weaveffi_products_create_product(name.as_ptr(), name.len(), 1.0, 0, &mut err);
+        let product = weaveffi_products_get_product(handle, &mut err);
+
+        let desc = "café";
+        weaveffi_products_Product_set_description(product, desc.as_ptr(), desc.len());
+        assert_eq!(unsafe { &*product }.description, Some("café".to_string()));
+
+        weaveffi_products_Product_destroy(product);
+    }
+
+    #[test]
+    fn set_status_uses_byteslice() {
+        let _g = setup();
+        let mut err = new_err();
+        let handle = weaveffi_orders_create_order(std::ptr::null(), 0, &mut err);
+        let order = weaveffi_orders_get_order(handle, &mut err);
+
+        let status = "expédié";
+        weaveffi_orders_Order_set_status(order, status.as_ptr(), status.len());
+        assert_eq!(unsafe { &*order }.status, "expédié");
+
+        weaveffi_orders_Order_destroy(order);
+    }
+
+    #[test]
     fn add_multiple_products_to_order() {
         let _g = setup();
         let mut err = new_err();
 
-        let n1 = CString::new("Widget").unwrap();
-        let n2 = CString::new("Gizmo").unwrap();
+        let n1 = "Widget";
+        let n2 = "Gizmo";
 
-        let h1 = weaveffi_products_create_product(n1.as_ptr(), 10.0, 0, &mut err);
-        let h2 = weaveffi_products_create_product(n2.as_ptr(), 25.0, 1, &mut err);
+        let h1 = weaveffi_products_create_product(n1.as_ptr(), n1.len(), 10.0, 0, &mut err);
+        let h2 = weaveffi_products_create_product(n2.as_ptr(), n2.len(), 25.0, 1, &mut err);
 
         let order_handle = weaveffi_orders_create_order(std::ptr::null(), 0, &mut err);
 

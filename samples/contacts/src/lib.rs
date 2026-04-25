@@ -43,31 +43,46 @@ pub struct Contact {
 static STORE: Mutex<Vec<Contact>> = Mutex::new(Vec::new());
 static NEXT_ID: AtomicI64 = AtomicI64::new(1);
 
+// --- Helpers ---
+
+/// Convert a (ptr, len) UTF-8 byte slice to an owned `String`.
+/// Returns `None` if the pointer is null or the bytes are not valid UTF-8.
+fn slice_to_string(ptr: *const u8, len: usize) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+    std::str::from_utf8(slice).ok().map(str::to_owned)
+}
+
 // --- Module functions ---
 
 #[no_mangle]
 pub extern "C" fn weaveffi_contacts_create_contact(
-    first_name: *const c_char,
-    last_name: *const c_char,
-    email: *const c_char,
+    first_name_ptr: *const u8,
+    first_name_len: usize,
+    last_name_ptr: *const u8,
+    last_name_len: usize,
+    email_ptr: *const u8,
+    email_len: usize,
     contact_type: i32,
     out_err: *mut weaveffi_error,
 ) -> weaveffi_handle_t {
-    let first_name = match abi::c_ptr_to_string(first_name) {
+    let first_name = match slice_to_string(first_name_ptr, first_name_len) {
         Some(s) => s,
         None => {
             abi::error_set(out_err, 1, "first_name is null or invalid UTF-8");
             return 0;
         }
     };
-    let last_name = match abi::c_ptr_to_string(last_name) {
+    let last_name = match slice_to_string(last_name_ptr, last_name_len) {
         Some(s) => s,
         None => {
             abi::error_set(out_err, 1, "last_name is null or invalid UTF-8");
             return 0;
         }
     };
-    let email = abi::c_ptr_to_string(email);
+    let email = slice_to_string(email_ptr, email_len);
     let ct = match ContactType::from_i32(contact_type) {
         Some(ct) => ct,
         None => {
@@ -205,10 +220,11 @@ pub extern "C" fn weaveffi_contacts_Contact_set_id(contact: *mut Contact, id: i6
 #[no_mangle]
 pub extern "C" fn weaveffi_contacts_Contact_set_first_name(
     contact: *mut Contact,
-    first_name: *const c_char,
+    first_name_ptr: *const u8,
+    first_name_len: usize,
 ) {
     assert!(!contact.is_null());
-    if let Some(s) = abi::c_ptr_to_string(first_name) {
+    if let Some(s) = slice_to_string(first_name_ptr, first_name_len) {
         unsafe { (*contact).first_name = s };
     }
 }
@@ -216,18 +232,23 @@ pub extern "C" fn weaveffi_contacts_Contact_set_first_name(
 #[no_mangle]
 pub extern "C" fn weaveffi_contacts_Contact_set_last_name(
     contact: *mut Contact,
-    last_name: *const c_char,
+    last_name_ptr: *const u8,
+    last_name_len: usize,
 ) {
     assert!(!contact.is_null());
-    if let Some(s) = abi::c_ptr_to_string(last_name) {
+    if let Some(s) = slice_to_string(last_name_ptr, last_name_len) {
         unsafe { (*contact).last_name = s };
     }
 }
 
 #[no_mangle]
-pub extern "C" fn weaveffi_contacts_Contact_set_email(contact: *mut Contact, email: *const c_char) {
+pub extern "C" fn weaveffi_contacts_Contact_set_email(
+    contact: *mut Contact,
+    email_ptr: *const u8,
+    email_len: usize,
+) {
     assert!(!contact.is_null());
-    unsafe { (*contact).email = abi::c_ptr_to_string(email) };
+    unsafe { (*contact).email = slice_to_string(email_ptr, email_len) };
 }
 
 #[no_mangle]
@@ -301,7 +322,6 @@ pub extern "C" fn weaveffi_error_clear(err: *mut weaveffi_error) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::CString;
 
     static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -320,14 +340,17 @@ mod tests {
     fn create_and_get_contact() {
         let _g = setup();
         let mut err = new_err();
-        let first = CString::new("Alice").unwrap();
-        let last = CString::new("Smith").unwrap();
-        let email = CString::new("alice@example.com").unwrap();
+        let first = "Alice";
+        let last = "Smith";
+        let email = "alice@example.com";
 
         let handle = weaveffi_contacts_create_contact(
             first.as_ptr(),
+            first.len(),
             last.as_ptr(),
+            last.len(),
             email.as_ptr(),
+            email.len(),
             ContactType::Work as i32,
             &mut err,
         );
@@ -351,13 +374,16 @@ mod tests {
     fn create_contact_with_null_email() {
         let _g = setup();
         let mut err = new_err();
-        let first = CString::new("Bob").unwrap();
-        let last = CString::new("Jones").unwrap();
+        let first = "Bob";
+        let last = "Jones";
 
         let handle = weaveffi_contacts_create_contact(
             first.as_ptr(),
+            first.len(),
             last.as_ptr(),
+            last.len(),
             std::ptr::null(),
+            0,
             ContactType::Personal as i32,
             &mut err,
         );
@@ -373,13 +399,16 @@ mod tests {
     fn create_contact_invalid_type() {
         let _g = setup();
         let mut err = new_err();
-        let first = CString::new("Bad").unwrap();
-        let last = CString::new("Type").unwrap();
+        let first = "Bad";
+        let last = "Type";
 
         let handle = weaveffi_contacts_create_contact(
             first.as_ptr(),
+            first.len(),
             last.as_ptr(),
+            last.len(),
             std::ptr::null(),
+            0,
             99,
             &mut err,
         );
@@ -392,12 +421,15 @@ mod tests {
     fn create_contact_null_first_name() {
         let _g = setup();
         let mut err = new_err();
-        let last = CString::new("Oops").unwrap();
+        let last = "Oops";
 
         let handle = weaveffi_contacts_create_contact(
             std::ptr::null(),
+            0,
             last.as_ptr(),
+            last.len(),
             std::ptr::null(),
+            0,
             0,
             &mut err,
         );
@@ -412,19 +444,25 @@ mod tests {
         let mut err = new_err();
         assert_eq!(weaveffi_contacts_count_contacts(&mut err), 0);
 
-        let first = CString::new("A").unwrap();
-        let last = CString::new("B").unwrap();
+        let first = "A";
+        let last = "B";
         weaveffi_contacts_create_contact(
             first.as_ptr(),
+            first.len(),
             last.as_ptr(),
+            last.len(),
             std::ptr::null(),
+            0,
             0,
             &mut err,
         );
         weaveffi_contacts_create_contact(
             first.as_ptr(),
+            first.len(),
             last.as_ptr(),
+            last.len(),
             std::ptr::null(),
+            0,
             1,
             &mut err,
         );
@@ -454,12 +492,15 @@ mod tests {
     fn delete_contact() {
         let _g = setup();
         let mut err = new_err();
-        let first = CString::new("Del").unwrap();
-        let last = CString::new("Me").unwrap();
+        let first = "Del";
+        let last = "Me";
         let handle = weaveffi_contacts_create_contact(
             first.as_ptr(),
+            first.len(),
             last.as_ptr(),
+            last.len(),
             std::ptr::null(),
+            0,
             0,
             &mut err,
         );
@@ -485,14 +526,17 @@ mod tests {
     fn contact_getters_and_setters() {
         let _g = setup();
         let mut err = new_err();
-        let first = CString::new("Get").unwrap();
-        let last = CString::new("Set").unwrap();
-        let email = CString::new("gs@test.com").unwrap();
+        let first = "Get";
+        let last = "Set";
+        let email = "gs@test.com";
 
         let handle = weaveffi_contacts_create_contact(
             first.as_ptr(),
+            first.len(),
             last.as_ptr(),
+            last.len(),
             email.as_ptr(),
+            email.len(),
             0,
             &mut err,
         );
@@ -515,8 +559,8 @@ mod tests {
         abi::free_string(em);
 
         // Setters
-        let new_first = CString::new("Updated").unwrap();
-        weaveffi_contacts_Contact_set_first_name(contact, new_first.as_ptr());
+        let new_first = "Updated";
+        weaveffi_contacts_Contact_set_first_name(contact, new_first.as_ptr(), new_first.len());
         let fname2 = weaveffi_contacts_Contact_get_first_name(contact);
         assert_eq!(abi::c_ptr_to_string(fname2).unwrap(), "Updated");
         abi::free_string(fname2);
@@ -527,7 +571,7 @@ mod tests {
         weaveffi_contacts_Contact_set_contact_type(contact, 2);
         assert_eq!(weaveffi_contacts_Contact_get_contact_type(contact), 2);
 
-        weaveffi_contacts_Contact_set_email(contact, std::ptr::null());
+        weaveffi_contacts_Contact_set_email(contact, std::ptr::null(), 0);
         assert!(weaveffi_contacts_Contact_get_email(contact).is_null());
 
         weaveffi_contacts_Contact_destroy(contact);
@@ -558,5 +602,131 @@ mod tests {
     #[test]
     fn free_null_contact_list_is_safe() {
         weaveffi_contacts_Contact_list_free(std::ptr::null_mut(), 0);
+    }
+
+    #[test]
+    fn create_contact_accepts_multibyte_utf8() {
+        let _g = setup();
+        let mut err = new_err();
+        let first = "Renée";
+        let last = "Müller";
+        let email = "renée@example.com";
+
+        let handle = weaveffi_contacts_create_contact(
+            first.as_ptr(),
+            first.len(),
+            last.as_ptr(),
+            last.len(),
+            email.as_ptr(),
+            email.len(),
+            ContactType::Personal as i32,
+            &mut err,
+        );
+        assert_eq!(err.code, 0);
+
+        let contact = weaveffi_contacts_get_contact(handle, &mut err);
+        let c = unsafe { &*contact };
+        assert_eq!(c.first_name, "Renée");
+        assert_eq!(c.last_name, "Müller");
+        assert_eq!(c.email, Some("renée@example.com".to_string()));
+        weaveffi_contacts_Contact_destroy(contact);
+    }
+
+    #[test]
+    fn create_contact_does_not_read_past_len() {
+        let _g = setup();
+        let mut err = new_err();
+        let buf = "AliceXXXX";
+        let last = "Smith";
+
+        let handle = weaveffi_contacts_create_contact(
+            buf.as_ptr(),
+            5,
+            last.as_ptr(),
+            last.len(),
+            std::ptr::null(),
+            0,
+            0,
+            &mut err,
+        );
+        assert_eq!(err.code, 0);
+
+        let contact = weaveffi_contacts_get_contact(handle, &mut err);
+        assert_eq!(unsafe { &*contact }.first_name, "Alice");
+        weaveffi_contacts_Contact_destroy(contact);
+    }
+
+    #[test]
+    fn create_contact_invalid_utf8_first_name() {
+        let _g = setup();
+        let mut err = new_err();
+        let bad: [u8; 3] = [0xFF, 0xFE, 0xFD];
+        let last = "Smith";
+
+        let handle = weaveffi_contacts_create_contact(
+            bad.as_ptr(),
+            bad.len(),
+            last.as_ptr(),
+            last.len(),
+            std::ptr::null(),
+            0,
+            0,
+            &mut err,
+        );
+        assert_eq!(handle, 0);
+        assert_ne!(err.code, 0);
+        abi::error_clear(&mut err);
+    }
+
+    #[test]
+    fn create_contact_empty_strings() {
+        let _g = setup();
+        let mut err = new_err();
+        let empty = "";
+
+        let handle = weaveffi_contacts_create_contact(
+            empty.as_ptr(),
+            0,
+            empty.as_ptr(),
+            0,
+            empty.as_ptr(),
+            0,
+            0,
+            &mut err,
+        );
+        assert_eq!(err.code, 0);
+
+        let contact = weaveffi_contacts_get_contact(handle, &mut err);
+        let c = unsafe { &*contact };
+        assert_eq!(c.first_name, "");
+        assert_eq!(c.last_name, "");
+        assert_eq!(c.email, Some(String::new()));
+        weaveffi_contacts_Contact_destroy(contact);
+    }
+
+    #[test]
+    fn set_first_name_uses_byteslice() {
+        let _g = setup();
+        let mut err = new_err();
+        let first = "Old";
+        let last = "Name";
+
+        let handle = weaveffi_contacts_create_contact(
+            first.as_ptr(),
+            first.len(),
+            last.as_ptr(),
+            last.len(),
+            std::ptr::null(),
+            0,
+            0,
+            &mut err,
+        );
+        let contact = weaveffi_contacts_get_contact(handle, &mut err);
+
+        let new_name = "新しい";
+        weaveffi_contacts_Contact_set_first_name(contact, new_name.as_ptr(), new_name.len());
+        assert_eq!(unsafe { &*contact }.first_name, "新しい");
+
+        weaveffi_contacts_Contact_destroy(contact);
     }
 }

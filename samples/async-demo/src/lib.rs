@@ -28,11 +28,17 @@ pub type weaveffi_tasks_run_batch_callback = extern "C" fn(
 
 #[no_mangle]
 pub extern "C" fn weaveffi_tasks_run_task_async(
-    name: *const c_char,
+    name_ptr: *const u8,
+    name_len: usize,
     callback: weaveffi_tasks_run_task_callback,
     context: *mut c_void,
 ) {
-    let name_str = abi::c_ptr_to_string(name).unwrap_or_default();
+    let name_str = if name_ptr.is_null() {
+        String::new()
+    } else {
+        let slice = unsafe { std::slice::from_raw_parts(name_ptr, name_len) };
+        std::str::from_utf8(slice).unwrap_or("").to_owned()
+    };
     let ctx = context as usize;
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -185,9 +191,14 @@ mod tests {
     fn run_task_calls_callback() {
         let (tx, rx) = mpsc::channel::<TaskCbMsg>();
         let tx_ptr = Box::into_raw(Box::new(tx));
-        let name = CString::new("test-task").unwrap();
+        let name = "test-task";
 
-        weaveffi_tasks_run_task_async(name.as_ptr(), task_callback, tx_ptr as *mut c_void);
+        weaveffi_tasks_run_task_async(
+            name.as_ptr(),
+            name.len(),
+            task_callback,
+            tx_ptr as *mut c_void,
+        );
 
         let (had_error, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         unsafe { drop(Box::from_raw(tx_ptr)) };
@@ -207,7 +218,7 @@ mod tests {
         let (tx, rx) = mpsc::channel::<TaskCbMsg>();
         let tx_ptr = Box::into_raw(Box::new(tx));
 
-        weaveffi_tasks_run_task_async(std::ptr::null(), task_callback, tx_ptr as *mut c_void);
+        weaveffi_tasks_run_task_async(std::ptr::null(), 0, task_callback, tx_ptr as *mut c_void);
 
         let (had_error, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         unsafe { drop(Box::from_raw(tx_ptr)) };
@@ -290,8 +301,13 @@ mod tests {
 
         let (tx, rx) = mpsc::channel::<TaskCbMsg>();
         let tx_ptr = Box::into_raw(Box::new(tx));
-        let name = CString::new("post-cancel").unwrap();
-        weaveffi_tasks_run_task_async(name.as_ptr(), task_callback, tx_ptr as *mut c_void);
+        let name = "post-cancel";
+        weaveffi_tasks_run_task_async(
+            name.as_ptr(),
+            name.len(),
+            task_callback,
+            tx_ptr as *mut c_void,
+        );
 
         let (had_error, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         unsafe { drop(Box::from_raw(tx_ptr)) };
@@ -344,5 +360,45 @@ mod tests {
     #[test]
     fn list_free_null_is_safe() {
         weaveffi_tasks_TaskResult_list_free(std::ptr::null_mut(), 0);
+    }
+
+    #[test]
+    fn run_task_accepts_multibyte_utf8() {
+        let (tx, rx) = mpsc::channel::<TaskCbMsg>();
+        let tx_ptr = Box::into_raw(Box::new(tx));
+        let name = "tâche-α";
+
+        weaveffi_tasks_run_task_async(
+            name.as_ptr(),
+            name.len(),
+            task_callback,
+            tx_ptr as *mut c_void,
+        );
+
+        let (had_error, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        unsafe { drop(Box::from_raw(tx_ptr)) };
+        assert!(!had_error);
+        assert!(!result.is_null());
+        assert!(unsafe { &*result }.value.contains("tâche-α"));
+
+        weaveffi_tasks_TaskResult_destroy(result);
+    }
+
+    #[test]
+    fn run_task_does_not_read_past_len() {
+        let (tx, rx) = mpsc::channel::<TaskCbMsg>();
+        let tx_ptr = Box::into_raw(Box::new(tx));
+        let buf = "alphaXXX";
+
+        weaveffi_tasks_run_task_async(buf.as_ptr(), 5, task_callback, tx_ptr as *mut c_void);
+
+        let (had_error, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        unsafe { drop(Box::from_raw(tx_ptr)) };
+        assert!(!had_error);
+        let r = unsafe { &*result };
+        assert!(r.value.contains("alpha"));
+        assert!(!r.value.contains("X"));
+
+        weaveffi_tasks_TaskResult_destroy(result);
     }
 }
