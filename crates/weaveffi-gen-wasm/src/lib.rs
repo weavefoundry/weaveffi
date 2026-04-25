@@ -166,6 +166,15 @@ fn render_wasm_readme(api: &Api) -> String {
     out.push_str("Optional values use **`0` / `null`** to represent the absent case. ");
     out.push_str("For numeric optionals, a separate `_is_present` flag (`i32`: 0 or 1) is used. ");
     out.push_str("For handle-typed optionals, a null pointer (`0`) signals absence.\n\n");
+    out.push_str("### Strings\n\n");
+    out.push_str("String parameters are passed as a **pointer + length** pair (`i32` pointer, `i32` length) ");
+    out.push_str("matching the C ABI signature `(const uint8_t* s_ptr, size_t s_len)`. ");
+    out.push_str("Strings are **not** NUL-terminated at the boundary; the explicit length is authoritative. ");
+    out.push_str("The generated JS `_encodeString(wasm, str)` helper UTF-8 encodes the input, copies the bytes ");
+    out.push_str(
+        "into linear memory via `weaveffi_alloc`, and returns a `[ptr, len]` tuple that is spread ",
+    );
+    out.push_str("into the WASM call.\n\n");
     out.push_str("### Lists\n\n");
     out.push_str("Lists are passed as a **pointer + length** pair (`i32` pointer, `i32` length) ");
     out.push_str("referencing a contiguous region in linear memory. The caller is responsible ");
@@ -494,6 +503,9 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
     out.push_str("//   Enums     -> i32 discriminant value\n");
     out.push_str(
         "//   Optionals -> 0/null for absent; for numerics a separate _is_present i32 flag\n",
+    );
+    out.push_str(
+        "//   Strings   -> (i32 ptr, i32 len) pair into linear memory; not NUL-terminated\n",
     );
     out.push_str("//   Lists     -> (i32 pointer, i32 length) pair into linear memory\n");
     out.push('\n');
@@ -2051,6 +2063,76 @@ mod tests {
         assert!(
             js.contains("weaveffi_parent_child_inner_fn"),
             "nested child C ABI call in JS missing: {js}"
+        );
+    }
+
+    #[test]
+    fn wasm_string_param_uses_ptr_and_len_in_js_call() {
+        // The C ABI expands a `string` parameter named `msg` to the pair
+        // `(const uint8_t* msg_ptr, size_t msg_len)`, plus the trailing
+        // `weaveffi_error* err`. The generated JS must UTF-8 encode the input
+        // via `_encodeString`, which returns a `[ptr, len]` tuple, then spread
+        // the pair into the WASM call so the wasm export receives
+        // `(msg_ptr, msg_len, _err)` matching the new C signature.
+        let api = make_api(vec![Module {
+            name: "echo".into(),
+            functions: vec![Function {
+                name: "shout".into(),
+                params: vec![Param {
+                    name: "msg".into(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+
+        assert!(
+            js.contains("function _encodeString(wasm, str) {"),
+            "JS must define the _encodeString helper: {js}"
+        );
+        assert!(
+            js.contains("return [ptr, bytes.length];"),
+            "_encodeString must return a (ptr, len) tuple matching the C (uint8_t*, size_t) signature: {js}"
+        );
+        assert!(
+            js.contains("const [msg_ptr, msg_len] = _encodeString(wasm, msg);"),
+            "string param must be encoded via _encodeString into a (ptr, len) pair: {js}"
+        );
+        assert!(
+            js.contains("wasm.weaveffi_echo_shout(msg_ptr, msg_len, _err);"),
+            "WASM call must pass (msg_ptr, msg_len, _err) matching the new (const uint8_t*, size_t) C signature: {js}"
+        );
+        assert!(
+            !js.contains("wasm.weaveffi_echo_shout(msg, _err)"),
+            "WASM call must NOT pass the string as a single NUL-terminated argument: {js}"
+        );
+
+        let readme = render_wasm_readme(&api);
+        assert!(
+            readme.contains("### Strings"),
+            "README must document the string ABI convention: {readme}"
+        );
+        assert!(
+            readme.contains("(const uint8_t* s_ptr, size_t s_len)"),
+            "README must reference the new C signature for strings: {readme}"
+        );
+        assert!(
+            readme.contains("not** NUL-terminated"),
+            "README must clarify that the WASM string ABI is not NUL-terminated: {readme}"
         );
     }
 }
