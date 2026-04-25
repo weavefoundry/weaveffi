@@ -4182,4 +4182,79 @@ mod tests {
             "missing function declaration: {out}"
         );
     }
+
+    #[test]
+    fn swift_string_param_uses_ptr_and_len_and_compiles_against_new_c_header() {
+        // The C ABI expands a `string` parameter named `msg` to the pair
+        // `(const uint8_t* msg_ptr, size_t msg_len)`, plus the trailing
+        // `weaveffi_error* err`. The Swift wrapper must materialise those exact
+        // arguments at the call site, and the system module must import the
+        // generated `weaveffi.h` so the C prototype resolves at compile time.
+        let api = make_api(vec![Module {
+            name: "echo".to_string(),
+            functions: vec![Function {
+                name: "shout".to_string(),
+                params: vec![Param {
+                    name: "msg".to_string(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_swift_string_ptr_len");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        SwiftGenerator.generate(&api, out_dir).unwrap();
+
+        let modulemap =
+            std::fs::read_to_string(tmp.join("swift/CWeaveFFI/module.modulemap")).unwrap();
+        assert!(
+            modulemap.contains("header \"../../c/weaveffi.h\""),
+            "modulemap must import the generated C header so the prototype resolves: {modulemap}"
+        );
+
+        let swift =
+            std::fs::read_to_string(tmp.join("swift/Sources/WeaveFFI/WeaveFFI.swift")).unwrap();
+        assert!(
+            swift.contains("import CWeaveFFI"),
+            "Swift wrapper must import the C system module: {swift}"
+        );
+        assert!(
+            swift.contains("let msg_bytes = Array(msg.utf8)"),
+            "string param should be materialised as a UTF-8 byte array: {swift}"
+        );
+        assert!(
+            swift.contains("msg_bytes.withUnsafeBufferPointer"),
+            "string param should be borrowed via withUnsafeBufferPointer: {swift}"
+        );
+        assert!(
+            swift.contains("let msg_ptr = msg_buf.baseAddress!"),
+            "string param should expose msg_ptr from the buffer: {swift}"
+        );
+        assert!(
+            swift.contains("let msg_len = msg_buf.count"),
+            "string param should expose msg_len from the buffer: {swift}"
+        );
+        assert!(
+            swift.contains("weaveffi_echo_shout(msg_ptr, msg_len, &err)"),
+            "C call must pass (msg_ptr, msg_len, &err) matching the new (const uint8_t*, size_t) C signature: {swift}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
