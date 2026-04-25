@@ -156,7 +156,7 @@ fn py_type_hint(ty: &TypeRef) -> String {
 
 fn py_param_argtypes(ty: &TypeRef) -> Vec<String> {
     match ty {
-        TypeRef::Bytes | TypeRef::BorrowedBytes => vec![
+        TypeRef::StringUtf8 | TypeRef::Bytes | TypeRef::BorrowedBytes => vec![
             "ctypes.POINTER(ctypes.c_uint8)".into(),
             "ctypes.c_size_t".into(),
         ],
@@ -625,10 +625,10 @@ class _PointerGuard(contextlib.AbstractContextManager):
         return False
 
 
-def _string_to_bytes(s: Optional[str]) -> Optional[bytes]:
-    if s is None:
-        return None
-    return s.encode("utf-8")
+def _string_to_byteslice(s: str) -> tuple:
+    _bytes = s.encode("utf-8")
+    _arr = (ctypes.c_uint8 * len(_bytes))(*_bytes)
+    return (_arr, len(_bytes))
 
 
 def _bytes_to_string(ptr) -> Optional[str]:
@@ -905,7 +905,7 @@ fn render_function(out: &mut String, module_name: &str, f: &Function, strip_modu
 fn py_list_convert_expr(name: &str, elem: &TypeRef) -> String {
     match elem {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            format!("*[_string_to_bytes(v) for v in {name}]")
+            format!("*[v.encode(\"utf-8\") if v is not None else None for v in {name}]")
         }
         TypeRef::Struct(_) | TypeRef::TypedHandle(_) => format!("*[v._ptr for v in {name}]"),
         TypeRef::Enum(_) => format!("*[v.value for v in {name}]"),
@@ -917,7 +917,9 @@ fn py_list_convert_expr(name: &str, elem: &TypeRef) -> String {
 fn py_map_elem_convert(list_name: &str, ty: &TypeRef, var: &str) -> String {
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            format!("*[_string_to_bytes({var}) for {var} in {list_name}]")
+            format!(
+                "*[{var}.encode(\"utf-8\") if {var} is not None else None for {var} in {list_name}]"
+            )
         }
         TypeRef::Enum(_) => format!("*[{var}.value for {var} in {list_name}]"),
         TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
@@ -930,6 +932,11 @@ fn py_map_elem_convert(list_name: &str, ty: &TypeRef, var: &str) -> String {
 
 fn py_param_conversion(name: &str, ty: &TypeRef, ind: &str) -> Vec<String> {
     match ty {
+        TypeRef::StringUtf8 => {
+            vec![format!(
+                "{ind}_{name}_arr, _{name}_len = _string_to_byteslice({name})"
+            )]
+        }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             let s = py_ctypes_scalar(&TypeRef::Bytes);
             vec![format!("{ind}_{name}_arr = ({s} * len({name}))(*{name})")]
@@ -946,8 +953,19 @@ fn py_param_conversion(name: &str, ty: &TypeRef, ind: &str) -> Vec<String> {
                     "{ind}_{name}_c = ctypes.byref(ctypes.c_int32(1 if {name} else 0)) if {name} is not None else None"
                 )]
             }
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                vec![format!("{ind}_{name}_c = _string_to_bytes({name})")]
+            TypeRef::StringUtf8 => {
+                vec![
+                    format!("{ind}if {name} is not None:"),
+                    format!("{ind}    _{name}_arr, _{name}_len = _string_to_byteslice({name})"),
+                    format!("{ind}else:"),
+                    format!("{ind}    _{name}_arr = None"),
+                    format!("{ind}    _{name}_len = 0"),
+                ]
+            }
+            TypeRef::BorrowedStr => {
+                vec![format!(
+                    "{ind}_{name}_c = {name}.encode(\"utf-8\") if {name} is not None else None"
+                )]
             }
             TypeRef::Enum(_) => {
                 vec![format!(
@@ -1006,14 +1024,20 @@ fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
             vec![name.to_string()]
         }
         TypeRef::Bool => vec![format!("1 if {name} else 0")],
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![format!("_string_to_bytes({name})")],
+        TypeRef::StringUtf8 => {
+            vec![format!("_{name}_arr"), format!("_{name}_len")]
+        }
+        TypeRef::BorrowedStr => vec![format!("{name}.encode(\"utf-8\")")],
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             vec![format!("_{name}_arr"), format!("len({name})")]
         }
         TypeRef::Struct(_) | TypeRef::TypedHandle(_) => vec![format!("{name}._ptr")],
         TypeRef::Enum(_) => vec![format!("{name}.value")],
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![format!("_{name}_c")],
+            TypeRef::StringUtf8 => {
+                vec![format!("_{name}_arr"), format!("_{name}_len")]
+            }
+            TypeRef::BorrowedStr => vec![format!("_{name}_c")],
             TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
                 vec![format!("{name}._ptr if {name} is not None else None")]
             }
@@ -1594,10 +1618,13 @@ mod tests {
             py.contains("def echo(msg: str) -> str:"),
             "missing signature: {py}"
         );
-        assert!(py.contains("ctypes.c_char_p"), "missing c_char_p: {py}");
         assert!(
-            py.contains("_string_to_bytes(msg)"),
-            "missing _string_to_bytes call: {py}"
+            py.contains("ctypes.c_char_p"),
+            "missing c_char_p for return: {py}"
+        );
+        assert!(
+            py.contains("_string_to_byteslice(msg)"),
+            "missing _string_to_byteslice call: {py}"
         );
         assert!(
             py.contains("_bytes_to_string(_result)"),
@@ -2964,8 +2991,8 @@ mod tests {
             "missing Optional[str] return"
         );
         assert!(
-            py.contains("_string_to_bytes(prefix)"),
-            "missing optional _string_to_bytes"
+            py.contains("_string_to_byteslice(prefix)"),
+            "missing optional _string_to_byteslice"
         );
 
         assert!(
@@ -3494,7 +3521,7 @@ mod tests {
         assert!(py.contains("contact_type: \"ContactType\""));
         assert!(py.contains("-> int:"));
         assert!(py.contains("weaveffi_contacts_create_contact"));
-        assert!(py.contains("_string_to_bytes(first_name)"));
+        assert!(py.contains("_string_to_byteslice(first_name)"));
         assert!(py.contains("contact_type.value"));
 
         assert!(py.contains("def get_contact(id: int) -> \"Contact\":"));
@@ -3623,8 +3650,8 @@ mod tests {
             "missing _PointerGuard.__exit__"
         );
         assert!(
-            py.contains("def _string_to_bytes("),
-            "missing _string_to_bytes helper"
+            py.contains("def _string_to_byteslice("),
+            "missing _string_to_byteslice helper"
         );
         assert!(
             py.contains("def _bytes_to_string("),
@@ -4021,8 +4048,8 @@ mod tests {
         let py = render_python_module(&api, true);
 
         assert!(
-            py.contains("_string_to_bytes(name)"),
-            "string param should use _string_to_bytes(name): {py}"
+            py.contains("_string_to_byteslice(name)"),
+            "string param should use _string_to_byteslice(name): {py}"
         );
         assert!(
             !py.contains("weaveffi_free_string(name"),
@@ -4402,6 +4429,67 @@ mod tests {
         assert!(
             py.contains("warnings.warn(\"Use add_v2 instead\", DeprecationWarning, stacklevel=2)"),
             "missing deprecation warning: {py}"
+        );
+    }
+
+    #[test]
+    fn python_string_param_uses_ptr_and_len() {
+        let api = make_api(vec![Module {
+            name: "io".into(),
+            functions: vec![Function {
+                name: "log".into(),
+                params: vec![Param {
+                    name: "msg".into(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let py = render_python_module(&api, true);
+
+        assert!(
+            py.contains("def _string_to_byteslice(s: str) -> tuple:"),
+            "preamble should define _string_to_byteslice helper: {py}"
+        );
+        assert!(
+            !py.contains("def _string_to_bytes("),
+            "old _string_to_bytes helper should be removed: {py}"
+        );
+
+        assert!(
+            py.contains(
+                "_fn.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.POINTER(_WeaveffiErrorStruct)]"
+            ),
+            "argtypes should use (POINTER(c_uint8), c_size_t) for string param: {py}"
+        );
+
+        assert!(
+            py.contains("_msg_arr, _msg_len = _string_to_byteslice(msg)"),
+            "string param should call _string_to_byteslice helper: {py}"
+        );
+
+        assert!(
+            py.contains("_fn(_msg_arr, _msg_len, ctypes.byref(_err))"),
+            "call should pass _msg_arr, _msg_len: {py}"
+        );
+
+        let pyi = render_pyi_module(&api, true);
+        assert!(
+            pyi.contains("def log(msg: str) -> None: ..."),
+            "pyi user-facing signature should still take str: {pyi}"
         );
     }
 }
