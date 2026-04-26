@@ -4604,4 +4604,67 @@ mod tests {
             "weaveffi_free_bytes must take (uint8_t*, size_t) (no const): {py}"
         );
     }
+
+    #[test]
+    fn python_check_error_calls_weaveffi_error_clear() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "math".into(),
+                functions: vec![Function {
+                    name: "add".into(),
+                    params: vec![
+                        Param {
+                            name: "a".into(),
+                            ty: TypeRef::I32,
+                            mutable: false,
+                        },
+                        Param {
+                            name: "b".into(),
+                            ty: TypeRef::I32,
+                            mutable: false,
+                        },
+                    ],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let py = render_python_module(&api, true);
+        let def_pos = py
+            .find("def _check_error(err: _WeaveffiErrorStruct) -> None:")
+            .expect("_check_error must be defined");
+        let msg_pos = py[def_pos..]
+            .find("message = err.message.decode(\"utf-8\")")
+            .map(|p| p + def_pos)
+            .expect("_check_error must capture err.message into a Python str");
+        let clear_pos = py[def_pos..]
+            .find("_lib.weaveffi_error_clear(ctypes.byref(err))")
+            .map(|p| p + def_pos)
+            .expect("_check_error must call _lib.weaveffi_error_clear after capturing the message");
+        let raise_pos = py[def_pos..]
+            .find("raise WeaveffiError(code, message)")
+            .map(|p| p + def_pos)
+            .expect("_check_error must raise after clearing");
+        assert!(
+            msg_pos < clear_pos,
+            "weaveffi_error_clear must run AFTER capturing err.message: {py}"
+        );
+        assert!(
+            clear_pos < raise_pos,
+            "weaveffi_error_clear must run BEFORE raising: {py}"
+        );
+    }
 }

@@ -2761,4 +2761,62 @@ mod tests {
             "Go wrapper must free returned bytes via C.weaveffi_free_bytes(result, cOutLen): {go}"
         );
     }
+
+    #[test]
+    fn go_wrapper_calls_weaveffi_error_clear_after_capturing_message() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "math".into(),
+                functions: vec![Function {
+                    name: "add".into(),
+                    params: vec![
+                        Param {
+                            name: "a".into(),
+                            ty: TypeRef::I32,
+                            mutable: false,
+                        },
+                        Param {
+                            name: "b".into(),
+                            ty: TypeRef::I32,
+                            mutable: false,
+                        },
+                    ],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let go = render_go(&api);
+        let msg_pos = go
+            .find("goErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(cErr.message), int(cErr.code))")
+            .expect("Go wrapper must build a Go error from cErr.message before clearing");
+        let clear_pos = go
+            .find("C.weaveffi_error_clear(&cErr)")
+            .expect("Go wrapper must call C.weaveffi_error_clear after capturing the message");
+        let return_pos = go[clear_pos..]
+            .find("return")
+            .map(|p| p + clear_pos)
+            .expect("Go wrapper must return the goErr after clearing");
+        assert!(
+            msg_pos < clear_pos,
+            "C.weaveffi_error_clear must run AFTER capturing cErr.message: {go}"
+        );
+        assert!(
+            clear_pos < return_pos,
+            "C.weaveffi_error_clear must run BEFORE returning the goErr: {go}"
+        );
+    }
 }

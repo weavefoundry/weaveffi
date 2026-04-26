@@ -2349,4 +2349,44 @@ mod tests {
             "Node addon must not cast result to (uint8_t*) when freeing: {addon}"
         );
     }
+
+    #[test]
+    fn node_addon_throws_then_calls_error_clear() {
+        let api = make_api(vec![{
+            let mut m = make_module("math");
+            m.functions.push(Function {
+                name: "add".into(),
+                params: vec![
+                    Param {
+                        name: "a".into(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                    },
+                    Param {
+                        name: "b".into(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                    },
+                ],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            });
+            m
+        }]);
+        let addon = render_addon_c(&api, true);
+        let throw_pos = addon
+            .find("napi_throw_error(env, NULL, err.message);")
+            .expect("addon must throw with err.message before clearing");
+        let clear_pos = addon
+            .find("weaveffi_error_clear(&err);")
+            .expect("addon must call weaveffi_error_clear after capturing the message");
+        assert!(
+            throw_pos < clear_pos,
+            "weaveffi_error_clear must run AFTER napi_throw_error has captured err.message: {addon}"
+        );
+    }
 }

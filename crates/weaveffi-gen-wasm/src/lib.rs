@@ -2236,4 +2236,32 @@ mod tests {
             "API reference must render the Bytes return as (i32, i32): {readme}"
         );
     }
+
+    #[test]
+    fn wasm_check_error_calls_weaveffi_error_clear() {
+        let js = render_wasm_js_stub(&sample_api(), DEFAULT_MODULE_NAME);
+        let def_pos = js
+            .find("function _checkError(wasm, errPtr) {")
+            .expect("_checkError must be defined");
+        let msg_pos = js[def_pos..]
+            .find("const msg = new TextDecoder().decode(")
+            .map(|p| p + def_pos)
+            .expect("_checkError must decode the error message before clearing");
+        let clear_pos = js[def_pos..]
+            .find("wasm.weaveffi_error_clear(errPtr);")
+            .map(|p| p + def_pos)
+            .expect("_checkError must call wasm.weaveffi_error_clear after capturing the message");
+        let throw_pos = js[def_pos..]
+            .find("throw new Error(")
+            .map(|p| p + def_pos)
+            .expect("_checkError must throw after clearing");
+        assert!(
+            msg_pos < clear_pos,
+            "wasm.weaveffi_error_clear must run AFTER decoding the error message: {js}"
+        );
+        assert!(
+            clear_pos < throw_pos,
+            "wasm.weaveffi_error_clear must run BEFORE throwing: {js}"
+        );
+    }
 }

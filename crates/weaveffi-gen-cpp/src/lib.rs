@@ -3511,4 +3511,26 @@ mod tests {
             "C++ wrapper must NOT need const_cast on bytes result: {h}"
         );
     }
+
+    #[test]
+    fn cpp_error_check_calls_error_clear() {
+        let h = render_cpp_header(&minimal_api(), "weaveffi");
+        let msg_pos = h
+            .find("std::string msg(err.message")
+            .expect("error block must capture err.message into a std::string");
+        let clear_pos = h
+            .find("weaveffi_error_clear(&err);")
+            .expect("error block must call weaveffi_error_clear after capturing the message");
+        let throw_pos = h
+            .find("throw WeaveFFIError(code, msg);")
+            .expect("error block must throw after clearing");
+        assert!(
+            msg_pos < clear_pos,
+            "weaveffi_error_clear must run AFTER capturing err.message: {h}"
+        );
+        assert!(
+            clear_pos < throw_pos,
+            "weaveffi_error_clear must run BEFORE throwing: {h}"
+        );
+    }
 }

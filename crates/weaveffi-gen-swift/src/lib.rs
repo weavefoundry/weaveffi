@@ -4351,4 +4351,57 @@ mod tests {
             "Swift wrapper must convert bytes return to Data using outLen: {swift}"
         );
     }
+
+    #[test]
+    fn swift_check_calls_error_clear_after_capturing_message() {
+        let api = make_api(vec![Module {
+            name: "math".to_string(),
+            functions: vec![Function {
+                name: "add".to_string(),
+                params: vec![
+                    Param {
+                        name: "a".to_string(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                    },
+                    Param {
+                        name: "b".to_string(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                    },
+                ],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let swift = render_swift_wrapper(&api, true);
+        let msg_pos = swift
+            .find("let message = err.message.flatMap")
+            .expect("check() must capture err.message into a Swift String");
+        let clear_pos = swift
+            .find("weaveffi_error_clear(&err)")
+            .expect("check() must call weaveffi_error_clear after capturing the message");
+        let throw_pos = swift
+            .find("throw WeaveFFIError")
+            .expect("check() must throw after clearing");
+        assert!(
+            msg_pos < clear_pos,
+            "weaveffi_error_clear must run AFTER capturing err.message: {swift}"
+        );
+        assert!(
+            clear_pos < throw_pos,
+            "weaveffi_error_clear must run BEFORE throwing: {swift}"
+        );
+    }
 }

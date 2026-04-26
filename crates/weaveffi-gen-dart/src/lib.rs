@@ -2029,4 +2029,54 @@ mod tests {
             "wrapper must free outLen in the finally block: {dart}"
         );
     }
+
+    #[test]
+    fn dart_check_error_calls_weaveffi_error_clear() {
+        let api = make_api(vec![simple_module(vec![Function {
+            name: "add".into(),
+            params: vec![
+                Param {
+                    name: "a".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                },
+                Param {
+                    name: "b".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                },
+            ],
+            returns: Some(TypeRef::I32),
+            doc: None,
+            r#async: false,
+            cancellable: false,
+            deprecated: None,
+            since: None,
+        }])]);
+
+        let dart = render_dart_module(&api);
+        let def_pos = dart
+            .find("void _checkError(Pointer<_WeaveffiError> err) {")
+            .expect("_checkError must be defined");
+        let msg_pos = dart[def_pos..]
+            .find("final msg = err.ref.message.toDartString();")
+            .map(|p| p + def_pos)
+            .expect("_checkError must capture err.ref.message into a Dart String");
+        let clear_pos = dart[def_pos..]
+            .find("_weaveffiErrorClear(err);")
+            .map(|p| p + def_pos)
+            .expect("_checkError must call _weaveffiErrorClear after capturing the message");
+        let throw_pos = dart[def_pos..]
+            .find("throw WeaveffiException(")
+            .map(|p| p + def_pos)
+            .expect("_checkError must throw after clearing");
+        assert!(
+            msg_pos < clear_pos,
+            "_weaveffiErrorClear must run AFTER capturing err.ref.message: {dart}"
+        );
+        assert!(
+            clear_pos < throw_pos,
+            "_weaveffiErrorClear must run BEFORE throwing: {dart}"
+        );
+    }
 }

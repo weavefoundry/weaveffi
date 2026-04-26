@@ -2418,4 +2418,63 @@ mod tests {
             "Ruby wrapper must free returned bytes via weaveffi_free_bytes(result, len): {rb}"
         );
     }
+
+    #[test]
+    fn ruby_check_error_calls_weaveffi_error_clear() {
+        let api = make_api(vec![Module {
+            name: "math".into(),
+            functions: vec![Function {
+                name: "add".into(),
+                params: vec![
+                    Param {
+                        name: "a".into(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                    },
+                    Param {
+                        name: "b".into(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                    },
+                ],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let rb = render_ruby_module(&api, "WeaveFFI");
+        let def_pos = rb
+            .find("def self.check_error!(err)")
+            .expect("check_error! must be defined");
+        let msg_pos = rb[def_pos..]
+            .find("msg = msg_ptr.null? ? '' : msg_ptr.read_string")
+            .map(|p| p + def_pos)
+            .expect("check_error! must capture msg_ptr.read_string into msg");
+        let clear_pos = rb[def_pos..]
+            .find("weaveffi_error_clear(err.to_ptr)")
+            .map(|p| p + def_pos)
+            .expect("check_error! must call weaveffi_error_clear after capturing the message");
+        let raise_pos = rb[def_pos..]
+            .find("raise Error.new(code, msg)")
+            .map(|p| p + def_pos)
+            .expect("check_error! must raise after clearing");
+        assert!(
+            msg_pos < clear_pos,
+            "weaveffi_error_clear must run AFTER capturing msg_ptr.read_string: {rb}"
+        );
+        assert!(
+            clear_pos < raise_pos,
+            "weaveffi_error_clear must run BEFORE raising: {rb}"
+        );
+    }
 }

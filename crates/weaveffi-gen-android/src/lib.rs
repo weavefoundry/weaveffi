@@ -4529,4 +4529,57 @@ mod tests {
             "JNI must NOT need (uint8_t*) cast on bytes return: {jni}"
         );
     }
+
+    #[test]
+    fn android_throw_weaveffi_error_calls_error_clear() {
+        let api = make_api(vec![Module {
+            name: "math".to_string(),
+            functions: vec![Function {
+                name: "add".to_string(),
+                params: vec![
+                    Param {
+                        name: "a".to_string(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                    },
+                    Param {
+                        name: "b".to_string(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                    },
+                ],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let throw_fn_pos = jni
+            .find("static void throw_weaveffi_error(JNIEnv* env, weaveffi_error* err) {")
+            .expect("throw_weaveffi_error helper must be defined");
+        let throw_new_pos = jni[throw_fn_pos..]
+            .find("(*env)->ThrowNew(env, exClass, msg);")
+            .map(|p| p + throw_fn_pos)
+            .expect("throw_weaveffi_error must call ThrowNew with msg");
+        let clear_pos = jni[throw_fn_pos..]
+            .find("weaveffi_error_clear(err);")
+            .map(|p| p + throw_fn_pos)
+            .expect(
+                "throw_weaveffi_error must call weaveffi_error_clear after capturing the message",
+            );
+        assert!(
+            throw_new_pos < clear_pos,
+            "weaveffi_error_clear must run AFTER ThrowNew has captured err->message: {jni}"
+        );
+    }
 }
