@@ -2333,6 +2333,16 @@ mod tests {
             readme.contains("| `payload` | `bytes` | `i32, i32` | ptr + len in linear memory |"),
             "API reference must render the Bytes param as (i32, i32): {readme}"
         );
+
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        assert!(
+            js.contains("const [payload_ptr, payload_len] = _encodeBytes(wasm, payload);"),
+            "JS stub must destructure bytes input into canonical (payload_ptr, payload_len) via _encodeBytes: {js}"
+        );
+        assert!(
+            js.contains("wasm.weaveffi_io_send(payload_ptr, payload_len, _err);"),
+            "JS stub must call WASM export with (payload_ptr, payload_len, _err) matching canonical (const uint8_t*, size_t, weaveffi_error*) shape: {js}"
+        );
     }
 
     #[test]
@@ -2372,6 +2382,20 @@ mod tests {
         assert!(
             readme.contains("| _returns_ | `bytes` | `i32, i32` | ptr + len in linear memory |"),
             "API reference must render the Bytes return as (i32, i32): {readme}"
+        );
+
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        assert!(
+            js.contains("const _bytesPtr = view.getInt32(retptr, true);"),
+            "JS stub must read returned bytes pointer from retptr matching canonical uint8_t* out_ptr: {js}"
+        );
+        assert!(
+            js.contains("const _bytesLen = view.getInt32(out_len_ptr, true);"),
+            "JS stub must read returned length from out_len_ptr matching canonical size_t* out_len: {js}"
+        );
+        assert!(
+            js.contains("wasm.weaveffi_free_bytes(_bytesPtr, _bytesLen)"),
+            "JS stub must free returned bytes via wasm.weaveffi_free_bytes(ptr, len): {js}"
         );
     }
 
