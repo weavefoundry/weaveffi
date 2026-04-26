@@ -23,6 +23,47 @@ fn run_hook(label: &str, cmd: &str) -> Result<()> {
     Ok(())
 }
 
+/// IR features a generator may or may not support.
+///
+/// Generators declare their supported capabilities via [`Generator::capabilities`].
+/// The default implementation returns [`Capability::ALL`], meaning generators are
+/// assumed feature-complete unless they override it to advertise a narrower set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Capability {
+    Callbacks,
+    Listeners,
+    Iterators,
+    Builders,
+    AsyncFunctions,
+    CancellableAsync,
+    TypedHandles,
+    BorrowedTypes,
+    MapTypes,
+    NestedModules,
+    CrossModuleTypes,
+    ErrorDomains,
+    DeprecatedAnnotations,
+}
+
+impl Capability {
+    /// Every capability defined by the IR.
+    pub const ALL: &'static [Capability] = &[
+        Capability::Callbacks,
+        Capability::Listeners,
+        Capability::Iterators,
+        Capability::Builders,
+        Capability::AsyncFunctions,
+        Capability::CancellableAsync,
+        Capability::TypedHandles,
+        Capability::BorrowedTypes,
+        Capability::MapTypes,
+        Capability::NestedModules,
+        Capability::CrossModuleTypes,
+        Capability::ErrorDomains,
+        Capability::DeprecatedAnnotations,
+    ];
+}
+
 pub trait Generator {
     fn name(&self) -> &'static str;
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()>;
@@ -57,6 +98,11 @@ pub trait Generator {
         _config: &GeneratorConfig,
     ) -> Vec<String> {
         self.output_files(api, out_dir)
+    }
+
+    /// IR features this generator fully supports. Defaults to [`Capability::ALL`].
+    fn capabilities(&self) -> &'static [Capability] {
+        Capability::ALL
     }
 }
 
@@ -306,6 +352,59 @@ mod tests {
         let orch = Orchestrator::new().with_generator(&gen);
         orch.run(&api, out_dir, &config, true, None).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn capability_all_contains_every_variant() {
+        use Capability::*;
+        let expected = [
+            Callbacks,
+            Listeners,
+            Iterators,
+            Builders,
+            AsyncFunctions,
+            CancellableAsync,
+            TypedHandles,
+            BorrowedTypes,
+            MapTypes,
+            NestedModules,
+            CrossModuleTypes,
+            ErrorDomains,
+            DeprecatedAnnotations,
+        ];
+        assert_eq!(Capability::ALL, &expected);
+    }
+
+    #[test]
+    fn default_generator_capabilities_is_feature_complete() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gen = CountingGenerator {
+            calls: Arc::clone(&calls),
+        };
+        assert_eq!(gen.capabilities(), Capability::ALL);
+    }
+
+    #[test]
+    fn generator_can_override_capabilities() {
+        struct LimitedGenerator;
+        impl Generator for LimitedGenerator {
+            fn name(&self) -> &'static str {
+                "limited"
+            }
+            fn generate(&self, _api: &Api, _out_dir: &Utf8Path) -> Result<()> {
+                Ok(())
+            }
+            fn capabilities(&self) -> &'static [Capability] {
+                &[Capability::AsyncFunctions, Capability::ErrorDomains]
+            }
+        }
+
+        let gen = LimitedGenerator;
+        assert_eq!(
+            gen.capabilities(),
+            &[Capability::AsyncFunctions, Capability::ErrorDomains]
+        );
+        assert!(!gen.capabilities().contains(&Capability::Callbacks));
     }
 
     #[test]
