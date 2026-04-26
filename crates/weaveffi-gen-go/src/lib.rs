@@ -51,6 +51,7 @@ impl Generator for GoGenerator {
         &[
             Capability::Callbacks,
             Capability::Listeners,
+            Capability::Iterators,
             Capability::CancellableAsync,
             Capability::TypedHandles,
             Capability::BorrowedTypes,
@@ -83,7 +84,8 @@ fn go_type(ty: &TypeRef) -> String {
             TypeRef::Bytes | TypeRef::BorrowedBytes => go_type(inner),
             _ => format!("*{}", go_type(inner)),
         },
-        TypeRef::List(inner) | TypeRef::Iterator(inner) => format!("[]{}", go_type(inner)),
+        TypeRef::List(inner) => format!("[]{}", go_type(inner)),
+        TypeRef::Iterator(inner) => format!("<-chan {}", go_type(inner)),
         TypeRef::Map(k, v) => format!("map[{}]{}", go_type(k), go_type(v)),
         TypeRef::Callback(name) => name.to_upper_camel_case(),
     }
@@ -167,7 +169,9 @@ fn return_uses_unsafe(ty: &TypeRef) -> bool {
 fn type_has_bool(ty: &TypeRef) -> bool {
     match ty {
         TypeRef::Bool => true,
-        TypeRef::Optional(inner) | TypeRef::List(inner) => type_has_bool(inner),
+        TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
+            type_has_bool(inner)
+        }
         _ => false,
     }
 }
@@ -858,7 +862,7 @@ fn render_function(out: &mut String, module: &str, f: &Function) {
     out.push_str("\t}\n");
 
     if let Some(ref ret) = f.returns {
-        emit_return(out, ret, module);
+        emit_return(out, ret, module, &f.name);
     } else {
         out.push_str("\treturn nil\n");
     }
@@ -1131,7 +1135,7 @@ fn emit_map_array(pre: &mut String, ptr_var: &str, slice_name: &str, ty: &TypeRe
 
 fn emit_return_out_params(pre: &mut String, args: &mut Vec<String>, ty: &TypeRef) {
     match ty {
-        TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Bytes | TypeRef::BorrowedBytes => {
+        TypeRef::List(_) | TypeRef::Bytes | TypeRef::BorrowedBytes => {
             pre.push_str("\tvar cOutLen C.size_t\n");
             args.push("&cOutLen".into());
         }
@@ -1142,7 +1146,7 @@ fn emit_return_out_params(pre: &mut String, args: &mut Vec<String>, ty: &TypeRef
 
 // ── Return conversion ──
 
-fn emit_return(out: &mut String, ty: &TypeRef, module: &str) {
+fn emit_return(out: &mut String, ty: &TypeRef, module: &str, func_name: &str) {
     match ty {
         TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::F64 => {
             let conv = go_scalar_conv("result", ty);
@@ -1176,7 +1180,7 @@ fn emit_return(out: &mut String, ty: &TypeRef, module: &str) {
         }
         TypeRef::Map(k, v) => emit_map_return(out, k, v),
         TypeRef::Callback(_) => out.push_str("\treturn nil, nil\n"),
-        TypeRef::Iterator(inner) => emit_list_return(out, inner, module),
+        TypeRef::Iterator(inner) => emit_iterator_return(out, inner, module, func_name),
     }
 }
 
@@ -1256,6 +1260,68 @@ fn emit_map_return(out: &mut String, k: &TypeRef, v: &TypeRef) {
     let gv = go_type(v);
     out.push_str(&format!("\tgoResult := make(map[{gk}]{gv})\n"));
     out.push_str("\treturn goResult, nil\n");
+}
+
+// ── Iterator return ──
+
+fn iter_out_item_c_type(inner: &TypeRef, module: &str) -> String {
+    match inner {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "*C.char".into(),
+        TypeRef::Struct(n) | TypeRef::TypedHandle(n) => format!("*C.weaveffi_{module}_{n}"),
+        _ => c_scalar_type(inner, module).unwrap_or_else(|| "C.int32_t".into()),
+    }
+}
+
+fn iter_item_to_go(var: &str, inner: &TypeRef) -> String {
+    match inner {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("C.GoString({var})"),
+        TypeRef::Bool => format!("cToBool({var})"),
+        TypeRef::Struct(n) => {
+            let g = local_type_name(n).to_upper_camel_case();
+            format!("new{g}({var})")
+        }
+        TypeRef::TypedHandle(n) => {
+            let g = n.to_upper_camel_case();
+            format!("&{g}{{ptr: {var}}}")
+        }
+        _ => go_scalar_conv(var, inner),
+    }
+}
+
+fn emit_iterator_return(out: &mut String, inner: &TypeRef, module: &str, func_name: &str) {
+    let pascal = func_name.to_upper_camel_case();
+    let iter_tag = format!("weaveffi_{module}_{pascal}Iterator");
+    let gi = go_type(inner);
+    let c_item_ty = iter_out_item_c_type(inner, module);
+    let conv = iter_item_to_go("outItem", inner);
+
+    out.push_str(&format!("\tch := make(chan {gi})\n"));
+    out.push_str("\tgo func() {\n");
+    out.push_str("\t\tdefer close(ch)\n");
+    out.push_str(&format!("\t\tdefer C.{iter_tag}_destroy(result)\n"));
+    out.push_str("\t\tfor {\n");
+    out.push_str(&format!("\t\t\tvar outItem {c_item_ty}\n"));
+    out.push_str("\t\t\tvar itemErr C.weaveffi_error\n");
+    out.push_str(&format!(
+        "\t\t\thas := C.{iter_tag}_next(result, &outItem, &itemErr)\n"
+    ));
+    out.push_str("\t\t\tif itemErr.code != 0 {\n");
+    out.push_str("\t\t\t\tC.weaveffi_error_clear(&itemErr)\n");
+    out.push_str("\t\t\t\treturn\n");
+    out.push_str("\t\t\t}\n");
+    out.push_str("\t\t\tif has == 0 {\n");
+    out.push_str("\t\t\t\treturn\n");
+    out.push_str("\t\t\t}\n");
+    if matches!(inner, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
+        out.push_str(&format!("\t\t\titem := {conv}\n"));
+        out.push_str("\t\t\tC.weaveffi_free_string(outItem)\n");
+        out.push_str("\t\t\tch <- item\n");
+    } else {
+        out.push_str(&format!("\t\t\tch <- {conv}\n"));
+    }
+    out.push_str("\t\t}\n");
+    out.push_str("\t}()\n");
+    out.push_str("\treturn ch, nil\n");
 }
 
 #[cfg(test)]
@@ -3460,22 +3526,84 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_includes_callbacks_and_listeners_excludes_async_iterators_builders() {
+    fn capabilities_includes_callbacks_listeners_iterators_excludes_async_builders() {
         let caps = GoGenerator.capabilities();
         assert!(caps.contains(&Capability::Callbacks));
         assert!(caps.contains(&Capability::Listeners));
+        assert!(caps.contains(&Capability::Iterators));
         assert!(!caps.contains(&Capability::AsyncFunctions));
-        assert!(!caps.contains(&Capability::Iterators));
         assert!(!caps.contains(&Capability::Builders));
         for cap in Capability::ALL {
-            if matches!(
-                cap,
-                Capability::AsyncFunctions | Capability::Iterators | Capability::Builders
-            ) {
+            if matches!(cap, Capability::AsyncFunctions | Capability::Builders) {
                 continue;
             }
             assert!(caps.contains(cap), "Go generator must support {cap:?}");
         }
+    }
+
+    #[test]
+    fn go_iterator_return_uses_channel() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "data".into(),
+                functions: vec![Function {
+                    name: "list_items".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::Iterator(Box::new(TypeRef::I32))),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let go = render_go(&api);
+
+        assert!(
+            go.contains("func DataListItems() (<-chan int32, error)"),
+            "iterator function must return <-chan T: {go}"
+        );
+        assert!(
+            go.contains("ch := make(chan int32)"),
+            "iterator must allocate a Go channel: {go}"
+        );
+        assert!(
+            go.contains("go func() {"),
+            "iterator must spawn a goroutine: {go}"
+        );
+        assert!(
+            go.contains("defer close(ch)"),
+            "goroutine must close the channel on done: {go}"
+        );
+        assert!(
+            go.contains("defer C.weaveffi_data_ListItemsIterator_destroy(result)"),
+            "goroutine must destroy the native iterator: {go}"
+        );
+        assert!(
+            go.contains("C.weaveffi_data_ListItemsIterator_next(result, &outItem, &itemErr)"),
+            "goroutine must call _next in the loop: {go}"
+        );
+        assert!(
+            go.contains("if has == 0 {"),
+            "goroutine must break when _next returns 0: {go}"
+        );
+        assert!(
+            go.contains("ch <- int32(outItem)"),
+            "goroutine must send converted items to the channel: {go}"
+        );
+        assert!(
+            go.contains("return ch, nil"),
+            "wrapper must return the channel and nil error on success: {go}"
+        );
     }
 
     #[test]
