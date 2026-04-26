@@ -25,7 +25,10 @@ impl RubyGenerator {
             lib_dir.join("weaveffi.rb"),
             render_ruby_module(api, module_name),
         )?;
-        std::fs::write(dir.join("weaveffi.gemspec"), render_gemspec(gem_name))?;
+        std::fs::write(
+            dir.join("weaveffi.gemspec"),
+            render_gemspec(gem_name, has_any_async(api)),
+        )?;
         std::fs::write(dir.join("README.md"), render_readme())?;
         Ok(())
     }
@@ -68,6 +71,7 @@ impl Generator for RubyGenerator {
             Capability::Callbacks,
             Capability::Listeners,
             Capability::Iterators,
+            Capability::AsyncFunctions,
             Capability::CancellableAsync,
             Capability::TypedHandles,
             Capability::BorrowedTypes,
@@ -311,7 +315,8 @@ fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Mo
 
 fn render_ruby_module(api: &Api, module_name: &str) -> String {
     let mut out = String::new();
-    render_preamble(&mut out, module_name);
+    let has_async = has_any_async(api);
+    render_preamble(&mut out, module_name, has_async);
     for (m, path) in collect_modules_with_path(&api.modules) {
         out.push_str(&format!("\n  # === Module: {} ===\n", path));
         for e in &m.enums {
@@ -327,7 +332,9 @@ fn render_ruby_module(api: &Api, module_name: &str) -> String {
             render_struct_ffi(&mut out, &path, s);
         }
         for f in &m.functions {
-            if !f.r#async {
+            if f.r#async {
+                render_async_attach_function(&mut out, &path, f);
+            } else {
                 render_attach_function(&mut out, &path, f);
             }
         }
@@ -338,7 +345,9 @@ fn render_ruby_module(api: &Api, module_name: &str) -> String {
             }
         }
         for f in &m.functions {
-            if !f.r#async {
+            if f.r#async {
+                render_async_function_wrapper(&mut out, &path, f);
+            } else {
                 render_function_wrapper(&mut out, &path, f);
             }
         }
@@ -350,13 +359,24 @@ fn render_ruby_module(api: &Api, module_name: &str) -> String {
     out
 }
 
-fn render_preamble(out: &mut String, module_name: &str) {
+fn has_any_async(api: &Api) -> bool {
+    collect_all_modules(&api.modules)
+        .iter()
+        .any(|m| m.functions.iter().any(|f| f.r#async))
+}
+
+fn render_preamble(out: &mut String, module_name: &str, has_async: bool) {
+    let extra_require = if has_async {
+        "require 'concurrent'\n"
+    } else {
+        ""
+    };
     out.push_str(&format!(
         "# frozen_string_literal: true
 # {module_name} Ruby FFI bindings (auto-generated)
 
 require 'ffi'
-
+{extra_require}
 module {module_name}
   extend FFI::Library
 
@@ -397,6 +417,32 @@ module {module_name}
   end
 "
     ));
+
+    if has_async {
+        out.push_str(
+            "
+  # Async callback registry. Pins Proc objects keyed by id so Ruby's GC
+  # cannot reclaim them while the native side still holds a function
+  # pointer. The id is also passed to C as the callback context.
+  @@async_callbacks = {}
+  @@async_next_id = 0
+  @@async_mutex = Mutex.new
+
+  def self.register_async_callback(cb)
+    @@async_mutex.synchronize do
+      id = @@async_next_id
+      @@async_next_id += 1
+      @@async_callbacks[id] = cb
+      id
+    end
+  end
+
+  def self.pop_async_callback(id)
+    @@async_mutex.synchronize { @@async_callbacks.delete(id) }
+  end
+",
+        );
+    }
 }
 
 fn render_enum(out: &mut String, e: &EnumDef) {
@@ -701,6 +747,326 @@ fn render_function_wrapper(out: &mut String, module_name: &str, f: &Function) {
         }
     }
 
+    out.push_str("  end\n");
+}
+
+// ── Async rendering ──
+
+/// FFI types for the C async callback parameters: `(context, err, result...)`.
+/// Strings are represented as `:pointer` (not `:string`) so the wrapper can
+/// call `weaveffi_free_string` after copying the payload into Ruby memory.
+fn rb_async_cb_param_ffi_types(ret: &Option<TypeRef>) -> Vec<String> {
+    let mut v = vec![":pointer".into(), ":pointer".into()];
+    match ret {
+        None => {}
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_)) => {
+            v.push(":pointer".into());
+            v.push(":size_t".into());
+        }
+        Some(TypeRef::Map(_, _)) => {
+            v.push(":pointer".into());
+            v.push(":pointer".into());
+            v.push(":size_t".into());
+        }
+        Some(TypeRef::Optional(inner)) if !is_c_pointer_type(inner) => {
+            v.push(":pointer".into());
+        }
+        Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
+            v.push(":pointer".into());
+        }
+        Some(ty) => {
+            v.push(rb_ffi_scalar(ty).into());
+        }
+    }
+    v
+}
+
+/// Ruby block parameter names mirroring `rb_async_cb_param_ffi_types`.
+fn rb_async_cb_param_names(ret: &Option<TypeRef>) -> Vec<&'static str> {
+    let mut v = vec!["ctx", "err_ptr"];
+    match ret {
+        None => {}
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_)) => {
+            v.push("result");
+            v.push("result_len");
+        }
+        Some(TypeRef::Map(_, _)) => {
+            v.push("result_keys");
+            v.push("result_values");
+            v.push("result_len");
+        }
+        _ => {
+            v.push("result");
+        }
+    }
+    v
+}
+
+fn render_async_attach_function(out: &mut String, module_name: &str, f: &Function) {
+    let c_sym = c_symbol_name(module_name, &f.name);
+    let cb_name = format!("{c_sym}_callback");
+    let async_fn = format!("{c_sym}_async");
+
+    let cb_types = rb_async_cb_param_ffi_types(&f.returns);
+    out.push_str(&format!(
+        "  callback :{cb_name}, [{}], :void\n",
+        cb_types.join(", ")
+    ));
+
+    let mut argtypes: Vec<String> = Vec::new();
+    for p in &f.params {
+        argtypes.extend(rb_param_ffi_types(&p.ty));
+    }
+    if f.cancellable {
+        argtypes.push(":pointer".into());
+    }
+    argtypes.push(format!(":{cb_name}"));
+    argtypes.push(":pointer".into());
+    out.push_str(&format!(
+        "  attach_function :{async_fn}, [{}], :void\n",
+        argtypes.join(", ")
+    ));
+}
+
+fn render_async_result_conversion(out: &mut String, ret: &Option<TypeRef>, ind: &str) {
+    match ret {
+        None => {
+            out.push_str(&format!("{ind}ruby_result = nil\n"));
+        }
+        Some(ty) => render_async_result_from_type(out, ty, ind),
+    }
+}
+
+fn render_async_result_from_type(out: &mut String, ty: &TypeRef, ind: &str) {
+    match ty {
+        TypeRef::I32
+        | TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::F64
+        | TypeRef::Handle
+        | TypeRef::Enum(_) => {
+            out.push_str(&format!("{ind}ruby_result = result\n"));
+        }
+        TypeRef::Bool => {
+            out.push_str(&format!("{ind}ruby_result = result != 0\n"));
+        }
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            out.push_str(&format!("{ind}if result.null?\n"));
+            out.push_str(&format!("{ind}  ruby_result = ''\n"));
+            out.push_str(&format!("{ind}else\n"));
+            out.push_str(&format!("{ind}  ruby_result = result.read_string\n"));
+            out.push_str(&format!("{ind}  weaveffi_free_string(result)\n"));
+            out.push_str(&format!("{ind}end\n"));
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            out.push_str(&format!("{ind}if result.null?\n"));
+            out.push_str(&format!("{ind}  ruby_result = ''.b\n"));
+            out.push_str(&format!("{ind}else\n"));
+            out.push_str(&format!(
+                "{ind}  ruby_result = result.read_string(result_len)\n"
+            ));
+            out.push_str(&format!("{ind}  weaveffi_free_bytes(result, result_len)\n"));
+            out.push_str(&format!("{ind}end\n"));
+        }
+        TypeRef::Struct(name) => {
+            out.push_str(&format!(
+                "{ind}ruby_result = {}.new(result)\n",
+                local_type_name(name)
+            ));
+        }
+        TypeRef::TypedHandle(name) => {
+            out.push_str(&format!("{ind}ruby_result = {name}.new(result)\n"));
+        }
+        TypeRef::List(inner) => {
+            out.push_str(&format!("{ind}if result.null?\n"));
+            out.push_str(&format!("{ind}  ruby_result = []\n"));
+            out.push_str(&format!("{ind}else\n"));
+            let reader = rb_array_reader(inner);
+            match inner.as_ref() {
+                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                    out.push_str(&format!(
+                        "{ind}  ruby_result = result.{reader}(result_len).map {{ |p| p.null? ? '' : p.read_string }}\n"
+                    ));
+                }
+                TypeRef::TypedHandle(n) => {
+                    out.push_str(&format!(
+                        "{ind}  ruby_result = result.{reader}(result_len).map {{ |p| {n}.new(p) }}\n"
+                    ));
+                }
+                TypeRef::Struct(n) => {
+                    let local = local_type_name(n);
+                    out.push_str(&format!(
+                        "{ind}  ruby_result = result.{reader}(result_len).map {{ |p| {local}.new(p) }}\n"
+                    ));
+                }
+                TypeRef::Bool => {
+                    out.push_str(&format!(
+                        "{ind}  ruby_result = result.{reader}(result_len).map {{ |v| v != 0 }}\n"
+                    ));
+                }
+                _ => {
+                    out.push_str(&format!(
+                        "{ind}  ruby_result = result.{reader}(result_len)\n"
+                    ));
+                }
+            }
+            out.push_str(&format!("{ind}end\n"));
+        }
+        TypeRef::Map(k, v) => {
+            out.push_str(&format!(
+                "{ind}if result_keys.null? || result_values.null?\n"
+            ));
+            out.push_str(&format!("{ind}  ruby_result = {{}}\n"));
+            out.push_str(&format!("{ind}else\n"));
+            let k_reader = rb_array_reader(k);
+            let v_reader = rb_array_reader(v);
+            let k_expr = rb_element_expr("k", k);
+            let v_expr = rb_element_expr("v", v);
+            out.push_str(&format!(
+                "{ind}  ruby_result = result_keys.{k_reader}(result_len).zip(result_values.{v_reader}(result_len))\
+                 .each_with_object({{}}) {{ |(k, v), h| h[{k_expr}] = {v_expr} }}\n"
+            ));
+            out.push_str(&format!("{ind}end\n"));
+        }
+        TypeRef::Optional(inner) => render_async_optional_from_type(out, inner, ind),
+        TypeRef::Iterator(_) => unreachable!("iterator return is not valid for async functions"),
+        TypeRef::Callback(_) => unreachable!("callback return is not valid for async functions"),
+    }
+}
+
+fn render_async_optional_from_type(out: &mut String, inner: &TypeRef, ind: &str) {
+    match inner {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            out.push_str(&format!("{ind}if result.null?\n"));
+            out.push_str(&format!("{ind}  ruby_result = nil\n"));
+            out.push_str(&format!("{ind}else\n"));
+            out.push_str(&format!("{ind}  ruby_result = result.read_string\n"));
+            out.push_str(&format!("{ind}  weaveffi_free_string(result)\n"));
+            out.push_str(&format!("{ind}end\n"));
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            out.push_str(&format!("{ind}if result.null?\n"));
+            out.push_str(&format!("{ind}  ruby_result = nil\n"));
+            out.push_str(&format!("{ind}else\n"));
+            out.push_str(&format!(
+                "{ind}  ruby_result = result.read_string(result_len)\n"
+            ));
+            out.push_str(&format!("{ind}  weaveffi_free_bytes(result, result_len)\n"));
+            out.push_str(&format!("{ind}end\n"));
+        }
+        TypeRef::Struct(name) => {
+            let local = local_type_name(name);
+            out.push_str(&format!("{ind}if result.null?\n"));
+            out.push_str(&format!("{ind}  ruby_result = nil\n"));
+            out.push_str(&format!("{ind}else\n"));
+            out.push_str(&format!("{ind}  ruby_result = {local}.new(result)\n"));
+            out.push_str(&format!("{ind}end\n"));
+        }
+        TypeRef::TypedHandle(name) => {
+            out.push_str(&format!("{ind}if result.null?\n"));
+            out.push_str(&format!("{ind}  ruby_result = nil\n"));
+            out.push_str(&format!("{ind}else\n"));
+            out.push_str(&format!("{ind}  ruby_result = {name}.new(result)\n"));
+            out.push_str(&format!("{ind}end\n"));
+        }
+        _ if !is_c_pointer_type(inner) => {
+            let read = rb_read_method(inner);
+            out.push_str(&format!("{ind}if result.null?\n"));
+            out.push_str(&format!("{ind}  ruby_result = nil\n"));
+            out.push_str(&format!("{ind}else\n"));
+            match inner {
+                TypeRef::Bool => {
+                    out.push_str(&format!("{ind}  ruby_result = result.read_int32 != 0\n"));
+                }
+                _ => {
+                    out.push_str(&format!("{ind}  ruby_result = result.{read}\n"));
+                }
+            }
+            out.push_str(&format!("{ind}end\n"));
+        }
+        _ => {
+            out.push_str(&format!("{ind}ruby_result = result\n"));
+        }
+    }
+}
+
+fn render_async_function_wrapper(out: &mut String, module_name: &str, f: &Function) {
+    let c_sym = c_symbol_name(module_name, &f.name);
+    let async_fn = format!("{c_sym}_async");
+    let func_name = f.name.to_snake_case();
+    let ind = "    ";
+
+    let params: Vec<String> = f.params.iter().map(|p| p.name.to_snake_case()).collect();
+    let params_comma = if params.is_empty() { "" } else { ", " };
+
+    out.push_str(&format!(
+        "\n  def self.{func_name}_async({}{params_comma}&block)\n",
+        params.join(", ")
+    ));
+
+    if let Some(msg) = &f.deprecated {
+        let escaped = msg.replace('"', "\\\"");
+        out.push_str(&format!("{ind}warn \"[DEPRECATED] {escaped}\"\n"));
+    }
+
+    for p in &f.params {
+        render_param_conversion(out, &p.name.to_snake_case(), &p.ty, ind);
+    }
+
+    let pipe_names = rb_async_cb_param_names(&f.returns).join(", ");
+    out.push_str(&format!("{ind}cb = proc do |{pipe_names}|\n"));
+    out.push_str(&format!("{ind}  begin\n"));
+    out.push_str(&format!("{ind}    err_struct = ErrorStruct.new(err_ptr)\n"));
+    out.push_str(&format!("{ind}    if !err_struct[:code].zero?\n"));
+    out.push_str(&format!("{ind}      code = err_struct[:code]\n"));
+    out.push_str(&format!("{ind}      msg_ptr = err_struct[:message]\n"));
+    out.push_str(&format!(
+        "{ind}      msg = msg_ptr.null? ? '' : msg_ptr.read_string\n"
+    ));
+    out.push_str(&format!("{ind}      weaveffi_error_clear(err_ptr)\n"));
+    out.push_str(&format!(
+        "{ind}      block.call(nil, Error.new(code, msg))\n"
+    ));
+    out.push_str(&format!("{ind}    else\n"));
+    render_async_result_conversion(out, &f.returns, &format!("{ind}      "));
+    out.push_str(&format!("{ind}      block.call(ruby_result, nil)\n"));
+    out.push_str(&format!("{ind}    end\n"));
+    out.push_str(&format!("{ind}  ensure\n"));
+    out.push_str(&format!("{ind}    pop_async_callback(ctx.address)\n"));
+    out.push_str(&format!("{ind}  end\n"));
+    out.push_str(&format!("{ind}end\n"));
+
+    out.push_str(&format!("{ind}id = register_async_callback(cb)\n"));
+
+    let mut call_args: Vec<String> = Vec::new();
+    for p in &f.params {
+        call_args.extend(rb_call_args(&p.name.to_snake_case(), &p.ty));
+    }
+    if f.cancellable {
+        call_args.push("FFI::Pointer::NULL".into());
+    }
+    call_args.push("cb".into());
+    call_args.push("FFI::Pointer.new(id)".into());
+
+    out.push_str(&format!("{ind}{async_fn}({})\n", call_args.join(", ")));
+    out.push_str("  end\n");
+
+    out.push_str(&format!(
+        "\n  def self.{func_name}({})\n",
+        params.join(", ")
+    ));
+    out.push_str(&format!("{ind}Concurrent::Promise.execute do\n"));
+    out.push_str(&format!("{ind}  queue = Queue.new\n"));
+    out.push_str(&format!(
+        "{ind}  {func_name}_async({}) do |result, err|\n",
+        params.join(", ")
+    ));
+    out.push_str(&format!("{ind}    queue.push([result, err])\n"));
+    out.push_str(&format!("{ind}  end\n"));
+    out.push_str(&format!("{ind}  result, err = queue.pop\n"));
+    out.push_str(&format!("{ind}  raise err if err\n"));
+    out.push_str(&format!("{ind}  result\n"));
+    out.push_str(&format!("{ind}end\n"));
     out.push_str("  end\n");
 }
 
@@ -1019,7 +1385,12 @@ fn render_map_return_code(out: &mut String, k: &TypeRef, v: &TypeRef, ind: &str,
     ));
 }
 
-fn render_gemspec(gem_name: &str) -> String {
+fn render_gemspec(gem_name: &str, has_async: bool) -> String {
+    let extra_dep = if has_async {
+        "  s.add_dependency 'concurrent-ruby', '~> 1.1'\n"
+    } else {
+        ""
+    };
     format!(
         "Gem::Specification.new do |s|
   s.name        = '{gem_name}'
@@ -1029,7 +1400,7 @@ fn render_gemspec(gem_name: &str) -> String {
   s.require_paths = ['lib']
 
   s.add_dependency 'ffi', '~> 1.15'
-end
+{extra_dep}end
 "
     )
 }
@@ -1538,7 +1909,103 @@ mod tests {
     }
 
     #[test]
-    fn skips_async_functions() {
+    fn ruby_async_emits_block_and_promise_versions() {
+        let api = make_api(vec![simple_module(
+            "io",
+            vec![Function {
+                name: "read".into(),
+                params: vec![Param {
+                    name: "path".into(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                }],
+                returns: Some(TypeRef::StringUtf8),
+                doc: None,
+                r#async: true,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+        )]);
+
+        let code = render_ruby_module(&api, "WeaveFFI");
+
+        assert!(
+            code.contains("require 'concurrent'"),
+            "concurrent-ruby must be required when async functions are present: {code}"
+        );
+        assert!(
+            code.contains("@@async_callbacks = {}"),
+            "preamble must declare the async callback registry: {code}"
+        );
+        assert!(
+            code.contains("def self.register_async_callback(cb)"),
+            "preamble must expose register_async_callback helper: {code}"
+        );
+        assert!(
+            code.contains("def self.pop_async_callback(id)"),
+            "preamble must expose pop_async_callback helper: {code}"
+        );
+        assert!(
+            code.contains(
+                "callback :weaveffi_io_read_callback, [:pointer, :pointer, :pointer], :void"
+            ),
+            "must declare the async C callback typedef with (ctx, err, result): {code}"
+        );
+        assert!(
+            code.contains(
+                "attach_function :weaveffi_io_read_async, \
+                 [:pointer, :size_t, :weaveffi_io_read_callback, :pointer], :void"
+            ),
+            "must attach the async C function with callback and context: {code}"
+        );
+        assert!(
+            code.contains("def self.read_async(path, &block)"),
+            "must emit block-based async wrapper: {code}"
+        );
+        assert!(
+            code.contains("id = register_async_callback(cb)"),
+            "block wrapper must pin the proc in the registry: {code}"
+        );
+        assert!(
+            code.contains(
+                "weaveffi_io_read_async(path_buf, path.bytesize, cb, FFI::Pointer.new(id))"
+            ),
+            "block wrapper must call the async C function with the id as context: {code}"
+        );
+        assert!(
+            code.contains("pop_async_callback(ctx.address)"),
+            "callback proc must unpin itself from the registry using ctx.address: {code}"
+        );
+        assert!(
+            code.contains("block.call(nil, Error.new(code, msg))"),
+            "callback proc must deliver errors to the block: {code}"
+        );
+        assert!(
+            code.contains("block.call(ruby_result, nil)"),
+            "callback proc must deliver the result to the block on success: {code}"
+        );
+
+        assert!(
+            code.contains("def self.read(path)"),
+            "must emit Promise-returning wrapper: {code}"
+        );
+        assert!(
+            code.contains("Concurrent::Promise.execute do"),
+            "Promise wrapper must use Concurrent::Promise.execute: {code}"
+        );
+        assert!(
+            code.contains("read_async(path) do |result, err|"),
+            "Promise wrapper must delegate to the block-based async variant: {code}"
+        );
+        assert!(
+            code.contains("raise err if err"),
+            "Promise wrapper must re-raise errors: {code}"
+        );
+    }
+
+    #[test]
+    fn ruby_async_gemspec_includes_concurrent_ruby() {
         let api = make_api(vec![simple_module(
             "io",
             vec![Function {
@@ -1553,14 +2020,50 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api, "WeaveFFI");
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
+        RubyGenerator.generate(&api, out_dir).unwrap();
+
+        let gemspec = std::fs::read_to_string(out_dir.join("ruby/weaveffi.gemspec")).unwrap();
         assert!(
-            !code.contains("def self.read"),
-            "async should be skipped: {code}"
+            gemspec.contains("s.add_dependency 'concurrent-ruby', '~> 1.1'"),
+            "gemspec must add concurrent-ruby dependency when async is present: {gemspec}"
+        );
+    }
+
+    #[test]
+    fn ruby_sync_only_gemspec_omits_concurrent_ruby() {
+        let api = make_api(vec![simple_module(
+            "math",
+            vec![Function {
+                name: "add".into(),
+                params: vec![],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+        )]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
+        RubyGenerator.generate(&api, out_dir).unwrap();
+
+        let gemspec = std::fs::read_to_string(out_dir.join("ruby/weaveffi.gemspec")).unwrap();
+        assert!(
+            !gemspec.contains("concurrent-ruby"),
+            "sync-only gemspec must not pull in concurrent-ruby: {gemspec}"
+        );
+        let rb = std::fs::read_to_string(out_dir.join("ruby/lib/weaveffi.rb")).unwrap();
+        assert!(
+            !rb.contains("require 'concurrent'"),
+            "sync-only module must not require concurrent: {rb}"
         );
         assert!(
-            !code.contains("weaveffi_io_read"),
-            "async attach should be skipped: {code}"
+            !rb.contains("@@async_callbacks"),
+            "sync-only module must not emit async registry: {rb}"
         );
     }
 
@@ -2735,16 +3238,9 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_includes_callbacks_and_listeners_and_iterators_excludes_async() {
+    fn capabilities_is_feature_complete() {
         let caps = RubyGenerator.capabilities();
-        assert!(caps.contains(&Capability::Callbacks));
-        assert!(caps.contains(&Capability::Listeners));
-        assert!(caps.contains(&Capability::Iterators));
-        assert!(!caps.contains(&Capability::AsyncFunctions));
         for cap in Capability::ALL {
-            if matches!(cap, Capability::AsyncFunctions) {
-                continue;
-            }
             assert!(caps.contains(cap), "Ruby generator must support {cap:?}");
         }
     }
