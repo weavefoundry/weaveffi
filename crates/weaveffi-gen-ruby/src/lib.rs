@@ -1,11 +1,11 @@
 use anyhow::Result;
 use camino::Utf8Path;
-use heck::{ToShoutySnakeCase, ToSnakeCase};
+use heck::{ToShoutySnakeCase, ToSnakeCase, ToUpperCamelCase};
 use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name};
 use weaveffi_ir::ir::{
-    Api, CallbackDef, EnumDef, Function, Module, StructDef, StructField, TypeRef,
+    Api, CallbackDef, EnumDef, Function, ListenerDef, Module, StructDef, StructField, TypeRef,
 };
 
 pub struct RubyGenerator;
@@ -66,6 +66,7 @@ impl Generator for RubyGenerator {
         &[
             Capability::Builders,
             Capability::Callbacks,
+            Capability::Listeners,
             Capability::CancellableAsync,
             Capability::TypedHandles,
             Capability::BorrowedTypes,
@@ -298,6 +299,9 @@ fn render_ruby_module(api: &Api, module_name: &str) -> String {
         for cb in &m.callbacks {
             render_callback_def(&mut out, cb);
         }
+        for l in &m.listeners {
+            render_listener_attach_functions(&mut out, &path, l);
+        }
         for s in &m.structs {
             render_struct_ffi(&mut out, &path, s);
         }
@@ -316,6 +320,9 @@ fn render_ruby_module(api: &Api, module_name: &str) -> String {
             if !f.r#async {
                 render_function_wrapper(&mut out, &path, f);
             }
+        }
+        for l in &m.listeners {
+            render_listener_module(&mut out, &path, l, module_name);
         }
     }
     out.push_str("end\n");
@@ -398,6 +405,53 @@ fn render_callback_def(out: &mut String, cb: &CallbackDef) {
         cb.name,
         cb_param_types.join(", ")
     ));
+}
+
+fn render_listener_attach_functions(out: &mut String, module_path: &str, l: &ListenerDef) {
+    let reg_fn = format!("weaveffi_{module_path}_register_{}", l.name);
+    let unreg_fn = format!("weaveffi_{module_path}_unregister_{}", l.name);
+    out.push_str(&format!(
+        "\n  attach_function :{reg_fn}, [:{}, :pointer], :uint64\n",
+        l.event_callback
+    ));
+    out.push_str(&format!(
+        "  attach_function :{unreg_fn}, [:uint64], :void\n"
+    ));
+}
+
+/// Emit a Ruby `module` wrapper for a listener. The module exposes:
+///   - `register(&block)`: wraps the block in a Proc that strips the C
+///     context pointer, calls `weaveffi_{module}_register_{listener}`,
+///     pins the Proc in `@@callbacks` keyed by the returned id so Ruby's
+///     GC cannot reclaim it while the native side still holds a pointer,
+///     and returns the id.
+///   - `unregister(id)`: calls `weaveffi_{module}_unregister_{listener}`
+///     and drops the Proc from `@@callbacks`.
+fn render_listener_module(
+    out: &mut String,
+    module_path: &str,
+    l: &ListenerDef,
+    rb_module_name: &str,
+) {
+    let class_name = l.name.to_upper_camel_case();
+    let reg_fn = format!("weaveffi_{module_path}_register_{}", l.name);
+    let unreg_fn = format!("weaveffi_{module_path}_unregister_{}", l.name);
+
+    out.push_str(&format!("\n  module {class_name}\n"));
+    out.push_str("    @@callbacks = {}\n\n");
+    out.push_str("    def self.register(&block)\n");
+    out.push_str("      cb = proc { |_ctx, *args| block.call(*args) }\n");
+    out.push_str(&format!(
+        "      id = {rb_module_name}.{reg_fn}(cb, FFI::Pointer::NULL)\n"
+    ));
+    out.push_str("      @@callbacks[id] = cb\n");
+    out.push_str("      id\n");
+    out.push_str("    end\n\n");
+    out.push_str("    def self.unregister(id)\n");
+    out.push_str(&format!("      {rb_module_name}.{unreg_fn}(id)\n"));
+    out.push_str("      @@callbacks.delete(id)\n");
+    out.push_str("    end\n");
+    out.push_str("  end\n");
 }
 
 fn render_struct_ffi(out: &mut String, module_name: &str, s: &StructDef) {
@@ -2614,17 +2668,14 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_includes_callbacks_excludes_listeners_async_and_iterators() {
+    fn capabilities_includes_callbacks_and_listeners_excludes_async_and_iterators() {
         let caps = RubyGenerator.capabilities();
         assert!(caps.contains(&Capability::Callbacks));
-        assert!(!caps.contains(&Capability::Listeners));
+        assert!(caps.contains(&Capability::Listeners));
         assert!(!caps.contains(&Capability::AsyncFunctions));
         assert!(!caps.contains(&Capability::Iterators));
         for cap in Capability::ALL {
-            if matches!(
-                cap,
-                Capability::Listeners | Capability::AsyncFunctions | Capability::Iterators
-            ) {
+            if matches!(cap, Capability::AsyncFunctions | Capability::Iterators) {
                 continue;
             }
             assert!(caps.contains(cap), "Ruby generator must support {cap:?}");
@@ -2689,6 +2740,88 @@ mod tests {
             code.contains("weaveffi_events_subscribe(handler, FFI::Pointer::NULL, err)"),
             "wrapper must pass the Proc directly plus a NULL context \
              so FFI manages the trampoline and lifetime: {code}"
+        );
+    }
+
+    #[test]
+    fn ruby_emits_listener_module() {
+        let api = make_api(vec![Module {
+            name: "events".into(),
+            functions: vec![],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![CallbackDef {
+                name: "OnMessage".into(),
+                params: vec![Param {
+                    name: "message".into(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+            }],
+            listeners: vec![ListenerDef {
+                name: "message_listener".into(),
+                event_callback: "OnMessage".into(),
+                doc: None,
+            }],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let code = render_ruby_module(&api, "WeaveFFI");
+
+        assert!(
+            code.contains(
+                "attach_function :weaveffi_events_register_message_listener, \
+                 [:OnMessage, :pointer], :uint64"
+            ),
+            "register attach_function must reference the callback type \
+             and return the registration id as :uint64: {code}"
+        );
+        assert!(
+            code.contains(
+                "attach_function :weaveffi_events_unregister_message_listener, \
+                 [:uint64], :void"
+            ),
+            "unregister attach_function must take the id as :uint64 and \
+             return :void: {code}"
+        );
+        assert!(
+            code.contains("module MessageListener"),
+            "listener wrapper must be a Ruby `module` named in PascalCase: {code}"
+        );
+        assert!(
+            code.contains("@@callbacks = {}"),
+            "listener module must use a class variable hash to pin Procs \
+             against GC: {code}"
+        );
+        assert!(
+            code.contains("def self.register(&block)"),
+            "register must be a module method taking a block: {code}"
+        );
+        assert!(
+            code.contains(
+                "WeaveFFI.weaveffi_events_register_message_listener(cb, FFI::Pointer::NULL)"
+            ),
+            "register must call the C ABI register function with the Proc \
+             and a NULL context pointer: {code}"
+        );
+        assert!(
+            code.contains("@@callbacks[id] = cb"),
+            "register must pin the Proc in @@callbacks keyed by the id: {code}"
+        );
+        assert!(
+            code.contains("def self.unregister(id)"),
+            "unregister must be a module method taking an id: {code}"
+        );
+        assert!(
+            code.contains("WeaveFFI.weaveffi_events_unregister_message_listener(id)"),
+            "unregister must call the C ABI unregister function with the id: {code}"
+        );
+        assert!(
+            code.contains("@@callbacks.delete(id)"),
+            "unregister must unpin the Proc from @@callbacks: {code}"
         );
     }
 }
