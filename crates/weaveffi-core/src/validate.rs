@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use weaveffi_ir::ir::{Api, ErrorDomain, Function, Module, Param, TypeRef};
+use weaveffi_ir::ir::{Api, CallbackDef, ErrorDomain, Function, Module, Param, TypeRef};
 
 use crate::codegen::Capability;
 
@@ -646,6 +646,16 @@ fn validate_type_ref(
     all_modules: &[Module],
     current_module: &str,
 ) -> Result<(), ValidationError> {
+    validate_type_ref_inner(ty, known, all_modules, current_module, &mut BTreeSet::new())
+}
+
+fn validate_type_ref_inner(
+    ty: &TypeRef,
+    known: &BTreeSet<&str>,
+    all_modules: &[Module],
+    current_module: &str,
+    visited_callbacks: &mut BTreeSet<String>,
+) -> Result<(), ValidationError> {
     match ty {
         TypeRef::Struct(name) | TypeRef::Enum(name) | TypeRef::TypedHandle(name) => {
             if !known.contains(name.as_str()) {
@@ -661,7 +671,7 @@ fn validate_type_ref(
             Ok(())
         }
         TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
-            validate_type_ref(inner, known, all_modules, current_module)
+            validate_type_ref_inner(inner, known, all_modules, current_module, visited_callbacks)
         }
         TypeRef::Map(k, v) => {
             let bad_key = match k.as_ref() {
@@ -673,11 +683,74 @@ fn validate_type_ref(
             if let Some(key_type) = bad_key {
                 return Err(ValidationError::InvalidMapKey { key_type });
             }
-            validate_type_ref(k, known, all_modules, current_module)?;
-            validate_type_ref(v, known, all_modules, current_module)
+            validate_type_ref_inner(k, known, all_modules, current_module, visited_callbacks)?;
+            validate_type_ref_inner(v, known, all_modules, current_module, visited_callbacks)
+        }
+        TypeRef::Callback(name) => {
+            let Some((owner_module, cb)) = find_callback_def(name, all_modules, current_module)
+            else {
+                return Err(ValidationError::UnknownTypeRef { name: name.clone() });
+            };
+            let canonical = format!("{}.{}", owner_module.name, cb.name);
+            if !visited_callbacks.insert(canonical) {
+                return Ok(());
+            }
+            let owner_known: BTreeSet<&str> = owner_module
+                .structs
+                .iter()
+                .map(|s| s.name.as_str())
+                .chain(owner_module.enums.iter().map(|e| e.name.as_str()))
+                .collect();
+            for p in &cb.params {
+                validate_type_ref_inner(
+                    &p.ty,
+                    &owner_known,
+                    all_modules,
+                    &owner_module.name,
+                    visited_callbacks,
+                )?;
+            }
+            if let Some(ret) = &cb.returns {
+                validate_type_ref_inner(
+                    ret,
+                    &owner_known,
+                    all_modules,
+                    &owner_module.name,
+                    visited_callbacks,
+                )?;
+            }
+            Ok(())
         }
         _ => Ok(()),
     }
+}
+
+fn find_callback_def<'a>(
+    name: &str,
+    all_modules: &'a [Module],
+    current_module: &str,
+) -> Option<(&'a Module, &'a CallbackDef)> {
+    if let Some(dot) = name.find('.') {
+        let mod_name = &name[..dot];
+        let cb_name = &name[dot + 1..];
+        let module = all_modules.iter().find(|m| m.name == mod_name)?;
+        let cb = module.callbacks.iter().find(|c| c.name == cb_name)?;
+        return Some((module, cb));
+    }
+    if let Some(m) = all_modules.iter().find(|m| m.name == current_module) {
+        if let Some(cb) = m.callbacks.iter().find(|c| c.name == name) {
+            return Some((m, cb));
+        }
+    }
+    for m in all_modules {
+        if m.name == current_module {
+            continue;
+        }
+        if let Some(cb) = m.callbacks.iter().find(|c| c.name == name) {
+            return Some((m, cb));
+        }
+    }
+    None
 }
 
 fn validate_error_domain(
@@ -3701,6 +3774,82 @@ mod tests {
             err,
             ValidationError::TargetMissingCapability { target, capability, .. }
                 if target == "ruby" && capability == "async_functions"
+        ));
+    }
+
+    #[test]
+    fn callback_ref_valid_passes() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "events".to_string(),
+                functions: vec![Function {
+                    name: "register".to_string(),
+                    params: vec![Param {
+                        name: "cb".to_string(),
+                        ty: TypeRef::Callback("OnMessage".to_string()),
+                        mutable: false,
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![CallbackDef {
+                    name: "OnMessage".to_string(),
+                    params: vec![Param {
+                        name: "message".to_string(),
+                        ty: TypeRef::StringUtf8,
+                        mutable: false,
+                    }],
+                    returns: None,
+                    doc: None,
+                }],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        assert!(validate_api(&mut api).is_ok());
+    }
+
+    #[test]
+    fn callback_ref_unknown_rejected() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "events".to_string(),
+                functions: vec![Function {
+                    name: "register".to_string(),
+                    params: vec![Param {
+                        name: "cb".to_string(),
+                        ty: TypeRef::Callback("Missing".to_string()),
+                        mutable: false,
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        assert!(matches!(
+            validate_api(&mut api).unwrap_err(),
+            ValidationError::UnknownTypeRef { name } if name == "Missing"
         ));
     }
 }
