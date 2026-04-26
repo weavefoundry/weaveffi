@@ -5,7 +5,8 @@ use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name, wrapper_name};
 use weaveffi_ir::ir::{
-    Api, CallbackDef, EnumDef, Function, Module, Param, StructDef, StructField, TypeRef,
+    Api, CallbackDef, EnumDef, Function, ListenerDef, Module, Param, StructDef, StructField,
+    TypeRef,
 };
 
 pub struct SwiftGenerator;
@@ -99,6 +100,7 @@ impl Generator for SwiftGenerator {
     fn capabilities(&self) -> &'static [Capability] {
         &[
             Capability::Callbacks,
+            Capability::Listeners,
             Capability::Iterators,
             Capability::Builders,
             Capability::AsyncFunctions,
@@ -287,6 +289,9 @@ fn render_swift_module_types(out: &mut String, m: &Module, module_path: &str) {
             render_swift_builder(out, module_path, s);
         }
     }
+    for l in &m.listeners {
+        render_swift_listener(out, module_path, l, &m.callbacks);
+    }
     for sub in &m.modules {
         let sub_path = format!("{module_path}_{}", sub.name);
         render_swift_module_types(out, sub, &sub_path);
@@ -312,6 +317,95 @@ fn render_swift_callback_type(out: &mut String, cb: &CallbackDef) {
         "    init(_ closure: @escaping {}) {{ self.closure = closure }}\n",
         cb.name
     ));
+    out.push_str("}\n\n");
+}
+
+/// Emit a Swift wrapper class for a listener. The class exposes:
+///   - `register(_:)`: pins the Swift closure via `Unmanaged.passRetained`,
+///     installs a `@convention(c)` trampoline, calls the C `register_*`
+///     symbol, stores the opaque context keyed by the returned listener id
+///     so it can be released later, and returns the id.
+///   - `unregister(_:)`: calls the C `unregister_*` symbol and releases the
+///     pinned closure for that listener id.
+fn render_swift_listener(
+    out: &mut String,
+    module_name: &str,
+    l: &ListenerDef,
+    callbacks: &[CallbackDef],
+) {
+    let cb = callbacks
+        .iter()
+        .find(|c| c.name == l.event_callback)
+        .expect("validator should have ensured event callback is defined in this module");
+
+    let class_name = l.name.to_upper_camel_case();
+    let reg_sym = format!("weaveffi_{}_register_{}", module_name, l.name);
+    let unreg_sym = format!("weaveffi_{}_unregister_{}", module_name, l.name);
+
+    let mut c_sig_types: Vec<String> = vec!["UnsafeMutableRawPointer?".to_string()];
+    let mut tramp_param_names: Vec<String> = vec!["context".to_string()];
+    for cp in &cb.params {
+        c_sig_types.extend(callback_c_param_types(&cp.ty));
+        tramp_param_names.extend(callback_c_param_names(&cp.ty, &cp.name));
+    }
+    let ret_c = cb
+        .returns
+        .as_ref()
+        .map(callback_c_return_type)
+        .unwrap_or_else(|| "Void".to_string());
+
+    out.push_str(&format!("public class {} {{\n", class_name));
+    out.push_str("    private static var contexts: [UInt64: UnsafeMutableRawPointer] = [:]\n");
+    out.push_str("    private static let lock = NSLock()\n\n");
+
+    out.push_str(&format!(
+        "    public static func register(_ callback: {}) -> UInt64 {{\n",
+        cb.name
+    ));
+    out.push_str(&format!("        let ref = {}Ref(callback)\n", cb.name));
+    out.push_str("        let ctx = Unmanaged.passRetained(ref).toOpaque()\n");
+    out.push_str(&format!(
+        "        let cb: @convention(c) ({}) -> {} = {{ {} in\n",
+        c_sig_types.join(", "),
+        ret_c,
+        tramp_param_names.join(", "),
+    ));
+    out.push_str(&format!(
+        "            let ref = Unmanaged<{}Ref>.fromOpaque(context!).takeUnretainedValue()\n",
+        cb.name
+    ));
+    let mut swift_args: Vec<String> = Vec::new();
+    for cp in &cb.params {
+        let (conv, arg) = callback_c_to_swift(&cp.ty, &cp.name);
+        if !conv.is_empty() {
+            out.push_str(&format!("            {conv}\n"));
+        }
+        swift_args.push(arg);
+    }
+    out.push_str(&format!(
+        "            ref.closure({})\n",
+        swift_args.join(", ")
+    ));
+    out.push_str("        }\n");
+    out.push_str(&format!("        let id = {}(cb, ctx)\n", reg_sym));
+    out.push_str("        lock.lock()\n");
+    out.push_str("        contexts[id] = ctx\n");
+    out.push_str("        lock.unlock()\n");
+    out.push_str("        return id\n");
+    out.push_str("    }\n\n");
+
+    out.push_str("    public static func unregister(_ id: UInt64) {\n");
+    out.push_str(&format!("        {}(id)\n", unreg_sym));
+    out.push_str("        lock.lock()\n");
+    out.push_str("        let ctx = contexts.removeValue(forKey: id)\n");
+    out.push_str("        lock.unlock()\n");
+    out.push_str("        if let ctx = ctx {\n");
+    out.push_str(&format!(
+        "            Unmanaged<{}Ref>.fromOpaque(ctx).release()\n",
+        cb.name
+    ));
+    out.push_str("        }\n");
+    out.push_str("    }\n");
     out.push_str("}\n\n");
 }
 
@@ -2304,8 +2398,8 @@ fn render_buffered_struct_create(
 mod tests {
     use super::*;
     use weaveffi_ir::ir::{
-        Api, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param, StructDef,
-        StructField,
+        Api, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, ListenerDef, Module, Param,
+        StructDef, StructField,
     };
 
     fn make_api(modules: Vec<Module>) -> Api {
@@ -4792,14 +4886,9 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_includes_callbacks_and_excludes_listeners() {
+    fn capabilities_is_feature_complete() {
         let caps = SwiftGenerator.capabilities();
-        assert!(caps.contains(&Capability::Callbacks));
-        assert!(!caps.contains(&Capability::Listeners));
         for cap in Capability::ALL {
-            if matches!(cap, Capability::Listeners) {
-                continue;
-            }
             assert!(caps.contains(cap), "Swift generator must support {cap:?}");
         }
     }
@@ -4876,6 +4965,80 @@ mod tests {
         assert!(
             swift.contains("weaveffi_events_subscribe(handler_cb, handler_ctx, &err)"),
             "C call must pass the trampoline and context: {swift}"
+        );
+    }
+
+    #[test]
+    fn swift_emits_listener_class() {
+        let api = make_api(vec![Module {
+            name: "events".to_string(),
+            functions: vec![],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![CallbackDef {
+                name: "OnData".to_string(),
+                params: vec![Param {
+                    name: "value".to_string(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+            }],
+            listeners: vec![ListenerDef {
+                name: "data_stream".to_string(),
+                event_callback: "OnData".to_string(),
+                doc: None,
+            }],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let swift = render_swift_wrapper(&api, true);
+
+        assert!(
+            swift.contains("public class DataStream {"),
+            "missing listener class: {swift}"
+        );
+        assert!(
+            swift.contains("public static func register(_ callback: OnData) -> UInt64 {"),
+            "listener must expose register(_:) -> UInt64 taking the event callback: {swift}"
+        );
+        assert!(
+            swift.contains("public static func unregister(_ id: UInt64) {"),
+            "listener must expose static unregister(_:): {swift}"
+        );
+        assert!(
+            swift.contains("let ref = OnDataRef(callback)"),
+            "register must box the closure via the callback ref type: {swift}"
+        );
+        assert!(
+            swift.contains("Unmanaged.passRetained(ref).toOpaque()"),
+            "register must pin the closure via Unmanaged.passRetained: {swift}"
+        );
+        assert!(
+            swift.contains("@convention(c) (UnsafeMutableRawPointer?, Int32) -> Void"),
+            "register must declare a @convention(c) trampoline matching the event callback: {swift}"
+        );
+        assert!(
+            swift.contains("Unmanaged<OnDataRef>.fromOpaque(context!).takeUnretainedValue()"),
+            "trampoline must recover the closure from the context pointer: {swift}"
+        );
+        assert!(
+            swift.contains("let id = weaveffi_events_register_data_stream(cb, ctx)"),
+            "register must call the C register symbol and capture the listener id: {swift}"
+        );
+        assert!(
+            swift.contains("contexts[id] = ctx"),
+            "register must store the opaque context keyed by listener id: {swift}"
+        );
+        assert!(
+            swift.contains("weaveffi_events_unregister_data_stream(id)"),
+            "unregister must call the C unregister symbol: {swift}"
+        );
+        assert!(
+            swift.contains("Unmanaged<OnDataRef>.fromOpaque(ctx).release()"),
+            "unregister must release the pinned closure via Unmanaged: {swift}"
         );
     }
 }
