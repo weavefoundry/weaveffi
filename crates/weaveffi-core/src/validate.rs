@@ -252,6 +252,8 @@ pub enum ValidationError {
         capability: String,
         location: String,
     },
+    #[error("unknown key '{key}' in inline [generators.{target}] section")]
+    UnknownGeneratorConfigKey { key: String, target: String },
 }
 
 const RESERVED: &[&str] = &[

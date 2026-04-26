@@ -5,6 +5,7 @@ use camino::Utf8Path;
 use clap::{CommandFactory, Parser, Subcommand};
 use color_eyre::eyre::{bail, eyre, Report, Result, WrapErr};
 use color_eyre::Section;
+use serde::Deserialize;
 use similar::TextDiff;
 use std::collections::{BTreeSet, HashMap};
 use std::env;
@@ -308,31 +309,256 @@ fn load_config(path: Option<&str>) -> Result<GeneratorConfig> {
     }
 }
 
+/// Typed representation of the inline `[generators]` section.
+///
+/// Each nested struct uses `deny_unknown_fields` so serde surfaces any
+/// unsupported key; we convert those errors into
+/// [`ValidationError::UnknownGeneratorConfigKey`] with the offending target
+/// so the CLI can print a focused suggestion.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InlineGeneratorsSection {
+    #[serde(default)]
+    swift: Option<InlineSwiftSection>,
+    #[serde(default)]
+    android: Option<InlineAndroidSection>,
+    #[serde(default)]
+    node: Option<InlineNodeSection>,
+    #[serde(default)]
+    wasm: Option<InlineWasmSection>,
+    #[serde(default)]
+    c: Option<InlineCSection>,
+    #[serde(default)]
+    python: Option<InlinePythonSection>,
+    #[serde(default)]
+    dotnet: Option<InlineDotnetSection>,
+    #[serde(default)]
+    cpp: Option<InlineCppSection>,
+    #[serde(default)]
+    dart: Option<InlineDartSection>,
+    #[serde(default)]
+    go: Option<InlineGoSection>,
+    #[serde(default)]
+    ruby: Option<InlineRubySection>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InlineSwiftSection {
+    #[serde(default)]
+    module_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InlineAndroidSection {
+    #[serde(default)]
+    package: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InlineNodeSection {
+    #[serde(default)]
+    package_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InlineWasmSection {
+    #[serde(default)]
+    module_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InlineCSection {
+    #[serde(default)]
+    prefix: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InlinePythonSection {
+    #[serde(default)]
+    package_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InlineDotnetSection {
+    #[serde(default)]
+    namespace: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InlineCppSection {
+    #[serde(default)]
+    namespace: Option<String>,
+    #[serde(default)]
+    header_name: Option<String>,
+    #[serde(default)]
+    standard: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InlineDartSection {
+    #[serde(default)]
+    package_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InlineGoSection {
+    #[serde(default)]
+    module_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InlineRubySection {
+    #[serde(default)]
+    module_name: Option<String>,
+    #[serde(default)]
+    gem_name: Option<String>,
+}
+
+const KNOWN_GENERATOR_TARGETS: &[&str] = &[
+    "swift", "android", "node", "wasm", "c", "python", "dotnet", "cpp", "dart", "go", "ruby",
+];
+
+/// Typed deserialization of the inline `[generators]` section.
+///
+/// Applies any populated fields onto `config`. Unknown targets or keys are
+/// rejected via `serde`'s `deny_unknown_fields` and converted to
+/// [`ValidationError::UnknownGeneratorConfigKey`].
 fn merge_inline_generators(
     config: &mut GeneratorConfig,
     generators: &HashMap<String, toml::Value>,
-) {
-    for (target, value) in generators {
-        let Some(table) = value.as_table() else {
-            continue;
-        };
-        for (key, val) in table {
-            let Some(s) = val.as_str() else { continue };
-            let field = format!("{target}_{key}");
-            match field.as_str() {
-                "swift_module_name" => config.swift_module_name = Some(s.to_owned()),
-                "android_package" => config.android_package = Some(s.to_owned()),
-                "node_package_name" => config.node_package_name = Some(s.to_owned()),
-                "wasm_module_name" => config.wasm_module_name = Some(s.to_owned()),
-                "c_prefix" => config.c_prefix = Some(s.to_owned()),
-                "python_package_name" => config.python_package_name = Some(s.to_owned()),
-                "dotnet_namespace" => config.dotnet_namespace = Some(s.to_owned()),
-                "cpp_namespace" => config.cpp_namespace = Some(s.to_owned()),
-                "cpp_header_name" => config.cpp_header_name = Some(s.to_owned()),
-                "cpp_standard" => config.cpp_standard = Some(s.to_owned()),
-                _ => {}
-            }
+) -> Result<(), ValidationError> {
+    let table: toml::map::Map<String, toml::Value> = generators
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let section: InlineGeneratorsSection = toml::Value::Table(table)
+        .try_into()
+        .map_err(|e| unknown_generator_key_from_toml_error(&e, generators))?;
+
+    if let Some(s) = section.swift {
+        if let Some(v) = s.module_name {
+            config.swift_module_name = Some(v);
         }
+    }
+    if let Some(s) = section.android {
+        if let Some(v) = s.package {
+            config.android_package = Some(v);
+        }
+    }
+    if let Some(s) = section.node {
+        if let Some(v) = s.package_name {
+            config.node_package_name = Some(v);
+        }
+    }
+    if let Some(s) = section.wasm {
+        if let Some(v) = s.module_name {
+            config.wasm_module_name = Some(v);
+        }
+    }
+    if let Some(s) = section.c {
+        if let Some(v) = s.prefix {
+            config.c_prefix = Some(v);
+        }
+    }
+    if let Some(s) = section.python {
+        if let Some(v) = s.package_name {
+            config.python_package_name = Some(v);
+        }
+    }
+    if let Some(s) = section.dotnet {
+        if let Some(v) = s.namespace {
+            config.dotnet_namespace = Some(v);
+        }
+    }
+    if let Some(s) = section.cpp {
+        if let Some(v) = s.namespace {
+            config.cpp_namespace = Some(v);
+        }
+        if let Some(v) = s.header_name {
+            config.cpp_header_name = Some(v);
+        }
+        if let Some(v) = s.standard {
+            config.cpp_standard = Some(v);
+        }
+    }
+    if let Some(s) = section.dart {
+        if let Some(v) = s.package_name {
+            config.dart_package_name = Some(v);
+        }
+    }
+    if let Some(s) = section.go {
+        if let Some(v) = s.module_path {
+            config.go_module_path = Some(v);
+        }
+    }
+    if let Some(s) = section.ruby {
+        if let Some(v) = s.module_name {
+            config.ruby_module_name = Some(v);
+        }
+        if let Some(v) = s.gem_name {
+            config.ruby_gem_name = Some(v);
+        }
+    }
+    Ok(())
+}
+
+/// Extracts the offending key out of a serde/toml `deny_unknown_fields` error
+/// and pairs it with the generator target it was nested under.
+fn unknown_generator_key_from_toml_error(
+    err: &toml::de::Error,
+    generators: &HashMap<String, toml::Value>,
+) -> ValidationError {
+    let msg = err.to_string();
+    let key = extract_unknown_field(&msg).unwrap_or_else(|| msg.trim().to_string());
+    let target = if generators.contains_key(&key) {
+        "generators".to_string()
+    } else {
+        generators
+            .iter()
+            .find(|(_, v)| v.as_table().is_some_and(|t| t.contains_key(&key)))
+            .map(|(t, _)| t.clone())
+            .unwrap_or_else(|| "generators".to_string())
+    };
+    ValidationError::UnknownGeneratorConfigKey { key, target }
+}
+
+/// Parses the key name out of serde's `unknown field \`X\`, ...` message.
+fn extract_unknown_field(msg: &str) -> Option<String> {
+    let marker = "unknown field `";
+    let start = msg.find(marker)? + marker.len();
+    let rest = &msg[start..];
+    let end = rest.find('`')?;
+    Some(rest[..end].to_string())
+}
+
+/// Comma-separated list of valid keys for a generator target (or of valid
+/// targets when `target == "generators"`), used in error suggestions.
+fn valid_keys_for_generator_target(target: &str) -> String {
+    match target {
+        "swift" => "module_name".to_string(),
+        "android" => "package".to_string(),
+        "node" => "package_name".to_string(),
+        "wasm" => "module_name".to_string(),
+        "c" => "prefix".to_string(),
+        "python" => "package_name".to_string(),
+        "dotnet" => "namespace".to_string(),
+        "cpp" => "namespace, header_name, standard".to_string(),
+        "dart" => "package_name".to_string(),
+        "go" => "module_path".to_string(),
+        "ruby" => "module_name, gem_name".to_string(),
+        "generators" => KNOWN_GENERATOR_TARGETS.join(", "),
+        _ => String::new(),
     }
 }
 
@@ -371,7 +597,7 @@ fn cmd_generate(
     validate_api(&mut api).map_err(format_validation_error)?;
 
     if let Some(ref generators) = api.generators {
-        merge_inline_generators(&mut config, generators);
+        merge_inline_generators(&mut config, generators).map_err(format_validation_error)?;
     }
 
     if warn {
@@ -693,6 +919,11 @@ fn format_parse_error(filename: &str, err: ParseError) -> Report {
 }
 
 fn format_validation_error(err: ValidationError) -> Report {
+    if let ValidationError::UnknownGeneratorConfigKey { target, .. } = &err {
+        let valid = valid_keys_for_generator_target(target);
+        let suggestion = format!("valid keys for the `{target}` generator section are: {valid}");
+        return eyre!(err).suggestion(suggestion);
+    }
     let suggestion = validation_suggestion(&err);
     eyre!(err).suggestion(suggestion)
 }
@@ -780,6 +1011,9 @@ fn validation_suggestion(err: &ValidationError) -> &'static str {
         }
         ValidationError::TargetMissingCapability { .. } => {
             "the selected target does not support this IR feature; remove the target with --targets, or remove the unsupported feature from the API"
+        }
+        ValidationError::UnknownGeneratorConfigKey { .. } => {
+            "remove the unknown key or rename it to match a supported field in the inline [generators] section"
         }
     }
 }
@@ -1084,6 +1318,10 @@ mod tests {
                 capability: "callbacks".into(),
                 location: "module 'events' callbacks".into(),
             },
+            ValidationError::UnknownGeneratorConfigKey {
+                key: "modul_name".into(),
+                target: "swift".into(),
+            },
         ];
 
         for err in &cases {
@@ -1208,7 +1446,7 @@ mod tests {
         assert!(api.generators.is_some());
 
         let mut config = GeneratorConfig::default();
-        merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
+        merge_inline_generators(&mut config, api.generators.as_ref().unwrap()).unwrap();
         assert_eq!(config.swift_module_name, Some("MySwiftModule".to_string()));
     }
 
@@ -1237,9 +1475,126 @@ mod tests {
             android_package: Some("com.file.app".into()),
             ..Default::default()
         };
-        merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
+        merge_inline_generators(&mut config, api.generators.as_ref().unwrap()).unwrap();
         assert_eq!(config.swift_module_name, Some("FromIDL".to_string()));
         assert_eq!(config.android_package, Some("com.idl.app".to_string()));
+    }
+
+    #[test]
+    fn inline_generators_typed_deser_works() {
+        let yaml = concat!(
+            "version: \"0.1.0\"\n",
+            "modules:\n",
+            "  - name: math\n",
+            "    functions:\n",
+            "      - name: add\n",
+            "        params:\n",
+            "          - { name: a, type: i32 }\n",
+            "          - { name: b, type: i32 }\n",
+            "        return: i32\n",
+            "generators:\n",
+            "  swift:\n",
+            "    module_name: MySwift\n",
+            "  android:\n",
+            "    package: com.example.app\n",
+            "  node:\n",
+            "    package_name: my-node-pkg\n",
+            "  wasm:\n",
+            "    module_name: my_wasm\n",
+            "  c:\n",
+            "    prefix: myffi\n",
+            "  python:\n",
+            "    package_name: my_python\n",
+            "  dotnet:\n",
+            "    namespace: My.Bindings\n",
+            "  cpp:\n",
+            "    namespace: mylib\n",
+            "    header_name: mylib.hpp\n",
+            "    standard: \"20\"\n",
+            "  dart:\n",
+            "    package_name: my_dart\n",
+            "  go:\n",
+            "    module_path: github.com/me/mylib\n",
+            "  ruby:\n",
+            "    module_name: MyRuby\n",
+            "    gem_name: my_ruby_gem\n",
+        );
+        let api: weaveffi_ir::ir::Api = serde_yaml::from_str(yaml).unwrap();
+        let mut config = GeneratorConfig::default();
+        merge_inline_generators(&mut config, api.generators.as_ref().unwrap()).unwrap();
+
+        assert_eq!(config.swift_module_name.as_deref(), Some("MySwift"));
+        assert_eq!(config.android_package.as_deref(), Some("com.example.app"));
+        assert_eq!(config.node_package_name.as_deref(), Some("my-node-pkg"));
+        assert_eq!(config.wasm_module_name.as_deref(), Some("my_wasm"));
+        assert_eq!(config.c_prefix.as_deref(), Some("myffi"));
+        assert_eq!(config.python_package_name.as_deref(), Some("my_python"));
+        assert_eq!(config.dotnet_namespace.as_deref(), Some("My.Bindings"));
+        assert_eq!(config.cpp_namespace.as_deref(), Some("mylib"));
+        assert_eq!(config.cpp_header_name.as_deref(), Some("mylib.hpp"));
+        assert_eq!(config.cpp_standard.as_deref(), Some("20"));
+        assert_eq!(config.dart_package_name.as_deref(), Some("my_dart"));
+        assert_eq!(
+            config.go_module_path.as_deref(),
+            Some("github.com/me/mylib")
+        );
+        assert_eq!(config.ruby_module_name.as_deref(), Some("MyRuby"));
+        assert_eq!(config.ruby_gem_name.as_deref(), Some("my_ruby_gem"));
+    }
+
+    #[test]
+    fn inline_generators_unknown_key_rejected() {
+        let yaml = concat!(
+            "version: \"0.1.0\"\n",
+            "modules:\n",
+            "  - name: math\n",
+            "    functions:\n",
+            "      - name: add\n",
+            "        params:\n",
+            "          - { name: a, type: i32 }\n",
+            "          - { name: b, type: i32 }\n",
+            "        return: i32\n",
+            "generators:\n",
+            "  swift:\n",
+            "    modul_name: Typo\n",
+        );
+        let api: weaveffi_ir::ir::Api = serde_yaml::from_str(yaml).unwrap();
+        let mut config = GeneratorConfig::default();
+        let err = merge_inline_generators(&mut config, api.generators.as_ref().unwrap())
+            .expect_err("typo'd key should be rejected");
+        match err {
+            ValidationError::UnknownGeneratorConfigKey { key, target } => {
+                assert_eq!(key, "modul_name");
+                assert_eq!(target, "swift");
+            }
+            other => panic!("expected UnknownGeneratorConfigKey, got {other:?}"),
+        }
+
+        let unknown_target_yaml = concat!(
+            "version: \"0.1.0\"\n",
+            "modules:\n",
+            "  - name: math\n",
+            "    functions:\n",
+            "      - name: add\n",
+            "        params:\n",
+            "          - { name: a, type: i32 }\n",
+            "          - { name: b, type: i32 }\n",
+            "        return: i32\n",
+            "generators:\n",
+            "  bogus:\n",
+            "    module_name: X\n",
+        );
+        let api: weaveffi_ir::ir::Api = serde_yaml::from_str(unknown_target_yaml).unwrap();
+        let mut config = GeneratorConfig::default();
+        let err = merge_inline_generators(&mut config, api.generators.as_ref().unwrap())
+            .expect_err("unknown target should be rejected");
+        match err {
+            ValidationError::UnknownGeneratorConfigKey { key, target } => {
+                assert_eq!(key, "bogus");
+                assert_eq!(target, "generators");
+            }
+            other => panic!("expected UnknownGeneratorConfigKey, got {other:?}"),
+        }
     }
 
     #[test]
