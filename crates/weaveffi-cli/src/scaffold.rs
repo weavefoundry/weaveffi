@@ -1,4 +1,4 @@
-use weaveffi_ir::ir::{Api, Module, StructDef, TypeRef};
+use weaveffi_ir::ir::{Api, CallbackDef, Module, StructDef, TypeRef};
 
 fn is_pointer_type(ty: &TypeRef) -> bool {
     matches!(
@@ -94,6 +94,31 @@ fn rust_param_fragments(name: &str, ty: &TypeRef, module: &str) -> Vec<String> {
     }
 }
 
+fn rust_param_types(ty: &TypeRef, module: &str) -> Vec<String> {
+    rust_param_fragments("_x", ty, module)
+        .into_iter()
+        .map(|f| f.split_once(": ").map(|(_, t)| t.to_string()).unwrap_or(f))
+        .collect()
+}
+
+fn rust_callback_param_fragments(name: &str, cb: &CallbackDef, module: &str) -> Vec<String> {
+    let mut cb_types = vec!["*mut std::ffi::c_void".to_string()];
+    for p in &cb.params {
+        cb_types.extend(rust_param_types(&p.ty, module));
+    }
+    let fn_sig = format!("extern \"C\" fn({})", cb_types.join(", "));
+    let full_sig = if let Some(ret) = &cb.returns {
+        let (ret_ty, _) = rust_return_type(ret, module);
+        format!("{fn_sig} -> {ret_ty}")
+    } else {
+        fn_sig
+    };
+    vec![
+        format!("{name}: {full_sig}"),
+        format!("{name}_context: *mut std::ffi::c_void"),
+    ]
+}
+
 fn rust_return_type(ty: &TypeRef, module: &str) -> (String, bool) {
     match ty {
         TypeRef::I32 => ("i32".into(), false),
@@ -169,6 +194,12 @@ fn render_module(out: &mut String, module: &Module) {
         let fn_name = format!("weaveffi_{mod_name}_{}", f.name);
         let mut params = Vec::new();
         for p in &f.params {
+            if let TypeRef::Callback(cb_name) = &p.ty {
+                if let Some(cb) = module.callbacks.iter().find(|c| &c.name == cb_name) {
+                    params.extend(rust_callback_param_fragments(&p.name, cb, mod_name));
+                    continue;
+                }
+            }
             params.extend(rust_param_fragments(&p.name, &p.ty, mod_name));
         }
 
@@ -372,7 +403,9 @@ fn render_builder_scaffold(out: &mut String, module: &str, s: &StructDef, prefix
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weaveffi_ir::ir::{Api, Function, Module, Param, StructDef, StructField, TypeRef};
+    use weaveffi_ir::ir::{
+        Api, CallbackDef, Function, Module, Param, StructDef, StructField, TypeRef,
+    };
 
     fn minimal_api(functions: Vec<Function>, structs: Vec<StructDef>) -> Api {
         Api {
@@ -1030,5 +1063,63 @@ mod tests {
         let out = render_scaffold(&api);
         assert!(out.contains("weaveffi_math_add"), "missing math module");
         assert!(out.contains("weaveffi_io_read"), "missing io module");
+    }
+
+    #[test]
+    fn scaffold_callback_param_emits_function_pointer() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "events".into(),
+                functions: vec![Function {
+                    name: "subscribe".into(),
+                    params: vec![Param {
+                        name: "handler".into(),
+                        ty: TypeRef::Callback("OnData".into()),
+                        mutable: false,
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![CallbackDef {
+                    name: "OnData".into(),
+                    params: vec![
+                        Param {
+                            name: "value".into(),
+                            ty: TypeRef::I32,
+                            mutable: false,
+                        },
+                        Param {
+                            name: "label".into(),
+                            ty: TypeRef::StringUtf8,
+                            mutable: false,
+                        },
+                    ],
+                    returns: Some(TypeRef::Bool),
+                    doc: None,
+                }],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let out = render_scaffold(&api);
+        assert!(
+            out.contains(
+                "handler: extern \"C\" fn(*mut std::ffi::c_void, i32, *const u8, usize) -> bool"
+            ),
+            "callback param should expand to extern fn pointer type: {out}"
+        );
+        assert!(
+            out.contains("handler_context: *mut std::ffi::c_void"),
+            "callback param should be followed by a context void pointer: {out}"
+        );
     }
 }
