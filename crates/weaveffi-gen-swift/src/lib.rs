@@ -73,9 +73,10 @@ impl SwiftGenerator {
     }
 }
 
-/// Write `Package.swift` and `module.modulemap`, create the Sources directory,
-/// and return the Sources path plus the derived C system module name. Shared
-/// between the built-in formatter path and the user-template override path.
+/// Write `Package.swift`, `module.modulemap`, the `Frameworks/` placeholder
+/// README, and create the Sources directory, returning the Sources path plus
+/// the derived C system module name. Shared between the built-in formatter
+/// path and the user-template override path.
 fn write_swift_support_files(
     out_dir: &Utf8Path,
     module_name: &str,
@@ -92,13 +93,24 @@ import PackageDescription
 
 let package = Package(
     name: "{name}",
+    platforms: [
+        .macOS(.v12),
+        .iOS(.v15),
+        .tvOS(.v15),
+        .watchOS(.v8),
+        .visionOS(.v1),
+    ],
     products: [
         .library(name: "{name}", targets: ["{name}"]),
     ],
     targets: [
-        .systemLibrary(name: "{c_name}"),
+        .binaryTarget(
+            name: "{c_name}",
+            path: "Frameworks/{c_name}.xcframework"
+        ),
         .target(name: "{name}", dependencies: ["{c_name}"]),
-    ]
+    ],
+    swiftLanguageVersions: [.v5]
 )
 "#,
         name = module_name,
@@ -111,9 +123,59 @@ let package = Package(
     );
     std::fs::write(module_dir.join("module.modulemap"), stamp_slash(modulemap))?;
 
+    let frameworks_dir = dir.join("Frameworks");
+    std::fs::create_dir_all(&frameworks_dir)?;
+    std::fs::write(
+        frameworks_dir.join("README.md"),
+        render_frameworks_readme(&c_module),
+    )?;
+
     let src_dir = dir.join("Sources").join(module_name);
     std::fs::create_dir_all(&src_dir)?;
     Ok((src_dir, c_module))
+}
+
+/// Human-readable instructions for dropping the cross-compiled xcframework
+/// into the generated SwiftPM package. Left unstamped so it renders cleanly
+/// as GitHub Markdown.
+fn render_frameworks_readme(c_module: &str) -> String {
+    format!(
+        r#"# Frameworks
+
+This directory is where SwiftPM expects to find the pre-built
+`{c_module}.xcframework` bundle referenced by the `binaryTarget` in
+`Package.swift`. The file is intentionally absent from code generation so
+the package tree stays light; you provide it yourself once per build of
+the underlying Rust cdylib.
+
+## Drop in an existing `.xcframework`
+
+If you already have an `.xcframework` produced by `xcodebuild
+-create-xcframework`, copy or symlink it into this directory so the final
+layout is:
+
+```
+Frameworks/
+  {c_module}.xcframework/
+    Info.plist
+    ios-arm64/
+    ios-arm64_x86_64-simulator/
+    macos-arm64_x86_64/
+    ...
+```
+
+SwiftPM, Xcode, and `swift build` will then pick it up automatically.
+
+## Let WeaveFFI build it for you
+
+Run `weaveffi build --xcframework` from the project root. WeaveFFI will
+cross-compile the Rust cdylib for the Apple targets declared in
+`Package.swift` (`aarch64-apple-ios`, `aarch64-apple-ios-sim`,
+`aarch64-apple-darwin`, `x86_64-apple-darwin`, …) and bundle them with
+`xcodebuild -create-xcframework` into
+`Frameworks/{c_module}.xcframework`.
+"#,
+    )
 }
 
 impl Generator for SwiftGenerator {
@@ -172,6 +234,7 @@ impl Generator for SwiftGenerator {
             out_dir
                 .join(format!("swift/{c_module}/module.modulemap"))
                 .to_string(),
+            out_dir.join("swift/Frameworks/README.md").to_string(),
             out_dir
                 .join(format!("swift/Sources/{module_name}/{module_name}.swift"))
                 .to_string(),
@@ -191,6 +254,7 @@ impl Generator for SwiftGenerator {
             out_dir
                 .join(format!("swift/{c_module}/module.modulemap"))
                 .to_string(),
+            out_dir.join("swift/Frameworks/README.md").to_string(),
             out_dir
                 .join(format!("swift/Sources/{module_name}/{module_name}.swift"))
                 .to_string(),
@@ -3699,6 +3763,7 @@ mod tests {
             vec![
                 out.join("swift/Package.swift").to_string(),
                 out.join("swift/CWeaveFFI/module.modulemap").to_string(),
+                out.join("swift/Frameworks/README.md").to_string(),
                 out.join("swift/Sources/WeaveFFI/WeaveFFI.swift")
                     .to_string(),
             ]
@@ -3715,6 +3780,7 @@ mod tests {
             vec![
                 out.join("swift/Package.swift").to_string(),
                 out.join("swift/CMylib/module.modulemap").to_string(),
+                out.join("swift/Frameworks/README.md").to_string(),
                 out.join("swift/Sources/MyCoolLib/MyCoolLib.swift")
                     .to_string(),
             ]
@@ -5362,8 +5428,10 @@ mod tests {
 
         let pkg = std::fs::read_to_string(tmp.join("swift/Package.swift")).unwrap();
         assert!(
-            pkg.contains(".systemLibrary(name: \"CMyCoolLib\")"),
-            "Package.swift must declare the prefix-derived system library target: {pkg}"
+            pkg.contains(".binaryTarget(")
+                && pkg.contains("name: \"CMyCoolLib\"")
+                && pkg.contains("path: \"Frameworks/CMyCoolLib.xcframework\""),
+            "Package.swift must declare the prefix-derived binaryTarget pointing at the xcframework: {pkg}"
         );
 
         // The default `weaveffi` prefix must still resolve to `CWeaveFFI` so
@@ -5511,7 +5579,7 @@ mod tests {
 
         let pkg = std::fs::read_to_string(out_dir.join("swift/Package.swift")).unwrap();
         assert!(
-            pkg.contains(".systemLibrary(name: \"CWeaveFFI\")"),
+            pkg.contains(".binaryTarget(") && pkg.contains("name: \"CWeaveFFI\""),
             "Package.swift must still be produced alongside the overridden wrapper: {pkg}"
         );
         let modulemap =
@@ -5520,5 +5588,124 @@ mod tests {
             modulemap.contains("module CWeaveFFI"),
             "module.modulemap must still be produced alongside the overridden wrapper: {modulemap}"
         );
+    }
+
+    #[test]
+    fn swift_package_targets_modern_apple_platforms() {
+        let api = make_api(vec![Module {
+            name: "math".to_string(),
+            functions: vec![Function {
+                name: "add".to_string(),
+                params: vec![],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_swift_platforms");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        SwiftGenerator.generate(&api, out_dir).unwrap();
+
+        let pkg = std::fs::read_to_string(tmp.join("swift/Package.swift")).unwrap();
+        assert!(
+            pkg.contains("platforms: ["),
+            "Package.swift must declare a platforms list: {pkg}"
+        );
+        for platform in [
+            ".macOS(.v12)",
+            ".iOS(.v15)",
+            ".tvOS(.v15)",
+            ".watchOS(.v8)",
+            ".visionOS(.v1)",
+        ] {
+            assert!(
+                pkg.contains(platform),
+                "Package.swift platforms must include {platform}: {pkg}"
+            );
+        }
+        assert!(
+            pkg.contains("swiftLanguageVersions: [.v5]"),
+            "Package.swift must pin swiftLanguageVersions to .v5: {pkg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn swift_package_declares_xcframework_path() {
+        let api = make_api(vec![Module {
+            name: "math".to_string(),
+            functions: vec![Function {
+                name: "add".to_string(),
+                params: vec![],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_swift_xcframework_path");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        SwiftGenerator.generate(&api, out_dir).unwrap();
+
+        let pkg = std::fs::read_to_string(tmp.join("swift/Package.swift")).unwrap();
+        assert!(
+            pkg.contains(".binaryTarget("),
+            "Package.swift must declare a .binaryTarget: {pkg}"
+        );
+        assert!(
+            pkg.contains("name: \"CWeaveFFI\""),
+            "binaryTarget must be named after the C system module: {pkg}"
+        );
+        assert!(
+            pkg.contains("path: \"Frameworks/CWeaveFFI.xcframework\""),
+            "binaryTarget must point at the Frameworks/ xcframework placeholder: {pkg}"
+        );
+        assert!(
+            !pkg.contains(".systemLibrary("),
+            "Package.swift must no longer declare a .systemLibrary target: {pkg}"
+        );
+
+        let readme_path = tmp.join("swift/Frameworks/README.md");
+        assert!(
+            readme_path.exists(),
+            "Frameworks/README.md must be generated so users know how to populate the directory: {readme_path:?}"
+        );
+        let readme = std::fs::read_to_string(&readme_path).unwrap();
+        assert!(
+            readme.contains("CWeaveFFI.xcframework"),
+            "Frameworks/README.md must name the expected xcframework: {readme}"
+        );
+        assert!(
+            readme.contains("weaveffi build --xcframework"),
+            "Frameworks/README.md must point users at `weaveffi build --xcframework`: {readme}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
