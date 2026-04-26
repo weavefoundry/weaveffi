@@ -2144,6 +2144,7 @@ dependencies = [
  "anyhow",
  "camino",
  "heck",
+ "serde_json",
  "weaveffi-core",
  "weaveffi-ir",
 ]

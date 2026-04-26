@@ -36,7 +36,17 @@ impl CppGenerator {
         )?;
         std::fs::write(
             dir.join("CMakeLists.txt"),
-            stamp_hash(render_cmake(cpp_std, prefix)),
+            stamp_hash(render_cmake(cpp_std, prefix, header_name)),
+        )?;
+        std::fs::write(
+            dir.join(format!("{prefix}-config.cmake.in")),
+            stamp_hash(render_cmake_config(prefix)),
+        )?;
+        // vcpkg.json is strict JSON without a comment syntax, so skip the stamp.
+        std::fs::write(dir.join("vcpkg.json"), render_vcpkg_json(prefix))?;
+        std::fs::write(
+            dir.join("conanfile.py"),
+            stamp_hash(render_conanfile(prefix)),
         )?;
         std::fs::write(dir.join("README.md"), render_readme(prefix))?;
         Ok(())
@@ -72,6 +82,9 @@ impl Generator for CppGenerator {
         vec![
             out_dir.join("cpp/weaveffi.hpp").to_string(),
             out_dir.join("cpp/CMakeLists.txt").to_string(),
+            out_dir.join("cpp/weaveffi-config.cmake.in").to_string(),
+            out_dir.join("cpp/vcpkg.json").to_string(),
+            out_dir.join("cpp/conanfile.py").to_string(),
             out_dir.join("cpp/README.md").to_string(),
         ]
     }
@@ -83,9 +96,15 @@ impl Generator for CppGenerator {
         config: &GeneratorConfig,
     ) -> Vec<String> {
         let header = config.cpp_header_name();
+        let prefix = config.c_prefix();
         vec![
             out_dir.join(format!("cpp/{header}")).to_string(),
             out_dir.join("cpp/CMakeLists.txt").to_string(),
+            out_dir
+                .join(format!("cpp/{prefix}-config.cmake.in"))
+                .to_string(),
+            out_dir.join("cpp/vcpkg.json").to_string(),
+            out_dir.join("cpp/conanfile.py").to_string(),
             out_dir.join("cpp/README.md").to_string(),
         ]
     }
@@ -109,15 +128,110 @@ impl Generator for CppGenerator {
     }
 }
 
-fn render_cmake(cpp_std: &str, prefix: &str) -> String {
+fn render_cmake(cpp_std: &str, prefix: &str, header_name: &str) -> String {
     format!(
         "\
-cmake_minimum_required(VERSION 3.14)
+cmake_minimum_required(VERSION 3.16)
 project(weaveffi_cpp)
+
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+# Locate the native C ABI library when it ships its own CMake package.
+# `find_package({prefix})` is optional: fall back to the bare library name
+# so callers can still link it via CMAKE_PREFIX_PATH or link_directories.
+find_package({prefix} QUIET CONFIG)
+
 add_library(weaveffi_cpp INTERFACE)
-target_include_directories(weaveffi_cpp INTERFACE ${{CMAKE_CURRENT_SOURCE_DIR}})
-target_link_libraries(weaveffi_cpp INTERFACE {prefix})
+target_include_directories(weaveffi_cpp INTERFACE
+    $<BUILD_INTERFACE:${{CMAKE_CURRENT_SOURCE_DIR}}>
+    $<INSTALL_INTERFACE:${{CMAKE_INSTALL_INCLUDEDIR}}>
+)
+if(TARGET {prefix}::{prefix})
+    target_link_libraries(weaveffi_cpp INTERFACE {prefix}::{prefix})
+else()
+    target_link_libraries(weaveffi_cpp INTERFACE {prefix})
+endif()
 target_compile_features(weaveffi_cpp INTERFACE cxx_std_{cpp_std})
+
+install(TARGETS weaveffi_cpp EXPORT {prefix}Targets)
+install(FILES {header_name} DESTINATION ${{CMAKE_INSTALL_INCLUDEDIR}})
+install(EXPORT {prefix}Targets
+    FILE {prefix}-targets.cmake
+    NAMESPACE {prefix}::
+    DESTINATION ${{CMAKE_INSTALL_LIBDIR}}/cmake/{prefix}
+)
+
+configure_package_config_file(
+    ${{CMAKE_CURRENT_SOURCE_DIR}}/{prefix}-config.cmake.in
+    ${{CMAKE_CURRENT_BINARY_DIR}}/{prefix}-config.cmake
+    INSTALL_DESTINATION ${{CMAKE_INSTALL_LIBDIR}}/cmake/{prefix}
+)
+write_basic_package_version_file(
+    ${{CMAKE_CURRENT_BINARY_DIR}}/{prefix}-config-version.cmake
+    VERSION 0.1.0
+    COMPATIBILITY SameMajorVersion
+)
+install(FILES
+    ${{CMAKE_CURRENT_BINARY_DIR}}/{prefix}-config.cmake
+    ${{CMAKE_CURRENT_BINARY_DIR}}/{prefix}-config-version.cmake
+    DESTINATION ${{CMAKE_INSTALL_LIBDIR}}/cmake/{prefix}
+)
+"
+    )
+}
+
+fn render_cmake_config(prefix: &str) -> String {
+    format!(
+        "\
+@PACKAGE_INIT@
+
+include(\"${{CMAKE_CURRENT_LIST_DIR}}/{prefix}-targets.cmake\")
+check_required_components({prefix})
+"
+    )
+}
+
+fn render_vcpkg_json(prefix: &str) -> String {
+    format!(
+        "{{\n  \"name\": \"{prefix}\",\n  \"version\": \"0.1.0\",\n  \"description\": \"WeaveFFI C++ RAII bindings generated from the WeaveFFI IR.\",\n  \"homepage\": \"https://github.com/weavefoundry/weaveffi\",\n  \"dependencies\": []\n}}\n"
+    )
+}
+
+fn render_conanfile(prefix: &str) -> String {
+    let class_name = format!("{}Conan", prefix.to_upper_camel_case());
+    format!(
+        "\
+from conan import ConanFile
+from conan.tools.cmake import CMake, CMakeToolchain, cmake_layout
+
+
+class {class_name}(ConanFile):
+    name = \"{prefix}\"
+    version = \"0.1.0\"
+    description = \"WeaveFFI C++ RAII bindings generated from the WeaveFFI IR.\"
+    license = \"MIT OR Apache-2.0\"
+    settings = \"os\", \"compiler\", \"build_type\", \"arch\"
+    exports_sources = \"CMakeLists.txt\", \"*.hpp\", \"*.cmake.in\"
+    generators = \"CMakeDeps\", \"CMakeToolchain\"
+    no_copy_source = True
+
+    def layout(self):
+        cmake_layout(self)
+
+    def build(self):
+        cmake = CMake(self)
+        cmake.configure()
+        cmake.build()
+
+    def package(self):
+        cmake = CMake(self)
+        cmake.install()
+
+    def package_info(self):
+        self.cpp_info.set_property(\"cmake_file_name\", \"{prefix}\")
+        self.cpp_info.set_property(\"cmake_target_name\", \"{prefix}::weaveffi_cpp\")
+        self.cpp_info.libs = [\"{prefix}\"]
 "
     )
 }
@@ -1998,6 +2112,9 @@ mod tests {
             vec![
                 out_dir.join("cpp/weaveffi.hpp").to_string(),
                 out_dir.join("cpp/CMakeLists.txt").to_string(),
+                out_dir.join("cpp/weaveffi-config.cmake.in").to_string(),
+                out_dir.join("cpp/vcpkg.json").to_string(),
+                out_dir.join("cpp/conanfile.py").to_string(),
                 out_dir.join("cpp/README.md").to_string(),
             ]
         );
@@ -2015,12 +2132,16 @@ mod tests {
             vec![
                 out_dir.join("cpp/weaveffi.hpp").to_string(),
                 out_dir.join("cpp/CMakeLists.txt").to_string(),
+                out_dir.join("cpp/weaveffi-config.cmake.in").to_string(),
+                out_dir.join("cpp/vcpkg.json").to_string(),
+                out_dir.join("cpp/conanfile.py").to_string(),
                 out_dir.join("cpp/README.md").to_string(),
             ]
         );
 
         let config = GeneratorConfig {
             cpp_header_name: Some("mylib.hpp".into()),
+            c_prefix: Some("myffi".into()),
             ..GeneratorConfig::default()
         };
         let custom_files = CppGenerator.output_files_with_config(&api, out_dir, &config);
@@ -2029,6 +2150,9 @@ mod tests {
             vec![
                 out_dir.join("cpp/mylib.hpp").to_string(),
                 out_dir.join("cpp/CMakeLists.txt").to_string(),
+                out_dir.join("cpp/myffi-config.cmake.in").to_string(),
+                out_dir.join("cpp/vcpkg.json").to_string(),
+                out_dir.join("cpp/conanfile.py").to_string(),
                 out_dir.join("cpp/README.md").to_string(),
             ]
         );
@@ -4496,6 +4620,153 @@ mod tests {
         );
         assert!(cmake.contains(" cpp "));
         assert!(cmake.contains("DO NOT EDIT"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cpp_cmake_supports_find_package() {
+        let api = minimal_api();
+        let tmp = std::env::temp_dir().join("weaveffi_test_cpp_find_package");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        let config = GeneratorConfig {
+            c_prefix: Some("myffi".into()),
+            ..GeneratorConfig::default()
+        };
+        CppGenerator
+            .generate_with_config(&api, out_dir, &config)
+            .unwrap();
+
+        let cmake = std::fs::read_to_string(tmp.join("cpp/CMakeLists.txt")).unwrap();
+        assert!(
+            cmake.contains("cmake_minimum_required(VERSION 3.16)"),
+            "CMakeLists.txt must require CMake 3.16: {cmake}"
+        );
+        assert!(
+            cmake.contains("find_package(myffi"),
+            "CMakeLists.txt must call find_package({{c_prefix}}): {cmake}"
+        );
+        assert!(
+            cmake.contains("include(CMakePackageConfigHelpers)"),
+            "CMakeLists.txt must include CMakePackageConfigHelpers: {cmake}"
+        );
+        assert!(
+            cmake.contains("install(TARGETS weaveffi_cpp EXPORT myffiTargets)"),
+            "CMakeLists.txt must install the target under myffiTargets export set: {cmake}"
+        );
+        assert!(
+            cmake.contains("install(EXPORT myffiTargets"),
+            "CMakeLists.txt must install the EXPORT set: {cmake}"
+        );
+        assert!(
+            cmake.contains("NAMESPACE myffi::"),
+            "install(EXPORT) must use the c_prefix namespace: {cmake}"
+        );
+        assert!(
+            cmake.contains("configure_package_config_file("),
+            "CMakeLists.txt must call configure_package_config_file: {cmake}"
+        );
+        assert!(
+            cmake.contains("myffi-config.cmake.in"),
+            "CMakeLists.txt must reference the {{c_prefix}}-config.cmake.in template: {cmake}"
+        );
+
+        let config_in = std::fs::read_to_string(tmp.join("cpp/myffi-config.cmake.in")).unwrap();
+        assert!(
+            config_in.contains("@PACKAGE_INIT@"),
+            "config.cmake.in must contain @PACKAGE_INIT@ placeholder: {config_in}"
+        );
+        assert!(
+            config_in.contains("myffi-targets.cmake"),
+            "config.cmake.in must include the generated targets file: {config_in}"
+        );
+        assert!(
+            config_in.contains("check_required_components(myffi)"),
+            "config.cmake.in must call check_required_components: {config_in}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cpp_has_vcpkg_json() {
+        let api = minimal_api();
+        let tmp = std::env::temp_dir().join("weaveffi_test_cpp_vcpkg");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        let config = GeneratorConfig {
+            c_prefix: Some("myffi".into()),
+            ..GeneratorConfig::default()
+        };
+        CppGenerator
+            .generate_with_config(&api, out_dir, &config)
+            .unwrap();
+
+        let vcpkg = std::fs::read_to_string(tmp.join("cpp/vcpkg.json")).unwrap();
+        assert!(
+            vcpkg.contains("\"name\": \"myffi\""),
+            "vcpkg.json must use the configured c_prefix as the port name: {vcpkg}"
+        );
+        assert!(
+            vcpkg.contains("\"version\":"),
+            "vcpkg.json must declare a version: {vcpkg}"
+        );
+        assert!(
+            vcpkg.trim_start().starts_with('{'),
+            "vcpkg.json must remain strict JSON (no comment stamp): {vcpkg}"
+        );
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(&vcpkg);
+        assert!(
+            parsed.is_ok(),
+            "vcpkg.json must parse as JSON: {vcpkg} ({:?})",
+            parsed.err()
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cpp_has_conanfile() {
+        let api = minimal_api();
+        let tmp = std::env::temp_dir().join("weaveffi_test_cpp_conan");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        let config = GeneratorConfig {
+            c_prefix: Some("myffi".into()),
+            ..GeneratorConfig::default()
+        };
+        CppGenerator
+            .generate_with_config(&api, out_dir, &config)
+            .unwrap();
+
+        let conan = std::fs::read_to_string(tmp.join("cpp/conanfile.py")).unwrap();
+        assert!(
+            conan.contains("from conan import ConanFile"),
+            "conanfile.py must import ConanFile: {conan}"
+        );
+        assert!(
+            conan.contains("class MyffiConan(ConanFile):"),
+            "conanfile.py must declare a class derived from the c_prefix: {conan}"
+        );
+        assert!(
+            conan.contains("name = \"myffi\""),
+            "conanfile.py must set name to the configured c_prefix: {conan}"
+        );
+        assert!(
+            conan.contains("from conan.tools.cmake import"),
+            "conanfile.py must use the CMake conan tools: {conan}"
+        );
+        assert!(
+            conan.contains("cmake_file_name"),
+            "conanfile.py must expose cmake_file_name in package_info: {conan}"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
