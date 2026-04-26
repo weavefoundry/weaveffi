@@ -331,6 +331,9 @@ fn render_kotlin(api: &Api, package: &str, strip_module_prefix: bool) -> String 
     let has_async = all_mods
         .iter()
         .any(|m| m.functions.iter().any(|f| f.r#async));
+    let has_cancellable_async = all_mods
+        .iter()
+        .any(|m| m.functions.iter().any(|f| f.r#async && f.cancellable));
     let mut kotlin = format!("package {package}\n\n");
     if has_async {
         kotlin.push_str("import kotlinx.coroutines.suspendCancellableCoroutine\n");
@@ -343,6 +346,17 @@ fn render_kotlin(api: &Api, package: &str, strip_module_prefix: bool) -> String 
         }
     }
     kotlin.push_str("class WeaveFFI {\n    companion object {\n        init { System.loadLibrary(\"weaveffi\") }\n\n");
+    if has_cancellable_async {
+        kotlin.push_str(
+            "        @JvmStatic private external fun weaveffiCancelTokenCreate(): Long\n",
+        );
+        kotlin.push_str(
+            "        @JvmStatic private external fun weaveffiCancelTokenCancel(token: Long)\n",
+        );
+        kotlin.push_str(
+            "        @JvmStatic private external fun weaveffiCancelTokenDestroy(token: Long)\n",
+        );
+    }
     for m in &all_mods {
         for cb in &m.callbacks {
             let _ = writeln!(
@@ -551,27 +565,58 @@ fn render_kotlin_async_fun(out: &mut String, f: &Function, func_name: &str) {
         .unwrap_or_else(|| "Unit".to_string());
     let mut call_arg_chain: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
     if f.cancellable {
-        call_arg_chain.push("0L".to_string());
+        call_arg_chain.push("token".to_string());
     }
     call_arg_chain.push("WeaveContinuation(cont)".to_string());
     let call_args = call_arg_chain;
     if let Some(msg) = &f.deprecated {
         let _ = writeln!(out, "        @Deprecated(\"{}\")", msg.replace('"', "\\\""));
     }
-    let _ = writeln!(
-        out,
-        "        @JvmStatic suspend fun {}({}): {} = suspendCancellableCoroutine {{ cont ->",
-        func_name,
-        params_sig.join(", "),
-        ret
-    );
-    let _ = writeln!(
-        out,
-        "            {}Async({})",
-        func_name,
-        call_args.join(", ")
-    );
-    let _ = writeln!(out, "        }}");
+    if f.cancellable {
+        let _ = writeln!(
+            out,
+            "        @JvmStatic suspend fun {}({}): {} {{",
+            func_name,
+            params_sig.join(", "),
+            ret
+        );
+        let _ = writeln!(out, "            val token = weaveffiCancelTokenCreate()");
+        let _ = writeln!(out, "            try {{");
+        let _ = writeln!(
+            out,
+            "                return suspendCancellableCoroutine {{ cont ->"
+        );
+        let _ = writeln!(
+            out,
+            "                    cont.invokeOnCancellation {{ weaveffiCancelTokenCancel(token) }}"
+        );
+        let _ = writeln!(
+            out,
+            "                    {}Async({})",
+            func_name,
+            call_args.join(", ")
+        );
+        let _ = writeln!(out, "                }}");
+        let _ = writeln!(out, "            }} finally {{");
+        let _ = writeln!(out, "                weaveffiCancelTokenDestroy(token)");
+        let _ = writeln!(out, "            }}");
+        let _ = writeln!(out, "        }}");
+    } else {
+        let _ = writeln!(
+            out,
+            "        @JvmStatic suspend fun {}({}): {} = suspendCancellableCoroutine {{ cont ->",
+            func_name,
+            params_sig.join(", "),
+            ret
+        );
+        let _ = writeln!(
+            out,
+            "            {}Async({})",
+            func_name,
+            call_args.join(", ")
+        );
+        let _ = writeln!(out, "        }}");
+    }
 }
 
 fn render_kotlin_enum(out: &mut String, e: &EnumDef) {
@@ -619,6 +664,35 @@ fn render_kotlin_error_types(out: &mut String, api: &Api) {
         }
         let _ = writeln!(out, "}}");
     }
+}
+
+/// Emit JNI trampolines that expose the `weaveffi_cancel_token_*` C ABI to
+/// Kotlin so cancellable `suspend fun`s can wire `invokeOnCancellation` to the
+/// real native token instead of a null placeholder.
+fn render_jni_cancel_token_helpers(out: &mut String, jni_prefix: &str) {
+    let _ = writeln!(
+        out,
+        "JNIEXPORT jlong JNICALL Java_{jni_prefix}_WeaveFFI_weaveffiCancelTokenCreate(JNIEnv* env, jclass clazz) {{"
+    );
+    out.push_str("    (void)env; (void)clazz;\n");
+    out.push_str("    return (jlong)(intptr_t)weaveffi_cancel_token_create();\n");
+    out.push_str("}\n\n");
+
+    let _ = writeln!(
+        out,
+        "JNIEXPORT void JNICALL Java_{jni_prefix}_WeaveFFI_weaveffiCancelTokenCancel(JNIEnv* env, jclass clazz, jlong token) {{"
+    );
+    out.push_str("    (void)env; (void)clazz;\n");
+    out.push_str("    weaveffi_cancel_token_cancel((weaveffi_cancel_token*)(intptr_t)token);\n");
+    out.push_str("}\n\n");
+
+    let _ = writeln!(
+        out,
+        "JNIEXPORT void JNICALL Java_{jni_prefix}_WeaveFFI_weaveffiCancelTokenDestroy(JNIEnv* env, jclass clazz, jlong token) {{"
+    );
+    out.push_str("    (void)env; (void)clazz;\n");
+    out.push_str("    weaveffi_cancel_token_destroy((weaveffi_cancel_token*)(intptr_t)token);\n");
+    out.push_str("}\n\n");
 }
 
 fn render_jni_callback_registry(out: &mut String, _jni_prefix: &str) {
@@ -963,6 +1037,13 @@ fn render_jni_c(api: &Api, package: &str, strip_module_prefix: bool) -> String {
         jni_c.push_str("    JavaVM* jvm;\n");
         jni_c.push_str("    jobject callback;\n");
         jni_c.push_str("} weaveffi_jni_async_ctx;\n\n");
+    }
+
+    let has_cancellable_async = all_mods
+        .iter()
+        .any(|m| m.functions.iter().any(|f| f.r#async && f.cancellable));
+    if has_cancellable_async {
+        render_jni_cancel_token_helpers(&mut jni_c, &jni_prefix);
     }
 
     let has_callbacks = all_mods.iter().any(|m| !m.callbacks.is_empty());
@@ -4801,6 +4882,110 @@ mod tests {
         assert!(
             kt.contains("import kotlinx.coroutines.suspendCancellableCoroutine"),
             "should import suspendCancellableCoroutine: {kt}"
+        );
+    }
+
+    #[test]
+    fn kotlin_cancellable_async_uses_invoke_on_cancellation() {
+        let api = make_api(vec![Module {
+            name: "tasks".to_string(),
+            functions: vec![
+                Function {
+                    name: "run".to_string(),
+                    params: vec![Param {
+                        name: "id".to_string(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                    }],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: true,
+                    cancellable: true,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "fire".to_string(),
+                    params: vec![],
+                    returns: None,
+                    doc: None,
+                    r#async: true,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+            ],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let kt = render_kotlin(&api, "com.weaveffi", true);
+        assert!(
+            kt.contains("@JvmStatic private external fun weaveffiCancelTokenCreate(): Long"),
+            "cancellable async must declare the cancel-token-create JNI helper: {kt}"
+        );
+        assert!(
+            kt.contains("@JvmStatic private external fun weaveffiCancelTokenCancel(token: Long)"),
+            "cancellable async must declare the cancel-token-cancel JNI helper: {kt}"
+        );
+        assert!(
+            kt.contains("@JvmStatic private external fun weaveffiCancelTokenDestroy(token: Long)"),
+            "cancellable async must declare the cancel-token-destroy JNI helper: {kt}"
+        );
+        assert!(
+            kt.contains("val token = weaveffiCancelTokenCreate()"),
+            "cancellable suspend fun must create a real token: {kt}"
+        );
+        assert!(
+            kt.contains("suspendCancellableCoroutine"),
+            "cancellable suspend fun must still use suspendCancellableCoroutine: {kt}"
+        );
+        assert!(
+            kt.contains("cont.invokeOnCancellation { weaveffiCancelTokenCancel(token) }"),
+            "cancellable suspend fun must wire invokeOnCancellation to the native token: {kt}"
+        );
+        assert!(
+            kt.contains("runAsync(id, token, WeaveContinuation(cont))"),
+            "cancellable Async JNI call must forward the real token: {kt}"
+        );
+        assert!(
+            kt.contains("weaveffiCancelTokenDestroy(token)"),
+            "cancellable suspend fun must destroy the token after completion: {kt}"
+        );
+        assert!(
+            !kt.contains("runAsync(id, 0L, WeaveContinuation(cont))"),
+            "cancellable Async JNI call must not pass a null-placeholder token: {kt}"
+        );
+
+        let fire_line = kt
+            .lines()
+            .find(|l| l.contains("fireAsync("))
+            .expect("non-cancellable fireAsync call should be emitted");
+        assert!(
+            !fire_line.contains("token"),
+            "non-cancellable async must not forward a cancel token: {fire_line}"
+        );
+
+        let jni = render_jni_c(&api, "com.weaveffi", true);
+        assert!(
+            jni.contains("Java_com_weaveffi_WeaveFFI_weaveffiCancelTokenCreate"),
+            "JNI bridge must export cancel-token-create: {jni}"
+        );
+        assert!(
+            jni.contains("Java_com_weaveffi_WeaveFFI_weaveffiCancelTokenCancel"),
+            "JNI bridge must export cancel-token-cancel: {jni}"
+        );
+        assert!(
+            jni.contains("Java_com_weaveffi_WeaveFFI_weaveffiCancelTokenDestroy"),
+            "JNI bridge must export cancel-token-destroy: {jni}"
+        );
+        assert!(
+            jni.contains("weaveffi_cancel_token_cancel((weaveffi_cancel_token*)(intptr_t)token)"),
+            "JNI cancel-token-cancel must forward to the C ABI: {jni}"
         );
     }
 
