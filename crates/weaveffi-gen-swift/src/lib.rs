@@ -11,6 +11,18 @@ use weaveffi_ir::ir::{
 
 pub struct SwiftGenerator;
 
+/// Derive the Swift C system module name (`C{PascalCasePrefix}`) from a C ABI prefix.
+///
+/// The default `weaveffi` prefix resolves to `CWeaveFFI` to preserve the canonical
+/// module name; any other prefix is pascal-cased via [`heck::ToUpperCamelCase`].
+fn c_system_module_name(c_prefix: &str) -> String {
+    if c_prefix == "weaveffi" {
+        "CWeaveFFI".to_string()
+    } else {
+        format!("C{}", c_prefix.to_upper_camel_case())
+    }
+}
+
 impl SwiftGenerator {
     fn generate_impl(
         &self,
@@ -18,9 +30,10 @@ impl SwiftGenerator {
         out_dir: &Utf8Path,
         module_name: &str,
         strip_module_prefix: bool,
+        c_prefix: &str,
     ) -> Result<()> {
         let dir = out_dir.join("swift");
-        let c_module = format!("C{}", module_name);
+        let c_module = c_system_module_name(c_prefix);
         let module_dir = dir.join(&c_module);
         std::fs::create_dir_all(&module_dir)?;
 
@@ -45,8 +58,7 @@ let package = Package(
         std::fs::write(dir.join("Package.swift"), package)?;
 
         let modulemap = format!(
-            "module {} [system] {{\n  header \"../../c/weaveffi.h\"\n  link \"weaveffi\"\n  export *\n}}\n",
-            c_module
+            "module {c_module} [system] {{\n  header \"../../c/{c_prefix}.h\"\n  link \"{c_prefix}\"\n  export *\n}}\n",
         );
         std::fs::write(module_dir.join("module.modulemap"), modulemap)?;
 
@@ -54,7 +66,7 @@ let package = Package(
         std::fs::create_dir_all(&src_dir)?;
         std::fs::write(
             src_dir.join(format!("{}.swift", module_name)),
-            render_swift_wrapper(api, strip_module_prefix),
+            render_swift_wrapper(api, strip_module_prefix, &c_module),
         )?;
         Ok(())
     }
@@ -66,7 +78,7 @@ impl Generator for SwiftGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "WeaveFFI", true)
+        self.generate_impl(api, out_dir, "WeaveFFI", true, "weaveffi")
     }
 
     fn generate_with_config(
@@ -80,12 +92,32 @@ impl Generator for SwiftGenerator {
             out_dir,
             config.swift_module_name(),
             config.strip_module_prefix,
+            config.c_prefix(),
         )
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
         let module_name = "WeaveFFI";
-        let c_module = format!("C{module_name}");
+        let c_module = "CWeaveFFI";
+        vec![
+            out_dir.join("swift/Package.swift").to_string(),
+            out_dir
+                .join(format!("swift/{c_module}/module.modulemap"))
+                .to_string(),
+            out_dir
+                .join(format!("swift/Sources/{module_name}/{module_name}.swift"))
+                .to_string(),
+        ]
+    }
+
+    fn output_files_with_config(
+        &self,
+        _api: &Api,
+        out_dir: &Utf8Path,
+        config: &GeneratorConfig,
+    ) -> Vec<String> {
+        let module_name = config.swift_module_name();
+        let c_module = c_system_module_name(config.c_prefix());
         vec![
             out_dir.join("swift/Package.swift").to_string(),
             out_dir
@@ -178,9 +210,9 @@ fn render_swift_enum(out: &mut String, e: &EnumDef) {
     out.push_str("}\n\n");
 }
 
-fn render_swift_wrapper(api: &Api, strip_module_prefix: bool) -> String {
+fn render_swift_wrapper(api: &Api, strip_module_prefix: bool, c_module: &str) -> String {
     let mut out = String::new();
-    out.push_str("import CWeaveFFI\nimport Foundation\n\n");
+    out.push_str(&format!("import {c_module}\nimport Foundation\n\n"));
 
     let all_mods = collect_all_modules(&api.modules);
     let error_codes: Vec<_> = all_mods
@@ -2500,7 +2532,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("public enum Color: Int32 {"),
             "missing enum declaration: {out}"
@@ -2541,7 +2573,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("case inProgress = 0"),
             "missing camelCase variant: {out}"
@@ -2578,7 +2610,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(out.contains("_ a: Color"), "missing enum param type: {out}");
         assert!(
             out.contains("-> Color {"),
@@ -2620,7 +2652,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("_ id: Int32?"),
             "missing optional param type: {out}"
@@ -2658,7 +2690,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("_ person: Contact?"),
             "missing optional struct param: {out}"
@@ -2695,7 +2727,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("-> Int32? {"),
             "missing optional return type: {out}"
@@ -2728,7 +2760,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("-> String? {"),
             "missing optional string return type: {out}"
@@ -2769,7 +2801,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("_ ids: [Int32]"),
             "missing list param type: {out}"
@@ -2804,7 +2836,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("-> [Int32] {"),
             "missing list return type: {out}"
@@ -2848,7 +2880,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("-> Contact? {"),
             "missing optional struct return: {out}"
@@ -2862,7 +2894,7 @@ mod tests {
     #[test]
     fn render_with_optional_pointer_helper() {
         let api = make_api(vec![]);
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("func withOptionalPointer<T, R>"),
             "missing withOptionalPointer helper: {out}"
@@ -2904,7 +2936,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("public class Contact {"),
             "missing class declaration: {out}"
@@ -3032,7 +3064,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("-> Contact {"),
             "missing struct return type: {out}"
@@ -3069,7 +3101,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("_ contact: Contact"),
             "missing struct param type: {out}"
@@ -3103,7 +3135,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("public var data: Data {"),
             "missing bytes getter: {out}"
@@ -3137,7 +3169,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("public var start: Point {"),
             "missing nested struct getter: {out}"
@@ -3174,7 +3206,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("-> Contact {"),
             "missing struct return type with buffer params: {out}"
@@ -3361,7 +3393,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("_ scores: [Int32: Double]"),
             "missing map param type: {out}"
@@ -3411,7 +3443,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("-> [Int32: Double] {"),
             "missing map return type: {out}"
@@ -3469,7 +3501,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
 
         assert!(
             out.contains("public var email: String? {"),
@@ -3559,24 +3591,19 @@ mod tests {
             pkg.contains("name: \"MyCoolLib\""),
             "Package.swift should use custom module name: {pkg}"
         );
+        // The C system module name is derived from `c_prefix` (default `weaveffi`
+        // → `CWeaveFFI`), independently of `swift_module_name`.
         assert!(
-            pkg.contains("\"CMyCoolLib\""),
-            "Package.swift should reference CMyCoolLib: {pkg}"
-        );
-        assert!(
-            !pkg.contains("WeaveFFI"),
-            "Package.swift should not contain WeaveFFI: {pkg}"
+            pkg.contains("\"CWeaveFFI\""),
+            "Package.swift should reference the default CWeaveFFI system module: {pkg}"
         );
 
-        let modulemap = std::fs::read_to_string(
-            tmp.join("swift")
-                .join("CMyCoolLib")
-                .join("module.modulemap"),
-        )
-        .unwrap();
+        let modulemap =
+            std::fs::read_to_string(tmp.join("swift").join("CWeaveFFI").join("module.modulemap"))
+                .unwrap();
         assert!(
-            modulemap.contains("module CMyCoolLib"),
-            "modulemap should use custom name: {modulemap}"
+            modulemap.contains("module CWeaveFFI"),
+            "modulemap should use the default CWeaveFFI name: {modulemap}"
         );
 
         let swift_src = tmp
@@ -3632,7 +3659,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
 
         assert!(
             out.contains("public enum WeaveFFIError: Error, LocalizedError {"),
@@ -3715,7 +3742,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
 
         assert!(
             out.contains("public var item_ids: [Int32] {"),
@@ -3866,7 +3893,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let swift = render_swift_wrapper(&api, true);
+        let swift = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             swift.contains("[Contact?]?"),
             "should contain deeply nested optional type: {swift}"
@@ -3901,7 +3928,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let swift = render_swift_wrapper(&api, true);
+        let swift = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             swift.contains("[String: [Int32]]"),
             "should contain map of lists type: {swift}"
@@ -3966,7 +3993,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let swift = render_swift_wrapper(&api, true);
+        let swift = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             swift.contains("[Color: Contact]"),
             "should contain enum-keyed map type: {swift}"
@@ -4009,7 +4036,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("_ msg: String"),
             "BorrowedStr param should use String type: {out}"
@@ -4046,7 +4073,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("_ data: Data"),
             "BorrowedBytes param should use Data type: {out}"
@@ -4092,7 +4119,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let swift = render_swift_wrapper(&api, true);
+        let swift = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             swift.contains("_ contact: Contact"),
             "TypedHandle should use class type not UInt64: {swift}"
@@ -4139,7 +4166,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
 
         assert!(
             !out.contains("weaveffi_free_string(name"),
@@ -4195,7 +4222,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("rv.map { Contact(ptr: $0) }"),
             "optional struct return should map null before wrapping: {out}"
@@ -4228,7 +4255,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("async throws"),
             "missing async throws in signature: {out}"
@@ -4265,7 +4292,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("withCheckedThrowingContinuation"),
             "missing withCheckedThrowingContinuation: {out}"
@@ -4322,7 +4349,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
 
         assert!(
             out.contains("let cancelToken = weaveffi_cancel_token_create()"),
@@ -4411,7 +4438,7 @@ mod tests {
             },
         ]);
 
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
 
         assert!(
             out.contains("-> Name"),
@@ -4466,7 +4493,7 @@ mod tests {
                 modules: vec![],
             }],
         }]);
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("public enum Parent {"),
             "top-level module enum missing: {out}"
@@ -4520,7 +4547,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("ListItemsIterator"),
             "should reference iterator type: {out}"
@@ -4567,7 +4594,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let out = render_swift_wrapper(&api, true);
+        let out = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             out.contains("@available(*, deprecated, message: \"Use addV2 instead\")"),
             "missing deprecation annotation: {out}"
@@ -4737,7 +4764,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let swift = render_swift_wrapper(&api, true);
+        let swift = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             swift.contains("let payload_bytes = Array(payload)"),
             "bytes param should be materialised as a UInt8 array: {swift}"
@@ -4782,7 +4809,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let swift = render_swift_wrapper(&api, true);
+        let swift = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             swift.contains("var outLen: Int = 0"),
             "bytes return must declare outLen for the canonical size_t* out_len out-param: {swift}"
@@ -4838,7 +4865,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let swift = render_swift_wrapper(&api, true);
+        let swift = render_swift_wrapper(&api, true, "CWeaveFFI");
         let msg_pos = swift
             .find("let message = err.message.flatMap")
             .expect("check() must capture err.message into a Swift String");
@@ -4891,7 +4918,7 @@ mod tests {
                 modules: vec![],
             }]);
 
-            let swift = render_swift_wrapper(&api, true);
+            let swift = render_swift_wrapper(&api, true, "CWeaveFFI");
             let convert_pos = swift
                 .find("Data(bytes: rv, count: outLen)")
                 .expect("Swift wrapper must convert bytes return to Data");
@@ -4931,7 +4958,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let swift = render_swift_wrapper(&api, true);
+        let swift = render_swift_wrapper(&api, true, "CWeaveFFI");
         let copy_pos = swift
             .find("let data = Data(bytes: result, count: Int(resultLen))")
             .expect("Swift async callback must copy the returned bytes into Data");
@@ -4967,7 +4994,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let swift = render_swift_wrapper(&api, true);
+        let swift = render_swift_wrapper(&api, true, "CWeaveFFI");
         assert!(
             swift.contains("public class Contact {"),
             "Swift struct wrapper must be a class: {swift}"
@@ -5025,7 +5052,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let swift = render_swift_wrapper(&api, true);
+        let swift = render_swift_wrapper(&api, true, "CWeaveFFI");
 
         assert!(
             swift.contains("public typealias OnData = (Int32) -> Void"),
@@ -5091,7 +5118,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let swift = render_swift_wrapper(&api, true);
+        let swift = render_swift_wrapper(&api, true, "CWeaveFFI");
 
         assert!(
             swift.contains("public class DataStream {"),
@@ -5137,5 +5164,106 @@ mod tests {
             swift.contains("Unmanaged<OnDataRef>.fromOpaque(ctx).release()"),
             "unregister must release the pinned closure via Unmanaged: {swift}"
         );
+    }
+
+    #[test]
+    fn swift_modulemap_respects_c_prefix() {
+        // When `c_prefix` is overridden, the Swift generator must emit a
+        // `module.modulemap` that imports `../../c/{c_prefix}.h` and links
+        // against `{c_prefix}`, the C system module directory must be named
+        // `C{PascalCasePrefix}`, and the Swift source must `import
+        // C{PascalCasePrefix}` so the Swift target resolves the C prototypes
+        // from the matching library/header pair.
+        let api = make_api(vec![Module {
+            name: "math".to_string(),
+            functions: vec![Function {
+                name: "add".to_string(),
+                params: vec![
+                    Param {
+                        name: "a".to_string(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                    },
+                    Param {
+                        name: "b".to_string(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                    },
+                ],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let config = GeneratorConfig {
+            c_prefix: Some("my_cool_lib".into()),
+            ..Default::default()
+        };
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_swift_modulemap_c_prefix");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        SwiftGenerator
+            .generate_with_config(&api, out_dir, &config)
+            .unwrap();
+
+        let modulemap_path = tmp.join("swift/CMyCoolLib/module.modulemap");
+        assert!(
+            modulemap_path.exists(),
+            "modulemap must live under C{{PascalCasePrefix}} directory: {modulemap_path:?}"
+        );
+        let modulemap = std::fs::read_to_string(&modulemap_path).unwrap();
+        assert!(
+            modulemap.contains("module CMyCoolLib"),
+            "modulemap declaration must use the prefix-derived system module name: {modulemap}"
+        );
+        assert!(
+            modulemap.contains("header \"../../c/my_cool_lib.h\""),
+            "modulemap must reference the C header named after c_prefix: {modulemap}"
+        );
+        assert!(
+            modulemap.contains("link \"my_cool_lib\""),
+            "modulemap must link the C library named after c_prefix: {modulemap}"
+        );
+        assert!(
+            !modulemap.contains("weaveffi"),
+            "modulemap must not leak the default 'weaveffi' prefix when a custom c_prefix is set: {modulemap}"
+        );
+
+        let swift =
+            std::fs::read_to_string(tmp.join("swift/Sources/WeaveFFI/WeaveFFI.swift")).unwrap();
+        assert!(
+            swift.contains("import CMyCoolLib"),
+            "Swift source must import the prefix-derived C system module: {swift}"
+        );
+        assert!(
+            !swift.contains("import CWeaveFFI"),
+            "Swift source must not import the default CWeaveFFI when c_prefix overrides it: {swift}"
+        );
+
+        let pkg = std::fs::read_to_string(tmp.join("swift/Package.swift")).unwrap();
+        assert!(
+            pkg.contains(".systemLibrary(name: \"CMyCoolLib\")"),
+            "Package.swift must declare the prefix-derived system library target: {pkg}"
+        );
+
+        // The default `weaveffi` prefix must still resolve to `CWeaveFFI` so
+        // existing consumers keep working when c_prefix is left unset.
+        assert_eq!(c_system_module_name("weaveffi"), "CWeaveFFI");
+        assert_eq!(c_system_module_name("my_cool_lib"), "CMyCoolLib");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
