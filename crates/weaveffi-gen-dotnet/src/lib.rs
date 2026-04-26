@@ -5,7 +5,8 @@ use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name, wrapper_name};
 use weaveffi_ir::ir::{
-    Api, CallbackDef, EnumDef, Function, Module, Param, StructDef, StructField, TypeRef,
+    Api, CallbackDef, EnumDef, Function, ListenerDef, Module, Param, StructDef, StructField,
+    TypeRef,
 };
 
 pub struct DotnetGenerator;
@@ -72,6 +73,7 @@ impl Generator for DotnetGenerator {
     fn capabilities(&self) -> &'static [Capability] {
         &[
             Capability::Callbacks,
+            Capability::Listeners,
             Capability::Iterators,
             Capability::Builders,
             Capability::AsyncFunctions,
@@ -307,6 +309,9 @@ fn render_csharp(api: &Api, namespace: &str, strip_module_prefix: bool) -> Strin
         for cb in &m.callbacks {
             render_callback_delegate(&mut out, cb);
         }
+        for l in &m.listeners {
+            render_listener_class(&mut out, &path, l);
+        }
     }
 
     render_native_methods(&mut out, api);
@@ -421,6 +426,60 @@ fn render_callback_delegate(out: &mut String, cb: &CallbackDef) {
         "    public delegate {ret_cs} {}({});\n\n",
         cb.name,
         params_sig.join(", ")
+    ));
+}
+
+fn render_listener_class(out: &mut String, module_path: &str, l: &ListenerDef) {
+    let class_name = l.name.to_upper_camel_case();
+    let reg_sym = c_symbol_name(module_path, &format!("register_{}", l.name));
+    let unreg_sym = c_symbol_name(module_path, &format!("unregister_{}", l.name));
+    let delegate_type = &l.event_callback;
+
+    if let Some(doc) = &l.doc {
+        out.push_str(&format!("    /// <summary>{doc}</summary>\n"));
+    }
+    out.push_str(&format!("    public static class {class_name}\n    {{\n"));
+    out.push_str(
+        "        private static readonly Dictionary<ulong, GCHandle> _handles = new Dictionary<ulong, GCHandle>();\n\n",
+    );
+
+    out.push_str(&format!(
+        "        public static ulong Register({delegate_type} callback)\n        {{\n"
+    ));
+    out.push_str("            var handle = GCHandle.Alloc(callback, GCHandleType.Normal);\n");
+    out.push_str("            var ptr = Marshal.GetFunctionPointerForDelegate(callback);\n");
+    out.push_str(&format!(
+        "            var id = NativeMethods.{reg_sym}(ptr, IntPtr.Zero);\n"
+    ));
+    out.push_str("            _handles[id] = handle;\n");
+    out.push_str("            return id;\n");
+    out.push_str("        }\n\n");
+
+    out.push_str("        public static void Unregister(ulong id)\n        {\n");
+    out.push_str(&format!("            NativeMethods.{unreg_sym}(id);\n"));
+    out.push_str("            if (_handles.TryGetValue(id, out var handle))\n            {\n");
+    out.push_str("                handle.Free();\n");
+    out.push_str("                _handles.Remove(id);\n");
+    out.push_str("            }\n");
+    out.push_str("        }\n");
+    out.push_str("    }\n\n");
+}
+
+fn render_listener_pinvoke(out: &mut String, module_path: &str, l: &ListenerDef) {
+    let reg_sym = c_symbol_name(module_path, &format!("register_{}", l.name));
+    let unreg_sym = c_symbol_name(module_path, &format!("unregister_{}", l.name));
+
+    out.push_str(&format!(
+        "        [DllImport(LibName, EntryPoint = \"{reg_sym}\", CallingConvention = CallingConvention.Cdecl)]\n"
+    ));
+    out.push_str(&format!(
+        "        internal static extern ulong {reg_sym}(IntPtr callback, IntPtr context);\n\n"
+    ));
+    out.push_str(&format!(
+        "        [DllImport(LibName, EntryPoint = \"{unreg_sym}\", CallingConvention = CallingConvention.Cdecl)]\n"
+    ));
+    out.push_str(&format!(
+        "        internal static extern void {unreg_sym}(ulong id);\n\n"
     ));
 }
 
@@ -751,6 +810,9 @@ fn render_native_methods(out: &mut String, api: &Api) {
     for (m, path) in collect_modules_with_path(&api.modules) {
         for s in &m.structs {
             render_struct_pinvoke(out, &path, s);
+        }
+        for l in &m.listeners {
+            render_listener_pinvoke(out, &path, l);
         }
         for f in &m.functions {
             render_function_pinvoke(out, &path, f);
@@ -4688,14 +4750,11 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_excludes_listeners() {
+    fn capabilities_includes_callbacks_and_listeners() {
         let caps = DotnetGenerator.capabilities();
         assert!(caps.contains(&Capability::Callbacks));
-        assert!(!caps.contains(&Capability::Listeners));
+        assert!(caps.contains(&Capability::Listeners));
         for cap in Capability::ALL {
-            if matches!(cap, Capability::Listeners) {
-                continue;
-            }
             assert!(caps.contains(cap), ".NET generator must support {cap:?}");
         }
     }
@@ -4774,6 +4833,94 @@ mod tests {
                 "internal static extern void weaveffi_events_subscribe(IntPtr handler, IntPtr handler_ctx, ref WeaveffiError err);"
             ),
             "P/Invoke declaration must take (IntPtr, IntPtr, ref err): {cs}"
+        );
+    }
+
+    #[test]
+    fn dotnet_emits_listener_class() {
+        let api = make_api(vec![Module {
+            name: "events".into(),
+            functions: vec![],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![CallbackDef {
+                name: "OnData".into(),
+                params: vec![Param {
+                    name: "value".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+            }],
+            listeners: vec![ListenerDef {
+                name: "data_stream".into(),
+                event_callback: "OnData".into(),
+                doc: None,
+            }],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let cs = render_csharp(&api, "WeaveFFI", true);
+
+        assert!(
+            cs.contains("public static class DataStream"),
+            "missing static listener class: {cs}"
+        );
+        assert!(
+            cs.contains(
+                "private static readonly Dictionary<ulong, GCHandle> _handles = new Dictionary<ulong, GCHandle>();"
+            ),
+            "listener class must keep GCHandles in a Dictionary<ulong, GCHandle>: {cs}"
+        );
+        assert!(
+            cs.contains("public static ulong Register(OnData callback)"),
+            "listener class must expose Register(DelegateType): {cs}"
+        );
+        assert!(
+            cs.contains("GCHandle.Alloc(callback, GCHandleType.Normal)"),
+            "Register must pin the delegate via GCHandle.Alloc with Normal: {cs}"
+        );
+        assert!(
+            cs.contains("Marshal.GetFunctionPointerForDelegate(callback)"),
+            "Register must use Marshal.GetFunctionPointerForDelegate: {cs}"
+        );
+        assert!(
+            cs.contains("NativeMethods.weaveffi_events_register_data_stream(ptr, IntPtr.Zero)"),
+            "Register must call the native register symbol with (ptr, IntPtr.Zero): {cs}"
+        );
+        assert!(
+            cs.contains("_handles[id] = handle;"),
+            "Register must store the GCHandle in the dictionary keyed by id: {cs}"
+        );
+        assert!(
+            cs.contains("public static void Unregister(ulong id)"),
+            "listener class must expose Unregister(ulong): {cs}"
+        );
+        assert!(
+            cs.contains("NativeMethods.weaveffi_events_unregister_data_stream(id);"),
+            "Unregister must call the native unregister symbol with the id: {cs}"
+        );
+        assert!(
+            cs.contains("handle.Free();"),
+            "Unregister must free the pinned GCHandle: {cs}"
+        );
+        assert!(
+            cs.contains("_handles.Remove(id);"),
+            "Unregister must remove the entry from the dictionary: {cs}"
+        );
+        assert!(
+            cs.contains(
+                "internal static extern ulong weaveffi_events_register_data_stream(IntPtr callback, IntPtr context);"
+            ),
+            "P/Invoke for register must take (IntPtr callback, IntPtr context) and return ulong: {cs}"
+        );
+        assert!(
+            cs.contains(
+                "internal static extern void weaveffi_events_unregister_data_stream(ulong id);"
+            ),
+            "P/Invoke for unregister must take (ulong id) and return void: {cs}"
         );
     }
 }
