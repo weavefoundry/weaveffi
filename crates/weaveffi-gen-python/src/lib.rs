@@ -1685,6 +1685,27 @@ packages = ["{package_name}"]
 
 [tool.setuptools.dynamic.version]
 attr = "{package_name}.__version__"
+
+# cibuildwheel builds Linux, macOS, and Windows wheels in CI for PyPI upload.
+# Run `pipx run cibuildwheel` (or use the pypa/cibuildwheel GitHub Action) from
+# this directory to produce wheels. See https://cibuildwheel.pypa.io/.
+[tool.cibuildwheel]
+build = "cp38-* cp39-* cp310-* cp311-* cp312-*"
+skip = "*-musllinux_* pp*"
+# Regenerate bindings and rebuild the native cdylib for the current target
+# before each wheel. Adjust the path to match where your IDL lives relative
+# to this pyproject.toml (by default cibuildwheel runs here, so `../../api.yml`
+# points at the repo root when bindings are produced under `generated/python/`).
+before-build = "weaveffi build ../../api.yml"
+
+[tool.cibuildwheel.linux]
+archs = ["x86_64", "aarch64"]
+
+[tool.cibuildwheel.macos]
+archs = ["x86_64", "arm64"]
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]
 "#,
     )
 }
@@ -6114,6 +6135,46 @@ mod tests {
         assert!(
             smoke.contains("import weaveffi"),
             "test_smoke.py must import the generated module: {smoke}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn python_pyproject_has_cibuildwheel_config() {
+        let api = make_api(vec![]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_python_cibw_config");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        PythonGenerator.generate(&api, out_dir).unwrap();
+
+        let pyproject = std::fs::read_to_string(tmp.join("python/pyproject.toml")).unwrap();
+        assert!(
+            pyproject.contains("[tool.cibuildwheel]"),
+            "pyproject should declare a [tool.cibuildwheel] section: {pyproject}"
+        );
+        assert!(
+            pyproject.contains("[tool.cibuildwheel.linux]"),
+            "pyproject should declare a Linux target for cibuildwheel: {pyproject}"
+        );
+        assert!(
+            pyproject.contains("[tool.cibuildwheel.macos]"),
+            "pyproject should declare a macOS target for cibuildwheel: {pyproject}"
+        );
+        assert!(
+            pyproject.contains("[tool.cibuildwheel.windows]"),
+            "pyproject should declare a Windows target for cibuildwheel: {pyproject}"
+        );
+        assert!(
+            pyproject.contains("before-build ="),
+            "pyproject should declare a before-build hook for cibuildwheel: {pyproject}"
+        );
+        assert!(
+            pyproject.contains("weaveffi build"),
+            "before-build hook must invoke `weaveffi build`: {pyproject}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);

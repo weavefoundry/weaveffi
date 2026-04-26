@@ -236,6 +236,90 @@ mypy demo.py
 IDEs like VS Code and PyCharm will show autocomplete for all generated
 functions, classes, and properties.
 
+## 9) Build wheels for PyPI with cibuildwheel
+
+The generated `pyproject.toml` ships with a `[tool.cibuildwheel]` block
+so you can produce Linux, macOS, and Windows wheels from a single
+`cibuildwheel` invocation and upload them to PyPI.
+
+The defaults look like:
+
+```toml
+[tool.cibuildwheel]
+build = "cp38-* cp39-* cp310-* cp311-* cp312-*"
+skip = "*-musllinux_* pp*"
+before-build = "weaveffi build ../../api.yml"
+
+[tool.cibuildwheel.linux]
+archs = ["x86_64", "aarch64"]
+
+[tool.cibuildwheel.macos]
+archs = ["x86_64", "arm64"]
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]
+```
+
+`before-build` regenerates bindings and compiles a fresh cdylib in each
+per-platform build environment. Adjust the IDL path (`../../api.yml`) to
+match your layout if you do not generate into `generated/python/`.
+
+### Local dry run
+
+Install the tool once and build the matrix locally:
+
+```bash
+pipx install cibuildwheel
+cd generated/python
+pipx run cibuildwheel --platform linux    # or macos / windows
+```
+
+Wheels land in `./wheelhouse/`.
+
+### GitHub Actions recipe
+
+Drop this into `.github/workflows/wheels.yml` to build the full matrix
+on every tag push and attach the wheels as an artifact:
+
+```yaml
+name: wheels
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build_wheels:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-13, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install weaveffi-cli
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2
+        with:
+          package-dir: generated/python
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: ./wheelhouse/*.whl
+```
+
+### Upload to PyPI
+
+Once the matrix succeeds, publish with `twine`:
+
+```bash
+pipx run twine upload wheelhouse/*.whl
+```
+
+For trusted publishing set up a PyPI project and use the
+`pypa/gh-action-pypi-publish` action in the same workflow.
+
 ## Troubleshooting
 
 | Problem | Solution |
