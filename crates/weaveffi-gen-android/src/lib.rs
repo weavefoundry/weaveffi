@@ -4457,12 +4457,60 @@ mod tests {
             "C call must pass ((const uint8_t*)msg_chars, (size_t)msg_len, &err) matching the new (const uint8_t*, size_t) C signature: {jni}"
         );
         assert!(
-            !jni.contains("weaveffi_echo_shout(msg_chars, &err)"),
-            "C call must NOT use the old single-pointer NUL-terminated form: {jni}"
-        );
-        assert!(
             jni.contains("(*env)->ReleaseStringUTFChars(env, msg, msg_chars);"),
             "JNI bridge must release the UTF-8 chars after the C call: {jni}"
+        );
+
+        // Arity guard: the call site must have exactly 3 top-level args
+        // (ptr, len, err). Any regression that drops the `len` or reverts to
+        // a single `const char*` parameter would trip this check.
+        let call_start = jni
+            .find("weaveffi_echo_shout(")
+            .expect("weaveffi_echo_shout call site missing");
+        let open = call_start + "weaveffi_echo_shout".len();
+        let mut depth = 0i32;
+        let mut end = open;
+        for (i, &b) in jni.as_bytes().iter().enumerate().skip(open) {
+            match b {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let args = &jni[open + 1..end];
+        let mut top_commas = 0usize;
+        let mut d = 0i32;
+        for ch in args.chars() {
+            match ch {
+                '(' | '[' | '{' => d += 1,
+                ')' | ']' | '}' => d -= 1,
+                ',' if d == 0 => top_commas += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            top_commas, 2,
+            "call site arity must match the new C signature (ptr, len, err) = 3 args / 2 commas; got args: {args:?}"
+        );
+
+        // No legacy NUL-terminated/const char* convention may leak into the
+        // generated JNI bridge: those would mismatch the new
+        // (const uint8_t*, size_t) C prototype.
+        assert!(
+            !jni.contains("weaveffi_echo_shout(msg_chars, &err)")
+                && !jni.contains("weaveffi_echo_shout(msg_chars,&err)"),
+            "JNI bridge must NOT use the old single-pointer NUL-terminated form: {jni}"
+        );
+        assert!(
+            !jni.contains("weaveffi_echo_shout((const char*)msg_chars,")
+                && !jni.contains("weaveffi_echo_shout(msg,"),
+            "JNI bridge must NOT pass msg_chars as a bare const char* or the raw jstring: {jni}"
         );
 
         let cmake =
