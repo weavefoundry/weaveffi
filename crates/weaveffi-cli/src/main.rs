@@ -1,7 +1,7 @@
 mod extract;
 mod scaffold;
 
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{bail, eyre, Report, Result, WrapErr};
 use color_eyre::Section;
@@ -272,6 +272,23 @@ enum Commands {
         #[arg(long)]
         write: bool,
     },
+    /// Generate bindings and build the current Cargo crate's shared library
+    Build {
+        /// Input IDL/IR file (yaml|yml|json|toml)
+        input: String,
+        /// Output directory for generated artifacts [default: ./generated]
+        #[arg(short, long)]
+        out: Option<String>,
+        /// Comma-separated list of FFI targets to generate (c, cpp, swift, android, node, wasm, python, dotnet, dart, go, ruby)
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Cargo target triple to cross-compile for (e.g. aarch64-apple-ios, aarch64-linux-android, wasm32-unknown-unknown)
+        #[arg(long)]
+        cargo_target: Option<String>,
+        /// Cargo profile to build with [default: release]
+        #[arg(long)]
+        profile: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -387,6 +404,22 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Commands::Build {
+            input,
+            out,
+            target,
+            cargo_target,
+            profile,
+        } => cmd_build(
+            &input,
+            out.as_deref(),
+            target.as_deref(),
+            cargo_target.as_deref(),
+            profile.as_deref(),
+            quiet,
+            cli.verbose,
+            format,
+        )?,
     }
     Ok(())
 }
@@ -2638,6 +2671,207 @@ fn cmd_targets(format: OutputFormat) -> Result<()> {
     Ok(())
 }
 
+/// Machine-readable summary emitted by `weaveffi build --format json`.
+#[derive(Debug, Serialize)]
+struct BuildReport<'a> {
+    artifact: &'a str,
+    package: &'a str,
+    profile: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cargo_target: Option<&'a str>,
+}
+
+/// Runs `weaveffi generate` followed by `cargo build` for the current crate,
+/// then reports the path to the emitted cdylib / staticlib / wasm module.
+#[allow(clippy::too_many_arguments)]
+fn cmd_build(
+    input: &str,
+    out: Option<&str>,
+    targets: Option<&str>,
+    cargo_target: Option<&str>,
+    profile: Option<&str>,
+    quiet: bool,
+    verbose: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    let out_dir = out.unwrap_or("./generated");
+    cmd_generate(
+        input, out_dir, targets, false, None, false, false, false, None, true, quiet, format,
+    )?;
+
+    let cwd = env::current_dir().wrap_err("failed to read current directory")?;
+    let cwd_utf8 = Utf8PathBuf::from_path_buf(cwd.clone())
+        .map_err(|_| eyre!("current directory is not valid UTF-8: {}", cwd.display()))?;
+    let cargo_toml_path = cwd_utf8.join("Cargo.toml");
+    if !cargo_toml_path.exists() {
+        bail!(
+            "no Cargo.toml found in {}; `weaveffi build` must run inside a Cargo crate",
+            cwd_utf8
+        );
+    }
+
+    let cargo_toml_contents = std::fs::read_to_string(cargo_toml_path.as_std_path())
+        .wrap_err_with(|| format!("failed to read {}", cargo_toml_path))?;
+    let (package_name, crate_types) = parse_cargo_manifest(&cargo_toml_contents)?;
+
+    let effective_profile = profile.unwrap_or("release");
+
+    let mut cargo = Command::new("cargo");
+    cargo.current_dir(&cwd).arg("build");
+    if effective_profile == "release" {
+        cargo.arg("--release");
+    } else {
+        cargo.args(["--profile", effective_profile]);
+    }
+    if let Some(t) = cargo_target {
+        cargo.args(["--target", t]);
+    }
+    if quiet {
+        cargo.arg("--quiet");
+    }
+    if verbose {
+        cargo.arg("--verbose");
+    }
+
+    let status = cargo.status().wrap_err("failed to spawn `cargo build`")?;
+    if !status.success() {
+        bail!("`cargo build` failed with status {}", status);
+    }
+
+    let artifact = locate_artifact(
+        &cwd_utf8,
+        &package_name,
+        &crate_types,
+        cargo_target,
+        effective_profile,
+    )?;
+
+    if format.is_json() {
+        emit_json(&BuildReport {
+            artifact: artifact.as_str(),
+            package: &package_name,
+            profile: effective_profile,
+            cargo_target,
+        })?;
+    } else {
+        println!("Built artifact: {}", artifact);
+    }
+    Ok(())
+}
+
+/// Extracts the package name and `[lib] crate-type` list from a Cargo
+/// manifest. Missing `[lib]` sections resolve to an empty crate-type vec so
+/// callers can surface a helpful error.
+fn parse_cargo_manifest(contents: &str) -> Result<(String, Vec<String>)> {
+    #[derive(Deserialize)]
+    struct Manifest {
+        package: Package,
+        lib: Option<Lib>,
+    }
+    #[derive(Deserialize)]
+    struct Package {
+        name: String,
+    }
+    #[derive(Deserialize)]
+    struct Lib {
+        #[serde(default, rename = "crate-type")]
+        crate_type: Vec<String>,
+    }
+
+    let manifest: Manifest = toml::from_str(contents).wrap_err("failed to parse Cargo.toml")?;
+    let crate_types = manifest.lib.map(|l| l.crate_type).unwrap_or_default();
+    Ok((manifest.package.name, crate_types))
+}
+
+/// Walks the usual cargo layout (`target/[<triple>/]<profile-dir>/`) looking
+/// for the first artifact produced by this crate's declared crate-types.
+/// Extension selection mirrors cargo's own naming: `libfoo.dylib` on Apple
+/// targets, `libfoo.so` on Linux/Android, `foo.dll`/`foo.lib` on Windows,
+/// `foo.wasm` on `wasm*` targets, and `libfoo.a` for `staticlib`.
+fn locate_artifact(
+    cargo_root: &Utf8Path,
+    package_name: &str,
+    crate_types: &[String],
+    cargo_target: Option<&str>,
+    profile: &str,
+) -> Result<Utf8PathBuf> {
+    let artifact_stem = package_name.replace('-', "_");
+    let profile_dir = cargo_profile_dir(profile);
+    let mut target_dir = cargo_root.join("target");
+    if let Some(t) = cargo_target {
+        target_dir = target_dir.join(t);
+    }
+    let out_dir = target_dir.join(profile_dir);
+
+    let triple = cargo_target.unwrap_or("");
+    let is_wasm = triple.starts_with("wasm");
+    let is_windows = if cargo_target.is_some() {
+        triple.contains("windows")
+    } else {
+        cfg!(target_os = "windows")
+    };
+    let is_macos_like = if cargo_target.is_some() {
+        triple.contains("apple")
+    } else {
+        cfg!(target_os = "macos") || cfg!(target_os = "ios")
+    };
+
+    let mut candidates: Vec<String> = Vec::new();
+    for ct in crate_types {
+        match ct.as_str() {
+            "cdylib" | "dylib" => {
+                if is_wasm {
+                    candidates.push(format!("{artifact_stem}.wasm"));
+                } else if is_windows {
+                    candidates.push(format!("{artifact_stem}.dll"));
+                } else if is_macos_like {
+                    candidates.push(format!("lib{artifact_stem}.dylib"));
+                } else {
+                    candidates.push(format!("lib{artifact_stem}.so"));
+                }
+            }
+            "staticlib" => {
+                if is_windows {
+                    candidates.push(format!("{artifact_stem}.lib"));
+                } else {
+                    candidates.push(format!("lib{artifact_stem}.a"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if candidates.is_empty() {
+        bail!(
+            "Cargo.toml has no cdylib/dylib/staticlib crate-type; add `crate-type = [\"cdylib\"]` under `[lib]`"
+        );
+    }
+
+    for cand in &candidates {
+        let p = out_dir.join(cand);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+
+    bail!(
+        "could not locate build artifact in {} (looked for {})",
+        out_dir,
+        candidates.join(", ")
+    );
+}
+
+/// Maps a cargo profile name to the directory cargo actually writes into.
+/// `dev`/`test` share `target/debug`, `bench` shares `target/release`, and
+/// every other profile maps to its own `target/<name>` directory.
+fn cargo_profile_dir(profile: &str) -> &str {
+    match profile {
+        "dev" | "test" => "debug",
+        "bench" => "release",
+        other => other,
+    }
+}
+
 fn sanitize_module_name(name: &str) -> String {
     let lowered = name.to_lowercase();
     let mut out = String::with_capacity(lowered.len());
@@ -4159,6 +4393,84 @@ mod tests {
             entry.message.starts_with("[WFFI002]"),
             "message should carry code prefix: {}",
             entry.message,
+        );
+    }
+
+    #[test]
+    fn build_calls_cargo_build_and_reports_artifact_path() {
+        let _ = color_eyre::install();
+        let dir = tempfile::tempdir().unwrap();
+
+        std::fs::write(
+            dir.path().join("api.yml"),
+            concat!(
+                "version: \"0.1.0\"\n",
+                "modules:\n",
+                "  - name: math\n",
+                "    functions:\n",
+                "      - name: add\n",
+                "        params:\n",
+                "          - { name: a, type: i32 }\n",
+                "          - { name: b, type: i32 }\n",
+                "        return: i32\n",
+            ),
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            concat!(
+                "[package]\n",
+                "name = \"weaveffi_build_test\"\n",
+                "version = \"0.1.0\"\n",
+                "edition = \"2021\"\n",
+                "\n",
+                "[lib]\n",
+                "crate-type = [\"cdylib\"]\n",
+            ),
+        )
+        .unwrap();
+
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("lib.rs"), "pub fn answer() -> i32 { 42 }\n").unwrap();
+
+        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .current_dir(dir.path())
+            .args(["--quiet", "build", "api.yml", "--target", "c"])
+            .output()
+            .expect("failed to run weaveffi build");
+
+        assert!(
+            cmd.status.success(),
+            "weaveffi build failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&cmd.stdout),
+            String::from_utf8_lossy(&cmd.stderr),
+        );
+
+        let stdout = String::from_utf8_lossy(&cmd.stdout);
+        let path_line = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("Built artifact: "))
+            .unwrap_or_else(|| panic!("stdout missing `Built artifact:` line: {stdout}"));
+        let artifact = std::path::Path::new(path_line.trim());
+        assert!(
+            artifact.exists(),
+            "reported artifact {artifact:?} does not exist on disk\nstdout: {stdout}",
+        );
+        let ext = artifact
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        assert!(
+            matches!(ext, "dylib" | "so" | "dll"),
+            "unexpected artifact extension {ext:?} for {artifact:?}",
+        );
+
+        assert!(
+            dir.path().join("generated/c/weaveffi.h").exists(),
+            "weaveffi build should have invoked `weaveffi generate`",
         );
     }
 }
