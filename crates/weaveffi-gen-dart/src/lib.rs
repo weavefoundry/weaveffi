@@ -2349,4 +2349,190 @@ mod tests {
             .expect("dispose must call the native destroy");
         assert!(detach_pos < destroy_pos);
     }
+
+    #[test]
+    fn dart_struct_setter_string_uses_uint8_pointer_and_length() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "set_contact_name".into(),
+                params: vec![
+                    Param {
+                        name: "contact".into(),
+                        ty: TypeRef::TypedHandle("Contact".into()),
+                        mutable: false,
+                    },
+                    Param {
+                        name: "new_name".into(),
+                        ty: TypeRef::StringUtf8,
+                        mutable: false,
+                    },
+                ],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                builder: false,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                    default: None,
+                }],
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let dart = render_dart_module(&api);
+
+        assert!(
+            dart.contains(
+                "typedef _NativeWeaveffiContactsSetContactName = Void Function(Pointer<Void>, Pointer<Uint8>, IntPtr, Pointer<_WeaveffiError>);"
+            ),
+            "struct setter native typedef should expand StringUtf8 into (Pointer<Uint8>, IntPtr): {dart}"
+        );
+        assert!(
+            dart.contains(
+                "typedef _DartWeaveffiContactsSetContactName = void Function(Pointer<Void>, Pointer<Uint8>, int, Pointer<_WeaveffiError>);"
+            ),
+            "struct setter dart typedef should expand StringUtf8 into (Pointer<Uint8>, int): {dart}"
+        );
+
+        assert!(
+            dart.contains("void setContactName(Contact contact, String newName)"),
+            "struct setter wrapper should still take a Dart String: {dart}"
+        );
+        assert!(
+            dart.contains("final newNameBytes = utf8.encode(newName);"),
+            "struct setter wrapper must encode string to UTF-8 bytes: {dart}"
+        );
+        assert!(
+            dart.contains("final newNameBuf = calloc<Uint8>(newNameBytes.length);"),
+            "struct setter wrapper must allocate a Uint8 buffer: {dart}"
+        );
+        assert!(
+            dart.contains("newNameBuf.asTypedList(newNameBytes.length).setAll(0, newNameBytes);"),
+            "struct setter wrapper must copy bytes into the native buffer: {dart}"
+        );
+        assert!(
+            dart.contains(
+                "_weaveffiContactsSetContactName(contact._handle, newNameBuf, newNameBytes.length, err);"
+            ),
+            "struct setter wrapper must call native with (handle, buf, length, err): {dart}"
+        );
+
+        let fn_start = dart
+            .find("void setContactName(Contact contact, String newName)")
+            .expect("setContactName wrapper");
+        let fn_body = &dart[fn_start..];
+        let finally_pos = fn_body.find("} finally {").expect("finally block");
+        let finally_body = &fn_body[finally_pos..];
+        assert!(
+            finally_body.contains("calloc.free(newNameBuf);"),
+            "struct setter wrapper must free the buffer in the finally block: {finally_body}"
+        );
+    }
+
+    #[test]
+    fn dart_builder_setter_string_uses_uint8_pointer_and_length() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "Contact_Builder_set_name".into(),
+                params: vec![
+                    Param {
+                        name: "builder".into(),
+                        ty: TypeRef::Handle,
+                        mutable: true,
+                    },
+                    Param {
+                        name: "value".into(),
+                        ty: TypeRef::StringUtf8,
+                        mutable: false,
+                    },
+                ],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                builder: true,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                    default: None,
+                }],
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let dart = render_dart_module(&api);
+
+        assert!(
+            dart.contains(
+                "typedef _NativeWeaveffiContactsContactBuilderSetName = Void Function(Int64, Pointer<Uint8>, IntPtr, Pointer<_WeaveffiError>);"
+            ),
+            "builder setter native typedef should expand StringUtf8 into (Pointer<Uint8>, IntPtr): {dart}"
+        );
+        assert!(
+            dart.contains(
+                "typedef _DartWeaveffiContactsContactBuilderSetName = void Function(int, Pointer<Uint8>, int, Pointer<_WeaveffiError>);"
+            ),
+            "builder setter dart typedef should expand StringUtf8 into (Pointer<Uint8>, int): {dart}"
+        );
+
+        assert!(
+            dart.contains("void contactBuilderSetName(int builder, String value)"),
+            "builder setter wrapper should still take a Dart String: {dart}"
+        );
+        assert!(
+            dart.contains("final valueBytes = utf8.encode(value);"),
+            "builder setter wrapper must encode string to UTF-8 bytes: {dart}"
+        );
+        assert!(
+            dart.contains("final valueBuf = calloc<Uint8>(valueBytes.length);"),
+            "builder setter wrapper must allocate a Uint8 buffer: {dart}"
+        );
+        assert!(
+            dart.contains("valueBuf.asTypedList(valueBytes.length).setAll(0, valueBytes);"),
+            "builder setter wrapper must copy bytes into the native buffer: {dart}"
+        );
+        assert!(
+            dart.contains(
+                "_weaveffiContactsContactBuilderSetName(builder, valueBuf, valueBytes.length, err);"
+            ),
+            "builder setter wrapper must call native with (handle, buf, length, err): {dart}"
+        );
+
+        let fn_start = dart
+            .find("void contactBuilderSetName(int builder, String value)")
+            .expect("contactBuilderSetName wrapper");
+        let fn_body = &dart[fn_start..];
+        let finally_pos = fn_body.find("} finally {").expect("finally block");
+        let finally_body = &fn_body[finally_pos..];
+        assert!(
+            finally_body.contains("calloc.free(valueBuf);"),
+            "builder setter wrapper must free the buffer in the finally block: {finally_body}"
+        );
+    }
 }
