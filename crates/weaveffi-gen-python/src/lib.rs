@@ -180,6 +180,9 @@ fn py_param_argtypes(ty: &TypeRef) -> Vec<String> {
 /// Returns `(restype, out_param_argtypes)` for a return type.
 fn py_return_info(ty: &TypeRef) -> (String, Vec<String>) {
     match ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            ("ctypes.POINTER(ctypes.c_char)".into(), vec![])
+        }
         TypeRef::Bytes | TypeRef::BorrowedBytes => (
             "ctypes.POINTER(ctypes.c_uint8)".into(),
             vec!["ctypes.POINTER(ctypes.c_size_t)".into()],
@@ -217,6 +220,9 @@ fn get_map_kv(ty: &TypeRef) -> Option<(&TypeRef, &TypeRef)> {
 fn py_async_cb_trailing_fields(ret: &Option<TypeRef>) -> Vec<(String, String)> {
     match ret {
         None => vec![],
+        Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
+            vec![("result".into(), "ctypes.POINTER(ctypes.c_char)".into())]
+        }
         Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => vec![
             ("result".into(), "ctypes.POINTER(ctypes.c_uint8)".into()),
             ("result_len".into(), "ctypes.c_size_t".into()),
@@ -267,11 +273,8 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
         }
         Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
             out.push_str(&format!(
-                "{ind}_s = _bytes_to_string(result) or \"\" if result else \"\"\n"
+                "{ind}_state[\"val\"] = _take_string(result) or \"\"\n"
             ));
-            out.push_str(&format!("{ind}if result:\n"));
-            out.push_str(&format!("{ind}    _lib.weaveffi_free_string(result)\n"));
-            out.push_str(&format!("{ind}_state[\"val\"] = _s\n"));
         }
         Some(TypeRef::Enum(name)) => {
             out.push_str(&format!("{ind}_state[\"val\"] = {name}(result)\n"));
@@ -328,12 +331,7 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
             if is_c_pointer_type(inner) {
                 match inner.as_ref() {
                     TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                        out.push_str(&format!("{ind}if not result:\n"));
-                        out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
-                        out.push_str(&format!("{ind}else:\n"));
-                        out.push_str(&format!("{ind}    _s = _bytes_to_string(result)\n"));
-                        out.push_str(&format!("{ind}    _lib.weaveffi_free_string(result)\n"));
-                        out.push_str(&format!("{ind}    _state[\"val\"] = _s\n"));
+                        out.push_str(&format!("{ind}_state[\"val\"] = _take_string(result)\n"));
                     }
                     TypeRef::Struct(name) => {
                         let name = local_type_name(name);
@@ -599,7 +597,7 @@ def _load_library() -> ctypes.CDLL:
 _lib = _load_library()
 _lib.weaveffi_error_clear.argtypes = [ctypes.POINTER(_WeaveffiErrorStruct)]
 _lib.weaveffi_error_clear.restype = None
-_lib.weaveffi_free_string.argtypes = [ctypes.c_char_p]
+_lib.weaveffi_free_string.argtypes = [ctypes.c_void_p]
 _lib.weaveffi_free_string.restype = None
 _lib.weaveffi_free_bytes.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t]
 _lib.weaveffi_free_bytes.restype = None
@@ -635,6 +633,21 @@ def _bytes_to_string(ptr) -> Optional[str]:
     if ptr is None:
         return None
     return ptr.decode("utf-8")
+
+
+def _take_string(_ptr) -> Optional[str]:
+    """Take ownership of an owned C string pointer, decode it, and free the
+    original allocation. Returns None when ``_ptr`` is null.
+
+    The raw pointer (``ctypes.POINTER(ctypes.c_char)``) is cast to ``c_char_p``
+    only to copy out the bytes; the original pointer is then freed via
+    ``weaveffi_free_string`` so no allocation is leaked.
+    """
+    if not _ptr:
+        return None
+    _s = ctypes.cast(_ptr, ctypes.c_char_p).value.decode("utf-8")
+    _lib.weaveffi_free_string(_ptr)
+    return _s
 "#,
     );
 }
@@ -1088,7 +1101,7 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
             out.push_str(&format!("{ind}return bool(_result)\n"));
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!("{ind}return _bytes_to_string(_result) or \"\"\n"));
+            out.push_str(&format!("{ind}return _take_string(_result) or \"\"\n"));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             out.push_str(&format!("{ind}if not _result:\n"));
@@ -1129,7 +1142,7 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
 fn render_optional_return(out: &mut String, inner: &TypeRef, ind: &str) {
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!("{ind}return _bytes_to_string(_result)\n"));
+            out.push_str(&format!("{ind}return _take_string(_result)\n"));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             out.push_str(&format!("{ind}if not _result:\n"));
@@ -1629,16 +1642,58 @@ mod tests {
             "missing signature: {py}"
         );
         assert!(
-            py.contains("ctypes.c_char_p"),
-            "missing c_char_p for return: {py}"
+            py.contains("_fn.restype = ctypes.POINTER(ctypes.c_char)"),
+            "string return must use raw POINTER(c_char) so the buffer is not auto-copied: {py}"
         );
         assert!(
             py.contains("_string_to_byteslice(msg)"),
             "missing _string_to_byteslice call: {py}"
         );
         assert!(
-            py.contains("_bytes_to_string(_result)"),
-            "missing _bytes_to_string call: {py}"
+            py.contains("_take_string(_result)"),
+            "string return must be decoded via _take_string (which frees the C buffer): {py}"
+        );
+    }
+
+    #[test]
+    fn python_string_return_calls_free_string() {
+        let api = make_api(vec![Module {
+            name: "text".into(),
+            functions: vec![Function {
+                name: "echo".into(),
+                params: vec![Param {
+                    name: "s".into(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                }],
+                returns: Some(TypeRef::StringUtf8),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let py = render_python_module(&api, true);
+
+        let cast_pos = py
+            .find("ctypes.cast(_ptr, ctypes.c_char_p).value.decode(\"utf-8\")")
+            .unwrap_or_else(|| {
+                panic!("expected raw pointer cast/decode in generated module: {py}")
+            });
+        let free_pos = py
+            .find("_lib.weaveffi_free_string(_ptr)")
+            .unwrap_or_else(|| panic!("expected weaveffi_free_string(_ptr) call to release the owned string buffer: {py}"));
+        assert!(
+            free_pos > cast_pos,
+            "weaveffi_free_string(_ptr) must come after the cast/decode so the value is read before the buffer is freed: {py}"
         );
     }
 
@@ -1811,8 +1866,8 @@ mod tests {
             "missing name getter C call: {py}"
         );
         assert!(
-            py.contains("_bytes_to_string(_result)"),
-            "missing _bytes_to_string in getter: {py}"
+            py.contains("_take_string(_result)"),
+            "struct string getter must use _take_string to free the C buffer: {py}"
         );
         assert!(
             py.contains("def age(self) -> int:"),
@@ -2081,8 +2136,8 @@ mod tests {
             "missing optional str return: {py}"
         );
         assert!(
-            py.contains("return _bytes_to_string(_result)"),
-            "missing _bytes_to_string for optional string: {py}"
+            py.contains("return _take_string(_result)"),
+            "optional string return must use _take_string to free the C buffer: {py}"
         );
     }
 
@@ -2228,8 +2283,8 @@ mod tests {
             "missing optional getter: {py}"
         );
         assert!(
-            py.contains("_bytes_to_string(_result)"),
-            "missing _bytes_to_string in optional getter: {py}"
+            py.contains("_take_string(_result)"),
+            "optional struct string getter must use _take_string to free the C buffer: {py}"
         );
     }
 
@@ -3674,6 +3729,10 @@ mod tests {
         assert!(
             py.contains("def _bytes_to_string("),
             "missing _bytes_to_string helper"
+        );
+        assert!(
+            py.contains("def _take_string("),
+            "missing _take_string helper"
         );
     }
 
