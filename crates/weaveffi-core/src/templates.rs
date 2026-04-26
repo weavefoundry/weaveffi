@@ -128,8 +128,9 @@ pub fn type_ref_to_map(ty: &TypeRef) -> HashMap<String, tera::Value> {
                 serde_json::to_value(type_ref_to_map(inner)).unwrap(),
             );
         }
-        TypeRef::Callback(_) => {
-            unreachable!("validator should have rejected callback template type")
+        TypeRef::Callback(name) => {
+            map.insert("kind".into(), "callback".into());
+            map.insert("name".into(), name.clone().into());
         }
     }
     map
@@ -232,24 +233,12 @@ mod tests {
     use super::*;
     use weaveffi_ir::ir::{Function, Module, Param, StructDef, StructField};
 
-    fn panic_message<F: FnOnce() + std::panic::UnwindSafe>(f: F) -> String {
-        let err = std::panic::catch_unwind(f).expect_err("expected panic");
-        err.downcast_ref::<String>()
-            .cloned()
-            .or_else(|| err.downcast_ref::<&'static str>().map(|s| s.to_string()))
-            .unwrap_or_default()
-    }
-
     #[test]
-    fn callback_type_ref_panics_when_validator_bypassed() {
-        let cb = TypeRef::Callback("OnData".into());
-        let msg = panic_message(|| {
-            let _ = type_ref_to_map(&cb);
-        });
-        assert!(
-            msg.contains("validator should have rejected"),
-            "panic message did not mention validator: {msg}"
-        );
+    fn template_context_callback_no_panic() {
+        let map = type_ref_to_map(&TypeRef::Callback("OnData".into()));
+        assert_eq!(map["kind"], "callback");
+        assert_eq!(map["name"], "OnData");
+        assert_eq!(map.len(), 2);
     }
 
     #[test]
