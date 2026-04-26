@@ -1,6 +1,7 @@
 use color_eyre::eyre::{bail, eyre, Result};
 use weaveffi_ir::ir::{
-    Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
+    Api, CallbackDef, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField,
+    TypeRef,
 };
 
 fn has_attr(attrs: &[syn::Attribute], name: &str) -> bool {
@@ -76,6 +77,48 @@ fn extract_typed_handle_attr(attrs: &[syn::Attribute]) -> Option<String> {
             return None;
         };
         Some(s.value())
+    })
+}
+
+fn extract_callback_name_attr(attrs: &[syn::Attribute]) -> Option<String> {
+    attrs.iter().find_map(|attr| {
+        let syn::Meta::NameValue(nv) = &attr.meta else {
+            return None;
+        };
+        if !nv.path.is_ident("weaveffi_callback") {
+            return None;
+        }
+        let syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(s),
+            ..
+        }) = &nv.value
+        else {
+            return None;
+        };
+        Some(s.value())
+    })
+}
+
+fn is_box_dyn_fn(ty: &syn::Type) -> bool {
+    let syn::Type::Path(tp) = ty else {
+        return false;
+    };
+    let Some(seg) = tp.path.segments.last() else {
+        return false;
+    };
+    if seg.ident != "Box" {
+        return false;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return false;
+    };
+    let Some(syn::GenericArgument::Type(syn::Type::TraitObject(to))) = args.args.first() else {
+        return false;
+    };
+    to.bounds.iter().any(|b| {
+        matches!(b, syn::TypeParamBound::Trait(tb)
+            if tb.path.segments.last().is_some_and(
+                |s| s.ident == "Fn" || s.ident == "FnMut" || s.ident == "FnOnce"))
     })
 }
 
@@ -182,6 +225,33 @@ fn map_type(ty: &syn::Type) -> Result<TypeRef> {
             _ => bail!("unsupported reference type; only &str and &[u8] are supported"),
         };
     }
+    if let syn::Type::ImplTrait(impl_trait) = ty {
+        for bound in &impl_trait.bounds {
+            let syn::TypeParamBound::Trait(tb) = bound else {
+                continue;
+            };
+            let Some(seg) = tb.path.segments.last() else {
+                continue;
+            };
+            if seg.ident != "Iterator" {
+                continue;
+            }
+            let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+                continue;
+            };
+            for arg in &args.args {
+                if let syn::GenericArgument::AssocType(at) = arg {
+                    if at.ident == "Item" {
+                        return Ok(TypeRef::Iterator(Box::new(map_type(&at.ty)?)));
+                    }
+                }
+            }
+        }
+        bail!("unsupported impl Trait; only impl Iterator<Item = T> is supported");
+    }
+    if is_box_dyn_fn(ty) {
+        bail!("Box<dyn Fn(...)> params must carry a #[weaveffi_callback = \"Name\"] attribute");
+    }
     let syn::Type::Path(type_path) = ty else {
         bail!("unsupported type syntax");
     };
@@ -254,9 +324,12 @@ fn extract_function(item: &syn::ItemFn) -> Result<Function> {
                 syn::Pat::Ident(id) => id.ident.to_string(),
                 _ => bail!("unsupported parameter pattern"),
             };
-            let ty = match extract_typed_handle_attr(&pt.attrs) {
-                Some(name) => TypeRef::TypedHandle(name),
-                None => map_type(&pt.ty)?,
+            let ty = if let Some(name) = extract_callback_name_attr(&pt.attrs) {
+                TypeRef::Callback(name)
+            } else if let Some(name) = extract_typed_handle_attr(&pt.attrs) {
+                TypeRef::TypedHandle(name)
+            } else {
+                map_type(&pt.ty)?
             };
             Ok(Param {
                 name: param_name,
@@ -282,6 +355,42 @@ fn extract_function(item: &syn::ItemFn) -> Result<Function> {
         cancellable: export_args.cancellable,
         deprecated: extract_deprecated(&item.attrs),
         since: export_args.since,
+    })
+}
+
+fn extract_callback(item: &syn::ItemFn) -> Result<CallbackDef> {
+    let name = item.sig.ident.to_string();
+    let params = item
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|arg| match arg {
+            syn::FnArg::Typed(pt) => Some(pt),
+            syn::FnArg::Receiver(_) => None,
+        })
+        .map(|pt| {
+            let param_name = match pt.pat.as_ref() {
+                syn::Pat::Ident(id) => id.ident.to_string(),
+                _ => bail!("unsupported parameter pattern"),
+            };
+            Ok(Param {
+                name: param_name,
+                ty: map_type(&pt.ty)?,
+                mutable: false,
+            })
+        })
+        .collect::<Result<_>>()?;
+
+    let returns = match &item.sig.output {
+        syn::ReturnType::Default => None,
+        syn::ReturnType::Type(_, ty) => Some(map_type(ty)?),
+    };
+
+    Ok(CallbackDef {
+        name,
+        params,
+        returns,
+        doc: extract_doc(&item.attrs),
     })
 }
 
@@ -354,10 +463,14 @@ fn extract_module(item_mod: &syn::ItemMod) -> Result<Module> {
     let mut functions = Vec::new();
     let mut structs = Vec::new();
     let mut enums = Vec::new();
+    let mut callbacks = Vec::new();
 
     if let Some((_, items)) = &item_mod.content {
         for item in items {
             match item {
+                syn::Item::Fn(f) if has_attr(&f.attrs, "weaveffi_callback") => {
+                    callbacks.push(extract_callback(f)?);
+                }
                 syn::Item::Fn(f) if has_attr(&f.attrs, "weaveffi_export") => {
                     functions.push(extract_function(f)?);
                 }
@@ -377,7 +490,7 @@ fn extract_module(item_mod: &syn::ItemMod) -> Result<Module> {
         functions,
         structs,
         enums,
-        callbacks: vec![],
+        callbacks,
         listeners: vec![],
         errors: None,
         modules: vec![],
@@ -1030,5 +1143,75 @@ mod tests {
         let api = extract_api_from_rust(src).unwrap();
         let f = &api.modules[0].functions[0];
         assert_eq!(f.since.as_deref(), Some("0.5.0"));
+    }
+
+    #[test]
+    fn extract_iterator_return() {
+        let src = r#"
+            mod m {
+                #[weaveffi_export]
+                fn ids() -> impl Iterator<Item = i32> { std::iter::empty() }
+
+                #[weaveffi_export]
+                fn names() -> impl Iterator<Item = String> { std::iter::empty() }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let fns = &api.modules[0].functions;
+        assert_eq!(
+            fns[0].returns,
+            Some(TypeRef::Iterator(Box::new(TypeRef::I32)))
+        );
+        assert_eq!(
+            fns[1].returns,
+            Some(TypeRef::Iterator(Box::new(TypeRef::StringUtf8)))
+        );
+    }
+
+    #[test]
+    fn extract_callback_param_with_attribute() {
+        let src = r#"
+            mod events {
+                #[weaveffi_callback]
+                fn OnData(payload: String) -> bool { unreachable!() }
+
+                #[weaveffi_export]
+                fn subscribe(
+                    #[weaveffi_callback = "OnData"]
+                    handler: Box<dyn Fn(String) -> bool>,
+                ) {}
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let m = &api.modules[0];
+
+        assert_eq!(m.callbacks.len(), 1);
+        let cb = &m.callbacks[0];
+        assert_eq!(cb.name, "OnData");
+        assert_eq!(cb.params.len(), 1);
+        assert_eq!(cb.params[0].name, "payload");
+        assert_eq!(cb.params[0].ty, TypeRef::StringUtf8);
+        assert_eq!(cb.returns, Some(TypeRef::Bool));
+
+        assert_eq!(m.functions.len(), 1);
+        let f = &m.functions[0];
+        assert_eq!(f.name, "subscribe");
+        assert_eq!(f.params[0].name, "handler");
+        assert_eq!(f.params[0].ty, TypeRef::Callback("OnData".to_string()));
+    }
+
+    #[test]
+    fn box_dyn_fn_without_attribute_errors() {
+        let src = r#"
+            mod events {
+                #[weaveffi_export]
+                fn subscribe(handler: Box<dyn Fn(String) -> bool>) {}
+            }
+        "#;
+        let err = extract_api_from_rust(src).unwrap_err();
+        assert!(
+            format!("{err}").contains("weaveffi_callback"),
+            "unexpected error: {err}"
+        );
     }
 }
