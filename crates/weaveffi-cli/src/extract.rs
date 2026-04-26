@@ -80,6 +80,28 @@ fn extract_typed_handle_attr(attrs: &[syn::Attribute]) -> Option<String> {
     })
 }
 
+fn extract_default_attr(attrs: &[syn::Attribute]) -> Result<Option<serde_yaml::Value>> {
+    for attr in attrs {
+        let syn::Meta::NameValue(nv) = &attr.meta else {
+            continue;
+        };
+        if !nv.path.is_ident("weaveffi_default") {
+            continue;
+        }
+        let syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(s),
+            ..
+        }) = &nv.value
+        else {
+            bail!("weaveffi_default: expected a string literal YAML value");
+        };
+        let value: serde_yaml::Value = serde_yaml::from_str(&s.value())
+            .map_err(|e| eyre!("weaveffi_default: invalid YAML literal: {e}"))?;
+        return Ok(Some(value));
+    }
+    Ok(None)
+}
+
 fn extract_callback_name_attr(attrs: &[syn::Attribute]) -> Option<String> {
     attrs.iter().find_map(|attr| {
         let syn::Meta::NameValue(nv) = &attr.meta else {
@@ -432,7 +454,7 @@ fn extract_struct(item: &syn::ItemStruct) -> Result<StructDef> {
                     name: field_name,
                     ty: map_type(&f.ty)?,
                     doc: extract_doc(&f.attrs),
-                    default: None,
+                    default: extract_default_attr(&f.attrs)?,
                 })
             })
             .collect::<Result<_>>()?,
@@ -962,6 +984,36 @@ mod tests {
         assert_eq!(s.fields[1].ty, TypeRef::I32);
         assert_eq!(s.fields[2].name, "label");
         assert_eq!(s.fields[2].ty, TypeRef::StringUtf8);
+    }
+
+    #[test]
+    fn extract_struct_field_default() {
+        let src = r#"
+            mod m {
+                #[weaveffi_struct]
+                struct Contact {
+                    name: String,
+                    #[weaveffi_default = "0"]
+                    age: i32,
+                    #[weaveffi_default = "\"unknown\""]
+                    nickname: String,
+                    #[weaveffi_default = "true"]
+                    active: bool,
+                }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let fields = &api.modules[0].structs[0].fields;
+        assert_eq!(fields[0].default, None);
+        assert_eq!(
+            fields[1].default,
+            Some(serde_yaml::Value::Number(serde_yaml::Number::from(0)))
+        );
+        assert_eq!(
+            fields[2].default,
+            Some(serde_yaml::Value::String("unknown".to_string()))
+        );
+        assert_eq!(fields[3].default, Some(serde_yaml::Value::Bool(true)));
     }
 
     #[test]
