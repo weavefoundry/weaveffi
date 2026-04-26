@@ -1606,9 +1606,7 @@ fn safe_cs_name(name: &str) -> String {
 mod tests {
     use super::*;
     use weaveffi_core::config::GeneratorConfig;
-    use weaveffi_ir::ir::{
-        CallbackSignature, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField,
-    };
+    use weaveffi_ir::ir::{EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField};
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
@@ -4638,10 +4636,7 @@ mod tests {
 
     #[test]
     fn callback_type_panics_with_validator_message() {
-        let cb = TypeRef::Callback(Box::new(CallbackSignature {
-            params: vec![],
-            returns: None,
-        }));
+        let cb = TypeRef::Callback("OnEvent".into());
         let err = std::panic::catch_unwind(|| {
             let _ = cs_type(&cb);
         })

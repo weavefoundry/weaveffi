@@ -1127,7 +1127,7 @@ mod tests {
     use camino::Utf8Path;
     use weaveffi_core::codegen::Generator;
     use weaveffi_core::config::GeneratorConfig;
-    use weaveffi_ir::ir::{CallbackSignature, EnumVariant, Module, Param, StructField};
+    use weaveffi_ir::ir::{EnumVariant, Module, Param, StructField};
 
     fn empty_api() -> Api {
         Api {
@@ -2550,10 +2550,7 @@ mod tests {
 
     #[test]
     fn callback_type_panics_with_validator_message() {
-        let cb = TypeRef::Callback(Box::new(CallbackSignature {
-            params: vec![],
-            returns: None,
-        }));
+        let cb = TypeRef::Callback("OnEvent".into());
         let err = std::panic::catch_unwind(|| {
             let _ = wasm_type(&cb);
         })

@@ -522,8 +522,8 @@ mod tests {
     use weaveffi_core::codegen::Generator;
     use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{
-        Api, CallbackDef, CallbackSignature, EnumDef, EnumVariant, Function, ListenerDef, Module,
-        Param, StructDef, StructField, TypeRef,
+        Api, CallbackDef, EnumDef, EnumVariant, Function, ListenerDef, Module, Param, StructDef,
+        StructField, TypeRef,
     };
 
     #[test]
@@ -2170,6 +2170,7 @@ mod tests {
                             mutable: false,
                         },
                     ],
+                    returns: None,
                     doc: None,
                 }],
                 listeners: vec![],
@@ -2201,6 +2202,7 @@ mod tests {
                         ty: TypeRef::StringUtf8,
                         mutable: false,
                     }],
+                    returns: None,
                     doc: None,
                 }],
                 listeners: vec![ListenerDef {
@@ -2236,6 +2238,7 @@ mod tests {
                 callbacks: vec![CallbackDef {
                     name: "on_ready".to_string(),
                     params: vec![],
+                    returns: None,
                     doc: None,
                 }],
                 listeners: vec![],
@@ -3077,10 +3080,7 @@ mod tests {
 
     #[test]
     fn callback_type_panics_with_validator_message() {
-        let cb = TypeRef::Callback(Box::new(CallbackSignature {
-            params: vec![],
-            returns: None,
-        }));
+        let cb = TypeRef::Callback("OnEvent".into());
         let err = std::panic::catch_unwind(|| {
             let _ = c_element_type(&cb, "m", "weaveffi");
         })

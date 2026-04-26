@@ -2142,8 +2142,8 @@ fn render_buffered_struct_create(
 mod tests {
     use super::*;
     use weaveffi_ir::ir::{
-        Api, CallbackSignature, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module,
-        Param, StructDef, StructField,
+        Api, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param, StructDef,
+        StructField,
     };
 
     fn make_api(modules: Vec<Module>) -> Api {
@@ -4644,10 +4644,7 @@ mod tests {
 
     #[test]
     fn callback_type_panics_with_validator_message() {
-        let cb = TypeRef::Callback(Box::new(CallbackSignature {
-            params: vec![],
-            returns: None,
-        }));
+        let cb = TypeRef::Callback("OnEvent".into());
         let err = std::panic::catch_unwind(|| {
             let _ = swift_type_for(&cb);
         })

@@ -60,27 +60,11 @@ pub struct Param {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CallbackSignature {
-    pub params: Vec<Param>,
-    #[serde(rename = "return", default)]
-    pub returns: Option<TypeRef>,
-}
-
-impl std::hash::Hash for CallbackSignature {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.params.len().hash(state);
-        for p in &self.params {
-            p.name.hash(state);
-            p.ty.hash(state);
-        }
-        self.returns.hash(state);
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallbackDef {
     pub name: String,
     pub params: Vec<Param>,
+    #[serde(rename = "return", default)]
+    pub returns: Option<TypeRef>,
     #[serde(default)]
     pub doc: Option<String>,
 }
@@ -112,7 +96,7 @@ pub enum TypeRef {
     List(Box<TypeRef>),
     Map(Box<TypeRef>, Box<TypeRef>),
     Iterator(Box<TypeRef>),
-    Callback(Box<CallbackSignature>),
+    Callback(String),
 }
 
 pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
@@ -148,6 +132,16 @@ pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
     {
         return parse_type_ref(inner).map(|t| TypeRef::Iterator(Box::new(t)));
     }
+    if let Some(inner) = s
+        .strip_prefix("callback<")
+        .and_then(|rest| rest.strip_suffix('>'))
+    {
+        let name = inner.trim();
+        if name.is_empty() {
+            return Err("callback type reference missing name".to_string());
+        }
+        return Ok(TypeRef::Callback(name.to_string()));
+    }
     match s {
         "i32" => Ok(TypeRef::I32),
         "u32" => Ok(TypeRef::U32),
@@ -181,7 +175,7 @@ fn type_ref_to_string(ty: &TypeRef) -> String {
         TypeRef::List(inner) => format!("[{}]", type_ref_to_string(inner)),
         TypeRef::Map(k, v) => format!("{{{}:{}}}", type_ref_to_string(k), type_ref_to_string(v)),
         TypeRef::Iterator(inner) => format!("iter<{}>", type_ref_to_string(inner)),
-        TypeRef::Callback(_) => "callback".to_string(),
+        TypeRef::Callback(name) => format!("callback<{name}>"),
     }
 }
 
@@ -1025,11 +1019,94 @@ modules:
                 ty: TypeRef::I32,
                 mutable: false,
             }],
+            returns: None,
             doc: Some("event callback".to_string()),
         };
         let json = serde_json::to_string(&cb).unwrap();
         let back: CallbackDef = serde_json::from_str(&json).unwrap();
         assert_eq!(back, cb);
+    }
+
+    #[test]
+    fn callback_def_with_returns_round_trip_yaml() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: events
+    functions: []
+    callbacks:
+      - name: on_request
+        params:
+          - name: payload
+            type: string
+        return: bool
+        doc: "Called on request; true to accept"
+"#;
+        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        let cb = &api.modules[0].callbacks[0];
+        assert_eq!(cb.name, "on_request");
+        assert_eq!(cb.returns, Some(TypeRef::Bool));
+    }
+
+    #[test]
+    fn callback_def_returns_default_is_none() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: events
+    functions: []
+    callbacks:
+      - name: on_data
+        params: []
+"#;
+        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        assert!(api.modules[0].callbacks[0].returns.is_none());
+    }
+
+    #[test]
+    fn parse_type_ref_callback_named() {
+        assert_eq!(
+            parse_type_ref("callback<OnData>"),
+            Ok(TypeRef::Callback("OnData".into()))
+        );
+        assert_eq!(
+            parse_type_ref("callback<on_event>"),
+            Ok(TypeRef::Callback("on_event".into()))
+        );
+    }
+
+    #[test]
+    fn parse_type_ref_callback_empty_name_is_error() {
+        assert!(parse_type_ref("callback<>").is_err());
+    }
+
+    #[test]
+    fn typeref_callback_round_trip() {
+        let ty = TypeRef::Callback("OnData".into());
+        let json = serde_json::to_string(&ty).unwrap();
+        assert_eq!(json, r#""callback<OnData>""#);
+        let back: TypeRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ty);
+    }
+
+    #[test]
+    fn typeref_callback_as_param_yaml_deser() {
+        let yaml = r#"
+version: "0.1.0"
+modules:
+  - name: events
+    functions:
+      - name: subscribe
+        params:
+          - name: handler
+            type: "callback<OnData>"
+    callbacks:
+      - name: OnData
+        params: []
+"#;
+        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert_eq!(f.params[0].ty, TypeRef::Callback("OnData".into()));
     }
 
     #[test]

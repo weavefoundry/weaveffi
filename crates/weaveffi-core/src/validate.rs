@@ -784,14 +784,8 @@ fn check_type_ref_capabilities(
                 require_capability(generator_caps, Capability::CrossModuleTypes, location)?;
             }
         }
-        TypeRef::Callback(sig) => {
+        TypeRef::Callback(_) => {
             require_capability(generator_caps, Capability::Callbacks, location)?;
-            for p in &sig.params {
-                check_type_ref_capabilities(&p.ty, location, generator_caps)?;
-            }
-            if let Some(ret) = &sig.returns {
-                check_type_ref_capabilities(ret, location, generator_caps)?;
-            }
         }
         _ => {}
     }
@@ -3095,11 +3089,13 @@ mod tests {
                     CallbackDef {
                         name: "on_data".to_string(),
                         params: vec![],
+                        returns: None,
                         doc: None,
                     },
                     CallbackDef {
                         name: "on_data".to_string(),
                         params: vec![],
+                        returns: None,
                         doc: None,
                     },
                 ],
@@ -3159,6 +3155,7 @@ mod tests {
                         ty: TypeRef::StringUtf8,
                         mutable: false,
                     }],
+                    returns: None,
                     doc: None,
                 }],
                 listeners: vec![ListenerDef {
@@ -3186,6 +3183,7 @@ mod tests {
                 callbacks: vec![CallbackDef {
                     name: "on_data".to_string(),
                     params: vec![],
+                    returns: None,
                     doc: None,
                 }],
                 listeners: vec![
@@ -3614,6 +3612,7 @@ mod tests {
                         ty: TypeRef::StringUtf8,
                         mutable: false,
                     }],
+                    returns: None,
                     doc: None,
                 }],
                 listeners: vec![],

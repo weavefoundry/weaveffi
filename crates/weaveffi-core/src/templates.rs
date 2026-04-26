@@ -230,7 +230,7 @@ pub fn api_to_context(api: &Api) -> tera::Context {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weaveffi_ir::ir::{CallbackSignature, Function, Module, Param, StructDef, StructField};
+    use weaveffi_ir::ir::{Function, Module, Param, StructDef, StructField};
 
     fn panic_message<F: FnOnce() + std::panic::UnwindSafe>(f: F) -> String {
         let err = std::panic::catch_unwind(f).expect_err("expected panic");
@@ -242,10 +242,7 @@ mod tests {
 
     #[test]
     fn callback_type_ref_panics_when_validator_bypassed() {
-        let cb = TypeRef::Callback(Box::new(CallbackSignature {
-            params: vec![],
-            returns: None,
-        }));
+        let cb = TypeRef::Callback("OnData".into());
         let msg = panic_message(|| {
             let _ = type_ref_to_map(&cb);
         });

@@ -1467,8 +1467,8 @@ mod tests {
     use weaveffi_core::codegen::Generator;
     use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{
-        Api, CallbackSignature, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module,
-        Param, StructDef, StructField, TypeRef,
+        Api, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param, StructDef,
+        StructField, TypeRef,
     };
 
     fn minimal_api() -> Api {
@@ -3708,10 +3708,7 @@ mod tests {
 
     #[test]
     fn callback_type_panics_with_validator_message() {
-        let cb = TypeRef::Callback(Box::new(CallbackSignature {
-            params: vec![],
-            returns: None,
-        }));
+        let cb = TypeRef::Callback("OnEvent".into());
         let err = std::panic::catch_unwind(|| {
             let _ = cpp_type(&cb);
         })
