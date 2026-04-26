@@ -3,7 +3,7 @@ use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
-use weaveffi_core::utils::{c_symbol_name, local_type_name};
+use weaveffi_core::utils::local_type_name;
 use weaveffi_ir::ir::{
     Api, CallbackDef, EnumDef, Function, ListenerDef, Module, StructDef, StructField, TypeRef,
 };
@@ -11,10 +11,16 @@ use weaveffi_ir::ir::{
 pub struct GoGenerator;
 
 impl GoGenerator {
-    fn generate_impl(&self, api: &Api, out_dir: &Utf8Path, module_path: &str) -> Result<()> {
+    fn generate_impl(
+        &self,
+        api: &Api,
+        out_dir: &Utf8Path,
+        module_path: &str,
+        c_prefix: &str,
+    ) -> Result<()> {
         let dir = out_dir.join("go");
         std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join("weaveffi.go"), render_go(api))?;
+        std::fs::write(dir.join("weaveffi.go"), render_go(api, c_prefix))?;
         std::fs::write(dir.join("go.mod"), render_go_mod(module_path))?;
         std::fs::write(dir.join("README.md"), render_readme())?;
         Ok(())
@@ -27,7 +33,7 @@ impl Generator for GoGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "weaveffi")
+        self.generate_impl(api, out_dir, "weaveffi", "weaveffi")
     }
 
     fn generate_with_config(
@@ -36,7 +42,7 @@ impl Generator for GoGenerator {
         out_dir: &Utf8Path,
         config: &GeneratorConfig,
     ) -> Result<()> {
-        self.generate_impl(api, out_dir, config.go_module_path())
+        self.generate_impl(api, out_dir, config.go_module_path(), config.c_prefix())
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
@@ -103,23 +109,23 @@ fn go_zero(ty: &TypeRef) -> String {
     }
 }
 
-fn c_scalar_type(ty: &TypeRef, module: &str) -> Option<String> {
+fn c_scalar_type(ty: &TypeRef, module: &str, prefix: &str) -> Option<String> {
     match ty {
         TypeRef::I32 => Some("C.int32_t".into()),
         TypeRef::U32 => Some("C.uint32_t".into()),
         TypeRef::I64 | TypeRef::Handle => Some("C.int64_t".into()),
         TypeRef::F64 => Some("C.double".into()),
         TypeRef::Bool => Some("C._Bool".into()),
-        TypeRef::Enum(n) => Some(format!("C.weaveffi_{module}_{n}")),
+        TypeRef::Enum(n) => Some(format!("C.{prefix}_{module}_{n}")),
         _ => None,
     }
 }
 
-fn c_scalar_conv(expr: &str, ty: &TypeRef, module: &str) -> String {
+fn c_scalar_conv(expr: &str, ty: &TypeRef, module: &str, prefix: &str) -> String {
     match ty {
         TypeRef::Bool => format!("boolToC({expr})"),
         _ => {
-            if let Some(ct) = c_scalar_type(ty, module) {
+            if let Some(ct) = c_scalar_type(ty, module, prefix) {
                 format!("{ct}({expr})")
             } else {
                 expr.to_string()
@@ -140,9 +146,9 @@ fn go_scalar_conv(expr: &str, ty: &TypeRef) -> String {
     }
 }
 
-fn c_opaque_type(ty: &TypeRef, module: &str) -> String {
+fn c_opaque_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
     match ty {
-        TypeRef::Struct(n) | TypeRef::TypedHandle(n) => format!("weaveffi_{module}_{n}"),
+        TypeRef::Struct(n) | TypeRef::TypedHandle(n) => format!("{prefix}_{module}_{n}"),
         _ => String::new(),
     }
 }
@@ -309,21 +315,21 @@ converts the result back to Go types. Errors are returned as Go `error` values.
 
 // ── Callback emission ──
 
-fn cb_c_elem_type(ty: &TypeRef, module: &str) -> String {
+fn cb_c_elem_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
     match ty {
         TypeRef::I32 => "int32_t".into(),
         TypeRef::U32 => "uint32_t".into(),
         TypeRef::I64 => "int64_t".into(),
         TypeRef::F64 => "double".into(),
         TypeRef::Bool => "bool".into(),
-        TypeRef::Handle => "weaveffi_handle_t".into(),
-        TypeRef::Enum(n) => format!("weaveffi_{module}_{n}"),
-        TypeRef::TypedHandle(n) | TypeRef::Struct(n) => format!("weaveffi_{module}_{n}*"),
+        TypeRef::Handle => format!("{prefix}_handle_t"),
+        TypeRef::Enum(n) => format!("{prefix}_{module}_{n}"),
+        TypeRef::TypedHandle(n) | TypeRef::Struct(n) => format!("{prefix}_{module}_{n}*"),
         _ => "void*".into(),
     }
 }
 
-fn cb_c_param_decl(ty: &TypeRef, name: &str, mutable: bool, module: &str) -> String {
+fn cb_c_param_decl(ty: &TypeRef, name: &str, mutable: bool, module: &str, prefix: &str) -> String {
     let q = if mutable { "" } else { "const " };
     match ty {
         TypeRef::I32 => format!("int32_t {name}"),
@@ -335,25 +341,25 @@ fn cb_c_param_decl(ty: &TypeRef, name: &str, mutable: bool, module: &str) -> Str
             format!("{q}uint8_t* {name}_ptr, size_t {name}_len")
         }
         TypeRef::BorrowedStr => format!("{q}char* {name}"),
-        TypeRef::Handle => format!("weaveffi_handle_t {name}"),
-        TypeRef::Enum(n) => format!("weaveffi_{module}_{n} {name}"),
-        TypeRef::TypedHandle(n) => format!("weaveffi_{module}_{n}* {name}"),
-        TypeRef::Struct(n) => format!("{q}weaveffi_{module}_{n}* {name}"),
+        TypeRef::Handle => format!("{prefix}_handle_t {name}"),
+        TypeRef::Enum(n) => format!("{prefix}_{module}_{n} {name}"),
+        TypeRef::TypedHandle(n) => format!("{prefix}_{module}_{n}* {name}"),
+        TypeRef::Struct(n) => format!("{q}{prefix}_{module}_{n}* {name}"),
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
-                cb_c_param_decl(inner, name, mutable, module)
+                cb_c_param_decl(inner, name, mutable, module, prefix)
             }
-            _ => format!("{q}{}* {name}", cb_c_elem_type(inner, module)),
+            _ => format!("{q}{}* {name}", cb_c_elem_type(inner, module, prefix)),
         },
         TypeRef::List(inner) => {
-            let elem = cb_c_elem_type(inner, module);
+            let elem = cb_c_elem_type(inner, module, prefix);
             format!("{q}{elem}* {name}, size_t {name}_len")
         }
         _ => format!("{q}void* {name}"),
     }
 }
 
-fn cb_c_ret_decl(ret: &Option<TypeRef>, module: &str) -> (String, Vec<String>) {
+fn cb_c_ret_decl(ret: &Option<TypeRef>, module: &str, prefix: &str) -> (String, Vec<String>) {
     match ret {
         None => ("void".into(), vec![]),
         Some(TypeRef::I32) => ("int32_t".into(), vec![]),
@@ -362,20 +368,20 @@ fn cb_c_ret_decl(ret: &Option<TypeRef>, module: &str) -> (String, Vec<String>) {
         Some(TypeRef::F64) => ("double".into(), vec![]),
         Some(TypeRef::Bool) => ("bool".into(), vec![]),
         Some(TypeRef::StringUtf8) | Some(TypeRef::BorrowedStr) => ("const char*".into(), vec![]),
-        Some(TypeRef::Enum(n)) => (format!("weaveffi_{module}_{n}"), vec![]),
-        Some(TypeRef::TypedHandle(n)) => (format!("weaveffi_{module}_{n}*"), vec![]),
-        Some(TypeRef::Struct(n)) => (format!("weaveffi_{module}_{n}*"), vec![]),
+        Some(TypeRef::Enum(n)) => (format!("{prefix}_{module}_{n}"), vec![]),
+        Some(TypeRef::TypedHandle(n)) => (format!("{prefix}_{module}_{n}*"), vec![]),
+        Some(TypeRef::Struct(n)) => (format!("{prefix}_{module}_{n}*"), vec![]),
         _ => ("void*".into(), vec![]),
     }
 }
 
-fn render_callback_extern_decl(out: &mut String, cb: &CallbackDef, module: &str) {
-    let (ret_ty, ret_extra) = cb_c_ret_decl(&cb.returns, module);
+fn render_callback_extern_decl(out: &mut String, cb: &CallbackDef, module: &str, prefix: &str) {
+    let (ret_ty, ret_extra) = cb_c_ret_decl(&cb.returns, module, prefix);
     let mut params: Vec<String> = vec!["void* context".into()];
     params.extend(
         cb.params
             .iter()
-            .map(|p| cb_c_param_decl(&p.ty, &p.name, p.mutable, module)),
+            .map(|p| cb_c_param_decl(&p.ty, &p.name, p.mutable, module, prefix)),
     );
     params.extend(ret_extra);
     out.push_str(&format!(
@@ -445,7 +451,7 @@ fn cb_trampoline_convert(pre: &mut String, ty: &TypeRef, name: &str) -> String {
     }
 }
 
-fn render_callback(out: &mut String, cb: &CallbackDef, module: &str) {
+fn render_callback(out: &mut String, cb: &CallbackDef, module: &str, prefix: &str) {
     let type_name = cb.name.to_upper_camel_case();
 
     let go_params: Vec<String> = cb
@@ -466,7 +472,7 @@ fn render_callback(out: &mut String, cb: &CallbackDef, module: &str) {
         go_params.join(", ")
     ));
 
-    let (c_ret_ty, _) = cb_c_ret_decl(&cb.returns, module);
+    let (c_ret_ty, _) = cb_c_ret_decl(&cb.returns, module, prefix);
     let mut c_params: Vec<String> = vec!["ctx unsafe.Pointer".into()];
     c_params.extend(
         cb.params
@@ -541,17 +547,17 @@ fn render_callback(out: &mut String, cb: &CallbackDef, module: &str) {
 /// A per-listener `sync.Map` pins the callback token against the id so that
 /// `Unregister` can drop the pinned entry from the shared callback registry
 /// after the native `unregister_*` call returns.
-fn render_listener(out: &mut String, module_path: &str, l: &ListenerDef) {
+fn render_listener(out: &mut String, module_path: &str, l: &ListenerDef, prefix: &str) {
     let type_name = l.name.to_upper_camel_case();
     let cb_type = l.event_callback.to_upper_camel_case();
     let pins_var = format!("_{}Pins", l.name.to_lower_camel_case());
-    let c_cb_type = format!("C.weaveffi_{module_path}_{}", l.event_callback);
+    let c_cb_type = format!("C.{prefix}_{module_path}_{}", l.event_callback);
     let trampoline = format!(
         "C.weaveffiGoCbTrampoline_{module_path}_{}",
         l.event_callback
     );
-    let reg_fn = c_symbol_name(module_path, &format!("register_{}", l.name));
-    let unreg_fn = c_symbol_name(module_path, &format!("unregister_{}", l.name));
+    let reg_fn = format!("{prefix}_{module_path}_register_{}", l.name);
+    let unreg_fn = format!("{prefix}_{module_path}_unregister_{}", l.name);
 
     if let Some(doc) = &l.doc {
         out.push_str(&format!("// {type_name} -- {doc}\n"));
@@ -593,7 +599,7 @@ fn async_value_go_type(ret: &Option<TypeRef>) -> Option<String> {
 /// (c_decl_type, go_cgo_type) for a type used as an element or scalar result.
 /// E.g. I32 -> ("int32_t", "C.int32_t"); Struct("Foo") -> ("weaveffi_m_Foo*", "*C.weaveffi_m_Foo").
 /// Strings are single-pointer element types (`const char*`).
-fn async_result_types(ty: &TypeRef, module: &str) -> (String, String) {
+fn async_result_types(ty: &TypeRef, module: &str, prefix: &str) -> (String, String) {
     match ty {
         TypeRef::I32 => ("int32_t".into(), "C.int32_t".into()),
         TypeRef::U32 => ("uint32_t".into(), "C.uint32_t".into()),
@@ -601,20 +607,20 @@ fn async_result_types(ty: &TypeRef, module: &str) -> (String, String) {
         TypeRef::F64 => ("double".into(), "C.double".into()),
         TypeRef::Bool => ("bool".into(), "C._Bool".into()),
         TypeRef::Enum(n) => (
-            format!("weaveffi_{module}_{n}"),
-            format!("C.weaveffi_{module}_{n}"),
+            format!("{prefix}_{module}_{n}"),
+            format!("C.{prefix}_{module}_{n}"),
         ),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => ("const char*".into(), "*C.char".into()),
         TypeRef::Struct(n) | TypeRef::TypedHandle(n) => (
-            format!("weaveffi_{module}_{n}*"),
-            format!("*C.weaveffi_{module}_{n}"),
+            format!("{prefix}_{module}_{n}*"),
+            format!("*C.{prefix}_{module}_{n}"),
         ),
         _ => ("void*".into(), "unsafe.Pointer".into()),
     }
 }
 
 /// (c_param_decl, go_cgo_param_decl) pairs following `(void* context, weaveffi_error* err)`.
-fn async_cb_params(ret: &Option<TypeRef>, module: &str) -> Vec<(String, String)> {
+fn async_cb_params(ret: &Option<TypeRef>, module: &str, prefix: &str) -> Vec<(String, String)> {
     match ret {
         None => vec![],
         Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => vec![
@@ -622,15 +628,15 @@ fn async_cb_params(ret: &Option<TypeRef>, module: &str) -> Vec<(String, String)>
             ("size_t result_len".into(), "resultLen C.size_t".into()),
         ],
         Some(TypeRef::List(inner)) => {
-            let (c_elem, go_elem) = async_result_types(inner, module);
+            let (c_elem, go_elem) = async_result_types(inner, module, prefix);
             vec![
                 (format!("{c_elem}* result"), format!("result *{go_elem}")),
                 ("size_t result_len".into(), "resultLen C.size_t".into()),
             ]
         }
         Some(TypeRef::Map(k, v)) => {
-            let (kc, kg) = async_result_types(k, module);
-            let (vc, vg) = async_result_types(v, module);
+            let (kc, kg) = async_result_types(k, module, prefix);
+            let (vc, vg) = async_result_types(v, module, prefix);
             vec![
                 (format!("{kc}* result_keys"), format!("resultKeys *{kg}")),
                 (
@@ -645,30 +651,30 @@ fn async_cb_params(ret: &Option<TypeRef>, module: &str) -> Vec<(String, String)>
                 vec![("const char* result".into(), "result *C.char".into())]
             }
             TypeRef::Struct(n) | TypeRef::TypedHandle(n) => vec![(
-                format!("weaveffi_{module}_{n}* result"),
-                format!("result *C.weaveffi_{module}_{n}"),
+                format!("{prefix}_{module}_{n}* result"),
+                format!("result *C.{prefix}_{module}_{n}"),
             )],
             _ => {
-                let (c, g) = async_result_types(inner, module);
+                let (c, g) = async_result_types(inner, module, prefix);
                 vec![(format!("const {c}* result"), format!("result *{g}"))]
             }
         },
         Some(ty) => {
-            let (c, g) = async_result_types(ty, module);
+            let (c, g) = async_result_types(ty, module, prefix);
             vec![(format!("{c} result"), format!("result {g}"))]
         }
     }
 }
 
-fn async_cb_extern_c_params(ret: &Option<TypeRef>, module: &str) -> Vec<String> {
-    async_cb_params(ret, module)
+fn async_cb_extern_c_params(ret: &Option<TypeRef>, module: &str, prefix: &str) -> Vec<String> {
+    async_cb_params(ret, module, prefix)
         .into_iter()
         .map(|(c, _)| c)
         .collect()
 }
 
-fn async_cb_go_params(ret: &Option<TypeRef>, module: &str) -> Vec<String> {
-    async_cb_params(ret, module)
+fn async_cb_go_params(ret: &Option<TypeRef>, module: &str, prefix: &str) -> Vec<String> {
+    async_cb_params(ret, module, prefix)
         .into_iter()
         .map(|(_, g)| g)
         .collect()
@@ -676,8 +682,8 @@ fn async_cb_go_params(ret: &Option<TypeRef>, module: &str) -> Vec<String> {
 
 /// Just the Go cgo types (no names), matching `async_cb_go_params`, used to
 /// build the type-assertion target in the trampoline body.
-fn async_cb_go_param_types(ret: &Option<TypeRef>, module: &str) -> Vec<String> {
-    async_cb_go_params(ret, module)
+fn async_cb_go_param_types(ret: &Option<TypeRef>, module: &str, prefix: &str) -> Vec<String> {
+    async_cb_go_params(ret, module, prefix)
         .into_iter()
         .map(|decl| {
             decl.split_once(' ')
@@ -706,7 +712,13 @@ fn async_cb_go_param_names(ret: &Option<TypeRef>) -> Vec<String> {
 
 /// Emit code that populates `res.Value` from the trampoline locals.
 /// `indent` is the whitespace prefix for each emitted line.
-fn emit_async_value_from_cb_params(out: &mut String, indent: &str, ret: &TypeRef, module: &str) {
+fn emit_async_value_from_cb_params(
+    out: &mut String,
+    indent: &str,
+    ret: &TypeRef,
+    module: &str,
+    prefix: &str,
+) {
     match ret {
         TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::F64 => {
             let conv = go_scalar_conv("result", ret);
@@ -722,7 +734,7 @@ fn emit_async_value_from_cb_params(out: &mut String, indent: &str, ret: &TypeRef
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             out.push_str(&format!("{indent}if result != nil {{\n"));
             out.push_str(&format!("{indent}\tres.Value = C.GoString(result)\n"));
-            out.push_str(&format!("{indent}\tC.weaveffi_free_string(result)\n"));
+            out.push_str(&format!("{indent}\tC.{prefix}_free_string(result)\n"));
             out.push_str(&format!("{indent}}}\n"));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
@@ -731,7 +743,7 @@ fn emit_async_value_from_cb_params(out: &mut String, indent: &str, ret: &TypeRef
                 "{indent}\tres.Value = C.GoBytes(unsafe.Pointer(result), C.int(resultLen))\n"
             ));
             out.push_str(&format!(
-                "{indent}\tC.weaveffi_free_bytes(result, resultLen)\n"
+                "{indent}\tC.{prefix}_free_bytes(result, resultLen)\n"
             ));
             out.push_str(&format!("{indent}}}\n"));
         }
@@ -750,7 +762,7 @@ fn emit_async_value_from_cb_params(out: &mut String, indent: &str, ret: &TypeRef
             out.push_str(&format!("{indent}\tcount := int(resultLen)\n"));
             let gi = go_type(inner);
             out.push_str(&format!("{indent}\tgoResult := make([]{gi}, count)\n"));
-            if let Some(ct) = c_scalar_type(inner, module) {
+            if let Some(ct) = c_scalar_type(inner, module, prefix) {
                 out.push_str(&format!(
                     "{indent}\tcSlice := unsafe.Slice((*{ct})(unsafe.Pointer(result)), count)\n"
                 ));
@@ -766,7 +778,7 @@ fn emit_async_value_from_cb_params(out: &mut String, indent: &str, ret: &TypeRef
                 out.push_str(&format!("{indent}\t\tgoResult[i] = C.GoString(v)\n"));
                 out.push_str(&format!("{indent}\t}}\n"));
             } else if let TypeRef::TypedHandle(n) = inner.as_ref() {
-                let ct = format!("C.weaveffi_{module}_{n}");
+                let ct = format!("C.{prefix}_{module}_{n}");
                 let gs = n.to_upper_camel_case();
                 out.push_str(&format!(
                     "{indent}\tcSlice := unsafe.Slice((**{ct})(unsafe.Pointer(result)), count)\n"
@@ -775,7 +787,7 @@ fn emit_async_value_from_cb_params(out: &mut String, indent: &str, ret: &TypeRef
                 out.push_str(&format!("{indent}\t\tgoResult[i] = &{gs}{{ptr: v}}\n"));
                 out.push_str(&format!("{indent}\t}}\n"));
             } else if let TypeRef::Struct(n) = inner.as_ref() {
-                let ct = format!("C.weaveffi_{module}_{n}");
+                let ct = format!("C.{prefix}_{module}_{n}");
                 let gs = local_type_name(n).to_upper_camel_case();
                 out.push_str(&format!(
                     "{indent}\tcSlice := unsafe.Slice((**{ct})(unsafe.Pointer(result)), count)\n"
@@ -796,7 +808,7 @@ fn emit_async_value_from_cb_params(out: &mut String, indent: &str, ret: &TypeRef
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                 out.push_str(&format!("{indent}if result != nil {{\n"));
                 out.push_str(&format!("{indent}\tv := C.GoString(result)\n"));
-                out.push_str(&format!("{indent}\tC.weaveffi_free_string(result)\n"));
+                out.push_str(&format!("{indent}\tC.{prefix}_free_string(result)\n"));
                 out.push_str(&format!("{indent}\tres.Value = &v\n"));
                 out.push_str(&format!("{indent}}}\n"));
             }
@@ -840,12 +852,9 @@ fn emit_async_value_from_cb_params(out: &mut String, indent: &str, ret: &TypeRef
     }
 }
 
-fn render_async_trampoline_extern_decl(out: &mut String, module: &str, f: &Function) {
-    let mut params = vec![
-        "void* context".to_string(),
-        "weaveffi_error* err".to_string(),
-    ];
-    params.extend(async_cb_extern_c_params(&f.returns, module));
+fn render_async_trampoline_extern_decl(out: &mut String, module: &str, f: &Function, prefix: &str) {
+    let mut params = vec!["void* context".to_string(), format!("{prefix}_error* err")];
+    params.extend(async_cb_extern_c_params(&f.returns, module, prefix));
     out.push_str(&format!(
         "extern void weaveffiGoAsyncTrampoline_{module}_{}({});\n",
         f.name,
@@ -853,8 +862,8 @@ fn render_async_trampoline_extern_decl(out: &mut String, module: &str, f: &Funct
     ));
 }
 
-fn render_async_function(out: &mut String, module: &str, f: &Function) {
-    let c_sym = c_symbol_name(module, &f.name);
+fn render_async_function(out: &mut String, module: &str, f: &Function, prefix: &str) {
+    let c_sym = format!("{prefix}_{module}_{}", f.name);
     let go_name = format!("{}_{}", module, f.name).to_upper_camel_case();
     let result_ty = format!("{go_name}Result");
     let trampoline = format!("weaveffiGoAsyncTrampoline_{module}_{}", f.name);
@@ -869,19 +878,19 @@ fn render_async_function(out: &mut String, module: &str, f: &Function) {
     out.push_str("}\n\n");
 
     // Trampoline.
-    let go_param_types = async_cb_go_param_types(&f.returns, module);
+    let go_param_types = async_cb_go_param_types(&f.returns, module, prefix);
     let go_param_names = async_cb_go_param_names(&f.returns);
     let cb_asserted_sig = {
-        let mut parts = vec!["*C.weaveffi_error".to_string()];
+        let mut parts = vec![format!("*C.{prefix}_error")];
         parts.extend(go_param_types.iter().cloned());
         format!("func({})", parts.join(", "))
     };
 
     let mut trampoline_params = vec![
         "ctx unsafe.Pointer".to_string(),
-        "err *C.weaveffi_error".to_string(),
+        format!("err *C.{prefix}_error"),
     ];
-    trampoline_params.extend(async_cb_go_params(&f.returns, module));
+    trampoline_params.extend(async_cb_go_params(&f.returns, module, prefix));
 
     out.push_str(&format!("//export {trampoline}\n"));
     out.push_str(&format!(
@@ -921,9 +930,9 @@ fn render_async_function(out: &mut String, module: &str, f: &Function) {
     out.push_str("\t\tdefer close(ch)\n");
     out.push_str("\t\tdone := make(chan struct{})\n");
 
-    // Build the closure signature: func(err *C.weaveffi_error, <extra params>).
-    let mut closure_params = vec!["err *C.weaveffi_error".to_string()];
-    closure_params.extend(async_cb_go_params(&f.returns, module));
+    // Build the closure signature: func(err *C.{prefix}_error, <extra params>).
+    let mut closure_params = vec![format!("err *C.{prefix}_error")];
+    closure_params.extend(async_cb_go_params(&f.returns, module, prefix));
     out.push_str(&format!(
         "\t\tcb := func({}) {{\n",
         closure_params.join(", ")
@@ -931,11 +940,11 @@ fn render_async_function(out: &mut String, module: &str, f: &Function) {
     out.push_str(&format!("\t\t\tvar res {result_ty}\n"));
     out.push_str("\t\t\tif err != nil && err.code != 0 {\n");
     out.push_str("\t\t\t\tres.Err = fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(err.message), int(err.code))\n");
-    out.push_str("\t\t\t\tC.weaveffi_error_clear(err)\n");
+    out.push_str(&format!("\t\t\t\tC.{prefix}_error_clear(err)\n"));
     out.push_str("\t\t\t}");
     if let Some(ret) = &f.returns {
         out.push_str(" else {\n");
-        emit_async_value_from_cb_params(out, "\t\t\t\t", ret, module);
+        emit_async_value_from_cb_params(out, "\t\t\t\t", ret, module, prefix);
         out.push_str("\t\t\t}\n");
     } else {
         out.push('\n');
@@ -958,6 +967,7 @@ fn render_async_function(out: &mut String, module: &str, f: &Function) {
             &p.name.to_lower_camel_case(),
             &p.ty,
             module,
+            prefix,
         );
     }
     // emit_param writes with single-tab indent; reindent to two tabs for the goroutine.
@@ -973,15 +983,21 @@ fn render_async_function(out: &mut String, module: &str, f: &Function) {
 
     if f.cancellable {
         // Create a native cancel token and wire ctx.Done() to
-        // weaveffi_cancel_token_cancel so `context.Context` cancellation
+        // {prefix}_cancel_token_cancel so `context.Context` cancellation
         // propagates to the Rust side. The watcher exits when either the
         // context fires or the async callback signals completion via `done`.
-        out.push_str("\t\tcancelTok := C.weaveffi_cancel_token_create()\n");
-        out.push_str("\t\tdefer C.weaveffi_cancel_token_destroy(cancelTok)\n");
+        out.push_str(&format!(
+            "\t\tcancelTok := C.{prefix}_cancel_token_create()\n"
+        ));
+        out.push_str(&format!(
+            "\t\tdefer C.{prefix}_cancel_token_destroy(cancelTok)\n"
+        ));
         out.push_str("\t\tgo func() {\n");
         out.push_str("\t\t\tselect {\n");
         out.push_str("\t\t\tcase <-ctx.Done():\n");
-        out.push_str("\t\t\t\tC.weaveffi_cancel_token_cancel(cancelTok)\n");
+        out.push_str(&format!(
+            "\t\t\t\tC.{prefix}_cancel_token_cancel(cancelTok)\n"
+        ));
         out.push_str("\t\t\tcase <-done:\n");
         out.push_str("\t\t\t}\n");
         out.push_str("\t\t}()\n");
@@ -999,7 +1015,7 @@ fn render_async_function(out: &mut String, module: &str, f: &Function) {
 
 // ── Top-level rendering ──
 
-fn render_go(api: &Api) -> String {
+fn render_go(api: &Api, c_prefix: &str) -> String {
     let (needs_fmt, needs_unsafe, needs_bool, needs_runtime, needs_registry) = scan_imports(api);
     let needs_context = collect_all_modules(&api.modules)
         .iter()
@@ -1009,16 +1025,16 @@ fn render_go(api: &Api) -> String {
     out.push_str("package weaveffi\n\n");
 
     out.push_str("/*\n");
-    out.push_str("#cgo LDFLAGS: -lweaveffi\n");
-    out.push_str("#include \"weaveffi.h\"\n");
+    out.push_str(&format!("#cgo LDFLAGS: -l{c_prefix}\n"));
+    out.push_str(&format!("#include \"{c_prefix}.h\"\n"));
     out.push_str("#include <stdlib.h>\n");
     for (m, path) in collect_modules_with_path(&api.modules) {
         for cb in &m.callbacks {
-            render_callback_extern_decl(&mut out, cb, &path);
+            render_callback_extern_decl(&mut out, cb, &path, c_prefix);
         }
         for f in &m.functions {
             if f.r#async {
-                render_async_trampoline_extern_decl(&mut out, &path, f);
+                render_async_trampoline_extern_decl(&mut out, &path, f, c_prefix);
             }
         }
     }
@@ -1068,22 +1084,22 @@ fn render_go(api: &Api) -> String {
             render_enum(&mut out, e);
         }
         for cb in &m.callbacks {
-            render_callback(&mut out, cb, &path);
+            render_callback(&mut out, cb, &path, c_prefix);
         }
         for l in &m.listeners {
-            render_listener(&mut out, &path, l);
+            render_listener(&mut out, &path, l, c_prefix);
         }
         for s in &m.structs {
-            render_struct(&mut out, &path, s);
+            render_struct(&mut out, &path, s, c_prefix);
             if s.builder {
-                render_go_builder(&mut out, &path, s);
+                render_go_builder(&mut out, &path, s, c_prefix);
             }
         }
         for f in &m.functions {
             if f.r#async {
-                render_async_function(&mut out, &path, f);
+                render_async_function(&mut out, &path, f, c_prefix);
             } else {
-                render_function(&mut out, &path, f);
+                render_function(&mut out, &path, f, c_prefix);
             }
         }
     }
@@ -1106,9 +1122,9 @@ fn render_enum(out: &mut String, e: &EnumDef) {
 
 // ── Structs ──
 
-fn render_struct(out: &mut String, module: &str, s: &StructDef) {
+fn render_struct(out: &mut String, module: &str, s: &StructDef, prefix: &str) {
     let name = s.name.to_upper_camel_case();
-    let c_tag = format!("weaveffi_{}_{}", module, s.name);
+    let c_tag = format!("{prefix}_{}_{}", module, s.name);
 
     out.push_str(&format!("type {name} struct {{\n"));
     out.push_str(&format!("\tptr *C.{c_tag}\n"));
@@ -1136,9 +1152,9 @@ fn render_struct(out: &mut String, module: &str, s: &StructDef) {
     out.push_str("}\n\n");
 }
 
-fn render_go_builder(out: &mut String, module: &str, s: &StructDef) {
+fn render_go_builder(out: &mut String, module: &str, s: &StructDef, prefix: &str) {
     let name = s.name.to_upper_camel_case();
-    let c_tag = format!("weaveffi_{module}_{}", s.name);
+    let c_tag = format!("{prefix}_{module}_{}", s.name);
     let c_builder_ty = format!("{c_tag}Builder");
 
     out.push_str(&format!("type {name}Builder struct {{\n"));
@@ -1159,7 +1175,7 @@ fn render_go_builder(out: &mut String, module: &str, s: &StructDef) {
         ));
         let mut pre = String::new();
         let mut c_args: Vec<String> = vec!["b.handle".into()];
-        emit_param(&mut pre, &mut c_args, "value", &field.ty, module);
+        emit_param(&mut pre, &mut c_args, "value", &field.ty, module, prefix);
         out.push_str(&pre);
         out.push_str(&format!(
             "\tC.{c_tag}_Builder_set_{}({})\n",
@@ -1173,7 +1189,7 @@ fn render_go_builder(out: &mut String, module: &str, s: &StructDef) {
     out.push_str(&format!(
         "func (b *{name}Builder) Build() (*{name}, error) {{\n"
     ));
-    out.push_str("\tvar cErr C.weaveffi_error\n");
+    out.push_str(&format!("\tvar cErr C.{prefix}_error\n"));
     out.push_str(&format!(
         "\tresult := C.{c_tag}_Builder_build(b.handle, &cErr)\n"
     ));
@@ -1181,7 +1197,7 @@ fn render_go_builder(out: &mut String, module: &str, s: &StructDef) {
     out.push_str("\tb.handle = nil\n");
     out.push_str("\tif cErr.code != 0 {\n");
     out.push_str("\t\tgoErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(cErr.message), int(cErr.code))\n");
-    out.push_str("\t\tC.weaveffi_error_clear(&cErr)\n");
+    out.push_str(&format!("\t\tC.{prefix}_error_clear(&cErr)\n"));
     out.push_str("\t\treturn nil, goErr\n");
     out.push_str("\t}\n");
     out.push_str(&format!("\treturn new{name}(result), nil\n"));
@@ -1273,8 +1289,8 @@ fn render_getter(
 
 // ── Functions ──
 
-fn render_function(out: &mut String, module: &str, f: &Function) {
-    let c_sym = c_symbol_name(module, &f.name);
+fn render_function(out: &mut String, module: &str, f: &Function, prefix: &str) {
+    let c_sym = format!("{prefix}_{module}_{}", f.name);
     let go_name = format!("{}_{}", module, f.name).to_upper_camel_case();
 
     let go_params: Vec<String> = f
@@ -1307,6 +1323,7 @@ fn render_function(out: &mut String, module: &str, f: &Function) {
             &p.name.to_lower_camel_case(),
             &p.ty,
             module,
+            prefix,
         );
     }
 
@@ -1314,7 +1331,7 @@ fn render_function(out: &mut String, module: &str, f: &Function) {
         emit_return_out_params(&mut pre, &mut c_args, ret);
     }
 
-    pre.push_str("\tvar cErr C.weaveffi_error\n");
+    pre.push_str(&format!("\tvar cErr C.{prefix}_error\n"));
     c_args.push("&cErr".into());
 
     out.push_str(&pre);
@@ -1330,7 +1347,7 @@ fn render_function(out: &mut String, module: &str, f: &Function) {
 
     out.push_str("\tif cErr.code != 0 {\n");
     out.push_str("\t\tgoErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(cErr.message), int(cErr.code))\n");
-    out.push_str("\t\tC.weaveffi_error_clear(&cErr)\n");
+    out.push_str(&format!("\t\tC.{prefix}_error_clear(&cErr)\n"));
     if let Some(ref ret) = f.returns {
         out.push_str(&format!("\t\treturn {}, goErr\n", go_zero(ret)));
     } else {
@@ -1339,7 +1356,7 @@ fn render_function(out: &mut String, module: &str, f: &Function) {
     out.push_str("\t}\n");
 
     if let Some(ref ret) = f.returns {
-        emit_return(out, ret, module, &f.name);
+        emit_return(out, ret, module, &f.name, prefix);
     } else {
         out.push_str("\treturn nil\n");
     }
@@ -1349,14 +1366,21 @@ fn render_function(out: &mut String, module: &str, f: &Function) {
 
 // ── Parameter conversion ──
 
-fn emit_param(pre: &mut String, args: &mut Vec<String>, name: &str, ty: &TypeRef, module: &str) {
+fn emit_param(
+    pre: &mut String,
+    args: &mut Vec<String>,
+    name: &str,
+    ty: &TypeRef,
+    module: &str,
+    prefix: &str,
+) {
     match ty {
         TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 => {
-            args.push(c_scalar_conv(name, ty, module));
+            args.push(c_scalar_conv(name, ty, module, prefix));
         }
         TypeRef::Bool => args.push(format!("boolToC({name})")),
-        TypeRef::Handle => args.push(format!("C.weaveffi_handle_t({name})")),
-        TypeRef::Enum(n) => args.push(format!("C.weaveffi_{module}_{n}({name})")),
+        TypeRef::Handle => args.push(format!("C.{prefix}_handle_t({name})")),
+        TypeRef::Enum(n) => args.push(format!("C.{prefix}_{module}_{n}({name})")),
         TypeRef::TypedHandle(_) | TypeRef::Struct(_) => args.push(format!("{name}.ptr")),
 
         TypeRef::StringUtf8 => {
@@ -1396,9 +1420,9 @@ fn emit_param(pre: &mut String, args: &mut Vec<String>, name: &str, ty: &TypeRef
             args.push(lv);
         }
 
-        TypeRef::Optional(inner) => emit_optional_param(pre, args, name, inner, module),
-        TypeRef::List(inner) => emit_list_param(pre, args, name, inner, module),
-        TypeRef::Map(k, v) => emit_map_param(pre, args, name, k, v, module),
+        TypeRef::Optional(inner) => emit_optional_param(pre, args, name, inner, module, prefix),
+        TypeRef::List(inner) => emit_list_param(pre, args, name, inner, module, prefix),
+        TypeRef::Map(k, v) => emit_map_param(pre, args, name, k, v, module, prefix),
 
         TypeRef::Callback(cb_name) => {
             let cn = name.to_upper_camel_case();
@@ -1407,7 +1431,7 @@ fn emit_param(pre: &mut String, args: &mut Vec<String>, name: &str, ty: &TypeRef
             let ctx_var = format!("c{cn}Ctx");
             pre.push_str(&format!("\t{tok_var} := _callbackRegister({name})\n"));
             pre.push_str(&format!(
-                "\t{fn_var} := (C.weaveffi_{module}_{cb_name})(unsafe.Pointer(C.weaveffiGoCbTrampoline_{module}_{cb_name}))\n"
+                "\t{fn_var} := (C.{prefix}_{module}_{cb_name})(unsafe.Pointer(C.weaveffiGoCbTrampoline_{module}_{cb_name}))\n"
             ));
             pre.push_str(&format!(
                 "\t{ctx_var} := unsafe.Pointer(uintptr({tok_var}))\n"
@@ -1425,6 +1449,7 @@ fn emit_optional_param(
     name: &str,
     inner: &TypeRef,
     module: &str,
+    prefix: &str,
 ) {
     let cv = format!("c{}", name.to_upper_camel_case());
 
@@ -1457,7 +1482,7 @@ fn emit_optional_param(
             args.push(cv);
         }
         TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
-            let ct = c_opaque_type(inner, module);
+            let ct = c_opaque_type(inner, module, prefix);
             pre.push_str(&format!("\tvar {cv} *C.{ct}\n"));
             pre.push_str(&format!("\tif {name} != nil {{\n"));
             pre.push_str(&format!("\t\t{cv} = {name}.ptr\n"));
@@ -1465,10 +1490,10 @@ fn emit_optional_param(
             args.push(cv);
         }
         _ => {
-            if let Some(ct) = c_scalar_type(inner, module) {
+            if let Some(ct) = c_scalar_type(inner, module, prefix) {
                 pre.push_str(&format!("\tvar {cv} *{ct}\n"));
                 pre.push_str(&format!("\tif {name} != nil {{\n"));
-                let conv = c_scalar_conv(&format!("*{name}"), inner, module);
+                let conv = c_scalar_conv(&format!("*{name}"), inner, module, prefix);
                 pre.push_str(&format!("\t\ttmp := {conv}\n"));
                 pre.push_str(&format!("\t\t{cv} = &tmp\n"));
                 pre.push_str("\t}\n");
@@ -1486,6 +1511,7 @@ fn emit_list_param(
     name: &str,
     inner: &TypeRef,
     module: &str,
+    prefix: &str,
 ) {
     let cn = name.to_upper_camel_case();
     let pv = format!("c{cn}Ptr");
@@ -1493,7 +1519,7 @@ fn emit_list_param(
 
     pre.push_str(&format!("\t{lv} := C.size_t(len({name}))\n"));
 
-    if let Some(ct) = c_scalar_type(inner, module) {
+    if let Some(ct) = c_scalar_type(inner, module, prefix) {
         if matches!(inner, TypeRef::Bool) {
             let arr = format!("c{cn}Arr");
             pre.push_str(&format!("\t{arr} := make([]C._Bool, len({name}))\n"));
@@ -1528,7 +1554,7 @@ fn emit_list_param(
         ));
         pre.push_str("\t}\n");
     } else if let TypeRef::Struct(n) | TypeRef::TypedHandle(n) = inner {
-        let ct = format!("C.weaveffi_{module}_{n}");
+        let ct = format!("C.{prefix}_{module}_{n}");
         let arr = format!("c{cn}Arr");
         pre.push_str(&format!("\t{arr} := make([]*{ct}, len({name}))\n"));
         pre.push_str(&format!("\tfor i, item := range {name} {{\n"));
@@ -1553,6 +1579,7 @@ fn emit_map_param(
     k: &TypeRef,
     v: &TypeRef,
     module: &str,
+    prefix: &str,
 ) {
     let cn = name.to_upper_camel_case();
     let lv = format!("c{cn}Len");
@@ -1568,18 +1595,25 @@ fn emit_map_param(
     pre.push_str("\t}\n");
 
     let kp = format!("c{cn}KeysPtr");
-    emit_map_array(pre, &kp, &format!("keys{cn}"), k, module);
+    emit_map_array(pre, &kp, &format!("keys{cn}"), k, module, prefix);
     args.push(kp);
 
     let vp = format!("c{cn}ValsPtr");
-    emit_map_array(pre, &vp, &format!("vals{cn}"), v, module);
+    emit_map_array(pre, &vp, &format!("vals{cn}"), v, module, prefix);
     args.push(vp);
 
     args.push(lv);
 }
 
-fn emit_map_array(pre: &mut String, ptr_var: &str, slice_name: &str, ty: &TypeRef, module: &str) {
-    if let Some(ct) = c_scalar_type(ty, module) {
+fn emit_map_array(
+    pre: &mut String,
+    ptr_var: &str,
+    slice_name: &str,
+    ty: &TypeRef,
+    module: &str,
+    prefix: &str,
+) {
+    if let Some(ct) = c_scalar_type(ty, module, prefix) {
         pre.push_str(&format!("\tvar {ptr_var} *{ct}\n"));
         pre.push_str(&format!("\tif len({slice_name}) > 0 {{\n"));
         pre.push_str(&format!(
@@ -1623,7 +1657,7 @@ fn emit_return_out_params(pre: &mut String, args: &mut Vec<String>, ty: &TypeRef
 
 // ── Return conversion ──
 
-fn emit_return(out: &mut String, ty: &TypeRef, module: &str, func_name: &str) {
+fn emit_return(out: &mut String, ty: &TypeRef, module: &str, func_name: &str, prefix: &str) {
     match ty {
         TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::F64 => {
             let conv = go_scalar_conv("result", ty);
@@ -1632,7 +1666,7 @@ fn emit_return(out: &mut String, ty: &TypeRef, module: &str, func_name: &str) {
         TypeRef::Bool => out.push_str("\treturn cToBool(result), nil\n"),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             out.push_str("\tgoResult := C.GoString(result)\n");
-            out.push_str("\tC.weaveffi_free_string(result)\n");
+            out.push_str(&format!("\tC.{prefix}_free_string(result)\n"));
             out.push_str("\treturn goResult, nil\n");
         }
         TypeRef::Enum(_) => {
@@ -1647,26 +1681,26 @@ fn emit_return(out: &mut String, ty: &TypeRef, module: &str, func_name: &str) {
             let g = local_type_name(n).to_upper_camel_case();
             out.push_str(&format!("\treturn new{g}(result), nil\n"));
         }
-        TypeRef::Optional(inner) => emit_optional_return(out, inner, module),
-        TypeRef::List(inner) => emit_list_return(out, inner, module),
+        TypeRef::Optional(inner) => emit_optional_return(out, inner, module, prefix),
+        TypeRef::List(inner) => emit_list_return(out, inner, module, prefix),
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             out.push_str("\tif result == nil {\n\t\treturn nil, nil\n\t}\n");
             out.push_str("\tgoResult := C.GoBytes(unsafe.Pointer(result), C.int(cOutLen))\n");
-            out.push_str("\tC.weaveffi_free_bytes(result, cOutLen)\n");
+            out.push_str(&format!("\tC.{prefix}_free_bytes(result, cOutLen)\n"));
             out.push_str("\treturn goResult, nil\n");
         }
         TypeRef::Map(k, v) => emit_map_return(out, k, v),
         TypeRef::Callback(_) => out.push_str("\treturn nil, nil\n"),
-        TypeRef::Iterator(inner) => emit_iterator_return(out, inner, module, func_name),
+        TypeRef::Iterator(inner) => emit_iterator_return(out, inner, module, func_name, prefix),
     }
 }
 
-fn emit_optional_return(out: &mut String, inner: &TypeRef, _module: &str) {
+fn emit_optional_return(out: &mut String, inner: &TypeRef, _module: &str, prefix: &str) {
     out.push_str("\tif result == nil {\n\t\treturn nil, nil\n\t}\n");
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             out.push_str("\tv := C.GoString(result)\n");
-            out.push_str("\tC.weaveffi_free_string(result)\n");
+            out.push_str(&format!("\tC.{prefix}_free_string(result)\n"));
             out.push_str("\treturn &v, nil\n");
         }
         TypeRef::TypedHandle(n) => {
@@ -1689,14 +1723,14 @@ fn emit_optional_return(out: &mut String, inner: &TypeRef, _module: &str) {
     }
 }
 
-fn emit_list_return(out: &mut String, inner: &TypeRef, module: &str) {
+fn emit_list_return(out: &mut String, inner: &TypeRef, module: &str, prefix: &str) {
     out.push_str("\tcount := int(cOutLen)\n");
     out.push_str("\tif count == 0 || result == nil {\n\t\treturn nil, nil\n\t}\n");
 
     let gi = go_type(inner);
     out.push_str(&format!("\tgoResult := make([]{gi}, count)\n"));
 
-    if let Some(ct) = c_scalar_type(inner, module) {
+    if let Some(ct) = c_scalar_type(inner, module, prefix) {
         out.push_str(&format!(
             "\tcSlice := unsafe.Slice((*{ct})(unsafe.Pointer(result)), count)\n"
         ));
@@ -1710,7 +1744,7 @@ fn emit_list_return(out: &mut String, inner: &TypeRef, module: &str) {
         out.push_str("\t\tgoResult[i] = C.GoString(v)\n");
         out.push_str("\t}\n");
     } else if let TypeRef::TypedHandle(n) = inner {
-        let ct = format!("C.weaveffi_{module}_{n}");
+        let ct = format!("C.{prefix}_{module}_{n}");
         let gs = n.to_upper_camel_case();
         out.push_str(&format!(
             "\tcSlice := unsafe.Slice((**{ct})(unsafe.Pointer(result)), count)\n"
@@ -1719,7 +1753,7 @@ fn emit_list_return(out: &mut String, inner: &TypeRef, module: &str) {
         out.push_str(&format!("\t\tgoResult[i] = &{gs}{{ptr: v}}\n"));
         out.push_str("\t}\n");
     } else if let TypeRef::Struct(n) = inner {
-        let ct = format!("C.weaveffi_{module}_{n}");
+        let ct = format!("C.{prefix}_{module}_{n}");
         let gs = local_type_name(n).to_upper_camel_case();
         out.push_str(&format!(
             "\tcSlice := unsafe.Slice((**{ct})(unsafe.Pointer(result)), count)\n"
@@ -1741,11 +1775,11 @@ fn emit_map_return(out: &mut String, k: &TypeRef, v: &TypeRef) {
 
 // ── Iterator return ──
 
-fn iter_out_item_c_type(inner: &TypeRef, module: &str) -> String {
+fn iter_out_item_c_type(inner: &TypeRef, module: &str, prefix: &str) -> String {
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "*C.char".into(),
-        TypeRef::Struct(n) | TypeRef::TypedHandle(n) => format!("*C.weaveffi_{module}_{n}"),
-        _ => c_scalar_type(inner, module).unwrap_or_else(|| "C.int32_t".into()),
+        TypeRef::Struct(n) | TypeRef::TypedHandle(n) => format!("*C.{prefix}_{module}_{n}"),
+        _ => c_scalar_type(inner, module, prefix).unwrap_or_else(|| "C.int32_t".into()),
     }
 }
 
@@ -1765,11 +1799,17 @@ fn iter_item_to_go(var: &str, inner: &TypeRef) -> String {
     }
 }
 
-fn emit_iterator_return(out: &mut String, inner: &TypeRef, module: &str, func_name: &str) {
+fn emit_iterator_return(
+    out: &mut String,
+    inner: &TypeRef,
+    module: &str,
+    func_name: &str,
+    prefix: &str,
+) {
     let pascal = func_name.to_upper_camel_case();
-    let iter_tag = format!("weaveffi_{module}_{pascal}Iterator");
+    let iter_tag = format!("{prefix}_{module}_{pascal}Iterator");
     let gi = go_type(inner);
-    let c_item_ty = iter_out_item_c_type(inner, module);
+    let c_item_ty = iter_out_item_c_type(inner, module, prefix);
     let conv = iter_item_to_go("outItem", inner);
 
     out.push_str(&format!("\tch := make(chan {gi})\n"));
@@ -1778,12 +1818,12 @@ fn emit_iterator_return(out: &mut String, inner: &TypeRef, module: &str, func_na
     out.push_str(&format!("\t\tdefer C.{iter_tag}_destroy(result)\n"));
     out.push_str("\t\tfor {\n");
     out.push_str(&format!("\t\t\tvar outItem {c_item_ty}\n"));
-    out.push_str("\t\t\tvar itemErr C.weaveffi_error\n");
+    out.push_str(&format!("\t\t\tvar itemErr C.{prefix}_error\n"));
     out.push_str(&format!(
         "\t\t\thas := C.{iter_tag}_next(result, &outItem, &itemErr)\n"
     ));
     out.push_str("\t\t\tif itemErr.code != 0 {\n");
-    out.push_str("\t\t\t\tC.weaveffi_error_clear(&itemErr)\n");
+    out.push_str(&format!("\t\t\t\tC.{prefix}_error_clear(&itemErr)\n"));
     out.push_str("\t\t\t\treturn\n");
     out.push_str("\t\t\t}\n");
     out.push_str("\t\t\tif has == 0 {\n");
@@ -1791,7 +1831,7 @@ fn emit_iterator_return(out: &mut String, inner: &TypeRef, module: &str, func_na
     out.push_str("\t\t\t}\n");
     if matches!(inner, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
         out.push_str(&format!("\t\t\titem := {conv}\n"));
-        out.push_str("\t\t\tC.weaveffi_free_string(outItem)\n");
+        out.push_str(&format!("\t\t\tC.{prefix}_free_string(outItem)\n"));
         out.push_str("\t\t\tch <- item\n");
     } else {
         out.push_str(&format!("\t\t\tch <- {conv}\n"));
@@ -1886,7 +1926,7 @@ mod tests {
 
     #[test]
     fn package_and_cgo_preamble() {
-        let go = render_go(&calculator_api());
+        let go = render_go(&calculator_api(), "weaveffi");
         assert!(go.starts_with("package weaveffi\n"), "missing package");
         assert!(
             go.contains("#cgo LDFLAGS: -lweaveffi"),
@@ -1901,14 +1941,14 @@ mod tests {
 
     #[test]
     fn imports_fmt_and_unsafe() {
-        let go = render_go(&calculator_api());
+        let go = render_go(&calculator_api(), "weaveffi");
         assert!(go.contains("\"fmt\""), "missing fmt import: {go}");
         assert!(go.contains("\"unsafe\""), "missing unsafe import: {go}");
     }
 
     #[test]
     fn simple_i32_function() {
-        let go = render_go(&calculator_api());
+        let go = render_go(&calculator_api(), "weaveffi");
         assert!(
             go.contains("func CalculatorAdd(a int32, b int32) (int32, error)"),
             "missing function sig: {go}"
@@ -1926,7 +1966,7 @@ mod tests {
 
     #[test]
     fn string_function() {
-        let go = render_go(&calculator_api());
+        let go = render_go(&calculator_api(), "weaveffi");
         assert!(
             go.contains("func CalculatorEcho(msg string) (string, error)"),
             "missing echo sig: {go}"
@@ -1956,7 +1996,7 @@ mod tests {
 
     #[test]
     fn error_handling() {
-        let go = render_go(&calculator_api());
+        let go = render_go(&calculator_api(), "weaveffi");
         assert!(
             go.contains("var cErr C.weaveffi_error"),
             "missing error var: {go}"
@@ -2008,7 +2048,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
         assert!(
             go.contains("type Color int32"),
             "missing enum typedef: {go}"
@@ -2061,7 +2101,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
         assert!(go.contains("type Contact struct {"), "missing struct: {go}");
         assert!(
             go.contains("ptr *C.weaveffi_contacts_Contact"),
@@ -2115,7 +2155,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
         assert!(
             go.contains("type PointBuilder struct {"),
             "builder type: {go}"
@@ -2165,7 +2205,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
         assert!(
             go.contains("func SystemReset() error"),
             "missing void function sig: {go}"
@@ -2205,7 +2245,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
         assert!(
             go.contains("(int64, error)"),
             "handle return should be int64: {go}"
@@ -2245,7 +2285,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
         assert!(go.contains("func boolToC("), "missing boolToC: {go}");
         assert!(go.contains("func cToBool("), "missing cToBool: {go}");
         assert!(
@@ -2295,7 +2335,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
         assert!(
             go.contains("func PaintMix(a Color) (Color, error)"),
             "missing enum function sig: {go}"
@@ -2349,7 +2389,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
         assert!(
             go.contains("(*Contact, error)"),
             "missing struct return type: {go}"
@@ -2389,7 +2429,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
         assert!(
             go.contains("query *string"),
             "optional string param should be *string: {go}"
@@ -2443,7 +2483,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
         assert!(
             go.contains("(*Contact, error)"),
             "optional struct return: {go}"
@@ -2476,7 +2516,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
         assert!(
             go.contains("([]int32, error)"),
             "missing list return type: {go}"
@@ -2523,7 +2563,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
         assert!(
             go.contains("([]*Contact, error)"),
             "missing struct list return: {go}"
@@ -2559,7 +2599,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
         assert!(
             go.contains("func TasksRun("),
             "async function wrapper should be emitted: {go}"
@@ -2607,7 +2647,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
         assert!(
             go.contains("type TasksRunResult struct {"),
             "Result struct should be emitted: {go}"
@@ -2699,7 +2739,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
 
         assert!(
             go.contains("\"context\""),
@@ -2828,7 +2868,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
         assert!(
             go.contains("id *int32"),
             "optional i32 param should be *int32: {go}"
@@ -2865,7 +2905,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
         assert!(
             go.contains("func (s *Contact) Email() *string"),
             "optional string getter should return *string: {go}"
@@ -2912,7 +2952,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
         assert!(
             !go.contains("boolToC"),
             "should not include bool helpers: {go}"
@@ -2953,7 +2993,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
         assert!(
             go.contains("func (s *Contact) ContactType() ContactType"),
             "missing enum field getter: {go}"
@@ -3505,6 +3545,71 @@ mod tests {
     }
 
     #[test]
+    fn go_cgo_respects_c_prefix() {
+        let api = calculator_api();
+        let config = GeneratorConfig {
+            c_prefix: Some("myffi".into()),
+            ..Default::default()
+        };
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_go_c_prefix");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        GoGenerator
+            .generate_with_config(&api, out_dir, &config)
+            .unwrap();
+
+        let go = std::fs::read_to_string(tmp.join("go/weaveffi.go")).unwrap();
+
+        assert!(
+            go.contains("#cgo LDFLAGS: -lmyffi"),
+            "cgo LDFLAGS must link against -lmyffi when c_prefix is set: {go}"
+        );
+        assert!(
+            go.contains("#include \"myffi.h\""),
+            "cgo preamble must include myffi.h when c_prefix is set: {go}"
+        );
+        assert!(
+            !go.contains("-lweaveffi") && !go.contains("\"weaveffi.h\""),
+            "must not retain default weaveffi library/header names when c_prefix is set: {go}"
+        );
+
+        assert!(
+            go.contains("C.myffi_calculator_add("),
+            "function calls must use myffi prefix: {go}"
+        );
+        assert!(
+            go.contains("C.myffi_calculator_echo("),
+            "function calls must use myffi prefix: {go}"
+        );
+        assert!(
+            !go.contains("C.weaveffi_calculator_"),
+            "function calls must not retain default weaveffi prefix: {go}"
+        );
+
+        assert!(
+            go.contains("var cErr C.myffi_error"),
+            "error struct type must use myffi prefix: {go}"
+        );
+        assert!(
+            go.contains("C.myffi_error_clear(&cErr)"),
+            "error_clear call must use myffi prefix: {go}"
+        );
+        assert!(
+            go.contains("C.myffi_free_string(result)"),
+            "free_string call must use myffi prefix: {go}"
+        );
+        assert!(
+            !go.contains("C.weaveffi_error") && !go.contains("C.weaveffi_free_string"),
+            "must not retain default weaveffi prefix for runtime symbols: {go}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn go_no_double_free_on_error() {
         let api = Api {
             version: "0.1.0".into(),
@@ -3544,7 +3649,7 @@ mod tests {
             generators: None,
         };
 
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
 
         let fn_start = go
             .find("func ContactsFindContact(")
@@ -3608,7 +3713,7 @@ mod tests {
             generators: None,
         };
 
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
 
         let fn_start = go
             .find("func ContactsFindContact(")
@@ -3675,7 +3780,7 @@ mod tests {
             generators: None,
         };
 
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
 
         let log_start = go.find("func IoLog(").expect("IoLog wrapper");
         let log_body = &go[log_start..];
@@ -3781,7 +3886,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
         assert!(
             go.contains("var cPayloadPtr *C.uint8_t"),
             "Go wrapper must declare *C.uint8_t for Bytes param ptr: {go}"
@@ -3825,7 +3930,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
         assert!(
             go.contains("var cOutLen C.size_t"),
             "Go wrapper must declare cOutLen out-param for Bytes return: {go}"
@@ -3881,7 +3986,7 @@ mod tests {
             generators: None,
         };
 
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
         let msg_pos = go
             .find("goErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(cErr.message), int(cErr.code))")
             .expect("Go wrapper must build a Go error from cErr.message before clearing");
@@ -3931,7 +4036,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
 
         let copy_pos = go
             .find("goResult := C.GoBytes(unsafe.Pointer(result), C.int(cOutLen))")
@@ -3971,7 +4076,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
 
         assert!(
             go.contains("\"runtime\""),
@@ -4050,7 +4155,7 @@ mod tests {
             generators: None,
         };
 
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
 
         let fn_start = go
             .find("func ContactsSetContactName(")
@@ -4141,7 +4246,7 @@ mod tests {
             generators: None,
         };
 
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
 
         let fn_start = go
             .find("func ContactsContactBuilderSetName(")
@@ -4219,7 +4324,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
 
         assert!(
             go.contains("type PointBuilder struct {\n\thandle *C.weaveffi_geo_PointBuilder\n}"),
@@ -4337,7 +4442,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
 
         assert!(
             go.contains("func DataListItems() (<-chan int32, error)"),
@@ -4415,7 +4520,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
 
         assert!(
             go.contains("type OnData func(payload string)"),
@@ -4511,7 +4616,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi");
 
         assert!(
             go.contains("type DataStream struct{}"),
