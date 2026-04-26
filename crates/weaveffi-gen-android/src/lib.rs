@@ -18,6 +18,10 @@ fn stamp_hash(body: String) -> String {
     format!("# {}\n{body}", stamp_header("android"))
 }
 
+fn stamp_xml(body: String) -> String {
+    format!("<!-- {} -->\n{body}", stamp_header("android"))
+}
+
 impl AndroidGenerator {
     fn generate_impl(
         &self,
@@ -35,6 +39,17 @@ impl AndroidGenerator {
             stamp_slash("rootProject.name = 'weaveffi'\n".to_string()),
         )?;
         std::fs::write(dir.join("build.gradle"), stamp_slash(build_gradle(package)))?;
+        std::fs::write(
+            dir.join("consumer-rules.pro"),
+            stamp_hash(consumer_rules(package)),
+        )?;
+
+        let main_dir = dir.join("src/main");
+        std::fs::create_dir_all(&main_dir)?;
+        std::fs::write(
+            main_dir.join("AndroidManifest.xml"),
+            stamp_xml(android_manifest()),
+        )?;
 
         let pkg_path = package.replace('.', "/");
         let src_dir = dir.join(format!("src/main/kotlin/{pkg_path}"));
@@ -80,6 +95,10 @@ impl Generator for AndroidGenerator {
         vec![
             out_dir.join("android/settings.gradle").to_string(),
             out_dir.join("android/build.gradle").to_string(),
+            out_dir.join("android/consumer-rules.pro").to_string(),
+            out_dir
+                .join("android/src/main/AndroidManifest.xml")
+                .to_string(),
             out_dir
                 .join("android/src/main/kotlin/com/weaveffi/WeaveFFI.kt")
                 .to_string(),
@@ -102,6 +121,10 @@ impl Generator for AndroidGenerator {
         vec![
             out_dir.join("android/settings.gradle").to_string(),
             out_dir.join("android/build.gradle").to_string(),
+            out_dir.join("android/consumer-rules.pro").to_string(),
+            out_dir
+                .join("android/src/main/AndroidManifest.xml")
+                .to_string(),
             out_dir
                 .join(format!("android/src/main/kotlin/{pkg_path}/WeaveFFI.kt"))
                 .to_string(),
@@ -144,12 +167,19 @@ android {{
     namespace '{namespace}'
     compileSdk 34
     defaultConfig {{
-        minSdk 24
+        minSdk 21
+        consumerProguardFiles "consumer-rules.pro"
+        ndk {{
+            abiFilters "arm64-v8a", "armeabi-v7a", "x86_64"
+        }}
         externalNativeBuild {{
             cmake {{
                 cppFlags ""
             }}
         }}
+    }}
+    buildFeatures {{
+        prefab true
     }}
     externalNativeBuild {{
         cmake {{
@@ -159,6 +189,30 @@ android {{
 }}
 "#
     )
+}
+
+fn consumer_rules(namespace: &str) -> String {
+    format!(
+        r#"# Preserve native method signatures; JNI resolves them by name.
+-keepclasseswithmembernames class * {{
+    native <methods>;
+}}
+
+# Keep all generated WeaveFFI classes – they are referenced by JNI
+# using the fully-qualified package name and stripping/renaming them
+# would break FindClass / GetMethodID lookups at runtime.
+-keep class {namespace}.** {{ *; }}
+"#
+    )
+}
+
+fn android_manifest() -> String {
+    // Library modules derive their package from `android.namespace` in
+    // build.gradle (AGP 8+), so the manifest itself only needs the root
+    // element with the android XML namespace declaration.
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+     <manifest xmlns:android=\"http://schemas.android.com/apk/res/android\" />\n"
+        .to_string()
 }
 
 fn cmake(c_prefix: &str) -> String {
@@ -5761,6 +5815,8 @@ mod tests {
         for (rel, prefix) in [
             ("android/settings.gradle", "// WeaveFFI "),
             ("android/build.gradle", "// WeaveFFI "),
+            ("android/consumer-rules.pro", "# WeaveFFI "),
+            ("android/src/main/AndroidManifest.xml", "<!-- WeaveFFI "),
             (
                 "android/src/main/kotlin/com/weaveffi/WeaveFFI.kt",
                 "// WeaveFFI ",
@@ -5782,6 +5838,99 @@ mod tests {
                 "{rel} missing DO NOT EDIT"
             );
         }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn android_build_gradle_has_modern_sdk() {
+        let api = make_api(vec![]);
+        let tmp = std::env::temp_dir().join("weaveffi_test_android_modern_sdk");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        AndroidGenerator.generate(&api, out_dir).unwrap();
+
+        let gradle = std::fs::read_to_string(tmp.join("android/build.gradle")).unwrap();
+        assert!(
+            gradle.contains("compileSdk 34"),
+            "missing compileSdk 34: {gradle}"
+        );
+        assert!(gradle.contains("minSdk 21"), "missing minSdk 21: {gradle}");
+        assert!(
+            gradle.contains("abiFilters \"arm64-v8a\", \"armeabi-v7a\", \"x86_64\""),
+            "missing ndk abiFilters: {gradle}"
+        );
+        assert!(
+            gradle.contains("buildFeatures"),
+            "missing buildFeatures block: {gradle}"
+        );
+        assert!(
+            gradle.contains("prefab true"),
+            "missing prefab = true in buildFeatures: {gradle}"
+        );
+        assert!(
+            gradle.contains("consumerProguardFiles \"consumer-rules.pro\""),
+            "missing consumerProguardFiles reference: {gradle}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn android_has_consumer_rules() {
+        let api = make_api(vec![]);
+        let config = GeneratorConfig {
+            android_package: Some("com.example.myffi".into()),
+            ..GeneratorConfig::default()
+        };
+        let tmp = std::env::temp_dir().join("weaveffi_test_android_consumer_rules");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        AndroidGenerator
+            .generate_with_config(&api, out_dir, &config)
+            .unwrap();
+
+        let rules = std::fs::read_to_string(tmp.join("android/consumer-rules.pro")).unwrap();
+        assert!(
+            rules.contains("native <methods>;"),
+            "consumer-rules.pro must keep native methods so JNI lookups survive R8: {rules}"
+        );
+        assert!(
+            rules.contains("-keep class com.example.myffi.** { *; }"),
+            "consumer-rules.pro must keep the generated package classes using the configured android_package: {rules}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn android_has_manifest() {
+        let api = make_api(vec![]);
+        let tmp = std::env::temp_dir().join("weaveffi_test_android_manifest");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        AndroidGenerator.generate(&api, out_dir).unwrap();
+
+        let manifest =
+            std::fs::read_to_string(tmp.join("android/src/main/AndroidManifest.xml")).unwrap();
+        assert!(
+            manifest.contains("<?xml version=\"1.0\" encoding=\"utf-8\"?>"),
+            "manifest missing XML prolog: {manifest}"
+        );
+        assert!(
+            manifest.contains("<manifest"),
+            "manifest missing <manifest> root element: {manifest}"
+        );
+        assert!(
+            manifest.contains("xmlns:android=\"http://schemas.android.com/apk/res/android\""),
+            "manifest missing android xmlns declaration: {manifest}"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
