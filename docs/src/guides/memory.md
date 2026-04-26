@@ -8,6 +8,65 @@ allocation that crosses the FFI boundary follows strict ownership rules.
 explicitly transferred back for deallocation. Rust allocates; the caller frees
 through the designated `weaveffi_free_*` functions.
 
+## Allocator contract
+
+WeaveFFI has **one heap** that matters across the FFI boundary: Rust's. Rust
+and the consumer (C, Swift, Kotlin, Node.js, .NET, Python, Dart, Go, Ruby,
+WASM) may each link against a different system allocator — `malloc` on POSIX,
+`HeapAlloc` on Windows, `CoTaskMemAlloc` in the CLR, the JavaScript runtime's
+own heap, and so on. Freeing a pointer with a different allocator than the one
+that produced it corrupts the heap.
+
+To make ownership unambiguous, every cross-boundary heap allocation is routed
+through the WeaveFFI ABI runtime. Two rules apply, without exception:
+
+1. **Rust-allocated pointers must be freed by Rust.** Use `weaveffi_free`,
+   `weaveffi_free_string`, `weaveffi_free_bytes`, `weaveffi_error_clear`, or
+   the struct-specific `*_destroy` function. The consumer's system allocator
+   must **NEVER** free a Rust-allocated pointer — no `free`, no `delete`, no
+   `HeapFree`, no `Marshal.FreeCoTaskMem`, no language-runtime finalizer that
+   routes through the consumer heap.
+2. **Consumer-allocated pointers must be freed by the consumer.** Rust must
+   **NEVER** free a pointer it did not allocate. When the consumer needs a
+   raw byte buffer that Rust will later release (or vice versa), allocate it
+   with `weaveffi_alloc` so the storage comes from Rust's heap from the start.
+
+Violating either rule is undefined behavior: at best a silent leak, at worst
+a heap-corruption crash on the next unrelated allocation.
+
+### `weaveffi_alloc` and `weaveffi_free` (C signatures)
+
+The C header declares these two prototypes next to `weaveffi_free_string` /
+`weaveffi_free_bytes`:
+
+```c
+// Allocate `size` bytes from Rust's heap (alignment 1).
+// Returns NULL when `size` is 0 or allocation fails.
+uint8_t* weaveffi_alloc(size_t size);
+
+// Free a buffer previously returned by weaveffi_alloc. `size` must match
+// the original allocation. A NULL ptr or 0 size is a no-op, so consumers
+// can safely forward defaults.
+void weaveffi_free(uint8_t* ptr, size_t size);
+```
+
+Use them whenever you need a raw byte buffer that crosses the boundary and
+is not already covered by a typed helper:
+
+```c
+uint8_t* scratch = weaveffi_alloc(1024);
+if (!scratch) {
+    return 1;
+}
+// ... hand `scratch` to Rust, or fill it yourself ...
+weaveffi_free(scratch, 1024);   // REQUIRED — do NOT call free()
+```
+
+For the common typed cases, prefer the dedicated helpers documented in the
+rest of this guide (`weaveffi_free_string` for returned `const char*`,
+`weaveffi_free_bytes` for returned `(ptr, len)` pairs, `*_destroy` for opaque
+structs, `weaveffi_error_clear` for error messages).
+
 ## String ownership
 
 Rust-returned strings are NUL-terminated, UTF-8, heap-allocated C strings
@@ -285,6 +344,7 @@ queue.sync {
 
 | Resource           | Allocator | Free function              | Notes                                |
 |--------------------|-----------|----------------------------|--------------------------------------|
+| Raw byte buffer    | Rust      | `weaveffi_free`            | Pair with `weaveffi_alloc`; size must match |
 | Returned string    | Rust      | `weaveffi_free_string`     | Every `const char*` return           |
 | Returned bytes     | Rust      | `weaveffi_free_bytes`      | Pass both pointer and length         |
 | Struct instance    | Rust      | `*_destroy`                | Call exactly once                    |

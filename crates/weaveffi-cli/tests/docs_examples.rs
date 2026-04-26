@@ -291,6 +291,38 @@ fn doc_wasm_readme_type_conventions() {
 }
 
 #[test]
+fn memory_guide_documents_allocator_contract() {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let guide = std::fs::read_to_string(workspace_root.join("docs/src/guides/memory.md"))
+        .expect("docs/src/guides/memory.md must exist");
+
+    assert!(
+        guide.contains("## Allocator contract"),
+        "memory guide must have an Allocator contract section: {guide}"
+    );
+    assert!(
+        guide.contains("uint8_t* weaveffi_alloc(size_t size);"),
+        "memory guide must document the weaveffi_alloc C signature: {guide}"
+    );
+    assert!(
+        guide.contains("void weaveffi_free(uint8_t* ptr, size_t size);"),
+        "memory guide must document the weaveffi_free C signature: {guide}"
+    );
+    assert!(
+        guide.contains("weaveffi_free_string") && guide.contains("weaveffi_free_bytes"),
+        "memory guide must mention the typed free helpers alongside the raw allocator: {guide}"
+    );
+    assert!(
+        guide.contains("NEVER"),
+        "memory guide must explicitly forbid freeing across allocators: {guide}"
+    );
+}
+
+#[test]
 fn summary_md_all_links_resolve() {
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
