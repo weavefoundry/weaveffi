@@ -43,9 +43,15 @@ impl DotnetGenerator {
         )?;
         std::fs::write(
             dir.join(format!("{namespace}.nuspec")),
-            render_nuspec(namespace),
+            render_nuspec(namespace, c_prefix),
         )?;
         std::fs::write(dir.join("README.md"), render_readme())?;
+        let runtimes_dir = dir.join("runtimes");
+        std::fs::create_dir_all(&runtimes_dir)?;
+        std::fs::write(
+            runtimes_dir.join("README.md"),
+            render_runtimes_readme(c_prefix),
+        )?;
         Ok(())
     }
 }
@@ -80,6 +86,7 @@ impl Generator for DotnetGenerator {
             out_dir.join("dotnet/WeaveFFI.csproj").to_string(),
             out_dir.join("dotnet/WeaveFFI.nuspec").to_string(),
             out_dir.join("dotnet/README.md").to_string(),
+            out_dir.join("dotnet/runtimes/README.md").to_string(),
         ]
     }
 
@@ -95,6 +102,7 @@ impl Generator for DotnetGenerator {
             out_dir.join(format!("dotnet/{ns}.csproj")).to_string(),
             out_dir.join(format!("dotnet/{ns}.nuspec")).to_string(),
             out_dir.join("dotnet/README.md").to_string(),
+            out_dir.join("dotnet/runtimes/README.md").to_string(),
         ]
     }
 
@@ -242,6 +250,9 @@ fn render_csproj(namespace: &str) -> String {
 
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
     <PackageId>{namespace}</PackageId>
     <Version>0.1.0</Version>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -252,7 +263,24 @@ fn render_csproj(namespace: &str) -> String {
     )
 }
 
-fn render_nuspec(namespace: &str) -> String {
+fn render_nuspec(namespace: &str, c_prefix: &str) -> String {
+    // NuGet looks up native dependencies using the standard
+    // `runtimes/{rid}/native/` convention. Consumers drop their
+    // cross-compiled shared libraries into matching folders under
+    // `runtimes/` before packing; see `runtimes/README.md`.
+    let rid_entries: &[(&str, &str)] = &[
+        ("linux-x64", "so"),
+        ("linux-arm64", "so"),
+        ("osx-x64", "dylib"),
+        ("osx-arm64", "dylib"),
+        ("win-x64", "dll"),
+        ("win-arm64", "dll"),
+    ];
+    let mut files = String::new();
+    for (rid, ext) in rid_entries {
+        let path = format!("runtimes/{rid}/native/lib{c_prefix}.{ext}");
+        files.push_str(&format!("    <file src=\"{path}\" target=\"{path}\" />\n"));
+    }
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
@@ -265,6 +293,8 @@ fn render_nuspec(namespace: &str) -> String {
     <projectUrl>https://github.com/AstroForge-Incorporated/weaveffi</projectUrl>
     <tags>ffi interop native pinvoke</tags>
   </metadata>
+  <files>
+{files}  </files>
 </package>
 "#,
     )
@@ -290,6 +320,29 @@ dotnet pack
 The resulting `.nupkg` will be in `bin/Debug/` (or `bin/Release/` with `-c Release`).
 "#
     .into()
+}
+
+fn render_runtimes_readme(c_prefix: &str) -> String {
+    format!(
+        r#"# Native runtime libraries
+
+The sibling `.nuspec` packs any shared libraries that live here into the
+standard NuGet `runtimes/{{rid}}/native/` layout so that `.NET` resolves the
+right binary at runtime.
+
+Drop your cross-compiled WeaveFFI libraries into:
+
+- `linux-x64/native/lib{c_prefix}.so`
+- `linux-arm64/native/lib{c_prefix}.so`
+- `osx-x64/native/lib{c_prefix}.dylib`
+- `osx-arm64/native/lib{c_prefix}.dylib`
+- `win-x64/native/lib{c_prefix}.dll`
+- `win-arm64/native/lib{c_prefix}.dll`
+
+Only the runtimes you ship for need to be populated; missing folders simply
+won't be included in the resulting `.nupkg`.
+"#,
+    )
 }
 
 fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
@@ -1894,6 +1947,7 @@ mod tests {
                 out.join("dotnet/WeaveFFI.csproj").to_string(),
                 out.join("dotnet/WeaveFFI.nuspec").to_string(),
                 out.join("dotnet/README.md").to_string(),
+                out.join("dotnet/runtimes/README.md").to_string(),
             ]
         );
     }
@@ -1912,6 +1966,7 @@ mod tests {
                 out.join("dotnet/WeaveFFI.csproj").to_string(),
                 out.join("dotnet/WeaveFFI.nuspec").to_string(),
                 out.join("dotnet/README.md").to_string(),
+                out.join("dotnet/runtimes/README.md").to_string(),
             ]
         );
 
@@ -1927,6 +1982,7 @@ mod tests {
                 out.join("dotnet/MyCompany.Bindings.csproj").to_string(),
                 out.join("dotnet/MyCompany.Bindings.nuspec").to_string(),
                 out.join("dotnet/README.md").to_string(),
+                out.join("dotnet/runtimes/README.md").to_string(),
             ]
         );
     }
@@ -2073,6 +2129,112 @@ mod tests {
         assert!(
             readme.contains("dotnet pack"),
             "missing pack instructions: {readme}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dotnet_csproj_has_modern_settings() {
+        let api = make_api(vec![simple_module(vec![])]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_dotnet_csproj_modern");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        DotnetGenerator.generate(&api, out_dir).unwrap();
+
+        let csproj = std::fs::read_to_string(tmp.join("dotnet/WeaveFFI.csproj")).unwrap();
+        assert!(
+            csproj.contains("<TargetFramework>net8.0</TargetFramework>"),
+            "csproj must target net8.0: {csproj}"
+        );
+        assert!(
+            csproj.contains("<Nullable>enable</Nullable>"),
+            "csproj must enable nullable reference types: {csproj}"
+        );
+        assert!(
+            csproj.contains("<TreatWarningsAsErrors>true</TreatWarningsAsErrors>"),
+            "csproj must treat warnings as errors: {csproj}"
+        );
+        assert!(
+            csproj.contains("<GeneratePackageOnBuild>false</GeneratePackageOnBuild>"),
+            "csproj must disable GeneratePackageOnBuild: {csproj}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dotnet_nuspec_includes_native_runtimes() {
+        let api = make_api(vec![simple_module(vec![])]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_dotnet_nuspec_runtimes");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        DotnetGenerator.generate(&api, out_dir).unwrap();
+
+        let nuspec = std::fs::read_to_string(tmp.join("dotnet/WeaveFFI.nuspec")).unwrap();
+        assert!(
+            nuspec.contains("<files>") && nuspec.contains("</files>"),
+            "nuspec must include a <files> element: {nuspec}"
+        );
+        for entry in [
+            "runtimes/linux-x64/native/libweaveffi.so",
+            "runtimes/linux-arm64/native/libweaveffi.so",
+            "runtimes/osx-x64/native/libweaveffi.dylib",
+            "runtimes/osx-arm64/native/libweaveffi.dylib",
+            "runtimes/win-x64/native/libweaveffi.dll",
+        ] {
+            assert!(
+                nuspec.contains(entry),
+                "nuspec must reference {entry}: {nuspec}"
+            );
+        }
+
+        let runtimes_readme = tmp.join("dotnet/runtimes/README.md");
+        assert!(
+            runtimes_readme.exists(),
+            "runtimes/ placeholder README must exist"
+        );
+        let runtimes_readme = std::fs::read_to_string(&runtimes_readme).unwrap();
+        assert!(
+            runtimes_readme.contains("linux-x64/native/libweaveffi.so"),
+            "runtimes README must document where to drop binaries: {runtimes_readme}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dotnet_nuspec_uses_custom_c_prefix() {
+        let api = make_api(vec![simple_module(vec![])]);
+
+        let config = GeneratorConfig {
+            c_prefix: Some("myffi".into()),
+            ..GeneratorConfig::default()
+        };
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_dotnet_nuspec_custom_prefix");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        DotnetGenerator
+            .generate_with_config(&api, out_dir, &config)
+            .unwrap();
+
+        let nuspec = std::fs::read_to_string(tmp.join("dotnet/WeaveFFI.nuspec")).unwrap();
+        assert!(
+            nuspec.contains("runtimes/linux-x64/native/libmyffi.so"),
+            "nuspec must honour custom c_prefix: {nuspec}"
+        );
+        assert!(
+            !nuspec.contains("libweaveffi"),
+            "nuspec must not leak the default c_prefix: {nuspec}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
