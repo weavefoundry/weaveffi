@@ -163,10 +163,14 @@ fn render_cpp_header(api: &Api, namespace: &str) -> String {
     out.push_str("#include <unordered_map>\n");
     out.push_str("#include <memory>\n");
     out.push_str("#include <stdexcept>\n");
-    if collect_all_modules(&api.modules)
+    let has_cancellable_async = collect_all_modules(&api.modules)
+        .iter()
+        .any(|m| m.functions.iter().any(|f| f.r#async && f.cancellable));
+    let needs_functional = collect_all_modules(&api.modules)
         .iter()
         .any(|m| !m.callbacks.is_empty())
-    {
+        || has_cancellable_async;
+    if needs_functional {
         out.push_str("#include <functional>\n");
     }
     if collect_all_modules(&api.modules)
@@ -180,6 +184,9 @@ fn render_cpp_header(api: &Api, namespace: &str) -> String {
         .any(|m| m.functions.iter().any(|f| f.r#async))
     {
         out.push_str("#include <future>\n");
+    }
+    if has_cancellable_async {
+        out.push_str("#include <stop_token>\n");
     }
     out.push('\n');
 
@@ -1525,7 +1532,7 @@ fn render_cpp_async_function(out: &mut String, func: &Function, abi_module: &str
         .map(|p| cpp_param_decl(&p.ty, &p.name))
         .collect();
     if func.cancellable {
-        cpp_params.push("weaveffi_cancel_token* cancel_token = nullptr".to_string());
+        cpp_params.push("std::stop_token stop_token = {}".to_string());
     }
     let fn_name = format!("{}_{}", abi_module, func.name);
 
@@ -1546,14 +1553,31 @@ fn render_cpp_async_function(out: &mut String, func: &Function, abi_module: &str
         setup.extend(s);
         c_args.extend(a);
     }
-    if func.cancellable {
-        c_args.push("cancel_token".to_string());
-    }
 
-    out.push_str(&format!(
-        "    auto* promise_ptr = new std::promise<{cpp_ret}>();\n"
-    ));
-    out.push_str("    auto future = promise_ptr->get_future();\n");
+    // Cancellable async wires `std::stop_token` to the native cancel token by
+    // keeping the promise, token, and `std::stop_callback` alive together on
+    // the heap. When `stop_token` fires, the callback invokes
+    // `weaveffi_cancel_token_cancel`, which the Rust side observes. The state
+    // is destroyed by the async C callback, unregistering the stop hook and
+    // releasing the native token.
+    if func.cancellable {
+        out.push_str("    struct _AsyncState {\n");
+        out.push_str(&format!("        std::promise<{cpp_ret}> promise;\n"));
+        out.push_str("        weaveffi_cancel_token* tok;\n");
+        out.push_str("        std::stop_callback<std::function<void()>> cb;\n");
+        out.push_str("        _AsyncState(std::stop_token st, weaveffi_cancel_token* t)\n");
+        out.push_str("            : tok(t), cb(st, [t]{ weaveffi_cancel_token_cancel(t); }) {}\n");
+        out.push_str("    };\n");
+        out.push_str("    auto* tok = weaveffi_cancel_token_create();\n");
+        out.push_str("    auto* promise_ptr = new _AsyncState(stop_token, tok);\n");
+        out.push_str("    auto future = promise_ptr->promise.get_future();\n");
+        c_args.push("tok".to_string());
+    } else {
+        out.push_str(&format!(
+            "    auto* promise_ptr = new std::promise<{cpp_ret}>();\n"
+        ));
+        out.push_str("    auto future = promise_ptr->get_future();\n");
+    }
 
     for line in &setup {
         out.push_str(&format!("    {line}\n"));
@@ -1578,9 +1602,14 @@ fn render_cpp_async_function(out: &mut String, func: &Function, abi_module: &str
         ));
     }
 
-    out.push_str(&format!(
-        "        auto* p = static_cast<std::promise<{cpp_ret}>*>(context);\n"
-    ));
+    if func.cancellable {
+        out.push_str("        auto* s = static_cast<_AsyncState*>(context);\n");
+        out.push_str("        auto* p = &s->promise;\n");
+    } else {
+        out.push_str(&format!(
+            "        auto* p = static_cast<std::promise<{cpp_ret}>*>(context);\n"
+        ));
+    }
     out.push_str("        if (err && err->code != 0) {\n");
     out.push_str("            std::string msg(err->message ? err->message : \"unknown error\");\n");
     out.push_str(
@@ -1595,7 +1624,12 @@ fn render_cpp_async_function(out: &mut String, func: &Function, abi_module: &str
     }
 
     out.push_str("        }\n");
-    out.push_str("        delete p;\n");
+    if func.cancellable {
+        out.push_str("        weaveffi_cancel_token_destroy(s->tok);\n");
+        out.push_str("        delete s;\n");
+    } else {
+        out.push_str("        delete p;\n");
+    }
     out.push_str("    }, static_cast<void*>(promise_ptr));\n");
     out.push_str("    return future;\n");
     out.push_str("}\n\n");
@@ -3454,6 +3488,88 @@ mod tests {
         assert!(
             h.contains("new std::promise<void>()"),
             "should create void promise: {h}"
+        );
+    }
+
+    #[test]
+    fn cpp_cancellable_async_wires_stop_token_to_cancel_token() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "tasks".into(),
+                functions: vec![
+                    Function {
+                        name: "run".into(),
+                        params: vec![Param {
+                            name: "id".into(),
+                            ty: TypeRef::I32,
+                            mutable: false,
+                        }],
+                        returns: Some(TypeRef::I32),
+                        doc: None,
+                        r#async: true,
+                        cancellable: true,
+                        deprecated: None,
+                        since: None,
+                    },
+                    Function {
+                        name: "fire".into(),
+                        params: vec![],
+                        returns: None,
+                        doc: None,
+                        r#async: true,
+                        cancellable: false,
+                        deprecated: None,
+                        since: None,
+                    },
+                ],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let h = render_cpp_header(&api, "weaveffi");
+
+        assert!(
+            h.contains("#include <stop_token>"),
+            "cancellable async must include <stop_token>: {h}"
+        );
+        assert!(
+            h.contains("#include <functional>"),
+            "cancellable async must include <functional> for stop_callback: {h}"
+        );
+        assert!(
+            h.contains("inline std::future<int32_t> tasks_run(int32_t id, std::stop_token stop_token = {})"),
+            "cancellable async must accept std::stop_token: {h}"
+        );
+        assert!(
+            h.contains("weaveffi_cancel_token_create()"),
+            "cancellable async must create a native cancel token: {h}"
+        );
+        assert!(
+            h.contains("std::stop_callback<std::function<void()>> cb;"),
+            "cancellable async must register a stop_callback: {h}"
+        );
+        assert!(
+            h.contains("weaveffi_cancel_token_cancel(t)"),
+            "stop_callback must forward to weaveffi_cancel_token_cancel: {h}"
+        );
+        assert!(
+            h.contains("weaveffi_cancel_token_destroy(s->tok)"),
+            "completion callback must destroy the native cancel token: {h}"
+        );
+
+        let fire_sig = h
+            .lines()
+            .find(|l| l.contains("inline std::future<void> tasks_fire("))
+            .expect("non-cancellable fire wrapper must still be emitted");
+        assert!(
+            !fire_sig.contains("stop_token"),
+            "non-cancellable async must not accept std::stop_token: {fire_sig}"
         );
     }
 

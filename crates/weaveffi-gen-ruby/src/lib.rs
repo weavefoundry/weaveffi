@@ -316,7 +316,8 @@ fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Mo
 fn render_ruby_module(api: &Api, module_name: &str) -> String {
     let mut out = String::new();
     let has_async = has_any_async(api);
-    render_preamble(&mut out, module_name, has_async);
+    let has_cancellable_async = has_any_cancellable_async(api);
+    render_preamble(&mut out, module_name, has_async, has_cancellable_async);
     for (m, path) in collect_modules_with_path(&api.modules) {
         out.push_str(&format!("\n  # === Module: {} ===\n", path));
         for e in &m.enums {
@@ -365,7 +366,18 @@ fn has_any_async(api: &Api) -> bool {
         .any(|m| m.functions.iter().any(|f| f.r#async))
 }
 
-fn render_preamble(out: &mut String, module_name: &str, has_async: bool) {
+fn has_any_cancellable_async(api: &Api) -> bool {
+    collect_all_modules(&api.modules)
+        .iter()
+        .any(|m| m.functions.iter().any(|f| f.r#async && f.cancellable))
+}
+
+fn render_preamble(
+    out: &mut String,
+    module_name: &str,
+    has_async: bool,
+    has_cancellable_async: bool,
+) {
     let extra_require = if has_async {
         "require 'concurrent'\n"
     } else {
@@ -417,6 +429,19 @@ module {module_name}
   end
 "
     ));
+
+    if has_cancellable_async {
+        out.push_str(
+            "
+  # Cancellation token bindings. Cancellable `_async` wrappers create a
+  # token, forward it to the C ABI, and call `weaveffi_cancel_token_cancel`
+  # when the caller's `Concurrent::Cancellation` origin fires.
+  attach_function :weaveffi_cancel_token_create, [], :pointer
+  attach_function :weaveffi_cancel_token_cancel, [:pointer], :void
+  attach_function :weaveffi_cancel_token_destroy, [:pointer], :void
+",
+        );
+    }
 
     if has_async {
         out.push_str(
@@ -998,9 +1023,23 @@ fn render_async_function_wrapper(out: &mut String, module_name: &str, f: &Functi
 
     let params: Vec<String> = f.params.iter().map(|p| p.name.to_snake_case()).collect();
     let params_comma = if params.is_empty() { "" } else { ", " };
+    let kw_sep = if f.cancellable {
+        if params.is_empty() {
+            ""
+        } else {
+            ", "
+        }
+    } else {
+        ""
+    };
+    let cancellable_kw = if f.cancellable {
+        "cancellation: nil"
+    } else {
+        ""
+    };
 
     out.push_str(&format!(
-        "\n  def self.{func_name}_async({}{params_comma}&block)\n",
+        "\n  def self.{func_name}_async({}{kw_sep}{cancellable_kw}{params_comma}&block)\n",
         params.join(", ")
     ));
 
@@ -1011,6 +1050,18 @@ fn render_async_function_wrapper(out: &mut String, module_name: &str, f: &Functi
 
     for p in &f.params {
         render_param_conversion(out, &p.name.to_snake_case(), &p.ty, ind);
+    }
+
+    if f.cancellable {
+        // Create the native cancel token and register a handler on the
+        // `Concurrent::Cancellation` origin (when provided) so its `cancel`
+        // forwards to `weaveffi_cancel_token_cancel`.
+        out.push_str(&format!("{ind}cancel_tok = weaveffi_cancel_token_create\n"));
+        out.push_str(&format!("{ind}if cancellation\n"));
+        out.push_str(&format!(
+            "{ind}  cancellation.origin.on_completion {{ weaveffi_cancel_token_cancel(cancel_tok) }}\n"
+        ));
+        out.push_str(&format!("{ind}end\n"));
     }
 
     let pipe_names = rb_async_cb_param_names(&f.returns).join(", ");
@@ -1033,6 +1084,11 @@ fn render_async_function_wrapper(out: &mut String, module_name: &str, f: &Functi
     out.push_str(&format!("{ind}    end\n"));
     out.push_str(&format!("{ind}  ensure\n"));
     out.push_str(&format!("{ind}    pop_async_callback(ctx.address)\n"));
+    if f.cancellable {
+        out.push_str(&format!(
+            "{ind}    weaveffi_cancel_token_destroy(cancel_tok)\n"
+        ));
+    }
     out.push_str(&format!("{ind}  end\n"));
     out.push_str(&format!("{ind}end\n"));
 
@@ -1043,7 +1099,7 @@ fn render_async_function_wrapper(out: &mut String, module_name: &str, f: &Functi
         call_args.extend(rb_call_args(&p.name.to_snake_case(), &p.ty));
     }
     if f.cancellable {
-        call_args.push("FFI::Pointer::NULL".into());
+        call_args.push("cancel_tok".into());
     }
     call_args.push("cb".into());
     call_args.push("FFI::Pointer.new(id)".into());
@@ -1051,14 +1107,24 @@ fn render_async_function_wrapper(out: &mut String, module_name: &str, f: &Functi
     out.push_str(&format!("{ind}{async_fn}({})\n", call_args.join(", ")));
     out.push_str("  end\n");
 
+    let sync_kw_sep = kw_sep;
     out.push_str(&format!(
-        "\n  def self.{func_name}({})\n",
+        "\n  def self.{func_name}({}{sync_kw_sep}{cancellable_kw})\n",
         params.join(", ")
     ));
     out.push_str(&format!("{ind}Concurrent::Promise.execute do\n"));
     out.push_str(&format!("{ind}  queue = Queue.new\n"));
+    let forward_kw = if f.cancellable {
+        if params.is_empty() {
+            "cancellation: cancellation"
+        } else {
+            ", cancellation: cancellation"
+        }
+    } else {
+        ""
+    };
     out.push_str(&format!(
-        "{ind}  {func_name}_async({}) do |result, err|\n",
+        "{ind}  {func_name}_async({}{forward_kw}) do |result, err|\n",
         params.join(", ")
     ));
     out.push_str(&format!("{ind}    queue.push([result, err])\n"));
@@ -2001,6 +2067,89 @@ mod tests {
         assert!(
             code.contains("raise err if err"),
             "Promise wrapper must re-raise errors: {code}"
+        );
+    }
+
+    #[test]
+    fn ruby_cancellable_async_wires_concurrent_cancellation_to_token() {
+        let api = make_api(vec![simple_module(
+            "tasks",
+            vec![
+                Function {
+                    name: "run".into(),
+                    params: vec![Param {
+                        name: "id".into(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                    }],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: true,
+                    cancellable: true,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "fire".into(),
+                    params: vec![],
+                    returns: None,
+                    doc: None,
+                    r#async: true,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+            ],
+        )]);
+
+        let code = render_ruby_module(&api, "WeaveFFI");
+
+        assert!(
+            code.contains("attach_function :weaveffi_cancel_token_create, [], :pointer"),
+            "must expose weaveffi_cancel_token_create via FFI: {code}"
+        );
+        assert!(
+            code.contains("attach_function :weaveffi_cancel_token_cancel, [:pointer], :void"),
+            "must expose weaveffi_cancel_token_cancel via FFI: {code}"
+        );
+        assert!(
+            code.contains("attach_function :weaveffi_cancel_token_destroy, [:pointer], :void"),
+            "must expose weaveffi_cancel_token_destroy via FFI: {code}"
+        );
+        assert!(
+            code.contains("def self.run_async(id, cancellation: nil, &block)"),
+            "cancellable async must accept cancellation keyword: {code}"
+        );
+        assert!(
+            code.contains("cancel_tok = weaveffi_cancel_token_create"),
+            "cancellable async must create a native cancel token: {code}"
+        );
+        assert!(
+            code.contains(
+                "cancellation.origin.on_completion { weaveffi_cancel_token_cancel(cancel_tok) }"
+            ),
+            "cancellation.origin completion must call weaveffi_cancel_token_cancel: {code}"
+        );
+        assert!(
+            code.contains("weaveffi_tasks_run_async(id, cancel_tok, cb, FFI::Pointer.new(id))"),
+            "cancellable async must forward the native token to _async: {code}"
+        );
+        assert!(
+            code.contains("weaveffi_cancel_token_destroy(cancel_tok)"),
+            "cancellable async must destroy the native token on completion: {code}"
+        );
+        assert!(
+            code.contains("def self.run(id, cancellation: nil)"),
+            "synchronous-style wrapper must forward the cancellation keyword: {code}"
+        );
+
+        let fire_sig = code
+            .lines()
+            .find(|l| l.contains("def self.fire_async("))
+            .expect("non-cancellable fire_async wrapper must still be emitted");
+        assert!(
+            !fire_sig.contains("cancellation:"),
+            "non-cancellable async must not accept cancellation: {fire_sig}"
         );
     }
 

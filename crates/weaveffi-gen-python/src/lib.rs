@@ -519,7 +519,7 @@ fn render_async_ffi_call_body(out: &mut String, module_name: &str, f: &Function)
         call_args.extend(py_param_call_args(&p.name, &p.ty));
     }
     if f.cancellable {
-        call_args.push("None".into());
+        call_args.push("_cancel_token".into());
     }
     call_args.push("_cb".into());
     call_args.push("None".into());
@@ -544,11 +544,29 @@ fn render_python_module(api: &Api, strip_module_prefix: bool) -> String {
     if has_async {
         out.push_str("\nimport asyncio\nimport threading\n");
     }
+    let has_cancellable_async = collect_all_modules(&api.modules)
+        .iter()
+        .any(|m| m.functions.iter().any(|f| f.r#async && f.cancellable));
+    if has_cancellable_async {
+        render_cancel_token_bindings(&mut out);
+    }
     for m in &api.modules {
         render_python_module_content(&mut out, m, &m.name, strip_module_prefix);
     }
     out.push('\n');
     out
+}
+
+/// Emit `ctypes` argtype/restype declarations for the `weaveffi_cancel_token_*`
+/// C ABI so cancellable `async def` wrappers can forward `asyncio.CancelledError`
+/// to `weaveffi_cancel_token_cancel`.
+fn render_cancel_token_bindings(out: &mut String) {
+    out.push_str("\n_lib.weaveffi_cancel_token_create.argtypes = []\n");
+    out.push_str("_lib.weaveffi_cancel_token_create.restype = ctypes.c_void_p\n");
+    out.push_str("_lib.weaveffi_cancel_token_cancel.argtypes = [ctypes.c_void_p]\n");
+    out.push_str("_lib.weaveffi_cancel_token_cancel.restype = None\n");
+    out.push_str("_lib.weaveffi_cancel_token_destroy.argtypes = [ctypes.c_void_p]\n");
+    out.push_str("_lib.weaveffi_cancel_token_destroy.restype = None\n");
 }
 
 fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
@@ -893,10 +911,15 @@ fn render_function(out: &mut String, module_name: &str, f: &Function, strip_modu
         render_iterator_class(out, module_name, &f.name, inner);
     }
 
+    let mut sync_params_sig = params_sig.clone();
+    if f.r#async && f.cancellable {
+        sync_params_sig.push("_cancel_token: Any".into());
+    }
+
     out.push_str(&format!(
         "\n\ndef {}({}) -> {}:\n",
         def_name,
-        params_sig.join(", "),
+        sync_params_sig.join(", "),
         ret_hint
     ));
 
@@ -997,21 +1020,49 @@ fn render_function(out: &mut String, module_name: &str, f: &Function, strip_modu
             "\n\nasync def {}({}) -> {}:\n",
             func_name, params_joined, ret_hint
         ));
-        out.push_str("    _loop = asyncio.get_event_loop()\n");
         let arg_names: Vec<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
-        let executor_args = if arg_names.is_empty() {
-            def_name
+        if f.cancellable {
+            // Create a native cancel token and forward `asyncio.CancelledError`
+            // from the awaiting Task to `weaveffi_cancel_token_cancel` so the
+            // C side can observe cooperative cancellation.
+            let mut executor_args_vec: Vec<&str> = vec![&def_name];
+            executor_args_vec.extend(arg_names.iter().copied());
+            executor_args_vec.push("_cancel_token");
+            let executor_args = executor_args_vec.join(", ");
+            out.push_str("    _cancel_token = _lib.weaveffi_cancel_token_create()\n");
+            out.push_str("    try:\n");
+            out.push_str("        _loop = asyncio.get_event_loop()\n");
+            out.push_str("        try:\n");
+            if f.returns.is_some() {
+                out.push_str(&format!(
+                    "            return await _loop.run_in_executor(None, {executor_args})\n"
+                ));
+            } else {
+                out.push_str(&format!(
+                    "            await _loop.run_in_executor(None, {executor_args})\n"
+                ));
+            }
+            out.push_str("        except asyncio.CancelledError:\n");
+            out.push_str("            _lib.weaveffi_cancel_token_cancel(_cancel_token)\n");
+            out.push_str("            raise\n");
+            out.push_str("    finally:\n");
+            out.push_str("        _lib.weaveffi_cancel_token_destroy(_cancel_token)\n");
         } else {
-            format!("{def_name}, {}", arg_names.join(", "))
-        };
-        if f.returns.is_some() {
-            out.push_str(&format!(
-                "    return await _loop.run_in_executor(None, {executor_args})\n"
-            ));
-        } else {
-            out.push_str(&format!(
-                "    await _loop.run_in_executor(None, {executor_args})\n"
-            ));
+            out.push_str("    _loop = asyncio.get_event_loop()\n");
+            let executor_args = if arg_names.is_empty() {
+                def_name
+            } else {
+                format!("{def_name}, {}", arg_names.join(", "))
+            };
+            if f.returns.is_some() {
+                out.push_str(&format!(
+                    "    return await _loop.run_in_executor(None, {executor_args})\n"
+                ));
+            } else {
+                out.push_str(&format!(
+                    "    await _loop.run_in_executor(None, {executor_args})\n"
+                ));
+            }
         }
     }
 }
@@ -4435,6 +4486,84 @@ mod tests {
         assert!(
             code.contains("_lib.weaveffi_free_string(_ptr)"),
             "async string delivery must call weaveffi_free_string to release the C buffer: {code}"
+        );
+    }
+
+    #[test]
+    fn python_cancellable_async_wires_asyncio_cancel_to_token() {
+        let api = make_api(vec![simple_module(vec![
+            Function {
+                name: "run".into(),
+                params: vec![Param {
+                    name: "id".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: true,
+                cancellable: true,
+                deprecated: None,
+                since: None,
+            },
+            Function {
+                name: "fire".into(),
+                params: vec![],
+                returns: None,
+                doc: None,
+                r#async: true,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            },
+        ])]);
+
+        let code = render_python_module(&api, true);
+
+        assert!(
+            code.contains("_lib.weaveffi_cancel_token_create.restype = ctypes.c_void_p"),
+            "should register cancel_token_create binding: {code}"
+        );
+        assert!(
+            code.contains("_lib.weaveffi_cancel_token_cancel.argtypes = [ctypes.c_void_p]"),
+            "should register cancel_token_cancel binding: {code}"
+        );
+        assert!(
+            code.contains("_lib.weaveffi_cancel_token_destroy.argtypes = [ctypes.c_void_p]"),
+            "should register cancel_token_destroy binding: {code}"
+        );
+        assert!(
+            code.contains("def _run_sync(id: int, _cancel_token: Any) -> int:"),
+            "cancellable sync helper must accept _cancel_token: {code}"
+        );
+        assert!(
+            code.contains("_cancel_token = _lib.weaveffi_cancel_token_create()"),
+            "async wrapper must create a native cancel token: {code}"
+        );
+        assert!(
+            code.contains("run_in_executor(None, _run_sync, id, _cancel_token)"),
+            "async wrapper must forward the cancel token to the executor: {code}"
+        );
+        assert!(
+            code.contains("except asyncio.CancelledError:"),
+            "async wrapper must handle asyncio.CancelledError: {code}"
+        );
+        assert!(
+            code.contains("_lib.weaveffi_cancel_token_cancel(_cancel_token)"),
+            "CancelledError handler must forward to weaveffi_cancel_token_cancel: {code}"
+        );
+        assert!(
+            code.contains("_lib.weaveffi_cancel_token_destroy(_cancel_token)"),
+            "cancellable async wrapper must destroy the token in finally: {code}"
+        );
+
+        let fire_line = code
+            .lines()
+            .find(|l| l.contains("run_in_executor(None, _fire_sync"))
+            .expect("non-cancellable fire should still use run_in_executor");
+        assert!(
+            !fire_line.contains("_cancel_token"),
+            "non-cancellable async must not forward a cancel token: {fire_line}"
         );
     }
 

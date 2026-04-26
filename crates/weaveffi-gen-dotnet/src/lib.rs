@@ -284,7 +284,7 @@ fn render_csharp(api: &Api, namespace: &str, strip_module_prefix: bool) -> Strin
         .iter()
         .any(|m| m.functions.iter().any(|f| f.r#async))
     {
-        out.push_str("using System.Threading.Tasks;\n");
+        out.push_str("using System.Threading;\nusing System.Threading.Tasks;\n");
     }
     out.push('\n');
     out.push_str(&format!("namespace {namespace}\n{{\n"));
@@ -807,6 +807,22 @@ fn render_native_methods(out: &mut String, api: &Api) {
         "        internal static extern void weaveffi_error_clear(ref WeaveffiError err);\n\n",
     );
 
+    let has_cancellable = collect_all_modules(&api.modules)
+        .iter()
+        .any(|m| m.functions.iter().any(|f| f.r#async && f.cancellable));
+    if has_cancellable {
+        out.push_str("        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]\n");
+        out.push_str("        internal static extern IntPtr weaveffi_cancel_token_create();\n\n");
+        out.push_str("        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]\n");
+        out.push_str(
+            "        internal static extern void weaveffi_cancel_token_cancel(IntPtr token);\n\n",
+        );
+        out.push_str("        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]\n");
+        out.push_str(
+            "        internal static extern void weaveffi_cancel_token_destroy(IntPtr token);\n\n",
+        );
+    }
+
     for (m, path) in collect_modules_with_path(&api.modules) {
         for s in &m.structs {
             render_struct_pinvoke(out, &path, s);
@@ -1103,11 +1119,14 @@ fn render_async_wrapper_method(
         .map(cs_type)
         .unwrap_or_else(|| "bool".into());
 
-    let params_sig: Vec<String> = f
+    let mut params_sig: Vec<String> = f
         .params
         .iter()
         .map(|p| format!("{} {}", cs_type(&p.ty), safe_cs_name(&p.name)))
         .collect();
+    if f.cancellable {
+        params_sig.push("CancellationToken cancellationToken = default".to_string());
+    }
 
     if let Some(msg) = &f.deprecated {
         out.push_str(&format!(
@@ -1124,6 +1143,16 @@ fn render_async_wrapper_method(
     out.push_str(&format!(
         "            var tcs = new TaskCompletionSource<{tcs_type}>(TaskCreationOptions.RunContinuationsAsynchronously);\n"
     ));
+
+    // Create a native cancel token for cancellable functions and register a
+    // CancellationToken.Register callback that forwards cancellation to
+    // `weaveffi_cancel_token_cancel` so the native side can observe it.
+    if f.cancellable {
+        out.push_str(
+            "            var cancelToken = NativeMethods.weaveffi_cancel_token_create();\n",
+        );
+        out.push_str("            var cancelReg = cancellationToken.Register(() => NativeMethods.weaveffi_cancel_token_cancel(cancelToken));\n");
+    }
 
     let cb_lambda_params = async_cb_lambda_params(&f.returns);
     out.push_str(&format!(
@@ -1155,7 +1184,7 @@ fn render_async_wrapper_method(
     } else {
         format!("{call_args}, ")
     };
-    let cancel_arg = if f.cancellable { "IntPtr.Zero, " } else { "" };
+    let cancel_arg = if f.cancellable { "cancelToken, " } else { "" };
 
     if needs_try {
         for p in &f.params {
@@ -1176,7 +1205,18 @@ fn render_async_wrapper_method(
         ));
     }
 
-    if f.returns.is_some() {
+    if f.cancellable {
+        out.push_str("            try\n            {\n");
+        if f.returns.is_some() {
+            out.push_str("                return await tcs.Task;\n");
+        } else {
+            out.push_str("                await tcs.Task;\n");
+        }
+        out.push_str("            }\n            finally\n            {\n");
+        out.push_str("                cancelReg.Dispose();\n");
+        out.push_str("                NativeMethods.weaveffi_cancel_token_destroy(cancelToken);\n");
+        out.push_str("            }\n");
+    } else if f.returns.is_some() {
         out.push_str("            return await tcs.Task;\n");
     } else {
         out.push_str("            await tcs.Task;\n");
@@ -4206,6 +4246,98 @@ mod tests {
         assert!(
             cs.contains("TaskCompletionSource"),
             "missing TaskCompletionSource: {cs}"
+        );
+    }
+
+    #[test]
+    fn dotnet_cancellable_async_wires_cancellation_token_to_native_token() {
+        let api = make_api(vec![Module {
+            name: "tasks".into(),
+            functions: vec![
+                Function {
+                    name: "run".into(),
+                    params: vec![Param {
+                        name: "id".into(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                    }],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: true,
+                    cancellable: true,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "fire".into(),
+                    params: vec![],
+                    returns: None,
+                    doc: None,
+                    r#async: true,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+            ],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let cs = render_csharp(&api, "WeaveFFI", true);
+
+        assert!(
+            cs.contains("using System.Threading;"),
+            "must import System.Threading for CancellationToken: {cs}"
+        );
+        assert!(
+            cs.contains("internal static extern IntPtr weaveffi_cancel_token_create();"),
+            "must declare weaveffi_cancel_token_create P/Invoke: {cs}"
+        );
+        assert!(
+            cs.contains("internal static extern void weaveffi_cancel_token_cancel(IntPtr token);"),
+            "must declare weaveffi_cancel_token_cancel P/Invoke: {cs}"
+        );
+        assert!(
+            cs.contains("internal static extern void weaveffi_cancel_token_destroy(IntPtr token);"),
+            "must declare weaveffi_cancel_token_destroy P/Invoke: {cs}"
+        );
+        assert!(
+            cs.contains(
+                "public static async Task<int> Run(int id, CancellationToken cancellationToken = default)"
+            ),
+            "cancellable async must accept CancellationToken parameter: {cs}"
+        );
+        assert!(
+            cs.contains("var cancelToken = NativeMethods.weaveffi_cancel_token_create();"),
+            "cancellable async must create a native cancel token: {cs}"
+        );
+        assert!(
+            cs.contains(
+                "cancellationToken.Register(() => NativeMethods.weaveffi_cancel_token_cancel(cancelToken))"
+            ),
+            "cancellable async must register a CancellationToken callback forwarding to weaveffi_cancel_token_cancel: {cs}"
+        );
+        assert!(
+            cs.contains(
+                "NativeMethods.weaveffi_tasks_run_async(id, cancelToken, callback, IntPtr.Zero);"
+            ),
+            "cancellable async call must forward the native token: {cs}"
+        );
+        assert!(
+            cs.contains("NativeMethods.weaveffi_cancel_token_destroy(cancelToken);"),
+            "cancellable async must destroy the native token: {cs}"
+        );
+
+        let fire_line = cs
+            .lines()
+            .find(|l| l.contains("NativeMethods.weaveffi_tasks_fire_async("))
+            .expect("non-cancellable fire call should be emitted");
+        assert!(
+            !fire_line.contains("cancelToken"),
+            "non-cancellable async must not forward a cancel token: {fire_line}"
         );
     }
 

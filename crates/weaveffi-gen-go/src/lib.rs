@@ -898,11 +898,15 @@ fn render_async_function(out: &mut String, module: &str, f: &Function) {
     out.push_str("}\n\n");
 
     // Wrapper function.
-    let go_params: Vec<String> = f
-        .params
-        .iter()
-        .map(|p| format!("{} {}", p.name.to_lower_camel_case(), go_type(&p.ty)))
-        .collect();
+    let mut go_params: Vec<String> = Vec::new();
+    if f.cancellable {
+        go_params.push("ctx context.Context".into());
+    }
+    go_params.extend(
+        f.params
+            .iter()
+            .map(|p| format!("{} {}", p.name.to_lower_camel_case(), go_type(&p.ty))),
+    );
 
     if let Some(msg) = &f.deprecated {
         out.push_str(&format!("// Deprecated: {msg}\n"));
@@ -942,7 +946,7 @@ fn render_async_function(out: &mut String, module: &str, f: &Function) {
 
     out.push_str("\t\ttoken := _callbackRegister(cb)\n");
     out.push_str("\t\tdefer _callbackRegistry.Delete(token)\n");
-    out.push_str("\t\tctx := unsafe.Pointer(uintptr(token))\n");
+    out.push_str("\t\tcbCtx := unsafe.Pointer(uintptr(token))\n");
 
     // Marshal input params using the same helpers as sync functions.
     let mut pre = String::new();
@@ -968,10 +972,23 @@ fn render_async_function(out: &mut String, module: &str, f: &Function) {
     ));
 
     if f.cancellable {
-        c_args.push("nil".into());
+        // Create a native cancel token and wire ctx.Done() to
+        // weaveffi_cancel_token_cancel so `context.Context` cancellation
+        // propagates to the Rust side. The watcher exits when either the
+        // context fires or the async callback signals completion via `done`.
+        out.push_str("\t\tcancelTok := C.weaveffi_cancel_token_create()\n");
+        out.push_str("\t\tdefer C.weaveffi_cancel_token_destroy(cancelTok)\n");
+        out.push_str("\t\tgo func() {\n");
+        out.push_str("\t\t\tselect {\n");
+        out.push_str("\t\t\tcase <-ctx.Done():\n");
+        out.push_str("\t\t\t\tC.weaveffi_cancel_token_cancel(cancelTok)\n");
+        out.push_str("\t\t\tcase <-done:\n");
+        out.push_str("\t\t\t}\n");
+        out.push_str("\t\t}()\n");
+        c_args.push("cancelTok".into());
     }
     c_args.push("fn".into());
-    c_args.push("ctx".into());
+    c_args.push("cbCtx".into());
     out.push_str(&format!("\t\tC.{c_sym}_async({})\n", c_args.join(", ")));
 
     out.push_str("\t\t<-done\n");
@@ -984,6 +1001,9 @@ fn render_async_function(out: &mut String, module: &str, f: &Function) {
 
 fn render_go(api: &Api) -> String {
     let (needs_fmt, needs_unsafe, needs_bool, needs_runtime, needs_registry) = scan_imports(api);
+    let needs_context = collect_all_modules(&api.modules)
+        .iter()
+        .any(|m| m.functions.iter().any(|f| f.r#async && f.cancellable));
     let mut out = String::new();
 
     out.push_str("package weaveffi\n\n");
@@ -1005,8 +1025,11 @@ fn render_go(api: &Api) -> String {
     out.push_str("*/\n");
     out.push_str("import \"C\"\n");
 
-    if needs_fmt || needs_unsafe || needs_runtime || needs_registry {
+    if needs_context || needs_fmt || needs_unsafe || needs_runtime || needs_registry {
         out.push_str("\nimport (\n");
+        if needs_context {
+            out.push_str("\t\"context\"\n");
+        }
         if needs_fmt {
             out.push_str("\t\"fmt\"\n");
         }
@@ -2632,6 +2655,92 @@ mod tests {
         assert!(
             go.contains("return ch"),
             "wrapper should return the channel: {go}"
+        );
+    }
+
+    #[test]
+    fn go_cancellable_async_wires_context_to_cancel_token() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "tasks".into(),
+                functions: vec![
+                    Function {
+                        name: "run".into(),
+                        params: vec![Param {
+                            name: "id".into(),
+                            ty: TypeRef::I32,
+                            mutable: false,
+                        }],
+                        returns: Some(TypeRef::I32),
+                        doc: None,
+                        r#async: true,
+                        cancellable: true,
+                        deprecated: None,
+                        since: None,
+                    },
+                    Function {
+                        name: "fire".into(),
+                        params: vec![],
+                        returns: None,
+                        doc: None,
+                        r#async: true,
+                        cancellable: false,
+                        deprecated: None,
+                        since: None,
+                    },
+                ],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let go = render_go(&api);
+
+        assert!(
+            go.contains("\"context\""),
+            "context import must be emitted for cancellable async: {go}"
+        );
+        assert!(
+            go.contains("func TasksRun(ctx context.Context, id int32) <-chan TasksRunResult {"),
+            "cancellable async wrapper must take context.Context first: {go}"
+        );
+        assert!(
+            go.contains("cancelTok := C.weaveffi_cancel_token_create()"),
+            "cancellable async must create a native cancel token: {go}"
+        );
+        assert!(
+            go.contains("defer C.weaveffi_cancel_token_destroy(cancelTok)"),
+            "cancellable async must destroy the native cancel token: {go}"
+        );
+        assert!(
+            go.contains("C.weaveffi_cancel_token_cancel(cancelTok)"),
+            "cancellable async must wire ctx.Done() to weaveffi_cancel_token_cancel: {go}"
+        );
+        assert!(
+            go.contains("case <-ctx.Done():"),
+            "cancellable async must select on ctx.Done(): {go}"
+        );
+        let run_async_call = go
+            .lines()
+            .find(|l| l.contains("C.weaveffi_tasks_run_async("))
+            .expect("run_async call must be emitted");
+        assert!(
+            run_async_call.contains("cancelTok") && run_async_call.contains("cbCtx"),
+            "cancellable async must forward the native token to _async: {run_async_call}"
+        );
+
+        let fire_sig = go
+            .lines()
+            .find(|l| l.contains("func TasksFire("))
+            .expect("non-cancellable fire wrapper must still be emitted");
+        assert!(
+            !fire_sig.contains("context.Context"),
+            "non-cancellable async must not accept context.Context: {fire_sig}"
         );
     }
 

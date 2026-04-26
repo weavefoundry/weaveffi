@@ -812,6 +812,10 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
             );
             out.push_str("    } catch (e) {\n");
             out.push_str("      ctx.reject(e);\n");
+            out.push_str("    } finally {\n");
+            // Cleanup must run regardless of settlement outcome so the native
+            // cancel token is not leaked when the C ABI completes normally.
+            out.push_str("      if (ctx.cleanup) ctx.cleanup();\n");
             out.push_str("    }\n");
             out.push_str("  }\n\n");
 
@@ -1161,7 +1165,10 @@ fn async_cb_wasm_params(returns: Option<&TypeRef>) -> Vec<&'static str> {
 
 fn emit_js_async_function_wrapper(out: &mut String, module_name: &str, func: &Function) {
     let abi_name = format!("weaveffi_{}_{}", module_name, func.name);
-    let js_params: Vec<&str> = func.params.iter().map(|p| p.name.as_str()).collect();
+    let mut js_params: Vec<String> = func.params.iter().map(|p| p.name.clone()).collect();
+    if func.cancellable {
+        js_params.push("{ signal } = {}".to_string());
+    }
     let indent = "        ";
     let indent2 = "          ";
 
@@ -1260,7 +1267,40 @@ fn emit_js_async_function_wrapper(out: &mut String, module_name: &str, func: &Fu
     let cb_params = async_cb_wasm_params(func.returns.as_ref());
     let sig_key = cb_params.join("_");
     if func.cancellable {
-        wasm_args.push("0".to_string());
+        // Bridge `AbortSignal` to `weaveffi_cancel_token_cancel`: allocate a
+        // native token, forward abort notifications to it, and register a
+        // cleanup hook so `_asyncHandler` destroys the token and unregisters
+        // the abort listener when the promise settles.
+        out.push_str(&format!(
+            "{indent2}const _cancelTok = wasm.weaveffi_cancel_token_create();\n"
+        ));
+        out.push_str(&format!("{indent2}let _abortHandler = null;\n"));
+        out.push_str(&format!(
+            "{indent2}const _ctxEntry = _asyncContexts.get(ctxId);\n"
+        ));
+        out.push_str(&format!("{indent2}_ctxEntry.cleanup = () => {{\n"));
+        out.push_str(&format!(
+            "{indent2}  if (signal && _abortHandler) signal.removeEventListener('abort', _abortHandler);\n"
+        ));
+        out.push_str(&format!(
+            "{indent2}  wasm.weaveffi_cancel_token_destroy(_cancelTok);\n"
+        ));
+        out.push_str(&format!("{indent2}}};\n"));
+        out.push_str(&format!("{indent2}if (signal) {{\n"));
+        out.push_str(&format!("{indent2}  if (signal.aborted) {{\n"));
+        out.push_str(&format!(
+            "{indent2}    wasm.weaveffi_cancel_token_cancel(_cancelTok);\n"
+        ));
+        out.push_str(&format!("{indent2}  }} else {{\n"));
+        out.push_str(&format!(
+            "{indent2}    _abortHandler = () => wasm.weaveffi_cancel_token_cancel(_cancelTok);\n"
+        ));
+        out.push_str(&format!(
+            "{indent2}    signal.addEventListener('abort', _abortHandler, {{ once: true }});\n"
+        ));
+        out.push_str(&format!("{indent2}  }}\n"));
+        out.push_str(&format!("{indent2}}}\n"));
+        wasm_args.push("_cancelTok".to_string());
     }
     wasm_args.push(format!("_cbPtr_{sig_key}"));
     wasm_args.push("ctxId".to_string());
@@ -2246,6 +2286,84 @@ mod tests {
         assert!(
             js.contains("__indirect_function_table"),
             "should reference the WASM function table: {js}"
+        );
+    }
+
+    #[test]
+    fn wasm_cancellable_async_wires_abort_signal_to_cancel_token() {
+        let api = make_api(vec![Module {
+            name: "tasks".into(),
+            functions: vec![
+                Function {
+                    name: "run".into(),
+                    params: vec![Param {
+                        name: "id".into(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                    }],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: true,
+                    cancellable: true,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "fire".into(),
+                    params: vec![],
+                    returns: None,
+                    doc: None,
+                    r#async: true,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+            ],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+
+        assert!(
+            js.contains("run(id, { signal } = {})"),
+            "cancellable async must accept a {{ signal }} option: {js}"
+        );
+        assert!(
+            js.contains("wasm.weaveffi_cancel_token_create()"),
+            "cancellable async must create a native cancel token: {js}"
+        );
+        assert!(
+            js.contains("wasm.weaveffi_cancel_token_cancel(_cancelTok)"),
+            "AbortSignal abort must forward to weaveffi_cancel_token_cancel: {js}"
+        );
+        assert!(
+            js.contains("wasm.weaveffi_cancel_token_destroy(_cancelTok)"),
+            "cleanup must destroy the native cancel token: {js}"
+        );
+        assert!(
+            js.contains("signal.addEventListener('abort', _abortHandler, { once: true })"),
+            "must register an abort listener: {js}"
+        );
+        assert!(
+            js.contains("if (ctx.cleanup) ctx.cleanup();"),
+            "_asyncHandler must run cleanup once the promise settles: {js}"
+        );
+        assert!(
+            js.contains("wasm.weaveffi_tasks_run_async(id, _cancelTok,"),
+            "cancellable async must forward the native token to the _async export: {js}"
+        );
+
+        let fire_sig = js
+            .lines()
+            .find(|l| l.contains("fire(") && l.contains("{"))
+            .expect("non-cancellable fire wrapper must still be emitted");
+        assert!(
+            !fire_sig.contains("signal"),
+            "non-cancellable async must not accept {{ signal }}: {fire_sig}"
         );
     }
 
