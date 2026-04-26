@@ -3,7 +3,9 @@ use camino::Utf8Path;
 use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name, wrapper_name};
-use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, StructField, TypeRef};
+use weaveffi_ir::ir::{
+    Api, CallbackDef, EnumDef, Function, Module, StructDef, StructField, TypeRef,
+};
 
 pub struct PythonGenerator;
 
@@ -83,6 +85,7 @@ impl Generator for PythonGenerator {
 
     fn capabilities(&self) -> &'static [Capability] {
         &[
+            Capability::Callbacks,
             Capability::Iterators,
             Capability::Builders,
             Capability::AsyncFunctions,
@@ -166,7 +169,7 @@ fn py_type_hint(ty: &TypeRef) -> String {
         TypeRef::List(inner) => format!("List[{}]", py_type_hint(inner)),
         TypeRef::Map(k, v) => format!("Dict[{}, {}]", py_type_hint(k), py_type_hint(v)),
         TypeRef::Iterator(inner) => format!("Iterator[{}]", py_type_hint(inner)),
-        TypeRef::Callback(_) => unreachable!("validator should have rejected callback Python type"),
+        TypeRef::Callback(_) => "Callable[..., Any]".into(),
     }
 }
 
@@ -189,6 +192,7 @@ fn py_param_argtypes(ty: &TypeRef) -> Vec<String> {
             format!("ctypes.POINTER({})", py_ctypes_scalar(v)),
             "ctypes.c_size_t".into(),
         ],
+        TypeRef::Callback(name) => vec![format!("_{name}"), "ctypes.c_void_p".into()],
         _ => vec![py_ctypes_scalar(ty).into()],
     }
 }
@@ -580,6 +584,9 @@ fn render_python_module_content(
     for e in &m.enums {
         render_enum(out, e);
     }
+    for cb in &m.callbacks {
+        render_callback(out, cb);
+    }
     for s in &m.structs {
         render_struct(out, module_path, s);
         if s.builder {
@@ -602,7 +609,7 @@ import contextlib
 import ctypes
 import platform
 from enum import IntEnum
-from typing import Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 
 class WeaveffiError(Exception):
@@ -637,6 +644,8 @@ _lib.weaveffi_free_string.argtypes = [ctypes.c_void_p]
 _lib.weaveffi_free_string.restype = None
 _lib.weaveffi_free_bytes.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t]
 _lib.weaveffi_free_bytes.restype = None
+
+_callback_refs: List[Any] = []
 
 
 def _check_error(err: _WeaveffiErrorStruct) -> None:
@@ -682,6 +691,22 @@ fn render_enum(out: &mut String, e: &EnumDef) {
         out.push_str(&format!("\n    {} = {}", v.name, v.value));
     }
     out.push('\n');
+}
+
+fn render_callback(out: &mut String, cb: &CallbackDef) {
+    let ret = match &cb.returns {
+        None => "None".to_string(),
+        Some(ty) => py_ctypes_scalar(ty).to_string(),
+    };
+    let mut parts = vec![ret, "ctypes.c_void_p".to_string()];
+    for p in &cb.params {
+        parts.extend(py_param_argtypes(&p.ty));
+    }
+    out.push_str(&format!(
+        "\n\n_{} = ctypes.CFUNCTYPE({})\n",
+        cb.name,
+        parts.join(", ")
+    ));
 }
 
 fn render_struct(out: &mut String, module_name: &str, s: &StructDef) {
@@ -1058,6 +1083,12 @@ fn py_param_conversion(name: &str, ty: &TypeRef, ind: &str) -> Vec<String> {
                 format!("{ind}_{name}_va = ({vs} * len(_{name}_vals))({vconv})"),
             ]
         }
+        TypeRef::Callback(cb_name) => vec![
+            format!("{ind}def _{name}_tramp(_ctx, *args):"),
+            format!("{ind}    return {name}(*args)"),
+            format!("{ind}_{name}_cfunc = _{cb_name}(_{name}_tramp)"),
+            format!("{ind}_callback_refs.append(_{name}_cfunc)"),
+        ],
         _ => vec![],
     }
 }
@@ -1104,7 +1135,7 @@ fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
         ],
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
         TypeRef::Callback(_) => {
-            unreachable!("validator should have rejected callback Python param call args")
+            vec![format!("_{name}_cfunc"), "ctypes.c_void_p(0)".into()]
         }
     }
 }
@@ -1424,7 +1455,7 @@ from weaveffi import *
 
 fn render_pyi_module(api: &Api, strip_module_prefix: bool) -> String {
     let mut out = String::from(
-        "from enum import IntEnum\nfrom typing import Dict, Iterator, List, Optional\n",
+        "from enum import IntEnum\nfrom typing import Any, Callable, Dict, Iterator, List, Optional\n",
     );
     for (m, path) in collect_modules_with_path(&api.modules) {
         for e in &m.enums {
@@ -1490,7 +1521,8 @@ mod tests {
     use camino::Utf8Path;
     use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{
-        Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
+        Api, CallbackDef, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField,
+        TypeRef,
     };
 
     fn make_api(modules: Vec<Module>) -> Api {
@@ -2799,7 +2831,7 @@ mod tests {
             "missing IntEnum import"
         );
         assert!(
-            pyi.contains("from typing import Dict, Iterator, List, Optional"),
+            pyi.contains("from typing import Any, Callable, Dict, Iterator, List, Optional"),
             "missing typing imports"
         );
 
@@ -2894,7 +2926,7 @@ mod tests {
 
         assert!(py.contains("import ctypes"));
         assert!(py.contains("from enum import IntEnum"));
-        assert!(py.contains("from typing import Dict, Iterator, List, Optional"));
+        assert!(py.contains("from typing import Any, Callable, Dict, Iterator, List, Optional"));
         assert!(py.contains("class WeaveffiError(Exception):"));
         assert!(py.contains("def _load_library()"));
         assert!(py.contains("_lib = _load_library()"));
@@ -3458,7 +3490,7 @@ mod tests {
         let pyi = render_pyi_module(&api, true);
 
         assert!(pyi.contains("from enum import IntEnum"));
-        assert!(pyi.contains("from typing import Dict, Iterator, List, Optional"));
+        assert!(pyi.contains("from typing import Any, Callable, Dict, Iterator, List, Optional"));
 
         assert!(pyi.contains("class ContactType(IntEnum):"));
         assert!(pyi.contains("    Personal: int"));
@@ -5031,12 +5063,12 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_excludes_callbacks_and_listeners() {
+    fn capabilities_includes_callbacks_excludes_listeners() {
         let caps = PythonGenerator.capabilities();
-        assert!(!caps.contains(&Capability::Callbacks));
+        assert!(caps.contains(&Capability::Callbacks));
         assert!(!caps.contains(&Capability::Listeners));
         for cap in Capability::ALL {
-            if matches!(cap, Capability::Callbacks | Capability::Listeners) {
+            if matches!(cap, Capability::Listeners) {
                 continue;
             }
             assert!(caps.contains(cap), "Python generator must support {cap:?}");
@@ -5044,20 +5076,91 @@ mod tests {
     }
 
     #[test]
-    fn callback_type_panics_with_validator_message() {
-        let cb = TypeRef::Callback("OnEvent".into());
-        let err = std::panic::catch_unwind(|| {
-            let _ = py_ctypes_scalar(&cb);
-        })
-        .expect_err("callback must panic");
-        let msg = err
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| err.downcast_ref::<&'static str>().map(|s| s.to_string()))
-            .unwrap_or_default();
+    fn python_emits_callback_cfunctype() {
+        let api = make_api(vec![Module {
+            name: "events".into(),
+            functions: vec![Function {
+                name: "subscribe".into(),
+                params: vec![Param {
+                    name: "handler".into(),
+                    ty: TypeRef::Callback("OnData".into()),
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![CallbackDef {
+                name: "OnData".into(),
+                params: vec![Param {
+                    name: "value".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+            }],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let py = render_python_module(&api, true);
+
         assert!(
-            msg.contains("validator should have rejected"),
-            "panic message did not mention validator: {msg}"
+            py.contains("_OnData = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_int32)"),
+            "missing CFUNCTYPE definition for callback: {py}"
+        );
+        assert!(
+            py.contains("from typing import Any, Callable, Dict, Iterator, List, Optional"),
+            "preamble must import Any and Callable: {py}"
+        );
+        assert!(
+            py.contains("_callback_refs: List[Any] = []"),
+            "preamble must define _callback_refs keep-alive list: {py}"
+        );
+        assert!(
+            py.contains("def subscribe(handler: Callable[..., Any]) -> None:"),
+            "wrapper must accept a Python Callable: {py}"
+        );
+        assert!(
+            py.contains("_OnData, ctypes.c_void_p"),
+            "argtypes must include the CFUNCTYPE and a c_void_p context: {py}"
+        );
+        assert!(
+            py.contains("def _handler_tramp(_ctx, *args):"),
+            "wrapper must emit a trampoline that ignores the context: {py}"
+        );
+        assert!(
+            py.contains("return handler(*args)"),
+            "trampoline must delegate to the user callable: {py}"
+        );
+        assert!(
+            py.contains("_handler_cfunc = _OnData(_handler_tramp)"),
+            "wrapper must wrap the trampoline via the CFUNCTYPE constructor: {py}"
+        );
+        assert!(
+            py.contains("_callback_refs.append(_handler_cfunc)"),
+            "wrapper must keep the cfunc alive in _callback_refs: {py}"
+        );
+        assert!(
+            py.contains("_fn(_handler_cfunc, ctypes.c_void_p(0), ctypes.byref(_err))"),
+            "C call must pass the cfunc and a null context: {py}"
+        );
+
+        let pyi = render_pyi_module(&api, true);
+        assert!(
+            pyi.contains("from typing import Any, Callable, Dict, Iterator, List, Optional"),
+            "pyi must import Any and Callable: {pyi}"
+        );
+        assert!(
+            pyi.contains("def subscribe(handler: Callable[..., Any]) -> None: ..."),
+            "pyi must declare callback param as Python Callable: {pyi}"
         );
     }
 }
