@@ -15,6 +15,7 @@ impl NodeGenerator {
         out_dir: &Utf8Path,
         package_name: &str,
         strip_module_prefix: bool,
+        c_prefix: &str,
     ) -> Result<()> {
         let dir = out_dir.join("node");
         std::fs::create_dir_all(&dir)?;
@@ -27,10 +28,10 @@ impl NodeGenerator {
             render_node_dts(api, strip_module_prefix),
         )?;
         std::fs::write(dir.join("package.json"), render_package_json(package_name))?;
-        std::fs::write(dir.join("binding.gyp"), render_binding_gyp())?;
+        std::fs::write(dir.join("binding.gyp"), render_binding_gyp(c_prefix))?;
         std::fs::write(
             dir.join("weaveffi_addon.c"),
-            render_addon_c(api, strip_module_prefix),
+            render_addon_c(api, strip_module_prefix, c_prefix),
         )?;
         Ok(())
     }
@@ -42,7 +43,7 @@ impl Generator for NodeGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "weaveffi", true)
+        self.generate_impl(api, out_dir, "weaveffi", true, "weaveffi")
     }
 
     fn generate_with_config(
@@ -56,6 +57,7 @@ impl Generator for NodeGenerator {
             out_dir,
             config.node_package_name(),
             config.strip_module_prefix,
+            config.c_prefix(),
         )
     }
 
@@ -104,19 +106,20 @@ fn render_package_json(name: &str) -> String {
     )
 }
 
-fn render_binding_gyp() -> String {
-    r#"{
+fn render_binding_gyp(c_prefix: &str) -> String {
+    format!(
+        r#"{{
   "targets": [
-    {
+    {{
       "target_name": "weaveffi",
       "sources": ["weaveffi_addon.c"],
       "include_dirs": ["../c"],
-      "libraries": ["-lweaveffi"]
-    }
+      "libraries": ["-l{c_prefix}"]
+    }}
   ]
-}
+}}
 "#
-    .to_string()
+    )
 }
 
 fn is_c_ptr_type(ty: &TypeRef) -> bool {
@@ -214,9 +217,9 @@ fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Mo
     }
 }
 
-fn render_addon_c(api: &Api, strip_module_prefix: bool) -> String {
-    let mut out = String::from(
-        "#include <node_api.h>\n#include \"weaveffi.h\"\n#include <stdlib.h>\n#include <string.h>\n\n",
+fn render_addon_c(api: &Api, strip_module_prefix: bool, c_prefix: &str) -> String {
+    let mut out = format!(
+        "#include <node_api.h>\n#include \"{c_prefix}.h\"\n#include <stdlib.h>\n#include <string.h>\n\n",
     );
 
     let has_async = collect_all_modules(&api.modules)
@@ -2205,6 +2208,81 @@ mod tests {
     }
 
     #[test]
+    fn node_binding_gyp_respects_c_prefix() {
+        // When `c_prefix` is overridden, the Node generator must emit a
+        // `binding.gyp` whose `libraries` field links against `-l{c_prefix}`
+        // (Linux/macOS) and whose `include_dirs` points at the C output
+        // directory (`../c`), and `weaveffi_addon.c` must `#include
+        // "{c_prefix}.h"` so the native addon compiles against the matching
+        // library/header pair.
+        let api = make_api(vec![{
+            let mut m = make_module("math");
+            m.functions.push(Function {
+                name: "add".into(),
+                params: vec![
+                    Param {
+                        name: "a".into(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                    },
+                    Param {
+                        name: "b".into(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                    },
+                ],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            });
+            m
+        }]);
+
+        let config = GeneratorConfig {
+            c_prefix: Some("my_cool_lib".into()),
+            ..Default::default()
+        };
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_node_binding_gyp_c_prefix");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        NodeGenerator
+            .generate_with_config(&api, out_dir, &config)
+            .unwrap();
+
+        let gyp = std::fs::read_to_string(tmp.join("node/binding.gyp")).unwrap();
+        assert!(
+            gyp.contains("\"-lmy_cool_lib\""),
+            "binding.gyp must link against the prefix-derived library: {gyp}"
+        );
+        assert!(
+            !gyp.contains("-lweaveffi"),
+            "binding.gyp must not leak the default '-lweaveffi' when c_prefix is set: {gyp}"
+        );
+        assert!(
+            gyp.contains("\"../c\""),
+            "binding.gyp include_dirs must point at the C output directory: {gyp}"
+        );
+
+        let addon = std::fs::read_to_string(tmp.join("node/weaveffi_addon.c")).unwrap();
+        assert!(
+            addon.contains("#include \"my_cool_lib.h\""),
+            "weaveffi_addon.c must include the prefix-derived C header: {addon}"
+        );
+        assert!(
+            !addon.contains("#include \"weaveffi.h\""),
+            "weaveffi_addon.c must not include the default weaveffi.h when c_prefix is set: {addon}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn generate_node_dts_with_structs_and_enums() {
         let api = make_api(vec![Module {
             name: "contacts".to_string(),
@@ -2506,7 +2584,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi");
         assert!(
             !addon.contains("// TODO: implement"),
             "generated addon.c should not contain TODO comments: {addon}"
@@ -2533,7 +2611,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi");
         assert!(
             addon.contains("napi_get_cb_info"),
             "generated addon.c should call napi_get_cb_info: {addon}"
@@ -2576,7 +2654,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi");
         assert!(
             addon.contains("size_t name_len = 0;"),
             "optional string len must be zero-initialised outside the if block: {addon}"
@@ -2627,7 +2705,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi");
         assert!(
             addon.contains(
                 "weaveffi_contacts_set_contact_name((weaveffi_handle_t)contact_raw, (const uint8_t*)new_name, (size_t)new_name_len, &err);"
@@ -2674,7 +2752,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi");
         assert!(
             addon.contains(
                 "weaveffi_contacts_Contact_Builder_set_name((weaveffi_handle_t)builder_raw, (const uint8_t*)value, (size_t)value_len, &err);"
@@ -2703,7 +2781,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi");
         assert!(
             addon.contains("weaveffi_free_string(result)"),
             "generated addon should free returned strings: {addon}"
@@ -2749,7 +2827,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi");
         assert!(
             addon.contains("err.code"),
             "generated addon.c should check err.code: {addon}"
@@ -3044,7 +3122,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi");
         assert!(
             addon.contains("free(name)"),
             "malloc'd JS string copy should be freed after the C call: {addon}"
@@ -3110,7 +3188,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi");
         assert!(
             addon.contains("if (result == NULL)"),
             "optional struct return should null-check before wrapping: {addon}"
@@ -3186,7 +3264,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi");
         assert!(
             addon.contains("napi_create_promise"),
             "async addon should call napi_create_promise: {addon}"
@@ -3234,7 +3312,7 @@ mod tests {
             m
         }]);
 
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi");
 
         assert!(
             addon.contains("weaveffi_cancel_token* tok = weaveffi_cancel_token_create();"),
@@ -3346,7 +3424,7 @@ mod tests {
             since: None,
         });
         let api = make_api(vec![m]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi");
         assert!(
             addon.contains("napi_get_buffer_info(env, args[0], &payload_raw, &payload_len);"),
             "Node addon must read buffer ptr+len: {addon}"
@@ -3371,7 +3449,7 @@ mod tests {
             since: None,
         });
         let api = make_api(vec![m]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi");
         assert!(
             addon.contains("uint8_t* result = weaveffi_io_read("),
             "Node addon must capture C return as uint8_t* (no const): {addon}"
@@ -3413,7 +3491,7 @@ mod tests {
         });
         let api = make_api(vec![m]);
 
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi");
         assert!(
             addon.contains(
                 "int32_t rc = weaveffi_data_ListItemsIterator_next(iter, &out_item, &err);"
@@ -3521,7 +3599,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi");
         let throw_pos = addon
             .find("napi_throw_error(env, NULL, err.message);")
             .expect("addon must throw with err.message before clearing");
@@ -3569,7 +3647,7 @@ mod tests {
             since: None,
         });
         let api = make_api(vec![m]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi");
 
         let copy_pos = addon
             .find("napi_create_buffer_copy(env, out_len, result, NULL, &ret);")
@@ -3610,7 +3688,7 @@ mod tests {
         });
         let api = make_api(vec![m]);
 
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi");
         assert!(
             addon.contains("Napi_weaveffi_contacts_Contact_destroy"),
             "addon must define a napi wrapper for the struct destroy: {addon}"
@@ -3724,7 +3802,7 @@ mod tests {
             "subscribe should accept OnData callback: {dts}"
         );
 
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi");
 
         assert!(
             addon.contains(
@@ -3847,7 +3925,7 @@ mod tests {
             "module.exports must export the listener class: {js}"
         );
 
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi");
         assert!(
             addon.contains("typedef struct weaveffi_listener_entry {"),
             "addon must declare the shared listener registry entry type: {addon}"
