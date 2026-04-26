@@ -67,6 +67,7 @@ impl Generator for RubyGenerator {
             Capability::Builders,
             Capability::Callbacks,
             Capability::Listeners,
+            Capability::Iterators,
             Capability::CancellableAsync,
             Capability::TypedHandles,
             Capability::BorrowedTypes,
@@ -138,9 +139,29 @@ fn rb_return_out_params(ty: &TypeRef) -> Vec<&'static str> {
     match ty {
         TypeRef::Bytes | TypeRef::BorrowedBytes => vec![":pointer"],
         TypeRef::Optional(inner) if is_c_pointer_type(inner) => rb_return_out_params(inner),
-        TypeRef::List(_) | TypeRef::Iterator(_) => vec![":pointer"],
+        TypeRef::List(_) => vec![":pointer"],
+        TypeRef::Iterator(_) => vec![],
         TypeRef::Map(_, _) => vec![":pointer", ":pointer", ":pointer"],
         _ => vec![],
+    }
+}
+
+fn iter_type_name(module: &str, func_name: &str) -> String {
+    let pascal = func_name.to_upper_camel_case();
+    format!("weaveffi_{module}_{pascal}Iterator")
+}
+
+fn rb_iter_item_expr(inner: &TypeRef) -> String {
+    match inner {
+        TypeRef::Bool => "out_item.read_int32 != 0".into(),
+        TypeRef::TypedHandle(name) => format!("{name}.new(out_item.read_pointer)"),
+        TypeRef::Struct(name) => {
+            format!("{}.new(out_item.read_pointer)", local_type_name(name))
+        }
+        _ => {
+            let read = rb_read_method(inner);
+            format!("out_item.{read}")
+        }
     }
 }
 
@@ -494,6 +515,15 @@ fn render_attach_function(out: &mut String, module_name: &str, f: &Function) {
         "  attach_function :{c_sym}, [{}], {restype}\n",
         argtypes.join(", ")
     ));
+    if let Some(TypeRef::Iterator(_)) = &f.returns {
+        let iter_tag = iter_type_name(module_name, &f.name);
+        out.push_str(&format!(
+            "  attach_function :{iter_tag}_next, [:pointer, :pointer, :pointer], :int32\n"
+        ));
+        out.push_str(&format!(
+            "  attach_function :{iter_tag}_destroy, [:pointer], :void\n"
+        ));
+    }
 }
 
 fn render_struct_class(
@@ -664,12 +694,46 @@ fn render_function_wrapper(out: &mut String, module_name: &str, f: &Function) {
             let (k, v) = get_map_kv(ret_ty).unwrap();
             let is_optional = matches!(ret_ty, TypeRef::Optional(_));
             render_map_return_code(out, k, v, ind, is_optional);
+        } else if let TypeRef::Iterator(inner) = ret_ty {
+            render_iterator_return(out, module_name, &f.name, inner, ind);
         } else {
             render_return_code(out, ret_ty, ind, None);
         }
     }
 
     out.push_str("  end\n");
+}
+
+fn render_iterator_return(
+    out: &mut String,
+    module_name: &str,
+    func_name: &str,
+    inner: &TypeRef,
+    ind: &str,
+) {
+    let iter_tag = iter_type_name(module_name, func_name);
+    let item_mem = rb_mem_type(inner);
+    let item_expr = rb_iter_item_expr(inner);
+
+    out.push_str(&format!("{ind}iter_ptr = result\n"));
+    out.push_str(&format!("{ind}Enumerator.new do |y|\n"));
+    out.push_str(&format!("{ind}  begin\n"));
+    out.push_str(&format!("{ind}    loop do\n"));
+    out.push_str(&format!(
+        "{ind}      out_item = FFI::MemoryPointer.new({item_mem})\n"
+    ));
+    out.push_str(&format!("{ind}      item_err = ErrorStruct.new\n"));
+    out.push_str(&format!(
+        "{ind}      has_item = {iter_tag}_next(iter_ptr, out_item, item_err)\n"
+    ));
+    out.push_str(&format!("{ind}      check_error!(item_err)\n"));
+    out.push_str(&format!("{ind}      break if has_item.zero?\n"));
+    out.push_str(&format!("{ind}      y << {item_expr}\n"));
+    out.push_str(&format!("{ind}    end\n"));
+    out.push_str(&format!("{ind}  ensure\n"));
+    out.push_str(&format!("{ind}    {iter_tag}_destroy(iter_ptr)\n"));
+    out.push_str(&format!("{ind}  end\n"));
+    out.push_str(&format!("{ind}end\n"));
 }
 
 // ── Parameter conversion ──
@@ -844,9 +908,12 @@ fn render_return_code(out: &mut String, ty: &TypeRef, ind: &str, qualifier: Opti
             out.push_str(&format!("{ind}{}.new(result)\n", local_type_name(name)));
         }
         TypeRef::Optional(inner) => render_optional_return_code(out, inner, ind, qualifier),
-        TypeRef::List(inner) | TypeRef::Iterator(inner) => {
+        TypeRef::List(inner) => {
             out.push_str(&format!("{ind}return [] if result.null?\n"));
             render_list_return_body(out, inner, ind);
+        }
+        TypeRef::Iterator(_) => {
+            unreachable!("iterator returns are handled in render_function_wrapper")
         }
         TypeRef::Map(_, _) | TypeRef::Callback(_) => {
             out.push_str(&format!("{ind}result\n"));
@@ -2668,14 +2735,14 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_includes_callbacks_and_listeners_excludes_async_and_iterators() {
+    fn capabilities_includes_callbacks_and_listeners_and_iterators_excludes_async() {
         let caps = RubyGenerator.capabilities();
         assert!(caps.contains(&Capability::Callbacks));
         assert!(caps.contains(&Capability::Listeners));
+        assert!(caps.contains(&Capability::Iterators));
         assert!(!caps.contains(&Capability::AsyncFunctions));
-        assert!(!caps.contains(&Capability::Iterators));
         for cap in Capability::ALL {
-            if matches!(cap, Capability::AsyncFunctions | Capability::Iterators) {
+            if matches!(cap, Capability::AsyncFunctions) {
                 continue;
             }
             assert!(caps.contains(cap), "Ruby generator must support {cap:?}");
@@ -2822,6 +2889,88 @@ mod tests {
         assert!(
             code.contains("@@callbacks.delete(id)"),
             "unregister must unpin the Proc from @@callbacks: {code}"
+        );
+    }
+
+    #[test]
+    fn ruby_iterator_return_uses_lazy_enumerator() {
+        let api = make_api(vec![simple_module(
+            "data",
+            vec![Function {
+                name: "list_items".into(),
+                params: vec![],
+                returns: Some(TypeRef::Iterator(Box::new(TypeRef::I32))),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+        )]);
+
+        let code = render_ruby_module(&api, "WeaveFFI");
+
+        assert!(
+            code.contains("attach_function :weaveffi_data_list_items, [:pointer], :pointer"),
+            "main function returns the iterator handle and only takes the err out-param: {code}"
+        );
+        assert!(
+            code.contains(
+                "attach_function :weaveffi_data_ListItemsIterator_next, \
+                 [:pointer, :pointer, :pointer], :int32"
+            ),
+            "per-iterator _next must be attached with (iter, out_item, err) -> int32: {code}"
+        );
+        assert!(
+            code.contains(
+                "attach_function :weaveffi_data_ListItemsIterator_destroy, [:pointer], :void"
+            ),
+            "per-iterator _destroy must be attached taking the iterator handle: {code}"
+        );
+
+        let fn_start = code
+            .find("def self.list_items")
+            .expect("list_items wrapper");
+        let fn_body = &code[fn_start..];
+        let fn_end = fn_body.find("\n  end\n").unwrap();
+        let fn_text = &fn_body[..fn_end];
+
+        assert!(
+            fn_text.contains("Enumerator.new do |y|"),
+            "wrapper must return a lazy Enumerator, not an Array: {fn_text}"
+        );
+        assert!(
+            fn_text.contains("loop do"),
+            "Enumerator body must drive _next in a loop: {fn_text}"
+        );
+        assert!(
+            fn_text.contains("weaveffi_data_ListItemsIterator_next(iter_ptr, out_item, item_err)"),
+            "loop must invoke _next with (iter_ptr, out_item, item_err): {fn_text}"
+        );
+        assert!(
+            fn_text.contains("break if has_item.zero?"),
+            "loop must terminate when _next reports no more items: {fn_text}"
+        );
+        assert!(
+            fn_text.contains("y << out_item.read_int32"),
+            "items must be yielded (not collected) to the Enumerator: {fn_text}"
+        );
+        assert!(
+            fn_text.contains("weaveffi_data_ListItemsIterator_destroy(iter_ptr)"),
+            "wrapper must call _destroy once iteration ends: {fn_text}"
+        );
+        assert!(
+            fn_text.contains("ensure"),
+            "destroy must run in an ensure block so it fires even on early exit: {fn_text}"
+        );
+
+        assert!(
+            !fn_text.contains("result.read_array_of_int32"),
+            "iterator must not be materialised via read_array_of_*: {fn_text}"
+        );
+        assert!(
+            !fn_text.contains("return [] if result.null?"),
+            "iterator must not fall through the list return path: {fn_text}"
         );
     }
 }
