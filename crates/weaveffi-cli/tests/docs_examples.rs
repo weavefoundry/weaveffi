@@ -662,3 +662,119 @@ fn getting_started_yaml_validates_via_cli() {
         .success()
         .stdout(predicates::str::contains("Validation passed"));
 }
+
+/// Every sample README must explain the same four things: the features
+/// demonstrated, the IDL highlights, the generate command, and what to
+/// look for in the generated output. These tests guard that contract so a
+/// future refactor does not quietly drop a section.
+fn assert_sample_readme_sections(sample: &str) {
+    let readme = read_doc(&format!("samples/{sample}/README.md"));
+    let required = [
+        "## What this sample demonstrates",
+        "## IDL highlights",
+        "## Generate",
+        "## What to look for in the generated output",
+    ];
+    for heading in required {
+        assert!(
+            readme.contains(heading),
+            "samples/{sample}/README.md must contain `{heading}`: {readme}"
+        );
+    }
+}
+
+#[test]
+fn contacts_readme_has_required_sections() {
+    assert_sample_readme_sections("contacts");
+    let readme = read_doc("samples/contacts/README.md");
+    assert!(
+        readme.contains("contacts.yml"),
+        "contacts README must reference its IDL file: {readme}"
+    );
+    assert!(
+        readme.contains("cargo run -p weaveffi-cli -- generate samples/contacts/contacts.yml"),
+        "contacts README must include the generate command: {readme}"
+    );
+}
+
+#[test]
+fn inventory_readme_has_required_sections() {
+    assert_sample_readme_sections("inventory");
+    let readme = read_doc("samples/inventory/README.md");
+    assert!(
+        readme.contains("inventory.yml"),
+        "inventory README must reference its IDL file: {readme}"
+    );
+    assert!(
+        readme.contains("cargo run -p weaveffi-cli -- generate samples/inventory/inventory.yml"),
+        "inventory README must include the generate command: {readme}"
+    );
+    for module in ["products", "orders"] {
+        assert!(
+            readme.contains(module),
+            "inventory README must mention the `{module}` module: {readme}"
+        );
+    }
+}
+
+#[test]
+fn async_demo_readme_has_required_sections() {
+    assert_sample_readme_sections("async-demo");
+    let readme = read_doc("samples/async-demo/README.md");
+    assert!(
+        readme.contains("async_demo.yml"),
+        "async-demo README must reference its IDL file: {readme}"
+    );
+    assert!(
+        readme.contains("cargo run -p weaveffi-cli -- generate samples/async-demo/async_demo.yml"),
+        "async-demo README must include the generate command: {readme}"
+    );
+    assert!(
+        readme.contains("async: true"),
+        "async-demo README must call out the async IDL flag: {readme}"
+    );
+    assert!(
+        readme.contains("_async"),
+        "async-demo README must document the _async C ABI suffix: {readme}"
+    );
+}
+
+#[test]
+fn events_readme_has_required_sections() {
+    assert_sample_readme_sections("events");
+    let readme = read_doc("samples/events/README.md");
+    assert!(
+        readme.contains("events.yml"),
+        "events README must reference its IDL file: {readme}"
+    );
+    assert!(
+        readme.contains("cargo run -p weaveffi-cli -- generate samples/events/events.yml"),
+        "events README must include the generate command: {readme}"
+    );
+    for token in ["callback", "listener", "iter"] {
+        assert!(
+            readme.contains(token),
+            "events README must mention `{token}`: {readme}"
+        );
+    }
+}
+
+#[test]
+fn node_addon_readme_has_required_sections() {
+    assert_sample_readme_sections("node-addon");
+    let readme = read_doc("samples/node-addon/README.md");
+    assert!(
+        readme.contains("calculator.yml"),
+        "node-addon README must reference the calculator IDL it consumes: {readme}"
+    );
+    assert!(
+        readme.contains("cargo run -p weaveffi-cli -- generate samples/calculator/calculator.yml"),
+        "node-addon README must include the generate command it depends on: {readme}"
+    );
+    for token in ["napi", "libloading", "WEAVEFFI_LIB"] {
+        assert!(
+            readme.contains(token),
+            "node-addon README must mention `{token}`: {readme}"
+        );
+    }
+}
