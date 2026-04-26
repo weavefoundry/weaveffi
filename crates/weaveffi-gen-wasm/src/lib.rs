@@ -1,7 +1,7 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
-use weaveffi_core::codegen::Generator;
+use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::local_type_name;
 use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, TypeRef};
@@ -56,6 +56,22 @@ impl Generator for WasmGenerator {
         config: &GeneratorConfig,
     ) -> Vec<String> {
         output_file_list(out_dir, config.wasm_module_name())
+    }
+
+    fn capabilities(&self) -> &'static [Capability] {
+        &[
+            Capability::Iterators,
+            Capability::Builders,
+            Capability::AsyncFunctions,
+            Capability::CancellableAsync,
+            Capability::TypedHandles,
+            Capability::BorrowedTypes,
+            Capability::MapTypes,
+            Capability::NestedModules,
+            Capability::CrossModuleTypes,
+            Capability::ErrorDomains,
+            Capability::DeprecatedAnnotations,
+        ]
     }
 }
 
@@ -2515,5 +2531,18 @@ mod tests {
             copy_pos < free_pos,
             "wasm.weaveffi_free_bytes must run AFTER the Uint8Array has copied the payload out of linear memory: {js}"
         );
+    }
+
+    #[test]
+    fn capabilities_excludes_callbacks_and_listeners() {
+        let caps = WasmGenerator.capabilities();
+        assert!(!caps.contains(&Capability::Callbacks));
+        assert!(!caps.contains(&Capability::Listeners));
+        for cap in Capability::ALL {
+            if matches!(cap, Capability::Callbacks | Capability::Listeners) {
+                continue;
+            }
+            assert!(caps.contains(cap), "WASM generator must support {cap:?}");
+        }
     }
 }

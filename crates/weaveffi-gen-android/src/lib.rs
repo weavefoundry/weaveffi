@@ -1,7 +1,7 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use std::fmt::Write as _;
-use weaveffi_core::codegen::Generator;
+use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name, wrapper_name};
 use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, TypeRef};
@@ -77,6 +77,22 @@ impl Generator for AndroidGenerator {
             out_dir
                 .join("android/src/main/cpp/weaveffi_jni.c")
                 .to_string(),
+        ]
+    }
+
+    fn capabilities(&self) -> &'static [Capability] {
+        &[
+            Capability::Iterators,
+            Capability::Builders,
+            Capability::AsyncFunctions,
+            Capability::CancellableAsync,
+            Capability::TypedHandles,
+            Capability::BorrowedTypes,
+            Capability::MapTypes,
+            Capability::NestedModules,
+            Capability::CrossModuleTypes,
+            Capability::ErrorDomains,
+            Capability::DeprecatedAnnotations,
         ]
     }
 }
@@ -4759,5 +4775,18 @@ mod tests {
             jni.contains("weaveffi_contacts_Contact_destroy("),
             "JNI native destroy must call the C ABI destroy: {jni}"
         );
+    }
+
+    #[test]
+    fn capabilities_excludes_callbacks_and_listeners() {
+        let caps = AndroidGenerator.capabilities();
+        assert!(!caps.contains(&Capability::Callbacks));
+        assert!(!caps.contains(&Capability::Listeners));
+        for cap in Capability::ALL {
+            if matches!(cap, Capability::Callbacks | Capability::Listeners) {
+                continue;
+            }
+            assert!(caps.contains(cap), "Android generator must support {cap:?}");
+        }
     }
 }

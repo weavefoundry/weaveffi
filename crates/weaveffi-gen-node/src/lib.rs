@@ -1,7 +1,7 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
-use weaveffi_core::codegen::Generator;
+use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_abi_struct_name, local_type_name, wrapper_name};
 use weaveffi_ir::ir::{Api, Function, Module, StructDef, TypeRef};
@@ -63,6 +63,21 @@ impl Generator for NodeGenerator {
             out_dir.join("node/package.json").to_string(),
             out_dir.join("node/binding.gyp").to_string(),
             out_dir.join("node/weaveffi_addon.c").to_string(),
+        ]
+    }
+
+    fn capabilities(&self) -> &'static [Capability] {
+        &[
+            Capability::Iterators,
+            Capability::Builders,
+            Capability::AsyncFunctions,
+            Capability::TypedHandles,
+            Capability::BorrowedTypes,
+            Capability::MapTypes,
+            Capability::NestedModules,
+            Capability::CrossModuleTypes,
+            Capability::ErrorDomains,
+            Capability::DeprecatedAnnotations,
         ]
     }
 }
@@ -2706,5 +2721,22 @@ mod tests {
             js.contains("FinalizationRegistry"),
             "index.js must register a FinalizationRegistry fallback: {js}"
         );
+    }
+
+    #[test]
+    fn capabilities_excludes_callbacks_listeners_and_cancellable_async() {
+        let caps = NodeGenerator.capabilities();
+        assert!(!caps.contains(&Capability::Callbacks));
+        assert!(!caps.contains(&Capability::Listeners));
+        assert!(!caps.contains(&Capability::CancellableAsync));
+        for cap in Capability::ALL {
+            if matches!(
+                cap,
+                Capability::Callbacks | Capability::Listeners | Capability::CancellableAsync
+            ) {
+                continue;
+            }
+            assert!(caps.contains(cap), "Node generator must support {cap:?}");
+        }
     }
 }

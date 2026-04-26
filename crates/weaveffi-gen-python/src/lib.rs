@@ -1,6 +1,6 @@
 use anyhow::Result;
 use camino::Utf8Path;
-use weaveffi_core::codegen::Generator;
+use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name, wrapper_name};
 use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, StructField, TypeRef};
@@ -78,6 +78,22 @@ impl Generator for PythonGenerator {
             out_dir.join("python/pyproject.toml").to_string(),
             out_dir.join("python/setup.py").to_string(),
             out_dir.join("python/README.md").to_string(),
+        ]
+    }
+
+    fn capabilities(&self) -> &'static [Capability] {
+        &[
+            Capability::Iterators,
+            Capability::Builders,
+            Capability::AsyncFunctions,
+            Capability::CancellableAsync,
+            Capability::TypedHandles,
+            Capability::BorrowedTypes,
+            Capability::MapTypes,
+            Capability::NestedModules,
+            Capability::CrossModuleTypes,
+            Capability::ErrorDomains,
+            Capability::DeprecatedAnnotations,
         ]
     }
 }
@@ -5002,5 +5018,18 @@ mod tests {
             pyi.contains("def Contact_Builder_set_name(builder: int, value: str) -> None: ..."),
             "pyi builder setter signature should still take str: {pyi}"
         );
+    }
+
+    #[test]
+    fn capabilities_excludes_callbacks_and_listeners() {
+        let caps = PythonGenerator.capabilities();
+        assert!(!caps.contains(&Capability::Callbacks));
+        assert!(!caps.contains(&Capability::Listeners));
+        for cap in Capability::ALL {
+            if matches!(cap, Capability::Callbacks | Capability::Listeners) {
+                continue;
+            }
+            assert!(caps.contains(cap), "Python generator must support {cap:?}");
+        }
     }
 }

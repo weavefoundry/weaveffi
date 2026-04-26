@@ -1,7 +1,7 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
-use weaveffi_core::codegen::Generator;
+use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_abi_struct_name, local_type_name};
 use weaveffi_ir::ir::{Api, ErrorCode, Function, Module, StructDef, StructField, TypeRef};
@@ -55,6 +55,22 @@ impl Generator for CppGenerator {
             out_dir.join("cpp/weaveffi.hpp").to_string(),
             out_dir.join("cpp/CMakeLists.txt").to_string(),
             out_dir.join("cpp/README.md").to_string(),
+        ]
+    }
+
+    fn capabilities(&self) -> &'static [Capability] {
+        &[
+            Capability::Iterators,
+            Capability::Builders,
+            Capability::AsyncFunctions,
+            Capability::CancellableAsync,
+            Capability::TypedHandles,
+            Capability::BorrowedTypes,
+            Capability::MapTypes,
+            Capability::NestedModules,
+            Capability::CrossModuleTypes,
+            Capability::ErrorDomains,
+            Capability::DeprecatedAnnotations,
         ]
     }
 }
@@ -3673,5 +3689,18 @@ mod tests {
         assert!(dtor_null_pos > dtor_destroy_pos);
         assert!(move_destroy_pos > move_assign_pos);
         assert!(null_source_pos > move_destroy_pos);
+    }
+
+    #[test]
+    fn capabilities_excludes_callbacks_and_listeners() {
+        let caps = CppGenerator.capabilities();
+        assert!(!caps.contains(&Capability::Callbacks));
+        assert!(!caps.contains(&Capability::Listeners));
+        for cap in Capability::ALL {
+            if matches!(cap, Capability::Callbacks | Capability::Listeners) {
+                continue;
+            }
+            assert!(caps.contains(cap), "C++ generator must support {cap:?}");
+        }
     }
 }

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
-use weaveffi_core::codegen::Generator;
+use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name};
 use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, TypeRef};
@@ -43,6 +43,21 @@ impl Generator for DartGenerator {
             out_dir.join("dart/lib/weaveffi.dart").to_string(),
             out_dir.join("dart/pubspec.yaml").to_string(),
             out_dir.join("dart/README.md").to_string(),
+        ]
+    }
+
+    fn capabilities(&self) -> &'static [Capability] {
+        &[
+            Capability::Iterators,
+            Capability::AsyncFunctions,
+            Capability::CancellableAsync,
+            Capability::TypedHandles,
+            Capability::BorrowedTypes,
+            Capability::MapTypes,
+            Capability::NestedModules,
+            Capability::CrossModuleTypes,
+            Capability::ErrorDomains,
+            Capability::DeprecatedAnnotations,
         ]
     }
 }
@@ -2534,5 +2549,22 @@ mod tests {
             finally_body.contains("calloc.free(valueBuf);"),
             "builder setter wrapper must free the buffer in the finally block: {finally_body}"
         );
+    }
+
+    #[test]
+    fn capabilities_excludes_callbacks_listeners_and_builders() {
+        let caps = DartGenerator.capabilities();
+        assert!(!caps.contains(&Capability::Callbacks));
+        assert!(!caps.contains(&Capability::Listeners));
+        assert!(!caps.contains(&Capability::Builders));
+        for cap in Capability::ALL {
+            if matches!(
+                cap,
+                Capability::Callbacks | Capability::Listeners | Capability::Builders
+            ) {
+                continue;
+            }
+            assert!(caps.contains(cap), "Dart generator must support {cap:?}");
+        }
     }
 }

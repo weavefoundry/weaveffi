@@ -1,7 +1,7 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
-use weaveffi_core::codegen::Generator;
+use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name, wrapper_name};
 use weaveffi_ir::ir::{Api, EnumDef, Function, Module, Param, StructDef, StructField, TypeRef};
@@ -64,6 +64,22 @@ impl Generator for DotnetGenerator {
             out_dir.join("dotnet/WeaveFFI.csproj").to_string(),
             out_dir.join("dotnet/WeaveFFI.nuspec").to_string(),
             out_dir.join("dotnet/README.md").to_string(),
+        ]
+    }
+
+    fn capabilities(&self) -> &'static [Capability] {
+        &[
+            Capability::Iterators,
+            Capability::Builders,
+            Capability::AsyncFunctions,
+            Capability::CancellableAsync,
+            Capability::TypedHandles,
+            Capability::BorrowedTypes,
+            Capability::MapTypes,
+            Capability::NestedModules,
+            Capability::CrossModuleTypes,
+            Capability::ErrorDomains,
+            Capability::DeprecatedAnnotations,
         ]
     }
 }
@@ -4601,5 +4617,18 @@ mod tests {
             .find("~Contact()")
             .expect("Contact must declare a finalizer");
         assert!(cs[finalizer_pos..].contains("Dispose();"));
+    }
+
+    #[test]
+    fn capabilities_excludes_callbacks_and_listeners() {
+        let caps = DotnetGenerator.capabilities();
+        assert!(!caps.contains(&Capability::Callbacks));
+        assert!(!caps.contains(&Capability::Listeners));
+        for cap in Capability::ALL {
+            if matches!(cap, Capability::Callbacks | Capability::Listeners) {
+                continue;
+            }
+            assert!(caps.contains(cap), ".NET generator must support {cap:?}");
+        }
     }
 }

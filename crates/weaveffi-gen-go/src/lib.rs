@@ -1,7 +1,7 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
-use weaveffi_core::codegen::Generator;
+use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name};
 use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, StructField, TypeRef};
@@ -42,6 +42,19 @@ impl Generator for GoGenerator {
             out_dir.join("go/weaveffi.go").to_string(),
             out_dir.join("go/go.mod").to_string(),
             out_dir.join("go/README.md").to_string(),
+        ]
+    }
+
+    fn capabilities(&self) -> &'static [Capability] {
+        &[
+            Capability::CancellableAsync,
+            Capability::TypedHandles,
+            Capability::BorrowedTypes,
+            Capability::MapTypes,
+            Capability::NestedModules,
+            Capability::CrossModuleTypes,
+            Capability::ErrorDomains,
+            Capability::DeprecatedAnnotations,
         ]
     }
 }
@@ -3118,5 +3131,28 @@ mod tests {
             !fn_text.contains("defer C.free"),
             "builder setter must not defer C.free for the string param: {fn_text}"
         );
+    }
+
+    #[test]
+    fn capabilities_excludes_callbacks_listeners_async_iterators_builders() {
+        let caps = GoGenerator.capabilities();
+        assert!(!caps.contains(&Capability::Callbacks));
+        assert!(!caps.contains(&Capability::Listeners));
+        assert!(!caps.contains(&Capability::AsyncFunctions));
+        assert!(!caps.contains(&Capability::Iterators));
+        assert!(!caps.contains(&Capability::Builders));
+        for cap in Capability::ALL {
+            if matches!(
+                cap,
+                Capability::Callbacks
+                    | Capability::Listeners
+                    | Capability::AsyncFunctions
+                    | Capability::Iterators
+                    | Capability::Builders
+            ) {
+                continue;
+            }
+            assert!(caps.contains(cap), "Go generator must support {cap:?}");
+        }
     }
 }

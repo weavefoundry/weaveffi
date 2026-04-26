@@ -1,7 +1,7 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
-use weaveffi_core::codegen::Generator;
+use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::c_abi_struct_name;
 use weaveffi_ir::ir::{Api, EnumDef, Module, Param, StructDef, TypeRef};
@@ -59,6 +59,23 @@ impl Generator for CGenerator {
         vec![
             out_dir.join(format!("c/{prefix}.h")).to_string(),
             out_dir.join(format!("c/{prefix}.c")).to_string(),
+        ]
+    }
+
+    fn capabilities(&self) -> &'static [Capability] {
+        &[
+            Capability::Listeners,
+            Capability::Iterators,
+            Capability::Builders,
+            Capability::AsyncFunctions,
+            Capability::CancellableAsync,
+            Capability::TypedHandles,
+            Capability::BorrowedTypes,
+            Capability::MapTypes,
+            Capability::NestedModules,
+            Capability::CrossModuleTypes,
+            Capability::ErrorDomains,
+            Capability::DeprecatedAnnotations,
         ]
     }
 }
@@ -3042,5 +3059,17 @@ mod tests {
             header.contains("void myffi_free(uint8_t* ptr, size_t size);"),
             "free prototype must honor configured c_prefix: {header}"
         );
+    }
+
+    #[test]
+    fn capabilities_excludes_callbacks() {
+        let caps = CGenerator.capabilities();
+        assert!(!caps.contains(&Capability::Callbacks));
+        for cap in Capability::ALL {
+            if *cap == Capability::Callbacks {
+                continue;
+            }
+            assert!(caps.contains(cap), "C generator must support {cap:?}");
+        }
     }
 }

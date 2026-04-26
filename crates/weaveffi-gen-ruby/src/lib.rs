@@ -1,7 +1,7 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToShoutySnakeCase, ToSnakeCase};
-use weaveffi_core::codegen::Generator;
+use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name};
 use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, StructField, TypeRef};
@@ -57,6 +57,20 @@ impl Generator for RubyGenerator {
             out_dir.join("ruby/lib/weaveffi.rb").to_string(),
             out_dir.join("ruby/weaveffi.gemspec").to_string(),
             out_dir.join("ruby/README.md").to_string(),
+        ]
+    }
+
+    fn capabilities(&self) -> &'static [Capability] {
+        &[
+            Capability::Builders,
+            Capability::CancellableAsync,
+            Capability::TypedHandles,
+            Capability::BorrowedTypes,
+            Capability::MapTypes,
+            Capability::NestedModules,
+            Capability::CrossModuleTypes,
+            Capability::ErrorDomains,
+            Capability::DeprecatedAnnotations,
         ]
     }
 }
@@ -2573,5 +2587,26 @@ mod tests {
             rb.contains("@handle = nil"),
             "Contact#destroy must null out @handle for idempotency: {rb}"
         );
+    }
+
+    #[test]
+    fn capabilities_excludes_callbacks_listeners_async_and_iterators() {
+        let caps = RubyGenerator.capabilities();
+        assert!(!caps.contains(&Capability::Callbacks));
+        assert!(!caps.contains(&Capability::Listeners));
+        assert!(!caps.contains(&Capability::AsyncFunctions));
+        assert!(!caps.contains(&Capability::Iterators));
+        for cap in Capability::ALL {
+            if matches!(
+                cap,
+                Capability::Callbacks
+                    | Capability::Listeners
+                    | Capability::AsyncFunctions
+                    | Capability::Iterators
+            ) {
+                continue;
+            }
+            assert!(caps.contains(cap), "Ruby generator must support {cap:?}");
+        }
     }
 }
