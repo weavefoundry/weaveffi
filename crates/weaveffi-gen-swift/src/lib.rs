@@ -4215,7 +4215,8 @@ mod tests {
         // `(const uint8_t* msg_ptr, size_t msg_len)`, plus the trailing
         // `weaveffi_error* err`. The Swift wrapper must materialise those exact
         // arguments at the call site, and the system module must import the
-        // generated `weaveffi.h` so the C prototype resolves at compile time.
+        // generated `weaveffi.h` and link `weaveffi` so the C prototype
+        // resolves at compile+link time.
         let api = make_api(vec![Module {
             name: "echo".to_string(),
             functions: vec![Function {
@@ -4253,6 +4254,10 @@ mod tests {
             modulemap.contains("header \"../../c/weaveffi.h\""),
             "modulemap must import the generated C header so the prototype resolves: {modulemap}"
         );
+        assert!(
+            modulemap.contains("link \"weaveffi\""),
+            "modulemap must link the weaveffi C library so the prototype resolves at link time: {modulemap}"
+        );
 
         let swift =
             std::fs::read_to_string(tmp.join("swift/Sources/WeaveFFI/WeaveFFI.swift")).unwrap();
@@ -4262,7 +4267,8 @@ mod tests {
         );
         assert!(
             swift.contains("let msg_bytes = Array(msg.utf8)"),
-            "string param should be materialised as a UTF-8 byte array: {swift}"
+            "string param should be materialised as a [UInt8] byte array so baseAddress \
+             resolves to UnsafePointer<UInt8> == const uint8_t*: {swift}"
         );
         assert!(
             swift.contains("msg_bytes.withUnsafeBufferPointer"),
@@ -4270,15 +4276,67 @@ mod tests {
         );
         assert!(
             swift.contains("let msg_ptr = msg_buf.baseAddress!"),
-            "string param should expose msg_ptr from the buffer: {swift}"
+            "string param should expose msg_ptr (UnsafePointer<UInt8>) from the buffer: {swift}"
         );
         assert!(
             swift.contains("let msg_len = msg_buf.count"),
-            "string param should expose msg_len from the buffer: {swift}"
+            "string param should expose msg_len (Int, matching size_t) from the buffer: {swift}"
         );
         assert!(
             swift.contains("weaveffi_echo_shout(msg_ptr, msg_len, &err)"),
             "C call must pass (msg_ptr, msg_len, &err) matching the new (const uint8_t*, size_t) C signature: {swift}"
+        );
+
+        // Arity guard: the call site must have exactly 3 top-level args
+        // (ptr, len, err). Any regression that drops the `len` or reverts to a
+        // single `const char*` parameter would trip this check.
+        let call_start = swift
+            .find("weaveffi_echo_shout(")
+            .expect("weaveffi_echo_shout call site missing");
+        let open = call_start + "weaveffi_echo_shout".len();
+        let mut depth = 0i32;
+        let mut end = open;
+        for (i, &b) in swift.as_bytes().iter().enumerate().skip(open) {
+            match b {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let args = &swift[open + 1..end];
+        let mut top_commas = 0usize;
+        let mut d = 0i32;
+        for ch in args.chars() {
+            match ch {
+                '(' | '[' | '{' | '<' => d += 1,
+                ')' | ']' | '}' | '>' => d -= 1,
+                ',' if d == 0 => top_commas += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            top_commas, 2,
+            "call site arity must match the new C signature (ptr, len, err) = 3 args / 2 commas; got args: {args:?}"
+        );
+
+        // No legacy NUL-terminated/const char* string convention may leak
+        // into the generated Swift: those would mismatch the new
+        // (const uint8_t*, size_t) C prototype.
+        assert!(
+            !swift.contains("msg.cString(using:"),
+            "Swift wrapper must not fall back to the legacy NUL-terminated cString path: {swift}"
+        );
+        assert!(
+            !swift.contains("UnsafePointer<CChar>(msg)")
+                && !swift.contains("strdup(msg)")
+                && !swift.contains("weaveffi_echo_shout(msg,"),
+            "Swift wrapper must not pass the Swift String directly as a single const char* arg: {swift}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
