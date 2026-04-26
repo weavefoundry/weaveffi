@@ -4,7 +4,9 @@ use heck::ToUpperCamelCase;
 use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name, wrapper_name};
-use weaveffi_ir::ir::{Api, EnumDef, Function, Module, Param, StructDef, StructField, TypeRef};
+use weaveffi_ir::ir::{
+    Api, CallbackDef, EnumDef, Function, Module, Param, StructDef, StructField, TypeRef,
+};
 
 pub struct DotnetGenerator;
 
@@ -69,6 +71,7 @@ impl Generator for DotnetGenerator {
 
     fn capabilities(&self) -> &'static [Capability] {
         &[
+            Capability::Callbacks,
             Capability::Iterators,
             Capability::Builders,
             Capability::AsyncFunctions,
@@ -113,7 +116,7 @@ fn cs_type(ty: &TypeRef) -> String {
         TypeRef::List(inner) => format!("{}[]", cs_type(inner)),
         TypeRef::Iterator(inner) => format!("IEnumerable<{}>", cs_type(inner)),
         TypeRef::Map(k, v) => format!("Dictionary<{}, {}>", cs_type(k), cs_type(v)),
-        TypeRef::Callback(_) => unreachable!("validator should have rejected callback .NET type"),
+        TypeRef::Callback(name) => name.clone(),
     }
 }
 
@@ -136,7 +139,7 @@ fn pinvoke_type(ty: &TypeRef) -> String {
         TypeRef::Handle => "ulong".into(),
         TypeRef::TypedHandle(_) => "IntPtr".into(),
         TypeRef::Enum(_) => "int".into(),
-        TypeRef::Callback(_) => unreachable!("validator should have rejected callback .NET type"),
+        TypeRef::Callback(_) => "IntPtr".into(),
     }
 }
 
@@ -170,6 +173,10 @@ fn pinvoke_param_list(p: &Param) -> Vec<String> {
                 format!("UIntPtr {}_len", p.name),
             ]
         }
+        TypeRef::Callback(_) => vec![
+            format!("IntPtr {}", p.name),
+            format!("IntPtr {}_ctx", p.name),
+        ],
         _ => vec![format!("{} {}", pinvoke_type(&p.ty), p.name)],
     }
 }
@@ -284,6 +291,11 @@ fn render_csharp(api: &Api, namespace: &str, strip_module_prefix: bool) -> Strin
     render_error_struct(&mut out);
     render_helpers_class(&mut out);
 
+    let has_callbacks = all_mods.iter().any(|m| !m.callbacks.is_empty());
+    if has_callbacks {
+        render_callback_handles_class(&mut out);
+    }
+
     for (m, path) in collect_modules_with_path(&api.modules) {
         for e in &m.enums {
             render_enum(&mut out, e);
@@ -291,6 +303,9 @@ fn render_csharp(api: &Api, namespace: &str, strip_module_prefix: bool) -> Strin
         for s in &m.structs {
             render_struct_class(&mut out, &path, s);
             render_builder_class(&mut out, &path, s);
+        }
+        for cb in &m.callbacks {
+            render_callback_delegate(&mut out, cb);
         }
     }
 
@@ -377,6 +392,36 @@ fn render_helpers_class(out: &mut String) {
     );
     out.push_str("        }\n");
     out.push_str("    }\n\n");
+}
+
+fn render_callback_handles_class(out: &mut String) {
+    out.push_str("    internal static class WeaveFFICallbackHandles\n    {\n");
+    out.push_str(
+        "        internal static readonly List<GCHandle> _handles = new List<GCHandle>();\n",
+    );
+    out.push_str("    }\n\n");
+}
+
+fn render_callback_delegate(out: &mut String, cb: &CallbackDef) {
+    if let Some(doc) = &cb.doc {
+        out.push_str(&format!("    /// <summary>{doc}</summary>\n"));
+    }
+    let ret_cs = cb
+        .returns
+        .as_ref()
+        .map(cs_type)
+        .unwrap_or_else(|| "void".into());
+    let params_sig: Vec<String> = cb
+        .params
+        .iter()
+        .map(|p| format!("{} {}", cs_type(&p.ty), safe_cs_name(&p.name)))
+        .collect();
+    out.push_str("    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]\n");
+    out.push_str(&format!(
+        "    public delegate {ret_cs} {}({});\n\n",
+        cb.name,
+        params_sig.join(", ")
+    ));
 }
 
 fn render_enum(out: &mut String, e: &EnumDef) {
@@ -873,6 +918,7 @@ fn param_needs_marshal(ty: &TypeRef) -> bool {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr | TypeRef::Bytes | TypeRef::BorrowedBytes => {
             true
         }
+        TypeRef::Callback(_) => true,
         TypeRef::Optional(inner) => matches!(
             inner.as_ref(),
             TypeRef::StringUtf8
@@ -889,6 +935,10 @@ fn param_needs_marshal(ty: &TypeRef) -> bool {
         ),
         _ => false,
     }
+}
+
+fn param_needs_cleanup(ty: &TypeRef) -> bool {
+    !matches!(ty, TypeRef::Callback(_)) && param_needs_marshal(ty)
 }
 
 fn reindent(out: &mut String, buf: &str, extra: usize) {
@@ -945,12 +995,16 @@ fn render_wrapper_method(
 
     out.push_str("            var err = new WeaveffiError();\n");
 
-    let needs_try = f.params.iter().any(|p| param_needs_marshal(&p.ty));
+    let needs_setup = f.params.iter().any(|p| param_needs_marshal(&p.ty));
+    let needs_cleanup = f.params.iter().any(|p| param_needs_cleanup(&p.ty));
 
-    if needs_try {
+    if needs_setup {
         for p in &f.params {
             render_marshal_setup(out, p, "            ");
         }
+    }
+
+    if needs_cleanup {
         out.push_str("            try\n            {\n");
         render_pinvoke_call_and_return(out, module_path, f, "                ");
         out.push_str("            }\n            finally\n            {\n");
@@ -1130,6 +1184,17 @@ fn render_marshal_setup(out: &mut String, p: &Param, indent: &str) {
                 "{indent}var {name}Pin = GCHandle.Alloc({name}, GCHandleType.Pinned);\n"
             ));
         }
+        TypeRef::Callback(_) => {
+            out.push_str(&format!(
+                "{indent}var {name}Handle = GCHandle.Alloc({name}, GCHandleType.Normal);\n"
+            ));
+            out.push_str(&format!(
+                "{indent}WeaveFFICallbackHandles._handles.Add({name}Handle);\n"
+            ));
+            out.push_str(&format!(
+                "{indent}var {name}Ptr = Marshal.GetFunctionPointerForDelegate({name});\n"
+            ));
+        }
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 => {
                 out.push_str(&format!("{indent}GCHandle {name}Pin = default;\n"));
@@ -1298,6 +1363,7 @@ fn build_call_args(params: &[Param]) -> String {
                     format!("{name}Pin.AddrOfPinnedObject()"),
                     format!("(UIntPtr){name}.Length"),
                 ],
+                TypeRef::Callback(_) => vec![format!("{name}Ptr"), "IntPtr.Zero".into()],
                 TypeRef::Optional(inner) => match inner.as_ref() {
                     TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
                         vec![format!("{name}?.Handle ?? IntPtr.Zero")]
@@ -4622,12 +4688,12 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_excludes_callbacks_and_listeners() {
+    fn capabilities_excludes_listeners() {
         let caps = DotnetGenerator.capabilities();
-        assert!(!caps.contains(&Capability::Callbacks));
+        assert!(caps.contains(&Capability::Callbacks));
         assert!(!caps.contains(&Capability::Listeners));
         for cap in Capability::ALL {
-            if matches!(cap, Capability::Callbacks | Capability::Listeners) {
+            if matches!(cap, Capability::Listeners) {
                 continue;
             }
             assert!(caps.contains(cap), ".NET generator must support {cap:?}");
@@ -4635,20 +4701,79 @@ mod tests {
     }
 
     #[test]
-    fn callback_type_panics_with_validator_message() {
-        let cb = TypeRef::Callback("OnEvent".into());
-        let err = std::panic::catch_unwind(|| {
-            let _ = cs_type(&cb);
-        })
-        .expect_err("callback must panic");
-        let msg = err
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| err.downcast_ref::<&'static str>().map(|s| s.to_string()))
-            .unwrap_or_default();
+    fn dotnet_emits_callback_delegate_and_pins_via_gc_handle() {
+        let api = make_api(vec![Module {
+            name: "events".into(),
+            functions: vec![Function {
+                name: "subscribe".into(),
+                params: vec![Param {
+                    name: "handler".into(),
+                    ty: TypeRef::Callback("OnData".into()),
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![CallbackDef {
+                name: "OnData".into(),
+                params: vec![Param {
+                    name: "value".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+            }],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let cs = render_csharp(&api, "WeaveFFI", true);
+
         assert!(
-            msg.contains("validator should have rejected"),
-            "panic message did not mention validator: {msg}"
+            cs.contains("[UnmanagedFunctionPointer(CallingConvention.Cdecl)]\n    public delegate void OnData(int value);"),
+            "missing delegate declaration with Cdecl attribute: {cs}"
+        );
+        assert!(
+            cs.contains("internal static class WeaveFFICallbackHandles"),
+            "missing static callback handles class: {cs}"
+        );
+        assert!(
+            cs.contains("internal static readonly List<GCHandle> _handles"),
+            "missing GCHandle list in static class: {cs}"
+        );
+        assert!(
+            cs.contains("public static void Subscribe(OnData handler)"),
+            "wrapper must accept the delegate type: {cs}"
+        );
+        assert!(
+            cs.contains("GCHandle.Alloc(handler, GCHandleType.Normal)"),
+            "wrapper must pin the delegate via GCHandle.Alloc with Normal: {cs}"
+        );
+        assert!(
+            cs.contains("WeaveFFICallbackHandles._handles.Add(handlerHandle)"),
+            "wrapper must store the GCHandle in the static collection: {cs}"
+        );
+        assert!(
+            cs.contains("Marshal.GetFunctionPointerForDelegate(handler)"),
+            "wrapper must use Marshal.GetFunctionPointerForDelegate: {cs}"
+        );
+        assert!(
+            cs.contains("NativeMethods.weaveffi_events_subscribe(handlerPtr, IntPtr.Zero"),
+            "P/Invoke must receive (ptr, IntPtr.Zero): {cs}"
+        );
+        assert!(
+            cs.contains(
+                "internal static extern void weaveffi_events_subscribe(IntPtr handler, IntPtr handler_ctx, ref WeaveffiError err);"
+            ),
+            "P/Invoke declaration must take (IntPtr, IntPtr, ref err): {cs}"
         );
     }
 }
