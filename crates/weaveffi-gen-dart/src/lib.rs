@@ -53,6 +53,7 @@ impl Generator for DartGenerator {
             Capability::Callbacks,
             Capability::Listeners,
             Capability::Iterators,
+            Capability::Builders,
             Capability::AsyncFunctions,
             Capability::CancellableAsync,
             Capability::TypedHandles,
@@ -80,15 +81,6 @@ fn dart_type(ty: &TypeRef) -> String {
         TypeRef::Iterator(inner) => format!("Iterable<{}>", dart_type(inner)),
         TypeRef::Map(k, v) => format!("Map<{}, {}>", dart_type(k), dart_type(v)),
         TypeRef::Callback(n) => n.to_upper_camel_case(),
-    }
-}
-
-fn dart_nullable_type_for_builder_field(ty: &TypeRef) -> String {
-    let t = dart_type(ty);
-    if t.ends_with('?') {
-        t
-    } else {
-        format!("{t}?")
     }
 }
 
@@ -332,7 +324,7 @@ fn render_dart_module(api: &Api) -> String {
         for s in &module.structs {
             render_struct(&mut out, &path, s);
             if s.builder {
-                render_dart_builder(&mut out, s);
+                render_dart_builder(&mut out, &path, s);
             }
         }
         for l in &module.listeners {
@@ -541,41 +533,132 @@ fn render_struct(out: &mut String, module_path: &str, s: &StructDef) {
     out.push_str("}\n");
 }
 
-fn render_dart_builder(out: &mut String, s: &StructDef) {
+fn render_dart_builder(out: &mut String, module_path: &str, s: &StructDef) {
     let class_name = s.name.to_upper_camel_case();
     let builder_name = format!("{class_name}Builder");
+    let c_prefix = format!("weaveffi_{}_{}", module_path, s.name);
+
+    let new_sym = format!("{c_prefix}_Builder_new");
+    emit_typedef_and_lookup(out, &new_sym, "", "", "Pointer<Void>", "Pointer<Void>");
+
+    for field in &s.fields {
+        let set_sym = format!("{c_prefix}_Builder_set_{}", field.name);
+        let mut native_params: Vec<String> = vec!["Pointer<Void>".into()];
+        native_params.extend(native_ffi_param_types(&field.ty));
+        let mut dart_params: Vec<String> = vec!["Pointer<Void>".into()];
+        dart_params.extend(dart_ffi_param_types(&field.ty));
+        emit_typedef_and_lookup(
+            out,
+            &set_sym,
+            &native_params.join(", "),
+            &dart_params.join(", "),
+            "Void",
+            "void",
+        );
+    }
+
+    let build_sym = format!("{c_prefix}_Builder_build");
+    emit_typedef_and_lookup(
+        out,
+        &build_sym,
+        "Pointer<Void>, Pointer<_WeaveffiError>",
+        "Pointer<Void>, Pointer<_WeaveffiError>",
+        "Pointer<Void>",
+        "Pointer<Void>",
+    );
+
+    let destroy_sym = format!("{c_prefix}_Builder_destroy");
+    emit_typedef_and_lookup(
+        out,
+        &destroy_sym,
+        "Pointer<Void>",
+        "Pointer<Void>",
+        "Void",
+        "void",
+    );
+
+    let new_var = new_sym.to_lower_camel_case();
+    let build_var = build_sym.to_lower_camel_case();
+    let destroy_var = destroy_sym.to_lower_camel_case();
 
     out.push_str(&format!("\nclass {builder_name} {{\n"));
-    for field in &s.fields {
-        let dt = dart_nullable_type_for_builder_field(&field.ty);
-        let priv_name = field.name.to_lower_camel_case();
-        out.push_str(&format!("  {dt} _{priv_name};\n"));
-    }
+    out.push_str(&format!("  Pointer<Void> _handle = _{new_var}();\n"));
 
     for field in &s.fields {
         let pascal = field.name.to_upper_camel_case();
         let dt = dart_type(&field.ty);
-        let priv_name = field.name.to_lower_camel_case();
-        out.push_str(&format!(
-            "\n  {builder_name} with{pascal}({dt} value) {{\n    _{priv_name} = value;\n    return this;\n  }}\n"
-        ));
+        let set_sym = format!("{c_prefix}_Builder_set_{}", field.name);
+        let set_var = set_sym.to_lower_camel_case();
+
+        out.push_str(&format!("\n  {builder_name} with{pascal}({dt} value) {{\n"));
+        emit_builder_setter_body(out, &field.ty, &set_var);
+        out.push_str("    return this;\n");
+        out.push_str("  }\n");
     }
 
     out.push_str(&format!("\n  {class_name} build() {{\n"));
-    for field in &s.fields {
-        if !matches!(&field.ty, TypeRef::Optional(_)) {
-            let priv_name = field.name.to_lower_camel_case();
-            out.push_str(&format!(
-                "    if (_{priv_name} == null) {{\n      throw StateError('missing field: {}');\n    }}\n",
-                field.name
-            ));
-        }
-    }
+    out.push_str("    final err = calloc<_WeaveffiError>();\n");
+    out.push_str("    try {\n");
     out.push_str(&format!(
-        "    throw UnimplementedError('{builder_name}.build requires FFI backing');\n"
+        "      final result = _{build_var}(_handle, err);\n"
     ));
+    out.push_str("      _checkError(err);\n");
+    out.push_str(&format!("      _{destroy_var}(_handle);\n"));
+    out.push_str("      _handle = nullptr;\n");
+    out.push_str(&format!("      return {class_name}._(result);\n"));
+    out.push_str("    } finally {\n");
+    out.push_str("      calloc.free(err);\n");
+    out.push_str("    }\n");
     out.push_str("  }\n");
     out.push_str("}\n");
+}
+
+fn emit_builder_setter_body(out: &mut String, ty: &TypeRef, set_var: &str) {
+    match ty {
+        TypeRef::StringUtf8 => {
+            out.push_str("    final valueBytes = utf8.encode(value);\n");
+            out.push_str("    final valueBuf = calloc<Uint8>(valueBytes.length);\n");
+            out.push_str("    valueBuf.asTypedList(valueBytes.length).setAll(0, valueBytes);\n");
+            out.push_str("    try {\n");
+            out.push_str(&format!(
+                "      _{set_var}(_handle, valueBuf, valueBytes.length);\n"
+            ));
+            out.push_str("    } finally {\n");
+            out.push_str("      calloc.free(valueBuf);\n");
+            out.push_str("    }\n");
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            out.push_str("    final valueBuf = calloc<Uint8>(value.length);\n");
+            out.push_str("    valueBuf.asTypedList(value.length).setAll(0, value);\n");
+            out.push_str("    try {\n");
+            out.push_str(&format!(
+                "      _{set_var}(_handle, valueBuf, value.length);\n"
+            ));
+            out.push_str("    } finally {\n");
+            out.push_str("      calloc.free(valueBuf);\n");
+            out.push_str("    }\n");
+        }
+        TypeRef::BorrowedStr => {
+            out.push_str("    final valuePtr = value.toNativeUtf8();\n");
+            out.push_str("    try {\n");
+            out.push_str(&format!("      _{set_var}(_handle, valuePtr);\n"));
+            out.push_str("    } finally {\n");
+            out.push_str("      calloc.free(valuePtr);\n");
+            out.push_str("    }\n");
+        }
+        TypeRef::Bool => {
+            out.push_str(&format!("    _{set_var}(_handle, value ? 1 : 0);\n"));
+        }
+        TypeRef::Enum(_) => {
+            out.push_str(&format!("    _{set_var}(_handle, value.value);\n"));
+        }
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+            out.push_str(&format!("    _{set_var}(_handle, value._handle);\n"));
+        }
+        _ => {
+            out.push_str(&format!("    _{set_var}(_handle, value);\n"));
+        }
+    }
 }
 
 fn render_function(out: &mut String, module_path: &str, f: &Function) {
@@ -1167,8 +1250,126 @@ mod tests {
             "fluent setter: {dart}"
         );
         assert!(
-            dart.contains("UnimplementedError('PointBuilder.build requires FFI backing')"),
-            "build stub: {dart}"
+            !dart.contains("UnimplementedError"),
+            "builder must not throw UnimplementedError: {dart}"
+        );
+    }
+
+    #[test]
+    fn dart_builder_build_calls_native() {
+        let api = make_api(vec![Module {
+            name: "geo".into(),
+            functions: vec![],
+            structs: vec![StructDef {
+                name: "Point".into(),
+                doc: None,
+                builder: true,
+                fields: vec![
+                    StructField {
+                        name: "x".into(),
+                        ty: TypeRef::F64,
+                        doc: None,
+                        default: None,
+                    },
+                    StructField {
+                        name: "y".into(),
+                        ty: TypeRef::F64,
+                        doc: None,
+                        default: None,
+                    },
+                ],
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let dart = render_dart_module(&api);
+
+        assert!(
+            dart.contains("'weaveffi_geo_Point_Builder_new'"),
+            "must look up Builder_new C symbol: {dart}"
+        );
+        assert!(
+            dart.contains("'weaveffi_geo_Point_Builder_set_x'"),
+            "must look up Builder_set_x C symbol: {dart}"
+        );
+        assert!(
+            dart.contains("'weaveffi_geo_Point_Builder_set_y'"),
+            "must look up Builder_set_y C symbol: {dart}"
+        );
+        assert!(
+            dart.contains("'weaveffi_geo_Point_Builder_build'"),
+            "must look up Builder_build C symbol: {dart}"
+        );
+        assert!(
+            dart.contains("'weaveffi_geo_Point_Builder_destroy'"),
+            "must look up Builder_destroy C symbol: {dart}"
+        );
+
+        assert!(
+            dart.contains("typedef _NativeWeaveffiGeoPointBuilderNew = Pointer<Void> Function();"),
+            "Builder_new native typedef must return Pointer<Void> with no params: {dart}"
+        );
+        assert!(
+            dart.contains(
+                "typedef _NativeWeaveffiGeoPointBuilderBuild = Pointer<Void> Function(Pointer<Void>, Pointer<_WeaveffiError>);"
+            ),
+            "Builder_build native typedef must take (Pointer<Void>, Pointer<_WeaveffiError>) and return Pointer<Void>: {dart}"
+        );
+        assert!(
+            dart.contains(
+                "typedef _NativeWeaveffiGeoPointBuilderDestroy = Void Function(Pointer<Void>);"
+            ),
+            "Builder_destroy native typedef must take Pointer<Void> and return Void: {dart}"
+        );
+        assert!(
+            dart.contains(
+                "typedef _NativeWeaveffiGeoPointBuilderSetX = Void Function(Pointer<Void>, Double);"
+            ),
+            "Builder_set_x native typedef must take (Pointer<Void>, Double): {dart}"
+        );
+
+        assert!(
+            dart.contains("Pointer<Void> _handle = _weaveffiGeoPointBuilderNew();"),
+            "builder class must init _handle by calling native Builder_new: {dart}"
+        );
+        assert!(
+            dart.contains("_weaveffiGeoPointBuilderSetX(_handle, value);"),
+            "withX must call native Builder_set_x with (_handle, value): {dart}"
+        );
+        assert!(
+            dart.contains("_weaveffiGeoPointBuilderSetY(_handle, value);"),
+            "withY must call native Builder_set_y with (_handle, value): {dart}"
+        );
+
+        let build_start = dart
+            .find("Point build() {")
+            .expect("build() method must be present");
+        let build_body = &dart[build_start..];
+        let native_build_pos = build_body
+            .find("_weaveffiGeoPointBuilderBuild(_handle, err)")
+            .expect("build() must call native Builder_build with (_handle, err)");
+        let check_pos = build_body
+            .find("_checkError(err);")
+            .expect("build() must check err after native Builder_build");
+        let native_destroy_pos = build_body
+            .find("_weaveffiGeoPointBuilderDestroy(_handle);")
+            .expect("build() must call native Builder_destroy with _handle");
+        let null_pos = build_body
+            .find("_handle = nullptr;")
+            .expect("build() must reset _handle to nullptr");
+        let return_pos = build_body
+            .find("return Point._(result);")
+            .expect("build() must return a wrapped Point._(result)");
+        assert!(
+            native_build_pos < check_pos
+                && check_pos < native_destroy_pos
+                && native_destroy_pos < null_pos
+                && null_pos < return_pos,
+            "build() order must be: native build, check err, native destroy, null handle, return wrapped struct: {build_body}"
         );
     }
 
@@ -2611,7 +2812,7 @@ mod tests {
             structs: vec![StructDef {
                 name: "Contact".into(),
                 doc: None,
-                builder: true,
+                builder: false,
                 fields: vec![StructField {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
@@ -2677,15 +2878,9 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_excludes_builders() {
+    fn capabilities_includes_all() {
         let caps = DartGenerator.capabilities();
-        assert!(caps.contains(&Capability::Callbacks));
-        assert!(caps.contains(&Capability::Listeners));
-        assert!(!caps.contains(&Capability::Builders));
         for cap in Capability::ALL {
-            if matches!(cap, Capability::Builders) {
-                continue;
-            }
             assert!(caps.contains(cap), "Dart generator must support {cap:?}");
         }
     }
