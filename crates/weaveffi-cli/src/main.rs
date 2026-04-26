@@ -117,7 +117,11 @@ enum Commands {
         #[arg(long, overrides_with = "exit_code")]
         no_exit_code: bool,
     },
-    Doctor,
+    Doctor {
+        /// Treat optional checks as required (exit non-zero if any fail)
+        #[arg(long)]
+        all: bool,
+    },
     Completions {
         /// Shell to generate completions for
         shell: clap_complete::Shell,
@@ -206,7 +210,11 @@ fn main() -> Result<()> {
             exit_code: _,
             no_exit_code,
         } => cmd_diff(&input, out.as_deref(), !no_exit_code, quiet)?,
-        Commands::Doctor => cmd_doctor()?,
+        Commands::Doctor { all } => {
+            if !cmd_doctor(all)? {
+                std::process::exit(1);
+            }
+        }
         Commands::Completions { shell } => cmd_completions(shell),
         Commands::SchemaVersion => println!("{CURRENT_SCHEMA_VERSION}"),
         Commands::CheckStamp {
@@ -1272,29 +1280,46 @@ fn cmd_extract(input: &str, output: Option<&str>, format: &str, quiet: bool) -> 
     Ok(())
 }
 
-fn cmd_doctor() -> Result<()> {
+/// Runs the doctor checks and returns `Ok(true)` when the process should exit
+/// 0. Required checks (rustc, cargo, weaveffi-cli) always gate success;
+/// optional checks only gate success when `all` is true.
+fn cmd_doctor(all: bool) -> Result<bool> {
     println!("WeaveFFI Doctor: checking toolchain prerequisites\n");
 
-    check_tool(
+    let mut required_failures: Vec<String> = Vec::new();
+    let mut optional_failures: Vec<String> = Vec::new();
+
+    println!("Required checks:");
+    if !check_tool(
         "rustc",
         &["--version"],
         "Rust compiler",
         Some("Install via https://rustup.rs"),
-    );
-    check_tool(
+    ) {
+        required_failures.push("rustc".to_string());
+    }
+    if !check_tool(
         "cargo",
         &["--version"],
         "Cargo (Rust package manager)",
         Some("Install via https://rustup.rs"),
-    );
+    ) {
+        required_failures.push("cargo".to_string());
+    }
+    if !check_weaveffi_cli() {
+        required_failures.push("weaveffi-cli".to_string());
+    }
 
+    println!("\nOptional checks:");
     if cfg!(target_os = "macos") {
-        check_tool(
+        if !check_tool(
             "xcodebuild",
             &["-version"],
             "Xcode command-line tools",
             Some("Install Xcode from the App Store, then run `xcode-select --install`"),
-        );
+        ) {
+            optional_failures.push("xcodebuild".to_string());
+        }
     } else {
         println!("- Xcode: skipped (non-macOS)");
     }
@@ -1317,39 +1342,101 @@ fn cmd_doctor() -> Result<()> {
                 "  note: ANDROID_NDK_HOME/ROOT is set and exists; ensure `ndk-build` is in PATH"
             );
         }
+        optional_failures.push("ndk-build".to_string());
     }
 
-    check_tool(
+    if !check_tool(
         "node",
         &["-v"],
         "Node.js",
         Some("Install from https://nodejs.org or with your package manager"),
-    );
-    check_tool(
+    ) {
+        optional_failures.push("node".to_string());
+    }
+    if !check_tool(
         "npm",
         &["-v"],
         "npm",
         Some("Install Node.js which includes npm, or use pnpm/yarn"),
-    );
+    ) {
+        optional_failures.push("npm".to_string());
+    }
 
-    check_cross_targets();
+    for t in check_cross_targets() {
+        optional_failures.push(format!("target:{t}"));
+    }
 
     println!("\nWebAssembly tools:");
-    check_tool(
+    if !check_tool(
         "wasm-pack",
         &["--version"],
         "wasm-pack",
         Some("install with `cargo install wasm-pack`"),
-    );
-    check_tool(
+    ) {
+        optional_failures.push("wasm-pack".to_string());
+    }
+    if !check_tool(
         "wasm-bindgen",
         &["--version"],
         "wasm-bindgen-cli",
         Some("install with `cargo install wasm-bindgen-cli`"),
-    );
+    ) {
+        optional_failures.push("wasm-bindgen".to_string());
+    }
 
-    println!("\nDoctor completed. Address any missing items above.");
-    Ok(())
+    println!();
+    if !required_failures.is_empty() {
+        eprintln!(
+            "Doctor failed: required tool(s) missing: {}",
+            required_failures.join(", ")
+        );
+        if !optional_failures.is_empty() {
+            eprintln!(
+                "Also missing optional tool(s): {}",
+                optional_failures.join(", ")
+            );
+        }
+        return Ok(false);
+    }
+
+    if !optional_failures.is_empty() {
+        if all {
+            eprintln!(
+                "Doctor failed (--all): optional tool(s) missing: {}",
+                optional_failures.join(", ")
+            );
+            return Ok(false);
+        }
+        println!(
+            "Doctor completed with warnings: optional tool(s) missing: {}",
+            optional_failures.join(", ")
+        );
+    } else {
+        println!("Doctor completed: all checks passed.");
+    }
+    Ok(true)
+}
+
+/// Verifies the currently running `weaveffi` binary can introspect its own
+/// install path. Serves as the "required" health check for the CLI itself.
+fn check_weaveffi_cli() -> bool {
+    match std::env::current_exe() {
+        Ok(path) if path.exists() => {
+            println!("- weaveffi-cli: OK ({})", path.display());
+            true
+        }
+        Ok(path) => {
+            println!(
+                "- weaveffi-cli: MISSING (current exe {} does not exist)",
+                path.display()
+            );
+            false
+        }
+        Err(e) => {
+            println!("- weaveffi-cli: MISSING (cannot resolve current executable: {e})");
+            false
+        }
+    }
 }
 
 fn cmd_completions(shell: clap_complete::Shell) {
@@ -1378,7 +1465,10 @@ fn sanitize_module_name(name: &str) -> String {
     }
 }
 
-fn check_cross_targets() {
+/// Returns the list of missing rustup target identifiers. When rustup itself
+/// is missing the list contains a single `"rustup"` entry so the caller can
+/// surface that in the summary.
+fn check_cross_targets() -> Vec<String> {
     println!("\nCross-compilation targets:");
 
     let installed = match Command::new("rustup")
@@ -1389,7 +1479,7 @@ fn check_cross_targets() {
         _ => {
             println!("- rustup: MISSING (cannot check installed targets)");
             println!("  hint: install via https://rustup.rs");
-            return;
+            return vec!["rustup".to_string()];
         }
     };
 
@@ -1399,14 +1489,17 @@ fn check_cross_targets() {
         ("wasm32-unknown-unknown", "WebAssembly"),
     ];
 
+    let mut missing: Vec<String> = Vec::new();
     for (target, label) in &required {
         if installed.lines().any(|line| line.trim() == *target) {
             println!("- {} ({}): installed", label, target);
         } else {
             println!("- {} ({}): MISSING", label, target);
             println!("  hint: install with `rustup target add {}`", target);
+            missing.push((*target).to_string());
         }
     }
+    missing
 }
 
 fn check_tool<S: AsRef<OsStr>>(cmd: &str, args: &[S], label: &str, hint: Option<&str>) -> bool {
@@ -1947,6 +2040,28 @@ mod tests {
         assert!(
             stdout.contains("wasm-bindgen-cli"),
             "missing wasm-bindgen-cli check: {stdout}"
+        );
+    }
+
+    #[test]
+    fn doctor_exits_nonzero_when_required_missing() {
+        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .env("PATH", "/nonexistent-weaveffi-doctor-path")
+            .arg("doctor")
+            .output()
+            .expect("failed to run weaveffi doctor");
+
+        assert!(
+            !cmd.status.success(),
+            "doctor must exit non-zero when required tools are missing (stdout: {}, stderr: {})",
+            String::from_utf8_lossy(&cmd.stdout),
+            String::from_utf8_lossy(&cmd.stderr),
+        );
+        let stderr = String::from_utf8_lossy(&cmd.stderr);
+        assert!(
+            stderr.contains("required tool(s) missing"),
+            "expected required-failure summary in stderr: {stderr}"
         );
     }
 
