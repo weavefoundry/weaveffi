@@ -1850,6 +1850,100 @@ mod tests {
     }
 
     #[test]
+    fn node_struct_setter_wrapper_uses_ptr_and_len() {
+        let api = make_api(vec![{
+            let mut m = make_module("contacts");
+            m.structs.push(StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                    default: None,
+                }],
+                builder: false,
+            });
+            m.functions.push(Function {
+                name: "set_contact_name".into(),
+                params: vec![
+                    Param {
+                        name: "contact".into(),
+                        ty: TypeRef::TypedHandle("Contact".into()),
+                        mutable: false,
+                    },
+                    Param {
+                        name: "new_name".into(),
+                        ty: TypeRef::StringUtf8,
+                        mutable: false,
+                    },
+                ],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            });
+            m
+        }]);
+        let addon = render_addon_c(&api, true);
+        assert!(
+            addon.contains(
+                "weaveffi_contacts_set_contact_name((weaveffi_handle_t)contact_raw, (const uint8_t*)new_name, (size_t)new_name_len, &err);"
+            ),
+            "struct setter wrapper should pass string as (const uint8_t*)ptr, (size_t)len: {addon}"
+        );
+    }
+
+    #[test]
+    fn node_builder_setter_wrapper_uses_ptr_and_len() {
+        let api = make_api(vec![{
+            let mut m = make_module("contacts");
+            m.structs.push(StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                    default: None,
+                }],
+                builder: true,
+            });
+            m.functions.push(Function {
+                name: "Contact_Builder_set_name".into(),
+                params: vec![
+                    Param {
+                        name: "builder".into(),
+                        ty: TypeRef::Handle,
+                        mutable: true,
+                    },
+                    Param {
+                        name: "value".into(),
+                        ty: TypeRef::StringUtf8,
+                        mutable: false,
+                    },
+                ],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            });
+            m
+        }]);
+        let addon = render_addon_c(&api, true);
+        assert!(
+            addon.contains(
+                "weaveffi_contacts_Contact_Builder_set_name((weaveffi_handle_t)builder_raw, (const uint8_t*)value, (size_t)value_len, &err);"
+            ),
+            "builder setter wrapper should pass string as (const uint8_t*)ptr, (size_t)len: {addon}"
+        );
+    }
+
+    #[test]
     fn node_addon_frees_strings() {
         let api = make_api(vec![{
             let mut m = make_module("greet");
