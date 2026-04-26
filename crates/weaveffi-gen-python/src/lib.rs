@@ -4832,4 +4832,138 @@ mod tests {
             "__exit__ must call _dispose(): {exit_body}"
         );
     }
+
+    #[test]
+    fn python_struct_setter_string_uses_ptr_and_len() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "set_contact_name".into(),
+                params: vec![
+                    Param {
+                        name: "contact".into(),
+                        ty: TypeRef::TypedHandle("Contact".into()),
+                        mutable: false,
+                    },
+                    Param {
+                        name: "new_name".into(),
+                        ty: TypeRef::StringUtf8,
+                        mutable: false,
+                    },
+                ],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                builder: false,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                    default: None,
+                }],
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let py = render_python_module(&api, true);
+
+        assert!(
+            py.contains(
+                "_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.POINTER(_WeaveffiErrorStruct)]"
+            ),
+            "struct setter argtypes should include (POINTER(c_uint8), c_size_t) for string param: {py}"
+        );
+        assert!(
+            py.contains("_new_name_arr, _new_name_len = _string_to_byteslice(new_name)"),
+            "struct setter must call _string_to_byteslice helper for string param: {py}"
+        );
+        assert!(
+            py.contains("_fn(contact._ptr, _new_name_arr, _new_name_len, ctypes.byref(_err))"),
+            "struct setter call must pass (handle, _arr, _len, &err): {py}"
+        );
+
+        let pyi = render_pyi_module(&api, true);
+        assert!(
+            pyi.contains("def set_contact_name(contact: \"Contact\", new_name: str) -> None: ..."),
+            "pyi struct setter signature should still take str: {pyi}"
+        );
+    }
+
+    #[test]
+    fn python_builder_setter_string_uses_ptr_and_len() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "Contact_Builder_set_name".into(),
+                params: vec![
+                    Param {
+                        name: "builder".into(),
+                        ty: TypeRef::Handle,
+                        mutable: true,
+                    },
+                    Param {
+                        name: "value".into(),
+                        ty: TypeRef::StringUtf8,
+                        mutable: false,
+                    },
+                ],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                builder: true,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                    default: None,
+                }],
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let py = render_python_module(&api, true);
+
+        assert!(
+            py.contains(
+                "_fn.argtypes = [ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.POINTER(_WeaveffiErrorStruct)]"
+            ),
+            "builder setter argtypes should include (POINTER(c_uint8), c_size_t) for string param: {py}"
+        );
+        assert!(
+            py.contains("_value_arr, _value_len = _string_to_byteslice(value)"),
+            "builder setter must call _string_to_byteslice helper for string param: {py}"
+        );
+        assert!(
+            py.contains("_fn(builder, _value_arr, _value_len, ctypes.byref(_err))"),
+            "builder setter call must pass (handle, _arr, _len, &err): {py}"
+        );
+
+        let pyi = render_pyi_module(&api, true);
+        assert!(
+            pyi.contains("def Contact_Builder_set_name(builder: int, value: str) -> None: ..."),
+            "pyi builder setter signature should still take str: {pyi}"
+        );
+    }
 }
