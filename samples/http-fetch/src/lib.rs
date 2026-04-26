@@ -74,6 +74,17 @@ fn runtime() -> &'static Runtime {
 const ERR_CODE_GENERIC: i32 = 1;
 const ERR_CODE_CANCELLED: i32 = 2;
 
+/// Resolve the `User-Agent` header to send on outgoing requests. Consumers
+/// can override the default at runtime via the `WEAVEFFI_HTTP_USER_AGENT`
+/// environment variable; an unset or empty value falls back to a compiled-in
+/// default that carries the crate version.
+fn resolve_user_agent() -> String {
+    match std::env::var("WEAVEFFI_HTTP_USER_AGENT") {
+        Ok(v) if !v.is_empty() => v,
+        _ => format!("weaveffi-http-fetch/{}", env!("CARGO_PKG_VERSION")),
+    }
+}
+
 fn slice_to_string(ptr: *const u8, len: usize) -> Option<String> {
     if ptr.is_null() {
         return None;
@@ -152,8 +163,10 @@ pub extern "C" fn weaveffi_http_fetch_async(
     // Raw pointers are `!Send`, so we ferry them across the spawned task as
     // `usize` addresses and recast them at each use site inside the async
     // block and its sub-futures.
+    let user_agent = resolve_user_agent();
+
     runtime().spawn(async move {
-        let mut builder = reqwest::Client::builder();
+        let mut builder = reqwest::Client::builder().user_agent(user_agent);
         if let Some(t) = timeout {
             builder = builder.timeout(t);
         }
@@ -682,5 +695,62 @@ mod tests {
     #[test]
     fn destroy_null_http_response_is_safe() {
         weaveffi_http_HttpResponse_destroy(std::ptr::null_mut());
+    }
+
+    // `std::env` is process-global, so the two user-agent tests serialise
+    // through this mutex to avoid racing on `WEAVEFFI_HTTP_USER_AGENT`.
+    static UA_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn resolve_user_agent_default_and_override() {
+        let _g = UA_TEST_LOCK.lock().unwrap();
+        std::env::remove_var("WEAVEFFI_HTTP_USER_AGENT");
+        assert_eq!(
+            resolve_user_agent(),
+            format!("weaveffi-http-fetch/{}", env!("CARGO_PKG_VERSION"))
+        );
+
+        std::env::set_var("WEAVEFFI_HTTP_USER_AGENT", "my-weave/1.2.3");
+        assert_eq!(resolve_user_agent(), "my-weave/1.2.3");
+
+        std::env::set_var("WEAVEFFI_HTTP_USER_AGENT", "");
+        assert_eq!(
+            resolve_user_agent(),
+            format!("weaveffi-http-fetch/{}", env!("CARGO_PKG_VERSION"))
+        );
+
+        std::env::remove_var("WEAVEFFI_HTTP_USER_AGENT");
+    }
+
+    #[test]
+    fn fetch_sends_overridden_user_agent() {
+        let _g = UA_TEST_LOCK.lock().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (uri, _guard) = rt.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/ua"))
+                .and(wiremock::matchers::header(
+                    "user-agent",
+                    "custom-weave-agent/9.9",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+                .mount(&server)
+                .await;
+            let uri = format!("{}/ua", server.uri());
+            (uri, server)
+        });
+
+        std::env::set_var("WEAVEFFI_HTTP_USER_AGENT", "custom-weave-agent/9.9");
+        let (code, msg, ptr) = fetch_sync(&uri, HttpMethod::Get, None);
+        std::env::remove_var("WEAVEFFI_HTTP_USER_AGENT");
+
+        assert_eq!(code, 0, "fetch errored: {msg:?}");
+        assert!(!ptr.is_null());
+        let resp = unsafe { *Box::from_raw(ptr) };
+        assert_eq!(resp.status, 200);
     }
 }
