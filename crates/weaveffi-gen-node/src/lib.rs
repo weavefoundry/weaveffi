@@ -4,7 +4,7 @@ use heck::ToUpperCamelCase;
 use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_abi_struct_name, local_type_name, wrapper_name};
-use weaveffi_ir::ir::{Api, CallbackDef, Function, Module, StructDef, TypeRef};
+use weaveffi_ir::ir::{Api, CallbackDef, Function, ListenerDef, Module, StructDef, TypeRef};
 
 pub struct NodeGenerator;
 
@@ -69,6 +69,7 @@ impl Generator for NodeGenerator {
     fn capabilities(&self) -> &'static [Capability] {
         &[
             Capability::Callbacks,
+            Capability::Listeners,
             Capability::Iterators,
             Capability::Builders,
             Capability::AsyncFunctions,
@@ -224,6 +225,13 @@ fn render_addon_c(api: &Api, strip_module_prefix: bool) -> String {
         out.push_str("} weaveffi_napi_async_ctx;\n\n");
     }
 
+    let has_listeners = collect_all_modules(&api.modules)
+        .iter()
+        .any(|m| !m.listeners.is_empty());
+    if has_listeners {
+        render_listener_registry(&mut out);
+    }
+
     for (m, path) in collect_modules_with_path(&api.modules) {
         for cb in &m.callbacks {
             render_callback_trampoline(&mut out, cb, &path);
@@ -235,6 +243,9 @@ fn render_addon_c(api: &Api, strip_module_prefix: bool) -> String {
     for (m, path) in collect_modules_with_path(&api.modules) {
         for s in &m.structs {
             render_struct_destroy_napi(&mut out, &s.name, &path, &mut all_exports);
+        }
+        for l in &m.listeners {
+            render_listener_napi(&mut out, l, &path, &mut all_exports);
         }
         for f in &m.functions {
             let c_name = format!("weaveffi_{}_{}", path, f.name);
@@ -300,6 +311,126 @@ fn render_struct_destroy_napi(
     out.push_str(&format!(
         "    {c_name}((weaveffi_{module_path}_{struct_name}*)(intptr_t)handle_raw);\n"
     ));
+    out.push_str("  }\n");
+    out.push_str("  napi_value ret;\n");
+    out.push_str("  napi_get_undefined(env, &ret);\n");
+    out.push_str("  return ret;\n");
+    out.push_str("}\n\n");
+}
+
+/// Emit a shared linked-list registry of threadsafe functions keyed by listener
+/// id. `register` allocates a tsfn and inserts it here so the tsfn outlives the
+/// binding call; `unregister` removes the entry and releases the tsfn so the
+/// N-API resources are freed.
+///
+/// Entries are mutated only from the main JS thread (inside `register`/
+/// `unregister` N-API callbacks), so no mutex is needed; the tsfn itself is
+/// thread-safe by design and is what the C-side trampoline invokes.
+fn render_listener_registry(out: &mut String) {
+    out.push_str("typedef struct weaveffi_listener_entry {\n");
+    out.push_str("    uint64_t id;\n");
+    out.push_str("    napi_threadsafe_function tsfn;\n");
+    out.push_str("    struct weaveffi_listener_entry* next;\n");
+    out.push_str("} weaveffi_listener_entry;\n\n");
+    out.push_str("static weaveffi_listener_entry* weaveffi_listeners_head = NULL;\n\n");
+
+    out.push_str(
+        "static void weaveffi_listeners_put(uint64_t id, napi_threadsafe_function tsfn) {\n",
+    );
+    out.push_str(
+        "    weaveffi_listener_entry* e = (weaveffi_listener_entry*)malloc(sizeof(weaveffi_listener_entry));\n",
+    );
+    out.push_str("    e->id = id;\n");
+    out.push_str("    e->tsfn = tsfn;\n");
+    out.push_str("    e->next = weaveffi_listeners_head;\n");
+    out.push_str("    weaveffi_listeners_head = e;\n");
+    out.push_str("}\n\n");
+
+    out.push_str("static napi_threadsafe_function weaveffi_listeners_take(uint64_t id) {\n");
+    out.push_str("    weaveffi_listener_entry** prev = &weaveffi_listeners_head;\n");
+    out.push_str("    while (*prev) {\n");
+    out.push_str("        if ((*prev)->id == id) {\n");
+    out.push_str("            weaveffi_listener_entry* e = *prev;\n");
+    out.push_str("            napi_threadsafe_function tsfn = e->tsfn;\n");
+    out.push_str("            *prev = e->next;\n");
+    out.push_str("            free(e);\n");
+    out.push_str("            return tsfn;\n");
+    out.push_str("        }\n");
+    out.push_str("        prev = &(*prev)->next;\n");
+    out.push_str("    }\n");
+    out.push_str("    return NULL;\n");
+    out.push_str("}\n\n");
+}
+
+/// Emit the N-API bindings for a listener's `register` and `unregister` pair.
+///
+/// `register` creates a `napi_threadsafe_function` from the user-supplied JS
+/// callback (reusing the event callback's existing `call_js` helper), passes
+/// the per-callback C trampoline plus the tsfn as the context pointer to the
+/// C register symbol, tracks the tsfn in the shared registry keyed by the
+/// returned listener id, and returns the id as a BigInt.
+///
+/// `unregister` calls the C unregister symbol with the id, takes the tsfn out
+/// of the registry, and releases it so the N-API resources are reclaimed.
+///
+/// The bindings are internal helpers driven by the generated JS wrapper
+/// class, so they always export under the fully-qualified
+/// `{module_path}_register_{name}` / `{module_path}_unregister_{name}` names
+/// regardless of `strip_module_prefix`, mirroring how struct `_destroy`
+/// helpers are exported.
+fn render_listener_napi(
+    out: &mut String,
+    l: &ListenerDef,
+    module_path: &str,
+    exports: &mut Vec<(String, String)>,
+) {
+    let cb_name = &l.event_callback;
+    let call_js = format!("weaveffi_{module_path}_{cb_name}_call_js");
+    let tramp = format!("weaveffi_{module_path}_{cb_name}_trampoline");
+    let reg_c = format!("weaveffi_{module_path}_register_{}", l.name);
+    let unreg_c = format!("weaveffi_{module_path}_unregister_{}", l.name);
+
+    let reg_napi = format!("Napi_{reg_c}");
+    let unreg_napi = format!("Napi_{unreg_c}");
+    let reg_js = format!("{module_path}_register_{}", l.name);
+    let unreg_js = format!("{module_path}_unregister_{}", l.name);
+    exports.push((reg_js, reg_napi.clone()));
+    exports.push((unreg_js, unreg_napi.clone()));
+
+    out.push_str(&format!(
+        "static napi_value {reg_napi}(napi_env env, napi_callback_info info) {{\n"
+    ));
+    out.push_str("  size_t argc = 1;\n");
+    out.push_str("  napi_value args[1];\n");
+    out.push_str("  napi_get_cb_info(env, info, &argc, args, NULL, NULL);\n");
+    out.push_str("  napi_value tsfn_name;\n");
+    out.push_str(&format!(
+        "  napi_create_string_utf8(env, \"{cb_name}\", NAPI_AUTO_LENGTH, &tsfn_name);\n"
+    ));
+    out.push_str("  napi_threadsafe_function tsfn;\n");
+    out.push_str(&format!(
+        "  napi_create_threadsafe_function(env, args[0], NULL, tsfn_name, 0, 1, NULL, NULL, NULL, {call_js}, &tsfn);\n"
+    ));
+    out.push_str(&format!("  uint64_t id = {reg_c}({tramp}, (void*)tsfn);\n"));
+    out.push_str("  weaveffi_listeners_put(id, tsfn);\n");
+    out.push_str("  napi_value ret;\n");
+    out.push_str("  napi_create_bigint_uint64(env, id, &ret);\n");
+    out.push_str("  return ret;\n");
+    out.push_str("}\n\n");
+
+    out.push_str(&format!(
+        "static napi_value {unreg_napi}(napi_env env, napi_callback_info info) {{\n"
+    ));
+    out.push_str("  size_t argc = 1;\n");
+    out.push_str("  napi_value args[1];\n");
+    out.push_str("  napi_get_cb_info(env, info, &argc, args, NULL, NULL);\n");
+    out.push_str("  uint64_t id = 0;\n");
+    out.push_str("  bool lossless = false;\n");
+    out.push_str("  napi_get_value_bigint_uint64(env, args[0], &id, &lossless);\n");
+    out.push_str(&format!("  {unreg_c}(id);\n"));
+    out.push_str("  napi_threadsafe_function tsfn = weaveffi_listeners_take(id);\n");
+    out.push_str("  if (tsfn) {\n");
+    out.push_str("    napi_release_threadsafe_function(tsfn, napi_tsfn_release);\n");
     out.push_str("  }\n");
     out.push_str("  napi_value ret;\n");
     out.push_str("  napi_get_undefined(env, &ret);\n");
@@ -1368,6 +1499,17 @@ fn render_struct_builder_dts(out: &mut String, s: &StructDef) {
     out.push_str("}\n");
 }
 
+fn render_listener_dts(out: &mut String, l: &ListenerDef) {
+    let class_name = l.name.to_upper_camel_case();
+    out.push_str(&format!("export declare class {class_name} {{\n"));
+    out.push_str(&format!(
+        "  static register(callback: {}): bigint;\n",
+        l.event_callback
+    ));
+    out.push_str("  static unregister(id: bigint): void;\n");
+    out.push_str("}\n");
+}
+
 fn render_node_index_js(api: &Api) -> String {
     let mut out = String::from("const addon = require('./index.node');\n\n");
     let structs: Vec<(String, String)> = collect_modules_with_path(&api.modules)
@@ -1379,15 +1521,26 @@ fn render_node_index_js(api: &Api) -> String {
                 .collect::<Vec<_>>()
         })
         .collect();
-    if structs.is_empty() {
+    let listeners: Vec<(ListenerDef, String)> = collect_modules_with_path(&api.modules)
+        .iter()
+        .flat_map(|(m, path)| {
+            m.listeners
+                .iter()
+                .map(|l| (l.clone(), path.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    if structs.is_empty() && listeners.is_empty() {
         out.push_str("module.exports = addon;\n");
         return out;
     }
 
-    out.push_str(
-        "const _hasFinalizer = typeof FinalizationRegistry !== 'undefined';\n\
-         const _registries = new Map();\n\n",
-    );
+    if !structs.is_empty() {
+        out.push_str(
+            "const _hasFinalizer = typeof FinalizationRegistry !== 'undefined';\n\
+             const _registries = new Map();\n\n",
+        );
+    }
 
     for (name, path) in &structs {
         let destroy_fn = format!("{path}_{name}_destroy");
@@ -1424,9 +1577,27 @@ fn render_node_index_js(api: &Api) -> String {
         out.push_str("}\n\n");
     }
 
+    for (l, path) in &listeners {
+        let class_name = l.name.to_upper_camel_case();
+        let reg_fn = format!("{path}_register_{}", l.name);
+        let unreg_fn = format!("{path}_unregister_{}", l.name);
+        out.push_str(&format!("class {class_name} {{\n"));
+        out.push_str("  static register(callback) {\n");
+        out.push_str(&format!("    return addon.{reg_fn}(callback);\n"));
+        out.push_str("  }\n");
+        out.push_str("  static unregister(id) {\n");
+        out.push_str(&format!("    addon.{unreg_fn}(id);\n"));
+        out.push_str("  }\n");
+        out.push_str("}\n\n");
+    }
+
     out.push_str("module.exports = Object.assign({}, addon, {\n");
     for (name, _path) in &structs {
         out.push_str(&format!("  {name}: {name},\n"));
+    }
+    for (l, _path) in &listeners {
+        let class_name = l.name.to_upper_camel_case();
+        out.push_str(&format!("  {class_name}: {class_name},\n"));
     }
     out.push_str("});\n");
     out
@@ -1461,6 +1632,9 @@ fn render_node_dts(api: &Api, strip_module_prefix: bool) -> String {
         }
         for cb in &m.callbacks {
             out.push_str(&ts_callback_type(cb));
+        }
+        for l in &m.listeners {
+            render_listener_dts(&mut out, l);
         }
         out.push_str(&format!("// module {}\n", path));
         for f in &m.functions {
@@ -1502,7 +1676,8 @@ mod tests {
     use super::*;
     use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{
-        CallbackDef, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField,
+        CallbackDef, EnumDef, EnumVariant, Function, ListenerDef, Module, Param, StructDef,
+        StructField,
     };
 
     fn make_api(modules: Vec<Module>) -> Api {
@@ -2976,13 +3151,13 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_includes_callbacks_excludes_listeners_and_cancellable_async() {
+    fn capabilities_includes_callbacks_and_listeners_excludes_cancellable_async() {
         let caps = NodeGenerator.capabilities();
         assert!(caps.contains(&Capability::Callbacks));
-        assert!(!caps.contains(&Capability::Listeners));
+        assert!(caps.contains(&Capability::Listeners));
         assert!(!caps.contains(&Capability::CancellableAsync));
         for cap in Capability::ALL {
-            if matches!(cap, Capability::Listeners | Capability::CancellableAsync) {
+            if matches!(cap, Capability::CancellableAsync) {
                 continue;
             }
             assert!(caps.contains(cap), "Node generator must support {cap:?}");
@@ -3106,6 +3281,138 @@ mod tests {
         assert!(
             create_pos < call_pos && call_pos < release_pos,
             "threadsafe function must be created before the C call and released after: {addon}"
+        );
+    }
+
+    #[test]
+    fn node_emits_listener_class() {
+        let api = make_api(vec![Module {
+            name: "events".into(),
+            functions: vec![],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![CallbackDef {
+                name: "OnData".into(),
+                params: vec![Param {
+                    name: "value".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+            }],
+            listeners: vec![ListenerDef {
+                name: "data_stream".into(),
+                event_callback: "OnData".into(),
+                doc: None,
+            }],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let dts = render_node_dts(&api, true);
+        assert!(
+            dts.contains("export declare class DataStream {"),
+            "dts must declare listener class: {dts}"
+        );
+        assert!(
+            dts.contains("static register(callback: OnData): bigint;"),
+            "dts listener class must expose static register(callback: OnData): bigint: {dts}"
+        );
+        assert!(
+            dts.contains("static unregister(id: bigint): void;"),
+            "dts listener class must expose static unregister(id: bigint): {dts}"
+        );
+
+        let js = render_node_index_js(&api);
+        assert!(
+            js.contains("class DataStream {"),
+            "index.js must define a listener class: {js}"
+        );
+        assert!(
+            js.contains("static register(callback) {"),
+            "index.js listener class must expose static register(callback): {js}"
+        );
+        assert!(
+            js.contains("return addon.events_register_data_stream(callback);"),
+            "register must call the N-API register binding: {js}"
+        );
+        assert!(
+            js.contains("static unregister(id) {"),
+            "index.js listener class must expose static unregister(id): {js}"
+        );
+        assert!(
+            js.contains("addon.events_unregister_data_stream(id);"),
+            "unregister must call the N-API unregister binding: {js}"
+        );
+        assert!(
+            js.contains("DataStream: DataStream,"),
+            "module.exports must export the listener class: {js}"
+        );
+
+        let addon = render_addon_c(&api, true);
+        assert!(
+            addon.contains("typedef struct weaveffi_listener_entry {"),
+            "addon must declare the shared listener registry entry type: {addon}"
+        );
+        assert!(
+            addon.contains("weaveffi_listeners_put(id, tsfn);"),
+            "register binding must store the tsfn in the shared registry keyed by id: {addon}"
+        );
+        assert!(
+            addon.contains(
+                "static napi_value Napi_weaveffi_events_register_data_stream(napi_env env, napi_callback_info info)"
+            ),
+            "addon must define the N-API register binding: {addon}"
+        );
+        assert!(
+            addon.contains(
+                "napi_create_threadsafe_function(env, args[0], NULL, tsfn_name, 0, 1, NULL, NULL, NULL, weaveffi_events_OnData_call_js, &tsfn);"
+            ),
+            "register binding must create the threadsafe function from the JS callback: {addon}"
+        );
+        assert!(
+            addon.contains(
+                "uint64_t id = weaveffi_events_register_data_stream(weaveffi_events_OnData_trampoline, (void*)tsfn);"
+            ),
+            "register binding must call the C register symbol with trampoline and tsfn context: {addon}"
+        );
+        assert!(
+            addon.contains("napi_create_bigint_uint64(env, id, &ret);"),
+            "register binding must return the listener id as a BigInt: {addon}"
+        );
+        assert!(
+            addon.contains(
+                "static napi_value Napi_weaveffi_events_unregister_data_stream(napi_env env, napi_callback_info info)"
+            ),
+            "addon must define the N-API unregister binding: {addon}"
+        );
+        assert!(
+            addon.contains("napi_get_value_bigint_uint64(env, args[0], &id, &lossless);"),
+            "unregister binding must read the listener id as a BigInt: {addon}"
+        );
+        assert!(
+            addon.contains("weaveffi_events_unregister_data_stream(id);"),
+            "unregister binding must call the C unregister symbol: {addon}"
+        );
+        assert!(
+            addon.contains("napi_threadsafe_function tsfn = weaveffi_listeners_take(id);"),
+            "unregister binding must take the tsfn out of the shared registry: {addon}"
+        );
+        assert!(
+            addon.contains("napi_release_threadsafe_function(tsfn, napi_tsfn_release);"),
+            "unregister binding must release the tsfn: {addon}"
+        );
+        assert!(
+            addon
+                .contains("{ \"events_register_data_stream\", NULL, Napi_weaveffi_events_register_data_stream"),
+            "addon must export register binding through N-API Init: {addon}"
+        );
+        assert!(
+            addon.contains(
+                "{ \"events_unregister_data_stream\", NULL, Napi_weaveffi_events_unregister_data_stream"
+            ),
+            "addon must export unregister binding through N-API Init: {addon}"
         );
     }
 }
