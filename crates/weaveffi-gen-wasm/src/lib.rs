@@ -60,6 +60,7 @@ impl Generator for WasmGenerator {
 
     fn capabilities(&self) -> &'static [Capability] {
         &[
+            Capability::Callbacks,
             Capability::Iterators,
             Capability::Builders,
             Capability::AsyncFunctions,
@@ -97,7 +98,8 @@ fn wasm_type(ty: &TypeRef) -> &'static str {
         | TypeRef::BorrowedStr
         | TypeRef::Bytes
         | TypeRef::BorrowedBytes
-        | TypeRef::List(_) => "i32, i32",
+        | TypeRef::List(_)
+        | TypeRef::Callback(_) => "i32, i32",
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::Struct(_)
             | TypeRef::Handle
@@ -106,7 +108,6 @@ fn wasm_type(ty: &TypeRef) -> &'static str {
             | TypeRef::Map(_, _) => "i64",
             _ => "i32, i32",
         },
-        TypeRef::Callback(_) => unreachable!("validator should have rejected callback WASM type"),
     }
 }
 
@@ -134,7 +135,7 @@ fn wasm_type_note(ty: &TypeRef) -> &'static str {
             | TypeRef::Map(_, _) => "opaque handle, 0 = absent",
             _ => "is_present flag + value",
         },
-        TypeRef::Callback(_) => unreachable!("validator should have rejected callback WASM type"),
+        TypeRef::Callback(_) => "function table index + context ptr",
     }
 }
 
@@ -154,7 +155,7 @@ fn type_display(ty: &TypeRef) -> String {
         TypeRef::List(inner) => format!("[{}]", type_display(inner)),
         TypeRef::Iterator(inner) => format!("iter<{}>", type_display(inner)),
         TypeRef::Map(k, v) => format!("{{{}:{}}}", type_display(k), type_display(v)),
-        TypeRef::Callback(_) => unreachable!("validator should have rejected callback WASM type"),
+        TypeRef::Callback(name) => format!("callback<{name}>"),
     }
 }
 
@@ -209,7 +210,21 @@ fn render_wasm_readme(api: &Api) -> String {
     out.push_str("### Lists\n\n");
     out.push_str("Lists are passed as a **pointer + length** pair (`i32` pointer, `i32` length) ");
     out.push_str("referencing a contiguous region in linear memory. The caller is responsible ");
-    out.push_str("for allocating and freeing the backing memory.\n");
+    out.push_str("for allocating and freeing the backing memory.\n\n");
+    out.push_str("### Callbacks\n\n");
+    out.push_str("Callback parameters are passed as a **(table index, context)** pair of `i32`s. ");
+    out.push_str(
+        "The JS wrapper uses `_registerCallback(wasm, jsFn)` to append the JS function to ",
+    );
+    out.push_str(
+        "`wasm.__indirect_function_table` via `Table.grow` and returns the new index; the wrapper ",
+    );
+    out.push_str(
+        "then passes `(table_index, 0)` to the WASM export. The context slot is reserved ",
+    );
+    out.push_str(
+        "for future use (JS closures already capture state, so `0` is the default context).\n",
+    );
     out.push_str("\n### Error Handling\n\n");
     out.push_str("The generated JS wrappers automatically handle errors by passing an error\n");
     out.push_str("pointer as the last argument to each WASM function. Your WASM module must\n");
@@ -394,6 +409,17 @@ fn api_needs_bytes_helpers(api: &Api) -> bool {
     api.modules.iter().any(module_needs_bytes_helpers)
 }
 
+fn api_has_callback_params(api: &Api) -> bool {
+    fn module_has(m: &Module) -> bool {
+        m.functions.iter().any(|f| {
+            f.params
+                .iter()
+                .any(|p| matches!(p.ty, TypeRef::Callback(_)))
+        }) || m.modules.iter().any(module_has)
+    }
+    api.modules.iter().any(module_has)
+}
+
 fn ts_type_for(ty: &TypeRef) -> String {
     match ty {
         TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 => "number".into(),
@@ -417,7 +443,7 @@ fn ts_type_for(ty: &TypeRef) -> String {
             format!("{t}[]")
         }
         TypeRef::Map(k, v) => format!("Record<{}, {}>", ts_type_for(k), ts_type_for(v)),
-        TypeRef::Callback(_) => unreachable!("validator should have rejected callback WASM type"),
+        TypeRef::Callback(name) => name.clone(),
     }
 }
 
@@ -453,6 +479,25 @@ fn render_wasm_dts(api: &Api, module_name: &str) -> String {
         String::from("// Generated TypeScript declarations for WeaveFFI WASM bindings\n\n");
 
     for (m, _path) in collect_modules_with_path(&api.modules) {
+        for cb in &m.callbacks {
+            let params: Vec<String> = cb
+                .params
+                .iter()
+                .map(|p| format!("{}: {}", p.name, ts_type_for(&p.ty)))
+                .collect();
+            let ret = cb
+                .returns
+                .as_ref()
+                .map(ts_type_for)
+                .unwrap_or_else(|| "void".to_string());
+            out.push_str(&format!(
+                "export type {} = ({}) => {};\n\n",
+                cb.name,
+                params.join(", "),
+                ret
+            ));
+        }
+
         for s in &m.structs {
             out.push_str(&format!("export interface {} {{\n", s.name));
             for field in &s.fields {
@@ -582,6 +627,7 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
     let all_mods = collect_all_modules(&api.modules);
     let has_functions = all_mods.iter().any(|m| !m.functions.is_empty());
     let has_async = api_has_async(api);
+    let has_callback_params = api_has_callback_params(api);
     if has_functions {
         out.push_str("function _allocError(wasm) {\n");
         out.push_str("  return wasm.weaveffi_alloc(8);\n");
@@ -610,6 +656,15 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
         out.push_str("    { parameters: paramTypes, results: [] },\n");
         out.push_str("    handler\n");
         out.push_str("  ));\n");
+        out.push_str("  return idx;\n");
+        out.push_str("}\n\n");
+    }
+
+    if has_callback_params {
+        out.push_str("function _registerCallback(wasm, jsFn) {\n");
+        out.push_str("  const table = wasm.__indirect_function_table;\n");
+        out.push_str("  const idx = table.grow(1);\n");
+        out.push_str("  table.set(idx, jsFn);\n");
         out.push_str("  return idx;\n");
         out.push_str("}\n\n");
     }
@@ -862,6 +917,14 @@ fn emit_js_function_wrapper(out: &mut String, module_name: &str, func: &Function
             TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
                 wasm_args.push(format!("{}._handle", param.name));
             }
+            TypeRef::Callback(_) => {
+                out.push_str(&format!(
+                    "{indent}const {name}_idx = _registerCallback(wasm, {name});\n",
+                    name = param.name
+                ));
+                wasm_args.push(format!("{}_idx", param.name));
+                wasm_args.push("0".to_string());
+            }
             _ => {
                 wasm_args.push(param.name.clone());
             }
@@ -1008,7 +1071,8 @@ fn async_cb_wasm_params(returns: Option<&TypeRef>) -> Vec<&'static str> {
             }
         },
         Some(TypeRef::Callback(_)) => {
-            unreachable!("validator should have rejected callback WASM type")
+            params.push("i32");
+            params.push("i32");
         }
     }
     params
@@ -1098,6 +1162,14 @@ fn emit_js_async_function_wrapper(out: &mut String, module_name: &str, func: &Fu
             TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
                 wasm_args.push(format!("{}._handle", param.name));
             }
+            TypeRef::Callback(_) => {
+                out.push_str(&format!(
+                    "{indent2}const {name}_idx = _registerCallback(wasm, {name});\n",
+                    name = param.name
+                ));
+                wasm_args.push(format!("{}_idx", param.name));
+                wasm_args.push("0".to_string());
+            }
             _ => {
                 wasm_args.push(param.name.clone());
             }
@@ -1127,7 +1199,7 @@ mod tests {
     use camino::Utf8Path;
     use weaveffi_core::codegen::Generator;
     use weaveffi_core::config::GeneratorConfig;
-    use weaveffi_ir::ir::{EnumVariant, Module, Param, StructField};
+    use weaveffi_ir::ir::{CallbackDef, EnumVariant, Module, Param, StructField};
 
     fn empty_api() -> Api {
         Api {
@@ -1381,6 +1453,7 @@ mod tests {
             wasm_type(&TypeRef::Optional(Box::new(TypeRef::I32))),
             "i32, i32"
         );
+        assert_eq!(wasm_type(&TypeRef::Callback("OnData".into())), "i32, i32");
     }
 
     #[test]
@@ -1407,6 +1480,10 @@ mod tests {
         assert_eq!(
             wasm_type_note(&TypeRef::Optional(Box::new(TypeRef::I32))),
             "is_present flag + value"
+        );
+        assert_eq!(
+            wasm_type_note(&TypeRef::Callback("OnData".into())),
+            "function table index + context ptr"
         );
     }
 
@@ -2536,12 +2613,12 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_excludes_callbacks_and_listeners() {
+    fn capabilities_include_callbacks_and_exclude_listeners() {
         let caps = WasmGenerator.capabilities();
-        assert!(!caps.contains(&Capability::Callbacks));
+        assert!(caps.contains(&Capability::Callbacks));
         assert!(!caps.contains(&Capability::Listeners));
         for cap in Capability::ALL {
-            if matches!(cap, Capability::Callbacks | Capability::Listeners) {
+            if matches!(cap, Capability::Listeners) {
                 continue;
             }
             assert!(caps.contains(cap), "WASM generator must support {cap:?}");
@@ -2549,20 +2626,92 @@ mod tests {
     }
 
     #[test]
-    fn callback_type_panics_with_validator_message() {
-        let cb = TypeRef::Callback("OnEvent".into());
-        let err = std::panic::catch_unwind(|| {
-            let _ = wasm_type(&cb);
-        })
-        .expect_err("callback must panic");
-        let msg = err
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| err.downcast_ref::<&'static str>().map(|s| s.to_string()))
-            .unwrap_or_default();
+    fn wasm_emits_callback_registration_helper_and_table_index() {
+        let api = make_api(vec![Module {
+            name: "events".into(),
+            functions: vec![Function {
+                name: "subscribe".into(),
+                params: vec![Param {
+                    name: "handler".into(),
+                    ty: TypeRef::Callback("OnData".into()),
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![CallbackDef {
+                name: "OnData".into(),
+                params: vec![Param {
+                    name: "payload".into(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+            }],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
         assert!(
-            msg.contains("validator should have rejected"),
-            "panic message did not mention validator: {msg}"
+            js.contains("function _registerCallback(wasm, jsFn) {"),
+            "JS must define _registerCallback helper: {js}"
+        );
+        assert!(
+            js.contains("const table = wasm.__indirect_function_table;"),
+            "_registerCallback must reference the WASM indirect function table: {js}"
+        );
+        assert!(
+            js.contains("const idx = table.grow(1);"),
+            "_registerCallback must grow the function table by 1 via Table.grow: {js}"
+        );
+        assert!(
+            js.contains("table.set(idx, jsFn);"),
+            "_registerCallback must install jsFn at the newly-grown index: {js}"
+        );
+        assert!(
+            js.contains("return idx;"),
+            "_registerCallback must return the new table index: {js}"
+        );
+        assert!(
+            js.contains("const handler_idx = _registerCallback(wasm, handler);"),
+            "function wrapper must register the JS callback and capture the index: {js}"
+        );
+        assert!(
+            js.contains("wasm.weaveffi_events_subscribe(handler_idx, 0, _err);"),
+            "WASM call must pass (table_index, context, _err) matching (i32, i32, err_ptr) C ABI shape: {js}"
+        );
+
+        let dts = render_wasm_dts(&api, DEFAULT_MODULE_NAME);
+        assert!(
+            dts.contains("export type OnData = (payload: string) => void;"),
+            "generated .d.ts must declare the callback type as a JS function type: {dts}"
+        );
+        assert!(
+            dts.contains("subscribe(handler: OnData): void"),
+            "generated .d.ts function signature must reference the callback type alias: {dts}"
+        );
+
+        let readme = render_wasm_readme(&api);
+        assert!(
+            readme.contains("### Callbacks"),
+            "README must document the callback ABI convention: {readme}"
+        );
+        assert!(
+            readme.contains("`_registerCallback(wasm, jsFn)`"),
+            "README must reference the JS helper: {readme}"
+        );
+        assert!(
+            readme.contains("| `handler` | `callback<OnData>` | `i32, i32` | function table index + context ptr |"),
+            "API reference must render the callback param as (i32, i32) with a descriptive note: {readme}"
         );
     }
 }
