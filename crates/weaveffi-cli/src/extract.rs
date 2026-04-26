@@ -109,6 +109,13 @@ fn two_generic_args(seg: &syn::PathSegment) -> Result<(&syn::Type, &syn::Type)> 
 }
 
 fn map_type(ty: &syn::Type) -> Result<TypeRef> {
+    if let syn::Type::Reference(r) = ty {
+        return match r.elem.as_ref() {
+            inner if is_ident(inner, "str") => Ok(TypeRef::BorrowedStr),
+            syn::Type::Slice(slice) if is_ident(&slice.elem, "u8") => Ok(TypeRef::BorrowedBytes),
+            _ => bail!("unsupported reference type; only &str and &[u8] are supported"),
+        };
+    }
     let syn::Type::Path(type_path) = ty else {
         bail!("unsupported type syntax");
     };
@@ -872,5 +879,31 @@ mod tests {
         let api = extract_api_from_rust(src).unwrap();
         let f = &api.modules[0].functions[0];
         assert_eq!(f.doc.as_deref(), Some("Adds two numbers."));
+    }
+
+    #[test]
+    fn extract_borrowed_str_param() {
+        let src = r#"
+            mod m {
+                #[weaveffi_export]
+                fn greet(name: &str) {}
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert_eq!(f.params[0].ty, TypeRef::BorrowedStr);
+    }
+
+    #[test]
+    fn extract_borrowed_bytes_param() {
+        let src = r#"
+            mod m {
+                #[weaveffi_export]
+                fn hash(data: &[u8]) {}
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert_eq!(f.params[0].ty, TypeRef::BorrowedBytes);
     }
 }
