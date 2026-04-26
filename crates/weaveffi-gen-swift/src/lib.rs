@@ -3,6 +3,7 @@ use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_core::codegen::{stamp_header, Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
+use weaveffi_core::templates::{api_to_context, TemplateEngine};
 use weaveffi_core::utils::{c_symbol_name, local_type_name, wrapper_name};
 use weaveffi_ir::ir::{
     Api, CallbackDef, EnumDef, Function, ListenerDef, Module, Param, StructDef, StructField,
@@ -10,6 +11,23 @@ use weaveffi_ir::ir::{
 };
 
 pub struct SwiftGenerator;
+
+/// Name under which the Swift wrapper template is registered.
+const WRAPPER_TEMPLATE: &str = "swift/wrapper.tera";
+
+/// Built-in Swift wrapper template, compiled into the binary. Exposed so
+/// callers (and tests) can seed a [`TemplateEngine`] with the shipped default
+/// via [`TemplateEngine::load_builtin`].
+pub const BUILTIN_WRAPPER_TEMPLATE: &str = include_str!("../templates/swift/wrapper.tera");
+
+/// Build a [`TemplateEngine`] pre-loaded with this crate's built-in templates.
+/// User templates loaded via [`TemplateEngine::load_dir`] override entries of
+/// the same name.
+pub fn builtin_template_engine() -> Result<TemplateEngine> {
+    let mut engine = TemplateEngine::new();
+    engine.load_builtin(WRAPPER_TEMPLATE, BUILTIN_WRAPPER_TEMPLATE)?;
+    Ok(engine)
+}
 
 fn stamp_slash(body: String) -> String {
     format!("// {}\n{body}", stamp_header("swift"))
@@ -46,13 +64,30 @@ impl SwiftGenerator {
         strip_module_prefix: bool,
         c_prefix: &str,
     ) -> Result<()> {
-        let dir = out_dir.join("swift");
-        let c_module = c_system_module_name(c_prefix);
-        let module_dir = dir.join(&c_module);
-        std::fs::create_dir_all(&module_dir)?;
+        let (src_dir, c_module) = write_swift_support_files(out_dir, module_name, c_prefix)?;
+        std::fs::write(
+            src_dir.join(format!("{}.swift", module_name)),
+            stamp_slash(render_swift_wrapper(api, strip_module_prefix, &c_module)),
+        )?;
+        Ok(())
+    }
+}
 
-        let package = format!(
-            r#"// swift-tools-version:5.7
+/// Write `Package.swift` and `module.modulemap`, create the Sources directory,
+/// and return the Sources path plus the derived C system module name. Shared
+/// between the built-in formatter path and the user-template override path.
+fn write_swift_support_files(
+    out_dir: &Utf8Path,
+    module_name: &str,
+    c_prefix: &str,
+) -> Result<(camino::Utf8PathBuf, String)> {
+    let dir = out_dir.join("swift");
+    let c_module = c_system_module_name(c_prefix);
+    let module_dir = dir.join(&c_module);
+    std::fs::create_dir_all(&module_dir)?;
+
+    let package = format!(
+        r#"// swift-tools-version:5.7
 import PackageDescription
 
 let package = Package(
@@ -66,24 +101,19 @@ let package = Package(
     ]
 )
 "#,
-            name = module_name,
-            c_name = c_module,
-        );
-        std::fs::write(dir.join("Package.swift"), stamp_swift_package(package))?;
+        name = module_name,
+        c_name = c_module,
+    );
+    std::fs::write(dir.join("Package.swift"), stamp_swift_package(package))?;
 
-        let modulemap = format!(
-            "module {c_module} [system] {{\n  header \"../../c/{c_prefix}.h\"\n  link \"{c_prefix}\"\n  export *\n}}\n",
-        );
-        std::fs::write(module_dir.join("module.modulemap"), stamp_slash(modulemap))?;
+    let modulemap = format!(
+        "module {c_module} [system] {{\n  header \"../../c/{c_prefix}.h\"\n  link \"{c_prefix}\"\n  export *\n}}\n",
+    );
+    std::fs::write(module_dir.join("module.modulemap"), stamp_slash(modulemap))?;
 
-        let src_dir = dir.join("Sources").join(module_name);
-        std::fs::create_dir_all(&src_dir)?;
-        std::fs::write(
-            src_dir.join(format!("{}.swift", module_name)),
-            stamp_slash(render_swift_wrapper(api, strip_module_prefix, &c_module)),
-        )?;
-        Ok(())
-    }
+    let src_dir = dir.join("Sources").join(module_name);
+    std::fs::create_dir_all(&src_dir)?;
+    Ok((src_dir, c_module))
 }
 
 impl Generator for SwiftGenerator {
@@ -108,6 +138,30 @@ impl Generator for SwiftGenerator {
             config.strip_module_prefix,
             config.c_prefix(),
         )
+    }
+
+    fn generate_with_templates(
+        &self,
+        api: &Api,
+        out_dir: &Utf8Path,
+        config: &GeneratorConfig,
+        templates: Option<&TemplateEngine>,
+    ) -> Result<()> {
+        if let Some(engine) = templates {
+            if engine.has_template(WRAPPER_TEMPLATE) {
+                let module_name = config.swift_module_name();
+                let (src_dir, _c_module) =
+                    write_swift_support_files(out_dir, module_name, config.c_prefix())?;
+                let ctx = api_to_context(api);
+                let wrapper_body = engine.render(WRAPPER_TEMPLATE, &ctx)?;
+                std::fs::write(
+                    src_dir.join(format!("{}.swift", module_name)),
+                    stamp_slash(wrapper_body),
+                )?;
+                return Ok(());
+            }
+        }
+        self.generate_with_config(api, out_dir, config)
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
@@ -5384,5 +5438,87 @@ mod tests {
         assert!(wrapper.contains("DO NOT EDIT"));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn builtin_wrapper_template_parses() {
+        let engine = builtin_template_engine().expect("built-in template should parse");
+        assert!(engine.has_template("swift/wrapper.tera"));
+    }
+
+    #[test]
+    fn swift_user_template_overrides_builtin() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "math".to_string(),
+                functions: vec![Function {
+                    name: "add".to_string(),
+                    params: vec![],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let tpl_dir = tempfile::tempdir().unwrap();
+        let tpl_path = Utf8Path::from_path(tpl_dir.path()).unwrap();
+        std::fs::create_dir_all(tpl_path.join("swift")).unwrap();
+        std::fs::write(
+            tpl_path.join("swift").join("wrapper.tera"),
+            "// custom swift wrapper for {{ modules[0].name }}\n",
+        )
+        .unwrap();
+
+        let mut engine = TemplateEngine::new();
+        engine
+            .load_builtin("swift/wrapper.tera", BUILTIN_WRAPPER_TEMPLATE)
+            .unwrap();
+        engine.load_dir(tpl_path).unwrap();
+
+        let out = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(out.path()).unwrap();
+        let config = GeneratorConfig::default();
+        SwiftGenerator
+            .generate_with_templates(&api, out_dir, &config, Some(&engine))
+            .unwrap();
+
+        let wrapper =
+            std::fs::read_to_string(out_dir.join("swift/Sources/WeaveFFI/WeaveFFI.swift")).unwrap();
+        assert!(
+            wrapper.contains("// custom swift wrapper for math"),
+            "user template output missing from generated wrapper: {wrapper}"
+        );
+        assert!(
+            !wrapper.contains("import CWeaveFFI"),
+            "built-in formatter output must not appear when user override is used: {wrapper}"
+        );
+        assert!(
+            wrapper.starts_with("// WeaveFFI "),
+            "stamp header should still be emitted: {wrapper}"
+        );
+
+        let pkg = std::fs::read_to_string(out_dir.join("swift/Package.swift")).unwrap();
+        assert!(
+            pkg.contains(".systemLibrary(name: \"CWeaveFFI\")"),
+            "Package.swift must still be produced alongside the overridden wrapper: {pkg}"
+        );
+        let modulemap =
+            std::fs::read_to_string(out_dir.join("swift/CWeaveFFI/module.modulemap")).unwrap();
+        assert!(
+            modulemap.contains("module CWeaveFFI"),
+            "module.modulemap must still be produced alongside the overridden wrapper: {modulemap}"
+        );
     }
 }
