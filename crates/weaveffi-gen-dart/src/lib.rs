@@ -267,6 +267,15 @@ fn render_dart_module(api: &Api) -> String {
         "void",
     );
 
+    emit_typedef_and_lookup(
+        &mut out,
+        "weaveffi_free_string",
+        "Pointer<Char>",
+        "Pointer<Char>",
+        "Void",
+        "void",
+    );
+
     out.push_str("\nclass WeaveffiException implements Exception {\n");
     out.push_str("  final int code;\n");
     out.push_str("  final String message;\n");
@@ -617,7 +626,13 @@ fn emit_function_body(out: &mut String, f: &Function, c_sym: &str) {
 fn emit_result_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!("{indent}return result.toDartString();\n"));
+            out.push_str(&format!(
+                "{indent}final str = result.cast<Char>() == nullptr ? '' : result.toDartString();\n"
+            ));
+            out.push_str(&format!(
+                "{indent}_weaveffiFreeString(result.cast<Char>());\n"
+            ));
+            out.push_str(&format!("{indent}return str;\n"));
         }
         TypeRef::Bool => {
             out.push_str(&format!("{indent}return result != 0;\n"));
@@ -645,7 +660,11 @@ fn emit_result_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                 out.push_str(&format!("{indent}if (result == nullptr) return null;\n"));
-                out.push_str(&format!("{indent}return result.toDartString();\n"));
+                out.push_str(&format!("{indent}final str = result.toDartString();\n"));
+                out.push_str(&format!(
+                    "{indent}_weaveffiFreeString(result.cast<Char>());\n"
+                ));
+                out.push_str(&format!("{indent}return str;\n"));
             }
             TypeRef::Struct(name) => {
                 let n = local_type_name(name).to_upper_camel_case();
@@ -2077,6 +2096,158 @@ mod tests {
         assert!(
             clear_pos < throw_pos,
             "_weaveffiErrorClear must run BEFORE throwing: {dart}"
+        );
+    }
+
+    #[test]
+    fn dart_string_return_calls_free_string() {
+        let api = make_api(vec![Module {
+            name: "text".into(),
+            functions: vec![
+                Function {
+                    name: "echo".into(),
+                    params: vec![Param {
+                        name: "msg".into(),
+                        ty: TypeRef::StringUtf8,
+                        mutable: false,
+                    }],
+                    returns: Some(TypeRef::StringUtf8),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "fetch".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::StringUtf8),
+                    doc: None,
+                    r#async: true,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "lookup".into(),
+                    params: vec![Param {
+                        name: "id".into(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                    }],
+                    returns: Some(TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+            ],
+            structs: vec![StructDef {
+                name: "Note".into(),
+                doc: None,
+                builder: false,
+                fields: vec![StructField {
+                    name: "title".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                    default: None,
+                }],
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let dart = render_dart_module(&api);
+
+        assert!(
+            dart.contains("typedef _NativeWeaveffiFreeString = Void Function(Pointer<Char>);"),
+            "missing _NativeWeaveffiFreeString typedef using Pointer<Char>: {dart}"
+        );
+        assert!(
+            dart.contains("typedef _DartWeaveffiFreeString = void Function(Pointer<Char>);"),
+            "missing _DartWeaveffiFreeString typedef using Pointer<Char>: {dart}"
+        );
+        assert!(
+            dart.contains("'weaveffi_free_string'"),
+            "missing 'weaveffi_free_string' lookup: {dart}"
+        );
+
+        let echo_start = dart.find("String echo(String msg)").expect("echo wrapper");
+        let echo_body = &dart[echo_start..];
+        let echo_end = echo_body.find("\n}\n").expect("end of echo body") + echo_start;
+        let echo_text = &dart[echo_start..echo_end];
+        let convert_pos = echo_text
+            .find("result.cast<Char>() == nullptr ? '' : result.toDartString()")
+            .expect("echo must capture string with null guard before freeing");
+        let free_pos = echo_text
+            .find("_weaveffiFreeString(result.cast<Char>())")
+            .expect("echo must call _weaveffiFreeString on the returned pointer");
+        let return_pos = echo_text
+            .find("return str;")
+            .expect("echo must return the captured str");
+        assert!(
+            convert_pos < free_pos && free_pos < return_pos,
+            "free must occur after capture and before return: {echo_text}"
+        );
+        assert!(
+            !echo_text.contains("return result.toDartString();"),
+            "echo must not return result.toDartString() directly (leak): {echo_text}"
+        );
+
+        let lookup_start = dart.find("String? lookup(int id)").expect("lookup wrapper");
+        let lookup_body = &dart[lookup_start..];
+        let lookup_end = lookup_body.find("\n}\n").expect("end of lookup body") + lookup_start;
+        let lookup_text = &dart[lookup_start..lookup_end];
+        let null_pos = lookup_text
+            .find("if (result == nullptr) return null;")
+            .expect("optional lookup must short-circuit on null");
+        let opt_convert_pos = lookup_text
+            .find("final str = result.toDartString();")
+            .expect("optional lookup must capture the string");
+        let opt_free_pos = lookup_text
+            .find("_weaveffiFreeString(result.cast<Char>())")
+            .expect("optional lookup must free the returned pointer");
+        let opt_return_pos = lookup_text
+            .find("return str;")
+            .expect("optional lookup must return the captured str");
+        assert!(
+            null_pos < opt_convert_pos
+                && opt_convert_pos < opt_free_pos
+                && opt_free_pos < opt_return_pos,
+            "optional string return must null-check, capture, free, then return: {lookup_text}"
+        );
+
+        let getter_start = dart.find("String get title").expect("title getter");
+        let getter_body = &dart[getter_start..];
+        let getter_end = getter_body.find("\n  }\n").expect("end of getter") + getter_start;
+        let getter_text = &dart[getter_start..getter_end];
+        assert!(
+            getter_text.contains("_weaveffiFreeString(result.cast<Char>())"),
+            "struct string getter must free the returned pointer: {getter_text}"
+        );
+        assert!(
+            getter_text.contains("return str;"),
+            "struct string getter must return captured str: {getter_text}"
+        );
+
+        let sync_async_start = dart
+            .find("String _fetch()")
+            .expect("sync helper for async fetch");
+        let sync_async_body = &dart[sync_async_start..];
+        let sync_async_end =
+            sync_async_body.find("\n}\n").expect("end of _fetch body") + sync_async_start;
+        let sync_async_text = &dart[sync_async_start..sync_async_end];
+        assert!(
+            sync_async_text.contains("_weaveffiFreeString(result.cast<Char>())"),
+            "async result delivery must free the returned pointer in sync helper: {sync_async_text}"
+        );
+        assert!(
+            sync_async_text.contains("return str;"),
+            "async sync helper must return captured str: {sync_async_text}"
         );
     }
 }
