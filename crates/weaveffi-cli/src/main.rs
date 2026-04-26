@@ -217,6 +217,14 @@ enum Commands {
         /// Input IDL/IR file (yaml|yml|json|toml)
         input: String,
     },
+    /// Run `validate` then `lint` and report both; useful in pre-commit hooks
+    Check {
+        /// Input IDL/IR file (yaml|yml|json|toml)
+        input: String,
+        /// Treat lint warnings as errors (exit 1 on any warning)
+        #[arg(long)]
+        strict: bool,
+    },
     Diff {
         /// Input IDL/IR file (yaml|yml|json|toml)
         input: String,
@@ -356,6 +364,11 @@ fn main() -> Result<()> {
         )?,
         Commands::Lint { input } => {
             if !cmd_lint(&input, quiet, format)? {
+                std::process::exit(1);
+            }
+        }
+        Commands::Check { input, strict } => {
+            if !cmd_check(&input, strict, quiet, format)? {
                 std::process::exit(1);
             }
         }
@@ -1131,6 +1144,18 @@ fn cmd_lint(input: &str, quiet: bool, format: OutputFormat) -> Result<bool> {
         }
         Ok(false)
     }
+}
+
+/// Runs `validate` then `lint` and reports both. Returns `Ok(true)` when the
+/// command should exit 0 and `Ok(false)` when it should exit 1 (validation
+/// failed, or `--strict` was set and lint emitted warnings).
+fn cmd_check(input: &str, strict: bool, quiet: bool, format: OutputFormat) -> Result<bool> {
+    let validate_ok = cmd_validate(input, false, quiet, format)?;
+    if !validate_ok {
+        return Ok(false);
+    }
+    let lint_ok = cmd_lint(input, quiet, format)?;
+    Ok(lint_ok || !strict)
 }
 
 /// Returns `Ok(true)` when the command should exit 0, `Ok(false)` when the
