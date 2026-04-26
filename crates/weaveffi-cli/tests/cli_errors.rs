@@ -110,6 +110,14 @@ modules:
         "expected rule violation message, got: {stderr}"
     );
     assert!(
+        stderr.contains("[WFFI002]"),
+        "expected error code prefix in message, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("weaveffi explain WFFI002"),
+        "expected pointer to `weaveffi explain`, got: {stderr}"
+    );
+    assert!(
         stderr.contains("Suggestion"),
         "expected Suggestion section, got: {stderr}"
     );

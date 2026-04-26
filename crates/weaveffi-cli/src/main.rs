@@ -48,6 +48,8 @@ impl OutputFormat {
 /// Structured error entry used in JSON outputs of `validate`.
 #[derive(Debug, Serialize)]
 struct ErrorEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
     location: Option<String>,
     message: String,
     suggestion: Option<String>,
@@ -114,6 +116,7 @@ fn parse_error_to_entry(filename: &str, err: &ParseError) -> ErrorEntry {
         }
     };
     ErrorEntry {
+        code: None,
         location,
         message: err.to_string(),
         suggestion,
@@ -130,9 +133,11 @@ fn validation_error_to_entry(filename: &str, err: &ValidationError) -> ErrorEntr
         Some(validation_suggestion(err).to_string())
     };
     let location = validation_error_span(err).map(|s| format!("{filename}:{}:{}", s.line, s.col));
+    let code = err.code();
     ErrorEntry {
+        code: Some(code.to_string()),
         location,
-        message: err.to_string(),
+        message: format!("[{code}] {err}"),
         suggestion,
     }
 }
@@ -251,6 +256,11 @@ enum Commands {
         #[arg(long)]
         lockfile: Option<String>,
     },
+    /// Print a long-form explanation for a WeaveFFI validation error code
+    Explain {
+        /// Error code to explain (e.g. WFFI001). Case-insensitive.
+        code: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -349,6 +359,11 @@ fn main() -> Result<()> {
         }
         Commands::Verify { dir, lockfile } => {
             if !cmd_verify(&dir, lockfile.as_deref(), quiet)? {
+                std::process::exit(1);
+            }
+        }
+        Commands::Explain { code } => {
+            if !cmd_explain(&code)? {
                 std::process::exit(1);
             }
         }
@@ -940,6 +955,7 @@ fn cmd_validate_json(input: &str) -> Result<bool> {
         emit_json(&ValidateErrJson {
             ok: false,
             errors: vec![ErrorEntry {
+                code: None,
                 location: Some(input.to_string()),
                 message: "input file has no extension (expected yml|yaml|json|toml)".to_string(),
                 suggestion: Some("use a supported format: yml, yaml, json, or toml".to_string()),
@@ -955,6 +971,7 @@ fn cmd_validate_json(input: &str) -> Result<bool> {
             emit_json(&ValidateErrJson {
                 ok: false,
                 errors: vec![ErrorEntry {
+                    code: None,
                     location: Some(input.to_string()),
                     message: format!(
                         "unsupported input format: {other} (expected yml|yaml|json|toml)"
@@ -973,6 +990,7 @@ fn cmd_validate_json(input: &str) -> Result<bool> {
             emit_json(&ValidateErrJson {
                 ok: false,
                 errors: vec![ErrorEntry {
+                    code: None,
                     location: Some(input.to_string()),
                     message: format!("failed to read input file: {e}"),
                     suggestion: None,
@@ -1462,14 +1480,21 @@ fn render_source_context(filename: &str, input: &str, line: usize, column: usize
 }
 
 fn format_validation_error(filename: &str, input: &str, err: ValidationError) -> Report {
+    let code = err.code();
     if let ValidationError::UnknownGeneratorConfigKey { target, .. } = &err {
         let valid = valid_keys_for_generator_target(target);
         let suggestion = format!("valid keys for the `{target}` generator section are: {valid}");
-        return eyre!(err).suggestion(suggestion);
+        let msg = format!("[{code}] {err}");
+        return eyre!(msg).suggestion(suggestion).note(format!(
+            "run `weaveffi explain {code}` for a longer explanation"
+        ));
     }
     let span = validation_error_span(&err);
     let suggestion = validation_suggestion(&err);
-    let mut report = eyre!(err).suggestion(suggestion);
+    let msg = format!("[{code}] {err}");
+    let mut report = eyre!(msg).suggestion(suggestion).note(format!(
+        "run `weaveffi explain {code}` for a longer explanation"
+    ));
     if let Some(span) = span {
         let note = render_source_context(filename, input, span.line as usize, span.col as usize);
         report = report.note(note);
@@ -1574,6 +1599,410 @@ fn validation_suggestion(err: &ValidationError) -> &'static str {
         }
         ValidationError::UnknownGeneratorConfigKey { .. } => {
             "remove the unknown key or rename it to match a supported field in the inline [generators] section"
+        }
+    }
+}
+
+/// Long-form markdown explanations for every [`ValidationError`] code, used
+/// by `weaveffi explain <code>`. Entries parallel the discriminants returned
+/// by [`ValidationError::code`]; keep them in sync.
+const ERROR_EXPLANATIONS: &[(&str, &str)] = &[
+    (
+        "WFFI001",
+        "# WFFI001: module has no name\n\
+        \n\
+        Every module entry in the API definition must have a non-empty `name` field.\n\
+        The name becomes the top-level namespace in every generated language.\n\
+        \n\
+        ## Example\n\
+        \n\
+        Wrong:\n\
+        ```yaml\n\
+        modules:\n\
+          - functions:\n\
+              - name: do_stuff\n\
+                params: []\n\
+        ```\n\
+        \n\
+        Right:\n\
+        ```yaml\n\
+        modules:\n\
+          - name: my_module\n\
+            functions:\n\
+              - name: do_stuff\n\
+                params: []\n\
+        ```\n",
+    ),
+    (
+        "WFFI002",
+        "# WFFI002: duplicate module name\n\
+        \n\
+        Module names must be unique within an API definition. Generated code uses\n\
+        the module name as a namespace, so duplicates would collide.\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Rename one of the modules or merge their contents into a single entry.\n",
+    ),
+    (
+        "WFFI003",
+        "# WFFI003: invalid module name\n\
+        \n\
+        A module name must be a valid identifier: it starts with a letter or\n\
+        underscore and contains only ASCII alphanumeric characters or underscores.\n\
+        Reserved words (e.g. `type`, `match`, `return`) are also rejected.\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Choose a name like `my_module` instead of `123mod` or `match`.\n",
+    ),
+    (
+        "WFFI004",
+        "# WFFI004: duplicate function name\n\
+        \n\
+        Two functions in the same module share a name. Every foreign-language\n\
+        target emits one symbol per function, so duplicates would clash.\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Rename one of the duplicates, or merge their signatures if they were\n\
+        meant to describe the same function.\n",
+    ),
+    (
+        "WFFI005",
+        "# WFFI005: duplicate parameter name\n\
+        \n\
+        A function declares two parameters with the same name. Parameter names\n\
+        become keyword arguments and variable bindings in the generated code, so\n\
+        they must be unique.\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Rename one of the duplicate parameters.\n",
+    ),
+    (
+        "WFFI006",
+        "# WFFI006: reserved keyword used as identifier\n\
+        \n\
+        Identifiers cannot reuse reserved words (`if`, `else`, `for`, `while`,\n\
+        `loop`, `match`, `type`, `return`, `async`, `await`, `break`, `continue`,\n\
+        `fn`, `struct`, `enum`, `mod`, `use`).\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Pick a different name, e.g. `kind` instead of `type` or `r#match` in a\n\
+        consumer language's reserved-name escape form.\n",
+    ),
+    (
+        "WFFI007",
+        "# WFFI007: invalid identifier\n\
+        \n\
+        Identifiers must start with a letter or underscore and contain only\n\
+        ASCII alphanumeric characters or underscores.\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Remove leading digits or non-ASCII characters: `1st` → `first`,\n\
+        `weav-ffi` → `weav_ffi`.\n",
+    ),
+    (
+        "WFFI008",
+        "# WFFI008: error domain missing name\n\
+        \n\
+        A module declares an `errors:` domain but does not give it a `name`.\n\
+        The domain name becomes the error enum emitted in each language.\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Add a `name:` field to the domain, e.g. `name: CalculatorError`.\n",
+    ),
+    (
+        "WFFI009",
+        "# WFFI009: duplicate error code name\n\
+        \n\
+        Two error codes in the same module share a symbolic name. Each error\n\
+        code becomes a variant of the generated error enum, so names must be\n\
+        unique within a module.\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Rename one of the duplicate error codes.\n",
+    ),
+    (
+        "WFFI010",
+        "# WFFI010: duplicate error numeric code\n\
+        \n\
+        Two error codes in the same module share a numeric value. Numeric\n\
+        values are transmitted across the C ABI and must disambiguate variants.\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Assign a different non-zero integer to one of the duplicates.\n",
+    ),
+    (
+        "WFFI011",
+        "# WFFI011: invalid error code value\n\
+        \n\
+        Error codes must be non-zero. Zero is reserved for the success value\n\
+        used by generated C ABI result helpers.\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Use any other positive or negative integer, e.g. `1`, `-1`, `100`.\n",
+    ),
+    (
+        "WFFI012",
+        "# WFFI012: function name collides with error domain\n\
+        \n\
+        A function shares its name with an error domain in the same module.\n\
+        Both are emitted at the module level in several languages (e.g. Swift\n\
+        extension members), so the names must be distinct.\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Rename either the function or the error domain.\n",
+    ),
+    (
+        "WFFI013",
+        "# WFFI013: duplicate struct name\n\
+        \n\
+        Two structs in the same module share a name. Struct names become\n\
+        language types (Swift struct, Kotlin data class, etc.) and must be\n\
+        unique within a module.\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Rename one of the duplicate structs.\n",
+    ),
+    (
+        "WFFI014",
+        "# WFFI014: duplicate struct field\n\
+        \n\
+        A struct declares two fields with the same name. Fields map to\n\
+        properties/members in the generated code and must be unique within\n\
+        their struct.\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Rename one of the duplicate fields.\n",
+    ),
+    (
+        "WFFI015",
+        "# WFFI015: empty struct\n\
+        \n\
+        Structs must declare at least one field. An empty struct has no bytes\n\
+        to marshal across the C ABI and no useful representation in target\n\
+        languages.\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Add one or more fields, or remove the struct if it is unused.\n",
+    ),
+    (
+        "WFFI016",
+        "# WFFI016: duplicate enum name\n\
+        \n\
+        Two enums in the same module share a name. Enums become types in the\n\
+        generated code and must be uniquely named within a module.\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Rename one of the duplicate enums.\n",
+    ),
+    (
+        "WFFI017",
+        "# WFFI017: empty enum\n\
+        \n\
+        Enums must declare at least one variant. Empty enums have no legal\n\
+        value and cannot be represented over the C ABI.\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Add one or more variants, or remove the enum if it is unused.\n",
+    ),
+    (
+        "WFFI018",
+        "# WFFI018: duplicate enum variant\n\
+        \n\
+        An enum declares two variants with the same name. Variant names become\n\
+        language-level enum cases and must be unique within their enum.\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Rename one of the duplicate variants.\n",
+    ),
+    (
+        "WFFI019",
+        "# WFFI019: duplicate enum variant value\n\
+        \n\
+        Two variants in the same enum share a numeric value. The discriminant\n\
+        is what crosses the C ABI, so duplicates would be indistinguishable on\n\
+        the foreign side.\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Assign distinct numeric values to each variant.\n",
+    ),
+    (
+        "WFFI020",
+        "# WFFI020: unknown type reference\n\
+        \n\
+        A field, parameter, or return type references a name that is not a\n\
+        primitive and is not defined as a struct or enum in the same module\n\
+        (or as a cross-module `other_module.Type`).\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Define the referenced struct/enum, qualify a cross-module reference\n\
+        (`mod.Type`), or fix the typo.\n",
+    ),
+    (
+        "WFFI021",
+        "# WFFI021: invalid map key type\n\
+        \n\
+        Maps only support primitive or string keys: `i32`, `u32`, `i64`, `f64`,\n\
+        `bool`, `string`. Structs, enums, lists, and nested maps cannot serve\n\
+        as keys over the C ABI.\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Change the map declaration to use a supported key type, for example\n\
+        `map<string, MyStruct>` instead of `map<MyStruct, i32>`.\n",
+    ),
+    (
+        "WFFI022",
+        "# WFFI022: borrowed type in invalid position\n\
+        \n\
+        Borrowed types (`&str`, `&[u8]`) only make sense as function\n\
+        parameters, where the caller keeps ownership for the duration of the\n\
+        call. They cannot appear in return types or struct fields because the\n\
+        generated code would have nothing to anchor the lifetime to.\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Switch to the owned counterpart: `string` or `bytes`.\n",
+    ),
+    (
+        "WFFI023",
+        "# WFFI023: duplicate callback name\n\
+        \n\
+        Two callback definitions in the same module share a name. Callbacks\n\
+        become named types in the generated bindings and must be unique within\n\
+        a module.\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Rename one of the duplicate callback definitions.\n",
+    ),
+    (
+        "WFFI024",
+        "# WFFI024: listener references an undefined callback\n\
+        \n\
+        A `listener` block refers to an `event_callback` name that is not\n\
+        defined in the same module's `callbacks:` section. Listeners must\n\
+        bind to a real callback so the generated code can invoke it.\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Define the callback in the same module, or correct the reference to\n\
+        an existing one.\n",
+    ),
+    (
+        "WFFI025",
+        "# WFFI025: duplicate listener name\n\
+        \n\
+        Two listener definitions in the same module share a name. Listener\n\
+        names become classes/interfaces in the generated bindings and must be\n\
+        unique within a module.\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Rename one of the duplicate listeners.\n",
+    ),
+    (
+        "WFFI026",
+        "# WFFI026: iterator type in invalid position\n\
+        \n\
+        Iterator types can only appear as function return types. They cannot\n\
+        be used as parameters or struct fields because the C ABI only knows\n\
+        how to vend a fresh iterator to the foreign caller, not accept one as\n\
+        input or store one inside a value type.\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Return the iterator from a function, or replace it with a `list`\n\
+        (`[T]`) where input or storage is required.\n",
+    ),
+    (
+        "WFFI027",
+        "# WFFI027: builder struct must have at least one field\n\
+        \n\
+        A struct marked `builder: true` has no fields. Builder structs are\n\
+        emitted as fluent builder classes/types, each field becoming a setter;\n\
+        an empty builder would expose no setters.\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Add the fields the builder should set, or drop `builder: true` if the\n\
+        struct is not meant to be a builder.\n",
+    ),
+    (
+        "WFFI028",
+        "# WFFI028: target does not support capability\n\
+        \n\
+        The selected generator does not support an IR feature used in the API\n\
+        (for example, async functions on a target that has no async support).\n\
+        The capability system keeps generators honest about what they emit.\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Either drop the target from `--target`, or remove the unsupported\n\
+        feature from the API definition.\n",
+    ),
+    (
+        "WFFI029",
+        "# WFFI029: unknown key in inline [generators] section\n\
+        \n\
+        The inline `generators:` block in the IDL contains a key that does\n\
+        not correspond to any supported generator field (or a `generators.X`\n\
+        target that is not a known generator).\n\
+        \n\
+        ## Fix\n\
+        \n\
+        Check for typos. Valid targets are: swift, android, node, wasm, c,\n\
+        python, dotnet, cpp, dart, go, ruby.\n",
+    ),
+];
+
+/// Returns the markdown explanation for a given error code, if known.
+/// The lookup is case-insensitive so `wffi001` and `WFFI001` both work.
+fn lookup_explanation(code: &str) -> Option<&'static str> {
+    let needle = code.to_ascii_uppercase();
+    ERROR_EXPLANATIONS
+        .iter()
+        .find(|(c, _)| *c == needle)
+        .map(|(_, text)| *text)
+}
+
+/// Implements `weaveffi explain <code>`. Returns `Ok(false)` when the code is
+/// unknown (so the caller can exit with a non-zero status) while still
+/// printing a helpful message that lists every valid code.
+fn cmd_explain(code: &str) -> Result<bool> {
+    match lookup_explanation(code) {
+        Some(text) => {
+            print!("{text}");
+            Ok(true)
+        }
+        None => {
+            let known: Vec<&str> = ERROR_EXPLANATIONS.iter().map(|(c, _)| *c).collect();
+            eprintln!(
+                "unknown error code: {code}\n\
+                 \n\
+                 run `weaveffi explain <code>` with one of the following codes:\n\
+                 {}",
+                known.join(", "),
+            );
+            Ok(false)
         }
     }
 }
@@ -3283,5 +3712,242 @@ mod tests {
             assert_eq!(entry["status"], target.status);
             assert_eq!(entry["emits"], target.emits);
         }
+    }
+
+    #[test]
+    fn lookup_explanation_returns_markdown_for_known_code() {
+        let text = lookup_explanation("WFFI001").expect("WFFI001 should be known");
+        assert!(
+            text.starts_with("# WFFI001"),
+            "explanation should begin with a markdown title: {text}"
+        );
+        assert!(
+            text.contains("module has no name"),
+            "explanation should describe the underlying error: {text}"
+        );
+    }
+
+    #[test]
+    fn lookup_explanation_is_case_insensitive() {
+        assert!(lookup_explanation("wffi002").is_some());
+        assert!(lookup_explanation("WfFi002").is_some());
+        assert_eq!(
+            lookup_explanation("wffi002"),
+            lookup_explanation("WFFI002"),
+            "case should not change the explanation returned",
+        );
+    }
+
+    #[test]
+    fn explain_unknown_code_returns_helpful_message() {
+        assert!(
+            !cmd_explain("WFFI999").unwrap(),
+            "unknown code should yield Ok(false)"
+        );
+        assert!(
+            !cmd_explain("not-a-code").unwrap(),
+            "garbage input should yield Ok(false)"
+        );
+
+        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .args(["explain", "WFFI999"])
+            .output()
+            .expect("failed to run weaveffi explain");
+        assert!(
+            !cmd.status.success(),
+            "unknown code must exit non-zero (stdout: {}, stderr: {})",
+            String::from_utf8_lossy(&cmd.stdout),
+            String::from_utf8_lossy(&cmd.stderr),
+        );
+        let stderr = String::from_utf8_lossy(&cmd.stderr);
+        assert!(
+            stderr.contains("unknown error code"),
+            "expected unknown-error preamble, got: {stderr}"
+        );
+        assert!(
+            stderr.contains("WFFI999"),
+            "expected the offending code echoed back, got: {stderr}"
+        );
+        assert!(
+            stderr.contains("WFFI001"),
+            "expected list of valid codes to include WFFI001, got: {stderr}"
+        );
+        assert!(
+            stderr.contains("weaveffi explain"),
+            "expected usage hint referencing the explain command, got: {stderr}"
+        );
+    }
+
+    #[test]
+    fn explain_known_code_prints_markdown() {
+        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .args(["explain", "WFFI002"])
+            .output()
+            .expect("failed to run weaveffi explain");
+        assert!(
+            cmd.status.success(),
+            "known code must exit zero: {}",
+            String::from_utf8_lossy(&cmd.stderr),
+        );
+        let stdout = String::from_utf8_lossy(&cmd.stdout);
+        assert!(
+            stdout.contains("# WFFI002"),
+            "explanation should include markdown title: {stdout}"
+        );
+        assert!(
+            stdout.contains("duplicate module name"),
+            "explanation should describe the underlying error: {stdout}"
+        );
+    }
+
+    #[test]
+    fn error_explanations_cover_all_validation_error_variants() {
+        let cases: Vec<ValidationError> = vec![
+            ValidationError::NoModuleName,
+            ValidationError::DuplicateModuleName("m".into()),
+            ValidationError::InvalidModuleName("123".into(), "bad"),
+            ValidationError::DuplicateFunctionName {
+                module: "m".into(),
+                function: "f".into(),
+                span: None,
+            },
+            ValidationError::DuplicateParamName {
+                module: "m".into(),
+                function: "f".into(),
+                param: "p".into(),
+            },
+            ValidationError::ReservedKeyword("type".into()),
+            ValidationError::InvalidIdentifier("123".into(), "bad"),
+            ValidationError::ErrorDomainMissingName("m".into()),
+            ValidationError::DuplicateErrorName {
+                module: "m".into(),
+                name: "e".into(),
+            },
+            ValidationError::DuplicateErrorCode {
+                module: "m".into(),
+                code: 1,
+            },
+            ValidationError::InvalidErrorCode {
+                module: "m".into(),
+                name: "e".into(),
+            },
+            ValidationError::NameCollisionWithErrorDomain {
+                module: "m".into(),
+                name: "e".into(),
+            },
+            ValidationError::DuplicateStructName {
+                module: "m".into(),
+                name: "S".into(),
+                span: None,
+            },
+            ValidationError::DuplicateStructField {
+                struct_name: "S".into(),
+                field: "f".into(),
+                span: None,
+            },
+            ValidationError::EmptyStruct {
+                module: "m".into(),
+                name: "S".into(),
+            },
+            ValidationError::DuplicateEnumName {
+                module: "m".into(),
+                name: "E".into(),
+            },
+            ValidationError::EmptyEnum {
+                module: "m".into(),
+                name: "E".into(),
+            },
+            ValidationError::DuplicateEnumVariant {
+                enum_name: "E".into(),
+                variant: "V".into(),
+                span: None,
+            },
+            ValidationError::DuplicateEnumValue {
+                enum_name: "E".into(),
+                value: 0,
+            },
+            ValidationError::UnknownTypeRef { name: "Foo".into() },
+            ValidationError::InvalidMapKey {
+                key_type: "struct Foo".into(),
+            },
+            ValidationError::BorrowedTypeInInvalidPosition {
+                ty: "&str".into(),
+                location: "return type".into(),
+            },
+            ValidationError::DuplicateCallbackName {
+                module: "m".into(),
+                name: "cb".into(),
+            },
+            ValidationError::ListenerCallbackNotFound {
+                module: "m".into(),
+                listener: "l".into(),
+                callback: "cb".into(),
+            },
+            ValidationError::DuplicateListenerName {
+                module: "m".into(),
+                name: "l".into(),
+            },
+            ValidationError::IteratorInInvalidPosition {
+                location: "field".into(),
+            },
+            ValidationError::BuilderStructEmpty {
+                module: "m".into(),
+                name: "B".into(),
+            },
+            ValidationError::TargetMissingCapability {
+                target: "node".into(),
+                capability: "callbacks".into(),
+                location: "module".into(),
+            },
+            ValidationError::UnknownGeneratorConfigKey {
+                key: "k".into(),
+                target: "swift".into(),
+            },
+        ];
+
+        assert_eq!(
+            ERROR_EXPLANATIONS.len(),
+            cases.len(),
+            "ERROR_EXPLANATIONS must have one entry per ValidationError variant",
+        );
+        for err in &cases {
+            let code = err.code();
+            let text = lookup_explanation(code)
+                .unwrap_or_else(|| panic!("missing explanation for code {code} ({err:?})"));
+            assert!(
+                text.contains(code),
+                "explanation for {code} should mention the code itself: {text}",
+            );
+        }
+    }
+
+    #[test]
+    fn format_validation_error_includes_error_code() {
+        let _ = color_eyre::install();
+        let err = ValidationError::DuplicateModuleName("foo".into());
+        let report = format_validation_error("schema.yml", "", err);
+        let msg = report.to_string();
+        assert!(
+            msg.contains("[WFFI002]"),
+            "rendered message should include error code: {msg}",
+        );
+        assert!(
+            msg.contains("duplicate module name"),
+            "rendered message should preserve the error text: {msg}",
+        );
+    }
+
+    #[test]
+    fn validation_error_to_entry_includes_code_field() {
+        let err = ValidationError::DuplicateModuleName("foo".into());
+        let entry = validation_error_to_entry("schema.yml", &err);
+        assert_eq!(entry.code.as_deref(), Some("WFFI002"));
+        assert!(
+            entry.message.starts_with("[WFFI002]"),
+            "message should carry code prefix: {}",
+            entry.message,
+        );
     }
 }

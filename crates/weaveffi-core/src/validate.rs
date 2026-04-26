@@ -274,6 +274,46 @@ pub enum ValidationError {
     UnknownGeneratorConfigKey { key: String, target: String },
 }
 
+impl ValidationError {
+    /// Stable identifier used by `weaveffi explain <code>` to look up a
+    /// long-form explanation for this error variant. Codes are append-only:
+    /// never renumber an existing variant, only assign the next free
+    /// `WFFInnn` to new variants.
+    pub fn code(&self) -> &'static str {
+        match self {
+            ValidationError::NoModuleName => "WFFI001",
+            ValidationError::DuplicateModuleName(_) => "WFFI002",
+            ValidationError::InvalidModuleName(_, _) => "WFFI003",
+            ValidationError::DuplicateFunctionName { .. } => "WFFI004",
+            ValidationError::DuplicateParamName { .. } => "WFFI005",
+            ValidationError::ReservedKeyword(_) => "WFFI006",
+            ValidationError::InvalidIdentifier(_, _) => "WFFI007",
+            ValidationError::ErrorDomainMissingName(_) => "WFFI008",
+            ValidationError::DuplicateErrorName { .. } => "WFFI009",
+            ValidationError::DuplicateErrorCode { .. } => "WFFI010",
+            ValidationError::InvalidErrorCode { .. } => "WFFI011",
+            ValidationError::NameCollisionWithErrorDomain { .. } => "WFFI012",
+            ValidationError::DuplicateStructName { .. } => "WFFI013",
+            ValidationError::DuplicateStructField { .. } => "WFFI014",
+            ValidationError::EmptyStruct { .. } => "WFFI015",
+            ValidationError::DuplicateEnumName { .. } => "WFFI016",
+            ValidationError::EmptyEnum { .. } => "WFFI017",
+            ValidationError::DuplicateEnumVariant { .. } => "WFFI018",
+            ValidationError::DuplicateEnumValue { .. } => "WFFI019",
+            ValidationError::UnknownTypeRef { .. } => "WFFI020",
+            ValidationError::InvalidMapKey { .. } => "WFFI021",
+            ValidationError::BorrowedTypeInInvalidPosition { .. } => "WFFI022",
+            ValidationError::DuplicateCallbackName { .. } => "WFFI023",
+            ValidationError::ListenerCallbackNotFound { .. } => "WFFI024",
+            ValidationError::DuplicateListenerName { .. } => "WFFI025",
+            ValidationError::IteratorInInvalidPosition { .. } => "WFFI026",
+            ValidationError::BuilderStructEmpty { .. } => "WFFI027",
+            ValidationError::TargetMissingCapability { .. } => "WFFI028",
+            ValidationError::UnknownGeneratorConfigKey { .. } => "WFFI029",
+        }
+    }
+}
+
 const RESERVED: &[&str] = &[
     "if", "else", "for", "while", "loop", "match", "type", "return", "async", "await", "break",
     "continue", "fn", "struct", "enum", "mod", "use",
@@ -3893,5 +3933,125 @@ mod tests {
             validate_api(&mut api).unwrap_err(),
             ValidationError::UnknownTypeRef { name } if name == "Missing"
         ));
+    }
+
+    #[test]
+    fn validation_error_codes_are_unique_and_well_formed() {
+        let cases: Vec<ValidationError> = vec![
+            ValidationError::NoModuleName,
+            ValidationError::DuplicateModuleName("m".into()),
+            ValidationError::InvalidModuleName("123".into(), "bad"),
+            ValidationError::DuplicateFunctionName {
+                module: "m".into(),
+                function: "f".into(),
+                span: None,
+            },
+            ValidationError::DuplicateParamName {
+                module: "m".into(),
+                function: "f".into(),
+                param: "p".into(),
+            },
+            ValidationError::ReservedKeyword("type".into()),
+            ValidationError::InvalidIdentifier("123".into(), "bad"),
+            ValidationError::ErrorDomainMissingName("m".into()),
+            ValidationError::DuplicateErrorName {
+                module: "m".into(),
+                name: "e".into(),
+            },
+            ValidationError::DuplicateErrorCode {
+                module: "m".into(),
+                code: 1,
+            },
+            ValidationError::InvalidErrorCode {
+                module: "m".into(),
+                name: "e".into(),
+            },
+            ValidationError::NameCollisionWithErrorDomain {
+                module: "m".into(),
+                name: "e".into(),
+            },
+            ValidationError::DuplicateStructName {
+                module: "m".into(),
+                name: "S".into(),
+                span: None,
+            },
+            ValidationError::DuplicateStructField {
+                struct_name: "S".into(),
+                field: "f".into(),
+                span: None,
+            },
+            ValidationError::EmptyStruct {
+                module: "m".into(),
+                name: "S".into(),
+            },
+            ValidationError::DuplicateEnumName {
+                module: "m".into(),
+                name: "E".into(),
+            },
+            ValidationError::EmptyEnum {
+                module: "m".into(),
+                name: "E".into(),
+            },
+            ValidationError::DuplicateEnumVariant {
+                enum_name: "E".into(),
+                variant: "V".into(),
+                span: None,
+            },
+            ValidationError::DuplicateEnumValue {
+                enum_name: "E".into(),
+                value: 0,
+            },
+            ValidationError::UnknownTypeRef { name: "Foo".into() },
+            ValidationError::InvalidMapKey {
+                key_type: "struct Foo".into(),
+            },
+            ValidationError::BorrowedTypeInInvalidPosition {
+                ty: "&str".into(),
+                location: "return type".into(),
+            },
+            ValidationError::DuplicateCallbackName {
+                module: "m".into(),
+                name: "cb".into(),
+            },
+            ValidationError::ListenerCallbackNotFound {
+                module: "m".into(),
+                listener: "l".into(),
+                callback: "cb".into(),
+            },
+            ValidationError::DuplicateListenerName {
+                module: "m".into(),
+                name: "l".into(),
+            },
+            ValidationError::IteratorInInvalidPosition {
+                location: "field".into(),
+            },
+            ValidationError::BuilderStructEmpty {
+                module: "m".into(),
+                name: "B".into(),
+            },
+            ValidationError::TargetMissingCapability {
+                target: "node".into(),
+                capability: "callbacks".into(),
+                location: "module".into(),
+            },
+            ValidationError::UnknownGeneratorConfigKey {
+                key: "k".into(),
+                target: "swift".into(),
+            },
+        ];
+
+        let mut seen = BTreeSet::new();
+        for err in &cases {
+            let code = err.code();
+            assert!(
+                code.starts_with("WFFI") && code.len() == 7,
+                "code must be WFFInnn, got {code} for {err:?}",
+            );
+            assert!(
+                code[4..].chars().all(|c| c.is_ascii_digit()),
+                "code suffix must be digits: {code}",
+            );
+            assert!(seen.insert(code), "duplicate code {code} for {err:?}",);
+        }
     }
 }
