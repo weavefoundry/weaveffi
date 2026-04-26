@@ -89,7 +89,7 @@ fn builder_pattern_emits_real_build_in_all_targets() {
         ),
         (
             "dart",
-            "dart/lib/weaveffi.dart",
+            "dart/lib/src/bindings.dart",
             &["class PointBuilder", build_sym],
         ),
         (

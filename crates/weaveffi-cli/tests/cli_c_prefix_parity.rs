@@ -232,8 +232,8 @@ fn c_prefix_honored_across_all_targets() {
     );
 
     // Dart: DynamicLibrary.open targets libmylib and lookupFunction uses mylib_*.
-    let dart = std::fs::read_to_string(out_path.join("dart/lib/weaveffi.dart"))
-        .expect("missing dart/lib/weaveffi.dart");
+    let dart = std::fs::read_to_string(out_path.join("dart/lib/src/bindings.dart"))
+        .expect("missing dart/lib/src/bindings.dart");
     assert!(
         dart.contains("libmylib.dylib")
             && dart.contains("libmylib.so")

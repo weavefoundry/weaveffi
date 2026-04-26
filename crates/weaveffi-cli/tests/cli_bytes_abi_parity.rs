@@ -92,7 +92,7 @@ fn bytes_param_signature_consistent_across_generators() {
         "python argtypes arity mismatch: C declaration has {c_commas} commas, argtypes has {py_commas} commas (list: {py_argtypes:?})"
     );
 
-    let dart_path = out_path.join("dart/lib/weaveffi.dart");
+    let dart_path = out_path.join("dart/lib/src/bindings.dart");
     let dart = std::fs::read_to_string(&dart_path)
         .unwrap_or_else(|_| panic!("missing {}", dart_path.display()));
     let dart_args = extract_dart_typedef_args(&dart, "weaveffi_parity_process")

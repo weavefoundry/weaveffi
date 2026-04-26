@@ -76,7 +76,7 @@ fn every_generator_clears_weaveffi_error() {
             "python/weaveffi/weaveffi.py",
             "_lib.weaveffi_error_clear",
         ),
-        ("dart", "dart/lib/weaveffi.dart", "_weaveffiErrorClear"),
+        ("dart", "dart/lib/src/bindings.dart", "_weaveffiErrorClear"),
         ("wasm", "wasm/weaveffi_wasm.js", "wasm.weaveffi_error_clear"),
     ];
 

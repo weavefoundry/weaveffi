@@ -63,7 +63,7 @@ fn every_generator_destroys_structs() {
         ("go", "go/weaveffi.go"),
         ("ruby", "ruby/lib/weaveffi.rb"),
         ("python", "python/weaveffi/weaveffi.py"),
-        ("dart", "dart/lib/weaveffi.dart"),
+        ("dart", "dart/lib/src/bindings.dart"),
     ];
 
     assert_eq!(

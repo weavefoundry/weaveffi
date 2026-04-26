@@ -51,11 +51,11 @@ fn async_function_emitted_in_all_targets() {
         "WeaveFFI.cs should contain `async Task` for async functions"
     );
 
-    let dart = std::fs::read_to_string(out_path.join("dart/lib/weaveffi.dart"))
-        .expect("missing dart/lib/weaveffi.dart");
+    let dart = std::fs::read_to_string(out_path.join("dart/lib/src/bindings.dart"))
+        .expect("missing dart/lib/src/bindings.dart");
     assert!(
         dart.contains("Future<"),
-        "weaveffi.dart should contain `Future<...>` for async functions"
+        "bindings.dart should contain `Future<...>` for async functions"
     );
 
     let node_dts =

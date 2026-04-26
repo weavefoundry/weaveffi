@@ -28,14 +28,20 @@ impl DartGenerator {
     ) -> Result<()> {
         let dart_dir = out_dir.join("dart");
         let lib_dir = dart_dir.join("lib");
-        std::fs::create_dir_all(&lib_dir)?;
+        let src_dir = lib_dir.join("src");
+        std::fs::create_dir_all(&src_dir)?;
         std::fs::write(
-            lib_dir.join("weaveffi.dart"),
+            src_dir.join("bindings.dart"),
             stamp_slash(render_dart_module(api, c_prefix)),
         )?;
+        std::fs::write(lib_dir.join("weaveffi.dart"), stamp_slash(render_barrel()))?;
         std::fs::write(
             dart_dir.join("pubspec.yaml"),
             stamp_hash(render_pubspec(package_name)),
+        )?;
+        std::fs::write(
+            dart_dir.join("analysis_options.yaml"),
+            stamp_hash(render_analysis_options()),
         )?;
         // README.md is documentation, not a source file; leave it unstamped.
         std::fs::write(dart_dir.join("README.md"), render_readme())?;
@@ -64,7 +70,9 @@ impl Generator for DartGenerator {
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
         vec![
             out_dir.join("dart/lib/weaveffi.dart").to_string(),
+            out_dir.join("dart/lib/src/bindings.dart").to_string(),
             out_dir.join("dart/pubspec.yaml").to_string(),
+            out_dir.join("dart/analysis_options.yaml").to_string(),
             out_dir.join("dart/README.md").to_string(),
         ]
     }
@@ -203,9 +211,20 @@ fn render_pubspec(package_name: &str) -> String {
          version: 0.1.0\n\
          environment:\n\
          \x20 sdk: '>=3.0.0 <4.0.0'\n\
+         \x20 flutter: '>=3.10.0'\n\
          dependencies:\n\
-         \x20 ffi: ^2.0.0\n"
+         \x20 ffi: ^2.1.0\n\
+         dev_dependencies:\n\
+         \x20 test: ^1.24.0\n"
     )
+}
+
+fn render_analysis_options() -> String {
+    "include: package:flutter_lints/flutter.yaml\n".into()
+}
+
+fn render_barrel() -> String {
+    "export 'src/bindings.dart';\n".into()
 }
 
 fn render_readme() -> String {
@@ -1073,7 +1092,9 @@ mod tests {
             files,
             vec![
                 out.join("dart/lib/weaveffi.dart").to_string(),
+                out.join("dart/lib/src/bindings.dart").to_string(),
                 out.join("dart/pubspec.yaml").to_string(),
+                out.join("dart/analysis_options.yaml").to_string(),
                 out.join("dart/README.md").to_string(),
             ]
         );
@@ -1088,7 +1109,9 @@ mod tests {
 
         let expected = vec![
             out.join("dart/lib/weaveffi.dart").to_string(),
+            out.join("dart/lib/src/bindings.dart").to_string(),
             out.join("dart/pubspec.yaml").to_string(),
+            out.join("dart/analysis_options.yaml").to_string(),
             out.join("dart/README.md").to_string(),
         ];
 
@@ -1190,7 +1213,7 @@ mod tests {
 
         DartGenerator.generate(&api, out_dir).unwrap();
 
-        let dart = std::fs::read_to_string(tmp.join("dart/lib/weaveffi.dart")).unwrap();
+        let dart = std::fs::read_to_string(tmp.join("dart/lib/src/bindings.dart")).unwrap();
 
         assert!(
             dart.contains("import 'dart:ffi'"),
@@ -1875,7 +1898,7 @@ mod tests {
             "missing sdk constraint: {pubspec}"
         );
         assert!(
-            pubspec.contains("ffi: ^2.0.0"),
+            pubspec.contains("ffi: ^2.1.0"),
             "missing ffi dependency: {pubspec}"
         );
 
@@ -3317,7 +3340,7 @@ mod tests {
             .generate_with_config(&api, out_dir, &config)
             .unwrap();
 
-        let dart = std::fs::read_to_string(tmp.join("dart/lib/weaveffi.dart")).unwrap();
+        let dart = std::fs::read_to_string(tmp.join("dart/lib/src/bindings.dart")).unwrap();
 
         assert!(
             dart.contains("DynamicLibrary.open('libmyffi.dylib')"),
@@ -3411,6 +3434,102 @@ mod tests {
         );
         assert!(pubspec.contains(" dart "));
         assert!(pubspec.contains("DO NOT EDIT"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dart_pubspec_has_modern_sdk_constraints() {
+        let api = make_api(vec![simple_module(vec![])]);
+        let tmp = std::env::temp_dir().join("weaveffi_test_dart_modern_sdk");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        DartGenerator.generate(&api, out_dir).unwrap();
+
+        let pubspec = std::fs::read_to_string(tmp.join("dart/pubspec.yaml")).unwrap();
+        assert!(
+            pubspec.contains("sdk: '>=3.0.0 <4.0.0'"),
+            "pubspec should pin a modern Dart SDK range: {pubspec}"
+        );
+        assert!(
+            pubspec.contains("flutter: '>=3.10.0'"),
+            "pubspec should declare an optional Flutter SDK floor: {pubspec}"
+        );
+        assert!(
+            pubspec.contains("ffi: ^2.1.0"),
+            "pubspec should use ffi ^2.1.0: {pubspec}"
+        );
+        assert!(
+            pubspec.contains("dev_dependencies:") && pubspec.contains("test: ^1.24.0"),
+            "pubspec should declare test ^1.24.0 as a dev dependency: {pubspec}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dart_has_analysis_options() {
+        let api = make_api(vec![simple_module(vec![])]);
+        let tmp = std::env::temp_dir().join("weaveffi_test_dart_analysis_options");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        DartGenerator.generate(&api, out_dir).unwrap();
+
+        let options_path = tmp.join("dart/analysis_options.yaml");
+        assert!(
+            options_path.exists(),
+            "analysis_options.yaml should be emitted"
+        );
+        let options = std::fs::read_to_string(&options_path).unwrap();
+        assert!(
+            options.contains("include: package:flutter_lints/flutter.yaml"),
+            "analysis_options.yaml should enable flutter_lints: {options}"
+        );
+        assert!(
+            options.starts_with("# WeaveFFI "),
+            "analysis_options.yaml missing stamp: {options}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dart_has_barrel_export() {
+        let api = make_api(vec![simple_module(vec![])]);
+        let tmp = std::env::temp_dir().join("weaveffi_test_dart_barrel");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        DartGenerator.generate(&api, out_dir).unwrap();
+
+        let barrel_path = tmp.join("dart/lib/weaveffi.dart");
+        let bindings_path = tmp.join("dart/lib/src/bindings.dart");
+        assert!(barrel_path.exists(), "barrel lib/weaveffi.dart must exist");
+        assert!(
+            bindings_path.exists(),
+            "internal lib/src/bindings.dart must exist"
+        );
+
+        let barrel = std::fs::read_to_string(&barrel_path).unwrap();
+        assert!(
+            barrel.contains("export 'src/bindings.dart';"),
+            "barrel should re-export src/bindings.dart: {barrel}"
+        );
+        assert!(
+            !barrel.contains("DynamicLibrary"),
+            "barrel must not contain FFI implementation details: {barrel}"
+        );
+
+        let bindings = std::fs::read_to_string(&bindings_path).unwrap();
+        assert!(
+            bindings.contains("DynamicLibrary"),
+            "internal bindings file should hold FFI declarations: {bindings}"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

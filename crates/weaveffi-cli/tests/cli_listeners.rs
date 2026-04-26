@@ -109,7 +109,7 @@ fn listener_register_unregister_emitted_for_all_targets() {
         ),
         (
             "dart",
-            "dart/lib/weaveffi.dart",
+            "dart/lib/src/bindings.dart",
             "weaveffi_events_register_message_listener",
         ),
         (

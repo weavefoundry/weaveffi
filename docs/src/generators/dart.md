@@ -21,8 +21,10 @@ file is ready to use.
 
 | File | Purpose |
 |------|---------|
-| `dart/lib/weaveffi.dart` | `dart:ffi` bindings: library loader, typedefs, lookup bindings, wrapper functions, enum/struct classes |
-| `dart/pubspec.yaml` | Package metadata (name, SDK constraint, `ffi` dependency) |
+| `dart/lib/weaveffi.dart` | Public barrel that re-exports `src/bindings.dart` |
+| `dart/lib/src/bindings.dart` | `dart:ffi` bindings: library loader, typedefs, lookup bindings, wrapper functions, enum/struct classes |
+| `dart/pubspec.yaml` | Package metadata (name, Dart/Flutter SDK constraints, `ffi` dependency, `test` dev dependency) |
+| `dart/analysis_options.yaml` | Enables `package:flutter_lints/flutter.yaml` |
 | `dart/README.md` | Basic usage instructions |
 
 ## dart:ffi approach

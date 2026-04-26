@@ -22,28 +22,39 @@ fn generate_dart_contacts() {
         .assert()
         .success();
 
-    let dart = std::fs::read_to_string(out_path.join("dart/lib/weaveffi.dart"))
+    let bindings = std::fs::read_to_string(out_path.join("dart/lib/src/bindings.dart"))
+        .expect("missing dart/lib/src/bindings.dart");
+    assert!(
+        bindings.contains("import 'dart:ffi'"),
+        "bindings.dart should import dart:ffi"
+    );
+    assert!(
+        bindings.contains("enum ContactType {"),
+        "bindings.dart should contain ContactType enum"
+    );
+    assert!(
+        bindings.contains("class Contact {"),
+        "bindings.dart should contain Contact class"
+    );
+    assert!(
+        bindings.contains("weaveffi_contacts_create_contact"),
+        "bindings.dart should contain create_contact symbol"
+    );
+
+    let barrel = std::fs::read_to_string(out_path.join("dart/lib/weaveffi.dart"))
         .expect("missing dart/lib/weaveffi.dart");
     assert!(
-        dart.contains("import 'dart:ffi'"),
-        "weaveffi.dart should import dart:ffi"
-    );
-    assert!(
-        dart.contains("enum ContactType {"),
-        "weaveffi.dart should contain ContactType enum"
-    );
-    assert!(
-        dart.contains("class Contact {"),
-        "weaveffi.dart should contain Contact class"
-    );
-    assert!(
-        dart.contains("weaveffi_contacts_create_contact"),
-        "weaveffi.dart should contain create_contact symbol"
+        barrel.contains("export 'src/bindings.dart';"),
+        "weaveffi.dart should re-export the internal bindings: {barrel}"
     );
 
     assert!(
         out_path.join("dart/pubspec.yaml").exists(),
         "missing dart/pubspec.yaml"
+    );
+    assert!(
+        out_path.join("dart/analysis_options.yaml").exists(),
+        "missing dart/analysis_options.yaml"
     );
     assert!(
         out_path.join("dart/README.md").exists(),

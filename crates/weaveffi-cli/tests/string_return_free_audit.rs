@@ -72,7 +72,7 @@ fn every_generator_frees_returned_strings() {
             "python/weaveffi/weaveffi.py",
             "_lib.weaveffi_free_string",
         ),
-        ("dart", "dart/lib/weaveffi.dart", "_weaveffiFreeString"),
+        ("dart", "dart/lib/src/bindings.dart", "_weaveffiFreeString"),
         ("wasm", "wasm/weaveffi_wasm.js", "wasm.weaveffi_free_string"),
     ];
 

@@ -66,7 +66,7 @@ fn iterator_return_emits_streaming_in_all_targets() {
         ("wasm", "wasm/weaveffi_wasm.js", &["get_messages"]),
         ("python", "python/weaveffi/weaveffi.py", &["__next__"]),
         ("dotnet", "dotnet/WeaveFFI.cs", &["IEnumerable<string>"]),
-        ("dart", "dart/lib/weaveffi.dart", &["Iterable<String>"]),
+        ("dart", "dart/lib/src/bindings.dart", &["Iterable<String>"]),
         ("go", "go/weaveffi.go", &["<-chan string"]),
         ("ruby", "ruby/lib/weaveffi.rb", &["Enumerator"]),
     ];

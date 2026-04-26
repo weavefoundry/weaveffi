@@ -65,7 +65,7 @@ fn callback_typedef_emitted_by_all_generators() {
             "_OnTick = ctypes.CFUNCTYPE",
         ),
         ("dotnet", "dotnet/WeaveFFI.cs", "delegate void OnTick"),
-        ("dart", "dart/lib/weaveffi.dart", "typedef OnTick"),
+        ("dart", "dart/lib/src/bindings.dart", "typedef OnTick"),
         ("go", "go/weaveffi.go", "type OnTick func"),
         ("ruby", "ruby/lib/weaveffi.rb", "callback :OnTick"),
     ];

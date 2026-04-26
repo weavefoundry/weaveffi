@@ -144,15 +144,15 @@ fn cancellable_async_emits_platform_primitive_in_all_targets() {
         "WeaveFFI.cs should forward CancellationToken.Register to weaveffi_cancel_token_cancel: {dotnet}"
     );
 
-    let dart = std::fs::read_to_string(out_path.join("dart/lib/weaveffi.dart"))
-        .expect("missing dart/lib/weaveffi.dart");
+    let dart = std::fs::read_to_string(out_path.join("dart/lib/src/bindings.dart"))
+        .expect("missing dart/lib/src/bindings.dart");
     assert!(
         dart.contains("CancelToken"),
-        "weaveffi.dart should expose a `CancelToken` class for cancellable async: {dart}"
+        "bindings.dart should expose a `CancelToken` class for cancellable async: {dart}"
     );
     assert!(
         dart.contains("weaveffi_cancel_token_cancel"),
-        "weaveffi.dart should forward CancelToken.cancel() to weaveffi_cancel_token_cancel: {dart}"
+        "bindings.dart should forward CancelToken.cancel() to weaveffi_cancel_token_cancel: {dart}"
     );
 
     let go =

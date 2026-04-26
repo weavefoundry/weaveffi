@@ -73,7 +73,7 @@ fn every_generator_frees_returned_bytes() {
             "python/weaveffi/weaveffi.py",
             "_lib.weaveffi_free_bytes",
         ),
-        ("dart", "dart/lib/weaveffi.dart", "_weaveffiFreeBytes"),
+        ("dart", "dart/lib/src/bindings.dart", "_weaveffiFreeBytes"),
         ("wasm", "wasm/weaveffi_wasm.js", "wasm.weaveffi_free_bytes"),
     ];
 
