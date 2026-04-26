@@ -269,11 +269,52 @@ pub fn api_to_context(api: &Api) -> tera::Context {
                 })
                 .collect();
 
+            let callbacks: Vec<tera::Value> = module
+                .callbacks
+                .iter()
+                .map(|cb| {
+                    let params: Vec<tera::Value> = cb
+                        .params
+                        .iter()
+                        .map(|p| {
+                            serde_json::json!({
+                                "name": p.name,
+                                "type": type_ref_to_map(&p.ty),
+                            })
+                        })
+                        .collect();
+                    let returns = cb
+                        .returns
+                        .as_ref()
+                        .map(|r| serde_json::to_value(type_ref_to_map(r)).unwrap());
+                    serde_json::json!({
+                        "name": cb.name,
+                        "params": params,
+                        "returns": returns,
+                        "doc": cb.doc,
+                    })
+                })
+                .collect();
+
+            let listeners: Vec<tera::Value> = module
+                .listeners
+                .iter()
+                .map(|l| {
+                    serde_json::json!({
+                        "name": l.name,
+                        "event_callback": l.event_callback,
+                        "doc": l.doc,
+                    })
+                })
+                .collect();
+
             serde_json::json!({
                 "name": module.name,
                 "functions": functions,
                 "structs": structs,
                 "enums": enums,
+                "callbacks": callbacks,
+                "listeners": listeners,
             })
         })
         .collect();
@@ -285,7 +326,9 @@ pub fn api_to_context(api: &Api) -> tera::Context {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weaveffi_ir::ir::{Function, Module, Param, StructDef, StructField};
+    use weaveffi_ir::ir::{
+        CallbackDef, Function, ListenerDef, Module, Param, StructDef, StructField,
+    };
 
     #[test]
     fn template_context_callback_no_panic() {
@@ -370,6 +413,60 @@ mod tests {
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0]["name"], "x");
         assert_eq!(fields[0]["type"]["kind"], "f64");
+
+        let callbacks = modules[0]["callbacks"].as_array().unwrap();
+        assert!(callbacks.is_empty());
+        let listeners = modules[0]["listeners"].as_array().unwrap();
+        assert!(listeners.is_empty());
+    }
+
+    #[test]
+    fn api_context_exposes_callbacks_and_listeners() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "events".into(),
+                functions: vec![],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![CallbackDef {
+                    name: "OnData".into(),
+                    params: vec![Param {
+                        name: "payload".into(),
+                        ty: TypeRef::StringUtf8,
+                        mutable: false,
+                    }],
+                    returns: Some(TypeRef::Bool),
+                    doc: Some("Fired when data arrives".into()),
+                }],
+                listeners: vec![ListenerDef {
+                    name: "data_stream".into(),
+                    event_callback: "OnData".into(),
+                    doc: Some("Subscribe to data events".into()),
+                }],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let json = api_to_context(&api).into_json();
+        let module = &json["modules"][0];
+
+        let callbacks = module["callbacks"].as_array().unwrap();
+        assert_eq!(callbacks.len(), 1);
+        assert_eq!(callbacks[0]["name"], "OnData");
+        assert_eq!(callbacks[0]["returns"]["kind"], "bool");
+        assert_eq!(callbacks[0]["doc"], "Fired when data arrives");
+        let params = callbacks[0]["params"].as_array().unwrap();
+        assert_eq!(params[0]["name"], "payload");
+        assert_eq!(params[0]["type"]["kind"], "string");
+
+        let listeners = module["listeners"].as_array().unwrap();
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0]["name"], "data_stream");
+        assert_eq!(listeners[0]["event_callback"], "OnData");
+        assert_eq!(listeners[0]["doc"], "Subscribe to data events");
     }
 
     #[test]
