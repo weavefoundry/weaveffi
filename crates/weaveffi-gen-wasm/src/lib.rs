@@ -2242,6 +2242,18 @@ mod tests {
             "JS must define the _encodeString helper: {js}"
         );
         assert!(
+            js.contains("const bytes = _encoder.encode(str);"),
+            "_encodeString must UTF-8 encode the input so the length matches size_t bytes, not JS chars: {js}"
+        );
+        assert!(
+            js.contains("const ptr = wasm.weaveffi_alloc(bytes.length);"),
+            "_encodeString must allocate linear memory for the encoded bytes via weaveffi_alloc: {js}"
+        );
+        assert!(
+            js.contains("new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);"),
+            "_encodeString must copy the encoded bytes into linear memory at ptr: {js}"
+        );
+        assert!(
             js.contains("return [ptr, bytes.length];"),
             "_encodeString must return a (ptr, len) tuple matching the C (uint8_t*, size_t) signature: {js}"
         );
