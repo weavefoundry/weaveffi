@@ -1,4 +1,4 @@
-use crate::ir::Api;
+use crate::ir::{Api, Module, Span, SpanTable};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
@@ -21,7 +21,15 @@ pub enum ParseError {
 }
 
 pub fn parse_api_str(s: &str, format: &str) -> Result<Api, ParseError> {
-    match format {
+    parse_api_str_with_spans(s, format).map(|(api, _)| api)
+}
+
+/// Parse an API definition and record source spans for every struct,
+/// function, field, and variant. The returned [`SpanTable`] is populated on
+/// a best-effort basis via a textual scan of the source; items it cannot
+/// locate are simply absent.
+pub fn parse_api_str_with_spans(s: &str, format: &str) -> Result<(Api, SpanTable), ParseError> {
+    let api: Api = match format {
         "yaml" | "yml" => serde_yaml::from_str(s).map_err(|e| {
             let (line, column) = e
                 .location()
@@ -32,16 +40,293 @@ pub fn parse_api_str(s: &str, format: &str) -> Result<Api, ParseError> {
                 column,
                 message: e.to_string(),
             }
-        }),
+        })?,
         "json" => serde_json::from_str(s).map_err(|e| ParseError::Json {
             line: e.line(),
             column: e.column(),
             message: e.to_string(),
-        }),
+        })?,
         "toml" => toml::from_str(s).map_err(|e| ParseError::Toml {
             message: e.to_string(),
-        }),
-        other => Err(ParseError::UnsupportedFormat(other.to_string())),
+        })?,
+        other => return Err(ParseError::UnsupportedFormat(other.to_string())),
+    };
+    let mut records = scan_spans(s, format);
+    let mut table = SpanTable::default();
+    for module in &api.modules {
+        record_module_spans(module, "", &mut records, &mut table);
+    }
+    Ok((api, table))
+}
+
+#[derive(Debug)]
+struct SpanRecord {
+    name: String,
+    span: Span,
+    claimed: bool,
+}
+
+fn scan_spans(source: &str, format: &str) -> Vec<SpanRecord> {
+    match format {
+        "yaml" | "yml" => scan_yaml_spans(source),
+        "json" => scan_json_spans(source),
+        "toml" => scan_toml_spans(source),
+        _ => Vec::new(),
+    }
+}
+
+fn scan_yaml_spans(source: &str) -> Vec<SpanRecord> {
+    let mut out = Vec::new();
+    for (idx, line) in source.lines().enumerate() {
+        let line_num = (idx + 1) as u32;
+        if let Some((name, col)) = find_yaml_name(line) {
+            out.push(SpanRecord {
+                name,
+                span: Span::new(line_num, col),
+                claimed: false,
+            });
+        }
+    }
+    out
+}
+
+/// Finds a YAML `name: X` declaration on a line and returns the value and its
+/// 1-based column. Accepts optional leading whitespace, a `- ` list marker,
+/// and an optional `{` for inline flow form.
+fn find_yaml_name(line: &str) -> Option<(String, u32)> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    if bytes.get(i) == Some(&b'#') {
+        return None;
+    }
+    if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b' ' {
+        i += 2;
+        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+    }
+    if bytes.get(i) == Some(&b'{') {
+        i += 1;
+        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+    }
+    if !line[i..].starts_with("name") {
+        return None;
+    }
+    i += 4;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b':') {
+        return None;
+    }
+    i += 1;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    if matches!(bytes.get(i), Some(&b'"') | Some(&b'\'')) {
+        i += 1;
+    }
+    let start = i;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    if start == i {
+        return None;
+    }
+    Some((line[start..i].to_string(), (start + 1) as u32))
+}
+
+fn scan_json_spans(source: &str) -> Vec<SpanRecord> {
+    let mut out = Vec::new();
+    for (idx, line) in source.lines().enumerate() {
+        let line_num = (idx + 1) as u32;
+        let Some(key_pos) = line.find("\"name\"") else {
+            continue;
+        };
+        let after = &line[key_pos + 6..];
+        let Some(colon_rel) = after.find(':') else {
+            continue;
+        };
+        let value_start_abs = key_pos + 6 + colon_rel + 1;
+        let mut i = value_start_abs;
+        let bytes = line.as_bytes();
+        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b'"') {
+            continue;
+        }
+        i += 1;
+        let start = i;
+        while i < bytes.len() && bytes[i] != b'"' {
+            i += 1;
+        }
+        if start == i || i >= bytes.len() {
+            continue;
+        }
+        let name = line[start..i].to_string();
+        if !name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        out.push(SpanRecord {
+            name,
+            span: Span::new(line_num, (start + 1) as u32),
+            claimed: false,
+        });
+    }
+    out
+}
+
+fn scan_toml_spans(source: &str) -> Vec<SpanRecord> {
+    let mut out = Vec::new();
+    for (idx, line) in source.lines().enumerate() {
+        let line_num = (idx + 1) as u32;
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+        if !line[i..].starts_with("name") {
+            continue;
+        }
+        let key_end = i + 4;
+        if key_end < bytes.len()
+            && (bytes[key_end].is_ascii_alphanumeric() || bytes[key_end] == b'_')
+        {
+            continue;
+        }
+        i = key_end;
+        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b'=') {
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b'"') {
+            continue;
+        }
+        i += 1;
+        let start = i;
+        while i < bytes.len() && bytes[i] != b'"' {
+            i += 1;
+        }
+        if start == i || i >= bytes.len() {
+            continue;
+        }
+        let name = line[start..i].to_string();
+        if !name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        out.push(SpanRecord {
+            name,
+            span: Span::new(line_num, (start + 1) as u32),
+            claimed: false,
+        });
+    }
+    out
+}
+
+fn claim_next(records: &mut [SpanRecord], name: &str) -> Option<Span> {
+    for r in records.iter_mut() {
+        if !r.claimed && r.name == name {
+            r.claimed = true;
+            return Some(r.span);
+        }
+    }
+    None
+}
+
+fn record_module_spans(
+    module: &Module,
+    parent_path: &str,
+    records: &mut [SpanRecord],
+    table: &mut SpanTable,
+) {
+    claim_next(records, &module.name);
+    let module_path = if parent_path.is_empty() {
+        module.name.clone()
+    } else {
+        format!("{parent_path}.{}", module.name)
+    };
+
+    for f in &module.functions {
+        if let Some(span) = claim_next(records, &f.name) {
+            table
+                .functions
+                .entry((module_path.clone(), f.name.clone()))
+                .or_insert(span);
+        }
+        for p in &f.params {
+            claim_next(records, &p.name);
+        }
+    }
+
+    for s in &module.structs {
+        if let Some(span) = claim_next(records, &s.name) {
+            table
+                .structs
+                .entry((module_path.clone(), s.name.clone()))
+                .or_insert(span);
+        }
+        for field in &s.fields {
+            if let Some(span) = claim_next(records, &field.name) {
+                table
+                    .fields
+                    .entry((module_path.clone(), s.name.clone(), field.name.clone()))
+                    .or_insert(span);
+            }
+        }
+    }
+
+    for e in &module.enums {
+        claim_next(records, &e.name);
+        for v in &e.variants {
+            if let Some(span) = claim_next(records, &v.name) {
+                table
+                    .variants
+                    .entry((module_path.clone(), e.name.clone(), v.name.clone()))
+                    .or_insert(span);
+            }
+        }
+    }
+
+    for cb in &module.callbacks {
+        claim_next(records, &cb.name);
+        for p in &cb.params {
+            claim_next(records, &p.name);
+        }
+    }
+
+    for l in &module.listeners {
+        claim_next(records, &l.name);
+    }
+
+    if let Some(errs) = &module.errors {
+        claim_next(records, &errs.name);
+        for c in &errs.codes {
+            claim_next(records, &c.name);
+        }
+    }
+
+    for sub in &module.modules {
+        record_module_spans(sub, &module_path, records, table);
     }
 }
 
@@ -1069,5 +1354,60 @@ modules:
         assert_eq!(child.functions[0].params[0].name, "x");
         assert_eq!(child.functions[0].params[0].ty, TypeRef::I32);
         assert_eq!(child.functions[0].returns, Some(TypeRef::I32));
+    }
+
+    #[test]
+    fn yaml_spans_record_function_and_field_positions() {
+        let yaml = "\nversion: \"0.1.0\"\nmodules:\n  - name: math\n    functions:\n      - name: add\n        params: []\n    structs:\n      - name: Point\n        fields:\n          - name: x\n            type: f64\n";
+        let (_, spans) = parse_api_str_with_spans(yaml, "yaml").unwrap();
+        let fn_span = spans.function("math", "add").expect("fn span");
+        assert_eq!(fn_span.line, 6);
+        let struct_span = spans.struct_("math", "Point").expect("struct span");
+        assert_eq!(struct_span.line, 9);
+        let field_span = spans.field("math", "Point", "x").expect("field span");
+        assert_eq!(field_span.line, 11);
+    }
+
+    #[test]
+    fn json_spans_record_item_positions() {
+        let json = r#"{
+    "version": "0.1.0",
+    "modules": [{
+        "name": "math",
+        "functions": [
+            { "name": "add", "params": [] }
+        ]
+    }]
+}"#;
+        let (_, spans) = parse_api_str_with_spans(json, "json").unwrap();
+        let fn_span = spans.function("math", "add").expect("fn span");
+        assert_eq!(fn_span.line, 6);
+    }
+
+    #[test]
+    fn toml_spans_record_function_position() {
+        let toml_str = r#"version = "0.1.0"
+
+[[modules]]
+name = "math"
+
+[[modules.functions]]
+name = "add"
+params = []
+"#;
+        let (_, spans) = parse_api_str_with_spans(toml_str, "toml").unwrap();
+        let fn_span = spans.function("math", "add").expect("fn span");
+        assert_eq!(fn_span.line, 7);
+    }
+
+    #[test]
+    fn duplicate_function_names_get_distinct_spans() {
+        let yaml = "\nversion: \"0.1.0\"\nmodules:\n  - name: math\n    functions:\n      - name: add\n        params: []\n      - name: add\n        params: []\n";
+        let (_, spans) = parse_api_str_with_spans(yaml, "yaml").unwrap();
+        // The first function is at line 6; since there are two functions named
+        // "add", the table only stores one, but both records are claimed so
+        // later items (if any) don't steal them.
+        let fn_span = spans.function("math", "add").expect("fn span");
+        assert_eq!(fn_span.line, 6);
     }
 }

@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
-use weaveffi_ir::ir::{Api, CallbackDef, ErrorDomain, Function, Module, Param, TypeRef};
+use weaveffi_ir::ir::{
+    Api, CallbackDef, ErrorDomain, Function, Module, Param, Span, SpanTable, TypeRef,
+};
 
 use crate::codegen::Capability;
 
@@ -187,7 +189,11 @@ pub enum ValidationError {
     #[error("invalid module name '{0}': {1}")]
     InvalidModuleName(String, &'static str),
     #[error("duplicate function name in module '{module}': {function}")]
-    DuplicateFunctionName { module: String, function: String },
+    DuplicateFunctionName {
+        module: String,
+        function: String,
+        span: Option<Span>,
+    },
     #[error("duplicate param name in function '{function}' of module '{module}': {param}")]
     DuplicateParamName {
         module: String,
@@ -209,9 +215,17 @@ pub enum ValidationError {
     #[error("function name collides with error domain name in module '{module}': {name}")]
     NameCollisionWithErrorDomain { module: String, name: String },
     #[error("duplicate struct name in module '{module}': {name}")]
-    DuplicateStructName { module: String, name: String },
+    DuplicateStructName {
+        module: String,
+        name: String,
+        span: Option<Span>,
+    },
     #[error("duplicate field name in struct '{struct_name}': {field}")]
-    DuplicateStructField { struct_name: String, field: String },
+    DuplicateStructField {
+        struct_name: String,
+        field: String,
+        span: Option<Span>,
+    },
     #[error("empty struct in module '{module}': {name}")]
     EmptyStruct { module: String, name: String },
     #[error("duplicate enum name in module '{module}': {name}")]
@@ -219,7 +233,11 @@ pub enum ValidationError {
     #[error("empty enum in module '{module}': {name}")]
     EmptyEnum { module: String, name: String },
     #[error("duplicate enum variant in enum '{enum_name}': {variant}")]
-    DuplicateEnumVariant { enum_name: String, variant: String },
+    DuplicateEnumVariant {
+        enum_name: String,
+        variant: String,
+        span: Option<Span>,
+    },
     #[error("duplicate enum value in enum '{enum_name}': {value}")]
     DuplicateEnumValue { enum_name: String, value: i32 },
     #[error("unknown type reference: {name}")]
@@ -284,12 +302,19 @@ fn check_identifier(name: &str) -> Result<(), ValidationError> {
 }
 
 pub fn validate_api(api: &mut Api) -> Result<(), ValidationError> {
+    validate_api_with_spans(api, &SpanTable::default())
+}
+
+/// Same as [`validate_api`] but attaches source [`Span`]s to errors where
+/// available (typically populated by
+/// [`weaveffi_ir::parse::parse_api_str_with_spans`]).
+pub fn validate_api_with_spans(api: &mut Api, spans: &SpanTable) -> Result<(), ValidationError> {
     let mut module_names = BTreeSet::new();
     for m in &api.modules {
         if !module_names.insert(m.name.clone()) {
             return Err(ValidationError::DuplicateModuleName(m.name.clone()));
         }
-        validate_module(m, &api.modules)?;
+        validate_module(m, &api.modules, spans, "")?;
     }
     resolve_type_refs(api);
     Ok(())
@@ -415,7 +440,12 @@ pub fn find_type_in_api(api: &Api, name: &str) -> Option<(String, bool)> {
     None
 }
 
-fn validate_module(module: &Module, all_modules: &[Module]) -> Result<(), ValidationError> {
+fn validate_module(
+    module: &Module,
+    all_modules: &[Module],
+    spans: &SpanTable,
+    parent_path: &str,
+) -> Result<(), ValidationError> {
     if module.name.trim().is_empty() {
         return Err(ValidationError::NoModuleName);
     }
@@ -429,12 +459,19 @@ fn validate_module(module: &Module, all_modules: &[Module]) -> Result<(), Valida
         other => other,
     })?;
 
+    let module_path = if parent_path.is_empty() {
+        module.name.clone()
+    } else {
+        format!("{parent_path}.{}", module.name)
+    };
+
     let mut function_names = BTreeSet::new();
     for f in &module.functions {
         if !function_names.insert(f.name.clone()) {
             return Err(ValidationError::DuplicateFunctionName {
                 module: module.name.clone(),
                 function: f.name.clone(),
+                span: spans.function(&module_path, &f.name),
             });
         }
         validate_function(module, f)?;
@@ -447,6 +484,7 @@ fn validate_module(module: &Module, all_modules: &[Module]) -> Result<(), Valida
             return Err(ValidationError::DuplicateStructName {
                 module: module.name.clone(),
                 name: s.name.clone(),
+                span: spans.struct_(&module_path, &s.name),
             });
         }
         if s.fields.is_empty() {
@@ -468,6 +506,7 @@ fn validate_module(module: &Module, all_modules: &[Module]) -> Result<(), Valida
                 return Err(ValidationError::DuplicateStructField {
                     struct_name: s.name.clone(),
                     field: f.name.clone(),
+                    span: spans.field(&module_path, &s.name, &f.name),
                 });
             }
         }
@@ -496,6 +535,7 @@ fn validate_module(module: &Module, all_modules: &[Module]) -> Result<(), Valida
                 return Err(ValidationError::DuplicateEnumVariant {
                     enum_name: e.name.clone(),
                     variant: v.name.clone(),
+                    span: spans.variant(&module_path, &e.name, &v.name),
                 });
             }
             if variant_values.insert(v.value, v.name.clone()).is_some() {
@@ -592,7 +632,7 @@ fn validate_module(module: &Module, all_modules: &[Module]) -> Result<(), Valida
         if !sub_module_names.insert(sub.name.clone()) {
             return Err(ValidationError::DuplicateModuleName(sub.name.clone()));
         }
-        validate_module(sub, all_modules)?;
+        validate_module(sub, all_modules, spans, &module_path)?;
     }
 
     Ok(())
@@ -1519,7 +1559,7 @@ mod tests {
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
-            ValidationError::DuplicateStructName { module, name }
+            ValidationError::DuplicateStructName { module, name, .. }
                 if module == "mymod" && name == "Point"
         ));
     }
@@ -1588,7 +1628,7 @@ mod tests {
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
-            ValidationError::DuplicateStructField { struct_name, field }
+            ValidationError::DuplicateStructField { struct_name, field, .. }
                 if struct_name == "Point" && field == "x"
         ));
     }
@@ -1695,7 +1735,7 @@ mod tests {
         };
         assert!(matches!(
             validate_api(&mut api).unwrap_err(),
-            ValidationError::DuplicateEnumVariant { enum_name, variant }
+            ValidationError::DuplicateEnumVariant { enum_name, variant, .. }
                 if enum_name == "Color" && variant == "Red"
         ));
     }

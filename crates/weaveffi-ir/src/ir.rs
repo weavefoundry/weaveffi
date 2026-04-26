@@ -1,8 +1,70 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
 pub const CURRENT_SCHEMA_VERSION: &str = "0.2.0";
+
+/// Source location for a parsed IR item.
+///
+/// Populated by [`crate::parse::parse_api_str_with_spans`] and keyed into a
+/// [`SpanTable`] alongside the parsed [`Api`]. Items constructed
+/// programmatically have no span and are not present in the table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Span {
+    pub line: u32,
+    pub col: u32,
+}
+
+impl Span {
+    pub fn new(line: u32, col: u32) -> Self {
+        Self { line, col }
+    }
+}
+
+/// Maps each parsed struct, function, field, and variant to its source
+/// location. Keyed by the logical path within the API (module path is a
+/// dotted string like `"parent.child"`, or just `"math"` for top-level).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpanTable {
+    pub functions: BTreeMap<(String, String), Span>,
+    pub structs: BTreeMap<(String, String), Span>,
+    pub fields: BTreeMap<(String, String, String), Span>,
+    pub variants: BTreeMap<(String, String, String), Span>,
+}
+
+impl SpanTable {
+    pub fn function(&self, module_path: &str, name: &str) -> Option<Span> {
+        self.functions
+            .get(&(module_path.to_string(), name.to_string()))
+            .copied()
+    }
+
+    pub fn struct_(&self, module_path: &str, name: &str) -> Option<Span> {
+        self.structs
+            .get(&(module_path.to_string(), name.to_string()))
+            .copied()
+    }
+
+    pub fn field(&self, module_path: &str, struct_name: &str, name: &str) -> Option<Span> {
+        self.fields
+            .get(&(
+                module_path.to_string(),
+                struct_name.to_string(),
+                name.to_string(),
+            ))
+            .copied()
+    }
+
+    pub fn variant(&self, module_path: &str, enum_name: &str, name: &str) -> Option<Span> {
+        self.variants
+            .get(&(
+                module_path.to_string(),
+                enum_name.to_string(),
+                name.to_string(),
+            ))
+            .copied()
+    }
+}
 
 /// `Eq` is omitted because `toml::Value` contains `f64`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -17,7 +17,7 @@ use weaveffi_core::codegen::{Capability, Generator, Orchestrator, LOCKFILE};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::templates::TemplateEngine;
 use weaveffi_core::validate::{
-    collect_warnings, validate_api, validate_capabilities, ValidationError,
+    collect_warnings, validate_api_with_spans, validate_capabilities, ValidationError,
 };
 use weaveffi_gen_android::AndroidGenerator;
 use weaveffi_gen_c::CGenerator;
@@ -30,8 +30,8 @@ use weaveffi_gen_python::PythonGenerator;
 use weaveffi_gen_ruby::RubyGenerator;
 use weaveffi_gen_swift::SwiftGenerator;
 use weaveffi_gen_wasm::WasmGenerator;
-use weaveffi_ir::ir::CURRENT_SCHEMA_VERSION;
-use weaveffi_ir::parse::{parse_api_str, ParseError};
+use weaveffi_ir::ir::{Span, SpanTable, CURRENT_SCHEMA_VERSION};
+use weaveffi_ir::parse::{parse_api_str_with_spans, ParseError};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum OutputFormat {
@@ -120,7 +120,7 @@ fn parse_error_to_entry(filename: &str, err: &ParseError) -> ErrorEntry {
     }
 }
 
-fn validation_error_to_entry(err: &ValidationError) -> ErrorEntry {
+fn validation_error_to_entry(filename: &str, err: &ValidationError) -> ErrorEntry {
     let suggestion = if let ValidationError::UnknownGeneratorConfigKey { target, .. } = err {
         let valid = valid_keys_for_generator_target(target);
         Some(format!(
@@ -129,8 +129,9 @@ fn validation_error_to_entry(err: &ValidationError) -> ErrorEntry {
     } else {
         Some(validation_suggestion(err).to_string())
     };
+    let location = validation_error_span(err).map(|s| format!("{filename}:{}:{}", s.line, s.col));
     ErrorEntry {
-        location: None,
+        location,
         message: err.to_string(),
         suggestion,
     }
@@ -400,8 +401,10 @@ fn cmd_new(name: &str, quiet: bool) -> Result<()> {
     std::fs::write(idl_path.as_std_path(), &idl_contents)
         .wrap_err_with(|| format!("failed to write {}", idl_path))?;
 
-    let mut api = parse_api_str(&idl_contents, "yaml").wrap_err("failed to parse generated IDL")?;
-    validate_api(&mut api).wrap_err("generated IDL failed validation")?;
+    let (mut api, _) = parse_api_str_with_spans(&idl_contents, "yaml")
+        .wrap_err("failed to parse generated IDL")?;
+    validate_api_with_spans(&mut api, &SpanTable::default())
+        .wrap_err("generated IDL failed validation")?;
 
     let cargo_toml_path = project_dir.join("Cargo.toml");
     let cargo_toml = format!(
@@ -769,12 +772,14 @@ fn cmd_generate(
     };
     let contents = std::fs::read_to_string(in_path.as_std_path())
         .wrap_err_with(|| format!("failed to read input file: {}", input))?;
-    let mut api =
-        parse_api_str(&contents, fmt).map_err(|e| pretty_parse_error(input, &contents, e))?;
-    validate_api(&mut api).map_err(format_validation_error)?;
+    let (mut api, spans) = parse_api_str_with_spans(&contents, fmt)
+        .map_err(|e| pretty_parse_error(input, &contents, e))?;
+    validate_api_with_spans(&mut api, &spans)
+        .map_err(|e| format_validation_error(input, &contents, e))?;
 
     if let Some(ref generators) = api.generators {
-        merge_inline_generators(&mut config, generators).map_err(format_validation_error)?;
+        merge_inline_generators(&mut config, generators)
+            .map_err(|e| format_validation_error(input, &contents, e))?;
     }
 
     if warn {
@@ -811,7 +816,8 @@ fn cmd_generate(
         .iter()
         .map(|g| (g.name(), g.capabilities()))
         .collect();
-    validate_capabilities(&api, &selected_caps).map_err(format_validation_error)?;
+    validate_capabilities(&api, &selected_caps)
+        .map_err(|e| format_validation_error(input, &contents, e))?;
 
     if dry_run {
         let mut files: Vec<String> = Vec::new();
@@ -897,10 +903,10 @@ fn cmd_validate_text(input: &str, warn: bool, quiet: bool) -> Result<()> {
     };
     let contents = std::fs::read_to_string(in_path.as_std_path())
         .wrap_err_with(|| format!("failed to read input file: {}", input))?;
-    let mut api =
-        parse_api_str(&contents, fmt).map_err(|e| pretty_parse_error(input, &contents, e))?;
+    let (mut api, spans) = parse_api_str_with_spans(&contents, fmt)
+        .map_err(|e| pretty_parse_error(input, &contents, e))?;
 
-    match validate_api(&mut api) {
+    match validate_api_with_spans(&mut api, &spans) {
         Ok(()) => {
             if warn {
                 for w in collect_warnings(&api) {
@@ -920,7 +926,7 @@ fn cmd_validate_text(input: &str, warn: bool, quiet: bool) -> Result<()> {
             }
             Ok(())
         }
-        Err(e) => Err(format_validation_error(e)),
+        Err(e) => Err(format_validation_error(input, &contents, e)),
     }
 }
 
@@ -972,8 +978,8 @@ fn cmd_validate_json(input: &str) -> Result<bool> {
             return Ok(false);
         }
     };
-    let mut api = match parse_api_str(&contents, fmt) {
-        Ok(api) => api,
+    let (mut api, spans) = match parse_api_str_with_spans(&contents, fmt) {
+        Ok(v) => v,
         Err(e) => {
             emit_json(&ValidateErrJson {
                 ok: false,
@@ -982,10 +988,10 @@ fn cmd_validate_json(input: &str) -> Result<bool> {
             return Ok(false);
         }
     };
-    if let Err(e) = validate_api(&mut api) {
+    if let Err(e) = validate_api_with_spans(&mut api, &spans) {
         emit_json(&ValidateErrJson {
             ok: false,
-            errors: vec![validation_error_to_entry(&e)],
+            errors: vec![validation_error_to_entry(input, &e)],
         })?;
         return Ok(false);
     }
@@ -1028,9 +1034,10 @@ fn cmd_lint(input: &str, quiet: bool, format: OutputFormat) -> Result<bool> {
     };
     let contents = std::fs::read_to_string(in_path.as_std_path())
         .wrap_err_with(|| format!("failed to read input file: {}", input))?;
-    let mut api =
-        parse_api_str(&contents, fmt).map_err(|e| pretty_parse_error(input, &contents, e))?;
-    validate_api(&mut api).map_err(format_validation_error)?;
+    let (mut api, spans) = parse_api_str_with_spans(&contents, fmt)
+        .map_err(|e| pretty_parse_error(input, &contents, e))?;
+    validate_api_with_spans(&mut api, &spans)
+        .map_err(|e| format_validation_error(input, &contents, e))?;
 
     let warnings = collect_warnings(&api);
     if format.is_json() {
@@ -1080,9 +1087,10 @@ fn cmd_diff(
     };
     let contents = std::fs::read_to_string(in_path.as_std_path())
         .wrap_err_with(|| format!("failed to read input file: {}", input))?;
-    let mut api =
-        parse_api_str(&contents, fmt).map_err(|e| pretty_parse_error(input, &contents, e))?;
-    validate_api(&mut api).map_err(format_validation_error)?;
+    let (mut api, spans) = parse_api_str_with_spans(&contents, fmt)
+        .map_err(|e| pretty_parse_error(input, &contents, e))?;
+    validate_api_with_spans(&mut api, &spans)
+        .map_err(|e| format_validation_error(input, &contents, e))?;
 
     let tmp = tempfile::tempdir().wrap_err("failed to create temp directory")?;
     let tmp_path = Utf8Path::from_path(tmp.path())
@@ -1450,14 +1458,31 @@ fn render_source_context(filename: &str, input: &str, line: usize, column: usize
     )
 }
 
-fn format_validation_error(err: ValidationError) -> Report {
+fn format_validation_error(filename: &str, input: &str, err: ValidationError) -> Report {
     if let ValidationError::UnknownGeneratorConfigKey { target, .. } = &err {
         let valid = valid_keys_for_generator_target(target);
         let suggestion = format!("valid keys for the `{target}` generator section are: {valid}");
         return eyre!(err).suggestion(suggestion);
     }
+    let span = validation_error_span(&err);
     let suggestion = validation_suggestion(&err);
-    eyre!(err).suggestion(suggestion)
+    let mut report = eyre!(err).suggestion(suggestion);
+    if let Some(span) = span {
+        let note = render_source_context(filename, input, span.line as usize, span.col as usize);
+        report = report.note(note);
+    }
+    report
+}
+
+/// Returns the source span carried by a [`ValidationError`] variant, if any.
+fn validation_error_span(err: &ValidationError) -> Option<Span> {
+    match err {
+        ValidationError::DuplicateFunctionName { span, .. }
+        | ValidationError::DuplicateStructName { span, .. }
+        | ValidationError::DuplicateStructField { span, .. }
+        | ValidationError::DuplicateEnumVariant { span, .. } => *span,
+        _ => None,
+    }
 }
 
 fn validation_suggestion(err: &ValidationError) -> &'static str {
@@ -1578,7 +1603,7 @@ fn cmd_extract(
         }
     })?;
 
-    if let Err(e) = validate_api(&mut api) {
+    if let Err(e) = validate_api_with_spans(&mut api, &SpanTable::default()) {
         eprintln!("warning: {}", e);
     }
 
@@ -2000,6 +2025,7 @@ mod tests {
             ValidationError::DuplicateFunctionName {
                 module: "m".into(),
                 function: "f".into(),
+                span: None,
             },
             ValidationError::DuplicateParamName {
                 module: "m".into(),
@@ -2028,10 +2054,12 @@ mod tests {
             ValidationError::DuplicateStructName {
                 module: "m".into(),
                 name: "S".into(),
+                span: None,
             },
             ValidationError::DuplicateStructField {
                 struct_name: "S".into(),
                 field: "f".into(),
+                span: None,
             },
             ValidationError::EmptyStruct {
                 module: "m".into(),
@@ -2048,6 +2076,7 @@ mod tests {
             ValidationError::DuplicateEnumVariant {
                 enum_name: "E".into(),
                 variant: "V".into(),
+                span: None,
             },
             ValidationError::DuplicateEnumValue {
                 enum_name: "E".into(),
@@ -2159,13 +2188,70 @@ mod tests {
     fn format_validation_error_preserves_message() {
         let _ = color_eyre::install();
         let err = ValidationError::DuplicateModuleName("foo".into());
-        let report = format_validation_error(err);
+        let report = format_validation_error("schema.yml", "", err);
         let msg = report.to_string();
         assert!(
             msg.contains("duplicate module name"),
             "missing error message in: {msg}"
         );
         assert!(msg.contains("foo"), "missing module name in: {msg}");
+    }
+
+    #[test]
+    fn validation_error_shows_source_position() {
+        let yaml = concat!(
+            "version: 0.1.0\n",
+            "modules:\n",
+            "  - name: math\n",
+            "    functions:\n",
+            "      - name: add\n",
+            "        params:\n",
+            "          - { name: a, type: i32 }\n",
+            "        return: i32\n",
+            "      - name: add\n",
+            "        params:\n",
+            "          - { name: a, type: i32 }\n",
+            "        return: i32\n",
+        );
+        let (mut api, spans) = parse_api_str_with_spans(yaml, "yaml").unwrap();
+        let err = validate_api_with_spans(&mut api, &spans).unwrap_err();
+
+        assert!(
+            matches!(
+                &err,
+                ValidationError::DuplicateFunctionName { span: Some(_), .. }
+            ),
+            "duplicate function error should carry a span, got: {err:?}"
+        );
+
+        let span = validation_error_span(&err).expect("duplicate error should carry a span");
+        assert_eq!(
+            span.line, 5,
+            "span should point at the first `add` declaration"
+        );
+        assert!(span.col >= 1, "span column should be 1-based");
+
+        let entry = validation_error_to_entry("schema.yml", &err);
+        let location = entry.location.as_deref().expect("location populated");
+        assert!(
+            location.starts_with("schema.yml:5:"),
+            "JSON error entry should include precise source location, got: {location}"
+        );
+
+        let note = render_source_context("schema.yml", yaml, span.line as usize, span.col as usize);
+        let plain = strip_ansi(&note);
+        assert!(
+            plain.contains("schema.yml:5"),
+            "rendered context should include file:line: {plain}"
+        );
+        assert!(
+            plain.contains("- name: add"),
+            "rendered context should show offending line: {plain}"
+        );
+        assert!(
+            plain.contains("^^^"),
+            "rendered context should include caret underline: {plain}"
+        );
     }
 
     #[test]
