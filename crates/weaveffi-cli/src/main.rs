@@ -297,6 +297,20 @@ enum Commands {
         #[arg(long)]
         profile: Option<String>,
     },
+    /// Watch the input IDL and regenerate bindings whenever it changes
+    Watch {
+        /// Input IDL/IR file (yaml|yml|json|toml)
+        input: String,
+        /// Output directory for generated artifacts [default: ./generated]
+        #[arg(short, long)]
+        out: Option<String>,
+        /// Comma-separated list of targets to generate (c, cpp, swift, android, node, wasm, python, dotnet, dart, go, ruby)
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Debounce duration in milliseconds between regenerations [default: 200]
+        #[arg(long)]
+        debounce_ms: Option<u64>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -431,6 +445,19 @@ fn main() -> Result<()> {
             profile.as_deref(),
             quiet,
             cli.verbose,
+            format,
+        )?,
+        Commands::Watch {
+            input,
+            out,
+            target,
+            debounce_ms,
+        } => cmd_watch(
+            &input,
+            out.as_deref(),
+            target.as_deref(),
+            debounce_ms,
+            quiet,
             format,
         )?,
     }
@@ -956,6 +983,110 @@ fn cmd_generate(
         println!("Generated artifacts in {}", out);
     }
     Ok(())
+}
+
+fn cmd_watch(
+    input: &str,
+    out: Option<&str>,
+    targets: Option<&str>,
+    debounce_ms: Option<u64>,
+    quiet: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    watch_loop(
+        input,
+        out.unwrap_or("./generated"),
+        targets,
+        debounce_ms.unwrap_or(200),
+        quiet,
+        format,
+        shutdown,
+    )
+}
+
+/// Core watch loop extracted so tests can inject a shutdown flag and join the
+/// background thread cleanly. In production `cmd_watch` passes a flag that is
+/// never flipped; Ctrl+C terminates the process instead.
+fn watch_loop(
+    input: &str,
+    out: &str,
+    targets: Option<&str>,
+    debounce_ms: u64,
+    quiet: bool,
+    format: OutputFormat,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    use notify::{RecursiveMode, Watcher};
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc::{channel, RecvTimeoutError};
+    use std::time::Duration;
+
+    let in_path = Utf8Path::new(input);
+    let parent = in_path
+        .parent()
+        .filter(|p| !p.as_str().is_empty())
+        .map(Utf8PathBuf::from)
+        .unwrap_or_else(|| Utf8PathBuf::from("."));
+
+    let canonical_input = std::fs::canonicalize(in_path.as_std_path())
+        .wrap_err_with(|| format!("failed to resolve input file: {}", input))?;
+
+    let (tx, rx) = channel::<notify::Result<notify::Event>>();
+    let mut watcher = notify::recommended_watcher(move |res| {
+        let _ = tx.send(res);
+    })
+    .wrap_err("failed to create file watcher")?;
+
+    watcher
+        .watch(parent.as_std_path(), RecursiveMode::Recursive)
+        .wrap_err_with(|| format!("failed to watch directory: {}", parent))?;
+
+    if !quiet {
+        println!("Watching {input}... Press Ctrl+C to exit.");
+    }
+
+    let debounce = Duration::from_millis(debounce_ms);
+    let poll = Duration::from_millis(100);
+
+    while !shutdown.load(Ordering::SeqCst) {
+        match rx.recv_timeout(poll) {
+            Ok(Ok(event)) => {
+                if !is_watched_event(&event, &canonical_input) {
+                    continue;
+                }
+                std::thread::sleep(debounce);
+                while rx.try_recv().is_ok() {}
+                if let Err(e) = cmd_generate(
+                    input, out, targets, false, None, false, false, false, None, true, quiet,
+                    format,
+                ) {
+                    eprintln!("regeneration failed: {e:#}");
+                }
+            }
+            Ok(Err(_)) => {}
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    Ok(())
+}
+
+fn is_watched_event(event: &notify::Event, canonical_input: &std::path::Path) -> bool {
+    use notify::EventKind;
+    if !matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+        return false;
+    }
+    event.paths.iter().any(|p| {
+        if let Ok(c) = std::fs::canonicalize(p) {
+            return c == canonical_input;
+        }
+        matches!(
+            (p.file_name(), canonical_input.file_name()),
+            (Some(a), Some(b)) if a == b
+        )
+    })
 }
 
 /// Returns `Ok(true)` when validation passed, `Ok(false)` when it failed in
@@ -4496,6 +4627,87 @@ mod tests {
         assert!(
             dir.path().join("generated/c/weaveffi.h").exists(),
             "weaveffi build should have invoked `weaveffi generate`",
+        );
+    }
+
+    #[test]
+    fn watch_regenerates_on_input_change() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let _ = color_eyre::install();
+
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let input_path = dir.path().join("api.yml");
+        let out_dir = dir.path().join("out");
+
+        let initial = concat!(
+            "version: \"0.1.0\"\n",
+            "modules:\n",
+            "  - name: math\n",
+            "    functions:\n",
+            "      - name: add\n",
+            "        params:\n",
+            "          - { name: a, type: i32 }\n",
+            "          - { name: b, type: i32 }\n",
+            "        return: i32\n",
+        );
+        std::fs::write(&input_path, initial).unwrap();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = Arc::clone(&shutdown);
+        let input_s = input_path.to_str().unwrap().to_owned();
+        let out_s = out_dir.to_str().unwrap().to_owned();
+
+        let handle = std::thread::spawn(move || {
+            watch_loop(
+                &input_s,
+                &out_s,
+                Some("c"),
+                50,
+                true,
+                OutputFormat::Text,
+                shutdown_clone,
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(500));
+
+        let modified = concat!(
+            "version: \"0.1.0\"\n",
+            "modules:\n",
+            "  - name: math\n",
+            "    functions:\n",
+            "      - name: multiply\n",
+            "        params:\n",
+            "          - { name: a, type: i32 }\n",
+            "          - { name: b, type: i32 }\n",
+            "        return: i32\n",
+        );
+        std::fs::write(&input_path, modified).unwrap();
+
+        let output = out_dir.join("c/weaveffi.h");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut saw_multiply = false;
+        while Instant::now() < deadline {
+            if output.exists() {
+                if let Ok(s) = std::fs::read_to_string(&output) {
+                    if s.contains("multiply") {
+                        saw_multiply = true;
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = handle.join();
+
+        assert!(
+            saw_multiply,
+            "watcher should have regenerated C header reflecting the modified IDL",
         );
     }
 }
