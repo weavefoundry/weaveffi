@@ -318,6 +318,12 @@ enum Commands {
         /// macOS host only.
         #[arg(long, conflicts_with = "cargo_target")]
         xcframework: bool,
+        /// Cross-compile the Rust cdylib for the three Android ABIs, drop the
+        /// `.so` slices into `<out>/android/src/main/jniLibs/<abi>/` and run
+        /// `gradle bundleRelease` in `<out>/android/` to produce an `.aar`.
+        /// Requires the Android NDK and a `gradle` binary on `$PATH`.
+        #[arg(long, conflicts_with_all = ["cargo_target", "xcframework"])]
+        aar: bool,
     },
     /// Watch the input IDL and regenerate bindings whenever it changes
     Watch {
@@ -462,6 +468,7 @@ fn main() -> Result<()> {
             cargo_target,
             profile,
             xcframework,
+            aar,
         } => cmd_build(
             &input,
             out.as_deref(),
@@ -469,6 +476,7 @@ fn main() -> Result<()> {
             cargo_target.as_deref(),
             profile.as_deref(),
             xcframework,
+            aar,
             quiet,
             cli.verbose,
             format,
@@ -3850,6 +3858,15 @@ struct XcframeworkReport<'a> {
     cargo_targets: &'a [&'a str],
 }
 
+/// Machine-readable summary emitted by `weaveffi build --aar --format json`.
+#[derive(Debug, Serialize)]
+struct AarReport<'a> {
+    aar: &'a str,
+    package: &'a str,
+    profile: &'a str,
+    cargo_targets: &'a [&'a str],
+}
+
 /// Apple cargo target triples bundled into the generated `.xcframework`.
 ///
 /// These correspond to the `binaryTarget` slices consumed by the generated
@@ -3862,12 +3879,25 @@ const XCFRAMEWORK_APPLE_TARGETS: &[&str] = &[
     "x86_64-apple-darwin",
 ];
 
+/// Android cargo target triples bundled into the generated `.aar`, paired
+/// with the Gradle/NDK ABI directory name used under `jniLibs/`.
+///
+/// Covers the three ABIs declared by the generated `build.gradle` (the
+/// `abiFilters` list): arm64, armv7, and x86_64.
+const AAR_ANDROID_TARGETS: &[(&str, &str)] = &[
+    ("aarch64-linux-android", "arm64-v8a"),
+    ("armv7-linux-androideabi", "armeabi-v7a"),
+    ("x86_64-linux-android", "x86_64"),
+];
+
 /// Runs `weaveffi generate` followed by `cargo build` for the current crate,
 /// then reports the path to the emitted cdylib / staticlib / wasm module.
 ///
 /// When `xcframework` is set the build hands off to [`build_xcframework`] after
 /// generation, producing `<out>/swift/Frameworks/<module>.xcframework` instead
-/// of a single per-host artifact.
+/// of a single per-host artifact. When `aar` is set it instead hands off to
+/// [`build_aar`], which drops Android cdylib slices into `jniLibs/` and drives
+/// `gradle bundleRelease` to produce `<out>/android/build/outputs/aar/*.aar`.
 #[allow(clippy::too_many_arguments)]
 fn cmd_build(
     input: &str,
@@ -3876,13 +3906,19 @@ fn cmd_build(
     cargo_target: Option<&str>,
     profile: Option<&str>,
     xcframework: bool,
+    aar: bool,
     quiet: bool,
     verbose: bool,
     format: OutputFormat,
 ) -> Result<()> {
     let out_dir = out.unwrap_or("./generated");
-    let effective_targets_owned =
-        xcframework.then(|| augment_targets_with(targets, &["c", "swift"]));
+    let effective_targets_owned = if xcframework {
+        Some(augment_targets_with(targets, &["c", "swift"]))
+    } else if aar {
+        Some(augment_targets_with(targets, &["c", "android"]))
+    } else {
+        None
+    };
     let targets_for_generate = effective_targets_owned.as_deref().or(targets);
     cmd_generate(
         input,
@@ -3918,6 +3954,20 @@ fn cmd_build(
 
     if xcframework {
         return build_xcframework(
+            &cwd,
+            &cwd_utf8,
+            out_dir,
+            &package_name,
+            &crate_types,
+            effective_profile,
+            quiet,
+            verbose,
+            format,
+        );
+    }
+
+    if aar {
+        return build_aar(
             &cwd,
             &cwd_utf8,
             out_dir,
@@ -4187,6 +4237,171 @@ fn build_xcframework(
         println!("Built xcframework: {}", xcframework_path);
     }
     Ok(())
+}
+
+/// Resolve `out_dir` (possibly relative to `cwd_utf8`) to an absolute,
+/// UTF-8 path. Mirrors the fallback chain used by [`build_xcframework`]:
+/// prefer `std::path::absolute`, fall back to `cwd` + relative join, and
+/// finally accept the caller-supplied value as-is when it is absolute.
+fn resolve_out_path(cwd_utf8: &Utf8Path, out_dir: &str) -> Utf8PathBuf {
+    std::path::absolute(out_dir)
+        .ok()
+        .and_then(|p| Utf8PathBuf::from_path_buf(p).ok())
+        .unwrap_or_else(|| {
+            if Utf8Path::new(out_dir).is_absolute() {
+                Utf8PathBuf::from(out_dir)
+            } else {
+                cwd_utf8.join(out_dir)
+            }
+        })
+}
+
+/// Cross-compile the Rust cdylib for every Android ABI listed in
+/// [`AAR_ANDROID_TARGETS`], copy the resulting `.so` files into the
+/// generated Android project's `src/main/jniLibs/<abi>/` tree, and run
+/// `gradle bundleRelease` inside `<out>/android/` to produce an `.aar`.
+///
+/// The copy step renames each slice to `lib<package_stem>.so`, matching the
+/// artifact Cargo produces so the consuming `System.loadLibrary` call
+/// resolves against the same binary in every ABI bucket.
+#[allow(clippy::too_many_arguments)]
+fn build_aar(
+    cwd: &std::path::Path,
+    cwd_utf8: &Utf8Path,
+    out_dir: &str,
+    package_name: &str,
+    crate_types: &[String],
+    effective_profile: &str,
+    quiet: bool,
+    verbose: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    if !crate_types.iter().any(|c| c == "cdylib" || c == "dylib") {
+        bail!("Cargo.toml must declare `crate-type = [\"cdylib\"]` under `[lib]` to build an .aar");
+    }
+
+    let out_path = resolve_out_path(cwd_utf8, out_dir);
+    let android_dir = out_path.join("android");
+    if !android_dir.exists() {
+        bail!(
+            "generated Android project not found at {}; the `android` generator must run before --aar",
+            android_dir
+        );
+    }
+
+    let artifact_stem = package_name.replace('-', "_");
+    let jni_libs_root = android_dir.join("src/main/jniLibs");
+    let cargo_targets: Vec<&str> = AAR_ANDROID_TARGETS.iter().map(|(t, _)| *t).collect();
+
+    for (triple, abi) in AAR_ANDROID_TARGETS {
+        let mut cargo = Command::new("cargo");
+        cargo.current_dir(cwd).arg("build");
+        if effective_profile == "release" {
+            cargo.arg("--release");
+        } else {
+            cargo.args(["--profile", effective_profile]);
+        }
+        cargo.args(["--target", triple]);
+        if quiet {
+            cargo.arg("--quiet");
+        }
+        if verbose {
+            cargo.arg("--verbose");
+        }
+        let status = cargo
+            .status()
+            .wrap_err_with(|| format!("failed to spawn `cargo build --target {triple}`"))?;
+        if !status.success() {
+            bail!(
+                "`cargo build --target {}` failed with status {}; is the target installed? (`rustup target add {}`)",
+                triple,
+                status,
+                triple
+            );
+        }
+
+        let artifact = locate_artifact(
+            cwd_utf8,
+            package_name,
+            crate_types,
+            Some(triple),
+            effective_profile,
+        )?;
+
+        let abi_dir = jni_libs_root.join(abi);
+        std::fs::create_dir_all(abi_dir.as_std_path())
+            .wrap_err_with(|| format!("failed to create {}", abi_dir))?;
+        let dest = abi_dir.join(format!("lib{artifact_stem}.so"));
+        std::fs::copy(artifact.as_std_path(), dest.as_std_path())
+            .wrap_err_with(|| format!("failed to copy Android slice {} -> {}", artifact, dest))?;
+    }
+
+    let mut gradle = Command::new("gradle");
+    gradle
+        .current_dir(android_dir.as_std_path())
+        .arg("bundleRelease");
+    if quiet {
+        gradle.arg("--quiet");
+    }
+    let gradle_status = gradle.status().wrap_err(
+        "failed to spawn `gradle`; install Gradle and ensure it's on $PATH to use --aar",
+    )?;
+    if !gradle_status.success() {
+        bail!(
+            "`gradle bundleRelease` failed with status {} in {}",
+            gradle_status,
+            android_dir
+        );
+    }
+
+    let aar_path = find_aar_output(&android_dir)?;
+
+    if format.is_json() {
+        emit_json(&AarReport {
+            aar: aar_path.as_str(),
+            package: package_name,
+            profile: effective_profile,
+            cargo_targets: &cargo_targets,
+        })?;
+    } else {
+        println!("Built aar: {}", aar_path);
+    }
+    Ok(())
+}
+
+/// Locate the AAR produced by `gradle bundleRelease` under
+/// `<android_dir>/build/outputs/aar/`. AGP names the artifact after the
+/// Gradle module (`<module>-release.aar`), but we tolerate any `.aar`
+/// suffix so custom `archivesBaseName` overrides still resolve.
+fn find_aar_output(android_dir: &Utf8Path) -> Result<Utf8PathBuf> {
+    let outputs = android_dir.join("build/outputs/aar");
+    if !outputs.exists() {
+        bail!(
+            "`gradle bundleRelease` did not produce {}; check the Gradle log above",
+            outputs
+        );
+    }
+    let mut found: Option<Utf8PathBuf> = None;
+    for entry in std::fs::read_dir(outputs.as_std_path())
+        .wrap_err_with(|| format!("failed to read {}", outputs))?
+    {
+        let entry = entry.wrap_err_with(|| format!("failed to read entry in {}", outputs))?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("aar") {
+            let utf8 = Utf8PathBuf::from_path_buf(path)
+                .map_err(|p| eyre!("aar path is not valid UTF-8: {}", p.display()))?;
+            if let Some(prev) = found.as_ref() {
+                bail!(
+                    "multiple .aar artifacts in {}; expected exactly one (found {} and {})",
+                    outputs,
+                    prev,
+                    utf8
+                );
+            }
+            found = Some(utf8);
+        }
+    }
+    found.ok_or_else(|| eyre!("no .aar file found in {}", outputs))
 }
 
 /// Extracts the package name and `[lib] crate-type` list from a Cargo
@@ -6128,6 +6343,213 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = Utf8Path::from_path(dir.path()).unwrap();
         assert_eq!(detect_xcframework_module_name(out), "CWeaveFFI");
+    }
+
+    /// The `--aar` target list must stay in lockstep with the `abiFilters`
+    /// emitted by the Android generator's `build.gradle`; any ABI that shows
+    /// up in one list but not the other would either leak an unused cdylib
+    /// slice into `jniLibs/` or produce a silently-stripped `.aar`.
+    #[test]
+    fn aar_android_targets_match_generator_abi_filters() {
+        let mut abis: Vec<&str> = AAR_ANDROID_TARGETS.iter().map(|(_, abi)| *abi).collect();
+        abis.sort();
+        assert_eq!(abis, vec!["arm64-v8a", "armeabi-v7a", "x86_64"]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(tmp.path()).unwrap();
+        let api = weaveffi_ir::ir::Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "math".into(),
+                functions: vec![],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        use weaveffi_core::codegen::Generator;
+        weaveffi_gen_android::AndroidGenerator
+            .generate(&api, out_dir)
+            .unwrap();
+        let gradle = std::fs::read_to_string(tmp.path().join("android/build.gradle")).unwrap();
+        for (_, abi) in AAR_ANDROID_TARGETS {
+            assert!(
+                gradle.contains(&format!("\"{abi}\"")),
+                "abiFilters in generated build.gradle must include {abi}: {gradle}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_aar_output_returns_first_aar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let android_dir = Utf8Path::from_path(tmp.path()).unwrap();
+        let outputs = android_dir.join("build/outputs/aar");
+        std::fs::create_dir_all(outputs.as_std_path()).unwrap();
+        let expected = outputs.join("weaveffi-release.aar");
+        std::fs::write(expected.as_std_path(), b"PK\x03\x04").unwrap();
+
+        let got = find_aar_output(android_dir).unwrap();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn find_aar_output_errors_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let android_dir = Utf8Path::from_path(tmp.path()).unwrap();
+        let err = find_aar_output(android_dir).unwrap_err();
+        assert!(
+            err.to_string().contains("did not produce"),
+            "missing outputs dir should surface a helpful error: {err}"
+        );
+    }
+
+    #[test]
+    fn find_aar_output_rejects_multiple_aars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let android_dir = Utf8Path::from_path(tmp.path()).unwrap();
+        let outputs = android_dir.join("build/outputs/aar");
+        std::fs::create_dir_all(outputs.as_std_path()).unwrap();
+        std::fs::write(outputs.join("a-release.aar").as_std_path(), b"PK").unwrap();
+        std::fs::write(outputs.join("b-release.aar").as_std_path(), b"PK").unwrap();
+        let err = find_aar_output(android_dir).unwrap_err();
+        assert!(
+            err.to_string().contains("multiple .aar"),
+            "ambiguous outputs should fail loudly: {err}"
+        );
+    }
+
+    /// Smoke test for `weaveffi build --aar`.
+    ///
+    /// Cross-compiles a minimal cdylib for each of the three Android ABIs
+    /// and drives `gradle bundleRelease` on the generated Android project.
+    /// The test skips gracefully when the Android NDK isn't installed (via
+    /// `ANDROID_NDK_HOME` / `ANDROID_NDK_ROOT`), when `gradle` is not on
+    /// `$PATH`, or when any of the required `rustup` targets is missing,
+    /// so it never fails on developer machines without the full toolchain.
+    #[test]
+    fn build_aar_smoke_test() {
+        let _ = color_eyre::install();
+
+        let ndk_present = env::var_os("ANDROID_NDK_HOME")
+            .map(|p| std::path::Path::new(&p).exists())
+            .unwrap_or(false)
+            || env::var_os("ANDROID_NDK_ROOT")
+                .map(|p| std::path::Path::new(&p).exists())
+                .unwrap_or(false);
+        if !ndk_present {
+            eprintln!("skipping: Android NDK not found (set ANDROID_NDK_HOME or ANDROID_NDK_ROOT)");
+            return;
+        }
+
+        if Command::new("gradle")
+            .arg("--version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skipping: `gradle --version` not available on this host");
+            return;
+        }
+
+        let installed = Command::new("rustup")
+            .args(["target", "list", "--installed"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .map(str::to_string)
+                    .collect::<BTreeSet<String>>()
+            })
+            .unwrap_or_default();
+        for (triple, _) in AAR_ANDROID_TARGETS {
+            if !installed.contains(*triple) {
+                eprintln!(
+                    "skipping: rustup target `{triple}` not installed (run `rustup target add {triple}`)",
+                );
+                return;
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+
+        std::fs::write(
+            dir.path().join("api.yml"),
+            concat!(
+                "version: \"0.1.0\"\n",
+                "modules:\n",
+                "  - name: math\n",
+                "    functions:\n",
+                "      - name: add\n",
+                "        params:\n",
+                "          - { name: a, type: i32 }\n",
+                "          - { name: b, type: i32 }\n",
+                "        return: i32\n",
+            ),
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            concat!(
+                "[package]\n",
+                "name = \"weaveffi_aar_smoke\"\n",
+                "version = \"0.1.0\"\n",
+                "edition = \"2021\"\n",
+                "\n",
+                "[lib]\n",
+                "crate-type = [\"cdylib\"]\n",
+            ),
+        )
+        .unwrap();
+
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("lib.rs"),
+            "#[no_mangle]\npub extern \"C\" fn smoke_answer() -> i32 { 42 }\n",
+        )
+        .unwrap();
+
+        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .current_dir(dir.path())
+            .args(["--quiet", "build", "api.yml", "--aar"])
+            .output()
+            .expect("failed to run weaveffi build --aar");
+
+        assert!(
+            cmd.status.success(),
+            "weaveffi build --aar failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&cmd.stdout),
+            String::from_utf8_lossy(&cmd.stderr),
+        );
+
+        let stdout = String::from_utf8_lossy(&cmd.stdout);
+        let path_line = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("Built aar: "))
+            .unwrap_or_else(|| panic!("stdout missing `Built aar:` line: {stdout}"));
+        let aar = std::path::Path::new(path_line.trim());
+        assert!(aar.exists(), "reported aar {aar:?} must exist on disk");
+        assert_eq!(
+            aar.extension().and_then(|s| s.to_str()),
+            Some("aar"),
+            "reported artifact {aar:?} must be an .aar",
+        );
+
+        let jni_root = dir.path().join("generated/android/src/main/jniLibs");
+        for (_, abi) in AAR_ANDROID_TARGETS {
+            let slice = jni_root.join(abi).join("libweaveffi_aar_smoke.so");
+            assert!(slice.exists(), "jniLibs slice missing for {abi}: {slice:?}",);
+        }
     }
 
     /// macOS smoke test for `weaveffi build --xcframework`.
