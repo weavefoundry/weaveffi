@@ -48,6 +48,37 @@ fn is_ident(ty: &syn::Type, name: &str) -> bool {
     matches!(ty, syn::Type::Path(p) if p.path.is_ident(name))
 }
 
+fn simple_type_name(ty: &syn::Type) -> Option<String> {
+    let syn::Type::Path(p) = ty else {
+        return None;
+    };
+    let seg = p.path.segments.last()?;
+    if matches!(seg.arguments, syn::PathArguments::None) {
+        Some(seg.ident.to_string())
+    } else {
+        None
+    }
+}
+
+fn extract_typed_handle_attr(attrs: &[syn::Attribute]) -> Option<String> {
+    attrs.iter().find_map(|attr| {
+        let syn::Meta::NameValue(nv) = &attr.meta else {
+            return None;
+        };
+        if !nv.path.is_ident("weaveffi_typed_handle") {
+            return None;
+        }
+        let syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(s),
+            ..
+        }) = &nv.value
+        else {
+            return None;
+        };
+        Some(s.value())
+    })
+}
+
 fn single_generic_arg(seg: &syn::PathSegment) -> Result<&syn::Type> {
     let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
         bail!("{}: expected generic arguments", seg.ident);
@@ -110,6 +141,12 @@ fn map_type(ty: &syn::Type) -> Result<TypeRef> {
             let (k, v) = two_generic_args(seg)?;
             Ok(TypeRef::Map(Box::new(map_type(k)?), Box::new(map_type(v)?)))
         }
+        "Handle" if matches!(seg.arguments, syn::PathArguments::AngleBracketed(_)) => {
+            let inner = single_generic_arg(seg)?;
+            let name = simple_type_name(inner)
+                .ok_or_else(|| eyre!("Handle: expected a named struct type argument"))?;
+            Ok(TypeRef::TypedHandle(name))
+        }
         other => Ok(TypeRef::Struct(other.to_string())),
     }
 }
@@ -144,9 +181,13 @@ fn extract_function(item: &syn::ItemFn) -> Result<Function> {
                 syn::Pat::Ident(id) => id.ident.to_string(),
                 _ => bail!("unsupported parameter pattern"),
             };
+            let ty = match extract_typed_handle_attr(&pt.attrs) {
+                Some(name) => TypeRef::TypedHandle(name),
+                None => map_type(&pt.ty)?,
+            };
             Ok(Param {
                 name: param_name,
-                ty: map_type(&pt.ty)?,
+                ty,
                 mutable: false,
             })
         })
@@ -787,6 +828,36 @@ mod tests {
         assert_eq!(m.functions[0].name, "public_fn");
         assert!(m.structs.is_empty());
         assert!(m.enums.is_empty());
+    }
+
+    #[test]
+    fn extract_typed_handle_param() {
+        let src = r#"
+            mod sessions {
+                #[weaveffi_export]
+                fn open(h: weaveffi_handle::Handle<Session>) {}
+
+                #[weaveffi_export]
+                fn close(#[weaveffi_typed_handle = "Session"] h: u64) {}
+
+                #[weaveffi_export]
+                fn use_bare(h: Handle<Session>) {}
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let fns = &api.modules[0].functions;
+        assert_eq!(
+            fns[0].params[0].ty,
+            TypeRef::TypedHandle("Session".to_string())
+        );
+        assert_eq!(
+            fns[1].params[0].ty,
+            TypeRef::TypedHandle("Session".to_string())
+        );
+        assert_eq!(
+            fns[2].params[0].ty,
+            TypeRef::TypedHandle("Session".to_string())
+        );
     }
 
     #[test]
