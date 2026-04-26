@@ -322,6 +322,113 @@ fn memory_guide_documents_allocator_contract() {
     );
 }
 
+fn read_doc(relative_path: &str) -> String {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    std::fs::read_to_string(workspace_root.join(relative_path))
+        .unwrap_or_else(|e| panic!("{relative_path} must exist: {e}"))
+}
+
+/// Extract the first fenced ```rust``` code block that appears after the
+/// given markdown heading (exact string match, including the `##` prefix).
+fn extract_rust_block_after_heading(md: &str, heading: &str) -> String {
+    let after = md
+        .split_once(heading)
+        .unwrap_or_else(|| panic!("heading not found: {heading}"))
+        .1;
+    let start = after
+        .find("```rust")
+        .unwrap_or_else(|| panic!("no ```rust``` block after heading {heading}"));
+    let body = &after[start + "```rust".len()..];
+    let nl = body.find('\n').expect("unterminated code fence");
+    let body = &body[nl + 1..];
+    let end = body.find("```").expect("unterminated code fence");
+    body[..end].to_string()
+}
+
+#[test]
+fn extract_guide_documents_all_attributes() {
+    let guide = read_doc("docs/src/guides/extract.md");
+    let required = [
+        "#[weaveffi_export]",
+        "#[weaveffi_export(async)]",
+        "#[weaveffi_export(cancellable)]",
+        "since = \"",
+        "#[weaveffi_struct]",
+        "#[weaveffi_struct(builder)]",
+        "#[weaveffi_enum]",
+        "#[weaveffi_callback]",
+        "#[weaveffi_callback = \"",
+        "#[weaveffi_listener(event = \"",
+        "#[weaveffi_typed_handle = \"",
+        "#[weaveffi_default = \"",
+        "#[deprecated",
+    ];
+    for attr in required {
+        assert!(
+            guide.contains(attr),
+            "extract guide must document {attr}: {guide}"
+        );
+    }
+}
+
+#[test]
+fn extract_guide_documents_required_limitations() {
+    let guide = read_doc("docs/src/guides/extract.md");
+    assert!(
+        guide.contains("## Limitations"),
+        "extract guide must have a Limitations section: {guide}"
+    );
+    let required = [
+        "Generic functions",
+        "Trait implementations",
+        "Lifetime parameters",
+        "&str",
+        "&[u8]",
+    ];
+    for item in required {
+        assert!(
+            guide.contains(item),
+            "extract guide Limitations must mention {item}: {guide}"
+        );
+    }
+}
+
+#[test]
+fn extract_guide_contacts_example_matches_sample_yml() {
+    let guide = read_doc("docs/src/guides/extract.md");
+    let rust = extract_rust_block_after_heading(&guide, "## Complete example");
+
+    let dir = tempfile::tempdir().expect("failed to create temp dir");
+    let src_path = dir.path().join("lib.rs");
+    std::fs::write(&src_path, &rust).unwrap();
+
+    let output = assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args(["extract", src_path.to_str().unwrap()])
+        .output()
+        .expect("failed to run extract");
+    assert!(
+        output.status.success(),
+        "extract failed on guide example: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let extracted: weaveffi_ir::ir::Api =
+        serde_yaml::from_slice(&output.stdout).expect("extract output should parse as Api");
+
+    let sample_yml = read_doc("samples/contacts/contacts.yml");
+    let sample: weaveffi_ir::ir::Api =
+        serde_yaml::from_str(&sample_yml).expect("contacts.yml should parse as Api");
+
+    assert_eq!(
+        extracted.modules, sample.modules,
+        "guide example must extract to the same modules as samples/contacts/contacts.yml"
+    );
+}
+
 #[test]
 fn summary_md_all_links_resolve() {
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
