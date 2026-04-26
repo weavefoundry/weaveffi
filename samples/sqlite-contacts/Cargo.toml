@@ -1,0 +1,16 @@
+[package]
+name = "sqlite-contacts"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+weaveffi-abi = { path = "../../crates/weaveffi-abi" }
+rusqlite = { version = "0.31", features = ["bundled"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[lints]
+workspace = true

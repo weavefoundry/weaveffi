@@ -1,0 +1,57 @@
+version: "0.2.0"
+modules:
+  - name: contacts
+    enums:
+      - name: Status
+        variants:
+          - name: Active
+            value: 0
+          - name: Archived
+            value: 1
+    structs:
+      - name: Contact
+        fields:
+          - { name: id, type: i64 }
+          - { name: name, type: string }
+          - { name: email, type: "string?" }
+          - { name: status, type: Status }
+          - { name: created_at, type: i64 }
+    functions:
+      - name: create_contact
+        doc: Insert a new contact and return the persisted row.
+        params:
+          - { name: name, type: string }
+          - { name: email, type: "string?" }
+        return: Contact
+        async: true
+        cancellable: true
+      - name: find_contact
+        doc: Look up a contact by id; returns null when absent.
+        params:
+          - { name: id, type: i64 }
+        return: "Contact?"
+        async: true
+      - name: list_contacts
+        doc: Stream all contacts, optionally filtered by status.
+        params:
+          - { name: status, type: "Status?" }
+        return: "iter<Contact>"
+      - name: update_contact
+        doc: Update a contact's email; returns true if a row was changed.
+        params:
+          - { name: id, type: i64 }
+          - { name: email, type: "string?" }
+        return: bool
+        async: true
+      - name: delete_contact
+        doc: Delete a contact by id; returns true if a row was removed.
+        params:
+          - { name: id, type: i64 }
+        return: bool
+        async: true
+      - name: count_contacts
+        doc: Count contacts, optionally filtered by status.
+        params:
+          - { name: status, type: "Status?" }
+        return: i64
+        async: true
