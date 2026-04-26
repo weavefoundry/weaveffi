@@ -272,9 +272,15 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
             out.push_str(&format!("{ind}_state[\"val\"] = bool(result)\n"));
         }
         Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
+            out.push_str(&format!("{ind}_ptr = result\n"));
+            out.push_str(&format!("{ind}if not _ptr:\n"));
+            out.push_str(&format!("{ind}    _state[\"val\"] = \"\"\n"));
+            out.push_str(&format!("{ind}else:\n"));
             out.push_str(&format!(
-                "{ind}_state[\"val\"] = _take_string(result) or \"\"\n"
+                "{ind}    _s = ctypes.cast(_ptr, ctypes.c_char_p).value.decode(\"utf-8\")\n"
             ));
+            out.push_str(&format!("{ind}    _lib.weaveffi_free_string(_ptr)\n"));
+            out.push_str(&format!("{ind}    _state[\"val\"] = _s\n"));
         }
         Some(TypeRef::Enum(name)) => {
             out.push_str(&format!("{ind}_state[\"val\"] = {name}(result)\n"));
@@ -331,7 +337,15 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
             if is_c_pointer_type(inner) {
                 match inner.as_ref() {
                     TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                        out.push_str(&format!("{ind}_state[\"val\"] = _take_string(result)\n"));
+                        out.push_str(&format!("{ind}_ptr = result\n"));
+                        out.push_str(&format!("{ind}if not _ptr:\n"));
+                        out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
+                        out.push_str(&format!("{ind}else:\n"));
+                        out.push_str(&format!(
+                            "{ind}    _s = ctypes.cast(_ptr, ctypes.c_char_p).value.decode(\"utf-8\")\n"
+                        ));
+                        out.push_str(&format!("{ind}    _lib.weaveffi_free_string(_ptr)\n"));
+                        out.push_str(&format!("{ind}    _state[\"val\"] = _s\n"));
                     }
                     TypeRef::Struct(name) => {
                         let name = local_type_name(name);
@@ -633,21 +647,6 @@ def _bytes_to_string(ptr) -> Optional[str]:
     if ptr is None:
         return None
     return ptr.decode("utf-8")
-
-
-def _take_string(_ptr) -> Optional[str]:
-    """Take ownership of an owned C string pointer, decode it, and free the
-    original allocation. Returns None when ``_ptr`` is null.
-
-    The raw pointer (``ctypes.POINTER(ctypes.c_char)``) is cast to ``c_char_p``
-    only to copy out the bytes; the original pointer is then freed via
-    ``weaveffi_free_string`` so no allocation is leaked.
-    """
-    if not _ptr:
-        return None
-    _s = ctypes.cast(_ptr, ctypes.c_char_p).value.decode("utf-8")
-    _lib.weaveffi_free_string(_ptr)
-    return _s
 "#,
     );
 }
@@ -1111,7 +1110,14 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
             out.push_str(&format!("{ind}return bool(_result)\n"));
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!("{ind}return _take_string(_result) or \"\"\n"));
+            out.push_str(&format!("{ind}_ptr = _result\n"));
+            out.push_str(&format!("{ind}if not _ptr:\n"));
+            out.push_str(&format!("{ind}    return \"\"\n"));
+            out.push_str(&format!(
+                "{ind}_s = ctypes.cast(_ptr, ctypes.c_char_p).value.decode(\"utf-8\")\n"
+            ));
+            out.push_str(&format!("{ind}_lib.weaveffi_free_string(_ptr)\n"));
+            out.push_str(&format!("{ind}return _s\n"));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             out.push_str(&format!("{ind}if not _result:\n"));
@@ -1152,7 +1158,14 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
 fn render_optional_return(out: &mut String, inner: &TypeRef, ind: &str) {
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!("{ind}return _take_string(_result)\n"));
+            out.push_str(&format!("{ind}_ptr = _result\n"));
+            out.push_str(&format!("{ind}if not _ptr:\n"));
+            out.push_str(&format!("{ind}    return None\n"));
+            out.push_str(&format!(
+                "{ind}_s = ctypes.cast(_ptr, ctypes.c_char_p).value.decode(\"utf-8\")\n"
+            ));
+            out.push_str(&format!("{ind}_lib.weaveffi_free_string(_ptr)\n"));
+            out.push_str(&format!("{ind}return _s\n"));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             out.push_str(&format!("{ind}if not _result:\n"));
@@ -1660,8 +1673,12 @@ mod tests {
             "missing _string_to_byteslice call: {py}"
         );
         assert!(
-            py.contains("_take_string(_result)"),
-            "string return must be decoded via _take_string (which frees the C buffer): {py}"
+            py.contains("ctypes.cast(_ptr, ctypes.c_char_p).value.decode(\"utf-8\")"),
+            "string return must cast the raw pointer to c_char_p and decode it: {py}"
+        );
+        assert!(
+            py.contains("_lib.weaveffi_free_string(_ptr)"),
+            "string return must call weaveffi_free_string on the raw pointer to release the C buffer: {py}"
         );
     }
 
@@ -1876,8 +1893,12 @@ mod tests {
             "missing name getter C call: {py}"
         );
         assert!(
-            py.contains("_take_string(_result)"),
-            "struct string getter must use _take_string to free the C buffer: {py}"
+            py.contains("ctypes.cast(_ptr, ctypes.c_char_p).value.decode(\"utf-8\")"),
+            "struct string getter must cast the raw pointer to c_char_p and decode it: {py}"
+        );
+        assert!(
+            py.contains("_lib.weaveffi_free_string(_ptr)"),
+            "struct string getter must call weaveffi_free_string to release the C buffer: {py}"
         );
         assert!(
             py.contains("def age(self) -> int:"),
@@ -2146,8 +2167,16 @@ mod tests {
             "missing optional str return: {py}"
         );
         assert!(
-            py.contains("return _take_string(_result)"),
-            "optional string return must use _take_string to free the C buffer: {py}"
+            py.contains("ctypes.cast(_ptr, ctypes.c_char_p).value.decode(\"utf-8\")"),
+            "optional string return must cast the raw pointer to c_char_p and decode it: {py}"
+        );
+        assert!(
+            py.contains("_lib.weaveffi_free_string(_ptr)"),
+            "optional string return must call weaveffi_free_string to release the C buffer: {py}"
+        );
+        assert!(
+            py.contains("return None"),
+            "optional string return must still return None for null pointers: {py}"
         );
     }
 
@@ -2293,8 +2322,12 @@ mod tests {
             "missing optional getter: {py}"
         );
         assert!(
-            py.contains("_take_string(_result)"),
-            "optional struct string getter must use _take_string to free the C buffer: {py}"
+            py.contains("ctypes.cast(_ptr, ctypes.c_char_p).value.decode(\"utf-8\")"),
+            "optional struct string getter must cast the raw pointer to c_char_p and decode it: {py}"
+        );
+        assert!(
+            py.contains("_lib.weaveffi_free_string(_ptr)"),
+            "optional struct string getter must call weaveffi_free_string to release the C buffer: {py}"
         );
     }
 
@@ -3740,10 +3773,6 @@ mod tests {
             py.contains("def _bytes_to_string("),
             "missing _bytes_to_string helper"
         );
-        assert!(
-            py.contains("def _take_string("),
-            "missing _take_string helper"
-        );
     }
 
     #[test]
@@ -4281,6 +4310,14 @@ mod tests {
         assert!(
             code.contains("run_in_executor(None, _fetch_data_sync, id)"),
             "should use run_in_executor with sync fn and args: {code}"
+        );
+        assert!(
+            code.contains("ctypes.cast(_ptr, ctypes.c_char_p).value.decode(\"utf-8\")"),
+            "async string delivery must cast the raw pointer to c_char_p and decode it: {code}"
+        );
+        assert!(
+            code.contains("_lib.weaveffi_free_string(_ptr)"),
+            "async string delivery must call weaveffi_free_string to release the C buffer: {code}"
         );
     }
 
