@@ -161,6 +161,14 @@ enum Commands {
     New {
         name: String,
     },
+    /// Initialise a WeaveFFI project in the current directory
+    Init {
+        /// Project name (defaults to the current directory name)
+        name: Option<String>,
+        /// Overwrite existing weaveffi.yml, Cargo.toml, or src/lib.rs
+        #[arg(long)]
+        force: bool,
+    },
     Generate {
         /// Input IDL/IR file (yaml|yml|json|toml)
         input: String,
@@ -334,6 +342,7 @@ fn main() -> Result<()> {
     let format = cli.format;
     match cli.command {
         Commands::New { name } => cmd_new(&name, quiet)?,
+        Commands::Init { name, force } => cmd_init(name.as_deref(), force, quiet)?,
         Commands::Generate {
             input,
             out,
@@ -475,7 +484,61 @@ fn cmd_new(name: &str, quiet: bool) -> Result<()> {
     std::fs::create_dir_all(project_dir.as_std_path())
         .wrap_err_with(|| format!("failed to create project directory: {}", name))?;
 
-    let module_name = sanitize_module_name(name);
+    write_project_scaffold(project_dir, name)?;
+
+    if !quiet {
+        println!("Initialized WeaveFFI project at {}", project_dir);
+        println!("Next steps:");
+        println!("  cd {name}");
+        println!("  # Implement the todo!() stubs in src/lib.rs");
+        println!("  cargo build");
+        println!("  weaveffi generate weaveffi.yml -o generated");
+    }
+    Ok(())
+}
+
+fn cmd_init(name: Option<&str>, force: bool, quiet: bool) -> Result<()> {
+    let cwd = env::current_dir().wrap_err("failed to read current directory")?;
+    let project_dir = Utf8PathBuf::from_path_buf(cwd.clone())
+        .map_err(|_| eyre!("current directory is not valid UTF-8: {}", cwd.display()))?;
+
+    let crate_name: String = match name {
+        Some(n) => n.to_string(),
+        None => project_dir
+            .file_name()
+            .map(|s| s.to_string())
+            .ok_or_else(|| eyre!("could not derive project name from current directory"))?,
+    };
+
+    let existing: Vec<&'static str> = ["weaveffi.yml", "Cargo.toml", "src/lib.rs"]
+        .into_iter()
+        .filter(|rel| project_dir.join(rel).exists())
+        .collect();
+    if !existing.is_empty() && !force {
+        bail!(
+            "refusing to initialise: {} already exist in {}. Pass --force to overwrite.",
+            existing.join(", "),
+            project_dir
+        );
+    }
+
+    write_project_scaffold(&project_dir, &crate_name)?;
+
+    if !quiet {
+        println!("Initialized WeaveFFI project at {}", project_dir);
+        println!("Next steps:");
+        println!("  # Implement the todo!() stubs in src/lib.rs");
+        println!("  cargo build");
+        println!("  weaveffi generate weaveffi.yml -o generated");
+    }
+    Ok(())
+}
+
+/// Write weaveffi.yml, Cargo.toml, src/lib.rs, and README.md into `project_dir`.
+/// Overwrites existing files unconditionally; callers are responsible for
+/// gating on user intent (e.g. `weaveffi init --force`).
+fn write_project_scaffold(project_dir: &Utf8Path, crate_name: &str) -> Result<()> {
+    let module_name = sanitize_module_name(crate_name);
 
     let idl_path = project_dir.join("weaveffi.yml");
     let idl_contents = format!(
@@ -535,7 +598,7 @@ fn cmd_new(name: &str, quiet: bool) -> Result<()> {
             "[lints.rust]\n",
             "unsafe_code = \"allow\"\n",
         ),
-        name = name,
+        name = crate_name,
     );
     std::fs::write(cargo_toml_path.as_std_path(), &cargo_toml)
         .wrap_err_with(|| format!("failed to write {}", cargo_toml_path))?;
@@ -569,19 +632,11 @@ fn cmd_new(name: &str, quiet: bool) -> Result<()> {
             "   ```\n\n",
             "5. Use the generated bindings from Swift, Kotlin, Node.js, Python, .NET, or WASM.\n",
         ),
-        name = name,
+        name = crate_name,
     );
     std::fs::write(readme_path.as_std_path(), &readme)
         .wrap_err_with(|| format!("failed to write {}", readme_path))?;
 
-    if !quiet {
-        println!("Initialized WeaveFFI project at {}", project_dir);
-        println!("Next steps:");
-        println!("  cd {name}");
-        println!("  # Implement the todo!() stubs in src/lib.rs");
-        println!("  cargo build");
-        println!("  weaveffi generate weaveffi.yml -o generated");
-    }
     Ok(())
 }
 
@@ -3887,6 +3942,123 @@ mod tests {
         assert!(
             contents.contains("todo!()"),
             "lib.rs should contain todo!() stubs: {contents}"
+        );
+    }
+
+    #[test]
+    fn init_in_empty_dir_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("my_project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .current_dir(&project_dir)
+            .arg("init")
+            .output()
+            .expect("failed to run weaveffi init");
+
+        assert!(
+            cmd.status.success(),
+            "weaveffi init failed: {}",
+            String::from_utf8_lossy(&cmd.stderr)
+        );
+
+        assert!(
+            project_dir.join("weaveffi.yml").exists(),
+            "weaveffi.yml should exist"
+        );
+        assert!(
+            project_dir.join("Cargo.toml").exists(),
+            "Cargo.toml should exist"
+        );
+        assert!(
+            project_dir.join("src/lib.rs").exists(),
+            "src/lib.rs should exist"
+        );
+        assert!(
+            project_dir.join("README.md").exists(),
+            "README.md should exist"
+        );
+
+        let cargo_toml = std::fs::read_to_string(project_dir.join("Cargo.toml")).unwrap();
+        assert!(
+            cargo_toml.contains("name = \"my_project\""),
+            "Cargo.toml should use crate name derived from current directory: {cargo_toml}"
+        );
+        assert!(
+            cargo_toml.contains("cdylib"),
+            "Cargo.toml should contain cdylib: {cargo_toml}"
+        );
+
+        let lib_rs = std::fs::read_to_string(project_dir.join("src/lib.rs")).unwrap();
+        assert!(
+            lib_rs.contains("todo!()"),
+            "lib.rs should contain todo!() stubs: {lib_rs}"
+        );
+    }
+
+    #[test]
+    fn init_refuses_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing_yml = dir.path().join("weaveffi.yml");
+        std::fs::write(&existing_yml, "version: \"0.0.0\"\n").unwrap();
+
+        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .current_dir(dir.path())
+            .args(["init", "test_proj"])
+            .output()
+            .expect("failed to run weaveffi init");
+
+        assert!(
+            !cmd.status.success(),
+            "weaveffi init should refuse when weaveffi.yml exists"
+        );
+        let stderr = String::from_utf8_lossy(&cmd.stderr);
+        assert!(
+            stderr.contains("weaveffi.yml") && stderr.contains("--force"),
+            "error should mention existing file and --force: {stderr}"
+        );
+
+        let contents = std::fs::read_to_string(&existing_yml).unwrap();
+        assert_eq!(
+            contents, "version: \"0.0.0\"\n",
+            "existing weaveffi.yml must not be overwritten without --force"
+        );
+        assert!(
+            !dir.path().join("Cargo.toml").exists(),
+            "Cargo.toml should not be created on refusal"
+        );
+        assert!(
+            !dir.path().join("src/lib.rs").exists(),
+            "src/lib.rs should not be created on refusal"
+        );
+
+        let forced = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .current_dir(dir.path())
+            .args(["init", "test_proj", "--force"])
+            .output()
+            .expect("failed to run weaveffi init --force");
+
+        assert!(
+            forced.status.success(),
+            "weaveffi init --force should succeed: {}",
+            String::from_utf8_lossy(&forced.stderr)
+        );
+        let new_yml = std::fs::read_to_string(&existing_yml).unwrap();
+        assert!(
+            new_yml.contains("version: \"0.1.0\""),
+            "--force should overwrite the existing weaveffi.yml: {new_yml}"
+        );
+        assert!(
+            dir.path().join("Cargo.toml").exists(),
+            "Cargo.toml should exist after --force"
+        );
+        assert!(
+            dir.path().join("src/lib.rs").exists(),
+            "src/lib.rs should exist after --force"
         );
     }
 
