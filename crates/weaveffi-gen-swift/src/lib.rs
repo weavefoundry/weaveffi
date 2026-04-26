@@ -960,7 +960,15 @@ fn render_async_resume_result(
         Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
             out.push_str(&format!("{}if let result = result {{\n", indent));
             out.push_str(&format!(
-                "{}    contRef.value.resume(returning: Data(bytes: result, count: Int(resultLen)))\n",
+                "{}    let data = Data(bytes: result, count: Int(resultLen))\n",
+                indent
+            ));
+            out.push_str(&format!(
+                "{}    weaveffi_free_bytes(UnsafeMutablePointer(mutating: result), Int(resultLen))\n",
+                indent
+            ));
+            out.push_str(&format!(
+                "{}    contRef.value.resume(returning: data)\n",
                 indent
             ));
             out.push_str(&format!("{}}} else {{\n", indent));
@@ -4470,6 +4478,44 @@ mod tests {
                  (either via a later statement or a `defer`): {swift}"
             );
         }
+
+        // Async result delivery must also copy into Data then free the owned
+        // `const uint8_t*` via a mutating-pointer cast before resuming.
+        let api = make_api(vec![Module {
+            name: "parity".to_string(),
+            functions: vec![Function {
+                name: "echo_async".to_string(),
+                params: vec![Param {
+                    name: "b".to_string(),
+                    ty: TypeRef::Bytes,
+                    mutable: false,
+                }],
+                returns: Some(TypeRef::Bytes),
+                doc: None,
+                r#async: true,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let swift = render_swift_wrapper(&api, true);
+        let copy_pos = swift
+            .find("let data = Data(bytes: result, count: Int(resultLen))")
+            .expect("Swift async callback must copy the returned bytes into Data");
+        let free_pos = swift
+            .find("weaveffi_free_bytes(UnsafeMutablePointer(mutating: result), Int(resultLen))")
+            .expect("Swift async callback must free the returned bytes buffer");
+        assert!(
+            copy_pos < free_pos,
+            "weaveffi_free_bytes must run AFTER copying the payload into Data in the \
+             async callback: {swift}"
+        );
     }
 
     #[test]

@@ -1055,6 +1055,16 @@ fn render_async_set_result(out: &mut String, ret: &Option<TypeRef>, indent: &str
             ));
             out.push_str(&format!("{indent}tcs.SetResult(str);\n"));
         }
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
+            out.push_str(&format!("{indent}var arr = new byte[(int)resultLen];\n"));
+            out.push_str(&format!(
+                "{indent}if (result != IntPtr.Zero) Marshal.Copy(result, arr, 0, (int)resultLen);\n"
+            ));
+            out.push_str(&format!(
+                "{indent}NativeMethods.weaveffi_free_bytes(result, resultLen);\n"
+            ));
+            out.push_str(&format!("{indent}tcs.SetResult(arr);\n"));
+        }
         Some(TypeRef::Enum(name)) => {
             out.push_str(&format!("{indent}tcs.SetResult(({name})result);\n"));
         }
@@ -4417,22 +4427,41 @@ mod tests {
 
     #[test]
     fn dotnet_bytes_return_calls_free_bytes() {
+        // Cover both the synchronous wrapper and the async callback's result
+        // delivery — both must Marshal.Copy the owned buffer and then release
+        // it via weaveffi_free_bytes before handing ownership to managed code.
         let api = make_api(vec![Module {
             name: "parity".into(),
-            functions: vec![Function {
-                name: "echo".into(),
-                params: vec![Param {
-                    name: "b".into(),
-                    ty: TypeRef::Bytes,
-                    mutable: false,
-                }],
-                returns: Some(TypeRef::Bytes),
-                doc: None,
-                r#async: false,
-                cancellable: false,
-                deprecated: None,
-                since: None,
-            }],
+            functions: vec![
+                Function {
+                    name: "echo".into(),
+                    params: vec![Param {
+                        name: "b".into(),
+                        ty: TypeRef::Bytes,
+                        mutable: false,
+                    }],
+                    returns: Some(TypeRef::Bytes),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "echo_async".into(),
+                    params: vec![Param {
+                        name: "b".into(),
+                        ty: TypeRef::Bytes,
+                        mutable: false,
+                    }],
+                    returns: Some(TypeRef::Bytes),
+                    doc: None,
+                    r#async: true,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+            ],
             structs: vec![],
             enums: vec![],
             callbacks: vec![],
@@ -4453,6 +4482,17 @@ mod tests {
         assert!(
             copy_pos < free_pos,
             "weaveffi_free_bytes must run AFTER Marshal.Copy has copied the payload: {cs}"
+        );
+
+        let async_copy_pos = cs
+            .find("Marshal.Copy(result, arr, 0, (int)resultLen);")
+            .expect("C# async callback must Marshal.Copy the bytes out of the owned buffer");
+        let async_free_pos = cs
+            .find("NativeMethods.weaveffi_free_bytes(result, resultLen);")
+            .expect("C# async callback must call NativeMethods.weaveffi_free_bytes on the returned IntPtr");
+        assert!(
+            async_copy_pos < async_free_pos,
+            "weaveffi_free_bytes must run AFTER Marshal.Copy in the async callback: {cs}"
         );
     }
 

@@ -692,7 +692,9 @@ fn render_cpp_getter(out: &mut String, struct_name: &str, module: &str, field: &
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             out.push_str("        size_t len = 0;\n");
             out.push_str(&format!("        auto* raw = {getter}({cast}, &len);\n"));
-            out.push_str("        return std::vector<uint8_t>(raw, raw + len);\n");
+            out.push_str("        std::vector<uint8_t> ret(raw, raw + len);\n");
+            out.push_str("        weaveffi_free_bytes(raw, len);\n");
+            out.push_str("        return ret;\n");
         }
         TypeRef::Handle => {
             out.push_str(&format!(
@@ -1317,9 +1319,11 @@ fn render_async_set_value(out: &mut String, ty: &TypeRef) {
             out.push_str("            p->set_value(std::move(ret));\n");
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            out.push_str("            std::vector<uint8_t> ret(result, result + result_len);\n");
             out.push_str(
-                "            p->set_value(std::vector<uint8_t>(result, result + result_len));\n",
+                "            weaveffi_free_bytes(const_cast<uint8_t*>(result), result_len);\n",
             );
+            out.push_str("            p->set_value(std::move(ret));\n");
         }
         TypeRef::Handle => {
             out.push_str(
@@ -3536,25 +3540,54 @@ mod tests {
 
     #[test]
     fn cpp_bytes_return_calls_free_bytes() {
+        // Cover all three bytes-return paths: top-level function, struct field
+        // getter, and async callback result delivery. Each must copy the bytes
+        // into a std::vector AND free the owned buffer afterwards.
         let api = Api {
             version: "0.1.0".into(),
             modules: vec![Module {
                 name: "parity".into(),
-                functions: vec![Function {
-                    name: "echo".into(),
-                    params: vec![Param {
-                        name: "b".into(),
-                        ty: TypeRef::Bytes,
-                        mutable: false,
-                    }],
-                    returns: Some(TypeRef::Bytes),
+                functions: vec![
+                    Function {
+                        name: "echo".into(),
+                        params: vec![Param {
+                            name: "b".into(),
+                            ty: TypeRef::Bytes,
+                            mutable: false,
+                        }],
+                        returns: Some(TypeRef::Bytes),
+                        doc: None,
+                        r#async: false,
+                        cancellable: false,
+                        deprecated: None,
+                        since: None,
+                    },
+                    Function {
+                        name: "echo_async".into(),
+                        params: vec![Param {
+                            name: "b".into(),
+                            ty: TypeRef::Bytes,
+                            mutable: false,
+                        }],
+                        returns: Some(TypeRef::Bytes),
+                        doc: None,
+                        r#async: true,
+                        cancellable: false,
+                        deprecated: None,
+                        since: None,
+                    },
+                ],
+                structs: vec![StructDef {
+                    name: "Bag".into(),
                     doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
+                    fields: vec![StructField {
+                        name: "data".into(),
+                        ty: TypeRef::Bytes,
+                        doc: None,
+                        default: None,
+                    }],
+                    builder: false,
                 }],
-                structs: vec![],
                 enums: vec![],
                 callbacks: vec![],
                 listeners: vec![],
@@ -3565,15 +3598,37 @@ mod tests {
         };
         let h = render_cpp_header(&api, "weaveffi");
 
-        let copy_pos = h
+        let fn_copy_pos = h
             .find("std::vector<uint8_t> ret(result, result + out_len);")
-            .expect("C++ wrapper must copy the bytes out of the owned buffer into a std::vector");
-        let free_pos = h
+            .expect("C++ function wrapper must copy the bytes out of the owned buffer");
+        let fn_free_pos = h
             .find("weaveffi_free_bytes(result, out_len);")
-            .expect("C++ wrapper must call weaveffi_free_bytes on the returned pointer");
+            .expect("C++ function wrapper must call weaveffi_free_bytes on the returned pointer");
         assert!(
-            copy_pos < free_pos,
-            "C++ wrapper must free AFTER copying data into std::vector: {h}"
+            fn_copy_pos < fn_free_pos,
+            "C++ function wrapper must free AFTER copying data into std::vector: {h}"
+        );
+
+        let getter_copy_pos = h
+            .find("std::vector<uint8_t> ret(raw, raw + len);")
+            .expect("C++ struct getter must copy the bytes out of the owned buffer");
+        let getter_free_pos = h
+            .find("weaveffi_free_bytes(raw, len);")
+            .expect("C++ struct getter must call weaveffi_free_bytes on the returned pointer");
+        assert!(
+            getter_copy_pos < getter_free_pos,
+            "C++ struct getter must free AFTER copying data into std::vector: {h}"
+        );
+
+        let async_copy_pos = h
+            .find("std::vector<uint8_t> ret(result, result + result_len);")
+            .expect("C++ async callback must copy the bytes out of the owned buffer");
+        let async_free_pos = h
+            .find("weaveffi_free_bytes(const_cast<uint8_t*>(result), result_len);")
+            .expect("C++ async callback must call weaveffi_free_bytes on the returned pointer");
+        assert!(
+            async_copy_pos < async_free_pos,
+            "C++ async callback must free AFTER copying data into std::vector: {h}"
         );
     }
 

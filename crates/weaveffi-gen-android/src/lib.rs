@@ -708,6 +708,13 @@ fn write_jni_box_result(out: &mut String, ret: Option<&TypeRef>) {
         Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
             out.push_str("        jobject boxed = (*env)->NewStringUTF(env, result);\n");
         }
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
+            out.push_str(
+                "        jbyteArray boxed = (*env)->NewByteArray(env, (jsize)result_len);\n",
+            );
+            out.push_str("        if (boxed && result) { (*env)->SetByteArrayRegion(env, boxed, 0, (jsize)result_len, (const jbyte*)result); }\n");
+            out.push_str("        weaveffi_free_bytes((uint8_t*)result, (size_t)result_len);\n");
+        }
         _ => {
             out.push_str("        jobject boxed = (jobject)(intptr_t)result;\n");
         }
@@ -4607,22 +4614,41 @@ mod tests {
 
     #[test]
     fn android_bytes_return_calls_free_bytes() {
+        // Cover both the synchronous JNI bridge and the async callback:
+        // both must copy bytes into a jbyteArray (SetByteArrayRegion) before
+        // releasing the owned C buffer via weaveffi_free_bytes.
         let api = make_api(vec![Module {
             name: "parity".to_string(),
-            functions: vec![Function {
-                name: "echo".to_string(),
-                params: vec![Param {
-                    name: "b".to_string(),
-                    ty: TypeRef::Bytes,
-                    mutable: false,
-                }],
-                returns: Some(TypeRef::Bytes),
-                doc: None,
-                r#async: false,
-                cancellable: false,
-                deprecated: None,
-                since: None,
-            }],
+            functions: vec![
+                Function {
+                    name: "echo".to_string(),
+                    params: vec![Param {
+                        name: "b".to_string(),
+                        ty: TypeRef::Bytes,
+                        mutable: false,
+                    }],
+                    returns: Some(TypeRef::Bytes),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "echo_async".to_string(),
+                    params: vec![Param {
+                        name: "b".to_string(),
+                        ty: TypeRef::Bytes,
+                        mutable: false,
+                    }],
+                    returns: Some(TypeRef::Bytes),
+                    doc: None,
+                    r#async: true,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+            ],
             structs: vec![],
             enums: vec![],
             callbacks: vec![],
@@ -4641,6 +4667,17 @@ mod tests {
         assert!(
             copy_pos < free_pos,
             "weaveffi_free_bytes must run AFTER copying data into the jbyteArray: {jni}"
+        );
+
+        let async_copy_pos = jni
+            .find("SetByteArrayRegion(env, boxed, 0, (jsize)result_len, (const jbyte*)result)")
+            .expect("JNI async callback must copy the returned bytes into a jbyteArray");
+        let async_free_pos = jni
+            .find("weaveffi_free_bytes((uint8_t*)result, (size_t)result_len);")
+            .expect("JNI async callback must free the returned pointer via weaveffi_free_bytes");
+        assert!(
+            async_copy_pos < async_free_pos,
+            "weaveffi_free_bytes must run AFTER copying data into the jbyteArray in async callback: {jni}"
         );
     }
 

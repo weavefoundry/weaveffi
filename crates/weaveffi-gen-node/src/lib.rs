@@ -319,6 +319,12 @@ fn emit_async_resolve_value(out: &mut String, ret: Option<&TypeRef>) {
                 "        napi_create_string_utf8(ctx->env, result, NAPI_AUTO_LENGTH, &val);\n",
             );
         }
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
+            out.push_str(
+                "        napi_create_buffer_copy(ctx->env, result_len, result, NULL, &val);\n",
+            );
+            out.push_str("        weaveffi_free_bytes((uint8_t*)result, result_len);\n");
+        }
         Some(TypeRef::TypedHandle(_) | TypeRef::Handle) => {
             out.push_str("        napi_create_int64(ctx->env, (int64_t)result, &val);\n");
         }
@@ -2585,6 +2591,9 @@ mod tests {
 
     #[test]
     fn node_bytes_return_calls_free_bytes() {
+        // Cover both the synchronous N-API wrapper and the async callback's
+        // resolve path: both must copy bytes into a Node Buffer via
+        // napi_create_buffer_copy and then release the owned C buffer.
         let mut m = make_module("parity");
         m.functions.push(Function {
             name: "echo".into(),
@@ -2596,6 +2605,20 @@ mod tests {
             returns: Some(TypeRef::Bytes),
             doc: None,
             r#async: false,
+            cancellable: false,
+            deprecated: None,
+            since: None,
+        });
+        m.functions.push(Function {
+            name: "echo_async".into(),
+            params: vec![Param {
+                name: "b".into(),
+                ty: TypeRef::Bytes,
+                mutable: false,
+            }],
+            returns: Some(TypeRef::Bytes),
+            doc: None,
+            r#async: true,
             cancellable: false,
             deprecated: None,
             since: None,
@@ -2612,6 +2635,17 @@ mod tests {
         assert!(
             copy_pos < free_pos,
             "weaveffi_free_bytes must run AFTER napi_create_buffer_copy has copied the payload: {addon}"
+        );
+
+        let async_copy_pos = addon
+            .find("napi_create_buffer_copy(ctx->env, result_len, result, NULL, &val);")
+            .expect("Node async callback must copy bytes into a Node Buffer via napi_create_buffer_copy");
+        let async_free_pos = addon
+            .find("weaveffi_free_bytes((uint8_t*)result, result_len);")
+            .expect("Node async callback must free the returned pointer via weaveffi_free_bytes");
+        assert!(
+            async_copy_pos < async_free_pos,
+            "weaveffi_free_bytes must run AFTER napi_create_buffer_copy in the async callback: {addon}"
         );
     }
 
