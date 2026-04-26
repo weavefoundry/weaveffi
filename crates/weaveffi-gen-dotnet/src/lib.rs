@@ -77,6 +77,21 @@ impl Generator for DotnetGenerator {
         ]
     }
 
+    fn output_files_with_config(
+        &self,
+        _api: &Api,
+        out_dir: &Utf8Path,
+        config: &GeneratorConfig,
+    ) -> Vec<String> {
+        let ns = config.dotnet_namespace();
+        vec![
+            out_dir.join(format!("dotnet/{ns}.cs")).to_string(),
+            out_dir.join(format!("dotnet/{ns}.csproj")).to_string(),
+            out_dir.join(format!("dotnet/{ns}.nuspec")).to_string(),
+            out_dir.join("dotnet/README.md").to_string(),
+        ]
+    }
+
     fn capabilities(&self) -> &'static [Capability] {
         &[
             Capability::Callbacks,
@@ -1872,6 +1887,39 @@ mod tests {
                 out.join("dotnet/WeaveFFI.cs").to_string(),
                 out.join("dotnet/WeaveFFI.csproj").to_string(),
                 out.join("dotnet/WeaveFFI.nuspec").to_string(),
+                out.join("dotnet/README.md").to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn dotnet_output_files_with_config_respects_naming() {
+        let api = make_api(vec![]);
+        let out = Utf8Path::new("/tmp/out");
+
+        let default_files =
+            DotnetGenerator.output_files_with_config(&api, out, &GeneratorConfig::default());
+        assert_eq!(
+            default_files,
+            vec![
+                out.join("dotnet/WeaveFFI.cs").to_string(),
+                out.join("dotnet/WeaveFFI.csproj").to_string(),
+                out.join("dotnet/WeaveFFI.nuspec").to_string(),
+                out.join("dotnet/README.md").to_string(),
+            ]
+        );
+
+        let config = GeneratorConfig {
+            dotnet_namespace: Some("MyCompany.Bindings".into()),
+            ..GeneratorConfig::default()
+        };
+        let custom_files = DotnetGenerator.output_files_with_config(&api, out, &config);
+        assert_eq!(
+            custom_files,
+            vec![
+                out.join("dotnet/MyCompany.Bindings.cs").to_string(),
+                out.join("dotnet/MyCompany.Bindings.csproj").to_string(),
+                out.join("dotnet/MyCompany.Bindings.nuspec").to_string(),
                 out.join("dotnet/README.md").to_string(),
             ]
         );

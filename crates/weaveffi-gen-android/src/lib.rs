@@ -84,6 +84,28 @@ impl Generator for AndroidGenerator {
         ]
     }
 
+    fn output_files_with_config(
+        &self,
+        _api: &Api,
+        out_dir: &Utf8Path,
+        config: &GeneratorConfig,
+    ) -> Vec<String> {
+        let pkg_path = config.android_package().replace('.', "/");
+        vec![
+            out_dir.join("android/settings.gradle").to_string(),
+            out_dir.join("android/build.gradle").to_string(),
+            out_dir
+                .join(format!("android/src/main/kotlin/{pkg_path}/WeaveFFI.kt"))
+                .to_string(),
+            out_dir
+                .join("android/src/main/cpp/CMakeLists.txt")
+                .to_string(),
+            out_dir
+                .join("android/src/main/cpp/weaveffi_jni.c")
+                .to_string(),
+        ]
+    }
+
     fn capabilities(&self) -> &'static [Capability] {
         &[
             Capability::Callbacks,
@@ -4344,6 +4366,39 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn android_output_files_with_config_respects_naming() {
+        let api = make_api(vec![]);
+        let out_dir = Utf8Path::new("/tmp/out");
+
+        let default_files =
+            AndroidGenerator.output_files_with_config(&api, out_dir, &GeneratorConfig::default());
+        assert!(
+            default_files
+                .iter()
+                .any(|f| f.ends_with("android/src/main/kotlin/com/weaveffi/WeaveFFI.kt")),
+            "default kotlin path should use com/weaveffi: {default_files:?}"
+        );
+
+        let config = GeneratorConfig {
+            android_package: Some("org.example.mylib".into()),
+            ..GeneratorConfig::default()
+        };
+        let custom_files = AndroidGenerator.output_files_with_config(&api, out_dir, &config);
+        assert!(
+            custom_files
+                .iter()
+                .any(|f| f.ends_with("android/src/main/kotlin/org/example/mylib/WeaveFFI.kt")),
+            "kotlin path should follow android_package: {custom_files:?}"
+        );
+        assert!(
+            !custom_files
+                .iter()
+                .any(|f| f.contains("kotlin/com/weaveffi/")),
+            "custom config should not leak default package path: {custom_files:?}"
+        );
     }
 
     #[test]

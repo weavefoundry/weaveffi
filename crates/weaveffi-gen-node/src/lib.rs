@@ -2495,6 +2495,36 @@ mod tests {
     }
 
     #[test]
+    fn node_output_files_with_config_respects_naming() {
+        // `node_package_name` only affects package.json content, not paths,
+        // so output paths must stay identical regardless of the configured name.
+        let api = make_api(vec![]);
+        let out = Utf8Path::new("/tmp/out");
+
+        let expected = vec![
+            out.join("node/index.js").to_string(),
+            out.join("node/types.d.ts").to_string(),
+            out.join("node/package.json").to_string(),
+            out.join("node/binding.gyp").to_string(),
+            out.join("node/weaveffi_addon.c").to_string(),
+        ];
+
+        let default_files =
+            NodeGenerator.output_files_with_config(&api, out, &GeneratorConfig::default());
+        assert_eq!(default_files, expected);
+
+        let config = GeneratorConfig {
+            node_package_name: Some("@myorg/cool-lib".into()),
+            ..GeneratorConfig::default()
+        };
+        let custom_files = NodeGenerator.output_files_with_config(&api, out, &config);
+        assert_eq!(
+            custom_files, expected,
+            "node_package_name must not affect output paths"
+        );
+    }
+
+    #[test]
     fn node_dts_has_jsdoc() {
         let api = make_api(vec![{
             let mut m = make_module("math");

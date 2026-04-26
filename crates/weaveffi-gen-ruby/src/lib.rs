@@ -1635,6 +1635,36 @@ mod tests {
     }
 
     #[test]
+    fn ruby_output_files_with_config_respects_naming() {
+        // `ruby_gem_name` is only used inside the gemspec and `ruby_module_name`
+        // only appears inside the generated .rb source, so neither may change
+        // the output file paths.
+        let api = make_api(vec![]);
+        let out_dir = Utf8Path::new("/tmp/out");
+
+        let expected = vec![
+            out_dir.join("ruby/lib/weaveffi.rb").to_string(),
+            out_dir.join("ruby/weaveffi.gemspec").to_string(),
+            out_dir.join("ruby/README.md").to_string(),
+        ];
+
+        let default_files =
+            RubyGenerator.output_files_with_config(&api, out_dir, &GeneratorConfig::default());
+        assert_eq!(default_files, expected);
+
+        let config = GeneratorConfig {
+            ruby_gem_name: Some("my_ruby_gem".into()),
+            ruby_module_name: Some("MyRubyMod".into()),
+            ..GeneratorConfig::default()
+        };
+        let custom_files = RubyGenerator.output_files_with_config(&api, out_dir, &config);
+        assert_eq!(
+            custom_files, expected,
+            "ruby_gem_name / ruby_module_name must not affect output paths"
+        );
+    }
+
+    #[test]
     fn ruby_generates_gemspec() {
         let api = make_api(vec![simple_module("math", vec![])]);
         let dir = tempfile::tempdir().unwrap();

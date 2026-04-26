@@ -1925,6 +1925,34 @@ mod tests {
     }
 
     #[test]
+    fn go_output_files_with_config_respects_naming() {
+        // `go_module_path` is only used in go.mod content, so it must not change
+        // the emitted file paths.
+        let api = calculator_api();
+        let out = Utf8Path::new("out");
+
+        let expected = vec![
+            out.join("go/weaveffi.go").to_string(),
+            out.join("go/go.mod").to_string(),
+            out.join("go/README.md").to_string(),
+        ];
+
+        let default_files =
+            GoGenerator.output_files_with_config(&api, out, &GeneratorConfig::default());
+        assert_eq!(default_files, expected);
+
+        let config = GeneratorConfig {
+            go_module_path: Some("github.com/myorg/mylib".into()),
+            ..GeneratorConfig::default()
+        };
+        let custom_files = GoGenerator.output_files_with_config(&api, out, &config);
+        assert_eq!(
+            custom_files, expected,
+            "go_module_path must not affect output paths"
+        );
+    }
+
+    #[test]
     fn package_and_cgo_preamble() {
         let go = render_go(&calculator_api(), "weaveffi");
         assert!(go.starts_with("package weaveffi\n"), "missing package");

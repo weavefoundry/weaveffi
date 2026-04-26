@@ -85,6 +85,29 @@ impl Generator for PythonGenerator {
         ]
     }
 
+    fn output_files_with_config(
+        &self,
+        _api: &Api,
+        out_dir: &Utf8Path,
+        config: &GeneratorConfig,
+    ) -> Vec<String> {
+        let pkg = config.python_package_name();
+        vec![
+            out_dir
+                .join(format!("python/{pkg}/__init__.py"))
+                .to_string(),
+            out_dir
+                .join(format!("python/{pkg}/weaveffi.py"))
+                .to_string(),
+            out_dir
+                .join(format!("python/{pkg}/weaveffi.pyi"))
+                .to_string(),
+            out_dir.join("python/pyproject.toml").to_string(),
+            out_dir.join("python/setup.py").to_string(),
+            out_dir.join("python/README.md").to_string(),
+        ]
+    }
+
     fn capabilities(&self) -> &'static [Capability] {
         &[
             Capability::Callbacks,
@@ -1756,6 +1779,43 @@ mod tests {
                 out.join("python/weaveffi/__init__.py").to_string(),
                 out.join("python/weaveffi/weaveffi.py").to_string(),
                 out.join("python/weaveffi/weaveffi.pyi").to_string(),
+                out.join("python/pyproject.toml").to_string(),
+                out.join("python/setup.py").to_string(),
+                out.join("python/README.md").to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn python_output_files_with_config_respects_naming() {
+        let api = make_api(vec![]);
+        let out = Utf8Path::new("/tmp/out");
+
+        let default_files =
+            PythonGenerator.output_files_with_config(&api, out, &GeneratorConfig::default());
+        assert_eq!(
+            default_files,
+            vec![
+                out.join("python/weaveffi/__init__.py").to_string(),
+                out.join("python/weaveffi/weaveffi.py").to_string(),
+                out.join("python/weaveffi/weaveffi.pyi").to_string(),
+                out.join("python/pyproject.toml").to_string(),
+                out.join("python/setup.py").to_string(),
+                out.join("python/README.md").to_string(),
+            ]
+        );
+
+        let config = GeneratorConfig {
+            python_package_name: Some("mypkg".into()),
+            ..GeneratorConfig::default()
+        };
+        let custom_files = PythonGenerator.output_files_with_config(&api, out, &config);
+        assert_eq!(
+            custom_files,
+            vec![
+                out.join("python/mypkg/__init__.py").to_string(),
+                out.join("python/mypkg/weaveffi.py").to_string(),
+                out.join("python/mypkg/weaveffi.pyi").to_string(),
                 out.join("python/pyproject.toml").to_string(),
                 out.join("python/setup.py").to_string(),
                 out.join("python/README.md").to_string(),

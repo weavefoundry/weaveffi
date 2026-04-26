@@ -1934,6 +1934,37 @@ mod tests {
     }
 
     #[test]
+    fn wasm_output_files_with_config_respects_naming() {
+        let api = sample_api();
+        let out = Utf8Path::new("/tmp/out");
+
+        let default_files =
+            WasmGenerator.output_files_with_config(&api, out, &GeneratorConfig::default());
+        assert_eq!(
+            default_files,
+            vec![
+                out.join("wasm/README.md").to_string(),
+                out.join("wasm/weaveffi_wasm.js").to_string(),
+                out.join("wasm/weaveffi_wasm.d.ts").to_string(),
+            ]
+        );
+
+        let config = GeneratorConfig {
+            wasm_module_name: Some("my_bindings".into()),
+            ..GeneratorConfig::default()
+        };
+        let custom_files = WasmGenerator.output_files_with_config(&api, out, &config);
+        assert_eq!(
+            custom_files,
+            vec![
+                out.join("wasm/README.md").to_string(),
+                out.join("wasm/my_bindings.js").to_string(),
+                out.join("wasm/my_bindings.d.ts").to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn wasm_typed_handle_type() {
         let api = make_api(vec![Module {
             name: "contacts".into(),

@@ -65,6 +65,20 @@ impl Generator for CppGenerator {
         ]
     }
 
+    fn output_files_with_config(
+        &self,
+        _api: &Api,
+        out_dir: &Utf8Path,
+        config: &GeneratorConfig,
+    ) -> Vec<String> {
+        let header = config.cpp_header_name();
+        vec![
+            out_dir.join(format!("cpp/{header}")).to_string(),
+            out_dir.join("cpp/CMakeLists.txt").to_string(),
+            out_dir.join("cpp/README.md").to_string(),
+        ]
+    }
+
     fn capabilities(&self) -> &'static [Capability] {
         &[
             Capability::Callbacks,
@@ -1972,6 +1986,37 @@ mod tests {
             files,
             vec![
                 out_dir.join("cpp/weaveffi.hpp").to_string(),
+                out_dir.join("cpp/CMakeLists.txt").to_string(),
+                out_dir.join("cpp/README.md").to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn cpp_output_files_with_config_respects_naming() {
+        let api = minimal_api();
+        let out_dir = Utf8Path::new("/tmp/out");
+
+        let default_files =
+            CppGenerator.output_files_with_config(&api, out_dir, &GeneratorConfig::default());
+        assert_eq!(
+            default_files,
+            vec![
+                out_dir.join("cpp/weaveffi.hpp").to_string(),
+                out_dir.join("cpp/CMakeLists.txt").to_string(),
+                out_dir.join("cpp/README.md").to_string(),
+            ]
+        );
+
+        let config = GeneratorConfig {
+            cpp_header_name: Some("mylib.hpp".into()),
+            ..GeneratorConfig::default()
+        };
+        let custom_files = CppGenerator.output_files_with_config(&api, out_dir, &config);
+        assert_eq!(
+            custom_files,
+            vec![
+                out_dir.join("cpp/mylib.hpp").to_string(),
                 out_dir.join("cpp/CMakeLists.txt").to_string(),
                 out_dir.join("cpp/README.md").to_string(),
             ]

@@ -3620,6 +3620,40 @@ mod tests {
     }
 
     #[test]
+    fn swift_output_files_with_config_respects_naming() {
+        let api = make_api(vec![]);
+        let out = Utf8Path::new("/tmp/out");
+
+        let default_files =
+            SwiftGenerator.output_files_with_config(&api, out, &GeneratorConfig::default());
+        assert_eq!(
+            default_files,
+            vec![
+                out.join("swift/Package.swift").to_string(),
+                out.join("swift/CWeaveFFI/module.modulemap").to_string(),
+                out.join("swift/Sources/WeaveFFI/WeaveFFI.swift")
+                    .to_string(),
+            ]
+        );
+
+        let config = GeneratorConfig {
+            swift_module_name: Some("MyCoolLib".into()),
+            c_prefix: Some("mylib".into()),
+            ..GeneratorConfig::default()
+        };
+        let custom_files = SwiftGenerator.output_files_with_config(&api, out, &config);
+        assert_eq!(
+            custom_files,
+            vec![
+                out.join("swift/Package.swift").to_string(),
+                out.join("swift/CMylib/module.modulemap").to_string(),
+                out.join("swift/Sources/MyCoolLib/MyCoolLib.swift")
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn swift_inline_error_types() {
         let api = make_api(vec![Module {
             name: "contacts".to_string(),

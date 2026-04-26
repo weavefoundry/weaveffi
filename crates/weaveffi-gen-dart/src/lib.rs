@@ -1068,6 +1068,34 @@ mod tests {
     }
 
     #[test]
+    fn dart_output_files_with_config_respects_naming() {
+        // `dart_package_name` is only written into pubspec.yaml, so it must not
+        // change the emitted file paths.
+        let api = make_api(vec![]);
+        let out = Utf8Path::new("/tmp/out");
+
+        let expected = vec![
+            out.join("dart/lib/weaveffi.dart").to_string(),
+            out.join("dart/pubspec.yaml").to_string(),
+            out.join("dart/README.md").to_string(),
+        ];
+
+        let default_files =
+            DartGenerator.output_files_with_config(&api, out, &GeneratorConfig::default());
+        assert_eq!(default_files, expected);
+
+        let config = GeneratorConfig {
+            dart_package_name: Some("my_dart_pkg".into()),
+            ..GeneratorConfig::default()
+        };
+        let custom_files = DartGenerator.output_files_with_config(&api, out, &config);
+        assert_eq!(
+            custom_files, expected,
+            "dart_package_name must not affect output paths"
+        );
+    }
+
+    #[test]
     fn dart_type_mapping() {
         assert_eq!(dart_type(&TypeRef::I32), "int");
         assert_eq!(dart_type(&TypeRef::U32), "int");

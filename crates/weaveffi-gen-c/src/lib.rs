@@ -1445,6 +1445,39 @@ mod tests {
     }
 
     #[test]
+    fn c_output_files_with_config_respects_naming() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![],
+            generators: None,
+        };
+        let out = Utf8Path::new("/tmp/out");
+
+        let default_files =
+            CGenerator.output_files_with_config(&api, out, &GeneratorConfig::default());
+        assert_eq!(
+            default_files,
+            vec![
+                out.join("c/weaveffi.h").to_string(),
+                out.join("c/weaveffi.c").to_string(),
+            ]
+        );
+
+        let config = GeneratorConfig {
+            c_prefix: Some("mylib".into()),
+            ..GeneratorConfig::default()
+        };
+        let custom_files = CGenerator.output_files_with_config(&api, out, &config);
+        assert_eq!(
+            custom_files,
+            vec![
+                out.join("c/mylib.h").to_string(),
+                out.join("c/mylib.c").to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn c_deeply_nested_optional() {
         let api = Api {
             version: "0.1.0".into(),
