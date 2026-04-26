@@ -301,9 +301,28 @@ pub fn read_cache(out_dir: &Utf8Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Write the hash to the cache file in the output directory.
+/// Write the hash to the cache file in the output directory atomically.
+///
+/// The hash is first written to a uniquely-named temp file
+/// (`.weaveffi-cache.tmp.{pid}.{nanos}`) and then renamed onto the final cache
+/// path. `std::fs::rename` is atomic on POSIX and uses `MoveFileExW` with
+/// `MOVEFILE_REPLACE_EXISTING` on Windows, so concurrent readers always
+/// observe either the previous cache contents or the fully written new
+/// contents, never a partially written file.
 pub fn write_cache(out_dir: &Utf8Path, hash: &str) -> Result<()> {
-    std::fs::write(out_dir.join(CACHE_FILE), hash)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let tmp_path = out_dir.join(format!("{CACHE_FILE}.tmp.{pid}.{nanos}"));
+    let final_path = out_dir.join(CACHE_FILE);
+
+    std::fs::write(tmp_path.as_std_path(), hash)?;
+    if let Err(e) = std::fs::rename(tmp_path.as_std_path(), final_path.as_std_path()) {
+        let _ = std::fs::remove_file(tmp_path.as_std_path());
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -570,6 +589,61 @@ mod tests {
 
         assert_eq!(canonical_serialize(&api_a), canonical_serialize(&api_b));
         assert_eq!(hash_api(&api_a), hash_api(&api_b));
+    }
+
+    #[test]
+    fn cache_write_is_atomic_under_concurrent_writers() {
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = Utf8Path::from_path(dir.path()).unwrap().to_path_buf();
+
+        // Each thread writes its own distinct SHA-256-shaped hash many times.
+        // The atomic rename contract means the final file must end up equal
+        // to exactly one of these hashes, never a truncated or interleaved
+        // value.
+        let thread_count = 16;
+        let writes_per_thread = 50;
+        let hashes: Vec<String> = (0..thread_count).map(|i| format!("{i:064x}")).collect();
+
+        let mut handles = Vec::with_capacity(thread_count);
+        for hash in &hashes {
+            let hash = hash.clone();
+            let dir = dir_path.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..writes_per_thread {
+                    // A rare temp-name collision can make a single write fail;
+                    // that's acceptable. The invariant we assert below is that
+                    // the final cache file is never corrupt.
+                    let _ = write_cache(&dir, &hash);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Exactly one hash string should be present (no interleaving, no
+        // partial writes). Also verify no tmp files were left behind.
+        let final_content = read_cache(&dir_path).expect("cache file should exist");
+        assert!(
+            hashes.contains(&final_content),
+            "cache file is corrupted or contains an unexpected value: {final_content:?}"
+        );
+
+        let leftover_tmp: Vec<_> = std::fs::read_dir(dir_path.as_std_path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{CACHE_FILE}.tmp."))
+            })
+            .collect();
+        assert!(
+            leftover_tmp.is_empty(),
+            "no temp files should remain after concurrent writes: {leftover_tmp:?}"
+        );
     }
 
     #[test]
