@@ -30,7 +30,7 @@ use weaveffi_gen_python::PythonGenerator;
 use weaveffi_gen_ruby::RubyGenerator;
 use weaveffi_gen_swift::SwiftGenerator;
 use weaveffi_gen_wasm::WasmGenerator;
-use weaveffi_ir::ir::{Span, SpanTable, CURRENT_SCHEMA_VERSION};
+use weaveffi_ir::ir::{Api, Module, Span, SpanTable, CURRENT_SCHEMA_VERSION};
 use weaveffi_ir::parse::{parse_api_str_with_spans, ParseError};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -261,6 +261,17 @@ enum Commands {
         /// Error code to explain (e.g. WFFI001). Case-insensitive.
         code: String,
     },
+    /// Re-emit an IDL file in canonical YAML form (sorted, 2-space indent)
+    Format {
+        /// Input IDL/IR file (yaml|yml|json|toml)
+        input: String,
+        /// Exit 0 if the file is already canonical, exit 1 otherwise; never writes
+        #[arg(long, conflicts_with = "write")]
+        check: bool,
+        /// Overwrite the input file with its canonical form
+        #[arg(long)]
+        write: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -364,6 +375,15 @@ fn main() -> Result<()> {
         }
         Commands::Explain { code } => {
             if !cmd_explain(&code)? {
+                std::process::exit(1);
+            }
+        }
+        Commands::Format {
+            input,
+            check,
+            write,
+        } => {
+            if !cmd_format(&input, check, write, quiet)? {
                 std::process::exit(1);
             }
         }
@@ -2069,6 +2089,197 @@ fn cmd_extract(
     }
 
     Ok(())
+}
+
+/// Implements `weaveffi format <input>`: re-emits the IDL in canonical YAML
+/// (sorted, 2-space indent). Returns `Ok(false)` only in `--check` mode when
+/// the file is not already canonical, so the caller can exit non-zero.
+fn cmd_format(input: &str, check: bool, write: bool, quiet: bool) -> Result<bool> {
+    let in_path = Utf8Path::new(input);
+    let ext = in_path.extension().unwrap_or("");
+    if ext.is_empty() {
+        bail!("input file has no extension (expected yml|yaml|json|toml)");
+    }
+    let fmt = match ext {
+        "yml" | "yaml" => "yaml",
+        "json" => "json",
+        "toml" => "toml",
+        other => bail!(
+            "unsupported input format: {} (expected yml|yaml|json|toml)",
+            other
+        ),
+    };
+    let contents = std::fs::read_to_string(in_path.as_std_path())
+        .wrap_err_with(|| format!("failed to read input file: {}", input))?;
+    let (api, _) = parse_api_str_with_spans(&contents, fmt)
+        .map_err(|e| pretty_parse_error(input, &contents, e))?;
+
+    let canonical = render_canonical_yaml(&api)?;
+
+    if check {
+        if contents == canonical {
+            Ok(true)
+        } else {
+            if !quiet {
+                eprintln!("{input} is not in canonical form; run `weaveffi format --write {input}` to fix");
+            }
+            Ok(false)
+        }
+    } else if write {
+        if contents != canonical {
+            std::fs::write(in_path.as_std_path(), &canonical)
+                .wrap_err_with(|| format!("failed to write {}", input))?;
+            if !quiet {
+                println!("Formatted {input}");
+            }
+        } else if !quiet {
+            println!("{input} already canonical");
+        }
+        Ok(true)
+    } else {
+        print!("{canonical}");
+        Ok(true)
+    }
+}
+
+/// Builds the canonical YAML representation of `api`: `version` first, then
+/// sorted modules, each module emitting its sorted collections in the order
+/// enums, structs, callbacks, listeners, errors, functions, modules. Strips
+/// null/default fields so idempotently-formatted input stays stable.
+fn render_canonical_yaml(api: &Api) -> Result<String> {
+    let value = canonicalise_api(api);
+    serde_yaml::to_string(&value).wrap_err("failed to serialize canonical YAML")
+}
+
+fn canonicalise_api(api: &Api) -> serde_yaml::Value {
+    let mut map = serde_yaml::Mapping::new();
+    map.insert(
+        serde_yaml::Value::String("version".into()),
+        serde_yaml::Value::String(api.version.clone()),
+    );
+
+    let mut modules = api.modules.clone();
+    modules.sort_by(|a, b| a.name.cmp(&b.name));
+    let modules_val: Vec<serde_yaml::Value> = modules.iter().map(canonicalise_module).collect();
+    map.insert(
+        serde_yaml::Value::String("modules".into()),
+        serde_yaml::Value::Sequence(modules_val),
+    );
+
+    if let Some(generators) = &api.generators {
+        let sorted: BTreeMap<_, _> = generators.iter().collect();
+        if let Ok(v) = serde_yaml::to_value(&sorted) {
+            map.insert(serde_yaml::Value::String("generators".into()), v);
+        }
+    }
+
+    serde_yaml::Value::Mapping(map)
+}
+
+fn canonicalise_module(module: &Module) -> serde_yaml::Value {
+    let mut map = serde_yaml::Mapping::new();
+    map.insert(
+        serde_yaml::Value::String("name".into()),
+        serde_yaml::Value::String(module.name.clone()),
+    );
+
+    if !module.enums.is_empty() {
+        let mut enums = module.enums.clone();
+        enums.sort_by(|a, b| a.name.cmp(&b.name));
+        if let Ok(v) = serde_yaml::to_value(&enums) {
+            map.insert(serde_yaml::Value::String("enums".into()), strip_defaults(v));
+        }
+    }
+    if !module.structs.is_empty() {
+        let mut structs = module.structs.clone();
+        for s in &mut structs {
+            s.fields.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        structs.sort_by(|a, b| a.name.cmp(&b.name));
+        if let Ok(v) = serde_yaml::to_value(&structs) {
+            map.insert(
+                serde_yaml::Value::String("structs".into()),
+                strip_defaults(v),
+            );
+        }
+    }
+    if !module.callbacks.is_empty() {
+        let mut callbacks = module.callbacks.clone();
+        callbacks.sort_by(|a, b| a.name.cmp(&b.name));
+        if let Ok(v) = serde_yaml::to_value(&callbacks) {
+            map.insert(
+                serde_yaml::Value::String("callbacks".into()),
+                strip_defaults(v),
+            );
+        }
+    }
+    if !module.listeners.is_empty() {
+        let mut listeners = module.listeners.clone();
+        listeners.sort_by(|a, b| a.name.cmp(&b.name));
+        if let Ok(v) = serde_yaml::to_value(&listeners) {
+            map.insert(
+                serde_yaml::Value::String("listeners".into()),
+                strip_defaults(v),
+            );
+        }
+    }
+    if let Some(errors) = &module.errors {
+        if let Ok(v) = serde_yaml::to_value(errors) {
+            map.insert(
+                serde_yaml::Value::String("errors".into()),
+                strip_defaults(v),
+            );
+        }
+    }
+    if !module.functions.is_empty() {
+        let mut functions = module.functions.clone();
+        functions.sort_by(|a, b| a.name.cmp(&b.name));
+        if let Ok(v) = serde_yaml::to_value(&functions) {
+            map.insert(
+                serde_yaml::Value::String("functions".into()),
+                strip_defaults(v),
+            );
+        }
+    }
+    if !module.modules.is_empty() {
+        let mut nested = module.modules.clone();
+        nested.sort_by(|a, b| a.name.cmp(&b.name));
+        let nested_val: Vec<serde_yaml::Value> = nested.iter().map(canonicalise_module).collect();
+        map.insert(
+            serde_yaml::Value::String("modules".into()),
+            serde_yaml::Value::Sequence(nested_val),
+        );
+    }
+
+    serde_yaml::Value::Mapping(map)
+}
+
+/// Recursively drops null entries and `false` values for keys whose IR
+/// defaults are `false` (async, cancellable, mutable, builder), so a YAML
+/// file that omits those keys round-trips through `format` unchanged.
+fn strip_defaults(value: serde_yaml::Value) -> serde_yaml::Value {
+    const BOOL_DEFAULT_FALSE: &[&str] = &["async", "cancellable", "mutable", "builder"];
+    match value {
+        serde_yaml::Value::Mapping(m) => {
+            let mut out = serde_yaml::Mapping::new();
+            for (k, v) in m {
+                if matches!(v, serde_yaml::Value::Null) {
+                    continue;
+                }
+                if let (Some(key), serde_yaml::Value::Bool(false)) = (k.as_str(), &v) {
+                    if BOOL_DEFAULT_FALSE.contains(&key) {
+                        continue;
+                    }
+                }
+                out.insert(k, strip_defaults(v));
+            }
+            serde_yaml::Value::Mapping(out)
+        }
+        serde_yaml::Value::Sequence(seq) => {
+            serde_yaml::Value::Sequence(seq.into_iter().map(strip_defaults).collect())
+        }
+        other => other,
+    }
 }
 
 /// Runs the doctor checks and returns `Ok(true)` when the process should exit
