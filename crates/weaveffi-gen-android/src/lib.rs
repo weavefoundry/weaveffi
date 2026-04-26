@@ -4396,6 +4396,9 @@ mod tests {
         // `weaveffi_error* err`. The JNI bridge must acquire the UTF-8 chars
         // and length via JNI, then forward them to the C function with the
         // matching `(const uint8_t*)msg_chars, (size_t)msg_len, &err` casts.
+        // The bridge must also include the generated `weaveffi.h` and the
+        // CMake project must add the sibling `c/` directory to its include
+        // path so the new C prototype resolves at compile time.
         let api = make_api(vec![Module {
             name: "echo".to_string(),
             functions: vec![Function {
@@ -4420,8 +4423,18 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let tmp = std::env::temp_dir().join("weaveffi_test_android_string_ptr_len");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
 
+        AndroidGenerator.generate(&api, out_dir).unwrap();
+
+        let jni = std::fs::read_to_string(tmp.join("android/src/main/cpp/weaveffi_jni.c")).unwrap();
+        assert!(
+            jni.contains("#include \"weaveffi.h\""),
+            "JNI bridge must include the generated C header so the new C prototype resolves: {jni}"
+        );
         assert!(
             jni.contains("const char* msg_chars = (*env)->GetStringUTFChars(env, msg, NULL);"),
             "JNI bridge must acquire UTF-8 chars from the jstring: {jni}"
@@ -4444,6 +4457,15 @@ mod tests {
             jni.contains("(*env)->ReleaseStringUTFChars(env, msg, msg_chars);"),
             "JNI bridge must release the UTF-8 chars after the C call: {jni}"
         );
+
+        let cmake =
+            std::fs::read_to_string(tmp.join("android/src/main/cpp/CMakeLists.txt")).unwrap();
+        assert!(
+            cmake.contains("target_include_directories(weaveffi PRIVATE ../../../../c)"),
+            "CMakeLists must add the generated c/ directory to the include path so weaveffi.h resolves: {cmake}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
