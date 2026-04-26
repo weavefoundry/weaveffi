@@ -905,6 +905,116 @@ fn valid_keys_for_generator_target(target: &str) -> String {
     }
 }
 
+/// A standalone binary discovered on `$PATH` that implements the WeaveFFI
+/// external-generator contract documented in
+/// `docs/src/extending/external-generators.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalGenerator {
+    name: String,
+    path: Utf8PathBuf,
+}
+
+/// Scan `$PATH` for binaries named `weaveffi-gen-<name>`. The first hit for
+/// each `<name>` wins (matching shell resolution order); entries that shadow
+/// a built-in target are skipped so an external binary can never replace an
+/// in-tree generator.
+fn discover_external_generators() -> Vec<ExternalGenerator> {
+    discover_external_generators_in(env::var_os("PATH").as_deref())
+}
+
+fn discover_external_generators_in(path_var: Option<&OsStr>) -> Vec<ExternalGenerator> {
+    let Some(path_var) = path_var else {
+        return Vec::new();
+    };
+    let builtin: BTreeSet<&str> = TARGETS.iter().map(|t| t.name).collect();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut out: Vec<ExternalGenerator> = Vec::new();
+
+    for dir in env::split_paths(path_var) {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            let Some(suffix) = name.strip_prefix("weaveffi-gen-") else {
+                continue;
+            };
+            if suffix.is_empty() || builtin.contains(suffix) {
+                continue;
+            }
+            if !is_executable_file(&entry.path()) {
+                continue;
+            }
+            if !seen.insert(suffix.to_string()) {
+                continue;
+            }
+            let Ok(path) = Utf8PathBuf::from_path_buf(entry.path()) else {
+                continue;
+            };
+            out.push(ExternalGenerator {
+                name: suffix.to_string(),
+                path,
+            });
+        }
+    }
+    out
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+}
+
+/// Invoke an external generator: write the validated API to a JSON temp
+/// file, create `<out_dir>/<name>/`, and exec
+/// `weaveffi-gen-<name> --api <api.json> --out <out_dir>/<name>`.
+fn run_external_generator(gen: &ExternalGenerator, api: &Api, out_dir: &Utf8Path) -> Result<()> {
+    let api_file = tempfile::Builder::new()
+        .prefix("weaveffi-api-")
+        .suffix(".json")
+        .tempfile()
+        .wrap_err("failed to create temp file for external generator API payload")?;
+    let json = serde_json::to_string(api)
+        .wrap_err("failed to serialise API to JSON for external generator")?;
+    std::fs::write(api_file.path(), json)
+        .wrap_err_with(|| format!("failed to write API JSON to {}", api_file.path().display()))?;
+
+    let target_dir = out_dir.join(&gen.name);
+    std::fs::create_dir_all(target_dir.as_std_path())
+        .wrap_err_with(|| format!("failed to create output directory {}", target_dir))?;
+
+    let status = Command::new(gen.path.as_std_path())
+        .arg("--api")
+        .arg(api_file.path())
+        .arg("--out")
+        .arg(target_dir.as_std_path())
+        .status()
+        .wrap_err_with(|| format!("failed to invoke external generator {}", gen.path))?;
+
+    if !status.success() {
+        bail!(
+            "external generator {} ({}) exited with status {}",
+            gen.name,
+            gen.path,
+            status
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_generate(
     input: &str,
@@ -978,6 +1088,14 @@ fn cmd_generate(
         .filter(|gen| filter.as_ref().is_none_or(|ts| ts.contains(&gen.name())))
         .collect();
 
+    let selected_external: Vec<ExternalGenerator> = match filter.as_ref() {
+        Some(ts) => discover_external_generators()
+            .into_iter()
+            .filter(|e| ts.contains(&e.name.as_str()))
+            .collect(),
+        None => Vec::new(),
+    };
+
     let selected_caps: Vec<(&str, &[Capability])> = selected
         .iter()
         .map(|g| (g.name(), g.capabilities()))
@@ -991,6 +1109,9 @@ fn cmd_generate(
             for path in gen.output_files_with_config(&api, out_dir, &config) {
                 files.push(path);
             }
+        }
+        for ext in &selected_external {
+            files.push(out_dir.join(&ext.name).to_string());
         }
         if format.is_json() {
             emit_json(&files)?;
@@ -1023,6 +1144,13 @@ fn cmd_generate(
     orchestrator
         .run(&api, out_dir, &config, force, engine.as_ref())
         .map_err(|e| eyre!("{:#}", e))?;
+
+    for ext in &selected_external {
+        if !quiet {
+            println!("Running external generator: {} ({})", ext.name, ext.path);
+        }
+        run_external_generator(ext, &api, out_dir)?;
+    }
 
     if emit_scaffold {
         let scaffold_path = out_dir.join("scaffold.rs");
@@ -4880,6 +5008,121 @@ mod tests {
         assert!(
             saw_multiply,
             "watcher should have regenerated C header reflecting the modified IDL",
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn external_generator_discovery_finds_path_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _ = color_eyre::install();
+        let temp = tempfile::tempdir().unwrap();
+        let bin_dir = temp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        let marker = temp.path().join("invoked.log");
+        let script = bin_dir.join("weaveffi-gen-testext");
+        let script_contents = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{marker}\"\n",
+            marker = marker.display()
+        );
+        std::fs::write(&script, script_contents).unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let yml = temp.path().join("api.yml");
+        std::fs::write(
+            &yml,
+            concat!(
+                "version: \"0.1.0\"\n",
+                "modules:\n",
+                "  - name: math\n",
+                "    functions:\n",
+                "      - name: add\n",
+                "        params:\n",
+                "          - { name: a, type: i32 }\n",
+                "          - { name: b, type: i32 }\n",
+                "        return: i32\n",
+            ),
+        )
+        .unwrap();
+        let out = temp.path().join("out");
+
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut new_path = std::ffi::OsString::from(&bin_dir);
+        new_path.push(":");
+        new_path.push(&old_path);
+
+        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .env("PATH", &new_path)
+            .args([
+                "generate",
+                yml.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+                "--target",
+                "testext",
+            ])
+            .output()
+            .expect("failed to run weaveffi generate --target testext");
+
+        assert!(
+            cmd.status.success(),
+            "generate should succeed when a matching external generator is on PATH\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&cmd.stdout),
+            String::from_utf8_lossy(&cmd.stderr),
+        );
+
+        assert!(
+            marker.exists(),
+            "external generator script should have been invoked; marker missing at {:?}",
+            marker
+        );
+
+        let logged = std::fs::read_to_string(&marker).unwrap();
+        assert!(
+            logged.contains("--api"),
+            "script should have received --api flag: {logged}"
+        );
+        assert!(
+            logged.contains("--out"),
+            "script should have received --out flag: {logged}"
+        );
+        let target_dir = out.join("testext");
+        assert!(
+            logged.contains(target_dir.to_str().unwrap()),
+            "script's --out should point at <out>/<name>/, got: {logged}"
+        );
+    }
+
+    #[test]
+    fn external_generator_discovery_skips_builtin_shadows() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin_dir = temp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let shadow = bin_dir.join("weaveffi-gen-c");
+            std::fs::write(&shadow, "#!/bin/sh\nexit 0\n").unwrap();
+            let mut perms = std::fs::metadata(&shadow).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&shadow, perms).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(bin_dir.join("weaveffi-gen-c.exe"), b"MZ").unwrap();
+        }
+
+        let path = std::ffi::OsString::from(&bin_dir);
+        let discovered = discover_external_generators_in(Some(path.as_os_str()));
+        assert!(
+            discovered.iter().all(|g| g.name != "c"),
+            "discovery must not surface binaries shadowing built-in targets: {discovered:?}"
         );
     }
 }
