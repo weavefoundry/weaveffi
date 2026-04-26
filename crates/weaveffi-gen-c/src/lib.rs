@@ -64,6 +64,7 @@ impl Generator for CGenerator {
 
     fn capabilities(&self) -> &'static [Capability] {
         &[
+            Capability::Callbacks,
             Capability::Listeners,
             Capability::Iterators,
             Capability::Builders,
@@ -112,7 +113,7 @@ fn c_element_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
             c_element_type(inner, module, prefix)
         }
         TypeRef::Map(_, _) => "void*".to_string(),
-        TypeRef::Callback(_) => unreachable!("validator should have rejected callback C type"),
+        TypeRef::Callback(n) => format!("{prefix}_{module}_{n}"),
     }
 }
 
@@ -178,7 +179,9 @@ fn c_type_for_param(ty: &TypeRef, name: &str, module: &str, prefix: &str, mutabl
             }
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
-        TypeRef::Callback(_) => unreachable!("validator should have rejected callback C type"),
+        TypeRef::Callback(n) => {
+            format!("{prefix}_{module}_{n} {name}, void* {name}_context")
+        }
     }
 }
 
@@ -222,9 +225,10 @@ fn c_ret_type(ty: &TypeRef, module: &str, prefix: &str) -> (String, Vec<String>)
             )
         }
         TypeRef::Iterator(_) => unreachable!("iterator return handled specially"),
-        TypeRef::Callback(_) => {
-            unreachable!("validator should have rejected callback C return type")
-        }
+        TypeRef::Callback(n) => (
+            format!("{prefix}_{module}_{n}"),
+            vec!["void** out_context".to_string()],
+        ),
     }
 }
 
@@ -348,6 +352,11 @@ fn render_struct_header(out: &mut String, module_name: &str, s: &StructDef, pref
             let extra = out_params.join(", ");
             out.push_str(&format!("{ret_ty} {getter}(const {tag}* ptr, {extra});\n"));
         }
+        if matches!(field.ty, TypeRef::Callback(_)) {
+            let setter = format!("{tag}_set_{}", field.name);
+            let param = c_type_for_param(&field.ty, "value", module_name, prefix, false);
+            out.push_str(&format!("void {setter}({tag}* ptr, {param});\n"));
+        }
     }
     out.push('\n');
 }
@@ -391,27 +400,32 @@ fn render_module_header(out: &mut String, module: &Module, prefix: &str, module_
     for e in &module.enums {
         render_enum_header(out, module_path, e, prefix);
     }
+    for cb in &module.callbacks {
+        let cb_type = format!("{prefix}_{module_path}_{}", cb.name);
+        let (ret_ty, ret_extra) = match &cb.returns {
+            Some(r) => c_ret_type(r, module_path, prefix),
+            None => ("void".to_string(), vec![]),
+        };
+        let mut params: Vec<String> = vec!["void* context".to_string()];
+        params.extend(
+            cb.params
+                .iter()
+                .map(|p| c_type_for_param(&p.ty, &p.name, module_path, prefix, p.mutable)),
+        );
+        params.extend(ret_extra);
+        out.push_str(&format!(
+            "typedef {ret_ty} (*{cb_type})({});\n",
+            params.join(", ")
+        ));
+    }
     for s in &module.structs {
         render_struct_header(out, module_path, s, prefix);
         if s.builder {
             render_builder_header(out, module_path, s, prefix);
         }
     }
-    for cb in &module.callbacks {
-        let cb_type = format!("{prefix}_{module_path}_{}_fn", cb.name);
-        let mut params: Vec<String> = cb
-            .params
-            .iter()
-            .map(|p| c_type_for_param(&p.ty, &p.name, module_path, prefix, p.mutable))
-            .collect();
-        params.push("void* context".to_string());
-        out.push_str(&format!(
-            "typedef void (*{cb_type})({});\n",
-            params.join(", ")
-        ));
-    }
     for l in &module.listeners {
-        let cb_type = format!("{prefix}_{module_path}_{}_fn", l.event_callback);
+        let cb_type = format!("{prefix}_{module_path}_{}", l.event_callback);
         let reg_fn = format!("{prefix}_{module_path}_register_{}", l.name);
         let unreg_fn = format!("{prefix}_{module_path}_unregister_{}", l.name);
         out.push_str(&format!(
@@ -2181,7 +2195,7 @@ mod tests {
         };
         let header = render_c_header(&api, "weaveffi");
         assert!(
-            header.contains("typedef void (*weaveffi_events_on_data_fn)(const uint8_t* payload_ptr, size_t payload_len, int32_t len, void* context);"),
+            header.contains("typedef void (*weaveffi_events_on_data)(void* context, const uint8_t* payload_ptr, size_t payload_len, int32_t len);"),
             "missing callback typedef: {header}"
         );
     }
@@ -2217,7 +2231,7 @@ mod tests {
         };
         let header = render_c_header(&api, "weaveffi");
         assert!(
-            header.contains("uint64_t weaveffi_events_register_data_stream(weaveffi_events_on_data_fn callback, void* context);"),
+            header.contains("uint64_t weaveffi_events_register_data_stream(weaveffi_events_on_data callback, void* context);"),
             "missing register function: {header}"
         );
         assert!(
@@ -2249,8 +2263,101 @@ mod tests {
         };
         let header = render_c_header(&api, "weaveffi");
         assert!(
-            header.contains("typedef void (*weaveffi_lifecycle_on_ready_fn)(void* context);"),
+            header.contains("typedef void (*weaveffi_lifecycle_on_ready)(void* context);"),
             "callback with no params should only have context: {header}"
+        );
+    }
+
+    #[test]
+    fn c_emits_callback_typedef() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "events".to_string(),
+                functions: vec![],
+                structs: vec![StructDef {
+                    name: "Sink".to_string(),
+                    doc: None,
+                    fields: vec![],
+                    builder: false,
+                }],
+                enums: vec![EnumDef {
+                    name: "Severity".to_string(),
+                    doc: None,
+                    variants: vec![EnumVariant {
+                        name: "Info".to_string(),
+                        value: 0,
+                        doc: None,
+                    }],
+                }],
+                callbacks: vec![CallbackDef {
+                    name: "OnMessage".to_string(),
+                    params: vec![Param {
+                        name: "message".to_string(),
+                        ty: TypeRef::StringUtf8,
+                        mutable: false,
+                    }],
+                    returns: Some(TypeRef::Bool),
+                    doc: None,
+                }],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let header = render_c_header(&api, "weaveffi");
+        assert!(
+            header.contains("typedef bool (*weaveffi_events_OnMessage)(void* context, const uint8_t* message_ptr, size_t message_len);"),
+            "missing callback typedef with return and context-first: {header}"
+        );
+        let enum_pos = header.find("typedef enum").unwrap();
+        let cb_pos = header.find("weaveffi_events_OnMessage").unwrap();
+        let struct_pos = header.find("typedef struct weaveffi_events_Sink").unwrap();
+        assert!(
+            enum_pos < cb_pos && cb_pos < struct_pos,
+            "callback typedef must appear after enums and before structs: {header}"
+        );
+    }
+
+    #[test]
+    fn c_function_param_callback_uses_pointer_and_context() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "events".to_string(),
+                functions: vec![Function {
+                    name: "subscribe".to_string(),
+                    params: vec![Param {
+                        name: "handler".to_string(),
+                        ty: TypeRef::Callback("OnData".into()),
+                        mutable: false,
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![CallbackDef {
+                    name: "OnData".to_string(),
+                    params: vec![],
+                    returns: None,
+                    doc: None,
+                }],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let header = render_c_header(&api, "weaveffi");
+        assert!(
+            header.contains("void weaveffi_events_subscribe(weaveffi_events_OnData handler, void* handler_context, weaveffi_error* out_err);"),
+            "callback param must expand to function pointer + context pointer: {header}"
         );
     }
 
@@ -3067,32 +3174,10 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_excludes_callbacks() {
+    fn capabilities_includes_callbacks() {
         let caps = CGenerator.capabilities();
-        assert!(!caps.contains(&Capability::Callbacks));
         for cap in Capability::ALL {
-            if *cap == Capability::Callbacks {
-                continue;
-            }
             assert!(caps.contains(cap), "C generator must support {cap:?}");
         }
-    }
-
-    #[test]
-    fn callback_type_panics_with_validator_message() {
-        let cb = TypeRef::Callback("OnEvent".into());
-        let err = std::panic::catch_unwind(|| {
-            let _ = c_element_type(&cb, "m", "weaveffi");
-        })
-        .expect_err("callback must panic");
-        let msg = err
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| err.downcast_ref::<&'static str>().map(|s| s.to_string()))
-            .unwrap_or_default();
-        assert!(
-            msg.contains("validator should have rejected"),
-            "panic message did not mention validator: {msg}"
-        );
     }
 }
