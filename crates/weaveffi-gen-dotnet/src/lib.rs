@@ -322,8 +322,10 @@ fn render_error_struct(out: &mut String) {
     out.push_str("        {\n");
     out.push_str("            if (err.Code != 0)\n");
     out.push_str("            {\n");
+    out.push_str("                var code = err.Code;\n");
     out.push_str("                var msg = Marshal.PtrToStringUTF8(err.Message) ?? \"\";\n");
-    out.push_str("                throw new WeaveffiException(err.Code, msg);\n");
+    out.push_str("                NativeMethods.weaveffi_error_clear(ref err);\n");
+    out.push_str("                throw new WeaveffiException(code, msg);\n");
     out.push_str("            }\n");
     out.push_str("        }\n");
     out.push_str("    }\n\n");
@@ -664,6 +666,10 @@ fn render_native_methods(out: &mut String, api: &Api) {
     out.push_str("        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]\n");
     out.push_str(
         "        internal static extern void weaveffi_free_bytes(IntPtr ptr, UIntPtr len);\n\n",
+    );
+    out.push_str("        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]\n");
+    out.push_str(
+        "        internal static extern void weaveffi_error_clear(ref WeaveffiError err);\n\n",
     );
 
     for (m, path) in collect_modules_with_path(&api.modules) {
@@ -1833,6 +1839,51 @@ mod tests {
         assert!(
             cs.contains("WeaveffiError.Check(err)"),
             "missing error check: {cs}"
+        );
+    }
+
+    #[test]
+    fn dotnet_error_check_calls_error_clear() {
+        let api = make_api(vec![simple_module(vec![Function {
+            name: "add".into(),
+            params: vec![
+                Param {
+                    name: "a".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                },
+                Param {
+                    name: "b".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                },
+            ],
+            returns: Some(TypeRef::I32),
+            doc: None,
+            r#async: false,
+            cancellable: false,
+            deprecated: None,
+            since: None,
+        }])]);
+
+        let cs = render_csharp(&api, "WeaveFFI", true);
+
+        let check_start = cs
+            .find("internal static void Check(WeaveffiError err)")
+            .expect("Check method must exist");
+        let check_end = cs[check_start..]
+            .find("    }\n")
+            .map(|i| check_start + i)
+            .expect("Check method must end");
+        let check_body = &cs[check_start..check_end];
+        assert!(
+            check_body.contains("NativeMethods.weaveffi_error_clear(ref err)"),
+            "Check body must call weaveffi_error_clear: {check_body}"
+        );
+
+        assert!(
+            cs.contains("internal static extern void weaveffi_error_clear(ref WeaveffiError err);"),
+            "missing weaveffi_error_clear P/Invoke: {cs}"
         );
     }
 
