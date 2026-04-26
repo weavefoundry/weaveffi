@@ -18,7 +18,10 @@ impl NodeGenerator {
     ) -> Result<()> {
         let dir = out_dir.join("node");
         std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join("index.js"), render_node_index_js(api))?;
+        std::fs::write(
+            dir.join("index.js"),
+            render_node_index_js(api, strip_module_prefix),
+        )?;
         std::fs::write(
             dir.join("types.d.ts"),
             render_node_dts(api, strip_module_prefix),
@@ -251,7 +254,7 @@ fn render_addon_c(api: &Api, strip_module_prefix: bool) -> String {
             let c_name = format!("weaveffi_{}_{}", path, f.name);
             let napi_name = format!("Napi_{c_name}");
             let js_name = wrapper_name(&path, &f.name, strip_module_prefix);
-            all_exports.push((js_name, napi_name.clone()));
+            all_exports.push((js_name.clone(), napi_name.clone()));
 
             if f.r#async {
                 render_async_callback(&mut out, f, &c_name, &path);
@@ -266,6 +269,17 @@ fn render_addon_c(api: &Api, strip_module_prefix: bool) -> String {
                 render_napi_body(&mut out, f, &c_name, &path);
             }
             out.push_str("}\n\n");
+
+            if let Some(TypeRef::Iterator(inner)) = &f.returns {
+                let next_napi = format!("{napi_name}__iter_next");
+                let destroy_napi = format!("{napi_name}__iter_destroy");
+                let next_js = format!("{js_name}__iter_next");
+                let destroy_js = format!("{js_name}__iter_destroy");
+                render_iterator_next_napi(&mut out, &next_napi, inner, &f.name, &path);
+                render_iterator_destroy_napi(&mut out, &destroy_napi, &f.name, &path);
+                all_exports.push((next_js, next_napi));
+                all_exports.push((destroy_js, destroy_napi));
+            }
         }
     }
 
@@ -808,11 +822,122 @@ fn render_napi_body(out: &mut String, f: &Function, c_name: &str, module: &str) 
     out.push_str("  }\n");
 
     match &f.returns {
-        Some(ret) => emit_ret_to_napi(out, ret, module, &f.name),
+        Some(ret) => emit_ret_to_napi(out, ret, module),
         None => {
             out.push_str("  napi_value ret;\n");
             out.push_str("  napi_get_undefined(env, &ret);\n");
             out.push_str("  return ret;\n");
+        }
+    }
+}
+
+fn render_iterator_next_napi(
+    out: &mut String,
+    napi_name: &str,
+    inner: &TypeRef,
+    fn_name: &str,
+    module: &str,
+) {
+    let fn_pascal = fn_name.to_upper_camel_case();
+    let iter_type = format!("weaveffi_{module}_{fn_pascal}Iterator");
+    let next_fn = format!("{iter_type}_next");
+    let item_ty = c_elem_type(inner, module);
+
+    out.push_str(&format!(
+        "static napi_value {napi_name}(napi_env env, napi_callback_info info) {{\n"
+    ));
+    out.push_str("  size_t argc = 1;\n");
+    out.push_str("  napi_value args[1];\n");
+    out.push_str("  napi_get_cb_info(env, info, &argc, args, NULL, NULL);\n");
+    out.push_str("  uint64_t iter_raw;\n");
+    out.push_str("  bool lossless;\n");
+    out.push_str("  napi_get_value_bigint_uint64(env, args[0], &iter_raw, &lossless);\n");
+    out.push_str(&format!(
+        "  {iter_type}* iter = ({iter_type}*)(uintptr_t)iter_raw;\n"
+    ));
+    out.push_str(&format!("  {item_ty} out_item;\n"));
+    out.push_str("  weaveffi_error err = {0};\n");
+    out.push_str(&format!(
+        "  int32_t rc = {next_fn}(iter, &out_item, &err);\n"
+    ));
+    out.push_str("  if (rc == -1 || err.code != 0) {\n");
+    out.push_str("    napi_throw_error(env, NULL, err.message);\n");
+    out.push_str("    weaveffi_error_clear(&err);\n");
+    out.push_str("    return NULL;\n");
+    out.push_str("  }\n");
+    out.push_str("  napi_value ret;\n");
+    out.push_str("  napi_create_object(env, &ret);\n");
+    out.push_str("  napi_value done_val;\n");
+    out.push_str("  napi_get_boolean(env, rc == 0, &done_val);\n");
+    out.push_str("  napi_set_named_property(env, ret, \"done\", done_val);\n");
+    out.push_str("  if (rc == 1) {\n");
+    out.push_str("    napi_value value;\n");
+    emit_iter_item_to_napi(out, inner);
+    out.push_str("    napi_set_named_property(env, ret, \"value\", value);\n");
+    out.push_str("  }\n");
+    out.push_str("  return ret;\n");
+    out.push_str("}\n\n");
+}
+
+fn render_iterator_destroy_napi(out: &mut String, napi_name: &str, fn_name: &str, module: &str) {
+    let fn_pascal = fn_name.to_upper_camel_case();
+    let iter_type = format!("weaveffi_{module}_{fn_pascal}Iterator");
+    let destroy_fn = format!("{iter_type}_destroy");
+
+    out.push_str(&format!(
+        "static napi_value {napi_name}(napi_env env, napi_callback_info info) {{\n"
+    ));
+    out.push_str("  size_t argc = 1;\n");
+    out.push_str("  napi_value args[1];\n");
+    out.push_str("  napi_get_cb_info(env, info, &argc, args, NULL, NULL);\n");
+    out.push_str("  uint64_t iter_raw;\n");
+    out.push_str("  bool lossless;\n");
+    out.push_str("  napi_get_value_bigint_uint64(env, args[0], &iter_raw, &lossless);\n");
+    out.push_str(&format!(
+        "  {iter_type}* iter = ({iter_type}*)(uintptr_t)iter_raw;\n"
+    ));
+    out.push_str(&format!("  {destroy_fn}(iter);\n"));
+    out.push_str("  napi_value ret;\n");
+    out.push_str("  napi_get_undefined(env, &ret);\n");
+    out.push_str("  return ret;\n");
+    out.push_str("}\n\n");
+}
+
+fn emit_iter_item_to_napi(out: &mut String, inner: &TypeRef) {
+    match inner {
+        TypeRef::I32 => {
+            out.push_str("    napi_create_int32(env, out_item, &value);\n");
+        }
+        TypeRef::U32 => {
+            out.push_str("    napi_create_uint32(env, out_item, &value);\n");
+        }
+        TypeRef::I64 => {
+            out.push_str("    napi_create_int64(env, out_item, &value);\n");
+        }
+        TypeRef::F64 => {
+            out.push_str("    napi_create_double(env, out_item, &value);\n");
+        }
+        TypeRef::Bool => {
+            out.push_str("    napi_get_boolean(env, out_item, &value);\n");
+        }
+        TypeRef::TypedHandle(_) | TypeRef::Handle => {
+            out.push_str("    napi_create_int64(env, (int64_t)out_item, &value);\n");
+        }
+        TypeRef::StringUtf8 => {
+            out.push_str("    napi_create_string_utf8(env, out_item, NAPI_AUTO_LENGTH, &value);\n");
+            out.push_str("    weaveffi_free_string(out_item);\n");
+        }
+        TypeRef::BorrowedStr => {
+            out.push_str("    napi_create_string_utf8(env, out_item, NAPI_AUTO_LENGTH, &value);\n");
+        }
+        TypeRef::Enum(_) => {
+            out.push_str("    napi_create_int32(env, (int32_t)out_item, &value);\n");
+        }
+        TypeRef::Struct(_) => {
+            out.push_str("    napi_create_int64(env, (int64_t)(intptr_t)out_item, &value);\n");
+        }
+        _ => {
+            out.push_str("    napi_create_int64(env, (int64_t)out_item, &value);\n");
         }
     }
 }
@@ -1255,7 +1380,7 @@ fn emit_ret_out_params(out: &mut String, c_args: &mut Vec<String>, ty: &TypeRef,
     }
 }
 
-fn emit_ret_to_napi(out: &mut String, ty: &TypeRef, module: &str, fn_name: &str) {
+fn emit_ret_to_napi(out: &mut String, ty: &TypeRef, module: &str) {
     out.push_str("  napi_value ret;\n");
     match ty {
         TypeRef::I32 => out.push_str("  napi_create_int32(env, result, &ret);\n"),
@@ -1297,54 +1422,14 @@ fn emit_ret_to_napi(out: &mut String, ty: &TypeRef, module: &str, fn_name: &str)
         TypeRef::Map(_, _) => {
             out.push_str("  napi_create_object(env, &ret);\n");
         }
-        TypeRef::Iterator(inner) => {
-            let fn_pascal = fn_name.to_upper_camel_case();
-            let iter_type = format!("weaveffi_{module}_{fn_pascal}Iterator");
-            let et = c_elem_type(inner, module);
-            out.push_str("  napi_create_array(env, &ret);\n");
-            out.push_str("  uint32_t iter_idx = 0;\n");
-            out.push_str(&format!("  {et} iter_item;\n"));
-            out.push_str(&format!(
-                "  while ({iter_type}_next(result, &iter_item)) {{\n"
-            ));
-            out.push_str("    napi_value elem;\n");
-            match inner.as_ref() {
-                TypeRef::I32 => {
-                    out.push_str("    napi_create_int32(env, iter_item, &elem);\n");
-                }
-                TypeRef::U32 => {
-                    out.push_str("    napi_create_uint32(env, iter_item, &elem);\n");
-                }
-                TypeRef::I64 => {
-                    out.push_str("    napi_create_int64(env, iter_item, &elem);\n");
-                }
-                TypeRef::F64 => {
-                    out.push_str("    napi_create_double(env, iter_item, &elem);\n");
-                }
-                TypeRef::Bool => {
-                    out.push_str("    napi_get_boolean(env, iter_item, &elem);\n");
-                }
-                TypeRef::TypedHandle(_) | TypeRef::Handle => {
-                    out.push_str("    napi_create_int64(env, (int64_t)iter_item, &elem);\n");
-                }
-                TypeRef::StringUtf8 => {
-                    out.push_str(
-                        "    napi_create_string_utf8(env, iter_item, NAPI_AUTO_LENGTH, &elem);\n",
-                    );
-                    out.push_str("    weaveffi_free_string(iter_item);\n");
-                }
-                TypeRef::Struct(_) | TypeRef::Enum(_) => {
-                    out.push_str(
-                        "    napi_create_int64(env, (int64_t)(intptr_t)iter_item, &elem);\n",
-                    );
-                }
-                _ => {
-                    out.push_str("    napi_create_int64(env, (int64_t)iter_item, &elem);\n");
-                }
-            }
-            out.push_str("    napi_set_element(env, ret, iter_idx++, elem);\n");
+        TypeRef::Iterator(_) => {
+            out.push_str("  if (result == NULL) {\n");
+            out.push_str("    napi_get_null(env, &ret);\n");
+            out.push_str("  } else {\n");
+            out.push_str(
+                "    napi_create_bigint_uint64(env, (uint64_t)(uintptr_t)result, &ret);\n",
+            );
             out.push_str("  }\n");
-            out.push_str(&format!("  {iter_type}_destroy(result);\n"));
         }
         TypeRef::Callback(_) => unreachable!("validator should have rejected callback Node return"),
     }
@@ -1462,7 +1547,7 @@ fn ts_type_for(ty: &TypeRef) -> String {
         TypeRef::Map(k, v) => format!("Record<{}, {}>", ts_type_for(k), ts_type_for(v)),
         TypeRef::Iterator(inner) => {
             let t = ts_type_for(inner);
-            format!("{t}[]")
+            format!("AsyncIterableIterator<{t}>")
         }
         TypeRef::Callback(name) => name.clone(),
     }
@@ -1510,7 +1595,7 @@ fn render_listener_dts(out: &mut String, l: &ListenerDef) {
     out.push_str("}\n");
 }
 
-fn render_node_index_js(api: &Api) -> String {
+fn render_node_index_js(api: &Api, strip_module_prefix: bool) -> String {
     let mut out = String::from("const addon = require('./index.node');\n\n");
     let structs: Vec<(String, String)> = collect_modules_with_path(&api.modules)
         .iter()
@@ -1530,7 +1615,17 @@ fn render_node_index_js(api: &Api) -> String {
                 .collect::<Vec<_>>()
         })
         .collect();
-    if structs.is_empty() && listeners.is_empty() {
+    let iterators: Vec<(String, String)> = collect_modules_with_path(&api.modules)
+        .iter()
+        .flat_map(|(m, path)| {
+            m.functions
+                .iter()
+                .filter(|f| matches!(f.returns, Some(TypeRef::Iterator(_))))
+                .map(|f| (f.name.clone(), path.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    if structs.is_empty() && listeners.is_empty() && iterators.is_empty() {
         out.push_str("module.exports = addon;\n");
         return out;
     }
@@ -1591,6 +1686,37 @@ fn render_node_index_js(api: &Api) -> String {
         out.push_str("}\n\n");
     }
 
+    for (fn_name, path) in &iterators {
+        let js_name = wrapper_name(path, fn_name, strip_module_prefix);
+        let next_name = format!("{js_name}__iter_next");
+        let destroy_name = format!("{js_name}__iter_destroy");
+        let wrapper = format!("_makeIter_{js_name}");
+        out.push_str(&format!("function {wrapper}(...args) {{\n"));
+        out.push_str(&format!("  const iter = addon.{js_name}(...args);\n"));
+        out.push_str("  let done = false;\n");
+        out.push_str("  return {\n");
+        out.push_str("    [Symbol.asyncIterator]() { return this; },\n");
+        out.push_str("    async next() {\n");
+        out.push_str("      if (done || iter === null) return { value: undefined, done: true };\n");
+        out.push_str(&format!("      const r = addon.{next_name}(iter);\n"));
+        out.push_str("      if (r.done) {\n");
+        out.push_str("        done = true;\n");
+        out.push_str(&format!("        addon.{destroy_name}(iter);\n"));
+        out.push_str("        return { value: undefined, done: true };\n");
+        out.push_str("      }\n");
+        out.push_str("      return { value: r.value, done: false };\n");
+        out.push_str("    },\n");
+        out.push_str("    async return(value) {\n");
+        out.push_str("      if (!done && iter !== null) {\n");
+        out.push_str("        done = true;\n");
+        out.push_str(&format!("        addon.{destroy_name}(iter);\n"));
+        out.push_str("      }\n");
+        out.push_str("      return { value, done: true };\n");
+        out.push_str("    },\n");
+        out.push_str("  };\n");
+        out.push_str("}\n\n");
+    }
+
     out.push_str("module.exports = Object.assign({}, addon, {\n");
     for (name, _path) in &structs {
         out.push_str(&format!("  {name}: {name},\n"));
@@ -1598,6 +1724,10 @@ fn render_node_index_js(api: &Api) -> String {
     for (l, _path) in &listeners {
         let class_name = l.name.to_upper_camel_case();
         out.push_str(&format!("  {class_name}: {class_name},\n"));
+    }
+    for (fn_name, path) in &iterators {
+        let js_name = wrapper_name(path, fn_name, strip_module_prefix);
+        out.push_str(&format!("  {js_name}: _makeIter_{js_name},\n"));
     }
     out.push_str("});\n");
     out
@@ -2992,6 +3122,102 @@ mod tests {
     }
 
     #[test]
+    fn node_iterator_return_uses_correct_next_signature() {
+        let mut m = make_module("data");
+        m.functions.push(Function {
+            name: "list_items".into(),
+            params: vec![],
+            returns: Some(TypeRef::Iterator(Box::new(TypeRef::I32))),
+            doc: None,
+            r#async: false,
+            cancellable: false,
+            deprecated: None,
+            since: None,
+        });
+        let api = make_api(vec![m]);
+
+        let addon = render_addon_c(&api, true);
+        assert!(
+            addon.contains(
+                "int32_t rc = weaveffi_data_ListItemsIterator_next(iter, &out_item, &err);"
+            ),
+            "addon must call _next with (iter, &out_item, &err) returning int32_t: {addon}"
+        );
+        assert!(
+            !addon.contains("weaveffi_data_ListItemsIterator_next(result, &iter_item)"),
+            "addon must not use the old 2-arg _next signature: {addon}"
+        );
+        assert!(
+            addon.contains("if (rc == -1 || err.code != 0)"),
+            "addon must treat rc == -1 as an error: {addon}"
+        );
+        assert!(
+            addon.contains("napi_get_boolean(env, rc == 0, &done_val);"),
+            "addon must treat rc == 0 as done: {addon}"
+        );
+        assert!(
+            addon.contains("napi_create_bigint_uint64(env, (uint64_t)(uintptr_t)result, &ret);"),
+            "addon must expose the iterator pointer as a BigInt handle: {addon}"
+        );
+        assert!(
+            addon.contains(
+                "static napi_value Napi_weaveffi_data_list_items__iter_next(napi_env env, napi_callback_info info)"
+            ),
+            "addon must define a per-iterator _iter_next N-API binding: {addon}"
+        );
+        assert!(
+            addon.contains(
+                "static napi_value Napi_weaveffi_data_list_items__iter_destroy(napi_env env, napi_callback_info info)"
+            ),
+            "addon must define a per-iterator _iter_destroy N-API binding: {addon}"
+        );
+        assert!(
+            addon.contains("weaveffi_data_ListItemsIterator_destroy(iter);"),
+            "addon must call the C iterator destroy with the iterator pointer: {addon}"
+        );
+        assert!(
+            addon.contains("\"list_items__iter_next\""),
+            "addon must export the _iter_next binding: {addon}"
+        );
+        assert!(
+            addon.contains("\"list_items__iter_destroy\""),
+            "addon must export the _iter_destroy binding: {addon}"
+        );
+
+        let js = render_node_index_js(&api, true);
+        assert!(
+            js.contains("function _makeIter_list_items(...args) {"),
+            "index.js must define a per-iterator JS wrapper: {js}"
+        );
+        assert!(
+            js.contains("[Symbol.asyncIterator]()"),
+            "index.js wrapper must expose Symbol.asyncIterator: {js}"
+        );
+        assert!(
+            js.contains("async next()"),
+            "index.js wrapper must expose an async next(): {js}"
+        );
+        assert!(
+            js.contains("addon.list_items__iter_next(iter)"),
+            "index.js next() must call the _iter_next binding with the iterator handle: {js}"
+        );
+        assert!(
+            js.contains("addon.list_items__iter_destroy(iter)"),
+            "index.js wrapper must call the _iter_destroy binding when done: {js}"
+        );
+        assert!(
+            js.contains("list_items: _makeIter_list_items,"),
+            "index.js must export list_items as the async-iterable wrapper: {js}"
+        );
+
+        let dts = render_node_dts(&api, true);
+        assert!(
+            dts.contains("export function list_items(): AsyncIterableIterator<number>"),
+            "dts must type list_items as AsyncIterableIterator<number>: {dts}"
+        );
+    }
+
+    #[test]
     fn node_addon_throws_then_calls_error_clear() {
         let api = make_api(vec![{
             let mut m = make_module("math");
@@ -3131,7 +3357,7 @@ mod tests {
             "dts class must expose dispose(): {dts}"
         );
 
-        let js = render_node_index_js(&api);
+        let js = render_node_index_js(&api, true);
         assert!(
             js.contains("class Contact {"),
             "index.js must define a Contact class: {js}"
@@ -3324,7 +3550,7 @@ mod tests {
             "dts listener class must expose static unregister(id: bigint): {dts}"
         );
 
-        let js = render_node_index_js(&api);
+        let js = render_node_index_js(&api, true);
         assert!(
             js.contains("class DataStream {"),
             "index.js must define a listener class: {js}"
