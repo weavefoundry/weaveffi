@@ -29,6 +29,14 @@ impl GoGenerator {
             stamp_slash(render_go(api, c_prefix)),
         )?;
         std::fs::write(dir.join("go.mod"), stamp_slash(render_go_mod(module_path)))?;
+        // go.sum is emitted empty as a placeholder; `go mod tidy` will populate
+        // it with real checksums once the user adds dependencies.
+        std::fs::write(dir.join("go.sum"), render_go_sum())?;
+        std::fs::write(dir.join("doc.go"), stamp_slash(render_doc_go()))?;
+        std::fs::write(
+            dir.join("weaveffi_test.go"),
+            stamp_slash(render_smoke_test()),
+        )?;
         // README.md is documentation, not a source file; leave it unstamped.
         std::fs::write(dir.join("README.md"), render_readme())?;
         Ok(())
@@ -41,7 +49,7 @@ impl Generator for GoGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "weaveffi", "weaveffi")
+        self.generate_impl(api, out_dir, "github.com/example/weaveffi", "weaveffi")
     }
 
     fn generate_with_config(
@@ -57,6 +65,9 @@ impl Generator for GoGenerator {
         vec![
             out_dir.join("go/weaveffi.go").to_string(),
             out_dir.join("go/go.mod").to_string(),
+            out_dir.join("go/go.sum").to_string(),
+            out_dir.join("go/doc.go").to_string(),
+            out_dir.join("go/weaveffi_test.go").to_string(),
             out_dir.join("go/README.md").to_string(),
         ]
     }
@@ -279,6 +290,43 @@ fn scan_imports(api: &Api) -> (bool, bool, bool, bool, bool) {
 
 fn render_go_mod(module_path: &str) -> String {
     format!("module {module_path}\n\ngo 1.21\n")
+}
+
+fn render_go_sum() -> String {
+    // Placeholder: the generated bindings have no Go dependencies, so go.sum is
+    // empty by design. It exists so `go build` inside a checked-in copy does
+    // not complain about a missing checksum file; `go mod tidy` will refresh it
+    // once the consumer adds dependencies.
+    String::new()
+}
+
+fn render_doc_go() -> String {
+    r#"// Package weaveffi exposes auto-generated CGo bindings for the WeaveFFI
+// C ABI. Each top-level function wraps a `weaveffi_{module}_{function}`
+// symbol from the compiled shared library, marshalling Go values to and
+// from the underlying C representation.
+//
+// See README.md for build prerequisites (CGo, a C compiler, and the
+// WeaveFFI shared library + header on the linker's search path).
+package weaveffi
+"#
+    .into()
+}
+
+fn render_smoke_test() -> String {
+    r#"package weaveffi
+
+import "testing"
+
+// TestPackageLoads is a smoke test that simply ensures the generated
+// package compiles and links against the WeaveFFI C library. Per-API
+// integration tests should live next to this file and exercise the
+// individual generated wrapper functions.
+func TestPackageLoads(t *testing.T) {
+	t.Log("weaveffi package loaded")
+}
+"#
+    .into()
 }
 
 fn render_readme() -> String {
@@ -1927,6 +1975,9 @@ mod tests {
             vec![
                 out.join("go/weaveffi.go").to_string(),
                 out.join("go/go.mod").to_string(),
+                out.join("go/go.sum").to_string(),
+                out.join("go/doc.go").to_string(),
+                out.join("go/weaveffi_test.go").to_string(),
                 out.join("go/README.md").to_string(),
             ]
         );
@@ -1942,6 +1993,9 @@ mod tests {
         let expected = vec![
             out.join("go/weaveffi.go").to_string(),
             out.join("go/go.mod").to_string(),
+            out.join("go/go.sum").to_string(),
+            out.join("go/doc.go").to_string(),
+            out.join("go/weaveffi_test.go").to_string(),
             out.join("go/README.md").to_string(),
         ];
 
@@ -2855,7 +2909,7 @@ mod tests {
         assert!(go_mod_path.exists(), "go/go.mod should exist");
         let go_mod = std::fs::read_to_string(&go_mod_path).unwrap();
         assert!(
-            go_mod.contains("module weaveffi"),
+            go_mod.contains("module github.com/example/weaveffi"),
             "missing module directive: {go_mod}"
         );
         assert!(go_mod.contains("go 1.21"), "missing go version: {go_mod}");
@@ -3061,7 +3115,7 @@ mod tests {
 
         let go_mod = std::fs::read_to_string(tmp.join("go/go.mod")).unwrap();
         assert!(
-            go_mod.contains("module weaveffi"),
+            go_mod.contains("module github.com/example/weaveffi"),
             "go.mod should have default module path: {go_mod}"
         );
 
@@ -3567,7 +3621,7 @@ mod tests {
             "go.mod should use custom module path: {go_mod}"
         );
         assert!(
-            !go_mod.contains("module weaveffi"),
+            !go_mod.contains("module github.com/example/weaveffi"),
             "go.mod should not use default path: {go_mod}"
         );
 
@@ -3576,6 +3630,103 @@ mod tests {
             go.contains("package weaveffi"),
             "Go source should still use weaveffi package: {go}"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn go_mod_uses_module_path() {
+        // Default run must emit a real, importable module path so consumers can
+        // `go get` the generated package without first editing go.mod.
+        let api = calculator_api();
+        let tmp = std::env::temp_dir().join("weaveffi_test_go_mod_default_path");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        GoGenerator
+            .generate_with_config(&api, out_dir, &GeneratorConfig::default())
+            .unwrap();
+
+        let go_mod = std::fs::read_to_string(tmp.join("go/go.mod")).unwrap();
+        assert!(
+            go_mod.contains("module github.com/example/weaveffi"),
+            "default go.mod should declare a real importable module path: {go_mod}"
+        );
+
+        let config = GeneratorConfig {
+            go_module_path: Some("github.com/myorg/mylib".into()),
+            ..Default::default()
+        };
+        GoGenerator
+            .generate_with_config(&api, out_dir, &config)
+            .unwrap();
+        let go_mod = std::fs::read_to_string(tmp.join("go/go.mod")).unwrap();
+        assert!(
+            go_mod.contains("module github.com/myorg/mylib"),
+            "custom go.mod must use the configured module path: {go_mod}"
+        );
+        assert!(
+            !go_mod.contains("github.com/example/weaveffi"),
+            "custom go.mod must not retain the default module path: {go_mod}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn go_has_doc_go() {
+        let api = calculator_api();
+        let tmp = std::env::temp_dir().join("weaveffi_test_go_doc");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        GoGenerator.generate(&api, out_dir).unwrap();
+
+        let doc_path = tmp.join("go/doc.go");
+        assert!(doc_path.exists(), "go/doc.go should exist");
+        let doc = std::fs::read_to_string(&doc_path).unwrap();
+        assert!(
+            doc.contains("package weaveffi"),
+            "doc.go must declare the weaveffi package: {doc}"
+        );
+        assert!(
+            doc.contains("// Package weaveffi"),
+            "doc.go must carry a package-level doc comment: {doc}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn go_has_smoke_test() {
+        let api = calculator_api();
+        let tmp = std::env::temp_dir().join("weaveffi_test_go_smoke");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        GoGenerator.generate(&api, out_dir).unwrap();
+
+        let test_path = tmp.join("go/weaveffi_test.go");
+        assert!(test_path.exists(), "go/weaveffi_test.go should exist");
+        let test_src = std::fs::read_to_string(&test_path).unwrap();
+        assert!(
+            test_src.contains("package weaveffi"),
+            "smoke test must live in the weaveffi package: {test_src}"
+        );
+        assert!(
+            test_src.contains("import \"testing\""),
+            "smoke test must import the testing package: {test_src}"
+        );
+        assert!(
+            test_src.contains("func TestPackageLoads(t *testing.T)"),
+            "smoke test must declare a TestPackageLoads function: {test_src}"
+        );
+
+        let go_sum = tmp.join("go/go.sum");
+        assert!(go_sum.exists(), "go/go.sum placeholder should exist");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

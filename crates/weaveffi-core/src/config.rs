@@ -74,7 +74,9 @@ impl GeneratorConfig {
     }
 
     pub fn go_module_path(&self) -> &str {
-        self.go_module_path.as_deref().unwrap_or("weaveffi")
+        self.go_module_path
+            .as_deref()
+            .unwrap_or("github.com/example/weaveffi")
     }
 
     pub fn ruby_module_name(&self) -> &str {
@@ -105,7 +107,7 @@ mod tests {
         assert_eq!(cfg.cpp_header_name(), "weaveffi.hpp");
         assert_eq!(cfg.cpp_standard(), "17");
         assert_eq!(cfg.dart_package_name(), "weaveffi");
-        assert_eq!(cfg.go_module_path(), "weaveffi");
+        assert_eq!(cfg.go_module_path(), "github.com/example/weaveffi");
         assert_eq!(cfg.ruby_module_name(), "WeaveFFI");
         assert_eq!(cfg.ruby_gem_name(), "weaveffi");
         assert!(!cfg.strip_module_prefix);
@@ -185,7 +187,7 @@ mod tests {
         assert_eq!(back.cpp_header_name(), "weaveffi.hpp");
         assert_eq!(back.cpp_standard(), "17");
         assert_eq!(back.dart_package_name(), "weaveffi");
-        assert_eq!(back.go_module_path(), "weaveffi");
+        assert_eq!(back.go_module_path(), "github.com/example/weaveffi");
         assert_eq!(back.ruby_module_name(), "WeaveFFI");
         assert_eq!(back.ruby_gem_name(), "weaveffi");
         assert!(back.strip_module_prefix);

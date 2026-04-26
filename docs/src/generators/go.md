@@ -452,8 +452,8 @@ func main() {
 
 ## Configuration
 
-The `go.mod` module path defaults to `weaveffi` but can be customized
-via generator configuration:
+The `go.mod` module path defaults to `github.com/example/weaveffi` but
+can be customized via generator configuration:
 
 ```yaml
 generators:
