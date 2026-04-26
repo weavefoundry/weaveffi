@@ -125,4 +125,59 @@ mod tests {
         assert_ne!(err.code, 0);
         abi::error_clear(&mut err);
     }
+
+    #[test]
+    fn add_works() {
+        let mut err = weaveffi_error::default();
+        let result = weaveffi_calculator_add(2, 3, &mut err);
+        assert_eq!(err.code, 0);
+        assert_eq!(result, 5);
+    }
+
+    #[test]
+    fn mul_works() {
+        let mut err = weaveffi_error::default();
+        let result = weaveffi_calculator_mul(4, 5, &mut err);
+        assert_eq!(err.code, 0);
+        assert_eq!(result, 20);
+    }
+
+    #[test]
+    fn div_by_zero_returns_error() {
+        let mut err = weaveffi_error::default();
+        let result = weaveffi_calculator_div(10, 0, &mut err);
+        assert_eq!(result, 0);
+        assert_ne!(err.code, 0);
+        abi::error_clear(&mut err);
+    }
+
+    #[test]
+    fn echo_round_trips_utf8() {
+        let mut err = weaveffi_error::default();
+        let input = "héllo→世界🌍";
+        let out = weaveffi_calculator_echo(input.as_ptr(), input.len(), &mut err);
+        assert_eq!(err.code, 0);
+        assert_eq!(abi::c_ptr_to_string(out).unwrap(), input);
+        abi::free_string(out);
+    }
+
+    #[test]
+    fn echo_round_trips_empty_string() {
+        let mut err = weaveffi_error::default();
+        let input = "";
+        let out = weaveffi_calculator_echo(input.as_ptr(), input.len(), &mut err);
+        assert_eq!(err.code, 0);
+        assert_eq!(abi::c_ptr_to_string(out).unwrap(), "");
+        abi::free_string(out);
+    }
+
+    #[test]
+    fn echo_handles_long_string() {
+        let mut err = weaveffi_error::default();
+        let input = "a".repeat(10 * 1024);
+        let out = weaveffi_calculator_echo(input.as_ptr(), input.len(), &mut err);
+        assert_eq!(err.code, 0);
+        assert_eq!(abi::c_ptr_to_string(out).unwrap(), input);
+        abi::free_string(out);
+    }
 }
