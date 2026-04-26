@@ -112,6 +112,10 @@ impl Generator for NodeGenerator {
 }
 
 fn render_package_json(name: &str) -> String {
+    // The `binary` block uses node-pre-gyp placeholders and `prebuilds/` in
+    // the `files` array lets consumers drop in prebuildify-produced binaries.
+    // Both tools are opt-in; the default `install` script still shells out to
+    // node-gyp so packages without prebuilt addons keep working.
     format!(
         r#"{{
   "name": "{name}",
@@ -129,14 +133,25 @@ fn render_package_json(name: &str) -> String {
     "weaveffi_addon.c",
     "binding.gyp",
     "build/",
+    "prebuilds/",
     "*.node"
   ],
   "engines": {{
     "node": ">=18"
   }},
   "gypfile": true,
+  "binary": {{
+    "module_name": "weaveffi",
+    "module_path": "./build/Release/",
+    "remote_path": "./{{module_name}}/v{{version}}/{{configuration}}/",
+    "package_name": "{{module_name}}-v{{version}}-{{node_abi}}-{{platform}}-{{arch}}.tar.gz",
+    "host": "https://example.com/{name}-prebuilds/"
+  }},
   "scripts": {{
     "install": "node-gyp rebuild",
+    "rebuild": "node-gyp rebuild",
+    "prebuild": "prebuildify --napi --strip",
+    "package": "node-pre-gyp package",
     "test": "node --test"
   }}
 }}
@@ -4272,6 +4287,78 @@ mod tests {
                 .iter()
                 .any(|p| p.ends_with("node/.npmignore")),
             "output_files must advertise node/.npmignore"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn node_package_json_has_prebuild_hooks() {
+        let api = make_api(vec![make_module("math")]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_node_pkg_prebuild_hooks");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        NodeGenerator.generate(&api, out_dir).unwrap();
+
+        let pkg = std::fs::read_to_string(tmp.join("node/package.json")).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&pkg).expect("package.json must be valid JSON");
+
+        let binary = parsed
+            .get("binary")
+            .expect("package.json must declare a `binary` block for node-pre-gyp");
+        for field in [
+            "module_name",
+            "module_path",
+            "remote_path",
+            "package_name",
+            "host",
+        ] {
+            assert!(
+                binary.get(field).and_then(|v| v.as_str()).is_some(),
+                "binary.{field} must be a non-empty string: {pkg}"
+            );
+        }
+        assert_eq!(
+            binary["module_name"], "weaveffi",
+            "binary.module_name must match the binding.gyp target_name: {pkg}"
+        );
+        let package_name = binary["package_name"].as_str().unwrap_or("");
+        for token in ["{node_abi}", "{platform}", "{arch}"] {
+            assert!(
+                package_name.contains(token),
+                "binary.package_name must include {token} placeholder: {pkg}"
+            );
+        }
+
+        let files: Vec<&str> = parsed["files"]
+            .as_array()
+            .expect("package.json must declare a files array")
+            .iter()
+            .map(|v| v.as_str().unwrap_or(""))
+            .collect();
+        assert!(
+            files.contains(&"prebuilds/"),
+            "package.json files array must include `prebuilds/` so prebuildify binaries ship: {pkg}"
+        );
+
+        let scripts = &parsed["scripts"];
+        assert!(
+            scripts
+                .get("prebuild")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains("prebuildify")),
+            "package.json scripts.prebuild must invoke prebuildify: {pkg}"
+        );
+        assert!(
+            scripts
+                .get("package")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains("node-pre-gyp")),
+            "package.json scripts.package must invoke node-pre-gyp: {pkg}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);

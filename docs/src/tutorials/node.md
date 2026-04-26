@@ -241,6 +241,76 @@ const { hello } = require("@myorg/greeter");
 console.log(hello("npm")); // "Hello, npm!"
 ```
 
+## Shipping prebuilt binaries (optional)
+
+Compiling an N-API addon from source requires a C toolchain on every
+consumer's machine, which is painful for CI runners and end-users who
+install via `npm install` without any build infrastructure. The
+generated `package.json` is pre-wired with hooks for the two most
+common prebuilt-binary tools so you can publish ready-to-load `.node`
+files alongside the source.
+
+### The `binary` block
+
+The generated `package.json` ships with a `node-pre-gyp`-compatible
+`binary` descriptor:
+
+```json
+"binary": {
+  "module_name": "weaveffi",
+  "module_path": "./build/Release/",
+  "remote_path": "./{module_name}/v{version}/{configuration}/",
+  "package_name": "{module_name}-v{version}-{node_abi}-{platform}-{arch}.tar.gz",
+  "host": "https://example.com/weaveffi-prebuilds/"
+}
+```
+
+Point `host` at the bucket, GitHub Releases URL, or CDN where you
+publish prebuilt tarballs. The `{node_abi}`, `{platform}`, and
+`{arch}` placeholders are expanded by `node-pre-gyp` at install time
+so each consumer downloads the artifact for its runtime.
+
+### Option A: `prebuildify`
+
+[`prebuildify`](https://github.com/prebuild/prebuildify) bundles
+prebuilt binaries directly into the npm tarball under `prebuilds/`,
+so consumers never hit the network. The generated `package.json`
+already lists `prebuilds/` in `files` and exposes a `prebuild`
+script:
+
+```bash
+npm install --save-dev prebuildify node-gyp-build
+npm run prebuild    # writes prebuilds/<platform>-<arch>/weaveffi.node
+```
+
+Then swap the native loader in a small wrapper (or `index.js`) to
+`node-gyp-build`, which picks the matching prebuild or falls back to
+a source build when none is available.
+
+### Option B: `@mapbox/node-pre-gyp`
+
+[`@mapbox/node-pre-gyp`](https://github.com/mapbox/node-pre-gyp)
+downloads prebuilts on demand using the `binary` block above. Build
+and stage each target with the generated `package` script:
+
+```bash
+npm install --save-dev @mapbox/node-pre-gyp
+npm run package     # writes build/stage/<remote_path>/<package_name>
+```
+
+Upload the resulting tarballs to the configured `host`, then change
+the `install` script to
+`node-pre-gyp install --fallback-to-build` so consumers fetch the
+prebuilt artifact and only compile from source when no match exists.
+
+### Picking a tool
+
+- Choose **`prebuildify`** for small support matrices and simpler
+  publishing — every binary ships inside the npm tarball.
+- Choose **`node-pre-gyp`** for larger matrices (many Node ABIs /
+  platforms / arches) where you prefer hosting binaries separately
+  and downloading them on demand.
+
 ## Troubleshooting
 
 | Problem | Solution |
