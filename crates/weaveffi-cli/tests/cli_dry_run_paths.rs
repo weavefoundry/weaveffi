@@ -52,7 +52,7 @@ fn walk_files(base: &std::path::Path, dir: &std::path::Path, out: &mut BTreeSet<
                 .to_str()
                 .expect("non-UTF-8 path")
                 .replace(std::path::MAIN_SEPARATOR, "/");
-            if rel_str != ".weaveffi-cache" {
+            if rel_str != ".weaveffi-cache" && rel_str != "weaveffi.lock" {
                 out.insert(rel_str);
             }
         }

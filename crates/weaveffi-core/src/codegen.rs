@@ -1,10 +1,17 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use camino::Utf8Path;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 use weaveffi_ir::ir::{Api, CURRENT_SCHEMA_VERSION};
 
 use crate::cache;
 use crate::config::GeneratorConfig;
 use crate::templates::TemplateEngine;
+
+/// Filename of the lockfile written to the output dir root.
+pub const LOCKFILE: &str = "weaveffi.lock";
 
 /// Returns the header message used to stamp every generated source file.
 ///
@@ -122,10 +129,20 @@ pub trait Generator {
     }
 }
 
-#[derive(Default)]
 pub struct Orchestrator<'a> {
     generators: Vec<&'a dyn Generator>,
     quiet: bool,
+    lockfile: bool,
+}
+
+impl Default for Orchestrator<'_> {
+    fn default() -> Self {
+        Self {
+            generators: Vec::new(),
+            quiet: false,
+            lockfile: true,
+        }
+    }
 }
 
 impl<'a> Orchestrator<'a> {
@@ -141,6 +158,12 @@ impl<'a> Orchestrator<'a> {
     /// Suppress informational stdout output (e.g. the cache-skip notice).
     pub fn quiet(mut self, quiet: bool) -> Self {
         self.quiet = quiet;
+        self
+    }
+
+    /// Enable or disable writing `weaveffi.lock` after generation. Defaults to on.
+    pub fn lockfile(mut self, enabled: bool) -> Self {
+        self.lockfile = enabled;
         self
     }
 
@@ -178,8 +201,123 @@ impl<'a> Orchestrator<'a> {
         }
 
         cache::write_cache(out_dir, &hash)?;
+
+        if self.lockfile {
+            write_lockfile(out_dir, &hash).context("failed to write weaveffi.lock")?;
+        }
+
         Ok(())
     }
+}
+
+#[derive(Serialize)]
+struct LockfileDoc {
+    meta: LockMeta,
+    hash: LockHash,
+    files: BTreeMap<String, String>,
+}
+
+#[derive(Serialize)]
+struct LockMeta {
+    ir_version: String,
+    tool_version: String,
+    generated_at: String,
+}
+
+#[derive(Serialize)]
+struct LockHash {
+    api: String,
+}
+
+/// Walk `out_dir`, SHA-256 every emitted file (excluding metadata), and write
+/// a deterministic `weaveffi.lock` TOML file to the directory root.
+fn write_lockfile(out_dir: &Utf8Path, api_hash: &str) -> Result<()> {
+    let mut files: BTreeMap<String, String> = BTreeMap::new();
+    collect_file_hashes(out_dir, out_dir, &mut files)?;
+
+    let doc = LockfileDoc {
+        meta: LockMeta {
+            ir_version: CURRENT_SCHEMA_VERSION.to_string(),
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
+            generated_at: format_rfc3339_utc(SystemTime::now()),
+        },
+        hash: LockHash {
+            api: api_hash.to_string(),
+        },
+        files,
+    };
+
+    let serialized = toml::to_string(&doc).context("failed to serialize weaveffi.lock")?;
+    let path = out_dir.join(LOCKFILE);
+    std::fs::write(path.as_std_path(), serialized)
+        .with_context(|| format!("failed to write {path}"))?;
+    Ok(())
+}
+
+fn collect_file_hashes(
+    base: &Utf8Path,
+    dir: &Utf8Path,
+    out: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    let entries = std::fs::read_dir(dir.as_std_path())
+        .with_context(|| format!("failed to read directory: {dir}"))?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let utf8 = Utf8Path::from_path(&path)
+            .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path: {path:?}"))?
+            .to_owned();
+        if utf8.is_dir() {
+            collect_file_hashes(base, &utf8, out)?;
+        } else {
+            let rel = utf8
+                .strip_prefix(base)
+                .context("failed to strip output-dir prefix")?
+                .to_string();
+            if is_metadata_file(&rel) {
+                continue;
+            }
+            let bytes = std::fs::read(utf8.as_std_path())
+                .with_context(|| format!("failed to read {utf8}"))?;
+            out.insert(rel, format!("{:x}", Sha256::digest(&bytes)));
+        }
+    }
+    Ok(())
+}
+
+/// Files that are orchestrator metadata, not generator output, and therefore
+/// must not be recorded in the lockfile.
+fn is_metadata_file(rel: &str) -> bool {
+    rel == LOCKFILE || rel == ".weaveffi-cache" || rel.starts_with(".weaveffi-cache.tmp.")
+}
+
+/// Format a `SystemTime` as an RFC-3339 UTC timestamp `YYYY-MM-DDTHH:MM:SSZ`.
+fn format_rfc3339_utc(t: SystemTime) -> String {
+    let secs = t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let days = (secs / 86400) as i64;
+    let rem = secs % 86400;
+    let hours = rem / 3600;
+    let minutes = (rem % 3600) / 60;
+    let seconds = rem % 60;
+    let (y, mo, d) = civil_from_days(days);
+    format!("{y:04}-{mo:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
+}
+
+/// Howard Hinnant's civil-from-days algorithm: convert days since
+/// 1970-01-01 to `(year, month, day)` with month in `[1, 12]` and day in
+/// `[1, 31]`. Public-domain reference implementation.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m as u32, d)
 }
 
 #[cfg(test)]
@@ -473,5 +611,113 @@ mod tests {
         let result = orch.run(&api, out_dir, &config, true, None);
         assert!(result.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1, "generator should have run");
+    }
+
+    #[test]
+    fn lockfile_written_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
+        let api = test_api();
+        let config = GeneratorConfig::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gen = CountingGenerator {
+            calls: Arc::clone(&calls),
+        };
+
+        let orch = Orchestrator::new().with_generator(&gen);
+        orch.run(&api, out_dir, &config, true, None).unwrap();
+
+        let lock_path = out_dir.join(LOCKFILE);
+        assert!(lock_path.exists(), "lockfile should be written by default");
+
+        let contents = std::fs::read_to_string(lock_path.as_std_path()).unwrap();
+        let parsed: toml::Value = toml::from_str(&contents).expect("lockfile should parse as TOML");
+
+        let meta = parsed
+            .get("meta")
+            .and_then(|v| v.as_table())
+            .expect("[meta] section");
+        assert_eq!(
+            meta.get("ir_version").and_then(|v| v.as_str()),
+            Some(weaveffi_ir::ir::CURRENT_SCHEMA_VERSION)
+        );
+        assert_eq!(
+            meta.get("tool_version").and_then(|v| v.as_str()),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        let generated_at = meta
+            .get("generated_at")
+            .and_then(|v| v.as_str())
+            .expect("generated_at");
+        assert!(
+            generated_at.ends_with('Z') && generated_at.len() == 20,
+            "generated_at should be RFC-3339 UTC: {generated_at}"
+        );
+
+        let hash_section = parsed
+            .get("hash")
+            .and_then(|v| v.as_table())
+            .expect("[hash] section");
+        let api_hash = hash_section
+            .get("api")
+            .and_then(|v| v.as_str())
+            .expect("api hash");
+        assert_eq!(api_hash.len(), 64, "SHA-256 hex digest is 64 chars");
+        assert_eq!(api_hash, cache::hash_api(&api));
+
+        let files = parsed
+            .get("files")
+            .and_then(|v| v.as_table())
+            .expect("[files] section");
+        let recorded_hash = files
+            .get("output.txt")
+            .and_then(|v| v.as_str())
+            .expect("output.txt entry");
+        let actual_bytes = std::fs::read(out_dir.join("output.txt").as_std_path()).unwrap();
+        assert_eq!(
+            recorded_hash,
+            format!("{:x}", Sha256::digest(&actual_bytes))
+        );
+
+        assert!(
+            !files.contains_key(LOCKFILE),
+            "lockfile must not reference itself"
+        );
+        assert!(
+            !files.contains_key(".weaveffi-cache"),
+            "cache file must not appear in lockfile"
+        );
+    }
+
+    #[test]
+    fn lockfile_disabled_via_builder() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
+        let api = test_api();
+        let config = GeneratorConfig::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gen = CountingGenerator {
+            calls: Arc::clone(&calls),
+        };
+
+        let orch = Orchestrator::new().with_generator(&gen).lockfile(false);
+        orch.run(&api, out_dir, &config, true, None).unwrap();
+
+        assert!(
+            !out_dir.join(LOCKFILE).exists(),
+            "lockfile must not be written when disabled"
+        );
+    }
+
+    #[test]
+    fn format_rfc3339_utc_known_values() {
+        let epoch = SystemTime::UNIX_EPOCH;
+        assert_eq!(format_rfc3339_utc(epoch), "1970-01-01T00:00:00Z");
+
+        let y2k = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(946_684_800);
+        assert_eq!(format_rfc3339_utc(y2k), "2000-01-01T00:00:00Z");
+
+        let leap_day = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_709_164_800);
+        assert_eq!(format_rfc3339_utc(leap_day), "2024-02-29T00:00:00Z");
     }
 }

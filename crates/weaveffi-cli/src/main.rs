@@ -75,6 +75,12 @@ enum Commands {
         /// Path to a directory containing user template overrides (.tera files)
         #[arg(long)]
         templates: Option<String>,
+        /// Write weaveffi.lock with SHA-256 hashes of generated files [default: on]
+        #[arg(long, overrides_with = "no_lockfile")]
+        lockfile: bool,
+        /// Skip writing the weaveffi.lock file
+        #[arg(long, overrides_with = "lockfile")]
+        no_lockfile: bool,
     },
     Validate {
         /// Input IDL/IR file (yaml|yml|json|toml)
@@ -149,6 +155,8 @@ fn main() -> Result<()> {
             force,
             dry_run,
             templates,
+            lockfile: _,
+            no_lockfile,
         } => cmd_generate(
             &input,
             &out,
@@ -159,6 +167,7 @@ fn main() -> Result<()> {
             force,
             dry_run,
             templates.as_deref(),
+            !no_lockfile,
             quiet,
         )?,
         Commands::Validate { input, warn } => cmd_validate(&input, warn, quiet)?,
@@ -588,6 +597,7 @@ fn cmd_generate(
     force: bool,
     dry_run: bool,
     templates_path: Option<&str>,
+    emit_lockfile: bool,
     quiet: bool,
 ) -> Result<()> {
     let mut config = load_config(config_path)?;
@@ -673,7 +683,7 @@ fn cmd_generate(
         None => None,
     };
 
-    let mut orchestrator = Orchestrator::new().quiet(quiet);
+    let mut orchestrator = Orchestrator::new().quiet(quiet).lockfile(emit_lockfile);
     for &gen in &selected {
         orchestrator = orchestrator.with_generator(gen);
     }
@@ -818,7 +828,7 @@ fn cmd_diff(input: &str, out: Option<&str>, quiet: bool) -> Result<()> {
     ];
 
     let config = GeneratorConfig::default();
-    let mut orchestrator = Orchestrator::new().quiet(quiet);
+    let mut orchestrator = Orchestrator::new().quiet(quiet).lockfile(false);
     for &gen in &all {
         orchestrator = orchestrator.with_generator(gen);
     }
@@ -892,7 +902,7 @@ fn walk_dir(base: &Utf8Path, dir: &Utf8Path, out: &mut BTreeSet<String>) -> Resu
                 .strip_prefix(base)
                 .wrap_err("failed to strip prefix")?
                 .to_string();
-            if rel != ".weaveffi-cache" {
+            if rel != ".weaveffi-cache" && rel != "weaveffi.lock" {
                 out.insert(rel);
             }
         }
@@ -1729,7 +1739,7 @@ mod tests {
         let out_str = out.to_str().unwrap();
 
         cmd_generate(
-            input, out_str, None, false, None, false, false, true, None, false,
+            input, out_str, None, false, None, false, false, true, None, true, false,
         )
         .unwrap();
 
@@ -2046,6 +2056,7 @@ mod tests {
             false,
             None,
             true,
+            true,
         )
         .unwrap();
 
@@ -2070,5 +2081,74 @@ mod tests {
 
         let no_stamp = "# WeaveFFI Python Bindings\n\nAuto-generated docs.\n";
         assert_eq!(extract_stamp_ir_version(no_stamp), None);
+    }
+
+    #[test]
+    fn generate_writes_lockfile_by_default() {
+        let _ = color_eyre::install();
+        let dir = tempfile::tempdir().unwrap();
+        let sample = format!(
+            "{}/../../samples/calculator/calculator.yml",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let out = dir.path().join("out");
+
+        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .args([
+                "generate",
+                &sample,
+                "-o",
+                out.to_str().unwrap(),
+                "--target",
+                "c",
+            ])
+            .output()
+            .expect("failed to run weaveffi generate");
+
+        assert!(
+            cmd.status.success(),
+            "generate failed: {}",
+            String::from_utf8_lossy(&cmd.stderr)
+        );
+        assert!(
+            out.join("weaveffi.lock").exists(),
+            "weaveffi.lock should be written by default"
+        );
+    }
+
+    #[test]
+    fn generate_no_lockfile_flag_skips_writing() {
+        let _ = color_eyre::install();
+        let dir = tempfile::tempdir().unwrap();
+        let sample = format!(
+            "{}/../../samples/calculator/calculator.yml",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let out = dir.path().join("out");
+
+        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .args([
+                "generate",
+                &sample,
+                "-o",
+                out.to_str().unwrap(),
+                "--target",
+                "c",
+                "--no-lockfile",
+            ])
+            .output()
+            .expect("failed to run weaveffi generate --no-lockfile");
+
+        assert!(
+            cmd.status.success(),
+            "generate --no-lockfile failed: {}",
+            String::from_utf8_lossy(&cmd.stderr)
+        );
+        assert!(
+            !out.join("weaveffi.lock").exists(),
+            "weaveffi.lock must not be written with --no-lockfile"
+        );
     }
 }
