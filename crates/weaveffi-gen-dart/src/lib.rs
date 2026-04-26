@@ -4,7 +4,9 @@ use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name};
-use weaveffi_ir::ir::{Api, CallbackDef, EnumDef, Function, Module, StructDef, TypeRef};
+use weaveffi_ir::ir::{
+    Api, CallbackDef, EnumDef, Function, ListenerDef, Module, StructDef, TypeRef,
+};
 
 pub struct DartGenerator;
 
@@ -49,6 +51,7 @@ impl Generator for DartGenerator {
     fn capabilities(&self) -> &'static [Capability] {
         &[
             Capability::Callbacks,
+            Capability::Listeners,
             Capability::Iterators,
             Capability::AsyncFunctions,
             Capability::CancellableAsync,
@@ -332,6 +335,9 @@ fn render_dart_module(api: &Api) -> String {
                 render_dart_builder(&mut out, s);
             }
         }
+        for l in &module.listeners {
+            render_listener(&mut out, &path, l);
+        }
         for f in &module.functions {
             render_function(&mut out, &path, f);
         }
@@ -404,6 +410,58 @@ fn render_callback(out: &mut String, cb: &CallbackDef) {
         "typedef _Dart{name} = {dart_ffi_ret} Function({});\n",
         dart_ffi_params.join(", ")
     ));
+}
+
+/// Emit a Dart wrapper class for a listener. The class exposes:
+///   - `register(callback)`: wraps the callback via `Pointer.fromFunction`,
+///     calls the C `register_{name}` symbol, stores the function pointer in
+///     a class-level `Map<int, ...>` keyed by the returned id to pin it
+///     against GC, and returns the id.
+///   - `unregister(id)`: calls the C `unregister_{name}` symbol and removes
+///     the pinned pointer from the map.
+fn render_listener(out: &mut String, module_path: &str, l: &ListenerDef) {
+    let class_name = l.name.to_upper_camel_case();
+    let cb_td = l.event_callback.to_upper_camel_case();
+    let cb_ptr_ty = format!("Pointer<NativeFunction<_Native{cb_td}>>");
+    let reg_sym = c_symbol_name(module_path, &format!("register_{}", l.name));
+    let unreg_sym = c_symbol_name(module_path, &format!("unregister_{}", l.name));
+
+    emit_typedef_and_lookup(
+        out,
+        &reg_sym,
+        &format!("{cb_ptr_ty}, Pointer<Void>"),
+        &format!("{cb_ptr_ty}, Pointer<Void>"),
+        "Uint64",
+        "int",
+    );
+    emit_typedef_and_lookup(out, &unreg_sym, "Uint64", "int", "Void", "void");
+
+    let reg_var = reg_sym.to_lower_camel_case();
+    let unreg_var = unreg_sym.to_lower_camel_case();
+
+    if let Some(doc) = &l.doc {
+        out.push_str(&format!("\n/// {doc}\n"));
+    } else {
+        out.push('\n');
+    }
+    out.push_str(&format!("class {class_name} {{\n"));
+    out.push_str(&format!(
+        "  static final Map<int, {cb_ptr_ty}> _callbacks = {{}};\n\n"
+    ));
+    out.push_str(&format!("  static int register({cb_td} callback) {{\n"));
+    out.push_str(&format!(
+        "    final ptr = Pointer.fromFunction<_Native{cb_td}>(callback);\n"
+    ));
+    out.push_str(&format!("    final id = _{reg_var}(ptr, nullptr);\n"));
+    out.push_str("    _callbacks[id] = ptr;\n");
+    out.push_str("    return id;\n");
+    out.push_str("  }\n\n");
+
+    out.push_str("  static void unregister(int id) {\n");
+    out.push_str(&format!("    _{unreg_var}(id);\n"));
+    out.push_str("    _callbacks.remove(id);\n");
+    out.push_str("  }\n");
+    out.push_str("}\n");
 }
 
 fn render_struct(out: &mut String, module_path: &str, s: &StructDef) {
@@ -2619,13 +2677,13 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_excludes_listeners_and_builders() {
+    fn capabilities_excludes_builders() {
         let caps = DartGenerator.capabilities();
         assert!(caps.contains(&Capability::Callbacks));
-        assert!(!caps.contains(&Capability::Listeners));
+        assert!(caps.contains(&Capability::Listeners));
         assert!(!caps.contains(&Capability::Builders));
         for cap in Capability::ALL {
-            if matches!(cap, Capability::Listeners | Capability::Builders) {
+            if matches!(cap, Capability::Builders) {
                 continue;
             }
             assert!(caps.contains(cap), "Dart generator must support {cap:?}");
@@ -2696,6 +2754,124 @@ mod tests {
         assert!(
             dart.contains("_weaveffiEventsSubscribe(handlerPtr, nullptr, err);"),
             "wrapper must pass (pointer, nullptr context) to native fn: {dart}"
+        );
+    }
+
+    #[test]
+    fn dart_emits_listener_class() {
+        let api = make_api(vec![Module {
+            name: "events".into(),
+            functions: vec![],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![CallbackDef {
+                name: "OnData".into(),
+                params: vec![Param {
+                    name: "value".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+            }],
+            listeners: vec![ListenerDef {
+                name: "data_stream".into(),
+                event_callback: "OnData".into(),
+                doc: None,
+            }],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let dart = render_dart_module(&api);
+
+        assert!(
+            dart.contains(
+                "typedef _NativeWeaveffiEventsRegisterDataStream = Uint64 Function(Pointer<NativeFunction<_NativeOnData>>, Pointer<Void>);"
+            ),
+            "register native typedef must return Uint64 and take (cb_ptr, context): {dart}"
+        );
+        assert!(
+            dart.contains(
+                "typedef _DartWeaveffiEventsRegisterDataStream = int Function(Pointer<NativeFunction<_NativeOnData>>, Pointer<Void>);"
+            ),
+            "register dart typedef must return int and take (cb_ptr, context): {dart}"
+        );
+        assert!(
+            dart.contains("'weaveffi_events_register_data_stream'"),
+            "must look up the register C symbol: {dart}"
+        );
+        assert!(
+            dart.contains(
+                "typedef _NativeWeaveffiEventsUnregisterDataStream = Void Function(Uint64);"
+            ),
+            "unregister native typedef must take (Uint64) and return Void: {dart}"
+        );
+        assert!(
+            dart.contains("typedef _DartWeaveffiEventsUnregisterDataStream = void Function(int);"),
+            "unregister dart typedef must take (int) and return void: {dart}"
+        );
+        assert!(
+            dart.contains("'weaveffi_events_unregister_data_stream'"),
+            "must look up the unregister C symbol: {dart}"
+        );
+
+        assert!(
+            dart.contains("class DataStream {"),
+            "must emit a Dart class named after the listener in PascalCase: {dart}"
+        );
+        assert!(
+            dart.contains(
+                "static final Map<int, Pointer<NativeFunction<_NativeOnData>>> _callbacks = {};"
+            ),
+            "listener class must pin callbacks in a Map<int, Pointer<NativeFunction<...>>>: {dart}"
+        );
+        assert!(
+            dart.contains("static int register(OnData callback) {"),
+            "listener class must expose static int register(CallbackType): {dart}"
+        );
+        assert!(
+            dart.contains("final ptr = Pointer.fromFunction<_NativeOnData>(callback);"),
+            "register must wrap the callback via Pointer.fromFunction: {dart}"
+        );
+        assert!(
+            dart.contains("final id = _weaveffiEventsRegisterDataStream(ptr, nullptr);"),
+            "register must call the native register symbol with (ptr, nullptr): {dart}"
+        );
+        assert!(
+            dart.contains("_callbacks[id] = ptr;"),
+            "register must store the pinned pointer in the map keyed by id: {dart}"
+        );
+        assert!(
+            dart.contains("static void unregister(int id) {"),
+            "listener class must expose static void unregister(int): {dart}"
+        );
+        assert!(
+            dart.contains("_weaveffiEventsUnregisterDataStream(id);"),
+            "unregister must call the native unregister symbol with the id: {dart}"
+        );
+        assert!(
+            dart.contains("_callbacks.remove(id);"),
+            "unregister must remove the pinned pointer from the map: {dart}"
+        );
+
+        let reg_start = dart
+            .find("static int register(OnData callback) {")
+            .expect("register method");
+        let reg_body = &dart[reg_start..];
+        let ptr_pos = reg_body
+            .find("Pointer.fromFunction<_NativeOnData>(callback)")
+            .expect("Pointer.fromFunction in register");
+        let call_pos = reg_body
+            .find("_weaveffiEventsRegisterDataStream(ptr, nullptr)")
+            .expect("native call in register");
+        let store_pos = reg_body
+            .find("_callbacks[id] = ptr;")
+            .expect("pin in register");
+        let return_pos = reg_body.find("return id;").expect("return in register");
+        assert!(
+            ptr_pos < call_pos && call_pos < store_pos && store_pos < return_pos,
+            "register ordering must be: fromFunction, native call, pin, return: {reg_body}"
         );
     }
 }
