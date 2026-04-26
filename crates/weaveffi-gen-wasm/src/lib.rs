@@ -823,7 +823,17 @@ fn emit_js_function_wrapper(out: &mut String, module_name: &str, func: &Function
             out.push_str(&format!(
                 "{indent}const view = new DataView(wasm.memory.buffer);\n"
             ));
-            out.push_str(&format!("{indent}return _decodeString(wasm, view.getInt32(retptr, true), view.getInt32(retptr + 4, true));\n"));
+            out.push_str(&format!(
+                "{indent}const _strPtr = view.getInt32(retptr, true);\n"
+            ));
+            out.push_str(&format!(
+                "{indent}const _strLen = view.getInt32(retptr + 4, true);\n"
+            ));
+            out.push_str(&format!(
+                "{indent}const _result = _decodeString(wasm, _strPtr, _strLen);\n"
+            ));
+            out.push_str(&format!("{indent}wasm.weaveffi_free_string(_strPtr);\n"));
+            out.push_str(&format!("{indent}return _result;\n"));
         }
         Some(TypeRef::Struct(name)) => {
             let cls = local_type_name(name);
@@ -1784,6 +1794,51 @@ mod tests {
         assert!(
             dts.contains("Record<Color, Contact>"),
             "should contain enum-keyed map type: {dts}"
+        );
+    }
+
+    #[test]
+    fn wasm_string_return_calls_free_string() {
+        let api = make_api(vec![Module {
+            name: "text".into(),
+            functions: vec![Function {
+                name: "echo".into(),
+                params: vec![Param {
+                    name: "s".into(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                }],
+                returns: Some(TypeRef::StringUtf8),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+
+        let decode_pos = js
+            .find("_decodeString(wasm, _strPtr, _strLen)")
+            .unwrap_or_else(|| {
+                panic!("expected _decodeString(wasm, _strPtr, _strLen) in generated JS: {js}")
+            });
+        let free_pos = js
+            .find("wasm.weaveffi_free_string(_strPtr)")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected wasm.weaveffi_free_string(_strPtr) call to release the owned string buffer: {js}"
+                )
+            });
+        assert!(
+            free_pos > decode_pos,
+            "wasm.weaveffi_free_string(_strPtr) must come after the decode so the value is read before the buffer is freed: {js}"
         );
     }
 
