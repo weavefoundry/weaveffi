@@ -49,11 +49,10 @@ impl PythonGenerator {
     ) -> Result<()> {
         let dir = out_dir.join("python");
         let pkg_dir = dir.join(package_name);
+        let tests_dir = dir.join("tests");
         std::fs::create_dir_all(&pkg_dir)?;
-        std::fs::write(
-            pkg_dir.join("__init__.py"),
-            stamp_hash("from .weaveffi import *  # noqa: F401,F403\n".to_string()),
-        )?;
+        std::fs::create_dir_all(&tests_dir)?;
+        std::fs::write(pkg_dir.join("__init__.py"), stamp_hash(render_init_py()))?;
         std::fs::write(
             pkg_dir.join("weaveffi.py"),
             stamp_hash(render_python_module(api, strip_module_prefix, c_prefix)),
@@ -69,6 +68,15 @@ impl PythonGenerator {
         std::fs::write(
             dir.join("setup.py"),
             stamp_hash(render_setup_py(package_name)),
+        )?;
+        std::fs::write(
+            dir.join("MANIFEST.in"),
+            stamp_hash(render_manifest_in(package_name)),
+        )?;
+        std::fs::write(tests_dir.join("__init__.py"), stamp_hash(String::new()))?;
+        std::fs::write(
+            tests_dir.join("test_smoke.py"),
+            stamp_hash(render_smoke_test(api, package_name, strip_module_prefix)),
         )?;
         // README.md is documentation, not a source file; leave it unstamped.
         std::fs::write(dir.join("README.md"), render_readme())?;
@@ -116,12 +124,11 @@ impl Generator for PythonGenerator {
                 let c_prefix = config.c_prefix();
                 let dir = out_dir.join("python");
                 let pkg_dir = dir.join(package_name);
+                let tests_dir = dir.join("tests");
                 std::fs::create_dir_all(&pkg_dir)?;
+                std::fs::create_dir_all(&tests_dir)?;
 
-                std::fs::write(
-                    pkg_dir.join("__init__.py"),
-                    stamp_hash("from .weaveffi import *  # noqa: F401,F403\n".to_string()),
-                )?;
+                std::fs::write(pkg_dir.join("__init__.py"), stamp_hash(render_init_py()))?;
 
                 let ctx = api_to_context(api);
                 let module_body = if has_module {
@@ -146,6 +153,15 @@ impl Generator for PythonGenerator {
                     dir.join("setup.py"),
                     stamp_hash(render_setup_py(package_name)),
                 )?;
+                std::fs::write(
+                    dir.join("MANIFEST.in"),
+                    stamp_hash(render_manifest_in(package_name)),
+                )?;
+                std::fs::write(tests_dir.join("__init__.py"), stamp_hash(String::new()))?;
+                std::fs::write(
+                    tests_dir.join("test_smoke.py"),
+                    stamp_hash(render_smoke_test(api, package_name, strip_module_prefix)),
+                )?;
                 std::fs::write(dir.join("README.md"), render_readme())?;
                 return Ok(());
             }
@@ -167,6 +183,9 @@ impl Generator for PythonGenerator {
                 .to_string(),
             out_dir.join("python/pyproject.toml").to_string(),
             out_dir.join("python/setup.py").to_string(),
+            out_dir.join("python/MANIFEST.in").to_string(),
+            out_dir.join("python/tests/__init__.py").to_string(),
+            out_dir.join("python/tests/test_smoke.py").to_string(),
             out_dir.join("python/README.md").to_string(),
         ]
     }
@@ -190,6 +209,9 @@ impl Generator for PythonGenerator {
                 .to_string(),
             out_dir.join("python/pyproject.toml").to_string(),
             out_dir.join("python/setup.py").to_string(),
+            out_dir.join("python/MANIFEST.in").to_string(),
+            out_dir.join("python/tests/__init__.py").to_string(),
+            out_dir.join("python/tests/test_smoke.py").to_string(),
             out_dir.join("python/README.md").to_string(),
         ]
     }
@@ -1643,17 +1665,26 @@ fn render_iterator_return(
 fn render_pyproject_toml(package_name: &str) -> String {
     format!(
         r#"[build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "{package_name}"
-version = "0.1.0"
 description = "Python bindings for WeaveFFI (auto-generated)"
 requires-python = ">=3.8"
+dynamic = ["version"]
+
+[project.optional-dependencies]
+dev = ["pytest", "mypy"]
 
 [tool.setuptools]
 packages = ["{package_name}"]
+
+[tool.setuptools.package-data]
+{package_name} = ["*.dylib", "*.so", "*.dll"]
+
+[tool.setuptools.dynamic.version]
+attr = "{package_name}.__version__"
 "#,
     )
 }
@@ -1669,6 +1700,82 @@ setup(
 )
 "#,
     )
+}
+
+/// Package `__init__.py`: declares `__version__` as a plain top-level assignment
+/// so `[tool.setuptools.dynamic.version]` can read it via AST, then re-exports
+/// the ctypes wrapper module.
+fn render_init_py() -> String {
+    "__version__ = \"0.1.0\"\n\nfrom .weaveffi import *  # noqa: E402,F401,F403\n".to_string()
+}
+
+fn render_manifest_in(package_name: &str) -> String {
+    format!(
+        "include {package_name}/*.dylib\ninclude {package_name}/*.so\ninclude {package_name}/*.dll\n"
+    )
+}
+
+fn render_smoke_test(api: &Api, package_name: &str, strip_module_prefix: bool) -> String {
+    let mut out = format!(
+        "\"\"\"Smoke tests for the generated {package_name} bindings.\"\"\"\n\nimport {package_name}\n\n\ndef test_module_is_importable() -> None:\n    assert {package_name} is not None\n    assert {package_name}.__version__\n"
+    );
+    if let Some((func_name, args)) = find_smoke_test_call(&api.modules, strip_module_prefix) {
+        let arg_list = args.join(", ");
+        out.push_str(&format!(
+            "\n\ndef test_{func_name}_is_callable() -> None:\n    _ = {package_name}.{func_name}({arg_list})\n"
+        ));
+    }
+    out
+}
+
+/// Walks the API looking for the first function whose parameters and return
+/// are all scalar (integers, floats, bool). If one is found, returns the
+/// Python wrapper name and a list of literal arguments to pass. Used to seed
+/// the generated smoke test with a concrete callable example.
+fn find_smoke_test_call(
+    modules: &[Module],
+    strip_module_prefix: bool,
+) -> Option<(String, Vec<String>)> {
+    for m in modules {
+        for f in &m.functions {
+            if f.r#async || f.cancellable {
+                continue;
+            }
+            let mut args = Vec::with_capacity(f.params.len());
+            let mut all_scalar = true;
+            for p in &f.params {
+                match scalar_literal(&p.ty) {
+                    Some(v) => args.push(v.to_string()),
+                    None => {
+                        all_scalar = false;
+                        break;
+                    }
+                }
+            }
+            if !all_scalar {
+                continue;
+            }
+            if let Some(ret) = &f.returns {
+                if scalar_literal(ret).is_none() {
+                    continue;
+                }
+            }
+            return Some((wrapper_name(&m.name, &f.name, strip_module_prefix), args));
+        }
+        if let Some(found) = find_smoke_test_call(&m.modules, strip_module_prefix) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn scalar_literal(ty: &TypeRef) -> Option<&'static str> {
+    match ty {
+        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 => Some("0"),
+        TypeRef::F64 => Some("0.0"),
+        TypeRef::Bool => Some("False"),
+        _ => None,
+    }
 }
 
 fn render_readme() -> &'static str {
@@ -1867,6 +1974,9 @@ mod tests {
                 out.join("python/weaveffi/weaveffi.pyi").to_string(),
                 out.join("python/pyproject.toml").to_string(),
                 out.join("python/setup.py").to_string(),
+                out.join("python/MANIFEST.in").to_string(),
+                out.join("python/tests/__init__.py").to_string(),
+                out.join("python/tests/test_smoke.py").to_string(),
                 out.join("python/README.md").to_string(),
             ]
         );
@@ -1887,6 +1997,9 @@ mod tests {
                 out.join("python/weaveffi/weaveffi.pyi").to_string(),
                 out.join("python/pyproject.toml").to_string(),
                 out.join("python/setup.py").to_string(),
+                out.join("python/MANIFEST.in").to_string(),
+                out.join("python/tests/__init__.py").to_string(),
+                out.join("python/tests/test_smoke.py").to_string(),
                 out.join("python/README.md").to_string(),
             ]
         );
@@ -1904,6 +2017,9 @@ mod tests {
                 out.join("python/mypkg/weaveffi.pyi").to_string(),
                 out.join("python/pyproject.toml").to_string(),
                 out.join("python/setup.py").to_string(),
+                out.join("python/MANIFEST.in").to_string(),
+                out.join("python/tests/__init__.py").to_string(),
+                out.join("python/tests/test_smoke.py").to_string(),
                 out.join("python/README.md").to_string(),
             ]
         );
@@ -4075,8 +4191,8 @@ mod tests {
             "missing project name: {pyproject}"
         );
         assert!(
-            pyproject.contains("version = \"0.1.0\""),
-            "missing version: {pyproject}"
+            pyproject.contains("dynamic = [\"version\"]"),
+            "missing dynamic version declaration: {pyproject}"
         );
         assert!(
             pyproject.contains("[tool.setuptools]"),
@@ -5770,6 +5886,9 @@ mod tests {
             "python/weaveffi/weaveffi.pyi",
             "python/pyproject.toml",
             "python/setup.py",
+            "python/MANIFEST.in",
+            "python/tests/__init__.py",
+            "python/tests/test_smoke.py",
         ] {
             let contents = std::fs::read_to_string(tmp.join(rel)).unwrap();
             assert!(
@@ -5890,5 +6009,113 @@ mod tests {
             pyproject.contains("[project]"),
             "pyproject.toml must still be produced alongside the overridden templates: {pyproject}"
         );
+    }
+
+    #[test]
+    fn python_pyproject_has_modern_metadata() {
+        let api = make_api(vec![simple_module(vec![Function {
+            name: "add".into(),
+            params: vec![
+                Param {
+                    name: "a".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                },
+                Param {
+                    name: "b".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                },
+            ],
+            returns: Some(TypeRef::I32),
+            doc: None,
+            r#async: false,
+            cancellable: false,
+            deprecated: None,
+            since: None,
+        }])]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_python_modern_metadata");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        PythonGenerator.generate(&api, out_dir).unwrap();
+
+        let pyproject = std::fs::read_to_string(tmp.join("python/pyproject.toml")).unwrap();
+        assert!(
+            pyproject.contains("requires-python = \">=3.8\""),
+            "pyproject should pin requires-python to >=3.8: {pyproject}"
+        );
+        assert!(
+            pyproject.contains("requires = [\"setuptools>=61\", \"wheel\"]"),
+            "build-system requires should include setuptools>=61 and wheel: {pyproject}"
+        );
+        assert!(
+            pyproject.contains("[project.optional-dependencies]"),
+            "pyproject should declare optional-dependencies: {pyproject}"
+        );
+        assert!(
+            pyproject.contains("dev = [\"pytest\", \"mypy\"]"),
+            "optional dev deps should include pytest and mypy: {pyproject}"
+        );
+        assert!(
+            pyproject.contains("dynamic = [\"version\"]"),
+            "pyproject should declare dynamic version: {pyproject}"
+        );
+        assert!(
+            pyproject.contains("[tool.setuptools.dynamic.version]"),
+            "pyproject should declare dynamic version source: {pyproject}"
+        );
+        assert!(
+            pyproject.contains("attr = \"weaveffi.__version__\""),
+            "dynamic version should read weaveffi.__version__: {pyproject}"
+        );
+
+        let init = std::fs::read_to_string(tmp.join("python/weaveffi/__init__.py")).unwrap();
+        assert!(
+            init.contains("__version__ = \"0.1.0\""),
+            "__init__.py must define __version__ so setuptools can read it: {init}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn python_includes_native_lib_in_package_data() {
+        let api = make_api(vec![]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_python_package_data");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        PythonGenerator.generate(&api, out_dir).unwrap();
+
+        let pyproject = std::fs::read_to_string(tmp.join("python/pyproject.toml")).unwrap();
+        assert!(
+            pyproject.contains("[tool.setuptools.package-data]"),
+            "pyproject should declare package-data: {pyproject}"
+        );
+        assert!(
+            pyproject.contains("weaveffi = [\"*.dylib\", \"*.so\", \"*.dll\"]"),
+            "package-data must include cdylib patterns for all platforms: {pyproject}"
+        );
+
+        let manifest = std::fs::read_to_string(tmp.join("python/MANIFEST.in")).unwrap();
+        for pattern in ["weaveffi/*.dylib", "weaveffi/*.so", "weaveffi/*.dll"] {
+            assert!(
+                manifest.contains(pattern),
+                "MANIFEST.in must list native library pattern {pattern}: {manifest}"
+            );
+        }
+
+        let smoke = std::fs::read_to_string(tmp.join("python/tests/test_smoke.py")).unwrap();
+        assert!(
+            smoke.contains("import weaveffi"),
+            "test_smoke.py must import the generated module: {smoke}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
