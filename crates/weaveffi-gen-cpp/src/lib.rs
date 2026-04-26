@@ -5,7 +5,7 @@ use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_abi_struct_name, local_type_name};
 use weaveffi_ir::ir::{
-    Api, CallbackDef, ErrorCode, Function, Module, StructDef, StructField, TypeRef,
+    Api, CallbackDef, ErrorCode, Function, ListenerDef, Module, StructDef, StructField, TypeRef,
 };
 
 pub struct CppGenerator;
@@ -63,6 +63,7 @@ impl Generator for CppGenerator {
     fn capabilities(&self) -> &'static [Capability] {
         &[
             Capability::Callbacks,
+            Capability::Listeners,
             Capability::Iterators,
             Capability::Builders,
             Capability::AsyncFunctions,
@@ -170,6 +171,12 @@ fn render_cpp_header(api: &Api, namespace: &str) -> String {
     }
     if collect_all_modules(&api.modules)
         .iter()
+        .any(|m| !m.listeners.is_empty())
+    {
+        out.push_str("#include <mutex>\n");
+    }
+    if collect_all_modules(&api.modules)
+        .iter()
         .any(|m| m.functions.iter().any(|f| f.r#async))
     {
         out.push_str("#include <future>\n");
@@ -193,6 +200,7 @@ fn render_cpp_header(api: &Api, namespace: &str) -> String {
         render_cpp_enums(&mut out, module);
         render_cpp_callbacks(&mut out, module);
         render_cpp_classes(&mut out, module, &path);
+        render_cpp_listeners(&mut out, module, &path);
         render_cpp_functions(&mut out, module, &error_codes, &path);
     }
     out.push_str(&format!("}} // namespace {namespace}\n"));
@@ -405,6 +413,16 @@ fn render_extern_c(out: &mut String, api: &Api) {
             ));
         }
 
+        for l in &module.listeners {
+            let cb_type = format!("weaveffi_{}_{}", path, l.event_callback);
+            let reg_fn = format!("weaveffi_{}_register_{}", path, l.name);
+            let unreg_fn = format!("weaveffi_{}_unregister_{}", path, l.name);
+            out.push_str(&format!(
+                "uint64_t {reg_fn}({cb_type} callback, void* context);\n"
+            ));
+            out.push_str(&format!("void {unreg_fn}(uint64_t id);\n"));
+        }
+
         for s in &module.structs {
             let tag = format!("weaveffi_{}_{}", path, s.name);
             out.push_str(&format!("typedef struct {tag} {tag};\n"));
@@ -602,6 +620,98 @@ fn render_cpp_callbacks(out: &mut String, module: &Module) {
             params.join(", ")
         ));
     }
+}
+
+// ── Namespace: listener wrapper classes ──
+
+/// Emit a C++ wrapper class for a listener. The class exposes:
+///   - `register_(std::function<...>)`: heap-allocates the `std::function`,
+///     installs a non-capturing C trampoline that invokes it via the
+///     `void* context` pointer, calls the C `register_*` symbol, and stores
+///     the owning `unique_ptr` in a static registry keyed by the returned
+///     listener id so it outlives the call.
+///   - `unregister_(uint64_t)`: calls the C `unregister_*` symbol and drops
+///     the owning `unique_ptr`, freeing the heap `std::function`.
+///
+/// The method is named `register_` rather than `register` because `register`
+/// is a reserved keyword in C++.
+fn render_cpp_listeners(out: &mut String, module: &Module, abi_module: &str) {
+    for l in &module.listeners {
+        render_cpp_listener(out, abi_module, l, &module.callbacks);
+    }
+}
+
+fn render_cpp_listener(
+    out: &mut String,
+    abi_module: &str,
+    l: &ListenerDef,
+    callbacks: &[CallbackDef],
+) {
+    let cb = callbacks
+        .iter()
+        .find(|c| c.name == l.event_callback)
+        .expect("validator should have ensured event callback is defined in this module");
+
+    let class_name = l.name.to_upper_camel_case();
+    let reg_sym = format!("weaveffi_{}_register_{}", abi_module, l.name);
+    let unreg_sym = format!("weaveffi_{}_unregister_{}", abi_module, l.name);
+    let cb_ty = &cb.name;
+
+    let mut tramp_params: Vec<String> = vec!["void* context".to_string()];
+    for cp in &cb.params {
+        tramp_params.push(callback_c_param_decl(&cp.ty, &cp.name));
+    }
+    let ret_c = cb
+        .returns
+        .as_ref()
+        .map(callback_c_return_type)
+        .unwrap_or_else(|| "void".to_string());
+
+    out.push_str(&format!("class {class_name} {{\n"));
+    out.push_str(&format!(
+        "    static inline std::unordered_map<uint64_t, std::unique_ptr<{cb_ty}>> registry_;\n"
+    ));
+    out.push_str("    static inline std::mutex lock_;\n\n");
+    out.push_str("public:\n");
+
+    out.push_str(&format!(
+        "    static uint64_t register_({cb_ty} callback) {{\n"
+    ));
+    out.push_str(&format!(
+        "        auto heap = std::make_unique<{cb_ty}>(std::move(callback));\n"
+    ));
+    out.push_str("        auto* raw = heap.get();\n");
+    out.push_str(&format!(
+        "        auto trampoline = +[]({}) -> {ret_c} {{\n",
+        tramp_params.join(", ")
+    ));
+    let mut cpp_args: Vec<String> = Vec::new();
+    for cp in &cb.params {
+        let (conv, arg) = callback_c_to_cpp(&cp.ty, &cp.name);
+        if !conv.is_empty() {
+            out.push_str(&format!("            {conv}\n"));
+        }
+        cpp_args.push(arg);
+    }
+    out.push_str(&format!(
+        "            return (*static_cast<{cb_ty}*>(context))({});\n",
+        cpp_args.join(", ")
+    ));
+    out.push_str("        };\n");
+    out.push_str(&format!(
+        "        uint64_t id = {reg_sym}(trampoline, raw);\n"
+    ));
+    out.push_str("        std::lock_guard<std::mutex> guard(lock_);\n");
+    out.push_str("        registry_[id] = std::move(heap);\n");
+    out.push_str("        return id;\n");
+    out.push_str("    }\n\n");
+
+    out.push_str("    static void unregister_(uint64_t id) {\n");
+    out.push_str(&format!("        {unreg_sym}(id);\n"));
+    out.push_str("        std::lock_guard<std::mutex> guard(lock_);\n");
+    out.push_str("        registry_.erase(id);\n");
+    out.push_str("    }\n");
+    out.push_str("};\n\n");
 }
 
 // ── Namespace: RAII classes ──
@@ -1628,8 +1738,8 @@ mod tests {
     use weaveffi_core::codegen::Generator;
     use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{
-        Api, CallbackDef, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param,
-        StructDef, StructField, TypeRef,
+        Api, CallbackDef, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, ListenerDef,
+        Module, Param, StructDef, StructField, TypeRef,
     };
 
     fn minimal_api() -> Api {
@@ -3855,14 +3965,9 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_excludes_listeners() {
+    fn capabilities_covers_all_features() {
         let caps = CppGenerator.capabilities();
-        assert!(caps.contains(&Capability::Callbacks));
-        assert!(!caps.contains(&Capability::Listeners));
         for cap in Capability::ALL {
-            if matches!(cap, Capability::Listeners) {
-                continue;
-            }
             assert!(caps.contains(cap), "C++ generator must support {cap:?}");
         }
     }
@@ -3959,6 +4064,104 @@ mod tests {
         assert!(
             h.contains("weaveffi_events_subscribe(cb_trampoline, cb_heap, &err);"),
             "wrapper must pass trampoline and heap pointer as the C callback + context args: {h}"
+        );
+    }
+
+    #[test]
+    fn cpp_emits_listener_class() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "events".into(),
+                functions: vec![],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![CallbackDef {
+                    name: "OnData".into(),
+                    params: vec![Param {
+                        name: "value".into(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                    }],
+                    returns: None,
+                    doc: None,
+                }],
+                listeners: vec![ListenerDef {
+                    name: "data_stream".into(),
+                    event_callback: "OnData".into(),
+                    doc: None,
+                }],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let h = render_cpp_header(&api, "weaveffi");
+
+        assert!(
+            h.contains("#include <mutex>"),
+            "should include <mutex> when listeners are present: {h}"
+        );
+        assert!(
+            h.contains(
+                "uint64_t weaveffi_events_register_data_stream(weaveffi_events_OnData callback, void* context);"
+            ),
+            "extern C should declare the register symbol: {h}"
+        );
+        assert!(
+            h.contains("void weaveffi_events_unregister_data_stream(uint64_t id);"),
+            "extern C should declare the unregister symbol: {h}"
+        );
+        assert!(
+            h.contains("class DataStream {"),
+            "missing listener wrapper class: {h}"
+        );
+        assert!(
+            h.contains(
+                "static inline std::unordered_map<uint64_t, std::unique_ptr<OnData>> registry_;"
+            ),
+            "listener class must hold a heap-allocated std::function registry keyed by id: {h}"
+        );
+        assert!(
+            h.contains("static inline std::mutex lock_;"),
+            "listener class must guard the registry with a mutex: {h}"
+        );
+        assert!(
+            h.contains("static uint64_t register_(OnData callback) {"),
+            "listener must expose static register_ taking the event callback: {h}"
+        );
+        assert!(
+            h.contains("static void unregister_(uint64_t id) {"),
+            "listener must expose static unregister_ taking the listener id: {h}"
+        );
+        assert!(
+            h.contains("auto heap = std::make_unique<OnData>(std::move(callback));"),
+            "register_ must heap-allocate the std::function: {h}"
+        );
+        assert!(
+            h.contains("auto trampoline = +[](void* context, int32_t value) -> void {"),
+            "register_ must define a non-capturing C trampoline: {h}"
+        );
+        assert!(
+            h.contains("(*static_cast<OnData*>(context))(value)"),
+            "trampoline must invoke the std::function via the context pointer: {h}"
+        );
+        assert!(
+            h.contains("uint64_t id = weaveffi_events_register_data_stream(trampoline, raw);"),
+            "register_ must call the C register symbol with trampoline and heap pointer: {h}"
+        );
+        assert!(
+            h.contains("registry_[id] = std::move(heap);"),
+            "register_ must store the owning unique_ptr in the registry keyed by id: {h}"
+        );
+        assert!(
+            h.contains("weaveffi_events_unregister_data_stream(id);"),
+            "unregister_ must call the C unregister symbol: {h}"
+        );
+        assert!(
+            h.contains("registry_.erase(id);"),
+            "unregister_ must drop the owning unique_ptr from the registry: {h}"
         );
     }
 }
