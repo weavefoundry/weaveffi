@@ -9,15 +9,25 @@ use weaveffi_ir::ir::{Api, EnumDef, Function, ListenerDef, Module, StructDef, Ty
 pub struct WasmGenerator;
 
 const DEFAULT_MODULE_NAME: &str = "weaveffi_wasm";
+const DEFAULT_C_PREFIX: &str = "weaveffi";
 
 impl WasmGenerator {
-    fn generate_impl(&self, api: &Api, out_dir: &Utf8Path, module_name: &str) -> Result<()> {
+    fn generate_impl(
+        &self,
+        api: &Api,
+        out_dir: &Utf8Path,
+        module_name: &str,
+        c_prefix: &str,
+    ) -> Result<()> {
         let wasm_dir = out_dir.join("wasm");
         std::fs::create_dir_all(&wasm_dir)?;
-        std::fs::write(wasm_dir.join("README.md"), render_wasm_readme(api))?;
+        std::fs::write(
+            wasm_dir.join("README.md"),
+            render_wasm_readme(api, c_prefix),
+        )?;
         std::fs::write(
             wasm_dir.join(format!("{module_name}.js")),
-            render_wasm_js_stub(api, module_name),
+            render_wasm_js_stub(api, module_name, c_prefix),
         )?;
         std::fs::write(
             wasm_dir.join(format!("{module_name}.d.ts")),
@@ -33,7 +43,7 @@ impl Generator for WasmGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, DEFAULT_MODULE_NAME)
+        self.generate_impl(api, out_dir, DEFAULT_MODULE_NAME, DEFAULT_C_PREFIX)
     }
 
     fn generate_with_config(
@@ -42,7 +52,7 @@ impl Generator for WasmGenerator {
         out_dir: &Utf8Path,
         config: &GeneratorConfig,
     ) -> Result<()> {
-        self.generate_impl(api, out_dir, config.wasm_module_name())
+        self.generate_impl(api, out_dir, config.wasm_module_name(), config.c_prefix())
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
@@ -160,7 +170,7 @@ fn type_display(ty: &TypeRef) -> String {
     }
 }
 
-fn render_wasm_readme(api: &Api) -> String {
+fn render_wasm_readme(api: &Api, c_prefix: &str) -> String {
     let mut out = String::new();
     out.push_str("# WeaveFFI WASM (experimental)\n\n");
     out.push_str("This folder contains a minimal stub to help you load a `wasm32-unknown-unknown` build of your WeaveFFI library.\n\n");
@@ -177,7 +187,9 @@ fn render_wasm_readme(api: &Api) -> String {
     out.push_str(
         "The host cannot inspect struct fields directly; use the generated accessor functions ",
     );
-    out.push_str("(`weaveffi_{module}_{struct}_get_{field}`) to read/write fields.\n\n");
+    out.push_str(&format!(
+        "(`{c_prefix}_{{module}}_{{struct}}_get_{{field}}`) to read/write fields.\n\n"
+    ));
     out.push_str("### Enums\n\n");
     out.push_str("Enums are passed as **`i32` values** corresponding to the variant's integer discriminant.\n\n");
     out.push_str("### Optionals\n\n");
@@ -189,9 +201,9 @@ fn render_wasm_readme(api: &Api) -> String {
     out.push_str("matching the C ABI signature `(const uint8_t* s_ptr, size_t s_len)`. ");
     out.push_str("Strings are **not** NUL-terminated at the boundary; the explicit length is authoritative. ");
     out.push_str("The generated JS `_encodeString(wasm, str)` helper UTF-8 encodes the input, copies the bytes ");
-    out.push_str(
-        "into linear memory via `weaveffi_alloc`, and returns a `[ptr, len]` tuple that is spread ",
-    );
+    out.push_str(&format!(
+        "into linear memory via `{c_prefix}_alloc`, and returns a `[ptr, len]` tuple that is spread ",
+    ));
     out.push_str("into the WASM call.\n\n");
     out.push_str("### Bytes\n\n");
     out.push_str(
@@ -205,9 +217,9 @@ fn render_wasm_readme(api: &Api) -> String {
     out.push_str(
         "retptr and the length into a separate `out_len_ptr` out-param, both in linear memory. ",
     );
-    out.push_str(
-        "The caller is responsible for freeing the returned buffer via `weaveffi_free_bytes(ptr, len)`.\n\n",
-    );
+    out.push_str(&format!(
+        "The caller is responsible for freeing the returned buffer via `{c_prefix}_free_bytes(ptr, len)`.\n\n",
+    ));
     out.push_str("### Lists\n\n");
     out.push_str("Lists are passed as a **pointer + length** pair (`i32` pointer, `i32` length) ");
     out.push_str("referencing a contiguous region in linear memory. The caller is responsible ");
@@ -230,17 +242,21 @@ fn render_wasm_readme(api: &Api) -> String {
     out.push_str("The generated JS wrappers automatically handle errors by passing an error\n");
     out.push_str("pointer as the last argument to each WASM function. Your WASM module must\n");
     out.push_str("export the following functions:\n\n");
-    out.push_str("- `weaveffi_alloc(size: i32) -> i32` — allocate `size` bytes in linear memory\n");
-    out.push_str("- `weaveffi_error_clear(err_ptr: i32)` — clear and free error resources\n");
+    out.push_str(&format!(
+        "- `{c_prefix}_alloc(size: i32) -> i32` — allocate `size` bytes in linear memory\n"
+    ));
+    out.push_str(&format!(
+        "- `{c_prefix}_error_clear(err_ptr: i32)` — clear and free error resources\n"
+    ));
 
     if !api.modules.is_empty() {
-        render_api_reference(&mut out, api);
+        render_api_reference(&mut out, api, c_prefix);
     }
 
     out
 }
 
-fn render_api_reference(out: &mut String, api: &Api) {
+fn render_api_reference(out: &mut String, api: &Api, c_prefix: &str) {
     out.push_str("\n## API Reference\n");
     for module in &api.modules {
         out.push_str(&format!("\n### Module: `{}`\n", module.name));
@@ -248,16 +264,16 @@ fn render_api_reference(out: &mut String, api: &Api) {
         if !module.functions.is_empty() {
             out.push_str("\n#### Functions\n");
             for func in &module.functions {
-                render_function_ref(out, &module.name, func);
+                render_function_ref(out, &module.name, func, c_prefix);
             }
         }
 
         if !module.structs.is_empty() {
             out.push_str("\n#### Structs\n");
             for s in &module.structs {
-                render_struct_ref(out, &module.name, s);
+                render_struct_ref(out, &module.name, s, c_prefix);
                 if s.builder {
-                    render_builder_ref(out, &module.name, s);
+                    render_builder_ref(out, &module.name, s, c_prefix);
                 }
             }
         }
@@ -271,8 +287,8 @@ fn render_api_reference(out: &mut String, api: &Api) {
     }
 }
 
-fn render_function_ref(out: &mut String, module_name: &str, func: &Function) {
-    let abi_name = format!("weaveffi_{}_{}", module_name, func.name);
+fn render_function_ref(out: &mut String, module_name: &str, func: &Function, c_prefix: &str) {
+    let abi_name = format!("{c_prefix}_{}_{}", module_name, func.name);
     out.push_str(&format!("\n##### `{abi_name}`\n\n"));
 
     if let Some(doc) = &func.doc {
@@ -316,7 +332,7 @@ fn render_function_ref(out: &mut String, module_name: &str, func: &Function) {
     }
 }
 
-fn render_struct_ref(out: &mut String, module_name: &str, s: &StructDef) {
+fn render_struct_ref(out: &mut String, module_name: &str, s: &StructDef, c_prefix: &str) {
     out.push_str(&format!("\n##### `{}`\n\n", s.name));
 
     if let Some(doc) = &s.doc {
@@ -331,7 +347,8 @@ fn render_struct_ref(out: &mut String, module_name: &str, s: &StructDef) {
         out.push_str("|----------|-------------|\n");
         for field in &s.fields {
             out.push_str(&format!(
-                "| `weaveffi_{}_{}_get_{}` | `{}` |\n",
+                "| `{}_{}_{}_get_{}` | `{}` |\n",
+                c_prefix,
                 module_name,
                 s.name,
                 field.name,
@@ -341,27 +358,27 @@ fn render_struct_ref(out: &mut String, module_name: &str, s: &StructDef) {
     }
 }
 
-fn render_builder_ref(out: &mut String, module_name: &str, s: &StructDef) {
+fn render_builder_ref(out: &mut String, module_name: &str, s: &StructDef, c_prefix: &str) {
     let name = &s.name;
     out.push_str(&format!("\n##### `{name}Builder`\n\n"));
     out.push_str(&format!("Builder for `{name}`.\n\n"));
     out.push_str("| Function | Args | Return |\n");
     out.push_str("|----------|------|--------|\n");
     out.push_str(&format!(
-        "| `weaveffi_{module_name}_{name}_Builder_new` | none | `i32` (handle) |\n"
+        "| `{c_prefix}_{module_name}_{name}_Builder_new` | none | `i32` (handle) |\n"
     ));
     for field in &s.fields {
         let wt = wasm_type(&field.ty);
         out.push_str(&format!(
-            "| `weaveffi_{module_name}_{name}_Builder_set_{}` | `i32` handle, `{wt}` value | none |\n",
+            "| `{c_prefix}_{module_name}_{name}_Builder_set_{}` | `i32` handle, `{wt}` value | none |\n",
             field.name
         ));
     }
     out.push_str(&format!(
-        "| `weaveffi_{module_name}_{name}_Builder_build` | `i32` handle | `i32` (handle) |\n"
+        "| `{c_prefix}_{module_name}_{name}_Builder_build` | `i32` handle | `i32` (handle) |\n"
     ));
     out.push_str(&format!(
-        "| `weaveffi_{module_name}_{name}_Builder_destroy` | `i32` handle | none |\n"
+        "| `{c_prefix}_{module_name}_{name}_Builder_destroy` | `i32` handle | none |\n"
     ));
 }
 
@@ -609,7 +626,7 @@ fn render_dts_listener(out: &mut String, l: &ListenerDef, indent: &str) {
     out.push_str(&format!("{indent}}};\n"));
 }
 
-fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
+fn render_wasm_js_stub(api: &Api, module_name: &str, c_prefix: &str) -> String {
     let pascal_name = module_name.to_upper_camel_case();
     let load_fn = format!("load{pascal_name}");
     let mut out = String::new();
@@ -636,7 +653,9 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
         out.push_str("const _decoder = new TextDecoder();\n\n");
         out.push_str("function _encodeString(wasm, str) {\n");
         out.push_str("  const bytes = _encoder.encode(str);\n");
-        out.push_str("  const ptr = wasm.weaveffi_alloc(bytes.length);\n");
+        out.push_str(&format!(
+            "  const ptr = wasm.{c_prefix}_alloc(bytes.length);\n"
+        ));
         out.push_str("  new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);\n");
         out.push_str("  return [ptr, bytes.length];\n");
         out.push_str("}\n\n");
@@ -647,7 +666,9 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
 
     if needs_bytes {
         out.push_str("function _encodeBytes(wasm, data) {\n");
-        out.push_str("  const ptr = wasm.weaveffi_alloc(data.length);\n");
+        out.push_str(&format!(
+            "  const ptr = wasm.{c_prefix}_alloc(data.length);\n"
+        ));
         out.push_str("  new Uint8Array(wasm.memory.buffer, ptr, data.length).set(data);\n");
         out.push_str("  return [ptr, data.length];\n");
         out.push_str("}\n\n");
@@ -660,7 +681,7 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
     let has_callback_params = api_has_callback_params(api);
     if has_functions || has_listeners {
         out.push_str("function _allocError(wasm) {\n");
-        out.push_str("  return wasm.weaveffi_alloc(8);\n");
+        out.push_str(&format!("  return wasm.{c_prefix}_alloc(8);\n"));
         out.push_str("}\n\n");
         out.push_str("function _checkError(wasm, errPtr) {\n");
         out.push_str("  const buffer = wasm.memory.buffer;\n");
@@ -673,7 +694,7 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
         out.push_str(
             "    const msg = new TextDecoder().decode(new Uint8Array(buffer, msgPtr, end));\n",
         );
-        out.push_str("    wasm.weaveffi_error_clear(errPtr);\n");
+        out.push_str(&format!("    wasm.{c_prefix}_error_clear(errPtr);\n"));
         out.push_str("    throw new Error(`WeaveFFI error ${code}: ${msg}`);\n");
         out.push_str("  }\n");
         out.push_str("}\n\n");
@@ -717,7 +738,7 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
             out.push_str("    this._handle = handle;\n");
             out.push_str("  }\n");
             for field in &s.fields {
-                let accessor = format!("weaveffi_{}_{}_get_{}", path, s.name, field.name);
+                let accessor = format!("{}_{}_{}_get_{}", c_prefix, path, s.name, field.name);
                 match &field.ty {
                     TypeRef::Iterator(_) => {
                         unreachable!("iterator not valid as struct field")
@@ -732,7 +753,9 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
                     }
                     TypeRef::StringUtf8 => {
                         out.push_str(&format!("  get {}() {{\n", field.name));
-                        out.push_str("    const retptr = this._wasm.weaveffi_alloc(8);\n");
+                        out.push_str(&format!(
+                            "    const retptr = this._wasm.{c_prefix}_alloc(8);\n"
+                        ));
                         out.push_str(&format!(
                             "    this._wasm.{}(retptr, this._handle);\n",
                             accessor
@@ -766,7 +789,9 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
     }
     out.push_str(" *\n");
     out.push_str(" * Exported functions follow the C ABI naming convention:\n");
-    out.push_str(" *   weaveffi_{module}_{function}(params...) -> result\n");
+    out.push_str(&format!(
+        " *   {c_prefix}_{{module}}_{{function}}(params...) -> result\n"
+    ));
     out.push_str(" *\n");
     out.push_str(" * @example\n");
     out.push_str(&format!(" * const api = await {load_fn}('lib.wasm');\n"));
@@ -844,7 +869,7 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
         out.push_str("  return {\n");
         out.push_str("    _raw: wasm,\n");
         for module in &api.modules {
-            render_js_module_object(&mut out, module, &module.name, "    ");
+            render_js_module_object(&mut out, module, &module.name, "    ", c_prefix);
         }
         out.push_str("  };\n");
     }
@@ -853,7 +878,13 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
     out
 }
 
-fn render_js_module_object(out: &mut String, m: &Module, module_path: &str, indent: &str) {
+fn render_js_module_object(
+    out: &mut String,
+    m: &Module,
+    module_path: &str,
+    indent: &str,
+    c_prefix: &str,
+) {
     let has_content = !m.functions.is_empty()
         || !m.listeners.is_empty()
         || m.modules
@@ -883,27 +914,27 @@ fn render_js_module_object(out: &mut String, m: &Module, module_path: &str, inde
     for func in &m.functions {
         let mut buf = String::new();
         if func.r#async {
-            emit_js_async_function_wrapper(&mut buf, module_path, func);
+            emit_js_async_function_wrapper(&mut buf, module_path, func, c_prefix);
         } else {
-            emit_js_function_wrapper(&mut buf, module_path, func);
+            emit_js_function_wrapper(&mut buf, module_path, func, c_prefix);
         }
         reindent(&buf, out);
     }
     for l in &m.listeners {
         let mut buf = String::new();
-        emit_js_listener_wrapper(&mut buf, module_path, l);
+        emit_js_listener_wrapper(&mut buf, module_path, l, c_prefix);
         reindent(&buf, out);
     }
     let child_indent = format!("{indent}  ");
     for sub in &m.modules {
         let sub_path = format!("{module_path}_{}", sub.name);
-        render_js_module_object(out, sub, &sub_path, &child_indent);
+        render_js_module_object(out, sub, &sub_path, &child_indent, c_prefix);
     }
     out.push_str(&format!("{indent}}},\n"));
 }
 
-fn emit_js_function_wrapper(out: &mut String, module_name: &str, func: &Function) {
-    let abi_name = format!("weaveffi_{}_{}", module_name, func.name);
+fn emit_js_function_wrapper(out: &mut String, module_name: &str, func: &Function, c_prefix: &str) {
+    let abi_name = format!("{c_prefix}_{}_{}", module_name, func.name);
     let js_params: Vec<&str> = func.params.iter().map(|p| p.name.as_str()).collect();
     let indent = "        ";
 
@@ -926,14 +957,18 @@ fn emit_js_function_wrapper(out: &mut String, module_name: &str, func: &Function
     );
 
     if returns_string {
-        out.push_str(&format!("{indent}const retptr = wasm.weaveffi_alloc(8);\n"));
+        out.push_str(&format!(
+            "{indent}const retptr = wasm.{c_prefix}_alloc(8);\n"
+        ));
         wasm_args.push("retptr".to_string());
     } else if returns_bytes {
         // Mirror the C ABI: retptr receives the returned `uint8_t*` (i32),
         // while `out_len` stays an explicit out-parameter for the length.
-        out.push_str(&format!("{indent}const retptr = wasm.weaveffi_alloc(4);\n"));
         out.push_str(&format!(
-            "{indent}const out_len_ptr = wasm.weaveffi_alloc(4);\n"
+            "{indent}const retptr = wasm.{c_prefix}_alloc(4);\n"
+        ));
+        out.push_str(&format!(
+            "{indent}const out_len_ptr = wasm.{c_prefix}_alloc(4);\n"
         ));
         wasm_args.push("retptr".to_string());
     }
@@ -1005,7 +1040,7 @@ fn emit_js_function_wrapper(out: &mut String, module_name: &str, func: &Function
             out.push_str(&format!(
                 "{indent}const _result = _decodeString(wasm, _strPtr, _strLen);\n"
             ));
-            out.push_str(&format!("{indent}wasm.weaveffi_free_string(_strPtr);\n"));
+            out.push_str(&format!("{indent}wasm.{c_prefix}_free_string(_strPtr);\n"));
             out.push_str(&format!("{indent}return _result;\n"));
         }
         Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
@@ -1024,7 +1059,7 @@ fn emit_js_function_wrapper(out: &mut String, module_name: &str, func: &Function
                 "{indent}const _result = new Uint8Array(wasm.memory.buffer, _bytesPtr, _bytesLen).slice();\n"
             ));
             out.push_str(&format!(
-                "{indent}wasm.weaveffi_free_bytes(_bytesPtr, _bytesLen);\n"
+                "{indent}wasm.{c_prefix}_free_bytes(_bytesPtr, _bytesLen);\n"
             ));
             out.push_str(&format!("{indent}return _result;\n"));
         }
@@ -1063,16 +1098,16 @@ fn emit_js_function_wrapper(out: &mut String, module_name: &str, func: &Function
 ///
 /// `register(callback)` pins the JS callback into the WASM indirect function
 /// table via `_registerCallback` (from the callback support phase), calls the
-/// C register symbol `weaveffi_{module}_register_{listener}` with
+/// C register symbol `{c_prefix}_{module}_register_{listener}` with
 /// `(table_index, 0, _err)`, stores the callback in a per-object Map keyed by
 /// the returned i64 id (exposed to JS as a BigInt), and returns the id.
 ///
-/// `unregister(id)` calls `weaveffi_{module}_unregister_{listener}(id, _err)`
+/// `unregister(id)` calls `{c_prefix}_{module}_unregister_{listener}(id, _err)`
 /// and removes the callback from the Map.
-fn emit_js_listener_wrapper(out: &mut String, module_name: &str, l: &ListenerDef) {
+fn emit_js_listener_wrapper(out: &mut String, module_name: &str, l: &ListenerDef, c_prefix: &str) {
     let class_name = l.name.to_upper_camel_case();
-    let reg_fn = format!("weaveffi_{}_register_{}", module_name, l.name);
-    let unreg_fn = format!("weaveffi_{}_unregister_{}", module_name, l.name);
+    let reg_fn = format!("{c_prefix}_{}_register_{}", module_name, l.name);
+    let unreg_fn = format!("{c_prefix}_{}_unregister_{}", module_name, l.name);
     let indent = "        ";
 
     if let Some(doc) = &l.doc {
@@ -1163,8 +1198,13 @@ fn async_cb_wasm_params(returns: Option<&TypeRef>) -> Vec<&'static str> {
     params
 }
 
-fn emit_js_async_function_wrapper(out: &mut String, module_name: &str, func: &Function) {
-    let abi_name = format!("weaveffi_{}_{}", module_name, func.name);
+fn emit_js_async_function_wrapper(
+    out: &mut String,
+    module_name: &str,
+    func: &Function,
+    c_prefix: &str,
+) {
+    let abi_name = format!("{c_prefix}_{}_{}", module_name, func.name);
     let mut js_params: Vec<String> = func.params.iter().map(|p| p.name.clone()).collect();
     if func.cancellable {
         js_params.push("{ signal } = {}".to_string());
@@ -1267,12 +1307,12 @@ fn emit_js_async_function_wrapper(out: &mut String, module_name: &str, func: &Fu
     let cb_params = async_cb_wasm_params(func.returns.as_ref());
     let sig_key = cb_params.join("_");
     if func.cancellable {
-        // Bridge `AbortSignal` to `weaveffi_cancel_token_cancel`: allocate a
-        // native token, forward abort notifications to it, and register a
+        // Bridge `AbortSignal` to `{c_prefix}_cancel_token_cancel`: allocate
+        // a native token, forward abort notifications to it, and register a
         // cleanup hook so `_asyncHandler` destroys the token and unregisters
         // the abort listener when the promise settles.
         out.push_str(&format!(
-            "{indent2}const _cancelTok = wasm.weaveffi_cancel_token_create();\n"
+            "{indent2}const _cancelTok = wasm.{c_prefix}_cancel_token_create();\n"
         ));
         out.push_str(&format!("{indent2}let _abortHandler = null;\n"));
         out.push_str(&format!(
@@ -1283,17 +1323,17 @@ fn emit_js_async_function_wrapper(out: &mut String, module_name: &str, func: &Fu
             "{indent2}  if (signal && _abortHandler) signal.removeEventListener('abort', _abortHandler);\n"
         ));
         out.push_str(&format!(
-            "{indent2}  wasm.weaveffi_cancel_token_destroy(_cancelTok);\n"
+            "{indent2}  wasm.{c_prefix}_cancel_token_destroy(_cancelTok);\n"
         ));
         out.push_str(&format!("{indent2}}};\n"));
         out.push_str(&format!("{indent2}if (signal) {{\n"));
         out.push_str(&format!("{indent2}  if (signal.aborted) {{\n"));
         out.push_str(&format!(
-            "{indent2}    wasm.weaveffi_cancel_token_cancel(_cancelTok);\n"
+            "{indent2}    wasm.{c_prefix}_cancel_token_cancel(_cancelTok);\n"
         ));
         out.push_str(&format!("{indent2}  }} else {{\n"));
         out.push_str(&format!(
-            "{indent2}    _abortHandler = () => wasm.weaveffi_cancel_token_cancel(_cancelTok);\n"
+            "{indent2}    _abortHandler = () => wasm.{c_prefix}_cancel_token_cancel(_cancelTok);\n"
         ));
         out.push_str(&format!(
             "{indent2}    signal.addEventListener('abort', _abortHandler, {{ once: true }});\n"
@@ -1411,7 +1451,7 @@ mod tests {
 
     #[test]
     fn readme_documents_structs() {
-        let readme = render_wasm_readme(&empty_api());
+        let readme = render_wasm_readme(&empty_api(), DEFAULT_C_PREFIX);
         assert!(readme.contains("### Structs"));
         assert!(readme.contains("opaque handles"));
         assert!(readme.contains("`i64` pointers"));
@@ -1419,7 +1459,7 @@ mod tests {
 
     #[test]
     fn readme_documents_enums() {
-        let readme = render_wasm_readme(&empty_api());
+        let readme = render_wasm_readme(&empty_api(), DEFAULT_C_PREFIX);
         assert!(readme.contains("### Enums"));
         assert!(readme.contains("`i32` values"));
         assert!(readme.contains("discriminant"));
@@ -1427,7 +1467,7 @@ mod tests {
 
     #[test]
     fn readme_documents_optionals() {
-        let readme = render_wasm_readme(&empty_api());
+        let readme = render_wasm_readme(&empty_api(), DEFAULT_C_PREFIX);
         assert!(readme.contains("### Optionals"));
         assert!(readme.contains("`0` / `null`"));
         assert!(readme.contains("_is_present"));
@@ -1435,7 +1475,7 @@ mod tests {
 
     #[test]
     fn readme_documents_lists() {
-        let readme = render_wasm_readme(&empty_api());
+        let readme = render_wasm_readme(&empty_api(), DEFAULT_C_PREFIX);
         assert!(readme.contains("### Lists"));
         assert!(readme.contains("pointer + length"));
         assert!(readme.contains("`i32` pointer, `i32` length"));
@@ -1443,7 +1483,7 @@ mod tests {
 
     #[test]
     fn js_stub_has_jsdoc() {
-        let js = render_wasm_js_stub(&empty_api(), DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(&empty_api(), DEFAULT_MODULE_NAME, DEFAULT_C_PREFIX);
         assert!(js.contains("@param {string} url"));
         assert!(js.contains("@returns {Promise<WebAssembly.Exports>}"));
         assert!(js.contains("@example"));
@@ -1451,7 +1491,7 @@ mod tests {
 
     #[test]
     fn js_stub_documents_complex_types() {
-        let js = render_wasm_js_stub(&empty_api(), DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(&empty_api(), DEFAULT_MODULE_NAME, DEFAULT_C_PREFIX);
         assert!(js.contains("Struct handle: () -> i64 (opaque pointer)"));
         assert!(js.contains("Enum: (i32 discriminant) -> void"));
         assert!(js.contains("Optional: (i32 is_present, i32 value) -> void"));
@@ -1460,7 +1500,7 @@ mod tests {
 
     #[test]
     fn js_stub_has_type_convention_header() {
-        let js = render_wasm_js_stub(&empty_api(), DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(&empty_api(), DEFAULT_MODULE_NAME, DEFAULT_C_PREFIX);
         assert!(js.contains("Structs   -> i64 opaque handle"));
         assert!(js.contains("Enums     -> i32 discriminant value"));
         assert!(js.contains("Optionals -> 0/null for absent"));
@@ -1487,32 +1527,32 @@ mod tests {
 
     #[test]
     fn empty_api_has_no_api_reference() {
-        let readme = render_wasm_readme(&empty_api());
+        let readme = render_wasm_readme(&empty_api(), DEFAULT_C_PREFIX);
         assert!(!readme.contains("## API Reference"));
     }
 
     #[test]
     fn api_reference_lists_module() {
-        let readme = render_wasm_readme(&sample_api());
+        let readme = render_wasm_readme(&sample_api(), DEFAULT_C_PREFIX);
         assert!(readme.contains("## API Reference"));
         assert!(readme.contains("### Module: `math`"));
     }
 
     #[test]
     fn api_reference_function_abi_name() {
-        let readme = render_wasm_readme(&sample_api());
+        let readme = render_wasm_readme(&sample_api(), DEFAULT_C_PREFIX);
         assert!(readme.contains("##### `weaveffi_math_add`"));
     }
 
     #[test]
     fn api_reference_function_signature() {
-        let readme = render_wasm_readme(&sample_api());
+        let readme = render_wasm_readme(&sample_api(), DEFAULT_C_PREFIX);
         assert!(readme.contains("`weaveffi_math_add(a: i32, b: i32) -> i32`"));
     }
 
     #[test]
     fn api_reference_function_param_table() {
-        let readme = render_wasm_readme(&sample_api());
+        let readme = render_wasm_readme(&sample_api(), DEFAULT_C_PREFIX);
         assert!(readme.contains("| `a` | `i32` | `i32` | native WASM i32 |"));
         assert!(readme.contains("| `b` | `i32` | `i32` | native WASM i32 |"));
         assert!(readme.contains("| _returns_ | `i32` | `i32` | native WASM i32 |"));
@@ -1520,13 +1560,13 @@ mod tests {
 
     #[test]
     fn api_reference_function_doc() {
-        let readme = render_wasm_readme(&sample_api());
+        let readme = render_wasm_readme(&sample_api(), DEFAULT_C_PREFIX);
         assert!(readme.contains("Add two numbers"));
     }
 
     #[test]
     fn api_reference_struct_accessors() {
-        let readme = render_wasm_readme(&sample_api());
+        let readme = render_wasm_readme(&sample_api(), DEFAULT_C_PREFIX);
         assert!(readme.contains("##### `Point`"));
         assert!(readme.contains("opaque handle (`i64`)"));
         assert!(readme.contains("| `weaveffi_math_Point_get_x` | `f64` |"));
@@ -1535,7 +1575,7 @@ mod tests {
 
     #[test]
     fn api_reference_enum_discriminants() {
-        let readme = render_wasm_readme(&sample_api());
+        let readme = render_wasm_readme(&sample_api(), DEFAULT_C_PREFIX);
         assert!(readme.contains("##### `Color`"));
         assert!(readme.contains("`i32` discriminant"));
         assert!(readme.contains("| `Red` | `0` |"));
@@ -1675,7 +1715,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let readme = render_wasm_readme(&api);
+        let readme = render_wasm_readme(&api, DEFAULT_C_PREFIX);
         assert!(readme.contains("| `name` | `string` | `i32, i32` | ptr + len in linear memory |"));
         assert!(readme.contains("| _returns_ | `Contact?` | `i64` | opaque handle, 0 = absent |"));
         assert!(readme.contains("| `weaveffi_contacts_Contact_get_id` | `i32` |"));
@@ -1707,7 +1747,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let readme = render_wasm_readme(&api);
+        let readme = render_wasm_readme(&api, DEFAULT_C_PREFIX);
         assert!(readme.contains("-> void`"));
         assert!(!readme.contains("_returns_"));
     }
@@ -1736,7 +1776,7 @@ mod tests {
                 modules: vec![],
             },
         ]);
-        let readme = render_wasm_readme(&api);
+        let readme = render_wasm_readme(&api, DEFAULT_C_PREFIX);
         assert!(readme.contains("### Module: `math`"));
         assert!(readme.contains("### Module: `io`"));
     }
@@ -1761,7 +1801,7 @@ mod tests {
     #[test]
     fn wasm_js_has_api_functions() {
         let api = sample_api();
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME, DEFAULT_C_PREFIX);
         assert!(js.contains("add(a, b)"));
         assert!(js.contains("wasm.weaveffi_math_add(a, b, _err)"));
         assert!(js.contains("class Point"));
@@ -1824,7 +1864,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME, DEFAULT_C_PREFIX);
         assert!(js.contains("function _encodeString(wasm, str)"));
         assert!(js.contains("function _decodeString(wasm, ptr, len)"));
         assert!(js.contains("TextEncoder"));
@@ -1838,7 +1878,7 @@ mod tests {
     #[test]
     fn wasm_js_has_error_helpers() {
         let api = sample_api();
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME, DEFAULT_C_PREFIX);
         assert!(js.contains("function _allocError(wasm)"));
         assert!(js.contains("function _checkError(wasm, errPtr)"));
     }
@@ -1846,7 +1886,7 @@ mod tests {
     #[test]
     fn wasm_js_function_passes_err() {
         let api = sample_api();
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME, DEFAULT_C_PREFIX);
         assert!(js.contains("const _err = _allocError(wasm)"));
         assert!(js.contains("_checkError(wasm, _err)"));
     }
@@ -1933,7 +1973,7 @@ mod tests {
             dts.contains("contact: Contact"),
             "TypedHandle should use class type not bigint: {dts}"
         );
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME, DEFAULT_C_PREFIX);
         assert!(
             js.contains("contact._handle"),
             "TypedHandle should extract ._handle: {js}"
@@ -2109,7 +2149,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME, DEFAULT_C_PREFIX);
 
         let decode_pos = js
             .find("_decodeString(wasm, _strPtr, _strLen)")
@@ -2164,7 +2204,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME, DEFAULT_C_PREFIX);
         assert!(
             js.contains("_encodeString(wasm, name)"),
             "string param should be copied to WASM memory via _encodeString"
@@ -2226,7 +2266,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME, DEFAULT_C_PREFIX);
         assert!(
             js.contains("result === 0n ? null : new Contact(wasm, result)"),
             "optional struct return should null-check before wrapping"
@@ -2258,7 +2298,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME, DEFAULT_C_PREFIX);
         assert!(
             js.contains("new Promise"),
             "async function should return a Promise: {js}"
@@ -2326,7 +2366,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME, DEFAULT_C_PREFIX);
 
         assert!(
             js.contains("run(id, { signal } = {})"),
@@ -2486,7 +2526,7 @@ mod tests {
             dts.contains("inner_fn(): number"),
             "nested child function in DTS missing: {dts}"
         );
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME, DEFAULT_C_PREFIX);
         assert!(
             js.contains("weaveffi_parent_outer_fn"),
             "parent C ABI call in JS missing: {js}"
@@ -2529,7 +2569,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME, DEFAULT_C_PREFIX);
 
         assert!(
             js.contains("function _encodeString(wasm, str) {"),
@@ -2611,7 +2651,7 @@ mod tests {
             "WASM call must NOT drop the length and pass ptr as NUL-terminated: {js}"
         );
 
-        let readme = render_wasm_readme(&api);
+        let readme = render_wasm_readme(&api, DEFAULT_C_PREFIX);
         assert!(
             readme.contains("### Strings"),
             "README must document the string ABI convention: {readme}"
@@ -2665,7 +2705,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let readme = render_wasm_readme(&api);
+        let readme = render_wasm_readme(&api, DEFAULT_C_PREFIX);
         assert!(
             readme.contains("### Bytes"),
             "README must document the canonical bytes ABI: {readme}"
@@ -2679,7 +2719,7 @@ mod tests {
             "API reference must render the Bytes param as (i32, i32): {readme}"
         );
 
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME, DEFAULT_C_PREFIX);
         assert!(
             js.contains("const [payload_ptr, payload_len] = _encodeBytes(wasm, payload);"),
             "JS stub must destructure bytes input into canonical (payload_ptr, payload_len) via _encodeBytes: {js}"
@@ -2711,7 +2751,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let readme = render_wasm_readme(&api);
+        let readme = render_wasm_readme(&api, DEFAULT_C_PREFIX);
         assert!(
             readme.contains("### Bytes"),
             "README must document the canonical bytes ABI: {readme}"
@@ -2729,7 +2769,7 @@ mod tests {
             "API reference must render the Bytes return as (i32, i32): {readme}"
         );
 
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME, DEFAULT_C_PREFIX);
         assert!(
             js.contains("const _bytesPtr = view.getInt32(retptr, true);"),
             "JS stub must read returned bytes pointer from retptr matching canonical uint8_t* out_ptr: {js}"
@@ -2746,7 +2786,7 @@ mod tests {
 
     #[test]
     fn wasm_check_error_calls_weaveffi_error_clear() {
-        let js = render_wasm_js_stub(&sample_api(), DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(&sample_api(), DEFAULT_MODULE_NAME, DEFAULT_C_PREFIX);
         let def_pos = js
             .find("function _checkError(wasm, errPtr) {")
             .expect("_checkError must be defined");
@@ -2797,7 +2837,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME, DEFAULT_C_PREFIX);
 
         let copy_pos = js
             .find("new Uint8Array(wasm.memory.buffer, _bytesPtr, _bytesLen).slice()")
@@ -2856,7 +2896,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME, DEFAULT_C_PREFIX);
         assert!(
             js.contains("function _registerCallback(wasm, jsFn) {"),
             "JS must define _registerCallback helper: {js}"
@@ -2896,7 +2936,7 @@ mod tests {
             "generated .d.ts function signature must reference the callback type alias: {dts}"
         );
 
-        let readme = render_wasm_readme(&api);
+        let readme = render_wasm_readme(&api, DEFAULT_C_PREFIX);
         assert!(
             readme.contains("### Callbacks"),
             "README must document the callback ABI convention: {readme}"
@@ -2937,7 +2977,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME, DEFAULT_C_PREFIX);
         assert!(
             js.contains("function _registerCallback(wasm, jsFn) {"),
             "listeners must emit the shared _registerCallback helper from the callback phase: {js}"
@@ -2995,6 +3035,194 @@ mod tests {
         assert!(
             dts.contains("unregister(id: bigint): void;"),
             "dts listener must declare unregister(id: bigint): void: {dts}"
+        );
+    }
+
+    #[test]
+    fn wasm_js_calls_respect_c_prefix() {
+        // When `c_prefix` is overridden, every `wasm.weaveffi_X_Y` call in the
+        // generated JS wrapper must become `wasm.{c_prefix}_X_Y` so the WASM
+        // imports line up with the C ABI exported by the weaveffi-gen-c
+        // output (which itself respects `c_prefix`), and the README must
+        // document the matching `{c_prefix}_alloc` / `{c_prefix}_error_clear`
+        // exports the WASM module is expected to provide.
+        let api = make_api(vec![Module {
+            name: "math".into(),
+            functions: vec![
+                Function {
+                    name: "add".into(),
+                    params: vec![
+                        Param {
+                            name: "a".into(),
+                            ty: TypeRef::I32,
+                            mutable: false,
+                        },
+                        Param {
+                            name: "b".into(),
+                            ty: TypeRef::I32,
+                            mutable: false,
+                        },
+                    ],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "echo".into(),
+                    params: vec![Param {
+                        name: "s".into(),
+                        ty: TypeRef::StringUtf8,
+                        mutable: false,
+                    }],
+                    returns: Some(TypeRef::StringUtf8),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "blob".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::Bytes),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "run".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: true,
+                    cancellable: true,
+                    deprecated: None,
+                    since: None,
+                },
+            ],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![ListenerDef {
+                name: "ticks".into(),
+                event_callback: "OnTick".into(),
+                doc: None,
+            }],
+            errors: None,
+            modules: vec![],
+        }]);
+        let mut api = api;
+        api.modules[0].callbacks.push(CallbackDef {
+            name: "OnTick".into(),
+            params: vec![Param {
+                name: "n".into(),
+                ty: TypeRef::I32,
+                mutable: false,
+            }],
+            returns: None,
+            doc: None,
+        });
+
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME, "myffi");
+
+        assert!(
+            js.contains("wasm.myffi_alloc("),
+            "alloc helpers must call wasm.myffi_alloc when c_prefix is overridden: {js}"
+        );
+        assert!(
+            !js.contains("wasm.weaveffi_alloc("),
+            "no wasm.weaveffi_alloc call may leak when c_prefix is overridden: {js}"
+        );
+        assert!(
+            js.contains("wasm.myffi_error_clear(errPtr);"),
+            "_checkError must call wasm.myffi_error_clear when c_prefix is overridden: {js}"
+        );
+        assert!(
+            !js.contains("wasm.weaveffi_error_clear("),
+            "no wasm.weaveffi_error_clear call may leak when c_prefix is overridden: {js}"
+        );
+        assert!(
+            js.contains("wasm.myffi_math_add(a, b, _err)"),
+            "module function calls must use the myffi prefix: {js}"
+        );
+        assert!(
+            !js.contains("wasm.weaveffi_math_add("),
+            "no default-prefixed module call may leak when c_prefix is overridden: {js}"
+        );
+        assert!(
+            js.contains("wasm.myffi_free_string(_strPtr)"),
+            "string-return free must call wasm.myffi_free_string: {js}"
+        );
+        assert!(
+            js.contains("wasm.myffi_free_bytes(_bytesPtr, _bytesLen)"),
+            "bytes-return free must call wasm.myffi_free_bytes: {js}"
+        );
+        assert!(
+            js.contains("wasm.myffi_cancel_token_create()"),
+            "cancellable async must call wasm.myffi_cancel_token_create: {js}"
+        );
+        assert!(
+            js.contains("wasm.myffi_cancel_token_cancel(_cancelTok)"),
+            "abort forwarding must call wasm.myffi_cancel_token_cancel: {js}"
+        );
+        assert!(
+            js.contains("wasm.myffi_cancel_token_destroy(_cancelTok)"),
+            "cleanup must call wasm.myffi_cancel_token_destroy: {js}"
+        );
+        assert!(
+            !js.contains("wasm.weaveffi_cancel_token_"),
+            "no default-prefixed cancel token call may leak when c_prefix is overridden: {js}"
+        );
+        assert!(
+            js.contains("wasm.myffi_math_run_async("),
+            "async export call must use the myffi prefix: {js}"
+        );
+        assert!(
+            js.contains("wasm.myffi_math_register_ticks("),
+            "listener register must call the myffi-prefixed C symbol: {js}"
+        );
+        assert!(
+            js.contains("wasm.myffi_math_unregister_ticks("),
+            "listener unregister must call the myffi-prefixed C symbol: {js}"
+        );
+
+        let readme = render_wasm_readme(&api, "myffi");
+        assert!(
+            readme.contains("`myffi_alloc(size: i32) -> i32`"),
+            "README must document the prefix-derived alloc export: {readme}"
+        );
+        assert!(
+            readme.contains("`myffi_error_clear(err_ptr: i32)`"),
+            "README must document the prefix-derived error_clear export: {readme}"
+        );
+        assert!(
+            readme.contains("via `myffi_alloc`"),
+            "README must reference myffi_alloc inside the strings section: {readme}"
+        );
+        assert!(
+            readme.contains("`myffi_free_bytes(ptr, len)`"),
+            "README must reference myffi_free_bytes inside the bytes section: {readme}"
+        );
+        assert!(
+            readme.contains("`myffi_{module}_{struct}_get_{field}`"),
+            "README struct accessor template must use the myffi prefix: {readme}"
+        );
+        assert!(
+            readme.contains("##### `myffi_math_add`"),
+            "README API Reference must name the function with the myffi prefix: {readme}"
+        );
+        assert!(
+            !readme.contains("`weaveffi_alloc("),
+            "README must not leak the default `weaveffi_alloc` export when c_prefix is overridden: {readme}"
+        );
+        assert!(
+            !readme.contains("`weaveffi_error_clear("),
+            "README must not leak the default `weaveffi_error_clear` export when c_prefix is overridden: {readme}"
         );
     }
 }
