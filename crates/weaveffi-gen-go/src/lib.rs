@@ -53,6 +53,7 @@ impl Generator for GoGenerator {
             Capability::Listeners,
             Capability::Iterators,
             Capability::Builders,
+            Capability::AsyncFunctions,
             Capability::CancellableAsync,
             Capability::TypedHandles,
             Capability::BorrowedTypes,
@@ -207,22 +208,28 @@ fn has_any_callbacks(api: &Api) -> bool {
         .any(|m| !m.callbacks.is_empty())
 }
 
-fn scan_imports(api: &Api) -> (bool, bool, bool, bool, bool) {
-    let has_sync_funcs = collect_all_modules(&api.modules)
+fn has_any_async(api: &Api) -> bool {
+    collect_all_modules(&api.modules)
         .iter()
-        .any(|m| m.functions.iter().any(|f| !f.r#async));
+        .any(|m| m.functions.iter().any(|f| f.r#async))
+}
+
+fn scan_imports(api: &Api) -> (bool, bool, bool, bool, bool) {
+    let has_funcs = collect_all_modules(&api.modules)
+        .iter()
+        .any(|m| !m.functions.is_empty());
 
     let has_builders = collect_all_modules(&api.modules)
         .iter()
         .any(|m| m.structs.iter().any(|s| s.builder));
 
-    let needs_fmt = has_sync_funcs || has_builders;
+    let needs_fmt = has_funcs || has_builders;
 
-    let has_callbacks = has_any_callbacks(api);
+    let needs_registry = has_any_callbacks(api) || has_any_async(api);
 
-    let needs_unsafe = has_callbacks
+    let needs_unsafe = needs_registry
         || collect_all_modules(&api.modules).iter().any(|m| {
-            m.functions.iter().filter(|f| !f.r#async).any(|f| {
+            m.functions.iter().any(|f| {
                 f.params.iter().any(|p| param_uses_unsafe(&p.ty))
                     || f.returns.as_ref().is_some_and(return_uses_unsafe)
             }) || m
@@ -232,7 +239,7 @@ fn scan_imports(api: &Api) -> (bool, bool, bool, bool, bool) {
         });
 
     let needs_bool = collect_all_modules(&api.modules).iter().any(|m| {
-        m.functions.iter().filter(|f| !f.r#async).any(|f| {
+        m.functions.iter().any(|f| {
             f.params.iter().any(|p| type_has_bool(&p.ty))
                 || f.returns.as_ref().is_some_and(type_has_bool)
         }) || m
@@ -250,7 +257,7 @@ fn scan_imports(api: &Api) -> (bool, bool, bool, bool, bool) {
         needs_unsafe,
         needs_bool,
         needs_runtime,
-        has_callbacks,
+        needs_registry,
     )
 }
 
@@ -575,10 +582,408 @@ fn render_listener(out: &mut String, module_path: &str, l: &ListenerDef) {
     out.push_str("}\n\n");
 }
 
+// ── Async emission ──
+
+/// Go type for the `Value` field of the generated `<Name>Result` struct.
+/// `None` means the function returns no value and the struct has only `Err`.
+fn async_value_go_type(ret: &Option<TypeRef>) -> Option<String> {
+    ret.as_ref().map(go_type)
+}
+
+/// (c_decl_type, go_cgo_type) for a type used as an element or scalar result.
+/// E.g. I32 -> ("int32_t", "C.int32_t"); Struct("Foo") -> ("weaveffi_m_Foo*", "*C.weaveffi_m_Foo").
+/// Strings are single-pointer element types (`const char*`).
+fn async_result_types(ty: &TypeRef, module: &str) -> (String, String) {
+    match ty {
+        TypeRef::I32 => ("int32_t".into(), "C.int32_t".into()),
+        TypeRef::U32 => ("uint32_t".into(), "C.uint32_t".into()),
+        TypeRef::I64 | TypeRef::Handle => ("int64_t".into(), "C.int64_t".into()),
+        TypeRef::F64 => ("double".into(), "C.double".into()),
+        TypeRef::Bool => ("bool".into(), "C._Bool".into()),
+        TypeRef::Enum(n) => (
+            format!("weaveffi_{module}_{n}"),
+            format!("C.weaveffi_{module}_{n}"),
+        ),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => ("const char*".into(), "*C.char".into()),
+        TypeRef::Struct(n) | TypeRef::TypedHandle(n) => (
+            format!("weaveffi_{module}_{n}*"),
+            format!("*C.weaveffi_{module}_{n}"),
+        ),
+        _ => ("void*".into(), "unsafe.Pointer".into()),
+    }
+}
+
+/// (c_param_decl, go_cgo_param_decl) pairs following `(void* context, weaveffi_error* err)`.
+fn async_cb_params(ret: &Option<TypeRef>, module: &str) -> Vec<(String, String)> {
+    match ret {
+        None => vec![],
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => vec![
+            ("const uint8_t* result".into(), "result *C.uint8_t".into()),
+            ("size_t result_len".into(), "resultLen C.size_t".into()),
+        ],
+        Some(TypeRef::List(inner)) => {
+            let (c_elem, go_elem) = async_result_types(inner, module);
+            vec![
+                (format!("{c_elem}* result"), format!("result *{go_elem}")),
+                ("size_t result_len".into(), "resultLen C.size_t".into()),
+            ]
+        }
+        Some(TypeRef::Map(k, v)) => {
+            let (kc, kg) = async_result_types(k, module);
+            let (vc, vg) = async_result_types(v, module);
+            vec![
+                (format!("{kc}* result_keys"), format!("resultKeys *{kg}")),
+                (
+                    format!("{vc}* result_values"),
+                    format!("resultValues *{vg}"),
+                ),
+                ("size_t result_len".into(), "resultLen C.size_t".into()),
+            ]
+        }
+        Some(TypeRef::Optional(inner)) => match inner.as_ref() {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                vec![("const char* result".into(), "result *C.char".into())]
+            }
+            TypeRef::Struct(n) | TypeRef::TypedHandle(n) => vec![(
+                format!("weaveffi_{module}_{n}* result"),
+                format!("result *C.weaveffi_{module}_{n}"),
+            )],
+            _ => {
+                let (c, g) = async_result_types(inner, module);
+                vec![(format!("const {c}* result"), format!("result *{g}"))]
+            }
+        },
+        Some(ty) => {
+            let (c, g) = async_result_types(ty, module);
+            vec![(format!("{c} result"), format!("result {g}"))]
+        }
+    }
+}
+
+fn async_cb_extern_c_params(ret: &Option<TypeRef>, module: &str) -> Vec<String> {
+    async_cb_params(ret, module)
+        .into_iter()
+        .map(|(c, _)| c)
+        .collect()
+}
+
+fn async_cb_go_params(ret: &Option<TypeRef>, module: &str) -> Vec<String> {
+    async_cb_params(ret, module)
+        .into_iter()
+        .map(|(_, g)| g)
+        .collect()
+}
+
+/// Just the Go cgo types (no names), matching `async_cb_go_params`, used to
+/// build the type-assertion target in the trampoline body.
+fn async_cb_go_param_types(ret: &Option<TypeRef>, module: &str) -> Vec<String> {
+    async_cb_go_params(ret, module)
+        .into_iter()
+        .map(|decl| {
+            decl.split_once(' ')
+                .map(|(_, ty)| ty.to_string())
+                .unwrap_or(decl)
+        })
+        .collect()
+}
+
+/// Names only (matching `async_cb_go_params`), used when calling the closure
+/// from the trampoline.
+fn async_cb_go_param_names(ret: &Option<TypeRef>) -> Vec<String> {
+    match ret {
+        None => vec![],
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) | Some(TypeRef::List(_)) => {
+            vec!["result".into(), "resultLen".into()]
+        }
+        Some(TypeRef::Map(_, _)) => vec![
+            "resultKeys".into(),
+            "resultValues".into(),
+            "resultLen".into(),
+        ],
+        Some(_) => vec!["result".into()],
+    }
+}
+
+/// Emit code that populates `res.Value` from the trampoline locals.
+/// `indent` is the whitespace prefix for each emitted line.
+fn emit_async_value_from_cb_params(out: &mut String, indent: &str, ret: &TypeRef, module: &str) {
+    match ret {
+        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::F64 => {
+            let conv = go_scalar_conv("result", ret);
+            out.push_str(&format!("{indent}res.Value = {conv}\n"));
+        }
+        TypeRef::Bool => {
+            out.push_str(&format!("{indent}res.Value = cToBool(result)\n"));
+        }
+        TypeRef::Enum(n) => {
+            let name = n.to_upper_camel_case();
+            out.push_str(&format!("{indent}res.Value = {name}(result)\n"));
+        }
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            out.push_str(&format!("{indent}if result != nil {{\n"));
+            out.push_str(&format!("{indent}\tres.Value = C.GoString(result)\n"));
+            out.push_str(&format!("{indent}\tC.weaveffi_free_string(result)\n"));
+            out.push_str(&format!("{indent}}}\n"));
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            out.push_str(&format!("{indent}if result != nil && resultLen > 0 {{\n"));
+            out.push_str(&format!(
+                "{indent}\tres.Value = C.GoBytes(unsafe.Pointer(result), C.int(resultLen))\n"
+            ));
+            out.push_str(&format!(
+                "{indent}\tC.weaveffi_free_bytes(result, resultLen)\n"
+            ));
+            out.push_str(&format!("{indent}}}\n"));
+        }
+        TypeRef::TypedHandle(n) => {
+            let name = n.to_upper_camel_case();
+            out.push_str(&format!("{indent}if result != nil {{\n"));
+            out.push_str(&format!("{indent}\tres.Value = &{name}{{ptr: result}}\n"));
+            out.push_str(&format!("{indent}}}\n"));
+        }
+        TypeRef::Struct(n) => {
+            let name = local_type_name(n).to_upper_camel_case();
+            out.push_str(&format!("{indent}res.Value = new{name}(result)\n"));
+        }
+        TypeRef::List(inner) => {
+            out.push_str(&format!("{indent}if result != nil && resultLen > 0 {{\n"));
+            out.push_str(&format!("{indent}\tcount := int(resultLen)\n"));
+            let gi = go_type(inner);
+            out.push_str(&format!("{indent}\tgoResult := make([]{gi}, count)\n"));
+            if let Some(ct) = c_scalar_type(inner, module) {
+                out.push_str(&format!(
+                    "{indent}\tcSlice := unsafe.Slice((*{ct})(unsafe.Pointer(result)), count)\n"
+                ));
+                out.push_str(&format!("{indent}\tfor i, v := range cSlice {{\n"));
+                let conv = go_scalar_conv("v", inner);
+                out.push_str(&format!("{indent}\t\tgoResult[i] = {conv}\n"));
+                out.push_str(&format!("{indent}\t}}\n"));
+            } else if matches!(inner.as_ref(), TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
+                out.push_str(&format!(
+                    "{indent}\tcSlice := unsafe.Slice((**C.char)(unsafe.Pointer(result)), count)\n"
+                ));
+                out.push_str(&format!("{indent}\tfor i, v := range cSlice {{\n"));
+                out.push_str(&format!("{indent}\t\tgoResult[i] = C.GoString(v)\n"));
+                out.push_str(&format!("{indent}\t}}\n"));
+            } else if let TypeRef::TypedHandle(n) = inner.as_ref() {
+                let ct = format!("C.weaveffi_{module}_{n}");
+                let gs = n.to_upper_camel_case();
+                out.push_str(&format!(
+                    "{indent}\tcSlice := unsafe.Slice((**{ct})(unsafe.Pointer(result)), count)\n"
+                ));
+                out.push_str(&format!("{indent}\tfor i, v := range cSlice {{\n"));
+                out.push_str(&format!("{indent}\t\tgoResult[i] = &{gs}{{ptr: v}}\n"));
+                out.push_str(&format!("{indent}\t}}\n"));
+            } else if let TypeRef::Struct(n) = inner.as_ref() {
+                let ct = format!("C.weaveffi_{module}_{n}");
+                let gs = local_type_name(n).to_upper_camel_case();
+                out.push_str(&format!(
+                    "{indent}\tcSlice := unsafe.Slice((**{ct})(unsafe.Pointer(result)), count)\n"
+                ));
+                out.push_str(&format!("{indent}\tfor i, v := range cSlice {{\n"));
+                out.push_str(&format!("{indent}\t\tgoResult[i] = new{gs}(v)\n"));
+                out.push_str(&format!("{indent}\t}}\n"));
+            }
+            out.push_str(&format!("{indent}\tres.Value = goResult\n"));
+            out.push_str(&format!("{indent}}}\n"));
+        }
+        TypeRef::Map(k, v) => {
+            let gk = go_type(k);
+            let gv = go_type(v);
+            out.push_str(&format!("{indent}res.Value = make(map[{gk}]{gv})\n"));
+        }
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                out.push_str(&format!("{indent}if result != nil {{\n"));
+                out.push_str(&format!("{indent}\tv := C.GoString(result)\n"));
+                out.push_str(&format!("{indent}\tC.weaveffi_free_string(result)\n"));
+                out.push_str(&format!("{indent}\tres.Value = &v\n"));
+                out.push_str(&format!("{indent}}}\n"));
+            }
+            TypeRef::Struct(n) => {
+                let name = local_type_name(n).to_upper_camel_case();
+                out.push_str(&format!("{indent}res.Value = new{name}(result)\n"));
+            }
+            TypeRef::TypedHandle(n) => {
+                let name = n.to_upper_camel_case();
+                out.push_str(&format!("{indent}if result != nil {{\n"));
+                out.push_str(&format!("{indent}\tres.Value = &{name}{{ptr: result}}\n"));
+                out.push_str(&format!("{indent}}}\n"));
+            }
+            TypeRef::Bool => {
+                out.push_str(&format!("{indent}if result != nil {{\n"));
+                out.push_str(&format!("{indent}\tv := cToBool(*result)\n"));
+                out.push_str(&format!("{indent}\tres.Value = &v\n"));
+                out.push_str(&format!("{indent}}}\n"));
+            }
+            TypeRef::Enum(n) => {
+                let name = n.to_upper_camel_case();
+                out.push_str(&format!("{indent}if result != nil {{\n"));
+                out.push_str(&format!("{indent}\tv := {name}(*result)\n"));
+                out.push_str(&format!("{indent}\tres.Value = &v\n"));
+                out.push_str(&format!("{indent}}}\n"));
+            }
+            _ => {
+                let gi = go_type(inner);
+                out.push_str(&format!("{indent}if result != nil {{\n"));
+                out.push_str(&format!("{indent}\tv := {gi}(*result)\n"));
+                out.push_str(&format!("{indent}\tres.Value = &v\n"));
+                out.push_str(&format!("{indent}}}\n"));
+            }
+        },
+        TypeRef::Iterator(_) => {
+            unreachable!("iterator return is not valid for async functions")
+        }
+        TypeRef::Callback(_) => {
+            unreachable!("callback return is not valid for async functions")
+        }
+    }
+}
+
+fn render_async_trampoline_extern_decl(out: &mut String, module: &str, f: &Function) {
+    let mut params = vec![
+        "void* context".to_string(),
+        "weaveffi_error* err".to_string(),
+    ];
+    params.extend(async_cb_extern_c_params(&f.returns, module));
+    out.push_str(&format!(
+        "extern void weaveffiGoAsyncTrampoline_{module}_{}({});\n",
+        f.name,
+        params.join(", ")
+    ));
+}
+
+fn render_async_function(out: &mut String, module: &str, f: &Function) {
+    let c_sym = c_symbol_name(module, &f.name);
+    let go_name = format!("{}_{}", module, f.name).to_upper_camel_case();
+    let result_ty = format!("{go_name}Result");
+    let trampoline = format!("weaveffiGoAsyncTrampoline_{module}_{}", f.name);
+    let cb_type = format!("{c_sym}_callback");
+
+    // Result struct.
+    out.push_str(&format!("type {result_ty} struct {{\n"));
+    if let Some(value_ty) = async_value_go_type(&f.returns) {
+        out.push_str(&format!("\tValue {value_ty}\n"));
+    }
+    out.push_str("\tErr error\n");
+    out.push_str("}\n\n");
+
+    // Trampoline.
+    let go_param_types = async_cb_go_param_types(&f.returns, module);
+    let go_param_names = async_cb_go_param_names(&f.returns);
+    let cb_asserted_sig = {
+        let mut parts = vec!["*C.weaveffi_error".to_string()];
+        parts.extend(go_param_types.iter().cloned());
+        format!("func({})", parts.join(", "))
+    };
+
+    let mut trampoline_params = vec![
+        "ctx unsafe.Pointer".to_string(),
+        "err *C.weaveffi_error".to_string(),
+    ];
+    trampoline_params.extend(async_cb_go_params(&f.returns, module));
+
+    out.push_str(&format!("//export {trampoline}\n"));
+    out.push_str(&format!(
+        "func {trampoline}({}) {{\n",
+        trampoline_params.join(", ")
+    ));
+    out.push_str("\tv, ok := _callbackRegistry.Load(int64(uintptr(ctx)))\n");
+    out.push_str("\tif !ok {\n\t\treturn\n\t}\n");
+    out.push_str(&format!("\tcb, ok := v.({cb_asserted_sig})\n"));
+    out.push_str("\tif !ok {\n\t\treturn\n\t}\n");
+    let mut call_args = vec!["err".to_string()];
+    call_args.extend(go_param_names.iter().cloned());
+    out.push_str(&format!("\tcb({})\n", call_args.join(", ")));
+    out.push_str("}\n\n");
+
+    // Wrapper function.
+    let go_params: Vec<String> = f
+        .params
+        .iter()
+        .map(|p| format!("{} {}", p.name.to_lower_camel_case(), go_type(&p.ty)))
+        .collect();
+
+    if let Some(msg) = &f.deprecated {
+        out.push_str(&format!("// Deprecated: {msg}\n"));
+    }
+
+    out.push_str(&format!(
+        "func {go_name}({}) <-chan {result_ty} {{\n",
+        go_params.join(", ")
+    ));
+    out.push_str(&format!("\tch := make(chan {result_ty}, 1)\n"));
+    out.push_str("\tgo func() {\n");
+    out.push_str("\t\tdefer close(ch)\n");
+    out.push_str("\t\tdone := make(chan struct{})\n");
+
+    // Build the closure signature: func(err *C.weaveffi_error, <extra params>).
+    let mut closure_params = vec!["err *C.weaveffi_error".to_string()];
+    closure_params.extend(async_cb_go_params(&f.returns, module));
+    out.push_str(&format!(
+        "\t\tcb := func({}) {{\n",
+        closure_params.join(", ")
+    ));
+    out.push_str(&format!("\t\t\tvar res {result_ty}\n"));
+    out.push_str("\t\t\tif err != nil && err.code != 0 {\n");
+    out.push_str("\t\t\t\tres.Err = fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(err.message), int(err.code))\n");
+    out.push_str("\t\t\t\tC.weaveffi_error_clear(err)\n");
+    out.push_str("\t\t\t}");
+    if let Some(ret) = &f.returns {
+        out.push_str(" else {\n");
+        emit_async_value_from_cb_params(out, "\t\t\t\t", ret, module);
+        out.push_str("\t\t\t}\n");
+    } else {
+        out.push('\n');
+    }
+    out.push_str("\t\t\tch <- res\n");
+    out.push_str("\t\t\tclose(done)\n");
+    out.push_str("\t\t}\n");
+
+    out.push_str("\t\ttoken := _callbackRegister(cb)\n");
+    out.push_str("\t\tdefer _callbackRegistry.Delete(token)\n");
+    out.push_str("\t\tctx := unsafe.Pointer(uintptr(token))\n");
+
+    // Marshal input params using the same helpers as sync functions.
+    let mut pre = String::new();
+    let mut c_args: Vec<String> = Vec::new();
+    for p in &f.params {
+        emit_param(
+            &mut pre,
+            &mut c_args,
+            &p.name.to_lower_camel_case(),
+            &p.ty,
+            module,
+        );
+    }
+    // emit_param writes with single-tab indent; reindent to two tabs for the goroutine.
+    for line in pre.lines() {
+        out.push('\t');
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    out.push_str(&format!(
+        "\t\tfn := (C.{cb_type})(unsafe.Pointer(C.{trampoline}))\n"
+    ));
+
+    if f.cancellable {
+        c_args.push("nil".into());
+    }
+    c_args.push("fn".into());
+    c_args.push("ctx".into());
+    out.push_str(&format!("\t\tC.{c_sym}_async({})\n", c_args.join(", ")));
+
+    out.push_str("\t\t<-done\n");
+    out.push_str("\t}()\n");
+    out.push_str("\treturn ch\n");
+    out.push_str("}\n\n");
+}
+
 // ── Top-level rendering ──
 
 fn render_go(api: &Api) -> String {
-    let (needs_fmt, needs_unsafe, needs_bool, needs_runtime, has_callbacks) = scan_imports(api);
+    let (needs_fmt, needs_unsafe, needs_bool, needs_runtime, needs_registry) = scan_imports(api);
     let mut out = String::new();
 
     out.push_str("package weaveffi\n\n");
@@ -587,17 +992,20 @@ fn render_go(api: &Api) -> String {
     out.push_str("#cgo LDFLAGS: -lweaveffi\n");
     out.push_str("#include \"weaveffi.h\"\n");
     out.push_str("#include <stdlib.h>\n");
-    if has_callbacks {
-        for (m, path) in collect_modules_with_path(&api.modules) {
-            for cb in &m.callbacks {
-                render_callback_extern_decl(&mut out, cb, &path);
+    for (m, path) in collect_modules_with_path(&api.modules) {
+        for cb in &m.callbacks {
+            render_callback_extern_decl(&mut out, cb, &path);
+        }
+        for f in &m.functions {
+            if f.r#async {
+                render_async_trampoline_extern_decl(&mut out, &path, f);
             }
         }
     }
     out.push_str("*/\n");
     out.push_str("import \"C\"\n");
 
-    if needs_fmt || needs_unsafe || needs_runtime || has_callbacks {
+    if needs_fmt || needs_unsafe || needs_runtime || needs_registry {
         out.push_str("\nimport (\n");
         if needs_fmt {
             out.push_str("\t\"fmt\"\n");
@@ -605,7 +1013,7 @@ fn render_go(api: &Api) -> String {
         if needs_runtime {
             out.push_str("\t\"runtime\"\n");
         }
-        if has_callbacks {
+        if needs_registry {
             out.push_str("\t\"sync\"\n");
             out.push_str("\t\"sync/atomic\"\n");
         }
@@ -616,7 +1024,7 @@ fn render_go(api: &Api) -> String {
     }
     out.push('\n');
 
-    if has_callbacks {
+    if needs_registry {
         render_callback_registry(&mut out);
     }
 
@@ -649,7 +1057,9 @@ fn render_go(api: &Api) -> String {
             }
         }
         for f in &m.functions {
-            if !f.r#async {
+            if f.r#async {
+                render_async_function(&mut out, &path, f);
+            } else {
                 render_function(&mut out, &path, f);
             }
         }
@@ -2102,7 +2512,7 @@ mod tests {
     }
 
     #[test]
-    fn async_functions_skipped() {
+    fn async_functions_emitted() {
         let api = Api {
             version: "0.1.0".into(),
             modules: vec![Module {
@@ -2128,8 +2538,100 @@ mod tests {
         };
         let go = render_go(&api);
         assert!(
-            !go.contains("func TasksRun("),
-            "async functions should be skipped: {go}"
+            go.contains("func TasksRun("),
+            "async function wrapper should be emitted: {go}"
+        );
+    }
+
+    #[test]
+    fn go_async_returns_channel() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "tasks".into(),
+                functions: vec![
+                    Function {
+                        name: "run".into(),
+                        params: vec![Param {
+                            name: "id".into(),
+                            ty: TypeRef::I32,
+                            mutable: false,
+                        }],
+                        returns: Some(TypeRef::StringUtf8),
+                        doc: None,
+                        r#async: true,
+                        cancellable: false,
+                        deprecated: None,
+                        since: None,
+                    },
+                    Function {
+                        name: "cancellable_run".into(),
+                        params: vec![],
+                        returns: Some(TypeRef::I32),
+                        doc: None,
+                        r#async: true,
+                        cancellable: true,
+                        deprecated: None,
+                        since: None,
+                    },
+                ],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let go = render_go(&api);
+        assert!(
+            go.contains("type TasksRunResult struct {"),
+            "Result struct should be emitted: {go}"
+        );
+        assert!(
+            go.contains("Value string"),
+            "Result struct should carry value field: {go}"
+        );
+        assert!(
+            go.contains("Err error"),
+            "Result struct should carry error field: {go}"
+        );
+        assert!(
+            go.contains("func TasksRun(id int32) <-chan TasksRunResult {"),
+            "wrapper should return a receive-only channel: {go}"
+        );
+        assert!(
+            go.contains("ch := make(chan TasksRunResult, 1)"),
+            "wrapper should create a buffered channel: {go}"
+        );
+        assert!(
+            go.contains("go func() {"),
+            "wrapper should spawn a goroutine: {go}"
+        );
+        assert!(
+            go.contains("defer close(ch)"),
+            "goroutine should close the channel on exit: {go}"
+        );
+        assert!(
+            go.contains("_callbackRegister(cb)"),
+            "callback should be registered before invoking the C entry point: {go}"
+        );
+        assert!(
+            go.contains("//export weaveffiGoAsyncTrampoline_tasks_run"),
+            "exported trampoline should be emitted: {go}"
+        );
+        assert!(
+            go.contains("C.weaveffi_tasks_run_async("),
+            "the _async C entry point should be invoked: {go}"
+        );
+        assert!(
+            go.contains("C.weaveffi_tasks_cancellable_run_async("),
+            "cancellable async should still use the _async entry point: {go}"
+        );
+        assert!(
+            go.contains("return ch"),
+            "wrapper should return the channel: {go}"
         );
     }
 
@@ -3689,17 +4191,14 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_includes_callbacks_listeners_iterators_builders_excludes_async() {
+    fn capabilities_includes_callbacks_listeners_iterators_builders_async() {
         let caps = GoGenerator.capabilities();
         assert!(caps.contains(&Capability::Callbacks));
         assert!(caps.contains(&Capability::Listeners));
         assert!(caps.contains(&Capability::Iterators));
         assert!(caps.contains(&Capability::Builders));
-        assert!(!caps.contains(&Capability::AsyncFunctions));
+        assert!(caps.contains(&Capability::AsyncFunctions));
         for cap in Capability::ALL {
-            if matches!(cap, Capability::AsyncFunctions) {
-                continue;
-            }
             assert!(caps.contains(cap), "Go generator must support {cap:?}");
         }
     }
