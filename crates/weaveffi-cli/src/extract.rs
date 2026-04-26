@@ -394,6 +394,28 @@ fn extract_callback(item: &syn::ItemFn) -> Result<CallbackDef> {
     })
 }
 
+fn parse_struct_args(attrs: &[syn::Attribute]) -> Result<bool> {
+    let mut builder = false;
+    for attr in attrs {
+        if !attr.path().is_ident("weaveffi_struct") {
+            continue;
+        }
+        if !matches!(attr.meta, syn::Meta::List(_)) {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("builder") {
+                builder = true;
+            } else {
+                return Err(meta.error("unknown weaveffi_struct argument"));
+            }
+            Ok(())
+        })
+        .map_err(|e| eyre!("weaveffi_struct: {e}"))?;
+    }
+    Ok(builder)
+}
+
 fn extract_struct(item: &syn::ItemStruct) -> Result<StructDef> {
     let name = item.ident.to_string();
     let fields = match &item.fields {
@@ -421,7 +443,7 @@ fn extract_struct(item: &syn::ItemStruct) -> Result<StructDef> {
         name,
         doc: extract_doc(&item.attrs),
         fields,
-        builder: false,
+        builder: parse_struct_args(&item.attrs)?,
     })
 }
 
@@ -875,6 +897,47 @@ mod tests {
         assert_eq!(f.params[1].name, "y");
         assert_eq!(f.params[1].ty, TypeRef::F64);
         assert_eq!(f.returns, Some(TypeRef::F64));
+    }
+
+    #[test]
+    fn extract_struct_with_builder_attribute() {
+        let src = r#"
+            mod m {
+                #[weaveffi_struct(builder)]
+                struct Config {
+                    host: String,
+                    port: i32,
+                }
+
+                #[weaveffi_struct]
+                struct Point {
+                    x: f64,
+                    y: f64,
+                }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let structs = &api.modules[0].structs;
+        assert_eq!(structs.len(), 2);
+        assert_eq!(structs[0].name, "Config");
+        assert!(structs[0].builder);
+        assert_eq!(structs[1].name, "Point");
+        assert!(!structs[1].builder);
+    }
+
+    #[test]
+    fn extract_struct_with_unknown_arg_errors() {
+        let src = r#"
+            mod m {
+                #[weaveffi_struct(wat)]
+                struct Bad { x: i32 }
+            }
+        "#;
+        let err = extract_api_from_rust(src).unwrap_err();
+        assert!(
+            format!("{err}").contains("weaveffi_struct"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
