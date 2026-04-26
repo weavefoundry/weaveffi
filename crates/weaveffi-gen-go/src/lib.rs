@@ -2937,4 +2937,186 @@ mod tests {
             "Close must null out the pointer: {go}"
         );
     }
+
+    #[test]
+    fn go_struct_setter_string_uses_byteslice_pointer_and_length() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "contacts".into(),
+                functions: vec![Function {
+                    name: "set_contact_name".into(),
+                    params: vec![
+                        Param {
+                            name: "contact".into(),
+                            ty: TypeRef::TypedHandle("Contact".into()),
+                            mutable: false,
+                        },
+                        Param {
+                            name: "new_name".into(),
+                            ty: TypeRef::StringUtf8,
+                            mutable: false,
+                        },
+                    ],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![StructDef {
+                    name: "Contact".into(),
+                    doc: None,
+                    builder: false,
+                    fields: vec![StructField {
+                        name: "name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                        default: None,
+                    }],
+                }],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let go = render_go(&api);
+
+        let fn_start = go
+            .find("func ContactsSetContactName(")
+            .expect("ContactsSetContactName wrapper");
+        let fn_body = &go[fn_start..];
+        let fn_text = &fn_body[..fn_body.find("\n}\n").unwrap()];
+
+        assert!(
+            fn_text.contains("newNameBytes := []byte(newName)"),
+            "struct setter should convert string param to []byte: {fn_text}"
+        );
+        assert!(
+            fn_text.contains("var cNewNamePtr *C.uint8_t"),
+            "struct setter should declare *C.uint8_t pointer var: {fn_text}"
+        );
+        assert!(
+            fn_text.contains("cNewNameLen := C.size_t(len(newNameBytes))"),
+            "struct setter should compute C.size_t length: {fn_text}"
+        );
+        assert!(
+            fn_text.contains("if len(newNameBytes) > 0 {"),
+            "struct setter should guard pointer with len > 0: {fn_text}"
+        );
+        assert!(
+            fn_text.contains("cNewNamePtr = (*C.uint8_t)(unsafe.Pointer(&newNameBytes[0]))"),
+            "struct setter should compute ptr from &newNameBytes[0]: {fn_text}"
+        );
+        assert!(
+            fn_text.contains(
+                "C.weaveffi_contacts_set_contact_name(contact.ptr, cNewNamePtr, cNewNameLen, &cErr)"
+            ),
+            "struct setter should call C with (handle.ptr, ptr, len, &cErr): {fn_text}"
+        );
+        assert!(
+            !fn_text.contains("C.CString(newName)"),
+            "struct setter must not use C.CString: {fn_text}"
+        );
+        assert!(
+            !fn_text.contains("defer C.free"),
+            "struct setter must not defer C.free for the string param: {fn_text}"
+        );
+    }
+
+    #[test]
+    fn go_builder_setter_string_uses_byteslice_pointer_and_length() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "contacts".into(),
+                functions: vec![Function {
+                    name: "Contact_Builder_set_name".into(),
+                    params: vec![
+                        Param {
+                            name: "builder".into(),
+                            ty: TypeRef::Handle,
+                            mutable: true,
+                        },
+                        Param {
+                            name: "value".into(),
+                            ty: TypeRef::StringUtf8,
+                            mutable: false,
+                        },
+                    ],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![StructDef {
+                    name: "Contact".into(),
+                    doc: None,
+                    builder: true,
+                    fields: vec![StructField {
+                        name: "name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                        default: None,
+                    }],
+                }],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let go = render_go(&api);
+
+        let fn_start = go
+            .find("func ContactsContactBuilderSetName(")
+            .expect("ContactsContactBuilderSetName wrapper");
+        let fn_body = &go[fn_start..];
+        let fn_text = &fn_body[..fn_body.find("\n}\n").unwrap()];
+
+        assert!(
+            fn_text.contains("valueBytes := []byte(value)"),
+            "builder setter should convert string param to []byte: {fn_text}"
+        );
+        assert!(
+            fn_text.contains("var cValuePtr *C.uint8_t"),
+            "builder setter should declare *C.uint8_t pointer var: {fn_text}"
+        );
+        assert!(
+            fn_text.contains("cValueLen := C.size_t(len(valueBytes))"),
+            "builder setter should compute C.size_t length: {fn_text}"
+        );
+        assert!(
+            fn_text.contains("if len(valueBytes) > 0 {"),
+            "builder setter should guard pointer with len > 0: {fn_text}"
+        );
+        assert!(
+            fn_text.contains("cValuePtr = (*C.uint8_t)(unsafe.Pointer(&valueBytes[0]))"),
+            "builder setter should compute ptr from &valueBytes[0]: {fn_text}"
+        );
+        assert!(
+            fn_text.contains(
+                "C.weaveffi_contacts_Contact_Builder_set_name(C.weaveffi_handle_t(builder), cValuePtr, cValueLen, &cErr)"
+            ),
+            "builder setter should call C with (handle, ptr, len, &cErr): {fn_text}"
+        );
+        assert!(
+            !fn_text.contains("C.CString(value)"),
+            "builder setter must not use C.CString: {fn_text}"
+        );
+        assert!(
+            !fn_text.contains("defer C.free"),
+            "builder setter must not defer C.free for the string param: {fn_text}"
+        );
+    }
 }
