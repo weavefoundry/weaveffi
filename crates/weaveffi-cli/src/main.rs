@@ -234,6 +234,8 @@ enum Commands {
         /// Shell to generate completions for
         shell: clap_complete::Shell,
     },
+    /// List every available target with language, runtime, status, and primary output file
+    Targets,
     SchemaVersion,
     CheckStamp {
         /// Directory of generated files to scan
@@ -335,6 +337,7 @@ fn main() -> Result<()> {
             }
         }
         Commands::Completions { shell } => cmd_completions(shell),
+        Commands::Targets => cmd_targets(format)?,
         Commands::SchemaVersion => println!("{CURRENT_SCHEMA_VERSION}"),
         Commands::CheckStamp {
             dir,
@@ -1854,6 +1857,147 @@ fn cmd_completions(shell: clap_complete::Shell) {
     );
 }
 
+/// Metadata for one generator target, printed by `weaveffi targets`.
+#[derive(Debug, Serialize)]
+struct TargetInfo {
+    name: &'static str,
+    language: &'static str,
+    runtime: &'static str,
+    status: &'static str,
+    emits: &'static str,
+}
+
+/// Static list of every generator target shipped with WeaveFFI, in the same
+/// order the generators are registered in `cmd_generate`. Runtime versions
+/// mirror what each generator bakes into its emitted manifests (pyproject,
+/// go.mod, pubspec, csproj, build.gradle, Package.swift, gemspec).
+const TARGETS: &[TargetInfo] = &[
+    TargetInfo {
+        name: "c",
+        language: "C",
+        runtime: "C99",
+        status: "stable",
+        emits: "c/weaveffi.h",
+    },
+    TargetInfo {
+        name: "cpp",
+        language: "C++",
+        runtime: "C++ >= 17",
+        status: "stable",
+        emits: "cpp/weaveffi.hpp",
+    },
+    TargetInfo {
+        name: "swift",
+        language: "Swift",
+        runtime: "Swift >= 5.7",
+        status: "stable",
+        emits: "swift/Package.swift",
+    },
+    TargetInfo {
+        name: "android",
+        language: "Kotlin/JNI",
+        runtime: "Kotlin >= 1.9",
+        status: "stable",
+        emits: "android/build.gradle",
+    },
+    TargetInfo {
+        name: "node",
+        language: "Node.js",
+        runtime: "Node >= 18",
+        status: "stable",
+        emits: "node/index.js",
+    },
+    TargetInfo {
+        name: "wasm",
+        language: "JavaScript",
+        runtime: "WebAssembly MVP",
+        status: "experimental",
+        emits: "wasm/weaveffi_wasm.js",
+    },
+    TargetInfo {
+        name: "python",
+        language: "Python",
+        runtime: "Python >= 3.8",
+        status: "stable",
+        emits: "python/weaveffi/__init__.py",
+    },
+    TargetInfo {
+        name: "dotnet",
+        language: "C#",
+        runtime: ".NET >= 8.0",
+        status: "stable",
+        emits: "dotnet/WeaveFFI.cs",
+    },
+    TargetInfo {
+        name: "dart",
+        language: "Dart",
+        runtime: "Dart >= 3.0",
+        status: "stable",
+        emits: "dart/lib/weaveffi.dart",
+    },
+    TargetInfo {
+        name: "go",
+        language: "Go",
+        runtime: "Go >= 1.21",
+        status: "stable",
+        emits: "go/weaveffi.go",
+    },
+    TargetInfo {
+        name: "ruby",
+        language: "Ruby",
+        runtime: "Ruby >= 2.7",
+        status: "stable",
+        emits: "ruby/lib/weaveffi.rb",
+    },
+];
+
+fn cmd_targets(format: OutputFormat) -> Result<()> {
+    if format.is_json() {
+        emit_json(&TARGETS)?;
+        return Ok(());
+    }
+
+    let headers = ["TARGET", "LANGUAGE", "RUNTIME", "STATUS", "EMITS"];
+    let mut widths = headers.map(str::len);
+    for t in TARGETS {
+        widths[0] = widths[0].max(t.name.len());
+        widths[1] = widths[1].max(t.language.len());
+        widths[2] = widths[2].max(t.runtime.len());
+        widths[3] = widths[3].max(t.status.len());
+        widths[4] = widths[4].max(t.emits.len());
+    }
+
+    println!(
+        "{:w0$}  {:w1$}  {:w2$}  {:w3$}  {:w4$}",
+        headers[0],
+        headers[1],
+        headers[2],
+        headers[3],
+        headers[4],
+        w0 = widths[0],
+        w1 = widths[1],
+        w2 = widths[2],
+        w3 = widths[3],
+        w4 = widths[4],
+    );
+    for t in TARGETS {
+        println!(
+            "{:w0$}  {:w1$}  {:w2$}  {:w3$}  {:w4$}",
+            t.name,
+            t.language,
+            t.runtime,
+            t.status,
+            t.emits,
+            w0 = widths[0],
+            w1 = widths[1],
+            w2 = widths[2],
+            w3 = widths[3],
+            w4 = widths[4],
+        );
+    }
+    Ok(())
+}
+
 fn sanitize_module_name(name: &str) -> String {
     let lowered = name.to_lowercase();
     let mut out = String::with_capacity(lowered.len());
@@ -3050,5 +3194,94 @@ mod tests {
             !cmd_verify(&out_str, None, true).unwrap(),
             "verify must fail when a tracked file is modified"
         );
+    }
+
+    #[test]
+    fn targets_lists_all_eleven() {
+        assert_eq!(
+            TARGETS.len(),
+            11,
+            "TARGETS must advertise every supported generator"
+        );
+
+        let expected = [
+            "c", "cpp", "swift", "android", "node", "wasm", "python", "dotnet", "dart", "go",
+            "ruby",
+        ];
+        let names: Vec<&str> = TARGETS.iter().map(|t| t.name).collect();
+        assert_eq!(
+            names, expected,
+            "TARGETS order must match the generator registration order"
+        );
+
+        for t in TARGETS {
+            assert!(!t.language.is_empty(), "{}: missing language", t.name);
+            assert!(!t.runtime.is_empty(), "{}: missing runtime", t.name);
+            assert!(
+                matches!(t.status, "stable" | "experimental"),
+                "{}: unexpected status {}",
+                t.name,
+                t.status
+            );
+            assert!(
+                t.emits.starts_with(&format!("{}/", t.name)),
+                "{}: emitted file {} should live under {}/",
+                t.name,
+                t.emits,
+                t.name
+            );
+        }
+
+        let text = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .arg("targets")
+            .output()
+            .expect("failed to run weaveffi targets");
+        assert!(
+            text.status.success(),
+            "weaveffi targets failed: {}",
+            String::from_utf8_lossy(&text.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&text.stdout);
+        for t in TARGETS {
+            assert!(
+                stdout.contains(t.name),
+                "missing target {} in text output: {stdout}",
+                t.name
+            );
+            assert!(
+                stdout.contains(t.emits),
+                "missing emitted file {} in text output: {stdout}",
+                t.emits
+            );
+        }
+        for header in ["TARGET", "LANGUAGE", "RUNTIME", "STATUS", "EMITS"] {
+            assert!(
+                stdout.contains(header),
+                "missing header {header} in text output: {stdout}"
+            );
+        }
+
+        let json = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .args(["--format", "json", "targets"])
+            .output()
+            .expect("failed to run weaveffi --format json targets");
+        assert!(
+            json.status.success(),
+            "weaveffi --format json targets failed: {}",
+            String::from_utf8_lossy(&json.stderr)
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&json.stdout)
+            .expect("weaveffi --format json targets must emit valid JSON");
+        let entries = parsed.as_array().expect("JSON output must be an array");
+        assert_eq!(entries.len(), 11, "JSON must list eleven targets");
+        for (entry, target) in entries.iter().zip(TARGETS) {
+            assert_eq!(entry["name"], target.name);
+            assert_eq!(entry["language"], target.language);
+            assert_eq!(entry["runtime"], target.runtime);
+            assert_eq!(entry["status"], target.status);
+            assert_eq!(entry["emits"], target.emits);
+        }
     }
 }
