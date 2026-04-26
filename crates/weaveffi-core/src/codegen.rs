@@ -109,6 +109,7 @@ pub trait Generator {
 #[derive(Default)]
 pub struct Orchestrator<'a> {
     generators: Vec<&'a dyn Generator>,
+    quiet: bool,
 }
 
 impl<'a> Orchestrator<'a> {
@@ -118,6 +119,12 @@ impl<'a> Orchestrator<'a> {
 
     pub fn with_generator(mut self, gen: &'a dyn Generator) -> Self {
         self.generators.push(gen);
+        self
+    }
+
+    /// Suppress informational stdout output (e.g. the cache-skip notice).
+    pub fn quiet(mut self, quiet: bool) -> Self {
+        self.quiet = quiet;
         self
     }
 
@@ -134,7 +141,9 @@ impl<'a> Orchestrator<'a> {
         if !force {
             if let Some(cached) = cache::read_cache(out_dir) {
                 if cached == hash {
-                    println!("No changes detected, skipping code generation.");
+                    if !self.quiet {
+                        println!("No changes detected, skipping code generation.");
+                    }
                     return Ok(());
                 }
             }

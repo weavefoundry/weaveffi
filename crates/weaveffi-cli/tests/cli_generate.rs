@@ -148,3 +148,51 @@ fn quiet_flag_suppresses_output() {
         "files should still be generated with --quiet"
     );
 }
+
+#[test]
+fn quiet_flag_suppresses_cache_skip_message() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
+    let input = repo_root.join("samples/calculator/calculator.yml");
+
+    let out_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let out_path = out_dir.path();
+
+    assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args([
+            "generate",
+            input.to_str().unwrap(),
+            "-o",
+            out_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args([
+            "--quiet",
+            "generate",
+            input.to_str().unwrap(),
+            "-o",
+            out_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+
+    assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args([
+            "generate",
+            input.to_str().unwrap(),
+            "-o",
+            out_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "No changes detected, skipping code generation.",
+        ));
+}

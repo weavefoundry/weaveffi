@@ -658,7 +658,7 @@ fn cmd_generate(
         None => None,
     };
 
-    let mut orchestrator = Orchestrator::new();
+    let mut orchestrator = Orchestrator::new().quiet(quiet);
     for &gen in &selected {
         orchestrator = orchestrator.with_generator(gen);
     }
@@ -803,7 +803,7 @@ fn cmd_diff(input: &str, out: Option<&str>, quiet: bool) -> Result<()> {
     ];
 
     let config = GeneratorConfig::default();
-    let mut orchestrator = Orchestrator::new();
+    let mut orchestrator = Orchestrator::new().quiet(quiet);
     for &gen in &all {
         orchestrator = orchestrator.with_generator(gen);
     }
