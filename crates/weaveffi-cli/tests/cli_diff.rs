@@ -19,6 +19,7 @@ fn diff_against_empty_dir() {
             input.to_str().unwrap(),
             "--out",
             empty_out.to_str().unwrap(),
+            "--no-exit-code",
         ])
         .output()
         .expect("failed to run weaveffi diff");

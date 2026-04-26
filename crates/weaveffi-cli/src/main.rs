@@ -110,6 +110,12 @@ enum Commands {
         /// Output directory to compare against (defaults to ./generated)
         #[arg(short, long)]
         out: Option<String>,
+        /// Exit with non-zero status when differences are detected [default: on]
+        #[arg(long, overrides_with = "no_exit_code")]
+        exit_code: bool,
+        /// Always exit 0, even when differences are detected
+        #[arg(long, overrides_with = "exit_code")]
+        no_exit_code: bool,
     },
     Doctor,
     Completions {
@@ -194,7 +200,12 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
-        Commands::Diff { input, out } => cmd_diff(&input, out.as_deref(), quiet)?,
+        Commands::Diff {
+            input,
+            out,
+            exit_code: _,
+            no_exit_code,
+        } => cmd_diff(&input, out.as_deref(), !no_exit_code, quiet)?,
         Commands::Doctor => cmd_doctor()?,
         Commands::Completions { shell } => cmd_completions(shell),
         Commands::SchemaVersion => println!("{CURRENT_SCHEMA_VERSION}"),
@@ -799,7 +810,7 @@ fn cmd_lint(input: &str, quiet: bool) -> Result<bool> {
     }
 }
 
-fn cmd_diff(input: &str, out: Option<&str>, quiet: bool) -> Result<()> {
+fn cmd_diff(input: &str, out: Option<&str>, exit_code: bool, quiet: bool) -> Result<()> {
     let out = out.unwrap_or("./generated");
 
     let in_path = Utf8Path::new(input);
@@ -886,8 +897,16 @@ fn cmd_diff(input: &str, out: Option<&str>, quiet: bool) -> Result<()> {
         }
     }
 
-    if !has_diff && !quiet {
-        println!("No differences found.");
+    if !has_diff {
+        if !quiet {
+            println!("No differences found.");
+        }
+        return Ok(());
+    }
+
+    if exit_code {
+        return Err(eyre!("generated output differs from '{out}'"))
+            .suggestion("run 'weaveffi generate' to update the output, or pass --no-exit-code");
     }
 
     Ok(())
@@ -2092,7 +2111,7 @@ mod tests {
 
         let cmd = assert_cmd::Command::cargo_bin("weaveffi")
             .expect("binary not found")
-            .args(["diff", input, "--out", out_str])
+            .args(["diff", input, "--out", out_str, "--no-exit-code"])
             .output()
             .expect("failed to run weaveffi diff");
 
@@ -2108,6 +2127,49 @@ mod tests {
                 "expected [new file] in every line, got: {line}"
             );
         }
+    }
+
+    #[test]
+    fn diff_exits_nonzero_when_changes() {
+        let _ = color_eyre::install();
+        let dir = tempfile::tempdir().unwrap();
+        let yml = dir.path().join("api.yml");
+        std::fs::write(
+            &yml,
+            concat!(
+                "version: \"0.1.0\"\n",
+                "modules:\n",
+                "  - name: math\n",
+                "    functions:\n",
+                "      - name: add\n",
+                "        params:\n",
+                "          - { name: a, type: i32 }\n",
+                "          - { name: b, type: i32 }\n",
+                "        return: i32\n",
+            ),
+        )
+        .unwrap();
+
+        let empty_out = dir.path().join("empty_out");
+        std::fs::create_dir_all(&empty_out).unwrap();
+        let input = yml.to_str().unwrap();
+        let out_str = empty_out.to_str().unwrap();
+
+        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .args(["diff", input, "--out", out_str])
+            .output()
+            .expect("failed to run weaveffi diff");
+
+        assert!(
+            !cmd.status.success(),
+            "diff should exit non-zero when changes are detected"
+        );
+        let stdout = String::from_utf8_lossy(&cmd.stdout);
+        assert!(
+            stdout.contains("[new file]"),
+            "diff stdout should still list new files: {stdout}"
+        );
     }
 
     #[test]
