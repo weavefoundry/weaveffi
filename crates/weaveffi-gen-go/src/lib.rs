@@ -5,7 +5,7 @@ use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name};
 use weaveffi_ir::ir::{
-    Api, CallbackDef, EnumDef, Function, Module, StructDef, StructField, TypeRef,
+    Api, CallbackDef, EnumDef, Function, ListenerDef, Module, StructDef, StructField, TypeRef,
 };
 
 pub struct GoGenerator;
@@ -50,6 +50,7 @@ impl Generator for GoGenerator {
     fn capabilities(&self) -> &'static [Capability] {
         &[
             Capability::Callbacks,
+            Capability::Listeners,
             Capability::CancellableAsync,
             Capability::TypedHandles,
             Capability::BorrowedTypes,
@@ -514,6 +515,54 @@ fn render_callback(out: &mut String, cb: &CallbackDef, module: &str) {
     out.push_str("}\n\n");
 }
 
+// ── Listener emission ──
+
+/// Emit a Go listener wrapper. Produces an empty struct type with
+/// `Register(cb CallbackType) uint64` and `Unregister(id uint64)` methods.
+/// A per-listener `sync.Map` pins the callback token against the id so that
+/// `Unregister` can drop the pinned entry from the shared callback registry
+/// after the native `unregister_*` call returns.
+fn render_listener(out: &mut String, module_path: &str, l: &ListenerDef) {
+    let type_name = l.name.to_upper_camel_case();
+    let cb_type = l.event_callback.to_upper_camel_case();
+    let pins_var = format!("_{}Pins", l.name.to_lower_camel_case());
+    let c_cb_type = format!("C.weaveffi_{module_path}_{}", l.event_callback);
+    let trampoline = format!(
+        "C.weaveffiGoCbTrampoline_{module_path}_{}",
+        l.event_callback
+    );
+    let reg_fn = c_symbol_name(module_path, &format!("register_{}", l.name));
+    let unreg_fn = c_symbol_name(module_path, &format!("unregister_{}", l.name));
+
+    if let Some(doc) = &l.doc {
+        out.push_str(&format!("// {type_name} -- {doc}\n"));
+    }
+    out.push_str(&format!("type {type_name} struct{{}}\n\n"));
+    out.push_str(&format!("var {pins_var} sync.Map\n\n"));
+
+    out.push_str(&format!(
+        "func ({type_name}) Register(cb {cb_type}) uint64 {{\n"
+    ));
+    out.push_str("\ttoken := _callbackRegister(cb)\n");
+    out.push_str("\tctx := unsafe.Pointer(uintptr(token))\n");
+    out.push_str(&format!(
+        "\tfn := ({c_cb_type})(unsafe.Pointer({trampoline}))\n"
+    ));
+    out.push_str(&format!("\tid := uint64(C.{reg_fn}(fn, ctx))\n"));
+    out.push_str(&format!("\t{pins_var}.Store(id, token)\n"));
+    out.push_str("\treturn id\n");
+    out.push_str("}\n\n");
+
+    out.push_str(&format!("func ({type_name}) Unregister(id uint64) {{\n"));
+    out.push_str(&format!("\tC.{unreg_fn}(C.uint64_t(id))\n"));
+    out.push_str(&format!(
+        "\tif token, ok := {pins_var}.LoadAndDelete(id); ok {{\n"
+    ));
+    out.push_str("\t\t_callbackRegistry.Delete(token)\n");
+    out.push_str("\t}\n");
+    out.push_str("}\n\n");
+}
+
 // ── Top-level rendering ──
 
 fn render_go(api: &Api) -> String {
@@ -577,6 +626,9 @@ fn render_go(api: &Api) -> String {
         }
         for cb in &m.callbacks {
             render_callback(&mut out, cb, &path);
+        }
+        for l in &m.listeners {
+            render_listener(&mut out, &path, l);
         }
         for s in &m.structs {
             render_struct(&mut out, &path, s);
@@ -3408,20 +3460,17 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_includes_callbacks_excludes_listeners_async_iterators_builders() {
+    fn capabilities_includes_callbacks_and_listeners_excludes_async_iterators_builders() {
         let caps = GoGenerator.capabilities();
         assert!(caps.contains(&Capability::Callbacks));
-        assert!(!caps.contains(&Capability::Listeners));
+        assert!(caps.contains(&Capability::Listeners));
         assert!(!caps.contains(&Capability::AsyncFunctions));
         assert!(!caps.contains(&Capability::Iterators));
         assert!(!caps.contains(&Capability::Builders));
         for cap in Capability::ALL {
             if matches!(
                 cap,
-                Capability::Listeners
-                    | Capability::AsyncFunctions
-                    | Capability::Iterators
-                    | Capability::Builders
+                Capability::AsyncFunctions | Capability::Iterators | Capability::Builders
             ) {
                 continue;
             }
@@ -3531,6 +3580,83 @@ mod tests {
         assert!(
             go.contains("C.weaveffi_events_subscribe(cHandlerFn, cHandlerCtx, &cErr)"),
             "C call should receive trampoline fn and token context: {go}"
+        );
+    }
+
+    #[test]
+    fn go_emits_listener_type() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "events".into(),
+                functions: vec![],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![CallbackDef {
+                    name: "OnData".into(),
+                    params: vec![Param {
+                        name: "value".into(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                    }],
+                    returns: None,
+                    doc: None,
+                }],
+                listeners: vec![ListenerDef {
+                    name: "data_stream".into(),
+                    event_callback: "OnData".into(),
+                    doc: None,
+                }],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let go = render_go(&api);
+
+        assert!(
+            go.contains("type DataStream struct{}"),
+            "missing listener struct type: {go}"
+        );
+        assert!(
+            go.contains("var _dataStreamPins sync.Map"),
+            "listener must declare a per-listener sync.Map for pinning: {go}"
+        );
+        assert!(
+            go.contains("func (DataStream) Register(cb OnData) uint64 {"),
+            "listener must expose Register(cb CallbackType) uint64: {go}"
+        );
+        assert!(
+            go.contains("token := _callbackRegister(cb)"),
+            "Register must register the callback to get a token: {go}"
+        );
+        assert!(
+            go.contains("fn := (C.weaveffi_events_OnData)(unsafe.Pointer(C.weaveffiGoCbTrampoline_events_OnData))"),
+            "Register must cast the trampoline to the C callback type: {go}"
+        );
+        assert!(
+            go.contains("id := uint64(C.weaveffi_events_register_data_stream(fn, ctx))"),
+            "Register must call the native register symbol with (fn, ctx): {go}"
+        );
+        assert!(
+            go.contains("_dataStreamPins.Store(id, token)"),
+            "Register must pin the token under id in the listener sync.Map: {go}"
+        );
+        assert!(
+            go.contains("func (DataStream) Unregister(id uint64) {"),
+            "listener must expose Unregister(id uint64): {go}"
+        );
+        assert!(
+            go.contains("C.weaveffi_events_unregister_data_stream(C.uint64_t(id))"),
+            "Unregister must call the native unregister symbol with the id: {go}"
+        );
+        assert!(
+            go.contains("_dataStreamPins.LoadAndDelete(id)"),
+            "Unregister must remove the pin from the listener sync.Map: {go}"
+        );
+        assert!(
+            go.contains("_callbackRegistry.Delete(token)"),
+            "Unregister must drop the token from the shared callback registry: {go}"
         );
     }
 }
