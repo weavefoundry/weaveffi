@@ -6,13 +6,14 @@ use clap::{CommandFactory, Parser, Subcommand};
 use color_eyre::eyre::{bail, eyre, Report, Result, WrapErr};
 use color_eyre::Section;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use similar::TextDiff;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::ffi::OsStr;
 use std::process::Command;
 use tracing_subscriber::EnvFilter;
-use weaveffi_core::codegen::{Capability, Generator, Orchestrator};
+use weaveffi_core::codegen::{Capability, Generator, Orchestrator, LOCKFILE};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::templates::TemplateEngine;
 use weaveffi_core::validate::{
@@ -123,6 +124,13 @@ enum Commands {
         #[arg(long)]
         expected_ir_version: Option<String>,
     },
+    Verify {
+        /// Directory of generated files to verify against a weaveffi.lock
+        dir: String,
+        /// Path to the lockfile (defaults to <dir>/weaveffi.lock)
+        #[arg(long)]
+        lockfile: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -195,6 +203,11 @@ fn main() -> Result<()> {
             expected_ir_version,
         } => {
             if !cmd_check_stamp(&dir, expected_ir_version.as_deref(), quiet)? {
+                std::process::exit(1);
+            }
+        }
+        Commands::Verify { dir, lockfile } => {
+            if !cmd_verify(&dir, lockfile.as_deref(), quiet)? {
                 std::process::exit(1);
             }
         }
@@ -966,6 +979,83 @@ fn cmd_check_stamp(dir: &str, expected_ir_version: Option<&str>, quiet: bool) ->
     if problems.is_empty() {
         if !quiet {
             println!("All {checked} files have matching stamps (IR version {expected})");
+        }
+        Ok(true)
+    } else {
+        for p in &problems {
+            eprintln!("{p}");
+        }
+        Ok(false)
+    }
+}
+
+/// Returns `Ok(true)` when every recorded file in `weaveffi.lock` still
+/// hashes to the value it did at generation time (and no stray files have
+/// appeared in `dir`), `Ok(false)` when at least one diff is reported.
+/// Callers convert a `false` result into exit code 1.
+fn cmd_verify(dir: &str, lockfile: Option<&str>, quiet: bool) -> Result<bool> {
+    let dir_path = Utf8Path::new(dir);
+    if !dir_path.exists() {
+        bail!("directory does not exist: {}", dir);
+    }
+    if !dir_path.is_dir() {
+        bail!("path is not a directory: {}", dir);
+    }
+
+    let lock_path = match lockfile {
+        Some(p) => Utf8Path::new(p).to_owned(),
+        None => dir_path.join(LOCKFILE),
+    };
+    if !lock_path.exists() {
+        bail!("lockfile not found: {}", lock_path);
+    }
+
+    let contents = std::fs::read_to_string(lock_path.as_std_path())
+        .wrap_err_with(|| format!("failed to read lockfile: {}", lock_path))?;
+    let parsed: toml::Value = toml::from_str(&contents)
+        .wrap_err_with(|| format!("failed to parse lockfile: {}", lock_path))?;
+
+    let files_table = parsed
+        .get("files")
+        .and_then(|v| v.as_table())
+        .ok_or_else(|| eyre!("lockfile missing [files] section: {}", lock_path))?;
+
+    let mut recorded: BTreeMap<String, String> = BTreeMap::new();
+    for (k, v) in files_table.iter() {
+        let h = v
+            .as_str()
+            .ok_or_else(|| eyre!("[files].{} is not a string in {}", k, lock_path))?;
+        recorded.insert(k.clone(), h.to_string());
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+
+    for (rel, expected_hash) in &recorded {
+        let file_path = dir_path.join(rel);
+        if !file_path.exists() {
+            problems.push(format!("{rel}: missing"));
+            continue;
+        }
+        let bytes = std::fs::read(file_path.as_std_path())
+            .wrap_err_with(|| format!("failed to read {}", file_path))?;
+        let actual_hash = format!("{:x}", Sha256::digest(&bytes));
+        if actual_hash != *expected_hash {
+            problems.push(format!(
+                "{rel}: modified (expected {expected_hash}, got {actual_hash})"
+            ));
+        }
+    }
+
+    let existing = collect_relative_files(dir_path)?;
+    for rel in &existing {
+        if !recorded.contains_key(rel) {
+            problems.push(format!("{rel}: untracked (not in lockfile)"));
+        }
+    }
+
+    if problems.is_empty() {
+        if !quiet {
+            println!("All {} files match {}", recorded.len(), lock_path);
         }
         Ok(true)
     } else {
@@ -2149,6 +2239,74 @@ mod tests {
         assert!(
             !out.join("weaveffi.lock").exists(),
             "weaveffi.lock must not be written with --no-lockfile"
+        );
+    }
+
+    fn write_verify_fixture(dir: &std::path::Path) -> (String, String) {
+        let yml = dir.join("api.yml");
+        std::fs::write(
+            &yml,
+            concat!(
+                "version: \"0.1.0\"\n",
+                "modules:\n",
+                "  - name: math\n",
+                "    functions:\n",
+                "      - name: add\n",
+                "        params:\n",
+                "          - { name: a, type: i32 }\n",
+                "          - { name: b, type: i32 }\n",
+                "        return: i32\n",
+            ),
+        )
+        .unwrap();
+
+        let out = dir.join("out");
+        let input = yml.to_str().unwrap().to_string();
+        let out_str = out.to_str().unwrap().to_string();
+
+        cmd_generate(
+            &input,
+            &out_str,
+            Some("c"),
+            false,
+            None,
+            false,
+            false,
+            false,
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+
+        (input, out_str)
+    }
+
+    #[test]
+    fn verify_succeeds_for_unchanged_dir() {
+        let _ = color_eyre::install();
+        let dir = tempfile::tempdir().unwrap();
+        let (_input, out_str) = write_verify_fixture(dir.path());
+
+        assert!(
+            cmd_verify(&out_str, None, true).unwrap(),
+            "freshly generated dir should verify against its own lockfile"
+        );
+    }
+
+    #[test]
+    fn verify_fails_when_file_modified() {
+        let _ = color_eyre::install();
+        let dir = tempfile::tempdir().unwrap();
+        let (_input, out_str) = write_verify_fixture(dir.path());
+
+        let header = std::path::Path::new(&out_str).join("c/weaveffi.h");
+        assert!(header.exists(), "expected generated C header at {header:?}");
+        std::fs::write(&header, "// tampered\n").unwrap();
+
+        assert!(
+            !cmd_verify(&out_str, None, true).unwrap(),
+            "verify must fail when a tracked file is modified"
         );
     }
 }
