@@ -2,10 +2,10 @@ mod extract;
 mod scaffold;
 
 use camino::Utf8Path;
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{bail, eyre, Report, Result, WrapErr};
 use color_eyre::Section;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use similar::TextDiff;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -33,6 +33,109 @@ use weaveffi_gen_wasm::WasmGenerator;
 use weaveffi_ir::ir::CURRENT_SCHEMA_VERSION;
 use weaveffi_ir::parse::{parse_api_str, ParseError};
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum OutputFormat {
+    Text,
+    Json,
+}
+
+impl OutputFormat {
+    fn is_json(self) -> bool {
+        matches!(self, OutputFormat::Json)
+    }
+}
+
+/// Structured error entry used in JSON outputs of `validate`.
+#[derive(Debug, Serialize)]
+struct ErrorEntry {
+    location: Option<String>,
+    message: String,
+    suggestion: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ValidateOkJson {
+    ok: bool,
+    modules: usize,
+    functions: usize,
+    structs: usize,
+    enums: usize,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ValidateErrJson {
+    ok: bool,
+    errors: Vec<ErrorEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiffEntry {
+    path: String,
+    status: &'static str,
+    patch: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorCheck {
+    name: String,
+    ok: bool,
+    version: Option<String>,
+    hint: Option<String>,
+}
+
+fn emit_json<T: Serialize>(value: &T) -> Result<()> {
+    let rendered = serde_json::to_string_pretty(value).wrap_err("failed to serialize JSON")?;
+    println!("{rendered}");
+    Ok(())
+}
+
+fn parse_error_to_entry(filename: &str, err: &ParseError) -> ErrorEntry {
+    let location = match err {
+        ParseError::Yaml { line, column, .. } | ParseError::Json { line, column, .. } => {
+            Some(format!("{filename}:{line}:{column}"))
+        }
+        _ => Some(filename.to_string()),
+    };
+    let suggestion = match err {
+        ParseError::Yaml { .. } => Some(
+            "check YAML syntax: ensure correct indentation, quoting, and key-value formatting"
+                .to_string(),
+        ),
+        ParseError::Json { .. } => Some(
+            "check JSON syntax: ensure all brackets, braces, and commas are correct".to_string(),
+        ),
+        ParseError::Toml { .. } => Some(
+            "check TOML syntax: ensure correct table headers, key-value pairs, and quoting"
+                .to_string(),
+        ),
+        ParseError::UnsupportedFormat(_) => {
+            Some("use a supported format: yml, yaml, json, or toml".to_string())
+        }
+    };
+    ErrorEntry {
+        location,
+        message: err.to_string(),
+        suggestion,
+    }
+}
+
+fn validation_error_to_entry(err: &ValidationError) -> ErrorEntry {
+    let suggestion = if let ValidationError::UnknownGeneratorConfigKey { target, .. } = err {
+        let valid = valid_keys_for_generator_target(target);
+        Some(format!(
+            "valid keys for the `{target}` generator section are: {valid}"
+        ))
+    } else {
+        Some(validation_suggestion(err).to_string())
+    };
+    ErrorEntry {
+        location: None,
+        message: err.to_string(),
+        suggestion,
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "weaveffi", version, about = "WeaveFFI CLI")]
 struct Cli {
@@ -40,6 +143,9 @@ struct Cli {
     quiet: bool,
     #[arg(long, short, global = true)]
     verbose: bool,
+    /// Output format for CLI diagnostics and reports
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text, global = true)]
+    format: OutputFormat,
     #[command(subcommand)]
     command: Commands,
 }
@@ -96,9 +202,10 @@ enum Commands {
         /// Output file path (defaults to stdout)
         #[arg(short, long)]
         output: Option<String>,
-        /// Output format: yaml (default), json, or toml
-        #[arg(short, long, default_value = "yaml")]
-        format: Option<String>,
+        /// Serialization format for the extracted API: yaml (default), json, or toml.
+        /// Overridden by the global --format json.
+        #[arg(long = "output-format", default_value = "yaml")]
+        output_format: Option<String>,
     },
     Lint {
         /// Input IDL/IR file (yaml|yml|json|toml)
@@ -161,6 +268,7 @@ fn main() -> Result<()> {
         .init();
 
     let quiet = cli.quiet;
+    let format = cli.format;
     match cli.command {
         Commands::New { name } => cmd_new(&name, quiet)?,
         Commands::Generate {
@@ -187,20 +295,26 @@ fn main() -> Result<()> {
             templates.as_deref(),
             !no_lockfile,
             quiet,
+            format,
         )?,
-        Commands::Validate { input, warn } => cmd_validate(&input, warn, quiet)?,
+        Commands::Validate { input, warn } => {
+            if !cmd_validate(&input, warn, quiet, format)? {
+                std::process::exit(1);
+            }
+        }
         Commands::Extract {
             input,
             output,
-            format,
+            output_format,
         } => cmd_extract(
             &input,
             output.as_deref(),
-            format.as_deref().unwrap_or("yaml"),
+            output_format.as_deref().unwrap_or("yaml"),
             quiet,
+            format,
         )?,
         Commands::Lint { input } => {
-            if !cmd_lint(&input, quiet)? {
+            if !cmd_lint(&input, quiet, format)? {
                 std::process::exit(1);
             }
         }
@@ -209,9 +323,13 @@ fn main() -> Result<()> {
             out,
             exit_code: _,
             no_exit_code,
-        } => cmd_diff(&input, out.as_deref(), !no_exit_code, quiet)?,
+        } => {
+            if !cmd_diff(&input, out.as_deref(), !no_exit_code, quiet, format)? {
+                std::process::exit(1);
+            }
+        }
         Commands::Doctor { all } => {
-            if !cmd_doctor(all)? {
+            if !cmd_doctor(all, format)? {
                 std::process::exit(1);
             }
         }
@@ -631,6 +749,7 @@ fn cmd_generate(
     templates_path: Option<&str>,
     emit_lockfile: bool,
     quiet: bool,
+    format: OutputFormat,
 ) -> Result<()> {
     let mut config = load_config(config_path)?;
 
@@ -639,7 +758,7 @@ fn cmd_generate(
     if ext.is_empty() {
         bail!("input file has no extension (expected yml|yaml|json|toml)");
     }
-    let format = match ext {
+    let fmt = match ext {
         "yml" | "yaml" => "yaml",
         "json" => "json",
         "toml" => "toml",
@@ -650,7 +769,7 @@ fn cmd_generate(
     };
     let contents = std::fs::read_to_string(in_path.as_std_path())
         .wrap_err_with(|| format!("failed to read input file: {}", input))?;
-    let mut api = parse_api_str(&contents, format).map_err(|e| format_parse_error(input, e))?;
+    let mut api = parse_api_str(&contents, fmt).map_err(|e| format_parse_error(input, e))?;
     validate_api(&mut api).map_err(format_validation_error)?;
 
     if let Some(ref generators) = api.generators {
@@ -694,8 +813,16 @@ fn cmd_generate(
     validate_capabilities(&api, &selected_caps).map_err(format_validation_error)?;
 
     if dry_run {
+        let mut files: Vec<String> = Vec::new();
         for gen in &selected {
             for path in gen.output_files_with_config(&api, out_dir, &config) {
+                files.push(path);
+            }
+        }
+        if format.is_json() {
+            emit_json(&files)?;
+        } else {
+            for path in &files {
                 println!("{path}");
             }
         }
@@ -740,13 +867,25 @@ fn cmd_generate(
     Ok(())
 }
 
-fn cmd_validate(input: &str, warn: bool, quiet: bool) -> Result<()> {
+/// Returns `Ok(true)` when validation passed, `Ok(false)` when it failed in
+/// JSON mode (JSON already printed to stdout; caller should exit 1). In text
+/// mode failures are still reported via eyre.
+fn cmd_validate(input: &str, warn: bool, quiet: bool, format: OutputFormat) -> Result<bool> {
+    if format.is_json() {
+        cmd_validate_json(input)
+    } else {
+        cmd_validate_text(input, warn, quiet)?;
+        Ok(true)
+    }
+}
+
+fn cmd_validate_text(input: &str, warn: bool, quiet: bool) -> Result<()> {
     let in_path = Utf8Path::new(input);
     let ext = in_path.extension().unwrap_or("");
     if ext.is_empty() {
         bail!("input file has no extension (expected yml|yaml|json|toml)");
     }
-    let format = match ext {
+    let fmt = match ext {
         "yml" | "yaml" => "yaml",
         "json" => "json",
         "toml" => "toml",
@@ -757,7 +896,7 @@ fn cmd_validate(input: &str, warn: bool, quiet: bool) -> Result<()> {
     };
     let contents = std::fs::read_to_string(in_path.as_std_path())
         .wrap_err_with(|| format!("failed to read input file: {}", input))?;
-    let mut api = parse_api_str(&contents, format).map_err(|e| format_parse_error(input, e))?;
+    let mut api = parse_api_str(&contents, fmt).map_err(|e| format_parse_error(input, e))?;
 
     match validate_api(&mut api) {
         Ok(()) => {
@@ -783,14 +922,100 @@ fn cmd_validate(input: &str, warn: bool, quiet: bool) -> Result<()> {
     }
 }
 
+fn cmd_validate_json(input: &str) -> Result<bool> {
+    let in_path = Utf8Path::new(input);
+    let ext = in_path.extension().unwrap_or("");
+    if ext.is_empty() {
+        emit_json(&ValidateErrJson {
+            ok: false,
+            errors: vec![ErrorEntry {
+                location: Some(input.to_string()),
+                message: "input file has no extension (expected yml|yaml|json|toml)".to_string(),
+                suggestion: Some("use a supported format: yml, yaml, json, or toml".to_string()),
+            }],
+        })?;
+        return Ok(false);
+    }
+    let fmt = match ext {
+        "yml" | "yaml" => "yaml",
+        "json" => "json",
+        "toml" => "toml",
+        other => {
+            emit_json(&ValidateErrJson {
+                ok: false,
+                errors: vec![ErrorEntry {
+                    location: Some(input.to_string()),
+                    message: format!(
+                        "unsupported input format: {other} (expected yml|yaml|json|toml)"
+                    ),
+                    suggestion: Some(
+                        "use a supported format: yml, yaml, json, or toml".to_string(),
+                    ),
+                }],
+            })?;
+            return Ok(false);
+        }
+    };
+    let contents = match std::fs::read_to_string(in_path.as_std_path()) {
+        Ok(c) => c,
+        Err(e) => {
+            emit_json(&ValidateErrJson {
+                ok: false,
+                errors: vec![ErrorEntry {
+                    location: Some(input.to_string()),
+                    message: format!("failed to read input file: {e}"),
+                    suggestion: None,
+                }],
+            })?;
+            return Ok(false);
+        }
+    };
+    let mut api = match parse_api_str(&contents, fmt) {
+        Ok(api) => api,
+        Err(e) => {
+            emit_json(&ValidateErrJson {
+                ok: false,
+                errors: vec![parse_error_to_entry(input, &e)],
+            })?;
+            return Ok(false);
+        }
+    };
+    if let Err(e) = validate_api(&mut api) {
+        emit_json(&ValidateErrJson {
+            ok: false,
+            errors: vec![validation_error_to_entry(&e)],
+        })?;
+        return Ok(false);
+    }
+
+    let n_modules = api.modules.len();
+    let n_functions: usize = api.modules.iter().map(|m| m.functions.len()).sum();
+    let n_structs: usize = api.modules.iter().map(|m| m.structs.len()).sum();
+    let n_enums: usize = api.modules.iter().map(|m| m.enums.len()).sum();
+    let warnings: Vec<String> = collect_warnings(&api)
+        .iter()
+        .map(|w| w.to_string())
+        .collect();
+
+    emit_json(&ValidateOkJson {
+        ok: true,
+        modules: n_modules,
+        functions: n_functions,
+        structs: n_structs,
+        enums: n_enums,
+        warnings,
+    })?;
+    Ok(true)
+}
+
 /// Returns `Ok(true)` when the file is clean, `Ok(false)` when warnings were found.
-fn cmd_lint(input: &str, quiet: bool) -> Result<bool> {
+fn cmd_lint(input: &str, quiet: bool, format: OutputFormat) -> Result<bool> {
     let in_path = Utf8Path::new(input);
     let ext = in_path.extension().unwrap_or("");
     if ext.is_empty() {
         bail!("input file has no extension (expected yml|yaml|json|toml)");
     }
-    let format = match ext {
+    let fmt = match ext {
         "yml" | "yaml" => "yaml",
         "json" => "json",
         "toml" => "toml",
@@ -801,10 +1026,16 @@ fn cmd_lint(input: &str, quiet: bool) -> Result<bool> {
     };
     let contents = std::fs::read_to_string(in_path.as_std_path())
         .wrap_err_with(|| format!("failed to read input file: {}", input))?;
-    let mut api = parse_api_str(&contents, format).map_err(|e| format_parse_error(input, e))?;
+    let mut api = parse_api_str(&contents, fmt).map_err(|e| format_parse_error(input, e))?;
     validate_api(&mut api).map_err(format_validation_error)?;
 
     let warnings = collect_warnings(&api);
+    if format.is_json() {
+        let messages: Vec<String> = warnings.iter().map(|w| w.to_string()).collect();
+        emit_json(&messages)?;
+        return Ok(warnings.is_empty());
+    }
+
     if warnings.is_empty() {
         if !quiet {
             println!("No warnings.");
@@ -818,7 +1049,16 @@ fn cmd_lint(input: &str, quiet: bool) -> Result<bool> {
     }
 }
 
-fn cmd_diff(input: &str, out: Option<&str>, exit_code: bool, quiet: bool) -> Result<()> {
+/// Returns `Ok(true)` when the command should exit 0, `Ok(false)` when the
+/// command should exit 1 (differences detected in exit-code mode, or JSON
+/// emitted with differences).
+fn cmd_diff(
+    input: &str,
+    out: Option<&str>,
+    exit_code: bool,
+    quiet: bool,
+    format: OutputFormat,
+) -> Result<bool> {
     let out = out.unwrap_or("./generated");
 
     let in_path = Utf8Path::new(input);
@@ -826,7 +1066,7 @@ fn cmd_diff(input: &str, out: Option<&str>, exit_code: bool, quiet: bool) -> Res
     if ext.is_empty() {
         bail!("input file has no extension (expected yml|yaml|json|toml)");
     }
-    let format = match ext {
+    let fmt = match ext {
         "yml" | "yaml" => "yaml",
         "json" => "json",
         "toml" => "toml",
@@ -837,7 +1077,7 @@ fn cmd_diff(input: &str, out: Option<&str>, exit_code: bool, quiet: bool) -> Res
     };
     let contents = std::fs::read_to_string(in_path.as_std_path())
         .wrap_err_with(|| format!("failed to read input file: {}", input))?;
-    let mut api = parse_api_str(&contents, format).map_err(|e| format_parse_error(input, e))?;
+    let mut api = parse_api_str(&contents, fmt).map_err(|e| format_parse_error(input, e))?;
     validate_api(&mut api).map_err(format_validation_error)?;
 
     let tmp = tempfile::tempdir().wrap_err("failed to create temp directory")?;
@@ -878,7 +1118,7 @@ fn cmd_diff(input: &str, out: Option<&str>, exit_code: bool, quiet: bool) -> Res
     };
 
     let all_paths: BTreeSet<_> = generated.union(&existing).collect();
-    let mut has_diff = false;
+    let mut entries: Vec<DiffEntry> = Vec::new();
 
     for rel in &all_paths {
         let gen_file = tmp_path.join(rel);
@@ -886,21 +1126,48 @@ fn cmd_diff(input: &str, out: Option<&str>, exit_code: bool, quiet: bool) -> Res
 
         match (gen_file.exists(), out_file.exists()) {
             (true, false) => {
-                has_diff = true;
-                println!("{rel}: [new file]");
+                let gen_content = std::fs::read_to_string(gen_file.as_std_path())?;
+                entries.push(DiffEntry {
+                    path: (*rel).clone(),
+                    status: "added",
+                    patch: unified_patch(rel, "", &gen_content),
+                });
             }
             (false, true) => {
-                has_diff = true;
-                println!("{rel}: [would be removed]");
+                let out_content = std::fs::read_to_string(out_file.as_std_path())?;
+                entries.push(DiffEntry {
+                    path: (*rel).clone(),
+                    status: "removed",
+                    patch: unified_patch(rel, &out_content, ""),
+                });
             }
             (true, true) => {
                 let gen_content = std::fs::read_to_string(gen_file.as_std_path())?;
                 let out_content = std::fs::read_to_string(out_file.as_std_path())?;
                 if gen_content != out_content {
-                    has_diff = true;
-                    print_unified_diff(rel, &out_content, &gen_content);
+                    entries.push(DiffEntry {
+                        path: (*rel).clone(),
+                        status: "changed",
+                        patch: unified_patch(rel, &out_content, &gen_content),
+                    });
                 }
             }
+            _ => {}
+        }
+    }
+
+    let has_diff = !entries.is_empty();
+
+    if format.is_json() {
+        emit_json(&entries)?;
+        return Ok(!(has_diff && exit_code));
+    }
+
+    for entry in &entries {
+        match entry.status {
+            "added" => println!("{}: [new file]", entry.path),
+            "removed" => println!("{}: [would be removed]", entry.path),
+            "changed" => print!("{}", entry.patch),
             _ => {}
         }
     }
@@ -909,7 +1176,7 @@ fn cmd_diff(input: &str, out: Option<&str>, exit_code: bool, quiet: bool) -> Res
         if !quiet {
             println!("No differences found.");
         }
-        return Ok(());
+        return Ok(true);
     }
 
     if exit_code {
@@ -917,7 +1184,19 @@ fn cmd_diff(input: &str, out: Option<&str>, exit_code: bool, quiet: bool) -> Res
             .suggestion("run 'weaveffi generate' to update the output, or pass --no-exit-code");
     }
 
-    Ok(())
+    Ok(true)
+}
+
+fn unified_patch(path: &str, old: &str, new: &str) -> String {
+    use std::fmt::Write;
+    let diff = TextDiff::from_lines(old, new);
+    let mut out = String::new();
+    let _ = writeln!(out, "--- {path}");
+    let _ = writeln!(out, "+++ {path}");
+    for hunk in diff.unified_diff().context_radius(3).iter_hunks() {
+        let _ = writeln!(out, "{hunk}");
+    }
+    out
 }
 
 fn collect_relative_files(base: &Utf8Path) -> Result<BTreeSet<String>> {
@@ -948,15 +1227,6 @@ fn walk_dir(base: &Utf8Path, dir: &Utf8Path, out: &mut BTreeSet<String>) -> Resu
         }
     }
     Ok(())
-}
-
-fn print_unified_diff(path: &str, old: &str, new: &str) {
-    let diff = TextDiff::from_lines(old, new);
-    println!("--- {path}");
-    println!("+++ {path}");
-    for hunk in diff.unified_diff().context_radius(3).iter_hunks() {
-        println!("{hunk}");
-    }
 }
 
 /// Returns `Ok(true)` when every file in `dir` carries a matching stamp,
@@ -1243,7 +1513,13 @@ fn validation_suggestion(err: &ValidationError) -> &'static str {
     }
 }
 
-fn cmd_extract(input: &str, output: Option<&str>, format: &str, quiet: bool) -> Result<()> {
+fn cmd_extract(
+    input: &str,
+    output: Option<&str>,
+    output_format: &str,
+    quiet: bool,
+    global_format: OutputFormat,
+) -> Result<()> {
     let source = std::fs::read_to_string(input)
         .wrap_err_with(|| format!("failed to read source file: {}", input))?;
 
@@ -1254,7 +1530,13 @@ fn cmd_extract(input: &str, output: Option<&str>, format: &str, quiet: bool) -> 
         eprintln!("warning: {}", e);
     }
 
-    let serialized = match format {
+    let effective_format = if global_format.is_json() {
+        "json"
+    } else {
+        output_format
+    };
+
+    let serialized = match effective_format {
         "yaml" | "yml" => {
             serde_yaml::to_string(&api).wrap_err("failed to serialize API as YAML")?
         }
@@ -1270,7 +1552,7 @@ fn cmd_extract(input: &str, output: Option<&str>, format: &str, quiet: bool) -> 
         Some(path) => {
             std::fs::write(path, &serialized)
                 .wrap_err_with(|| format!("failed to write output file: {}", path))?;
-            if !quiet {
+            if !quiet && !global_format.is_json() {
                 println!("Extracted API written to {}", path);
             }
         }
@@ -1283,44 +1565,44 @@ fn cmd_extract(input: &str, output: Option<&str>, format: &str, quiet: bool) -> 
 /// Runs the doctor checks and returns `Ok(true)` when the process should exit
 /// 0. Required checks (rustc, cargo, weaveffi-cli) always gate success;
 /// optional checks only gate success when `all` is true.
-fn cmd_doctor(all: bool) -> Result<bool> {
-    println!("WeaveFFI Doctor: checking toolchain prerequisites\n");
+fn cmd_doctor(all: bool, format: OutputFormat) -> Result<bool> {
+    let json_mode = format.is_json();
+    if !json_mode {
+        println!("WeaveFFI Doctor: checking toolchain prerequisites\n");
+        println!("Required checks:");
+    }
 
-    let mut required_failures: Vec<String> = Vec::new();
-    let mut optional_failures: Vec<String> = Vec::new();
+    let mut required: Vec<DoctorCheck> = Vec::new();
+    let mut optional: Vec<DoctorCheck> = Vec::new();
 
-    println!("Required checks:");
-    if !check_tool(
+    required.push(run_tool_check(
         "rustc",
         &["--version"],
         "Rust compiler",
         Some("Install via https://rustup.rs"),
-    ) {
-        required_failures.push("rustc".to_string());
-    }
-    if !check_tool(
+        json_mode,
+    ));
+    required.push(run_tool_check(
         "cargo",
         &["--version"],
         "Cargo (Rust package manager)",
         Some("Install via https://rustup.rs"),
-    ) {
-        required_failures.push("cargo".to_string());
-    }
-    if !check_weaveffi_cli() {
-        required_failures.push("weaveffi-cli".to_string());
-    }
+        json_mode,
+    ));
+    required.push(run_weaveffi_cli_check(json_mode));
 
-    println!("\nOptional checks:");
+    if !json_mode {
+        println!("\nOptional checks:");
+    }
     if cfg!(target_os = "macos") {
-        if !check_tool(
+        optional.push(run_tool_check(
             "xcodebuild",
             &["-version"],
             "Xcode command-line tools",
             Some("Install Xcode from the App Store, then run `xcode-select --install`"),
-        ) {
-            optional_failures.push("xcodebuild".to_string());
-        }
-    } else {
+            json_mode,
+        ));
+    } else if !json_mode {
         println!("- Xcode: skipped (non-macOS)");
     }
 
@@ -1329,8 +1611,14 @@ fn cmd_doctor(all: bool) -> Result<bool> {
     } else {
         Some("Install via Android Studio SDK Manager. Set ANDROID_NDK_HOME.")
     };
-    let ndk_ok = check_tool("ndk-build", &["-v"], "Android NDK (ndk-build)", ndk_hint);
-    if !ndk_ok {
+    let ndk_check = run_tool_check(
+        "ndk-build",
+        &["-v"],
+        "Android NDK (ndk-build)",
+        ndk_hint,
+        json_mode,
+    );
+    if !ndk_check.ok && !json_mode {
         let env_ok = env::var_os("ANDROID_NDK_HOME")
             .map(|p| std::path::Path::new(&p).exists())
             .unwrap_or(false)
@@ -1342,46 +1630,66 @@ fn cmd_doctor(all: bool) -> Result<bool> {
                 "  note: ANDROID_NDK_HOME/ROOT is set and exists; ensure `ndk-build` is in PATH"
             );
         }
-        optional_failures.push("ndk-build".to_string());
     }
+    optional.push(ndk_check);
 
-    if !check_tool(
+    optional.push(run_tool_check(
         "node",
         &["-v"],
         "Node.js",
         Some("Install from https://nodejs.org or with your package manager"),
-    ) {
-        optional_failures.push("node".to_string());
-    }
-    if !check_tool(
+        json_mode,
+    ));
+    optional.push(run_tool_check(
         "npm",
         &["-v"],
         "npm",
         Some("Install Node.js which includes npm, or use pnpm/yarn"),
-    ) {
-        optional_failures.push("npm".to_string());
-    }
+        json_mode,
+    ));
 
-    for t in check_cross_targets() {
-        optional_failures.push(format!("target:{t}"));
-    }
+    optional.extend(run_cross_target_checks(json_mode));
 
-    println!("\nWebAssembly tools:");
-    if !check_tool(
+    if !json_mode {
+        println!("\nWebAssembly tools:");
+    }
+    optional.push(run_tool_check(
         "wasm-pack",
         &["--version"],
         "wasm-pack",
         Some("install with `cargo install wasm-pack`"),
-    ) {
-        optional_failures.push("wasm-pack".to_string());
-    }
-    if !check_tool(
+        json_mode,
+    ));
+    optional.push(run_tool_check(
         "wasm-bindgen",
         &["--version"],
         "wasm-bindgen-cli",
         Some("install with `cargo install wasm-bindgen-cli`"),
-    ) {
-        optional_failures.push("wasm-bindgen".to_string());
+        json_mode,
+    ));
+
+    let required_failures: Vec<String> = required
+        .iter()
+        .filter(|c| !c.ok)
+        .map(|c| c.name.clone())
+        .collect();
+    let optional_failures: Vec<String> = optional
+        .iter()
+        .filter(|c| !c.ok)
+        .map(|c| c.name.clone())
+        .collect();
+
+    if json_mode {
+        let mut all_checks = required;
+        all_checks.extend(optional);
+        emit_json(&all_checks)?;
+        if !required_failures.is_empty() {
+            return Ok(false);
+        }
+        if !optional_failures.is_empty() && all {
+            return Ok(false);
+        }
+        return Ok(true);
     }
 
     println!();
@@ -1419,22 +1727,43 @@ fn cmd_doctor(all: bool) -> Result<bool> {
 
 /// Verifies the currently running `weaveffi` binary can introspect its own
 /// install path. Serves as the "required" health check for the CLI itself.
-fn check_weaveffi_cli() -> bool {
+fn run_weaveffi_cli_check(json_mode: bool) -> DoctorCheck {
     match std::env::current_exe() {
         Ok(path) if path.exists() => {
-            println!("- weaveffi-cli: OK ({})", path.display());
-            true
+            if !json_mode {
+                println!("- weaveffi-cli: OK ({})", path.display());
+            }
+            DoctorCheck {
+                name: "weaveffi-cli".to_string(),
+                ok: true,
+                version: Some(path.display().to_string()),
+                hint: None,
+            }
         }
         Ok(path) => {
-            println!(
-                "- weaveffi-cli: MISSING (current exe {} does not exist)",
-                path.display()
-            );
-            false
+            if !json_mode {
+                println!(
+                    "- weaveffi-cli: MISSING (current exe {} does not exist)",
+                    path.display()
+                );
+            }
+            DoctorCheck {
+                name: "weaveffi-cli".to_string(),
+                ok: false,
+                version: None,
+                hint: Some(format!("current exe {} does not exist", path.display())),
+            }
         }
         Err(e) => {
-            println!("- weaveffi-cli: MISSING (cannot resolve current executable: {e})");
-            false
+            if !json_mode {
+                println!("- weaveffi-cli: MISSING (cannot resolve current executable: {e})");
+            }
+            DoctorCheck {
+                name: "weaveffi-cli".to_string(),
+                ok: false,
+                version: None,
+                hint: Some(format!("cannot resolve current executable: {e}")),
+            }
         }
     }
 }
@@ -1465,11 +1794,12 @@ fn sanitize_module_name(name: &str) -> String {
     }
 }
 
-/// Returns the list of missing rustup target identifiers. When rustup itself
-/// is missing the list contains a single `"rustup"` entry so the caller can
-/// surface that in the summary.
-fn check_cross_targets() -> Vec<String> {
-    println!("\nCross-compilation targets:");
+/// Returns a DoctorCheck per required cross-compilation target (plus a
+/// "rustup" entry when rustup itself is missing).
+fn run_cross_target_checks(json_mode: bool) -> Vec<DoctorCheck> {
+    if !json_mode {
+        println!("\nCross-compilation targets:");
+    }
 
     let installed = match Command::new("rustup")
         .args(["target", "list", "--installed"])
@@ -1477,9 +1807,16 @@ fn check_cross_targets() -> Vec<String> {
     {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).to_string(),
         _ => {
-            println!("- rustup: MISSING (cannot check installed targets)");
-            println!("  hint: install via https://rustup.rs");
-            return vec!["rustup".to_string()];
+            if !json_mode {
+                println!("- rustup: MISSING (cannot check installed targets)");
+                println!("  hint: install via https://rustup.rs");
+            }
+            return vec![DoctorCheck {
+                name: "rustup".to_string(),
+                ok: false,
+                version: None,
+                hint: Some("install via https://rustup.rs".to_string()),
+            }];
         }
     };
 
@@ -1489,31 +1826,61 @@ fn check_cross_targets() -> Vec<String> {
         ("wasm32-unknown-unknown", "WebAssembly"),
     ];
 
-    let mut missing: Vec<String> = Vec::new();
+    let mut checks: Vec<DoctorCheck> = Vec::new();
     for (target, label) in &required {
-        if installed.lines().any(|line| line.trim() == *target) {
-            println!("- {} ({}): installed", label, target);
-        } else {
-            println!("- {} ({}): MISSING", label, target);
-            println!("  hint: install with `rustup target add {}`", target);
-            missing.push((*target).to_string());
+        let ok = installed.lines().any(|line| line.trim() == *target);
+        if !json_mode {
+            if ok {
+                println!("- {} ({}): installed", label, target);
+            } else {
+                println!("- {} ({}): MISSING", label, target);
+                println!("  hint: install with `rustup target add {}`", target);
+            }
         }
+        checks.push(DoctorCheck {
+            name: format!("target:{target}"),
+            ok,
+            version: if ok {
+                Some((*target).to_string())
+            } else {
+                None
+            },
+            hint: if ok {
+                None
+            } else {
+                Some(format!("install with `rustup target add {target}`"))
+            },
+        });
     }
-    missing
+    checks
 }
 
-fn check_tool<S: AsRef<OsStr>>(cmd: &str, args: &[S], label: &str, hint: Option<&str>) -> bool {
+fn run_tool_check<S: AsRef<OsStr>>(
+    cmd: &str,
+    args: &[S],
+    label: &str,
+    hint: Option<&str>,
+    json_mode: bool,
+) -> DoctorCheck {
     match Command::new(cmd).args(args).output() {
-        Ok(out) => {
-            if out.status.success() {
-                let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        Ok(out) if out.status.success() => {
+            let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !json_mode {
                 if ver.is_empty() {
                     println!("- {}: OK ({})", label, cmd);
                 } else {
                     println!("- {}: OK ({}: {})", label, cmd, ver);
                 }
-                true
-            } else {
+            }
+            DoctorCheck {
+                name: cmd.to_string(),
+                ok: true,
+                version: if ver.is_empty() { None } else { Some(ver) },
+                hint: None,
+            }
+        }
+        Ok(out) => {
+            if !json_mode {
                 println!(
                     "- {}: MISSING ({} exited with status {})",
                     label, cmd, out.status
@@ -1521,15 +1888,27 @@ fn check_tool<S: AsRef<OsStr>>(cmd: &str, args: &[S], label: &str, hint: Option<
                 if let Some(h) = hint {
                     println!("  hint: {}", h);
                 }
-                false
+            }
+            DoctorCheck {
+                name: cmd.to_string(),
+                ok: false,
+                version: None,
+                hint: hint.map(|s| s.to_string()),
             }
         }
         Err(_) => {
-            println!("- {}: MISSING ({} not found in PATH)", label, cmd);
-            if let Some(h) = hint {
-                println!("  hint: {}", h);
+            if !json_mode {
+                println!("- {}: MISSING ({} not found in PATH)", label, cmd);
+                if let Some(h) = hint {
+                    println!("  hint: {}", h);
+                }
             }
-            false
+            DoctorCheck {
+                name: cmd.to_string(),
+                ok: false,
+                version: None,
+                hint: hint.map(|s| s.to_string()),
+            }
         }
     }
 }
@@ -1731,7 +2110,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR")
         );
         assert!(
-            cmd_lint(&sample, false).unwrap(),
+            cmd_lint(&sample, false, OutputFormat::Text).unwrap(),
             "calculator sample should be lint-clean"
         );
     }
@@ -1941,7 +2320,18 @@ mod tests {
         let out_str = out.to_str().unwrap();
 
         cmd_generate(
-            input, out_str, None, false, None, false, false, true, None, true, false,
+            input,
+            out_str,
+            None,
+            false,
+            None,
+            false,
+            false,
+            true,
+            None,
+            true,
+            false,
+            OutputFormat::Text,
         )
         .unwrap();
 
@@ -2324,6 +2714,7 @@ mod tests {
             None,
             true,
             true,
+            OutputFormat::Text,
         )
         .unwrap();
 
@@ -2453,6 +2844,7 @@ mod tests {
             None,
             true,
             true,
+            OutputFormat::Text,
         )
         .unwrap();
 

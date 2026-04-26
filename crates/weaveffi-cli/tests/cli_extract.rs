@@ -217,11 +217,19 @@ mod math {{
 
     let output = assert_cmd::Command::cargo_bin("weaveffi")
         .expect("binary not found")
-        .args(["extract", src_path.to_str().unwrap(), "--format", "json"])
+        .args([
+            "extract",
+            src_path.to_str().unwrap(),
+            "--output-format",
+            "json",
+        ])
         .output()
         .expect("failed to run extract");
 
-    assert!(output.status.success(), "extract --format json failed");
+    assert!(
+        output.status.success(),
+        "extract --output-format json failed"
+    );
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     let api: serde_json::Value =
@@ -263,11 +271,19 @@ mod math {{
 
     let output = assert_cmd::Command::cargo_bin("weaveffi")
         .expect("binary not found")
-        .args(["extract", src_path.to_str().unwrap(), "--format", "toml"])
+        .args([
+            "extract",
+            src_path.to_str().unwrap(),
+            "--output-format",
+            "toml",
+        ])
         .output()
         .expect("failed to run extract");
 
-    assert!(output.status.success(), "extract --format toml failed");
+    assert!(
+        output.status.success(),
+        "extract --output-format toml failed"
+    );
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     let api: toml::Value = stdout.parse().expect("output should be valid TOML");
