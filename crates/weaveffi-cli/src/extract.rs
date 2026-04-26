@@ -1,7 +1,7 @@
 use color_eyre::eyre::{bail, eyre, Result};
 use weaveffi_ir::ir::{
-    Api, CallbackDef, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField,
-    TypeRef,
+    Api, CallbackDef, EnumDef, EnumVariant, Function, ListenerDef, Module, Param, StructDef,
+    StructField, TypeRef,
 };
 
 fn has_attr(attrs: &[syn::Attribute], name: &str) -> bool {
@@ -502,16 +502,49 @@ fn extract_enum(item: &syn::ItemEnum) -> Result<EnumDef> {
     })
 }
 
+fn parse_listener_event(attrs: &[syn::Attribute]) -> Result<String> {
+    let mut event = None;
+    for attr in attrs {
+        if !attr.path().is_ident("weaveffi_listener") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("event") {
+                let lit: syn::LitStr = meta.value()?.parse()?;
+                event = Some(lit.value());
+            } else {
+                return Err(meta.error("unknown weaveffi_listener argument"));
+            }
+            Ok(())
+        })
+        .map_err(|e| eyre!("weaveffi_listener: {e}"))?;
+    }
+    event.ok_or_else(|| eyre!("weaveffi_listener: missing required `event = \"...\"` argument"))
+}
+
+fn extract_listener(item: &syn::ItemFn) -> Result<ListenerDef> {
+    Ok(ListenerDef {
+        name: item.sig.ident.to_string(),
+        event_callback: parse_listener_event(&item.attrs)?,
+        doc: extract_doc(&item.attrs),
+    })
+}
+
 fn extract_module(item_mod: &syn::ItemMod) -> Result<Module> {
     let name = item_mod.ident.to_string();
     let mut functions = Vec::new();
     let mut structs = Vec::new();
     let mut enums = Vec::new();
     let mut callbacks = Vec::new();
+    let mut listeners = Vec::new();
+    let mut modules = Vec::new();
 
     if let Some((_, items)) = &item_mod.content {
         for item in items {
             match item {
+                syn::Item::Fn(f) if has_attr(&f.attrs, "weaveffi_listener") => {
+                    listeners.push(extract_listener(f)?);
+                }
                 syn::Item::Fn(f) if has_attr(&f.attrs, "weaveffi_callback") => {
                     callbacks.push(extract_callback(f)?);
                 }
@@ -524,6 +557,9 @@ fn extract_module(item_mod: &syn::ItemMod) -> Result<Module> {
                 syn::Item::Enum(e) if has_attr(&e.attrs, "weaveffi_enum") => {
                     enums.push(extract_enum(e)?);
                 }
+                syn::Item::Mod(m) if m.content.is_some() => {
+                    modules.push(extract_module(m)?);
+                }
                 _ => {}
             }
         }
@@ -535,9 +571,9 @@ fn extract_module(item_mod: &syn::ItemMod) -> Result<Module> {
         structs,
         enums,
         callbacks,
-        listeners: vec![],
+        listeners,
         errors: None,
-        modules: vec![],
+        modules,
     })
 }
 
@@ -1326,6 +1362,102 @@ mod tests {
         let err = extract_api_from_rust(src).unwrap_err();
         assert!(
             format!("{err}").contains("weaveffi_callback"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn extract_nested_modules() {
+        let src = r#"
+            mod outer {
+                #[weaveffi_export]
+                fn top_fn() {}
+
+                mod inner {
+                    #[weaveffi_export]
+                    fn inner_fn(x: i32) -> i32 { x }
+
+                    #[weaveffi_struct]
+                    struct Point { x: f64, y: f64 }
+
+                    mod deeper {
+                        #[weaveffi_export]
+                        fn deep_fn() -> bool { true }
+                    }
+                }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        assert_eq!(api.modules.len(), 1);
+
+        let outer = &api.modules[0];
+        assert_eq!(outer.name, "outer");
+        assert_eq!(outer.functions.len(), 1);
+        assert_eq!(outer.functions[0].name, "top_fn");
+        assert_eq!(outer.modules.len(), 1);
+
+        let inner = &outer.modules[0];
+        assert_eq!(inner.name, "inner");
+        assert_eq!(inner.functions.len(), 1);
+        assert_eq!(inner.functions[0].name, "inner_fn");
+        assert_eq!(inner.structs.len(), 1);
+        assert_eq!(inner.structs[0].name, "Point");
+        assert_eq!(inner.modules.len(), 1);
+
+        let deeper = &inner.modules[0];
+        assert_eq!(deeper.name, "deeper");
+        assert_eq!(deeper.functions.len(), 1);
+        assert_eq!(deeper.functions[0].name, "deep_fn");
+        assert!(deeper.modules.is_empty());
+    }
+
+    #[test]
+    fn extract_listener() {
+        let src = r#"
+            mod events {
+                #[weaveffi_callback]
+                fn OnMessage(payload: String) {}
+
+                /// Subscribe to messages.
+                #[weaveffi_listener(event = "OnMessage")]
+                fn message_listener() {}
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let m = &api.modules[0];
+        assert_eq!(m.listeners.len(), 1);
+        let l = &m.listeners[0];
+        assert_eq!(l.name, "message_listener");
+        assert_eq!(l.event_callback, "OnMessage");
+        assert_eq!(l.doc.as_deref(), Some("Subscribe to messages."));
+    }
+
+    #[test]
+    fn listener_missing_event_errors() {
+        let src = r#"
+            mod events {
+                #[weaveffi_listener()]
+                fn bad() {}
+            }
+        "#;
+        let err = extract_api_from_rust(src).unwrap_err();
+        assert!(
+            format!("{err}").contains("event"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn listener_unknown_arg_errors() {
+        let src = r#"
+            mod events {
+                #[weaveffi_listener(foo = "bar")]
+                fn bad() {}
+            }
+        "#;
+        let err = extract_api_from_rust(src).unwrap_err();
+        assert!(
+            format!("{err}").contains("weaveffi_listener"),
             "unexpected error: {err}"
         );
     }
