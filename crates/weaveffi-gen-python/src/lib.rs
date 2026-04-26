@@ -4726,4 +4726,43 @@ mod tests {
             "weaveffi_error_clear must run BEFORE raising: {py}"
         );
     }
+
+    #[test]
+    fn python_bytes_return_calls_free_bytes() {
+        let api = make_api(vec![Module {
+            name: "parity".into(),
+            functions: vec![Function {
+                name: "echo".into(),
+                params: vec![Param {
+                    name: "b".into(),
+                    ty: TypeRef::Bytes,
+                    mutable: false,
+                }],
+                returns: Some(TypeRef::Bytes),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let py = render_python_module(&api, true);
+
+        let copy_pos = py
+            .find("_b = bytes(_result[:_n])")
+            .expect("Python wrapper must copy the returned bytes via bytes(_result[:_n])");
+        let free_pos = py
+            .find("_lib.weaveffi_free_bytes(_result, ctypes.c_size_t(_n))")
+            .expect("Python wrapper must free the returned pointer via _lib.weaveffi_free_bytes");
+        assert!(
+            copy_pos < free_pos,
+            "_lib.weaveffi_free_bytes must run AFTER the bytes have been copied into a Python bytes object: {py}"
+        );
+    }
 }

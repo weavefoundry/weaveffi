@@ -2389,4 +2389,36 @@ mod tests {
             "weaveffi_error_clear must run AFTER napi_throw_error has captured err.message: {addon}"
         );
     }
+
+    #[test]
+    fn node_bytes_return_calls_free_bytes() {
+        let mut m = make_module("parity");
+        m.functions.push(Function {
+            name: "echo".into(),
+            params: vec![Param {
+                name: "b".into(),
+                ty: TypeRef::Bytes,
+                mutable: false,
+            }],
+            returns: Some(TypeRef::Bytes),
+            doc: None,
+            r#async: false,
+            cancellable: false,
+            deprecated: None,
+            since: None,
+        });
+        let api = make_api(vec![m]);
+        let addon = render_addon_c(&api, true);
+
+        let copy_pos = addon
+            .find("napi_create_buffer_copy(env, out_len, result, NULL, &ret);")
+            .expect("Node addon must copy bytes into a Node Buffer via napi_create_buffer_copy");
+        let free_pos = addon
+            .find("weaveffi_free_bytes(result, out_len);")
+            .expect("Node addon must free the returned pointer via weaveffi_free_bytes");
+        assert!(
+            copy_pos < free_pos,
+            "weaveffi_free_bytes must run AFTER napi_create_buffer_copy has copied the payload: {addon}"
+        );
+    }
 }

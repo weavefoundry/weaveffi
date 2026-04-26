@@ -3533,4 +3533,47 @@ mod tests {
             "weaveffi_error_clear must run BEFORE throwing: {h}"
         );
     }
+
+    #[test]
+    fn cpp_bytes_return_calls_free_bytes() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "parity".into(),
+                functions: vec![Function {
+                    name: "echo".into(),
+                    params: vec![Param {
+                        name: "b".into(),
+                        ty: TypeRef::Bytes,
+                        mutable: false,
+                    }],
+                    returns: Some(TypeRef::Bytes),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let h = render_cpp_header(&api, "weaveffi");
+
+        let copy_pos = h
+            .find("std::vector<uint8_t> ret(result, result + out_len);")
+            .expect("C++ wrapper must copy the bytes out of the owned buffer into a std::vector");
+        let free_pos = h
+            .find("weaveffi_free_bytes(result, out_len);")
+            .expect("C++ wrapper must call weaveffi_free_bytes on the returned pointer");
+        assert!(
+            copy_pos < free_pos,
+            "C++ wrapper must free AFTER copying data into std::vector: {h}"
+        );
+    }
 }

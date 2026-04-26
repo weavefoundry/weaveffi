@@ -181,11 +181,15 @@ fn render_wasm_readme(api: &Api) -> String {
     );
     out.push_str("matching the C ABI signature `(const uint8_t* {name}_ptr, size_t {name}_len)`. ");
     out.push_str("Byte returns follow the canonical `(uint8_t* out_ptr, size_t* out_len, weaveffi_error* out_err)` ");
-    out.push_str("convention: the WASM export writes the (`ptr`, `len`) pair into a caller-allocated 8-byte ");
     out.push_str(
-        "retptr in linear memory, and the caller is responsible for freeing the returned buffer ",
+        "convention: the WASM export writes the returned pointer into a caller-allocated 4-byte ",
     );
-    out.push_str("via `weaveffi_free_bytes(ptr, len)`.\n\n");
+    out.push_str(
+        "retptr and the length into a separate `out_len_ptr` out-param, both in linear memory. ",
+    );
+    out.push_str(
+        "The caller is responsible for freeing the returned buffer via `weaveffi_free_bytes(ptr, len)`.\n\n",
+    );
     out.push_str("### Lists\n\n");
     out.push_str("Lists are passed as a **pointer + length** pair (`i32` pointer, `i32` length) ");
     out.push_str("referencing a contiguous region in linear memory. The caller is responsible ");
@@ -359,6 +363,21 @@ fn api_needs_string_helpers(api: &Api) -> bool {
     api.modules.iter().any(module_needs_string_helpers)
 }
 
+fn api_needs_bytes_helpers(api: &Api) -> bool {
+    fn module_needs_bytes_helpers(m: &Module) -> bool {
+        m.functions.iter().any(|f| {
+            f.params
+                .iter()
+                .any(|p| matches!(p.ty, TypeRef::Bytes | TypeRef::BorrowedBytes))
+                || matches!(
+                    f.returns.as_ref(),
+                    Some(TypeRef::Bytes | TypeRef::BorrowedBytes)
+                )
+        }) || m.modules.iter().any(module_needs_bytes_helpers)
+    }
+    api.modules.iter().any(module_needs_bytes_helpers)
+}
+
 fn ts_type_for(ty: &TypeRef) -> String {
     match ty {
         TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 => "number".into(),
@@ -505,6 +524,7 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
     let load_fn = format!("load{pascal_name}");
     let mut out = String::new();
     let needs_strings = api_needs_string_helpers(api);
+    let needs_bytes = api_needs_bytes_helpers(api);
 
     out.push_str("// WeaveFFI WASM bindings (auto-generated)\n");
     out.push_str("//\n");
@@ -532,6 +552,14 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
         out.push_str("}\n\n");
         out.push_str("function _decodeString(wasm, ptr, len) {\n");
         out.push_str("  return _decoder.decode(new Uint8Array(wasm.memory.buffer, ptr, len));\n");
+        out.push_str("}\n\n");
+    }
+
+    if needs_bytes {
+        out.push_str("function _encodeBytes(wasm, data) {\n");
+        out.push_str("  const ptr = wasm.weaveffi_alloc(data.length);\n");
+        out.push_str("  new Uint8Array(wasm.memory.buffer, ptr, data.length).set(data);\n");
+        out.push_str("  return [ptr, data.length];\n");
         out.push_str("}\n\n");
     }
 
@@ -778,9 +806,21 @@ fn emit_js_function_wrapper(out: &mut String, module_name: &str, func: &Function
 
     let mut wasm_args = Vec::new();
     let returns_string = matches!(func.returns.as_ref(), Some(TypeRef::StringUtf8));
+    let returns_bytes = matches!(
+        func.returns.as_ref(),
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes)
+    );
 
     if returns_string {
         out.push_str(&format!("{indent}const retptr = wasm.weaveffi_alloc(8);\n"));
+        wasm_args.push("retptr".to_string());
+    } else if returns_bytes {
+        // Mirror the C ABI: retptr receives the returned `uint8_t*` (i32),
+        // while `out_len` stays an explicit out-parameter for the length.
+        out.push_str(&format!("{indent}const retptr = wasm.weaveffi_alloc(4);\n"));
+        out.push_str(&format!(
+            "{indent}const out_len_ptr = wasm.weaveffi_alloc(4);\n"
+        ));
         wasm_args.push("retptr".to_string());
     }
 
@@ -795,6 +835,14 @@ fn emit_js_function_wrapper(out: &mut String, module_name: &str, func: &Function
                 wasm_args.push(format!("{}_ptr", param.name));
                 wasm_args.push(format!("{}_len", param.name));
             }
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
+                out.push_str(&format!(
+                    "{indent}const [{name}_ptr, {name}_len] = _encodeBytes(wasm, {name});\n",
+                    name = param.name
+                ));
+                wasm_args.push(format!("{}_ptr", param.name));
+                wasm_args.push(format!("{}_len", param.name));
+            }
             TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
                 wasm_args.push(format!("{}._handle", param.name));
             }
@@ -804,6 +852,9 @@ fn emit_js_function_wrapper(out: &mut String, module_name: &str, func: &Function
         }
     }
 
+    if returns_bytes {
+        wasm_args.push("out_len_ptr".to_string());
+    }
     wasm_args.push("_err".to_string());
     let wasm_call = format!("wasm.{}({})", abi_name, wasm_args.join(", "));
 
@@ -833,6 +884,26 @@ fn emit_js_function_wrapper(out: &mut String, module_name: &str, func: &Function
                 "{indent}const _result = _decodeString(wasm, _strPtr, _strLen);\n"
             ));
             out.push_str(&format!("{indent}wasm.weaveffi_free_string(_strPtr);\n"));
+            out.push_str(&format!("{indent}return _result;\n"));
+        }
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
+            out.push_str(&format!("{indent}{wasm_call};\n"));
+            out.push_str(&format!("{indent}_checkError(wasm, _err);\n"));
+            out.push_str(&format!(
+                "{indent}const view = new DataView(wasm.memory.buffer);\n"
+            ));
+            out.push_str(&format!(
+                "{indent}const _bytesPtr = view.getInt32(retptr, true);\n"
+            ));
+            out.push_str(&format!(
+                "{indent}const _bytesLen = view.getInt32(out_len_ptr, true);\n"
+            ));
+            out.push_str(&format!(
+                "{indent}const _result = new Uint8Array(wasm.memory.buffer, _bytesPtr, _bytesLen).slice();\n"
+            ));
+            out.push_str(&format!(
+                "{indent}wasm.weaveffi_free_bytes(_bytesPtr, _bytesLen);\n"
+            ));
             out.push_str(&format!("{indent}return _result;\n"));
         }
         Some(TypeRef::Struct(name)) => {
@@ -2317,6 +2388,45 @@ mod tests {
         assert!(
             clear_pos < throw_pos,
             "wasm.weaveffi_error_clear must run BEFORE throwing: {js}"
+        );
+    }
+
+    #[test]
+    fn wasm_bytes_return_calls_free_bytes() {
+        let api = make_api(vec![Module {
+            name: "parity".into(),
+            functions: vec![Function {
+                name: "echo".into(),
+                params: vec![Param {
+                    name: "b".into(),
+                    ty: TypeRef::Bytes,
+                    mutable: false,
+                }],
+                returns: Some(TypeRef::Bytes),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+
+        let copy_pos = js
+            .find("new Uint8Array(wasm.memory.buffer, _bytesPtr, _bytesLen).slice()")
+            .expect("WASM wrapper must copy the returned bytes out of linear memory via .slice()");
+        let free_pos = js
+            .find("wasm.weaveffi_free_bytes(_bytesPtr, _bytesLen)")
+            .expect("WASM wrapper must free the returned pointer via wasm.weaveffi_free_bytes");
+        assert!(
+            copy_pos < free_pos,
+            "wasm.weaveffi_free_bytes must run AFTER the Uint8Array has copied the payload out of linear memory: {js}"
         );
     }
 }

@@ -2477,4 +2477,43 @@ mod tests {
             "weaveffi_error_clear must run BEFORE raising: {rb}"
         );
     }
+
+    #[test]
+    fn ruby_bytes_return_calls_free_bytes() {
+        let api = make_api(vec![Module {
+            name: "parity".into(),
+            functions: vec![Function {
+                name: "echo".into(),
+                params: vec![Param {
+                    name: "b".into(),
+                    ty: TypeRef::Bytes,
+                    mutable: false,
+                }],
+                returns: Some(TypeRef::Bytes),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let rb = render_ruby_module(&api, "WeaveFFI");
+
+        let copy_pos = rb
+            .find("data = result.read_string(len)")
+            .expect("Ruby wrapper must copy the returned bytes via result.read_string(len)");
+        let free_pos = rb
+            .find("weaveffi_free_bytes(result, len)")
+            .expect("Ruby wrapper must free the returned pointer via weaveffi_free_bytes");
+        assert!(
+            copy_pos < free_pos,
+            "weaveffi_free_bytes must run AFTER read_string has copied the payload: {rb}"
+        );
+    }
 }

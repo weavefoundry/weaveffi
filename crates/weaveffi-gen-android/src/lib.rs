@@ -4582,4 +4582,43 @@ mod tests {
             "weaveffi_error_clear must run AFTER ThrowNew has captured err->message: {jni}"
         );
     }
+
+    #[test]
+    fn android_bytes_return_calls_free_bytes() {
+        let api = make_api(vec![Module {
+            name: "parity".to_string(),
+            functions: vec![Function {
+                name: "echo".to_string(),
+                params: vec![Param {
+                    name: "b".to_string(),
+                    ty: TypeRef::Bytes,
+                    mutable: false,
+                }],
+                returns: Some(TypeRef::Bytes),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let copy_pos = jni
+            .find("SetByteArrayRegion(env, out, 0, (jsize)out_len, (const jbyte*)rv)")
+            .expect("JNI must copy the returned bytes into a jbyteArray via SetByteArrayRegion");
+        let free_pos = jni
+            .find("weaveffi_free_bytes(rv, (size_t)out_len);")
+            .expect("JNI must free the returned pointer via weaveffi_free_bytes");
+        assert!(
+            copy_pos < free_pos,
+            "weaveffi_free_bytes must run AFTER copying data into the jbyteArray: {jni}"
+        );
+    }
 }

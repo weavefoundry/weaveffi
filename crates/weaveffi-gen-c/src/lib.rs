@@ -2960,4 +2960,45 @@ mod tests {
             "header must declare weaveffi_free_bytes(uint8_t* ptr, size_t len) for caller cleanup: {header}"
         );
     }
+
+    #[test]
+    fn c_bytes_return_calls_free_bytes() {
+        // The C header IS the "wrapper" surface for C consumers: they must
+        // call `weaveffi_free_bytes` themselves after copying the payload.
+        // Assert the helper is declared whenever a function returns Bytes,
+        // so string-grep audits across generators stay uniform.
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "parity".to_string(),
+                functions: vec![Function {
+                    name: "echo".to_string(),
+                    params: vec![Param {
+                        name: "b".to_string(),
+                        ty: TypeRef::Bytes,
+                        mutable: false,
+                    }],
+                    returns: Some(TypeRef::Bytes),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let header = render_c_header(&api, "weaveffi");
+        assert!(
+            header.contains("void weaveffi_free_bytes(uint8_t* ptr, size_t len);"),
+            "C header must declare weaveffi_free_bytes so callers can release buffers returned by the bytes-returning function: {header}"
+        );
+    }
 }

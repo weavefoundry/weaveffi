@@ -2250,4 +2250,43 @@ mod tests {
             "async sync helper must return captured str: {sync_async_text}"
         );
     }
+
+    #[test]
+    fn dart_bytes_return_calls_free_bytes() {
+        let api = make_api(vec![Module {
+            name: "parity".into(),
+            functions: vec![Function {
+                name: "echo".into(),
+                params: vec![Param {
+                    name: "b".into(),
+                    ty: TypeRef::Bytes,
+                    mutable: false,
+                }],
+                returns: Some(TypeRef::Bytes),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let dart = render_dart_module(&api);
+
+        let copy_pos = dart
+            .find("List<int>.from(result.asTypedList(len))")
+            .expect("Dart wrapper must copy returned bytes into a List<int> via asTypedList");
+        let free_pos = dart
+            .find("_weaveffiFreeBytes(result, len)")
+            .expect("Dart wrapper must free the returned pointer via _weaveffiFreeBytes");
+        assert!(
+            copy_pos < free_pos,
+            "_weaveffiFreeBytes must run AFTER the payload is copied into a List<int>: {dart}"
+        );
+    }
 }

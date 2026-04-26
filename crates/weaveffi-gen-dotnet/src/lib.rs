@@ -4278,4 +4278,45 @@ mod tests {
             "Wrapper must Marshal.Copy the bytes out before freeing: {cs}"
         );
     }
+
+    #[test]
+    fn dotnet_bytes_return_calls_free_bytes() {
+        let api = make_api(vec![Module {
+            name: "parity".into(),
+            functions: vec![Function {
+                name: "echo".into(),
+                params: vec![Param {
+                    name: "b".into(),
+                    ty: TypeRef::Bytes,
+                    mutable: false,
+                }],
+                returns: Some(TypeRef::Bytes),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let cs = render_csharp(&api, "WeaveFFI", true);
+
+        let copy_pos = cs
+            .find("Marshal.Copy(result, arr, 0, (int)outLen);")
+            .expect("C# wrapper must Marshal.Copy the bytes out of the owned buffer");
+        let free_pos = cs
+            .find("NativeMethods.weaveffi_free_bytes(result, outLen);")
+            .expect(
+                "C# wrapper must call NativeMethods.weaveffi_free_bytes on the returned IntPtr",
+            );
+        assert!(
+            copy_pos < free_pos,
+            "weaveffi_free_bytes must run AFTER Marshal.Copy has copied the payload: {cs}"
+        );
+    }
 }

@@ -2819,4 +2819,47 @@ mod tests {
             "C.weaveffi_error_clear must run BEFORE returning the goErr: {go}"
         );
     }
+
+    #[test]
+    fn go_bytes_return_calls_free_bytes() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "parity".into(),
+                functions: vec![Function {
+                    name: "echo".into(),
+                    params: vec![Param {
+                        name: "b".into(),
+                        ty: TypeRef::Bytes,
+                        mutable: false,
+                    }],
+                    returns: Some(TypeRef::Bytes),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let go = render_go(&api);
+
+        let copy_pos = go
+            .find("goResult := C.GoBytes(unsafe.Pointer(result), C.int(cOutLen))")
+            .expect("Go wrapper must copy bytes into a Go []byte via C.GoBytes");
+        let free_pos = go
+            .find("C.weaveffi_free_bytes(result, cOutLen)")
+            .expect("Go wrapper must free the returned pointer via C.weaveffi_free_bytes");
+        assert!(
+            copy_pos < free_pos,
+            "C.weaveffi_free_bytes must run AFTER C.GoBytes has copied the payload: {go}"
+        );
+    }
 }

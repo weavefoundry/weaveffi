@@ -1622,7 +1622,8 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
 
     let is_list_return = matches!(f.returns.as_ref(), Some(TypeRef::List(_)));
     let is_map_return = matches!(f.returns.as_ref(), Some(TypeRef::Map(_, _)));
-    if is_list_return || is_map_return {
+    let is_bytes_return = matches!(f.returns.as_ref(), Some(TypeRef::Bytes));
+    if is_list_return || is_map_return || is_bytes_return {
         out.push_str("        var outLen: Int = 0\n");
     }
     if let Some(TypeRef::Map(k, v)) = &f.returns {
@@ -1641,6 +1642,7 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
     let handles_return_inside = matches!(
         f.returns.as_ref(),
         Some(TypeRef::StringUtf8)
+            | Some(TypeRef::Bytes)
             | Some(TypeRef::Enum(_))
             | Some(TypeRef::Optional(_))
             | Some(TypeRef::List(_))
@@ -1781,7 +1783,7 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
                 c_sym, call_args
             )
         }
-    } else if is_list_return {
+    } else if is_list_return || is_bytes_return {
         if call_args.is_empty() {
             format!("{}(&outLen, &err)", c_sym)
         } else {
@@ -1806,6 +1808,22 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
                 inner_indent
             ));
             out.push_str(&format!("{}    return String(cString: rv)\n", inner_indent));
+        }
+        Some(TypeRef::Bytes) => {
+            out.push_str(&format!("{}    let rv = {}\n", inner_indent, call_with_err));
+            out.push_str(&format!("{}    try check(&err)\n", inner_indent));
+            out.push_str(&format!(
+                "{}    guard let rv = rv else {{ return Data() }}\n",
+                inner_indent
+            ));
+            out.push_str(&format!(
+                "{}    defer {{ weaveffi_free_bytes(rv, outLen) }}\n",
+                inner_indent
+            ));
+            out.push_str(&format!(
+                "{}    return Data(bytes: rv, count: outLen)\n",
+                inner_indent
+            ));
         }
         Some(TypeRef::Enum(name)) => {
             out.push_str(&format!("{}    let rv = {}\n", inner_indent, call_with_err));
@@ -4403,5 +4421,54 @@ mod tests {
             clear_pos < throw_pos,
             "weaveffi_error_clear must run BEFORE throwing: {swift}"
         );
+    }
+
+    #[test]
+    fn swift_bytes_return_calls_free_bytes() {
+        // Covers both the direct-call path (no buffer params) and the
+        // buffered-call path (bytes param forces `render_buffered_call`),
+        // since both paths must free the returned `uint8_t*`.
+        for params in [
+            vec![],
+            vec![Param {
+                name: "b".to_string(),
+                ty: TypeRef::Bytes,
+                mutable: false,
+            }],
+        ] {
+            let api = make_api(vec![Module {
+                name: "parity".to_string(),
+                functions: vec![Function {
+                    name: "echo".to_string(),
+                    params,
+                    returns: Some(TypeRef::Bytes),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }]);
+
+            let swift = render_swift_wrapper(&api, true);
+            let convert_pos = swift
+                .find("Data(bytes: rv, count: outLen)")
+                .expect("Swift wrapper must convert bytes return to Data");
+            let free_pos = swift
+                .find("weaveffi_free_bytes(rv, outLen)")
+                .expect("Swift wrapper must call weaveffi_free_bytes on the returned pointer");
+            assert!(
+                convert_pos < free_pos
+                    || swift.contains("defer { weaveffi_free_bytes(rv, outLen) }"),
+                "weaveffi_free_bytes must run only after the payload is copied into Data \
+                 (either via a later statement or a `defer`): {swift}"
+            );
+        }
     }
 }
