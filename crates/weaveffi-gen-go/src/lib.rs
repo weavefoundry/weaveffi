@@ -52,6 +52,7 @@ impl Generator for GoGenerator {
             Capability::Callbacks,
             Capability::Listeners,
             Capability::Iterators,
+            Capability::Builders,
             Capability::CancellableAsync,
             Capability::TypedHandles,
             Capability::BorrowedTypes,
@@ -211,7 +212,11 @@ fn scan_imports(api: &Api) -> (bool, bool, bool, bool, bool) {
         .iter()
         .any(|m| m.functions.iter().any(|f| !f.r#async));
 
-    let needs_fmt = has_sync_funcs;
+    let has_builders = collect_all_modules(&api.modules)
+        .iter()
+        .any(|m| m.structs.iter().any(|s| s.builder));
+
+    let needs_fmt = has_sync_funcs || has_builders;
 
     let has_callbacks = has_any_callbacks(api);
 
@@ -220,7 +225,10 @@ fn scan_imports(api: &Api) -> (bool, bool, bool, bool, bool) {
             m.functions.iter().filter(|f| !f.r#async).any(|f| {
                 f.params.iter().any(|p| param_uses_unsafe(&p.ty))
                     || f.returns.as_ref().is_some_and(return_uses_unsafe)
-            })
+            }) || m
+                .structs
+                .iter()
+                .any(|s| s.builder && s.fields.iter().any(|fld| param_uses_unsafe(&fld.ty)))
         });
 
     let needs_bool = collect_all_modules(&api.modules).iter().any(|m| {
@@ -637,7 +645,7 @@ fn render_go(api: &Api) -> String {
         for s in &m.structs {
             render_struct(&mut out, &path, s);
             if s.builder {
-                render_go_builder(&mut out, s);
+                render_go_builder(&mut out, &path, s);
             }
         }
         for f in &m.functions {
@@ -695,14 +703,18 @@ fn render_struct(out: &mut String, module: &str, s: &StructDef) {
     out.push_str("}\n\n");
 }
 
-fn render_go_builder(out: &mut String, s: &StructDef) {
+fn render_go_builder(out: &mut String, module: &str, s: &StructDef) {
     let name = s.name.to_upper_camel_case();
+    let c_tag = format!("weaveffi_{module}_{}", s.name);
+    let c_builder_ty = format!("{c_tag}Builder");
+
     out.push_str(&format!("type {name}Builder struct {{\n"));
-    out.push_str("\tfields map[string]interface{}\n");
+    out.push_str(&format!("\thandle *C.{c_builder_ty}\n"));
     out.push_str("}\n\n");
+
     out.push_str(&format!("func New{name}Builder() *{name}Builder {{\n"));
     out.push_str(&format!(
-        "\treturn &{name}Builder{{fields: make(map[string]interface{{}})}}\n"
+        "\treturn &{name}Builder{{handle: C.{c_tag}_Builder_new()}}\n"
     ));
     out.push_str("}\n\n");
 
@@ -712,10 +724,42 @@ fn render_go_builder(out: &mut String, s: &StructDef) {
         out.push_str(&format!(
             "func (b *{name}Builder) With{method}(value {gt}) *{name}Builder {{\n"
         ));
-        out.push_str(&format!("\tb.fields[\"{}\"] = value\n", field.name));
+        let mut pre = String::new();
+        let mut c_args: Vec<String> = vec!["b.handle".into()];
+        emit_param(&mut pre, &mut c_args, "value", &field.ty, module);
+        out.push_str(&pre);
+        out.push_str(&format!(
+            "\tC.{c_tag}_Builder_set_{}({})\n",
+            field.name,
+            c_args.join(", ")
+        ));
         out.push_str("\treturn b\n");
         out.push_str("}\n\n");
     }
+
+    out.push_str(&format!(
+        "func (b *{name}Builder) Build() (*{name}, error) {{\n"
+    ));
+    out.push_str("\tvar cErr C.weaveffi_error\n");
+    out.push_str(&format!(
+        "\tresult := C.{c_tag}_Builder_build(b.handle, &cErr)\n"
+    ));
+    out.push_str(&format!("\tC.{c_tag}_Builder_destroy(b.handle)\n"));
+    out.push_str("\tb.handle = nil\n");
+    out.push_str("\tif cErr.code != 0 {\n");
+    out.push_str("\t\tgoErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(cErr.message), int(cErr.code))\n");
+    out.push_str("\t\tC.weaveffi_error_clear(&cErr)\n");
+    out.push_str("\t\treturn nil, goErr\n");
+    out.push_str("\t}\n");
+    out.push_str(&format!("\treturn new{name}(result), nil\n"));
+    out.push_str("}\n\n");
+
+    out.push_str(&format!("func (b *{name}Builder) Close() {{\n"));
+    out.push_str("\tif b.handle != nil {\n");
+    out.push_str(&format!("\t\tC.{c_tag}_Builder_destroy(b.handle)\n"));
+    out.push_str("\t\tb.handle = nil\n");
+    out.push_str("\t}\n");
+    out.push_str("}\n\n");
 }
 
 fn render_getter(
@@ -1644,18 +1688,23 @@ mod tests {
             "builder type: {go}"
         );
         assert!(
-            go.contains("fields map[string]interface{}"),
-            "fields map: {go}"
+            go.contains("handle *C.weaveffi_geo_PointBuilder"),
+            "typed builder handle: {go}"
         );
         assert!(
-            go.contains("func NewPointBuilder() *PointBuilder"),
-            "constructor: {go}"
+            go.contains(
+                "func NewPointBuilder() *PointBuilder {\n\treturn &PointBuilder{handle: C.weaveffi_geo_Point_Builder_new()}"
+            ),
+            "constructor must call C Builder_new: {go}"
         );
         assert!(
             go.contains("func (b *PointBuilder) WithX(value float64) *PointBuilder"),
             "WithX: {go}"
         );
-        assert!(go.contains("b.fields[\"x\"] = value"), "field assign: {go}");
+        assert!(
+            go.contains("C.weaveffi_geo_Point_Builder_set_x(b.handle, C.double(value))"),
+            "WithX should call C setter with typed handle: {go}"
+        );
     }
 
     #[test]
@@ -3526,15 +3575,129 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_includes_callbacks_listeners_iterators_excludes_async_builders() {
+    fn go_builder_build_calls_c_builder_build() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "geo".into(),
+                functions: vec![],
+                structs: vec![StructDef {
+                    name: "Point".into(),
+                    doc: None,
+                    builder: true,
+                    fields: vec![
+                        StructField {
+                            name: "x".into(),
+                            ty: TypeRef::F64,
+                            doc: None,
+                            default: None,
+                        },
+                        StructField {
+                            name: "y".into(),
+                            ty: TypeRef::F64,
+                            doc: None,
+                            default: None,
+                        },
+                    ],
+                }],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let go = render_go(&api);
+
+        assert!(
+            go.contains("type PointBuilder struct {\n\thandle *C.weaveffi_geo_PointBuilder\n}"),
+            "builder struct must hold a typed C handle: {go}"
+        );
+        assert!(
+            go.contains(
+                "func NewPointBuilder() *PointBuilder {\n\treturn &PointBuilder{handle: C.weaveffi_geo_Point_Builder_new()}\n}"
+            ),
+            "constructor must call C Builder_new: {go}"
+        );
+        assert!(
+            go.contains("C.weaveffi_geo_Point_Builder_set_x(b.handle, C.double(value))"),
+            "WithX must call native Builder_set_x with (b.handle, C.double(value)): {go}"
+        );
+        assert!(
+            go.contains("C.weaveffi_geo_Point_Builder_set_y(b.handle, C.double(value))"),
+            "WithY must call native Builder_set_y with (b.handle, C.double(value)): {go}"
+        );
+
+        let build_start = go
+            .find("func (b *PointBuilder) Build() (*Point, error) {")
+            .expect("Build must return (*Point, error)");
+        let build_body = &go[build_start..];
+        let build_end = build_body.find("\n}\n").unwrap();
+        let build_text = &build_body[..build_end];
+
+        assert!(
+            build_text.contains("var cErr C.weaveffi_error"),
+            "Build must declare cErr: {build_text}"
+        );
+        assert!(
+            build_text.contains("result := C.weaveffi_geo_Point_Builder_build(b.handle, &cErr)"),
+            "Build must call C Builder_build with (b.handle, &cErr): {build_text}"
+        );
+        assert!(
+            build_text.contains("C.weaveffi_geo_Point_Builder_destroy(b.handle)"),
+            "Build must destroy the builder: {build_text}"
+        );
+        assert!(
+            build_text.contains("b.handle = nil"),
+            "Build must nil the handle after destroy: {build_text}"
+        );
+        assert!(
+            build_text.contains("if cErr.code != 0 {"),
+            "Build must check cErr.code: {build_text}"
+        );
+        assert!(
+            build_text.contains("C.weaveffi_error_clear(&cErr)"),
+            "Build must clear cErr after capturing: {build_text}"
+        );
+        assert!(
+            build_text.contains("return nil, goErr"),
+            "Build must return (nil, err) on error: {build_text}"
+        );
+        assert!(
+            build_text.contains("return newPoint(result), nil"),
+            "Build must wrap result with newPoint on success: {build_text}"
+        );
+
+        let close_start = go
+            .find("func (b *PointBuilder) Close() {")
+            .expect("Close() cleanup method must be present");
+        let close_body = &go[close_start..];
+        let close_text = &close_body[..close_body.find("\n}\n").unwrap()];
+        assert!(
+            close_text.contains("if b.handle != nil {"),
+            "Close must guard on b.handle != nil: {close_text}"
+        );
+        assert!(
+            close_text.contains("C.weaveffi_geo_Point_Builder_destroy(b.handle)"),
+            "Close must call C Builder_destroy: {close_text}"
+        );
+        assert!(
+            close_text.contains("b.handle = nil"),
+            "Close must nil the handle: {close_text}"
+        );
+    }
+
+    #[test]
+    fn capabilities_includes_callbacks_listeners_iterators_builders_excludes_async() {
         let caps = GoGenerator.capabilities();
         assert!(caps.contains(&Capability::Callbacks));
         assert!(caps.contains(&Capability::Listeners));
         assert!(caps.contains(&Capability::Iterators));
+        assert!(caps.contains(&Capability::Builders));
         assert!(!caps.contains(&Capability::AsyncFunctions));
-        assert!(!caps.contains(&Capability::Builders));
         for cap in Capability::ALL {
-            if matches!(cap, Capability::AsyncFunctions | Capability::Builders) {
+            if matches!(cap, Capability::AsyncFunctions) {
                 continue;
             }
             assert!(caps.contains(cap), "Go generator must support {cap:?}");
