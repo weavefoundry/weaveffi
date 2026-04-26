@@ -4,7 +4,7 @@ use heck::ToUpperCamelCase;
 use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_abi_struct_name, local_type_name, wrapper_name};
-use weaveffi_ir::ir::{Api, Function, Module, StructDef, TypeRef};
+use weaveffi_ir::ir::{Api, CallbackDef, Function, Module, StructDef, TypeRef};
 
 pub struct NodeGenerator;
 
@@ -68,6 +68,7 @@ impl Generator for NodeGenerator {
 
     fn capabilities(&self) -> &'static [Capability] {
         &[
+            Capability::Callbacks,
             Capability::Iterators,
             Capability::Builders,
             Capability::AsyncFunctions,
@@ -223,6 +224,12 @@ fn render_addon_c(api: &Api, strip_module_prefix: bool) -> String {
         out.push_str("} weaveffi_napi_async_ctx;\n\n");
     }
 
+    for (m, path) in collect_modules_with_path(&api.modules) {
+        for cb in &m.callbacks {
+            render_callback_trampoline(&mut out, cb, &path);
+        }
+    }
+
     let mut all_exports: Vec<(String, String)> = Vec::new();
 
     for (m, path) in collect_modules_with_path(&api.modules) {
@@ -298,6 +305,211 @@ fn render_struct_destroy_napi(
     out.push_str("  napi_get_undefined(env, &ret);\n");
     out.push_str("  return ret;\n");
     out.push_str("}\n\n");
+}
+
+/// Emit the N-API bridge helpers for a callback: an invocation struct that
+/// carries the callback args across threads, a `call_js` function that runs on
+/// the JS thread and invokes the user's JS function, and a C-ABI trampoline
+/// that schedules the JS call via `napi_call_threadsafe_function`.
+fn render_callback_trampoline(out: &mut String, cb: &CallbackDef, module_path: &str) {
+    let cb_type = format!("weaveffi_{module_path}_{}", cb.name);
+    let inv_struct = format!("{cb_type}_invocation");
+
+    out.push_str("typedef struct {\n");
+    for p in &cb.params {
+        for field in callback_invocation_fields(&p.ty, &p.name) {
+            out.push_str(&format!("    {field};\n"));
+        }
+    }
+    if cb.params.is_empty() {
+        out.push_str("    int _unused;\n");
+    }
+    out.push_str(&format!("}} {inv_struct};\n\n"));
+
+    let call_js = format!("{cb_type}_call_js");
+    out.push_str(&format!(
+        "static void {call_js}(napi_env env, napi_value js_cb, void* context, void* data) {{\n"
+    ));
+    out.push_str("    (void)context;\n");
+    out.push_str(&format!("    {inv_struct}* inv = ({inv_struct}*)data;\n"));
+    out.push_str("    napi_value undef;\n");
+    out.push_str("    napi_get_undefined(env, &undef);\n");
+    let n_params = cb.params.len();
+    if n_params > 0 {
+        out.push_str(&format!("    napi_value cb_args[{n_params}];\n"));
+        for (i, p) in cb.params.iter().enumerate() {
+            emit_callback_arg_to_napi(out, &p.ty, &p.name, i);
+        }
+        out.push_str(&format!(
+            "    napi_call_function(env, undef, js_cb, {n_params}, cb_args, NULL);\n"
+        ));
+    } else {
+        out.push_str("    napi_call_function(env, undef, js_cb, 0, NULL, NULL);\n");
+    }
+    for p in &cb.params {
+        if let Some(free_stmt) = callback_arg_free(&p.ty, &p.name) {
+            out.push_str(&format!("    {free_stmt}\n"));
+        }
+    }
+    out.push_str("    free(inv);\n");
+    out.push_str("}\n\n");
+
+    let tramp = format!("{cb_type}_trampoline");
+    let ret_c = callback_c_return_type_node(cb.returns.as_ref());
+    let mut tramp_params: Vec<String> = vec!["void* context".to_string()];
+    for p in &cb.params {
+        tramp_params.extend(callback_trampoline_c_params(&p.ty, &p.name));
+    }
+    out.push_str(&format!(
+        "static {ret_c} {tramp}({}) {{\n",
+        tramp_params.join(", ")
+    ));
+    out.push_str("    napi_threadsafe_function tsfn = (napi_threadsafe_function)context;\n");
+    out.push_str(&format!(
+        "    {inv_struct}* inv = ({inv_struct}*)malloc(sizeof({inv_struct}));\n"
+    ));
+    for p in &cb.params {
+        emit_callback_arg_copy(out, &p.ty, &p.name);
+    }
+    out.push_str("    napi_call_threadsafe_function(tsfn, inv, napi_tsfn_blocking);\n");
+    if cb.returns.is_some() {
+        out.push_str(&format!("    return ({ret_c})0;\n"));
+    }
+    out.push_str("}\n\n");
+}
+
+/// Fields in the invocation struct used to carry the callback args across the
+/// JS/C thread boundary.
+fn callback_invocation_fields(ty: &TypeRef, name: &str) -> Vec<String> {
+    match ty {
+        TypeRef::I32 => vec![format!("int32_t {name}")],
+        TypeRef::U32 => vec![format!("uint32_t {name}")],
+        TypeRef::I64 => vec![format!("int64_t {name}")],
+        TypeRef::F64 => vec![format!("double {name}")],
+        TypeRef::Bool => vec![format!("bool {name}")],
+        TypeRef::Handle | TypeRef::TypedHandle(_) => {
+            vec![format!("weaveffi_handle_t {name}")]
+        }
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            vec![format!("char* {name}"), format!("size_t {name}_len")]
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            vec![format!("uint8_t* {name}"), format!("size_t {name}_len")]
+        }
+        _ => unreachable!("unsupported Node callback parameter type: {ty:?}"),
+    }
+}
+
+/// C-side parameters for the trampoline signature; for strings/bytes this
+/// expands to the `{ptr, len}` pair that matches the C ABI.
+fn callback_trampoline_c_params(ty: &TypeRef, name: &str) -> Vec<String> {
+    match ty {
+        TypeRef::I32 => vec![format!("int32_t {name}")],
+        TypeRef::U32 => vec![format!("uint32_t {name}")],
+        TypeRef::I64 => vec![format!("int64_t {name}")],
+        TypeRef::F64 => vec![format!("double {name}")],
+        TypeRef::Bool => vec![format!("bool {name}")],
+        TypeRef::Handle | TypeRef::TypedHandle(_) => {
+            vec![format!("weaveffi_handle_t {name}")]
+        }
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr | TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            vec![
+                format!("const uint8_t* {name}_ptr"),
+                format!("size_t {name}_len"),
+            ]
+        }
+        _ => unreachable!("unsupported Node callback parameter type: {ty:?}"),
+    }
+}
+
+fn callback_c_return_type_node(ty: Option<&TypeRef>) -> String {
+    match ty {
+        None => "void".into(),
+        Some(TypeRef::I32) => "int32_t".into(),
+        Some(TypeRef::U32) => "uint32_t".into(),
+        Some(TypeRef::I64) => "int64_t".into(),
+        Some(TypeRef::F64) => "double".into(),
+        Some(TypeRef::Bool) => "bool".into(),
+        Some(TypeRef::Handle) | Some(TypeRef::TypedHandle(_)) => "weaveffi_handle_t".into(),
+        _ => unreachable!("unsupported Node callback return type: {ty:?}"),
+    }
+}
+
+/// Inside the trampoline, copy the incoming C arg into the heap-allocated
+/// invocation struct so it outlives the current stack frame.
+fn emit_callback_arg_copy(out: &mut String, ty: &TypeRef, name: &str) {
+    match ty {
+        TypeRef::I32
+        | TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::F64
+        | TypeRef::Bool
+        | TypeRef::Handle
+        | TypeRef::TypedHandle(_) => {
+            out.push_str(&format!("    inv->{name} = {name};\n"));
+        }
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            out.push_str(&format!("    inv->{name}_len = {name}_len;\n"));
+            out.push_str(&format!(
+                "    inv->{name} = (char*)malloc({name}_len + 1);\n"
+            ));
+            out.push_str(&format!(
+                "    memcpy(inv->{name}, {name}_ptr, {name}_len);\n"
+            ));
+            out.push_str(&format!("    inv->{name}[{name}_len] = 0;\n"));
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            out.push_str(&format!("    inv->{name}_len = {name}_len;\n"));
+            out.push_str(&format!(
+                "    inv->{name} = (uint8_t*)malloc({name}_len);\n"
+            ));
+            out.push_str(&format!(
+                "    memcpy(inv->{name}, {name}_ptr, {name}_len);\n"
+            ));
+        }
+        _ => unreachable!("unsupported Node callback parameter type: {ty:?}"),
+    }
+}
+
+/// Inside `call_js`, convert an invocation field into a `napi_value` argument
+/// to pass to the user's JS callback.
+fn emit_callback_arg_to_napi(out: &mut String, ty: &TypeRef, name: &str, idx: usize) {
+    match ty {
+        TypeRef::I32 => out.push_str(&format!(
+            "    napi_create_int32(env, inv->{name}, &cb_args[{idx}]);\n"
+        )),
+        TypeRef::U32 => out.push_str(&format!(
+            "    napi_create_uint32(env, inv->{name}, &cb_args[{idx}]);\n"
+        )),
+        TypeRef::I64 => out.push_str(&format!(
+            "    napi_create_int64(env, inv->{name}, &cb_args[{idx}]);\n"
+        )),
+        TypeRef::F64 => out.push_str(&format!(
+            "    napi_create_double(env, inv->{name}, &cb_args[{idx}]);\n"
+        )),
+        TypeRef::Bool => out.push_str(&format!(
+            "    napi_get_boolean(env, inv->{name}, &cb_args[{idx}]);\n"
+        )),
+        TypeRef::Handle | TypeRef::TypedHandle(_) => out.push_str(&format!(
+            "    napi_create_int64(env, (int64_t)inv->{name}, &cb_args[{idx}]);\n"
+        )),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => out.push_str(&format!(
+            "    napi_create_string_utf8(env, inv->{name}, inv->{name}_len, &cb_args[{idx}]);\n"
+        )),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => out.push_str(&format!(
+            "    napi_create_buffer_copy(env, inv->{name}_len, inv->{name}, NULL, &cb_args[{idx}]);\n"
+        )),
+        _ => unreachable!("unsupported Node callback parameter type: {ty:?}"),
+    }
+}
+
+fn callback_arg_free(ty: &TypeRef, name: &str) -> Option<String> {
+    match ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr | TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            Some(format!("free(inv->{name});"))
+        }
+        _ => None,
+    }
 }
 
 fn async_cb_result_params_node(ret: Option<&TypeRef>, module: &str) -> String {
@@ -563,7 +775,23 @@ fn emit_param(
             emit_map_param(out, c_args, cleanups, k, v, name, idx, module);
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
-        TypeRef::Callback(_) => unreachable!("validator should have rejected callback Node param"),
+        TypeRef::Callback(cb_name) => {
+            let tramp = format!("weaveffi_{module}_{cb_name}_trampoline");
+            let call_js = format!("weaveffi_{module}_{cb_name}_call_js");
+            out.push_str(&format!("  napi_value {name}_tsfn_name;\n"));
+            out.push_str(&format!(
+                "  napi_create_string_utf8(env, \"{cb_name}\", NAPI_AUTO_LENGTH, &{name}_tsfn_name);\n"
+            ));
+            out.push_str(&format!("  napi_threadsafe_function {name}_tsfn;\n"));
+            out.push_str(&format!(
+                "  napi_create_threadsafe_function(env, args[{idx}], NULL, {name}_tsfn_name, 0, 1, NULL, NULL, NULL, {call_js}, &{name}_tsfn);\n"
+            ));
+            c_args.push(tramp);
+            c_args.push(format!("(void*){name}_tsfn"));
+            cleanups.push(format!(
+                "  napi_release_threadsafe_function({name}_tsfn, napi_tsfn_release);\n"
+            ));
+        }
     }
 }
 
@@ -1105,8 +1333,27 @@ fn ts_type_for(ty: &TypeRef) -> String {
             let t = ts_type_for(inner);
             format!("{t}[]")
         }
-        TypeRef::Callback(_) => unreachable!("validator should have rejected callback Node type"),
+        TypeRef::Callback(name) => name.clone(),
     }
+}
+
+fn ts_callback_type(cb: &CallbackDef) -> String {
+    let params: Vec<String> = cb
+        .params
+        .iter()
+        .map(|p| format!("{}: {}", p.name, ts_type_for(&p.ty)))
+        .collect();
+    let ret = cb
+        .returns
+        .as_ref()
+        .map(ts_type_for)
+        .unwrap_or_else(|| "void".to_string());
+    format!(
+        "export type {} = ({}) => {};\n",
+        cb.name,
+        params.join(", "),
+        ret
+    )
 }
 
 fn render_struct_builder_dts(out: &mut String, s: &StructDef) {
@@ -1212,6 +1459,9 @@ fn render_node_dts(api: &Api, strip_module_prefix: bool) -> String {
             }
             out.push_str("}\n");
         }
+        for cb in &m.callbacks {
+            out.push_str(&ts_callback_type(cb));
+        }
         out.push_str(&format!("// module {}\n", path));
         for f in &m.functions {
             let params: Vec<String> = f
@@ -1251,7 +1501,9 @@ fn render_node_dts(api: &Api, strip_module_prefix: bool) -> String {
 mod tests {
     use super::*;
     use weaveffi_core::config::GeneratorConfig;
-    use weaveffi_ir::ir::{EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField};
+    use weaveffi_ir::ir::{
+        CallbackDef, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField,
+    };
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
@@ -2724,16 +2976,13 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_excludes_callbacks_listeners_and_cancellable_async() {
+    fn capabilities_includes_callbacks_excludes_listeners_and_cancellable_async() {
         let caps = NodeGenerator.capabilities();
-        assert!(!caps.contains(&Capability::Callbacks));
+        assert!(caps.contains(&Capability::Callbacks));
         assert!(!caps.contains(&Capability::Listeners));
         assert!(!caps.contains(&Capability::CancellableAsync));
         for cap in Capability::ALL {
-            if matches!(
-                cap,
-                Capability::Callbacks | Capability::Listeners | Capability::CancellableAsync
-            ) {
+            if matches!(cap, Capability::Listeners | Capability::CancellableAsync) {
                 continue;
             }
             assert!(caps.contains(cap), "Node generator must support {cap:?}");
@@ -2755,6 +3004,108 @@ mod tests {
         assert!(
             msg.contains("validator should have rejected"),
             "panic message did not mention validator: {msg}"
+        );
+    }
+
+    #[test]
+    fn node_emits_callback_type_and_threadsafe_function() {
+        let api = make_api(vec![Module {
+            name: "events".into(),
+            functions: vec![Function {
+                name: "subscribe".into(),
+                params: vec![Param {
+                    name: "handler".into(),
+                    ty: TypeRef::Callback("OnData".into()),
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![CallbackDef {
+                name: "OnData".into(),
+                params: vec![Param {
+                    name: "value".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+            }],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let dts = render_node_dts(&api, true);
+        assert!(
+            dts.contains("export type OnData = (value: number) => void;"),
+            "missing TS type alias for OnData callback: {dts}"
+        );
+        assert!(
+            dts.contains("export function subscribe(handler: OnData): void"),
+            "subscribe should accept OnData callback: {dts}"
+        );
+
+        let addon = render_addon_c(&api, true);
+
+        assert!(
+            addon.contains(
+                "typedef struct {\n    int32_t value;\n} weaveffi_events_OnData_invocation;"
+            ),
+            "addon must declare invocation struct carrying callback args: {addon}"
+        );
+        assert!(
+            addon.contains("static void weaveffi_events_OnData_call_js(napi_env env, napi_value js_cb, void* context, void* data)"),
+            "addon must define the JS-thread dispatch helper: {addon}"
+        );
+        assert!(
+            addon.contains("napi_call_function(env, undef, js_cb, 1, cb_args, NULL);"),
+            "call_js must invoke the user's JS callback with the captured args: {addon}"
+        );
+        assert!(
+            addon.contains(
+                "static void weaveffi_events_OnData_trampoline(void* context, int32_t value)"
+            ),
+            "addon must define the C-ABI trampoline matching the C callback signature: {addon}"
+        );
+        assert!(
+            addon.contains("napi_call_threadsafe_function(tsfn, inv, napi_tsfn_blocking);"),
+            "trampoline must schedule the JS call via napi_call_threadsafe_function: {addon}"
+        );
+
+        assert!(
+            addon.contains("napi_create_threadsafe_function(env, args[0], NULL, handler_tsfn_name, 0, 1, NULL, NULL, NULL, weaveffi_events_OnData_call_js, &handler_tsfn);"),
+            "wrapper must create a threadsafe function from the JS callback: {addon}"
+        );
+        assert!(
+            addon.contains(
+                "weaveffi_events_subscribe(weaveffi_events_OnData_trampoline, (void*)handler_tsfn, &err);"
+            ),
+            "C call must pass the trampoline and the tsfn as context: {addon}"
+        );
+        assert!(
+            addon.contains("napi_release_threadsafe_function(handler_tsfn, napi_tsfn_release);"),
+            "wrapper must release the threadsafe function after the call: {addon}"
+        );
+
+        let create_pos = addon
+            .find("napi_create_threadsafe_function(env, args[0]")
+            .expect("threadsafe function must be created before the C call");
+        let call_pos = addon
+            .find("weaveffi_events_subscribe(weaveffi_events_OnData_trampoline")
+            .expect("C call must be present");
+        let release_pos = addon
+            .find("napi_release_threadsafe_function(handler_tsfn")
+            .expect("release must be present");
+        assert!(
+            create_pos < call_pos && call_pos < release_pos,
+            "threadsafe function must be created before the C call and released after: {addon}"
         );
     }
 }
