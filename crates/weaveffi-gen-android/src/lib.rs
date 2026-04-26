@@ -4,7 +4,9 @@ use std::fmt::Write as _;
 use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name, wrapper_name};
-use weaveffi_ir::ir::{Api, CallbackDef, EnumDef, Function, Module, StructDef, TypeRef};
+use weaveffi_ir::ir::{
+    Api, CallbackDef, EnumDef, Function, ListenerDef, Module, StructDef, TypeRef,
+};
 
 pub struct AndroidGenerator;
 
@@ -83,6 +85,7 @@ impl Generator for AndroidGenerator {
     fn capabilities(&self) -> &'static [Capability] {
         &[
             Capability::Callbacks,
+            Capability::Listeners,
             Capability::Iterators,
             Capability::Builders,
             Capability::AsyncFunctions,
@@ -465,6 +468,11 @@ fn render_kotlin(api: &Api, package: &str, strip_module_prefix: bool) -> String 
             }
         }
     }
+    for (m, _path) in collect_modules_with_path(&api.modules) {
+        for l in &m.listeners {
+            render_kotlin_listener(&mut kotlin, l);
+        }
+    }
     render_kotlin_error_types(&mut kotlin, api);
     if has_async {
         kotlin.push_str("\ninternal class WeaveContinuation<T>(private val cont: kotlinx.coroutines.CancellableContinuation<T>) {\n");
@@ -490,6 +498,27 @@ fn render_kotlin_callback_typealias(out: &mut String, cb: &CallbackDef) {
         params.join(", "),
         ret
     );
+}
+
+/// Emit a Kotlin wrapper class for a listener. The companion object exposes
+/// `register(callback): Long` and `unregister(id: Long)` as `@JvmStatic external`
+/// functions; the JNI bridge reuses the shared callback registry to pin the
+/// Kotlin lambda and installs the per-callback trampoline on the C ABI.
+fn render_kotlin_listener(out: &mut String, l: &ListenerDef) {
+    let class_name = to_pascal_case(&l.name);
+    let _ = writeln!(out);
+    let _ = writeln!(out, "class {class_name} {{");
+    let _ = writeln!(out, "    companion object {{");
+    let _ = writeln!(out, "        init {{ System.loadLibrary(\"weaveffi\") }}");
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "        @JvmStatic external fun register(callback: {}): Long",
+        l.event_callback
+    );
+    let _ = writeln!(out, "        @JvmStatic external fun unregister(id: Long)");
+    let _ = writeln!(out, "    }}");
+    let _ = writeln!(out, "}}");
 }
 
 fn render_kotlin_async_fun(out: &mut String, f: &Function, func_name: &str) {
@@ -858,6 +887,33 @@ fn render_jni_callback_register(out: &mut String, jni_prefix: &str, cb: &Callbac
     out.push_str("}\n\n");
 }
 
+fn render_jni_listener(out: &mut String, module: &str, l: &ListenerDef, jni_prefix: &str) {
+    let class_name = to_pascal_case(&l.name);
+    let trampoline = format!("weaveffi_{module}_{}_trampoline", l.event_callback);
+    let reg_sym = format!("weaveffi_{module}_register_{}", l.name);
+    let unreg_sym = format!("weaveffi_{module}_unregister_{}", l.name);
+
+    let _ = writeln!(
+        out,
+        "JNIEXPORT jlong JNICALL Java_{jni_prefix}_{class_name}_register(JNIEnv* env, jclass clazz, jobject callback) {{"
+    );
+    out.push_str("    jlong token = weaveffi_cb_register(env, callback);\n");
+    let _ = writeln!(
+        out,
+        "    uint64_t id = {reg_sym}(&{trampoline}, (void*)(intptr_t)token);"
+    );
+    out.push_str("    return (jlong)id;\n");
+    out.push_str("}\n\n");
+
+    let _ = writeln!(
+        out,
+        "JNIEXPORT void JNICALL Java_{jni_prefix}_{class_name}_unregister(JNIEnv* env, jclass clazz, jlong id) {{"
+    );
+    out.push_str("    (void)env; (void)clazz;\n");
+    let _ = writeln!(out, "    {unreg_sym}((uint64_t)id);");
+    out.push_str("}\n\n");
+}
+
 fn render_jni_c(api: &Api, package: &str, strip_module_prefix: bool) -> String {
     let jni_prefix = package.replace('.', "_");
     let jni_pkg_path = package.replace('.', "/");
@@ -917,6 +973,12 @@ fn render_jni_c(api: &Api, package: &str, strip_module_prefix: bool) -> String {
                 render_jni_callback_trampoline(&mut jni_c, &path, cb);
                 render_jni_callback_register(&mut jni_c, &jni_prefix, cb);
             }
+        }
+    }
+
+    for (m, path) in collect_modules_with_path(&api.modules) {
+        for l in &m.listeners {
+            render_jni_listener(&mut jni_c, &path, l, &jni_prefix);
         }
     }
 
@@ -5108,14 +5170,9 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_includes_callbacks_excludes_listeners() {
+    fn capabilities_includes_callbacks_and_listeners() {
         let caps = AndroidGenerator.capabilities();
-        assert!(caps.contains(&Capability::Callbacks));
-        assert!(!caps.contains(&Capability::Listeners));
         for cap in Capability::ALL {
-            if matches!(cap, Capability::Listeners) {
-                continue;
-            }
             assert!(caps.contains(cap), "Android generator must support {cap:?}");
         }
     }
@@ -5213,6 +5270,80 @@ mod tests {
         assert!(
             jni.contains("(void*)(intptr_t)handler"),
             "JNI wrapper must pass registry token as context: {jni}"
+        );
+    }
+
+    #[test]
+    fn kotlin_emits_listener_class() {
+        use weaveffi_ir::ir::{CallbackDef, ListenerDef};
+        let api = make_api(vec![Module {
+            name: "events".to_string(),
+            functions: vec![],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![CallbackDef {
+                name: "OnData".to_string(),
+                params: vec![Param {
+                    name: "value".to_string(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+            }],
+            listeners: vec![ListenerDef {
+                name: "data_stream".to_string(),
+                event_callback: "OnData".to_string(),
+                doc: None,
+            }],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let kt = render_kotlin(&api, "com.weaveffi", true);
+        assert!(
+            kt.contains("class DataStream {"),
+            "missing listener class: {kt}"
+        );
+        assert!(
+            kt.contains("@JvmStatic external fun register(callback: OnData): Long"),
+            "listener must expose register(callback): Long taking the event callback: {kt}"
+        );
+        assert!(
+            kt.contains("@JvmStatic external fun unregister(id: Long)"),
+            "listener must expose unregister(id: Long): {kt}"
+        );
+        assert!(
+            kt.contains("System.loadLibrary(\"weaveffi\")"),
+            "listener companion must load the native library: {kt}"
+        );
+
+        let jni = render_jni_c(&api, "com.weaveffi", true);
+        assert!(
+            jni.contains(
+                "JNIEXPORT jlong JNICALL Java_com_weaveffi_DataStream_register(JNIEnv* env, jclass clazz, jobject callback)"
+            ),
+            "JNI must export listener register: {jni}"
+        );
+        assert!(
+            jni.contains("jlong token = weaveffi_cb_register(env, callback);"),
+            "listener register must pin lambda via shared callback registry: {jni}"
+        );
+        assert!(
+            jni.contains(
+                "weaveffi_events_register_data_stream(&weaveffi_events_OnData_trampoline, (void*)(intptr_t)token)"
+            ),
+            "listener register must call C register with trampoline and context token: {jni}"
+        );
+        assert!(
+            jni.contains(
+                "JNIEXPORT void JNICALL Java_com_weaveffi_DataStream_unregister(JNIEnv* env, jclass clazz, jlong id)"
+            ),
+            "JNI must export listener unregister: {jni}"
+        );
+        assert!(
+            jni.contains("weaveffi_events_unregister_data_stream((uint64_t)id);"),
+            "listener unregister must call C unregister with the listener id: {jni}"
         );
     }
 }
