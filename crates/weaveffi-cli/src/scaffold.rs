@@ -320,6 +320,53 @@ fn render_struct_scaffold(out: &mut String, module: &str, s: &StructDef) {
         out.push_str("    todo!()\n");
         out.push_str("}\n\n");
     }
+
+    if s.builder {
+        render_builder_scaffold(out, module, s, &prefix);
+    }
+}
+
+fn render_builder_scaffold(out: &mut String, module: &str, s: &StructDef, prefix: &str) {
+    let builder_ty = format!("{prefix}Builder");
+
+    out.push_str("#[repr(C)]\n");
+    out.push_str(&format!("pub struct {builder_ty} {{\n"));
+    out.push_str("    // TODO: add builder fields\n");
+    out.push_str("}\n\n");
+
+    out.push_str("#[no_mangle]\n");
+    out.push_str(&format!(
+        "pub extern \"C\" fn {prefix}_Builder_new() -> *mut {builder_ty} {{\n"
+    ));
+    out.push_str("    todo!()\n");
+    out.push_str("}\n\n");
+
+    for field in &s.fields {
+        let setter = format!("{prefix}_Builder_set_{}", field.name);
+        let mut setter_params = vec![format!("builder: *mut {builder_ty}")];
+        setter_params.extend(rust_param_fragments("value", &field.ty, module));
+        out.push_str("#[no_mangle]\n");
+        out.push_str(&format!(
+            "pub extern \"C\" fn {setter}({}) {{\n",
+            setter_params.join(", ")
+        ));
+        out.push_str("    todo!()\n");
+        out.push_str("}\n\n");
+    }
+
+    out.push_str("#[no_mangle]\n");
+    out.push_str(&format!(
+        "pub extern \"C\" fn {prefix}_Builder_build(builder: *mut {builder_ty}, out_err: *mut weaveffi_error) -> *mut {prefix} {{\n"
+    ));
+    out.push_str("    todo!()\n");
+    out.push_str("}\n\n");
+
+    out.push_str("#[no_mangle]\n");
+    out.push_str(&format!(
+        "pub extern \"C\" fn {prefix}_Builder_destroy(builder: *mut {builder_ty}) {{\n"
+    ));
+    out.push_str("    todo!()\n");
+    out.push_str("}\n\n");
 }
 
 #[cfg(test)]
@@ -904,6 +951,15 @@ mod tests {
         );
 
         assert!(
+            out.contains("fn weaveffi_io_Message_Builder_set_body(builder: *mut weaveffi_io_MessageBuilder, value_ptr: *const u8, value_len: usize)"),
+            "StringUtf8 builder setter should take (builder, value_ptr, value_len): {out}"
+        );
+        assert!(
+            out.contains("fn weaveffi_io_Message_Builder_set_label(builder: *mut weaveffi_io_MessageBuilder, value_ptr: *const u8, value_len: usize)"),
+            "BorrowedStr builder setter should take (builder, value_ptr, value_len): {out}"
+        );
+
+        assert!(
             !out.contains("msg: *const c_char"),
             "StringUtf8 param must not use legacy *const c_char: {out}"
         );
@@ -918,6 +974,10 @@ mod tests {
         assert!(
             !out.contains("label: *const c_char"),
             "BorrowedStr struct field setter must not use legacy *const c_char: {out}"
+        );
+        assert!(
+            !out.contains("value: *const c_char"),
+            "builder string setter must not use legacy value: *const c_char: {out}"
         );
     }
 
