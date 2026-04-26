@@ -4,7 +4,9 @@ use heck::{ToShoutySnakeCase, ToSnakeCase};
 use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name};
-use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, StructField, TypeRef};
+use weaveffi_ir::ir::{
+    Api, CallbackDef, EnumDef, Function, Module, StructDef, StructField, TypeRef,
+};
 
 pub struct RubyGenerator;
 
@@ -63,6 +65,7 @@ impl Generator for RubyGenerator {
     fn capabilities(&self) -> &'static [Capability] {
         &[
             Capability::Builders,
+            Capability::Callbacks,
             Capability::CancellableAsync,
             Capability::TypedHandles,
             Capability::BorrowedTypes,
@@ -104,16 +107,17 @@ fn rb_ffi_scalar(ty: &TypeRef) -> &'static str {
     }
 }
 
-fn rb_param_ffi_types(ty: &TypeRef) -> Vec<&'static str> {
+fn rb_param_ffi_types(ty: &TypeRef) -> Vec<String> {
     match ty {
         TypeRef::StringUtf8 | TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            vec![":pointer", ":size_t"]
+            vec![":pointer".into(), ":size_t".into()]
         }
-        TypeRef::Optional(inner) if !is_c_pointer_type(inner) => vec![":pointer"],
+        TypeRef::Optional(inner) if !is_c_pointer_type(inner) => vec![":pointer".into()],
         TypeRef::Optional(inner) => rb_param_ffi_types(inner),
-        TypeRef::List(_) => vec![":pointer", ":size_t"],
-        TypeRef::Map(_, _) => vec![":pointer", ":pointer", ":size_t"],
-        _ => vec![rb_ffi_scalar(ty)],
+        TypeRef::List(_) => vec![":pointer".into(), ":size_t".into()],
+        TypeRef::Map(_, _) => vec![":pointer".into(), ":pointer".into(), ":size_t".into()],
+        TypeRef::Callback(name) => vec![format!(":{name}"), ":pointer".into()],
+        _ => vec![rb_ffi_scalar(ty).into()],
     }
 }
 
@@ -239,7 +243,7 @@ fn rb_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
             format!("{name}_vals_buf"),
             format!("{name}.length"),
         ],
-        TypeRef::Callback(_) => vec![name.to_string()],
+        TypeRef::Callback(_) => vec![name.to_string(), "FFI::Pointer::NULL".to_string()],
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
     }
 }
@@ -290,6 +294,9 @@ fn render_ruby_module(api: &Api, module_name: &str) -> String {
         out.push_str(&format!("\n  # === Module: {} ===\n", path));
         for e in &m.enums {
             render_enum(&mut out, e);
+        }
+        for cb in &m.callbacks {
+            render_callback_def(&mut out, cb);
         }
         for s in &m.structs {
             render_struct_ffi(&mut out, &path, s);
@@ -376,6 +383,23 @@ fn render_enum(out: &mut String, e: &EnumDef) {
     out.push_str("  end\n");
 }
 
+fn render_callback_def(out: &mut String, cb: &CallbackDef) {
+    let mut cb_param_types: Vec<String> = vec![":pointer".into()];
+    for p in &cb.params {
+        cb_param_types.extend(rb_param_ffi_types(&p.ty));
+    }
+    let ret = cb
+        .returns
+        .as_ref()
+        .map(rb_return_ffi_type)
+        .unwrap_or(":void");
+    out.push_str(&format!(
+        "\n  callback :{}, [{}], {ret}\n",
+        cb.name,
+        cb_param_types.join(", ")
+    ));
+}
+
 fn render_struct_ffi(out: &mut String, module_name: &str, s: &StructDef) {
     let prefix = format!("weaveffi_{}_{}", module_name, s.name);
     out.push_str(&format!(
@@ -401,7 +425,7 @@ fn render_attach_function(out: &mut String, module_name: &str, f: &Function) {
     let c_sym = c_symbol_name(module_name, &f.name);
     let mut argtypes: Vec<String> = Vec::new();
     for p in &f.params {
-        argtypes.extend(rb_param_ffi_types(&p.ty).iter().map(|s| s.to_string()));
+        argtypes.extend(rb_param_ffi_types(&p.ty));
     }
     if let Some(ret_ty) = &f.returns {
         argtypes.extend(rb_return_out_params(ret_ty).iter().map(|s| s.to_string()));
@@ -2590,23 +2614,81 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_excludes_callbacks_listeners_async_and_iterators() {
+    fn capabilities_includes_callbacks_excludes_listeners_async_and_iterators() {
         let caps = RubyGenerator.capabilities();
-        assert!(!caps.contains(&Capability::Callbacks));
+        assert!(caps.contains(&Capability::Callbacks));
         assert!(!caps.contains(&Capability::Listeners));
         assert!(!caps.contains(&Capability::AsyncFunctions));
         assert!(!caps.contains(&Capability::Iterators));
         for cap in Capability::ALL {
             if matches!(
                 cap,
-                Capability::Callbacks
-                    | Capability::Listeners
-                    | Capability::AsyncFunctions
-                    | Capability::Iterators
+                Capability::Listeners | Capability::AsyncFunctions | Capability::Iterators
             ) {
                 continue;
             }
             assert!(caps.contains(cap), "Ruby generator must support {cap:?}");
         }
+    }
+
+    #[test]
+    fn ruby_emits_callback_via_ffi_callback() {
+        let api = make_api(vec![Module {
+            name: "events".into(),
+            functions: vec![Function {
+                name: "subscribe".into(),
+                params: vec![Param {
+                    name: "handler".into(),
+                    ty: TypeRef::Callback("OnData".into()),
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![CallbackDef {
+                name: "OnData".into(),
+                params: vec![Param {
+                    name: "value".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+            }],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let code = render_ruby_module(&api, "WeaveFFI");
+
+        assert!(
+            code.contains("callback :OnData, [:pointer, :int32], :void"),
+            "Ruby must declare the callback via FFI's callback macro \
+             with a leading :pointer context and user-defined params: {code}"
+        );
+        assert!(
+            code.contains(
+                "attach_function :weaveffi_events_subscribe, \
+                 [:OnData, :pointer, :pointer], :void"
+            ),
+            "attach_function must reference the callback type, include a :pointer \
+             context arg, and the :pointer err out-param: {code}"
+        );
+        assert!(
+            code.contains("def self.subscribe(handler)"),
+            "wrapper must accept the callback Proc as its only user-facing param: {code}"
+        );
+        assert!(
+            code.contains("weaveffi_events_subscribe(handler, FFI::Pointer::NULL, err)"),
+            "wrapper must pass the Proc directly plus a NULL context \
+             so FFI manages the trampoline and lifetime: {code}"
+        );
     }
 }
