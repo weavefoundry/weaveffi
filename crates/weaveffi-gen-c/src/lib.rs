@@ -259,7 +259,11 @@ fn render_c_header(api: &Api, prefix: &str) -> String {
     ));
     out.push_str(&format!("void {prefix}_free_string(const char* ptr);\n"));
     out.push_str(&format!(
-        "void {prefix}_free_bytes(uint8_t* ptr, size_t len);\n\n"
+        "void {prefix}_free_bytes(uint8_t* ptr, size_t len);\n"
+    ));
+    out.push_str(&format!("uint8_t* {prefix}_alloc(size_t size);\n"));
+    out.push_str(&format!(
+        "void {prefix}_free(uint8_t* ptr, size_t size);\n\n"
     ));
     out.push_str(&format!(
         "typedef struct {prefix}_cancel_token {prefix}_cancel_token;\n"
@@ -2999,6 +3003,44 @@ mod tests {
         assert!(
             header.contains("void weaveffi_free_bytes(uint8_t* ptr, size_t len);"),
             "C header must declare weaveffi_free_bytes so callers can release buffers returned by the bytes-returning function: {header}"
+        );
+    }
+
+    #[test]
+    fn c_header_declares_alloc_and_free() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![],
+            generators: None,
+        };
+
+        let header = render_c_header(&api, "weaveffi");
+        assert!(
+            header.contains("uint8_t* weaveffi_alloc(size_t size);"),
+            "header must declare weaveffi_alloc prototype: {header}"
+        );
+        assert!(
+            header.contains("void weaveffi_free(uint8_t* ptr, size_t size);"),
+            "header must declare weaveffi_free prototype: {header}"
+        );
+    }
+
+    #[test]
+    fn c_header_alloc_and_free_honor_c_prefix() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![],
+            generators: None,
+        };
+
+        let header = render_c_header(&api, "myffi");
+        assert!(
+            header.contains("uint8_t* myffi_alloc(size_t size);"),
+            "alloc prototype must honor configured c_prefix: {header}"
+        );
+        assert!(
+            header.contains("void myffi_free(uint8_t* ptr, size_t size);"),
+            "free prototype must honor configured c_prefix: {header}"
         );
     }
 }

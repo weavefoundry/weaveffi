@@ -5,10 +5,53 @@
 
 pub mod arena;
 
+use std::alloc::{alloc as sys_alloc, dealloc as sys_dealloc, Layout};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Layout used by [`weaveffi_alloc`] / [`weaveffi_free`]: alignment 1 for raw byte arrays.
+fn byte_layout(size: usize) -> Option<Layout> {
+    if size == 0 {
+        return None;
+    }
+    Layout::from_size_align(size, 1).ok()
+}
+
+/// Allocate `size` bytes of raw storage with alignment 1, returning an owned pointer.
+///
+/// Returns a null pointer when `size` is zero or allocation fails. The caller
+/// must release the buffer with [`weaveffi_free`] using the same `size`.
+#[no_mangle]
+pub extern "C" fn weaveffi_alloc(size: usize) -> *mut u8 {
+    let Some(layout) = byte_layout(size) else {
+        return ptr::null_mut();
+    };
+    // SAFETY: `layout` has non-zero size, which is the requirement for `std::alloc::alloc`.
+    unsafe { sys_alloc(layout) }
+}
+
+/// Free a buffer previously returned by [`weaveffi_alloc`].
+///
+/// `size` must match the size passed to `weaveffi_alloc`. A null `ptr` or zero
+/// `size` is a no-op so foreign callers can safely forward defaults.
+///
+/// # Safety
+///
+/// `ptr` must have been returned by [`weaveffi_alloc`] with the same `size` and
+/// must not be used after this call.
+#[no_mangle]
+pub extern "C" fn weaveffi_free(ptr: *mut u8, size: usize) {
+    if ptr.is_null() {
+        return;
+    }
+    let Some(layout) = byte_layout(size) else {
+        return;
+    };
+    // SAFETY: caller guarantees `ptr` came from `weaveffi_alloc` with matching `size`.
+    unsafe { sys_dealloc(ptr, layout) };
+}
 
 /// Public opaque handle type exposed to foreign callers.
 pub type weaveffi_handle_t = u64;
@@ -307,5 +350,34 @@ mod tests {
         cancel_token_cancel(ptr::null_mut());
         assert!(!cancel_token_is_cancelled(ptr::null()));
         cancel_token_destroy(ptr::null_mut());
+    }
+
+    #[test]
+    fn alloc_and_free_round_trip() {
+        const SIZE: usize = 64;
+        let ptr = weaveffi_alloc(SIZE);
+        assert!(!ptr.is_null());
+
+        // SAFETY: `ptr` points to `SIZE` bytes just allocated above.
+        let buf = unsafe { std::slice::from_raw_parts_mut(ptr, SIZE) };
+        for (i, slot) in buf.iter_mut().enumerate() {
+            *slot = (i as u8) ^ 0xA5;
+        }
+        for (i, &value) in buf.iter().enumerate() {
+            assert_eq!(value, (i as u8) ^ 0xA5);
+        }
+
+        weaveffi_free(ptr, SIZE);
+    }
+
+    #[test]
+    fn alloc_zero_returns_null() {
+        assert!(weaveffi_alloc(0).is_null());
+    }
+
+    #[test]
+    fn free_null_is_safe() {
+        weaveffi_free(ptr::null_mut(), 0);
+        weaveffi_free(ptr::null_mut(), 32);
     }
 }
