@@ -552,11 +552,14 @@ fn render_cpp_classes(out: &mut String, module: &Module, abi_module: &str) {
             "    explicit {name}(void* h) : handle_(h) {{}}\n\n"
         ));
 
-        // Destructor
+        // Destructor: destroy + null out source for idempotency.
         out.push_str(&format!("    ~{name}() {{\n"));
+        out.push_str("        if (handle_) {\n");
         out.push_str(&format!(
-            "        if (handle_) {tag}_destroy(static_cast<{tag}*>(handle_));\n"
+            "            {tag}_destroy(static_cast<{tag}*>(handle_));\n"
         ));
+        out.push_str("            handle_ = nullptr;\n");
+        out.push_str("        }\n");
         out.push_str("    }\n\n");
 
         // Deleted copy
@@ -612,9 +615,12 @@ fn render_cpp_builder(out: &mut String, s: &StructDef, abi_module: &str) {
         "    {name}Builder() : handle_(reinterpret_cast<void*>({tag}_Builder_new())) {{}}\n\n"
     ));
     out.push_str(&format!("    ~{name}Builder() {{\n"));
+    out.push_str("        if (handle_) {\n");
     out.push_str(&format!(
-        "        if (handle_) {tag}_Builder_destroy(static_cast<{builder_ty}*>(handle_));\n"
+        "            {tag}_Builder_destroy(static_cast<{builder_ty}*>(handle_));\n"
     ));
+    out.push_str("            handle_ = nullptr;\n");
+    out.push_str("        }\n");
     out.push_str("    }\n\n");
 
     out.push_str(&format!(
@@ -3639,10 +3645,19 @@ mod tests {
         let dtor_pos = h
             .find("~Contact()")
             .expect("Contact class must declare a destructor");
-        let dtor_destroy_pos = h[dtor_pos..]
+        let next_method = h[dtor_pos..]
+            .find("\n    Contact(const Contact&)")
+            .map(|p| dtor_pos + p)
+            .expect("destructor must be followed by the deleted copy constructor");
+        let dtor_body = &h[dtor_pos..next_method];
+        let dtor_destroy_pos = dtor_body
             .find("weaveffi_contacts_Contact_destroy(static_cast<weaveffi_contacts_Contact*>(handle_))")
             .map(|p| dtor_pos + p)
             .expect("destructor must call weaveffi_contacts_Contact_destroy on the handle");
+        let dtor_null_pos = dtor_body
+            .find("handle_ = nullptr;")
+            .map(|p| dtor_pos + p)
+            .expect("destructor must null out handle_ after destroy for idempotency");
         let move_assign_pos = h
             .find("Contact& operator=(Contact&& other) noexcept")
             .expect("Contact class must declare move-assignment operator");
@@ -3655,6 +3670,7 @@ mod tests {
             .map(|p| move_assign_pos + p)
             .expect("move-assignment must null out the source handle");
         assert!(dtor_destroy_pos > dtor_pos);
+        assert!(dtor_null_pos > dtor_destroy_pos);
         assert!(move_destroy_pos > move_assign_pos);
         assert!(null_source_pos > move_destroy_pos);
     }
