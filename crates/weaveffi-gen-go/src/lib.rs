@@ -1,7 +1,7 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
-use weaveffi_core::codegen::{Capability, Generator};
+use weaveffi_core::codegen::{stamp_header, Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::local_type_name;
 use weaveffi_ir::ir::{
@@ -9,6 +9,10 @@ use weaveffi_ir::ir::{
 };
 
 pub struct GoGenerator;
+
+fn stamp_slash(body: String) -> String {
+    format!("// {}\n{body}", stamp_header("go"))
+}
 
 impl GoGenerator {
     fn generate_impl(
@@ -20,8 +24,12 @@ impl GoGenerator {
     ) -> Result<()> {
         let dir = out_dir.join("go");
         std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join("weaveffi.go"), render_go(api, c_prefix))?;
-        std::fs::write(dir.join("go.mod"), render_go_mod(module_path))?;
+        std::fs::write(
+            dir.join("weaveffi.go"),
+            stamp_slash(render_go(api, c_prefix)),
+        )?;
+        std::fs::write(dir.join("go.mod"), stamp_slash(render_go_mod(module_path)))?;
+        // README.md is documentation, not a source file; leave it unstamped.
         std::fs::write(dir.join("README.md"), render_readme())?;
         Ok(())
     }
@@ -4690,5 +4698,57 @@ mod tests {
             go.contains("_callbackRegistry.Delete(token)"),
             "Unregister must drop the token from the shared callback registry: {go}"
         );
+    }
+
+    #[test]
+    fn go_outputs_have_version_stamp() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "math".to_string(),
+                functions: vec![Function {
+                    name: "add".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_go_stamp");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).unwrap();
+
+        GoGenerator.generate(&api, out_dir).unwrap();
+
+        for rel in ["go/weaveffi.go", "go/go.mod"] {
+            let contents = std::fs::read_to_string(tmp.join(rel)).unwrap();
+            assert!(
+                contents.starts_with("// WeaveFFI "),
+                "{rel} missing stamp: {contents}"
+            );
+            assert!(
+                contents.contains(" go "),
+                "{rel} stamp missing generator name"
+            );
+            assert!(
+                contents.contains("DO NOT EDIT"),
+                "{rel} missing DO NOT EDIT"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

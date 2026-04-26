@@ -1,12 +1,20 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
-use weaveffi_core::codegen::{Capability, Generator};
+use weaveffi_core::codegen::{stamp_header, Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_abi_struct_name, local_type_name, wrapper_name};
 use weaveffi_ir::ir::{Api, CallbackDef, Function, ListenerDef, Module, StructDef, TypeRef};
 
 pub struct NodeGenerator;
+
+fn stamp_slash(body: String) -> String {
+    format!("// {}\n{body}", stamp_header("node"))
+}
+
+fn stamp_hash(body: String) -> String {
+    format!("# {}\n{body}", stamp_header("node"))
+}
 
 impl NodeGenerator {
     fn generate_impl(
@@ -21,17 +29,21 @@ impl NodeGenerator {
         std::fs::create_dir_all(&dir)?;
         std::fs::write(
             dir.join("index.js"),
-            render_node_index_js(api, strip_module_prefix),
+            stamp_slash(render_node_index_js(api, strip_module_prefix)),
         )?;
         std::fs::write(
             dir.join("types.d.ts"),
-            render_node_dts(api, strip_module_prefix),
+            stamp_slash(render_node_dts(api, strip_module_prefix)),
         )?;
+        // package.json is strict JSON without a comment syntax, so skip the stamp.
         std::fs::write(dir.join("package.json"), render_package_json(package_name))?;
-        std::fs::write(dir.join("binding.gyp"), render_binding_gyp(c_prefix))?;
+        std::fs::write(
+            dir.join("binding.gyp"),
+            stamp_hash(render_binding_gyp(c_prefix)),
+        )?;
         std::fs::write(
             dir.join("weaveffi_addon.c"),
-            render_addon_c(api, strip_module_prefix, c_prefix),
+            stamp_slash(render_addon_c(api, strip_module_prefix, c_prefix)),
         )?;
         Ok(())
     }
@@ -4019,5 +4031,69 @@ mod tests {
             ),
             "addon must export unregister binding through N-API Init: {addon}"
         );
+    }
+
+    #[test]
+    fn node_outputs_have_version_stamp() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "math".to_string(),
+                functions: vec![Function {
+                    name: "add".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_node_stamp");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).unwrap();
+
+        NodeGenerator.generate(&api, out_dir).unwrap();
+
+        for (rel, prefix) in [
+            ("node/index.js", "// WeaveFFI "),
+            ("node/types.d.ts", "// WeaveFFI "),
+            ("node/binding.gyp", "# WeaveFFI "),
+            ("node/weaveffi_addon.c", "// WeaveFFI "),
+        ] {
+            let contents = std::fs::read_to_string(tmp.join(rel)).unwrap();
+            assert!(
+                contents.starts_with(prefix),
+                "{rel} missing stamp (expected prefix {prefix:?}): {contents}"
+            );
+            assert!(
+                contents.contains(" node "),
+                "{rel} stamp missing generator name"
+            );
+            assert!(
+                contents.contains("DO NOT EDIT"),
+                "{rel} missing DO NOT EDIT"
+            );
+        }
+
+        // package.json is strict JSON and cannot carry a comment header.
+        let pkg = std::fs::read_to_string(tmp.join("node/package.json")).unwrap();
+        assert!(
+            !pkg.contains("WeaveFFI 0."),
+            "package.json must stay comment-free so it remains valid JSON: {pkg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

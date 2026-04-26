@@ -1,7 +1,7 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
-use weaveffi_core::codegen::{Capability, Generator};
+use weaveffi_core::codegen::{stamp_header, Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name, wrapper_name};
 use weaveffi_ir::ir::{
@@ -10,6 +10,20 @@ use weaveffi_ir::ir::{
 };
 
 pub struct SwiftGenerator;
+
+fn stamp_slash(body: String) -> String {
+    format!("// {}\n{body}", stamp_header("swift"))
+}
+
+/// Prepend the stamp to `Package.swift` while preserving the mandatory
+/// `swift-tools-version` directive on the first line.
+fn stamp_swift_package(body: String) -> String {
+    let stamp_line = format!("// {}\n", stamp_header("swift"));
+    match body.split_once('\n') {
+        Some((first, rest)) => format!("{first}\n{stamp_line}{rest}"),
+        None => format!("{stamp_line}{body}"),
+    }
+}
 
 /// Derive the Swift C system module name (`C{PascalCasePrefix}`) from a C ABI prefix.
 ///
@@ -55,18 +69,18 @@ let package = Package(
             name = module_name,
             c_name = c_module,
         );
-        std::fs::write(dir.join("Package.swift"), package)?;
+        std::fs::write(dir.join("Package.swift"), stamp_swift_package(package))?;
 
         let modulemap = format!(
             "module {c_module} [system] {{\n  header \"../../c/{c_prefix}.h\"\n  link \"{c_prefix}\"\n  export *\n}}\n",
         );
-        std::fs::write(module_dir.join("module.modulemap"), modulemap)?;
+        std::fs::write(module_dir.join("module.modulemap"), stamp_slash(modulemap))?;
 
         let src_dir = dir.join("Sources").join(module_name);
         std::fs::create_dir_all(&src_dir)?;
         std::fs::write(
             src_dir.join(format!("{}.swift", module_name)),
-            render_swift_wrapper(api, strip_module_prefix, &c_module),
+            stamp_slash(render_swift_wrapper(api, strip_module_prefix, &c_module)),
         )?;
         Ok(())
     }
@@ -5271,8 +5285,13 @@ mod tests {
             modulemap.contains("link \"my_cool_lib\""),
             "modulemap must link the C library named after c_prefix: {modulemap}"
         );
+        let modulemap_body: String = modulemap
+            .lines()
+            .filter(|l| !l.starts_with("// WeaveFFI"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            !modulemap.contains("weaveffi"),
+            !modulemap_body.contains("weaveffi"),
             "modulemap must not leak the default 'weaveffi' prefix when a custom c_prefix is set: {modulemap}"
         );
 
@@ -5297,6 +5316,72 @@ mod tests {
         // existing consumers keep working when c_prefix is left unset.
         assert_eq!(c_system_module_name("weaveffi"), "CWeaveFFI");
         assert_eq!(c_system_module_name("my_cool_lib"), "CMyCoolLib");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn swift_outputs_have_version_stamp() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "math".to_string(),
+                functions: vec![Function {
+                    name: "add".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_swift_stamp");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).unwrap();
+
+        SwiftGenerator.generate(&api, out_dir).unwrap();
+
+        let pkg = std::fs::read_to_string(tmp.join("swift/Package.swift")).unwrap();
+        assert!(
+            pkg.starts_with("// swift-tools-version:"),
+            "Package.swift must preserve swift-tools-version on line 1: {pkg}"
+        );
+        assert!(
+            pkg.contains("// WeaveFFI "),
+            "Package.swift missing stamp: {pkg}"
+        );
+        assert!(pkg.contains(" swift "));
+        assert!(pkg.contains("DO NOT EDIT"));
+
+        let modulemap =
+            std::fs::read_to_string(tmp.join("swift/CWeaveFFI/module.modulemap")).unwrap();
+        assert!(
+            modulemap.starts_with("// WeaveFFI "),
+            "module.modulemap missing stamp: {modulemap}"
+        );
+        assert!(modulemap.contains(" swift "));
+        assert!(modulemap.contains("DO NOT EDIT"));
+
+        let wrapper =
+            std::fs::read_to_string(tmp.join("swift/Sources/WeaveFFI/WeaveFFI.swift")).unwrap();
+        assert!(
+            wrapper.starts_with("// WeaveFFI "),
+            "WeaveFFI.swift missing stamp: {wrapper}"
+        );
+        assert!(wrapper.contains(" swift "));
+        assert!(wrapper.contains("DO NOT EDIT"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

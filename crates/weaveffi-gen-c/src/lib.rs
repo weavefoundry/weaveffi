@@ -1,12 +1,16 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
-use weaveffi_core::codegen::{Capability, Generator};
+use weaveffi_core::codegen::{stamp_header, Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::c_abi_struct_name;
 use weaveffi_ir::ir::{Api, EnumDef, Module, Param, StructDef, TypeRef};
 
 pub struct CGenerator;
+
+fn with_stamp(body: String) -> String {
+    format!("// {}\n{body}", stamp_header("c"))
+}
 
 impl CGenerator {
     fn generate_impl(&self, api: &Api, out_dir: &Utf8Path, prefix: &str) -> Result<()> {
@@ -14,11 +18,11 @@ impl CGenerator {
         std::fs::create_dir_all(&dir)?;
         std::fs::write(
             dir.join(format!("{prefix}.h")),
-            render_c_header(api, prefix),
+            with_stamp(render_c_header(api, prefix)),
         )?;
         std::fs::write(
             dir.join(format!("{prefix}.c")),
-            render_c_convenience_c(prefix),
+            with_stamp(render_c_convenience_c(prefix)),
         )?;
         Ok(())
     }
@@ -3211,6 +3215,53 @@ mod tests {
         let caps = CGenerator.capabilities();
         for cap in Capability::ALL {
             assert!(caps.contains(cap), "C generator must support {cap:?}");
+        }
+    }
+
+    #[test]
+    fn c_outputs_have_version_stamp() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "math".to_string(),
+                functions: vec![Function {
+                    name: "add".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(tmp.path()).unwrap();
+        CGenerator.generate(&api, out_dir).unwrap();
+
+        for rel in ["c/weaveffi.h", "c/weaveffi.c"] {
+            let contents = std::fs::read_to_string(out_dir.join(rel)).unwrap();
+            assert!(
+                contents.starts_with("// WeaveFFI "),
+                "{rel} missing stamp header: {contents}"
+            );
+            assert!(
+                contents.contains(" c "),
+                "{rel} stamp missing generator name: {contents}"
+            );
+            assert!(
+                contents.contains("DO NOT EDIT"),
+                "{rel} stamp missing DO NOT EDIT: {contents}"
+            );
         }
     }
 }

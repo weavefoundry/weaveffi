@@ -1,7 +1,7 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToShoutySnakeCase, ToSnakeCase, ToUpperCamelCase};
-use weaveffi_core::codegen::{Capability, Generator};
+use weaveffi_core::codegen::{stamp_header, Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::local_type_name;
 use weaveffi_ir::ir::{
@@ -9,6 +9,10 @@ use weaveffi_ir::ir::{
 };
 
 pub struct RubyGenerator;
+
+fn stamp_hash(body: String) -> String {
+    format!("# {}\n{body}", stamp_header("ruby"))
+}
 
 impl RubyGenerator {
     fn generate_impl(
@@ -24,12 +28,13 @@ impl RubyGenerator {
         std::fs::create_dir_all(&lib_dir)?;
         std::fs::write(
             lib_dir.join("weaveffi.rb"),
-            render_ruby_module(api, module_name, c_prefix),
+            stamp_hash(render_ruby_module(api, module_name, c_prefix)),
         )?;
         std::fs::write(
             dir.join("weaveffi.gemspec"),
-            render_gemspec(gem_name, has_any_async(api)),
+            stamp_hash(render_gemspec(gem_name, has_any_async(api))),
         )?;
+        // README.md is documentation, not a source file; leave it unstamped.
         std::fs::write(dir.join("README.md"), render_readme())?;
         Ok(())
     }
@@ -3831,5 +3836,53 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn ruby_outputs_have_version_stamp() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "math".to_string(),
+                functions: vec![Function {
+                    name: "add".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(tmp.path()).unwrap();
+
+        RubyGenerator.generate(&api, out_dir).unwrap();
+
+        for rel in ["ruby/lib/weaveffi.rb", "ruby/weaveffi.gemspec"] {
+            let contents = std::fs::read_to_string(out_dir.join(rel)).unwrap();
+            assert!(
+                contents.starts_with("# WeaveFFI "),
+                "{rel} missing stamp: {contents}"
+            );
+            assert!(
+                contents.contains(" ruby "),
+                "{rel} stamp missing generator name"
+            );
+            assert!(
+                contents.contains("DO NOT EDIT"),
+                "{rel} missing DO NOT EDIT"
+            );
+        }
     }
 }

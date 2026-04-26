@@ -1,7 +1,7 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
-use weaveffi_core::codegen::{Capability, Generator};
+use weaveffi_core::codegen::{stamp_header, Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::local_type_name;
 use weaveffi_ir::ir::{
@@ -9,6 +9,14 @@ use weaveffi_ir::ir::{
 };
 
 pub struct DartGenerator;
+
+fn stamp_slash(body: String) -> String {
+    format!("// {}\n{body}", stamp_header("dart"))
+}
+
+fn stamp_hash(body: String) -> String {
+    format!("# {}\n{body}", stamp_header("dart"))
+}
 
 impl DartGenerator {
     fn generate_impl(
@@ -23,9 +31,13 @@ impl DartGenerator {
         std::fs::create_dir_all(&lib_dir)?;
         std::fs::write(
             lib_dir.join("weaveffi.dart"),
-            render_dart_module(api, c_prefix),
+            stamp_slash(render_dart_module(api, c_prefix)),
         )?;
-        std::fs::write(dart_dir.join("pubspec.yaml"), render_pubspec(package_name))?;
+        std::fs::write(
+            dart_dir.join("pubspec.yaml"),
+            stamp_hash(render_pubspec(package_name)),
+        )?;
+        // README.md is documentation, not a source file; leave it unstamped.
         std::fs::write(dart_dir.join("README.md"), render_readme())?;
         Ok(())
     }
@@ -3347,6 +3359,58 @@ mod tests {
             dart.contains("'myffi_free_bytes'"),
             "preamble bindings must use c_prefix for free_bytes: {dart}"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dart_outputs_have_version_stamp() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "math".to_string(),
+                functions: vec![Function {
+                    name: "add".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_dart_stamp");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).unwrap();
+
+        DartGenerator.generate(&api, out_dir).unwrap();
+
+        let dart = std::fs::read_to_string(tmp.join("dart/lib/weaveffi.dart")).unwrap();
+        assert!(
+            dart.starts_with("// WeaveFFI "),
+            "weaveffi.dart missing stamp: {dart}"
+        );
+        assert!(dart.contains(" dart "));
+        assert!(dart.contains("DO NOT EDIT"));
+
+        let pubspec = std::fs::read_to_string(tmp.join("dart/pubspec.yaml")).unwrap();
+        assert!(
+            pubspec.starts_with("# WeaveFFI "),
+            "pubspec.yaml missing stamp: {pubspec}"
+        );
+        assert!(pubspec.contains(" dart "));
+        assert!(pubspec.contains("DO NOT EDIT"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

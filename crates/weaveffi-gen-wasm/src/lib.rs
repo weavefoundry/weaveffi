@@ -1,7 +1,7 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
-use weaveffi_core::codegen::{Capability, Generator};
+use weaveffi_core::codegen::{stamp_header, Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::local_type_name;
 use weaveffi_ir::ir::{Api, EnumDef, Function, ListenerDef, Module, StructDef, TypeRef};
@@ -10,6 +10,10 @@ pub struct WasmGenerator;
 
 const DEFAULT_MODULE_NAME: &str = "weaveffi_wasm";
 const DEFAULT_C_PREFIX: &str = "weaveffi";
+
+fn stamp_slash(body: String) -> String {
+    format!("// {}\n{body}", stamp_header("wasm"))
+}
 
 impl WasmGenerator {
     fn generate_impl(
@@ -21,17 +25,18 @@ impl WasmGenerator {
     ) -> Result<()> {
         let wasm_dir = out_dir.join("wasm");
         std::fs::create_dir_all(&wasm_dir)?;
+        // README.md is documentation, not a source file; leave it unstamped.
         std::fs::write(
             wasm_dir.join("README.md"),
             render_wasm_readme(api, c_prefix),
         )?;
         std::fs::write(
             wasm_dir.join(format!("{module_name}.js")),
-            render_wasm_js_stub(api, module_name, c_prefix),
+            stamp_slash(render_wasm_js_stub(api, module_name, c_prefix)),
         )?;
         std::fs::write(
             wasm_dir.join(format!("{module_name}.d.ts")),
-            render_wasm_dts(api, module_name),
+            stamp_slash(render_wasm_dts(api, module_name)),
         )?;
         Ok(())
     }
@@ -3255,5 +3260,60 @@ mod tests {
             !readme.contains("`weaveffi_error_clear("),
             "README must not leak the default `weaveffi_error_clear` export when c_prefix is overridden: {readme}"
         );
+    }
+
+    #[test]
+    fn wasm_outputs_have_version_stamp() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "math".to_string(),
+                functions: vec![Function {
+                    name: "add".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_wasm_stamp");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).unwrap();
+
+        WasmGenerator.generate(&api, out_dir).unwrap();
+
+        for rel in [
+            format!("wasm/{DEFAULT_MODULE_NAME}.js"),
+            format!("wasm/{DEFAULT_MODULE_NAME}.d.ts"),
+        ] {
+            let contents = std::fs::read_to_string(tmp.join(&rel)).unwrap();
+            assert!(
+                contents.starts_with("// WeaveFFI "),
+                "{rel} missing stamp: {contents}"
+            );
+            assert!(
+                contents.contains(" wasm "),
+                "{rel} stamp missing generator name"
+            );
+            assert!(
+                contents.contains("DO NOT EDIT"),
+                "{rel} missing DO NOT EDIT"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

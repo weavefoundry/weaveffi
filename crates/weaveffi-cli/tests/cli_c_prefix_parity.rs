@@ -114,8 +114,13 @@ fn c_prefix_honored_across_all_targets() {
         modulemap.contains("../../c/mylib.h"),
         "swift modulemap must include the mylib C header: {modulemap}"
     );
+    let modulemap_body: String = modulemap
+        .lines()
+        .filter(|l| !l.starts_with("// WeaveFFI"))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        !modulemap.contains("weaveffi"),
+        !modulemap_body.contains("weaveffi"),
         "swift modulemap must not leak the default weaveffi name: {modulemap}"
     );
 

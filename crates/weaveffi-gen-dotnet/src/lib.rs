@@ -1,7 +1,7 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
-use weaveffi_core::codegen::{Capability, Generator};
+use weaveffi_core::codegen::{stamp_header, Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{local_type_name, wrapper_name};
 use weaveffi_ir::ir::{
@@ -10,6 +10,10 @@ use weaveffi_ir::ir::{
 };
 
 pub struct DotnetGenerator;
+
+fn stamp_slash(body: String) -> String {
+    format!("// {}\n{body}", stamp_header("dotnet"))
+}
 
 /// Build the C symbol name for a function, honoring the configured C prefix.
 fn c_sym(c_prefix: &str, module: &str, func: &str) -> String {
@@ -29,8 +33,10 @@ impl DotnetGenerator {
         std::fs::create_dir_all(&dir)?;
         std::fs::write(
             dir.join(format!("{namespace}.cs")),
-            render_csharp(api, namespace, strip_module_prefix, c_prefix),
+            stamp_slash(render_csharp(api, namespace, strip_module_prefix, c_prefix)),
         )?;
+        // .csproj and .nuspec are XML and cannot carry `//`, `#`, or `/* */`
+        // comments, so leave them unstamped.
         std::fs::write(
             dir.join(format!("{namespace}.csproj")),
             render_csproj(namespace),
@@ -5262,6 +5268,50 @@ mod tests {
                 && !cs.contains("weaveffi_error_clear"),
             "runtime helpers must not leak the default 'weaveffi_' prefix: {cs}"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dotnet_outputs_have_version_stamp() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "math".to_string(),
+                functions: vec![Function {
+                    name: "add".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_dotnet_stamp");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).unwrap();
+
+        DotnetGenerator.generate(&api, out_dir).unwrap();
+
+        let cs = std::fs::read_to_string(tmp.join("dotnet/WeaveFFI.cs")).unwrap();
+        assert!(
+            cs.starts_with("// WeaveFFI "),
+            "WeaveFFI.cs missing stamp: {cs}"
+        );
+        assert!(cs.contains(" dotnet "));
+        assert!(cs.contains("DO NOT EDIT"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

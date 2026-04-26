@@ -1,10 +1,26 @@
 use anyhow::{bail, Result};
 use camino::Utf8Path;
-use weaveffi_ir::ir::Api;
+use weaveffi_ir::ir::{Api, CURRENT_SCHEMA_VERSION};
 
 use crate::cache;
 use crate::config::GeneratorConfig;
 use crate::templates::TemplateEngine;
+
+/// Returns the header message used to stamp every generated source file.
+///
+/// The returned string is the bare message; each generator wraps it in the
+/// appropriate comment syntax for its target language (`//`, `#`, or `/* */`).
+/// It embeds the IR schema version, the generator name, and the WeaveFFI tool
+/// version (from `CARGO_PKG_VERSION`) so stamped files are traceable back to
+/// the exact toolchain that produced them.
+pub fn stamp_header(generator_name: &str) -> String {
+    format!(
+        "WeaveFFI {ir} {gen} {tool} - DO NOT EDIT - regenerate with 'weaveffi generate'",
+        ir = CURRENT_SCHEMA_VERSION,
+        gen = generator_name,
+        tool = env!("CARGO_PKG_VERSION"),
+    )
+}
 
 fn run_hook(label: &str, cmd: &str) -> Result<()> {
     let status = if cfg!(target_os = "windows") {
@@ -414,6 +430,29 @@ mod tests {
             &[Capability::AsyncFunctions, Capability::ErrorDomains]
         );
         assert!(!gen.capabilities().contains(&Capability::Callbacks));
+    }
+
+    #[test]
+    fn stamp_header_contains_versions_and_generator() {
+        let s = stamp_header("c");
+        assert!(s.starts_with("WeaveFFI "), "unexpected prefix: {s}");
+        assert!(
+            s.contains(weaveffi_ir::ir::CURRENT_SCHEMA_VERSION),
+            "missing IR version in {s}"
+        );
+        assert!(s.contains(" c "), "missing generator name in {s}");
+        assert!(
+            s.contains(env!("CARGO_PKG_VERSION")),
+            "missing tool version in {s}"
+        );
+        assert!(
+            s.contains("DO NOT EDIT"),
+            "missing DO NOT EDIT notice in {s}"
+        );
+        assert!(
+            s.contains("regenerate with 'weaveffi generate'"),
+            "missing regeneration hint in {s}"
+        );
     }
 
     #[test]

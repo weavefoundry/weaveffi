@@ -1,7 +1,7 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use std::fmt::Write as _;
-use weaveffi_core::codegen::{Capability, Generator};
+use weaveffi_core::codegen::{stamp_header, Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name, wrapper_name};
 use weaveffi_ir::ir::{
@@ -9,6 +9,14 @@ use weaveffi_ir::ir::{
 };
 
 pub struct AndroidGenerator;
+
+fn stamp_slash(body: String) -> String {
+    format!("// {}\n{body}", stamp_header("android"))
+}
+
+fn stamp_hash(body: String) -> String {
+    format!("# {}\n{body}", stamp_header("android"))
+}
 
 impl AndroidGenerator {
     fn generate_impl(
@@ -24,21 +32,21 @@ impl AndroidGenerator {
 
         std::fs::write(
             dir.join("settings.gradle"),
-            "rootProject.name = 'weaveffi'\n",
+            stamp_slash("rootProject.name = 'weaveffi'\n".to_string()),
         )?;
-        std::fs::write(dir.join("build.gradle"), build_gradle(package))?;
+        std::fs::write(dir.join("build.gradle"), stamp_slash(build_gradle(package)))?;
 
         let pkg_path = package.replace('.', "/");
         let src_dir = dir.join(format!("src/main/kotlin/{pkg_path}"));
         std::fs::create_dir_all(&src_dir)?;
         let kotlin = render_kotlin(api, package, strip_module_prefix, c_prefix);
-        std::fs::write(src_dir.join("WeaveFFI.kt"), kotlin)?;
+        std::fs::write(src_dir.join("WeaveFFI.kt"), stamp_slash(kotlin))?;
 
         let jni_dir = dir.join("src/main/cpp");
         std::fs::create_dir_all(&jni_dir)?;
-        std::fs::write(jni_dir.join("CMakeLists.txt"), cmake(c_prefix))?;
+        std::fs::write(jni_dir.join("CMakeLists.txt"), stamp_hash(cmake(c_prefix)))?;
         let jni_c = render_jni_c(api, package, strip_module_prefix, c_prefix);
-        std::fs::write(jni_dir.join("weaveffi_jni.c"), jni_c)?;
+        std::fs::write(jni_dir.join("weaveffi_jni.c"), stamp_slash(jni_c))?;
 
         Ok(())
     }
@@ -5713,6 +5721,67 @@ mod tests {
             !cmake.contains("add_library(weaveffi"),
             "CMake add_library target must not fall back to the default weaveffi name: {cmake}"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn android_outputs_have_version_stamp() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "math".to_string(),
+                functions: vec![Function {
+                    name: "add".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_android_stamp");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).unwrap();
+
+        AndroidGenerator.generate(&api, out_dir).unwrap();
+
+        for (rel, prefix) in [
+            ("android/settings.gradle", "// WeaveFFI "),
+            ("android/build.gradle", "// WeaveFFI "),
+            (
+                "android/src/main/kotlin/com/weaveffi/WeaveFFI.kt",
+                "// WeaveFFI ",
+            ),
+            ("android/src/main/cpp/CMakeLists.txt", "# WeaveFFI "),
+            ("android/src/main/cpp/weaveffi_jni.c", "// WeaveFFI "),
+        ] {
+            let contents = std::fs::read_to_string(tmp.join(rel)).unwrap();
+            assert!(
+                contents.starts_with(prefix),
+                "{rel} missing stamp (expected prefix {prefix:?}): {contents}"
+            );
+            assert!(
+                contents.contains(" android "),
+                "{rel} stamp missing generator name"
+            );
+            assert!(
+                contents.contains("DO NOT EDIT"),
+                "{rel} missing DO NOT EDIT"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

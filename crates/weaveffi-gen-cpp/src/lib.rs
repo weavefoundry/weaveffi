@@ -1,7 +1,7 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
-use weaveffi_core::codegen::{Capability, Generator};
+use weaveffi_core::codegen::{stamp_header, Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_abi_struct_name, local_type_name};
 use weaveffi_ir::ir::{
@@ -9,6 +9,14 @@ use weaveffi_ir::ir::{
 };
 
 pub struct CppGenerator;
+
+fn stamp_slash(body: String) -> String {
+    format!("// {}\n{body}", stamp_header("cpp"))
+}
+
+fn stamp_hash(body: String) -> String {
+    format!("# {}\n{body}", stamp_header("cpp"))
+}
 
 impl CppGenerator {
     fn generate_impl(
@@ -24,9 +32,12 @@ impl CppGenerator {
         std::fs::create_dir_all(&dir)?;
         std::fs::write(
             dir.join(header_name),
-            render_cpp_header(api, namespace, prefix),
+            stamp_slash(render_cpp_header(api, namespace, prefix)),
         )?;
-        std::fs::write(dir.join("CMakeLists.txt"), render_cmake(cpp_std, prefix))?;
+        std::fs::write(
+            dir.join("CMakeLists.txt"),
+            stamp_hash(render_cmake(cpp_std, prefix)),
+        )?;
         std::fs::write(dir.join("README.md"), render_readme(prefix))?;
         Ok(())
     }
@@ -4455,5 +4466,37 @@ mod tests {
             h.contains("registry_.erase(id);"),
             "unregister_ must drop the owning unique_ptr from the registry: {h}"
         );
+    }
+
+    #[test]
+    fn cpp_outputs_have_version_stamp() {
+        let api = minimal_api();
+        let tmp = std::env::temp_dir().join("weaveffi_test_cpp_stamp");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        CppGenerator.generate(&api, out_dir).unwrap();
+
+        let hpp = std::fs::read_to_string(tmp.join("cpp/weaveffi.hpp")).unwrap();
+        assert!(
+            hpp.starts_with("// WeaveFFI "),
+            "weaveffi.hpp missing stamp: {hpp}"
+        );
+        assert!(
+            hpp.contains(" cpp "),
+            "weaveffi.hpp stamp missing generator name"
+        );
+        assert!(hpp.contains("DO NOT EDIT"));
+
+        let cmake = std::fs::read_to_string(tmp.join("cpp/CMakeLists.txt")).unwrap();
+        assert!(
+            cmake.starts_with("# WeaveFFI "),
+            "CMakeLists.txt missing stamp: {cmake}"
+        );
+        assert!(cmake.contains(" cpp "));
+        assert!(cmake.contains("DO NOT EDIT"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

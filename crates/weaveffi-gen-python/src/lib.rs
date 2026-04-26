@@ -1,6 +1,6 @@
 use anyhow::Result;
 use camino::Utf8Path;
-use weaveffi_core::codegen::{Capability, Generator};
+use weaveffi_core::codegen::{stamp_header, Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{local_type_name, wrapper_name};
 use weaveffi_ir::ir::{
@@ -8,6 +8,10 @@ use weaveffi_ir::ir::{
 };
 
 pub struct PythonGenerator;
+
+fn stamp_hash(body: String) -> String {
+    format!("# {}\n{body}", stamp_header("python"))
+}
 
 impl PythonGenerator {
     fn generate_impl(
@@ -23,21 +27,25 @@ impl PythonGenerator {
         std::fs::create_dir_all(&pkg_dir)?;
         std::fs::write(
             pkg_dir.join("__init__.py"),
-            "from .weaveffi import *  # noqa: F401,F403\n",
+            stamp_hash("from .weaveffi import *  # noqa: F401,F403\n".to_string()),
         )?;
         std::fs::write(
             pkg_dir.join("weaveffi.py"),
-            render_python_module(api, strip_module_prefix, c_prefix),
+            stamp_hash(render_python_module(api, strip_module_prefix, c_prefix)),
         )?;
         std::fs::write(
             pkg_dir.join("weaveffi.pyi"),
-            render_pyi_module(api, strip_module_prefix),
+            stamp_hash(render_pyi_module(api, strip_module_prefix)),
         )?;
         std::fs::write(
             dir.join("pyproject.toml"),
-            render_pyproject_toml(package_name),
+            stamp_hash(render_pyproject_toml(package_name)),
         )?;
-        std::fs::write(dir.join("setup.py"), render_setup_py(package_name))?;
+        std::fs::write(
+            dir.join("setup.py"),
+            stamp_hash(render_setup_py(package_name)),
+        )?;
+        // README.md is documentation, not a source file; leave it unstamped.
         std::fs::write(dir.join("README.md"), render_readme())?;
         Ok(())
     }
@@ -5643,5 +5651,63 @@ mod tests {
             pyi.contains("def unregister(id: int) -> None: ..."),
             "pyi must declare static unregister(id: int) -> None: {pyi}"
         );
+    }
+
+    #[test]
+    fn python_outputs_have_version_stamp() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "math".to_string(),
+                functions: vec![Function {
+                    name: "add".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_python_stamp");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).unwrap();
+
+        PythonGenerator.generate(&api, out_dir).unwrap();
+
+        for rel in [
+            "python/weaveffi/__init__.py",
+            "python/weaveffi/weaveffi.py",
+            "python/weaveffi/weaveffi.pyi",
+            "python/pyproject.toml",
+            "python/setup.py",
+        ] {
+            let contents = std::fs::read_to_string(tmp.join(rel)).unwrap();
+            assert!(
+                contents.starts_with("# WeaveFFI "),
+                "{rel} missing stamp: {contents}"
+            );
+            assert!(
+                contents.contains(" python "),
+                "{rel} stamp missing generator name"
+            );
+            assert!(
+                contents.contains("DO NOT EDIT"),
+                "{rel} missing DO NOT EDIT"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
