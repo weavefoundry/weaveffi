@@ -852,15 +852,28 @@ fn render_swift_async_function(
         params_sig.join(", "),
         ret_swift
     ));
-    out.push_str(&format!(
-        "        try await withCheckedThrowingContinuation {{ (continuation: CheckedContinuation<{}, Error>) in\n",
-        ret_swift
-    ));
-    out.push_str(
-        "            let ctx = Unmanaged.passRetained(ContinuationRef(continuation)).toOpaque()\n",
-    );
 
-    let base = "            ";
+    // Cancellable async functions wrap the continuation in
+    // `withTaskCancellationHandler` so that `Task.isCancelled` forwards to
+    // `weaveffi_cancel_token_cancel` on the token passed to the C ABI.
+    let extra = if f.cancellable { "    " } else { "" };
+    if f.cancellable {
+        out.push_str("        let cancelToken = weaveffi_cancel_token_create()\n");
+        out.push_str("        defer { weaveffi_cancel_token_destroy(cancelToken) }\n");
+        out.push_str("        return try await withTaskCancellationHandler {\n");
+    }
+
+    out.push_str(&format!(
+        "        {}try await withCheckedThrowingContinuation {{ (continuation: CheckedContinuation<{}, Error>) in\n",
+        extra, ret_swift
+    ));
+    out.push_str(&format!(
+        "            {}let ctx = Unmanaged.passRetained(ContinuationRef(continuation)).toOpaque()\n",
+        extra
+    ));
+
+    let base = format!("            {}", extra);
+    let base = base.as_str();
 
     for p in &f.params {
         match &p.ty {
@@ -1045,12 +1058,12 @@ fn render_swift_async_function(
     if f.cancellable {
         if call_args.is_empty() {
             out.push_str(&format!(
-                "{}{}(nil, {{ {} in\n",
+                "{}{}(cancelToken, {{ {} in\n",
                 inner_indent, c_sym, cb_param_names
             ));
         } else {
             out.push_str(&format!(
-                "{}{}({}, nil, {{ {} in\n",
+                "{}{}({}, cancelToken, {{ {} in\n",
                 inner_indent, c_sym, call_args, cb_param_names
             ));
         }
@@ -1097,7 +1110,12 @@ fn render_swift_async_function(
         out.push_str(&format!("{}}}\n", indent));
     }
 
-    out.push_str("        }\n");
+    out.push_str(&format!("        {}}}\n", extra));
+    if f.cancellable {
+        out.push_str("        } onCancel: {\n");
+        out.push_str("            weaveffi_cancel_token_cancel(cancelToken)\n");
+        out.push_str("        }\n");
+    }
     out.push_str("    }\n");
 }
 
@@ -4263,6 +4281,85 @@ mod tests {
         assert!(
             out.contains("weaveffi_tasks_run_async"),
             "missing async C function call: {out}"
+        );
+    }
+
+    #[test]
+    fn swift_cancellable_async_uses_task_cancellation_handler() {
+        let api = make_api(vec![Module {
+            name: "tasks".to_string(),
+            functions: vec![
+                Function {
+                    name: "run".to_string(),
+                    params: vec![Param {
+                        name: "id".to_string(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                    }],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: true,
+                    cancellable: true,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "fire".to_string(),
+                    params: vec![],
+                    returns: None,
+                    doc: None,
+                    r#async: true,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+            ],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let out = render_swift_wrapper(&api, true);
+
+        assert!(
+            out.contains("let cancelToken = weaveffi_cancel_token_create()"),
+            "cancellable async must create a cancel token: {out}"
+        );
+        assert!(
+            out.contains("defer { weaveffi_cancel_token_destroy(cancelToken) }"),
+            "cancellable async must defer token destruction: {out}"
+        );
+        assert!(
+            out.contains("withTaskCancellationHandler"),
+            "cancellable async must use withTaskCancellationHandler: {out}"
+        );
+        assert!(
+            out.contains("} onCancel: {"),
+            "cancellable async must declare an onCancel handler: {out}"
+        );
+        assert!(
+            out.contains("weaveffi_cancel_token_cancel(cancelToken)"),
+            "onCancel handler must forward to weaveffi_cancel_token_cancel: {out}"
+        );
+        assert!(
+            out.contains("weaveffi_tasks_run_async(id, cancelToken,"),
+            "cancellable C call must pass the cancel token: {out}"
+        );
+
+        let fire_async = out
+            .lines()
+            .find(|l| l.contains("weaveffi_tasks_fire_async("))
+            .expect("non-cancellable fire_async should be emitted");
+        assert!(
+            !fire_async.contains("cancelToken"),
+            "non-cancellable async must not pass a cancel token: {fire_async}"
+        );
+        assert!(
+            !out.contains("(nil, {"),
+            "cancellable async must wire the real token, not nil: {out}"
         );
     }
 
