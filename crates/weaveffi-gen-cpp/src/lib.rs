@@ -224,7 +224,7 @@ fn c_element_type(ty: &TypeRef, module: &str) -> String {
             c_element_type(inner, module)
         }
         TypeRef::Map(_, _) => "void*".into(),
-        TypeRef::Callback(_) => todo!("callback C++ type"),
+        TypeRef::Callback(_) => unreachable!("validator should have rejected callback C++ type"),
     }
 }
 
@@ -275,7 +275,7 @@ fn c_param_type(ty: &TypeRef, name: &str, module: &str) -> String {
             };
             format!("{kp}, {vp}, size_t {name}_len")
         }
-        TypeRef::Callback(_) => todo!("callback C++ type"),
+        TypeRef::Callback(_) => unreachable!("validator should have rejected callback C++ type"),
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
     }
 }
@@ -317,7 +317,7 @@ fn c_ret_type(ty: &TypeRef, module: &str) -> (String, Vec<String>) {
                 "size_t* out_len".into(),
             ],
         ),
-        TypeRef::Callback(_) => todo!("callback C++ type"),
+        TypeRef::Callback(_) => unreachable!("validator should have rejected callback C++ type"),
     }
 }
 
@@ -498,7 +498,7 @@ fn cpp_type(ty: &TypeRef) -> String {
         TypeRef::Map(k, v) => {
             format!("std::unordered_map<{}, {}>", cpp_type(k), cpp_type(v))
         }
-        TypeRef::Callback(_) => todo!("callback C++ type"),
+        TypeRef::Callback(_) => unreachable!("validator should have rejected callback C++ type"),
     }
 }
 
@@ -744,7 +744,7 @@ fn render_cpp_getter(out: &mut String, struct_name: &str, module: &str, field: &
         TypeRef::Map(k, v) => {
             render_getter_map(out, k, v, &getter, &cast, module);
         }
-        TypeRef::Callback(_) => todo!("callback C++ getter"),
+        TypeRef::Callback(_) => unreachable!("validator should have rejected callback C++ getter"),
         TypeRef::Iterator(_) => unreachable!("iterator not valid as struct field"),
     }
 
@@ -1032,7 +1032,7 @@ fn param_to_c_args(ty: &TypeRef, name: &str, module: &str) -> (Vec<String>, Vec<
                 ],
             )
         }
-        TypeRef::Callback(_) => todo!("callback C++ param"),
+        TypeRef::Callback(_) => unreachable!("validator should have rejected callback C++ param"),
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
     }
 }
@@ -1242,7 +1242,7 @@ fn render_cpp_return(out: &mut String, ty: &TypeRef) {
             out.push_str("    }\n");
             out.push_str("    return ret;\n");
         }
-        TypeRef::Callback(_) => todo!("callback C++ return"),
+        TypeRef::Callback(_) => unreachable!("validator should have rejected callback C++ return"),
     }
 }
 
@@ -1455,7 +1455,9 @@ fn render_async_set_value(out: &mut String, ty: &TypeRef) {
             out.push_str("            }\n");
             out.push_str("            p->set_value(std::move(ret));\n");
         }
-        TypeRef::Callback(_) => todo!("callback C++ async return"),
+        TypeRef::Callback(_) => {
+            unreachable!("validator should have rejected callback C++ async return")
+        }
     }
 }
 
@@ -1465,8 +1467,8 @@ mod tests {
     use weaveffi_core::codegen::Generator;
     use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{
-        Api, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param, StructDef,
-        StructField, TypeRef,
+        Api, CallbackSignature, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module,
+        Param, StructDef, StructField, TypeRef,
     };
 
     fn minimal_api() -> Api {
@@ -3702,5 +3704,26 @@ mod tests {
             }
             assert!(caps.contains(cap), "C++ generator must support {cap:?}");
         }
+    }
+
+    #[test]
+    fn callback_type_panics_with_validator_message() {
+        let cb = TypeRef::Callback(Box::new(CallbackSignature {
+            params: vec![],
+            returns: None,
+        }));
+        let err = std::panic::catch_unwind(|| {
+            let _ = cpp_type(&cb);
+        })
+        .expect_err("callback must panic");
+        let msg = err
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&'static str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            msg.contains("validator should have rejected"),
+            "panic message did not mention validator: {msg}"
+        );
     }
 }

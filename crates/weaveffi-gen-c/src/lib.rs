@@ -112,7 +112,7 @@ fn c_element_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
             c_element_type(inner, module, prefix)
         }
         TypeRef::Map(_, _) => "void*".to_string(),
-        TypeRef::Callback(_) => todo!("callback C type"),
+        TypeRef::Callback(_) => unreachable!("validator should have rejected callback C type"),
     }
 }
 
@@ -178,7 +178,7 @@ fn c_type_for_param(ty: &TypeRef, name: &str, module: &str, prefix: &str, mutabl
             }
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
-        TypeRef::Callback(_) => todo!("callback C type"),
+        TypeRef::Callback(_) => unreachable!("validator should have rejected callback C type"),
     }
 }
 
@@ -222,7 +222,9 @@ fn c_ret_type(ty: &TypeRef, module: &str, prefix: &str) -> (String, Vec<String>)
             )
         }
         TypeRef::Iterator(_) => unreachable!("iterator return handled specially"),
-        TypeRef::Callback(_) => todo!("callback C return type"),
+        TypeRef::Callback(_) => {
+            unreachable!("validator should have rejected callback C return type")
+        }
     }
 }
 
@@ -520,8 +522,8 @@ mod tests {
     use weaveffi_core::codegen::Generator;
     use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{
-        Api, CallbackDef, EnumDef, EnumVariant, Function, ListenerDef, Module, Param, StructDef,
-        StructField, TypeRef,
+        Api, CallbackDef, CallbackSignature, EnumDef, EnumVariant, Function, ListenerDef, Module,
+        Param, StructDef, StructField, TypeRef,
     };
 
     #[test]
@@ -3071,5 +3073,26 @@ mod tests {
             }
             assert!(caps.contains(cap), "C generator must support {cap:?}");
         }
+    }
+
+    #[test]
+    fn callback_type_panics_with_validator_message() {
+        let cb = TypeRef::Callback(Box::new(CallbackSignature {
+            params: vec![],
+            returns: None,
+        }));
+        let err = std::panic::catch_unwind(|| {
+            let _ = c_element_type(&cb, "m", "weaveffi");
+        })
+        .expect_err("callback must panic");
+        let msg = err
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&'static str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            msg.contains("validator should have rejected"),
+            "panic message did not mention validator: {msg}"
+        );
     }
 }

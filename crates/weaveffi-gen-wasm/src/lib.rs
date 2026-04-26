@@ -106,7 +106,7 @@ fn wasm_type(ty: &TypeRef) -> &'static str {
             | TypeRef::Map(_, _) => "i64",
             _ => "i32, i32",
         },
-        TypeRef::Callback(_) => todo!("callback WASM type"),
+        TypeRef::Callback(_) => unreachable!("validator should have rejected callback WASM type"),
     }
 }
 
@@ -134,7 +134,7 @@ fn wasm_type_note(ty: &TypeRef) -> &'static str {
             | TypeRef::Map(_, _) => "opaque handle, 0 = absent",
             _ => "is_present flag + value",
         },
-        TypeRef::Callback(_) => todo!("callback WASM type"),
+        TypeRef::Callback(_) => unreachable!("validator should have rejected callback WASM type"),
     }
 }
 
@@ -154,7 +154,7 @@ fn type_display(ty: &TypeRef) -> String {
         TypeRef::List(inner) => format!("[{}]", type_display(inner)),
         TypeRef::Iterator(inner) => format!("iter<{}>", type_display(inner)),
         TypeRef::Map(k, v) => format!("{{{}:{}}}", type_display(k), type_display(v)),
-        TypeRef::Callback(_) => todo!("callback WASM type"),
+        TypeRef::Callback(_) => unreachable!("validator should have rejected callback WASM type"),
     }
 }
 
@@ -417,7 +417,7 @@ fn ts_type_for(ty: &TypeRef) -> String {
             format!("{t}[]")
         }
         TypeRef::Map(k, v) => format!("Record<{}, {}>", ts_type_for(k), ts_type_for(v)),
-        TypeRef::Callback(_) => todo!("callback WASM type"),
+        TypeRef::Callback(_) => unreachable!("validator should have rejected callback WASM type"),
     }
 }
 
@@ -1007,7 +1007,9 @@ fn async_cb_wasm_params(returns: Option<&TypeRef>) -> Vec<&'static str> {
                 params.push("i32");
             }
         },
-        Some(TypeRef::Callback(_)) => todo!("callback WASM type"),
+        Some(TypeRef::Callback(_)) => {
+            unreachable!("validator should have rejected callback WASM type")
+        }
     }
     params
 }
@@ -1125,7 +1127,7 @@ mod tests {
     use camino::Utf8Path;
     use weaveffi_core::codegen::Generator;
     use weaveffi_core::config::GeneratorConfig;
-    use weaveffi_ir::ir::{EnumVariant, Module, Param, StructField};
+    use weaveffi_ir::ir::{CallbackSignature, EnumVariant, Module, Param, StructField};
 
     fn empty_api() -> Api {
         Api {
@@ -2544,5 +2546,26 @@ mod tests {
             }
             assert!(caps.contains(cap), "WASM generator must support {cap:?}");
         }
+    }
+
+    #[test]
+    fn callback_type_panics_with_validator_message() {
+        let cb = TypeRef::Callback(Box::new(CallbackSignature {
+            params: vec![],
+            returns: None,
+        }));
+        let err = std::panic::catch_unwind(|| {
+            let _ = wasm_type(&cb);
+        })
+        .expect_err("callback must panic");
+        let msg = err
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&'static str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            msg.contains("validator should have rejected"),
+            "panic message did not mention validator: {msg}"
+        );
     }
 }

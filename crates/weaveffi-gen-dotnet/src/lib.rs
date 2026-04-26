@@ -113,7 +113,7 @@ fn cs_type(ty: &TypeRef) -> String {
         TypeRef::List(inner) => format!("{}[]", cs_type(inner)),
         TypeRef::Iterator(inner) => format!("IEnumerable<{}>", cs_type(inner)),
         TypeRef::Map(k, v) => format!("Dictionary<{}, {}>", cs_type(k), cs_type(v)),
-        TypeRef::Callback(_) => todo!("callback .NET type"),
+        TypeRef::Callback(_) => unreachable!("validator should have rejected callback .NET type"),
     }
 }
 
@@ -136,7 +136,7 @@ fn pinvoke_type(ty: &TypeRef) -> String {
         TypeRef::Handle => "ulong".into(),
         TypeRef::TypedHandle(_) => "IntPtr".into(),
         TypeRef::Enum(_) => "int".into(),
-        TypeRef::Callback(_) => todo!("callback .NET type"),
+        TypeRef::Callback(_) => unreachable!("validator should have rejected callback .NET type"),
     }
 }
 
@@ -623,7 +623,9 @@ fn render_struct_getter(out: &mut String, prefix: &str, field: &StructField) {
             out.push_str("                }\n");
             out.push_str("                return dict;\n");
         }
-        TypeRef::Callback(_) => todo!("callback struct getter"),
+        TypeRef::Callback(_) => {
+            unreachable!("validator should have rejected callback struct getter")
+        }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as struct field"),
     }
 
@@ -1604,7 +1606,9 @@ fn safe_cs_name(name: &str) -> String {
 mod tests {
     use super::*;
     use weaveffi_core::config::GeneratorConfig;
-    use weaveffi_ir::ir::{EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField};
+    use weaveffi_ir::ir::{
+        CallbackSignature, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField,
+    };
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
@@ -4630,5 +4634,26 @@ mod tests {
             }
             assert!(caps.contains(cap), ".NET generator must support {cap:?}");
         }
+    }
+
+    #[test]
+    fn callback_type_panics_with_validator_message() {
+        let cb = TypeRef::Callback(Box::new(CallbackSignature {
+            params: vec![],
+            returns: None,
+        }));
+        let err = std::panic::catch_unwind(|| {
+            let _ = cs_type(&cb);
+        })
+        .expect_err("callback must panic");
+        let msg = err
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&'static str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            msg.contains("validator should have rejected"),
+            "panic message did not mention validator: {msg}"
+        );
     }
 }

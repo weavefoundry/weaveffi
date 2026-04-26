@@ -127,7 +127,7 @@ fn swift_type_for(t: &TypeRef) -> String {
         TypeRef::List(inner) => format!("[{}]", swift_type_for(inner)),
         TypeRef::Map(k, v) => format!("[{}: {}]", swift_type_for(k), swift_type_for(v)),
         TypeRef::Iterator(inner) => format!("[{}]", swift_type_for(inner)),
-        TypeRef::Callback(_) => todo!("callback Swift type"),
+        TypeRef::Callback(_) => unreachable!("validator should have rejected callback Swift type"),
     }
 }
 
@@ -1425,7 +1425,7 @@ fn swift_c_ptr_element(ty: &TypeRef) -> String {
         TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) | TypeRef::Iterator(_) => {
             "OpaquePointer?".to_string()
         }
-        TypeRef::Callback(_) => todo!("callback Swift type"),
+        TypeRef::Callback(_) => unreachable!("validator should have rejected callback Swift type"),
     }
 }
 
@@ -2142,8 +2142,8 @@ fn render_buffered_struct_create(
 mod tests {
     use super::*;
     use weaveffi_ir::ir::{
-        Api, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param, StructDef,
-        StructField,
+        Api, CallbackSignature, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module,
+        Param, StructDef, StructField,
     };
 
     fn make_api(modules: Vec<Module>) -> Api {
@@ -4640,5 +4640,26 @@ mod tests {
             }
             assert!(caps.contains(cap), "Swift generator must support {cap:?}");
         }
+    }
+
+    #[test]
+    fn callback_type_panics_with_validator_message() {
+        let cb = TypeRef::Callback(Box::new(CallbackSignature {
+            params: vec![],
+            returns: None,
+        }));
+        let err = std::panic::catch_unwind(|| {
+            let _ = swift_type_for(&cb);
+        })
+        .expect_err("callback must panic");
+        let msg = err
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&'static str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            msg.contains("validator should have rejected"),
+            "panic message did not mention validator: {msg}"
+        );
     }
 }

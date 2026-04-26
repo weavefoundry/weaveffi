@@ -141,7 +141,7 @@ fn c_elem_type(ty: &TypeRef, module: &str) -> String {
             c_elem_type(inner, module)
         }
         TypeRef::Map(_, _) => "void*".into(),
-        TypeRef::Callback(_) => todo!("callback Node type"),
+        TypeRef::Callback(_) => unreachable!("validator should have rejected callback Node type"),
     }
 }
 
@@ -167,7 +167,7 @@ fn c_ret_type_str(ty: &TypeRef, module: &str) -> String {
         TypeRef::List(inner) => format!("{}*", c_elem_type(inner, module)),
         TypeRef::Map(_, _) => "void".into(),
         TypeRef::Iterator(_) => "void*".into(),
-        TypeRef::Callback(_) => todo!("callback Node type"),
+        TypeRef::Callback(_) => unreachable!("validator should have rejected callback Node type"),
     }
 }
 
@@ -563,7 +563,7 @@ fn emit_param(
             emit_map_param(out, c_args, cleanups, k, v, name, idx, module);
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
-        TypeRef::Callback(_) => todo!("callback Node param"),
+        TypeRef::Callback(_) => unreachable!("validator should have rejected callback Node param"),
     }
 }
 
@@ -987,7 +987,7 @@ fn emit_ret_to_napi(out: &mut String, ty: &TypeRef, module: &str, fn_name: &str)
             out.push_str("  }\n");
             out.push_str(&format!("  {iter_type}_destroy(result);\n"));
         }
-        TypeRef::Callback(_) => todo!("callback Node return"),
+        TypeRef::Callback(_) => unreachable!("validator should have rejected callback Node return"),
     }
     out.push_str("  return ret;\n");
 }
@@ -1105,7 +1105,7 @@ fn ts_type_for(ty: &TypeRef) -> String {
             let t = ts_type_for(inner);
             format!("{t}[]")
         }
-        TypeRef::Callback(_) => todo!("callback Node type"),
+        TypeRef::Callback(_) => unreachable!("validator should have rejected callback Node type"),
     }
 }
 
@@ -1251,7 +1251,9 @@ fn render_node_dts(api: &Api, strip_module_prefix: bool) -> String {
 mod tests {
     use super::*;
     use weaveffi_core::config::GeneratorConfig;
-    use weaveffi_ir::ir::{EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField};
+    use weaveffi_ir::ir::{
+        CallbackSignature, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField,
+    };
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
@@ -2738,5 +2740,26 @@ mod tests {
             }
             assert!(caps.contains(cap), "Node generator must support {cap:?}");
         }
+    }
+
+    #[test]
+    fn callback_type_panics_with_validator_message() {
+        let cb = TypeRef::Callback(Box::new(CallbackSignature {
+            params: vec![],
+            returns: None,
+        }));
+        let err = std::panic::catch_unwind(|| {
+            let _ = c_elem_type(&cb, "m");
+        })
+        .expect_err("callback must panic");
+        let msg = err
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&'static str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            msg.contains("validator should have rejected"),
+            "panic message did not mention validator: {msg}"
+        );
     }
 }

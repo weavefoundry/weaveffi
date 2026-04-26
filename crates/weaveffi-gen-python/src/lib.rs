@@ -148,7 +148,7 @@ fn py_ctypes_scalar(ty: &TypeRef) -> &'static str {
         TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) | TypeRef::Iterator(_) => {
             "ctypes.c_void_p"
         }
-        TypeRef::Callback(_) => todo!("callback Python type"),
+        TypeRef::Callback(_) => unreachable!("validator should have rejected callback Python type"),
     }
 }
 
@@ -166,7 +166,7 @@ fn py_type_hint(ty: &TypeRef) -> String {
         TypeRef::List(inner) => format!("List[{}]", py_type_hint(inner)),
         TypeRef::Map(k, v) => format!("Dict[{}, {}]", py_type_hint(k), py_type_hint(v)),
         TypeRef::Iterator(inner) => format!("Iterator[{}]", py_type_hint(inner)),
-        TypeRef::Callback(_) => todo!("callback Python type"),
+        TypeRef::Callback(_) => unreachable!("validator should have rejected callback Python type"),
     }
 }
 
@@ -271,7 +271,9 @@ fn py_async_cb_trailing_fields(ret: &Option<TypeRef>) -> Vec<(String, String)> {
                 )]
             }
         }
-        Some(TypeRef::Callback(_)) => todo!("async Python callback return type"),
+        Some(TypeRef::Callback(_)) => {
+            unreachable!("validator should have rejected async Python callback return type")
+        }
         Some(ty) => vec![("result".into(), py_ctypes_scalar(ty).to_string())],
     }
 }
@@ -433,8 +435,12 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
                 }
             }
         }
-        Some(TypeRef::Iterator(_)) => todo!("async iterator return"),
-        Some(TypeRef::Callback(_)) => todo!("async Python callback return type"),
+        Some(TypeRef::Iterator(_)) => {
+            unreachable!("validator should have rejected async iterator return")
+        }
+        Some(TypeRef::Callback(_)) => {
+            unreachable!("validator should have rejected async Python callback return type")
+        }
     }
 }
 
@@ -1097,7 +1103,9 @@ fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
             format!("len(_{name}_keys)"),
         ],
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
-        TypeRef::Callback(_) => todo!("callback Python param call args"),
+        TypeRef::Callback(_) => {
+            unreachable!("validator should have rejected callback Python param call args")
+        }
     }
 }
 
@@ -1167,7 +1175,9 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
         TypeRef::List(inner) => render_list_return(out, inner, ind),
         TypeRef::Map(k, v) => render_map_return(out, k, v, ind),
         TypeRef::Iterator(_) => unreachable!("iterator return handled in render_function"),
-        TypeRef::Callback(_) => todo!("callback Python return"),
+        TypeRef::Callback(_) => {
+            unreachable!("validator should have rejected callback Python return")
+        }
     }
 }
 
@@ -1480,7 +1490,8 @@ mod tests {
     use camino::Utf8Path;
     use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{
-        Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
+        Api, CallbackSignature, EnumDef, EnumVariant, Function, Module, Param, StructDef,
+        StructField, TypeRef,
     };
 
     fn make_api(modules: Vec<Module>) -> Api {
@@ -5031,5 +5042,26 @@ mod tests {
             }
             assert!(caps.contains(cap), "Python generator must support {cap:?}");
         }
+    }
+
+    #[test]
+    fn callback_type_panics_with_validator_message() {
+        let cb = TypeRef::Callback(Box::new(CallbackSignature {
+            params: vec![],
+            returns: None,
+        }));
+        let err = std::panic::catch_unwind(|| {
+            let _ = py_ctypes_scalar(&cb);
+        })
+        .expect_err("callback must panic");
+        let msg = err
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&'static str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            msg.contains("validator should have rejected"),
+            "panic message did not mention validator: {msg}"
+        );
     }
 }
