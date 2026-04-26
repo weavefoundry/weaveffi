@@ -674,7 +674,7 @@ fn render_struct(out: &mut String, module_name: &str, s: &StructDef) {
     out.push_str("\n\n    def __init__(self, _ptr: int) -> None:");
     out.push_str("\n        self._ptr = _ptr");
 
-    out.push_str("\n\n    def __del__(self) -> None:");
+    out.push_str("\n\n    def _dispose(self) -> None:");
     out.push_str("\n        if self._ptr is not None:");
     out.push_str(&format!(
         "\n            _lib.{prefix}_destroy.argtypes = [ctypes.c_void_p]"
@@ -684,6 +684,16 @@ fn render_struct(out: &mut String, module_name: &str, s: &StructDef) {
     ));
     out.push_str(&format!("\n            _lib.{prefix}_destroy(self._ptr)"));
     out.push_str("\n            self._ptr = None");
+
+    out.push_str("\n\n    def __del__(self) -> None:");
+    out.push_str("\n        self._dispose()");
+
+    out.push_str(&format!("\n\n    def __enter__(self) -> \"{}\":", s.name));
+    out.push_str("\n        return self");
+
+    out.push_str("\n\n    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:");
+    out.push_str("\n        self._dispose()");
+    out.push_str("\n        return False");
 
     for field in &s.fields {
         render_getter(out, &prefix, field);
@@ -4763,6 +4773,63 @@ mod tests {
         assert!(
             copy_pos < free_pos,
             "_lib.weaveffi_free_bytes must run AFTER the bytes have been copied into a Python bytes object: {py}"
+        );
+    }
+
+    #[test]
+    fn python_struct_wrapper_calls_destroy() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                builder: false,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                    default: None,
+                }],
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let py = render_python_module(&api, true);
+
+        assert!(py.contains("class Contact:"), "missing class Contact: {py}");
+        let del_pos = py
+            .find("def __del__(self) -> None:")
+            .expect("class must define __del__");
+        let exit_pos = py
+            .find("def __exit__(self, exc_type, exc_val, exc_tb) -> bool:")
+            .expect("class must define __exit__ for context-manager cleanup");
+        let enter_pos = py
+            .find("def __enter__(self)")
+            .expect("class must define __enter__ for context-manager usage");
+        assert!(enter_pos < exit_pos);
+
+        let dispose_pos = py
+            .find("def _dispose(self) -> None:")
+            .expect("class must define _dispose helper");
+        let destroy_pos = py[dispose_pos..]
+            .find("weaveffi_contacts_Contact_destroy(self._ptr)")
+            .map(|p| dispose_pos + p)
+            .expect("_dispose must call the C destroy function");
+        assert!(destroy_pos > dispose_pos);
+
+        let del_body = &py[del_pos..];
+        assert!(
+            del_body[..120].contains("self._dispose()"),
+            "__del__ must call _dispose(): {del_body}"
+        );
+        let exit_body = &py[exit_pos..];
+        assert!(
+            exit_body[..160].contains("self._dispose()"),
+            "__exit__ must call _dispose(): {exit_body}"
         );
     }
 }

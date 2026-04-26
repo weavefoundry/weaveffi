@@ -4621,4 +4621,36 @@ mod tests {
             "weaveffi_free_bytes must run AFTER copying data into the jbyteArray: {jni}"
         );
     }
+
+    #[test]
+    fn android_struct_wrapper_calls_destroy() {
+        let api = make_struct_api();
+        let kt = render_kotlin(&api, "com.weaveffi", true);
+        assert!(
+            kt.contains("class Contact internal constructor(private var handle: Long) : java.io.Closeable {"),
+            "Kotlin struct must implement Closeable: {kt}"
+        );
+        let close_pos = kt
+            .find("override fun close()")
+            .expect("Kotlin struct must override close");
+        let destroy_pos = kt[close_pos..]
+            .find("nativeDestroy(handle)")
+            .map(|p| close_pos + p)
+            .expect("close() must call nativeDestroy");
+        let zero_pos = kt[close_pos..]
+            .find("handle = 0L")
+            .map(|p| close_pos + p)
+            .expect("close() must zero the handle to be idempotent");
+        assert!(destroy_pos > close_pos && zero_pos > destroy_pos);
+        let finalize_pos = kt
+            .find("protected fun finalize()")
+            .expect("Kotlin struct must declare a finalize fallback");
+        assert!(kt[finalize_pos..].contains("close()"));
+
+        let jni = render_jni_c(&api, "com.weaveffi", true);
+        assert!(
+            jni.contains("weaveffi_contacts_Contact_destroy("),
+            "JNI native destroy must call the C ABI destroy: {jni}"
+        );
+    }
 }

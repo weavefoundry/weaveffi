@@ -168,13 +168,20 @@ fn doc_node_dts_interface_and_enum() {
     let dts = std::fs::read_to_string(out.join("generated/node/types.d.ts")).unwrap();
 
     assert!(
-        dts.contains("export interface Contact {"),
-        "TS interface missing: {dts}"
+        dts.contains("export declare class Contact {"),
+        "TS class missing: {dts}"
     );
-    assert!(dts.contains("  name: string;"), "name field missing: {dts}");
     assert!(
-        dts.contains("  email: string | null;"),
+        dts.contains("readonly name: string;"),
+        "name field missing: {dts}"
+    );
+    assert!(
+        dts.contains("readonly email: string | null;"),
         "optional field missing: {dts}"
+    );
+    assert!(
+        dts.contains("dispose(): void;"),
+        "dispose method missing: {dts}"
     );
     assert!(
         dts.contains("export enum ContactType {"),
@@ -484,8 +491,8 @@ fn getting_started_yaml_generates_all_targets() {
 
     let dts = std::fs::read_to_string(gen.join("node/types.d.ts")).unwrap();
     assert!(
-        dts.contains("interface Point"),
-        "types.d.ts should contain Point interface"
+        dts.contains("export declare class Point"),
+        "types.d.ts should contain Point class wrapper"
     );
     assert!(
         dts.contains("function math_add"),

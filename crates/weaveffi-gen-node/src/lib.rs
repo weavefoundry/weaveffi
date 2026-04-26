@@ -18,10 +18,7 @@ impl NodeGenerator {
     ) -> Result<()> {
         let dir = out_dir.join("node");
         std::fs::create_dir_all(&dir)?;
-        std::fs::write(
-            dir.join("index.js"),
-            "module.exports = require('./index.node')\n",
-        )?;
+        std::fs::write(dir.join("index.js"), render_node_index_js(api))?;
         std::fs::write(
             dir.join("types.d.ts"),
             render_node_dts(api, strip_module_prefix),
@@ -214,6 +211,9 @@ fn render_addon_c(api: &Api, strip_module_prefix: bool) -> String {
     let mut all_exports: Vec<(String, String)> = Vec::new();
 
     for (m, path) in collect_modules_with_path(&api.modules) {
+        for s in &m.structs {
+            render_struct_destroy_napi(&mut out, &s.name, &path, &mut all_exports);
+        }
         for f in &m.functions {
             let c_name = format!("weaveffi_{}_{}", path, f.name);
             let napi_name = format!("Napi_{c_name}");
@@ -254,6 +254,35 @@ fn render_addon_c(api: &Api, strip_module_prefix: bool) -> String {
     out.push_str("}\n\n");
     out.push_str("NAPI_MODULE(NODE_GYP_MODULE_NAME, Init)\n");
     out
+}
+
+fn render_struct_destroy_napi(
+    out: &mut String,
+    struct_name: &str,
+    module_path: &str,
+    exports: &mut Vec<(String, String)>,
+) {
+    let c_name = format!("weaveffi_{module_path}_{struct_name}_destroy");
+    let napi_name = format!("Napi_{c_name}");
+    let js_name = format!("{module_path}_{struct_name}_destroy");
+    exports.push((js_name, napi_name.clone()));
+    out.push_str(&format!(
+        "static napi_value {napi_name}(napi_env env, napi_callback_info info) {{\n"
+    ));
+    out.push_str("  size_t argc = 1;\n");
+    out.push_str("  napi_value args[1];\n");
+    out.push_str("  napi_get_cb_info(env, info, &argc, args, NULL, NULL);\n");
+    out.push_str("  int64_t handle_raw = 0;\n");
+    out.push_str("  napi_get_value_int64(env, args[0], &handle_raw);\n");
+    out.push_str("  if (handle_raw != 0) {\n");
+    out.push_str(&format!(
+        "    {c_name}((weaveffi_{module_path}_{struct_name}*)(intptr_t)handle_raw);\n"
+    ));
+    out.push_str("  }\n");
+    out.push_str("  napi_value ret;\n");
+    out.push_str("  napi_get_undefined(env, &ret);\n");
+    out.push_str("  return ret;\n");
+    out.push_str("}\n\n");
 }
 
 fn async_cb_result_params_node(ret: Option<&TypeRef>, module: &str) -> String {
@@ -1071,14 +1100,85 @@ fn render_struct_builder_dts(out: &mut String, s: &StructDef) {
     out.push_str("}\n");
 }
 
+fn render_node_index_js(api: &Api) -> String {
+    let mut out = String::from("const addon = require('./index.node');\n\n");
+    let structs: Vec<(String, String)> = collect_modules_with_path(&api.modules)
+        .iter()
+        .flat_map(|(m, path)| {
+            m.structs
+                .iter()
+                .map(|s| (s.name.clone(), path.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    if structs.is_empty() {
+        out.push_str("module.exports = addon;\n");
+        return out;
+    }
+
+    out.push_str(
+        "const _hasFinalizer = typeof FinalizationRegistry !== 'undefined';\n\
+         const _registries = new Map();\n\n",
+    );
+
+    for (name, path) in &structs {
+        let destroy_fn = format!("{path}_{name}_destroy");
+        out.push_str(&format!(
+            "function _registryFor_{name}() {{\n\
+             \x20 let r = _registries.get('{destroy_fn}');\n\
+             \x20 if (!r && _hasFinalizer) {{\n\
+             \x20   r = new FinalizationRegistry((h) => {{ if (h) addon.{destroy_fn}(h); }});\n\
+             \x20   _registries.set('{destroy_fn}', r);\n\
+             \x20 }}\n\
+             \x20 return r;\n\
+             }}\n\n",
+        ));
+        out.push_str(&format!("class {name} {{\n"));
+        out.push_str("  constructor(handle) {\n");
+        out.push_str("    this.handle = handle;\n");
+        out.push_str("    this._disposed = false;\n");
+        out.push_str(&format!(
+            "    const r = _registryFor_{name}();\n\
+             \x20   if (r) r.register(this, handle, this);\n"
+        ));
+        out.push_str("  }\n");
+        out.push_str("  dispose() {\n");
+        out.push_str("    if (this._disposed) return;\n");
+        out.push_str("    this._disposed = true;\n");
+        out.push_str("    const h = this.handle;\n");
+        out.push_str("    this.handle = 0n;\n");
+        out.push_str(&format!(
+            "    const r = _registryFor_{name}();\n\
+             \x20   if (r) r.unregister(this);\n"
+        ));
+        out.push_str(&format!("    if (h) addon.{destroy_fn}(h);\n"));
+        out.push_str("  }\n");
+        out.push_str("}\n\n");
+    }
+
+    out.push_str("module.exports = Object.assign({}, addon, {\n");
+    for (name, _path) in &structs {
+        out.push_str(&format!("  {name}: {name},\n"));
+    }
+    out.push_str("});\n");
+    out
+}
+
 fn render_node_dts(api: &Api, strip_module_prefix: bool) -> String {
     let mut out = String::from("// Generated types for WeaveFFI functions\n");
     for (m, path) in collect_modules_with_path(&api.modules) {
         for s in &m.structs {
-            out.push_str(&format!("export interface {} {{\n", s.name));
+            out.push_str(&format!("export declare class {} {{\n", s.name));
+            out.push_str("  readonly handle: bigint;\n");
+            out.push_str("  constructor(handle: bigint);\n");
             for field in &s.fields {
-                out.push_str(&format!("  {}: {};\n", field.name, ts_type_for(&field.ty)));
+                out.push_str(&format!(
+                    "  readonly {}: {};\n",
+                    field.name,
+                    ts_type_for(&field.ty)
+                ));
             }
+            out.push_str("  dispose(): void;\n");
             out.push_str("}\n");
             if s.builder {
                 render_struct_builder_dts(&mut out, s);
@@ -1276,10 +1376,11 @@ mod tests {
 
         let dts = render_node_dts(&make_api(vec![m]), true);
 
-        assert!(dts.contains("export interface Contact {"));
-        assert!(dts.contains("  name: string;"));
-        assert!(dts.contains("  age: number;"));
-        assert!(dts.contains("  active: boolean;"));
+        assert!(dts.contains("export declare class Contact {"));
+        assert!(dts.contains("  readonly name: string;"));
+        assert!(dts.contains("  readonly age: number;"));
+        assert!(dts.contains("  readonly active: boolean;"));
+        assert!(dts.contains("  dispose(): void;"));
         assert!(dts.contains("export enum Color {"));
         assert!(dts.contains("  Red = 0,"));
         assert!(dts.contains("  Green = 1,"));
@@ -1287,13 +1388,10 @@ mod tests {
         assert!(dts.contains("export function get_contact(id: number): Contact | null"));
         assert!(dts.contains("export function list_contacts(): Contact[]"));
 
-        let iface_pos = dts.find("export interface Contact").unwrap();
+        let class_pos = dts.find("export declare class Contact").unwrap();
         let enum_pos = dts.find("export enum Color").unwrap();
         let fn_pos = dts.find("export function get_contact").unwrap();
-        assert!(
-            iface_pos < fn_pos,
-            "interface should appear before functions"
-        );
+        assert!(class_pos < fn_pos, "class should appear before functions");
         assert!(enum_pos < fn_pos, "enum should appear before functions");
     }
 
@@ -1495,18 +1593,22 @@ mod tests {
         let dts = std::fs::read_to_string(tmp.join("node").join("types.d.ts")).unwrap();
 
         assert!(
-            dts.contains("export interface Contact {"),
-            "missing Contact interface: {dts}"
+            dts.contains("export declare class Contact {"),
+            "missing Contact class: {dts}"
         );
-        assert!(dts.contains("  name: string;"), "missing name field: {dts}");
         assert!(
-            dts.contains("  email: string | null;"),
+            dts.contains("  readonly name: string;"),
+            "missing name field: {dts}"
+        );
+        assert!(
+            dts.contains("  readonly email: string | null;"),
             "missing optional email field: {dts}"
         );
         assert!(
-            dts.contains("  tags: string[];"),
+            dts.contains("  readonly tags: string[];"),
             "missing list tags field: {dts}"
         );
+        assert!(dts.contains("  dispose(): void;"), "missing dispose: {dts}");
 
         assert!(
             dts.contains("export enum Color {"),
@@ -1535,13 +1637,10 @@ mod tests {
             "missing get_tags with list return: {dts}"
         );
 
-        let iface_pos = dts.find("export interface Contact").unwrap();
+        let class_pos = dts.find("export declare class Contact").unwrap();
         let enum_pos = dts.find("export enum Color").unwrap();
         let fn_pos = dts.find("export function get_contact").unwrap();
-        assert!(
-            iface_pos < fn_pos,
-            "interface should appear before functions"
-        );
+        assert!(class_pos < fn_pos, "class should appear before functions");
         assert!(enum_pos < fn_pos, "enum should appear before functions");
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2419,6 +2518,65 @@ mod tests {
         assert!(
             copy_pos < free_pos,
             "weaveffi_free_bytes must run AFTER napi_create_buffer_copy has copied the payload: {addon}"
+        );
+    }
+
+    #[test]
+    fn node_struct_wrapper_calls_destroy() {
+        let mut m = make_module("contacts");
+        m.structs.push(StructDef {
+            name: "Contact".into(),
+            doc: None,
+            fields: vec![StructField {
+                name: "name".into(),
+                ty: TypeRef::StringUtf8,
+                doc: None,
+                default: None,
+            }],
+            builder: false,
+        });
+        let api = make_api(vec![m]);
+
+        let addon = render_addon_c(&api, true);
+        assert!(
+            addon.contains("Napi_weaveffi_contacts_Contact_destroy"),
+            "addon must define a napi wrapper for the struct destroy: {addon}"
+        );
+        assert!(
+            addon.contains("weaveffi_contacts_Contact_destroy("),
+            "addon must invoke the C struct destroy: {addon}"
+        );
+        assert!(
+            addon.contains("\"contacts_Contact_destroy\""),
+            "addon must export the struct destroy through N-API: {addon}"
+        );
+
+        let dts = render_node_dts(&api, true);
+        assert!(
+            dts.contains("export declare class Contact {"),
+            "dts must declare struct as a class: {dts}"
+        );
+        assert!(
+            dts.contains("dispose(): void;"),
+            "dts class must expose dispose(): {dts}"
+        );
+
+        let js = render_node_index_js(&api);
+        assert!(
+            js.contains("class Contact {"),
+            "index.js must define a Contact class: {js}"
+        );
+        assert!(
+            js.contains("dispose()"),
+            "index.js must define dispose(): {js}"
+        );
+        assert!(
+            js.contains("addon.contacts_Contact_destroy(h)"),
+            "dispose must call the N-API destroy on the handle: {js}"
+        );
+        assert!(
+            js.contains("FinalizationRegistry"),
+            "index.js must register a FinalizationRegistry fallback: {js}"
         );
     }
 }

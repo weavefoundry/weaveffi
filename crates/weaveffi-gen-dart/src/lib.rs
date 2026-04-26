@@ -367,15 +367,25 @@ fn render_struct(out: &mut String, module_path: &str, s: &StructDef) {
     } else {
         out.push('\n');
     }
+    let destroy_camel = destroy_sym.to_lower_camel_case();
     out.push_str(&format!("class {class_name} {{\n"));
-    out.push_str("  final Pointer<Void> _handle;\n");
-    out.push_str(&format!("  {class_name}._(this._handle);\n\n"));
+    out.push_str("  Pointer<Void> _handle;\n");
+    out.push_str("  bool _disposed = false;\n");
+    out.push_str(&format!(
+        "  static final Finalizer<Pointer<Void>> _finalizer =\n      Finalizer<Pointer<Void>>((ptr) {{\n        if (ptr != nullptr) _{destroy_camel}(ptr);\n      }});\n\n"
+    ));
+    out.push_str(&format!(
+        "  {class_name}._(this._handle) {{\n    _finalizer.attach(this, _handle, detach: this);\n  }}\n\n"
+    ));
 
     out.push_str("  void dispose() {\n");
-    out.push_str(&format!(
-        "    _{}(_handle);\n",
-        destroy_sym.to_lower_camel_case()
-    ));
+    out.push_str("    if (_disposed) return;\n");
+    out.push_str("    _disposed = true;\n");
+    out.push_str("    _finalizer.detach(this);\n");
+    out.push_str("    if (_handle != nullptr) {\n");
+    out.push_str(&format!("      _{destroy_camel}(_handle);\n"));
+    out.push_str("      _handle = nullptr;\n");
+    out.push_str("    }\n");
     out.push_str("  }\n");
 
     for field in &s.fields {
@@ -2288,5 +2298,55 @@ mod tests {
             copy_pos < free_pos,
             "_weaveffiFreeBytes must run AFTER the payload is copied into a List<int>: {dart}"
         );
+    }
+
+    #[test]
+    fn dart_struct_wrapper_calls_destroy() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                builder: false,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                    default: None,
+                }],
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let dart = render_dart_module(&api);
+
+        assert!(
+            dart.contains("class Contact {"),
+            "Dart struct must be a class: {dart}"
+        );
+        assert!(
+            dart.contains("Finalizer<Pointer<Void>>"),
+            "Dart struct must register a Finalizer<Pointer>: {dart}"
+        );
+        assert!(
+            dart.contains("_finalizer.attach(this, _handle, detach: this);"),
+            "constructor must attach the finalizer: {dart}"
+        );
+        let dispose_pos = dart
+            .find("void dispose() {")
+            .expect("Dart struct must declare dispose()");
+        let detach_pos = dart[dispose_pos..]
+            .find("_finalizer.detach(this);")
+            .map(|p| dispose_pos + p)
+            .expect("dispose must detach the finalizer before destroying the handle");
+        let destroy_pos = dart[dispose_pos..]
+            .find("_weaveffiContactsContactDestroy(_handle);")
+            .map(|p| dispose_pos + p)
+            .expect("dispose must call the native destroy");
+        assert!(detach_pos < destroy_pos);
     }
 }

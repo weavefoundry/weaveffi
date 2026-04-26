@@ -179,7 +179,7 @@ fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Mo
     }
 }
 
-fn scan_imports(api: &Api) -> (bool, bool, bool) {
+fn scan_imports(api: &Api) -> (bool, bool, bool, bool) {
     let has_sync_funcs = collect_all_modules(&api.modules)
         .iter()
         .any(|m| m.functions.iter().any(|f| !f.r#async));
@@ -203,7 +203,11 @@ fn scan_imports(api: &Api) -> (bool, bool, bool) {
             .any(|s| s.fields.iter().any(|fld| type_has_bool(&fld.ty)))
     });
 
-    (needs_fmt, needs_unsafe, needs_bool)
+    let needs_runtime = collect_all_modules(&api.modules)
+        .iter()
+        .any(|m| !m.structs.is_empty());
+
+    (needs_fmt, needs_unsafe, needs_bool, needs_runtime)
 }
 
 // ── Packaging scaffold ──
@@ -255,7 +259,7 @@ converts the result back to Go types. Errors are returned as Go `error` values.
 // ── Top-level rendering ──
 
 fn render_go(api: &Api) -> String {
-    let (needs_fmt, needs_unsafe, needs_bool) = scan_imports(api);
+    let (needs_fmt, needs_unsafe, needs_bool, needs_runtime) = scan_imports(api);
     let mut out = String::new();
 
     out.push_str("package weaveffi\n\n");
@@ -267,10 +271,13 @@ fn render_go(api: &Api) -> String {
     out.push_str("*/\n");
     out.push_str("import \"C\"\n");
 
-    if needs_fmt || needs_unsafe {
+    if needs_fmt || needs_unsafe || needs_runtime {
         out.push_str("\nimport (\n");
         if needs_fmt {
             out.push_str("\t\"fmt\"\n");
+        }
+        if needs_runtime {
+            out.push_str("\t\"runtime\"\n");
         }
         if needs_unsafe {
             out.push_str("\t\"unsafe\"\n");
@@ -334,6 +341,15 @@ fn render_struct(out: &mut String, module: &str, s: &StructDef) {
     out.push_str(&format!("\tptr *C.{c_tag}\n"));
     out.push_str("}\n\n");
 
+    out.push_str(&format!("func new{name}(ptr *C.{c_tag}) *{name} {{\n"));
+    out.push_str("\tif ptr == nil {\n\t\treturn nil\n\t}\n");
+    out.push_str(&format!("\ts := &{name}{{ptr: ptr}}\n"));
+    out.push_str(&format!(
+        "\truntime.SetFinalizer(s, func(x *{name}) {{ x.Close() }})\n"
+    ));
+    out.push_str("\treturn s\n");
+    out.push_str("}\n\n");
+
     for field in &s.fields {
         render_getter(out, module, &name, &c_tag, field);
     }
@@ -342,6 +358,7 @@ fn render_struct(out: &mut String, module: &str, s: &StructDef) {
     out.push_str("\tif s.ptr != nil {\n");
     out.push_str(&format!("\t\tC.{c_tag}_destroy(s.ptr)\n"));
     out.push_str("\t\ts.ptr = nil\n");
+    out.push_str("\t\truntime.SetFinalizer(s, nil)\n");
     out.push_str("\t}\n");
     out.push_str("}\n\n");
 }
@@ -402,7 +419,7 @@ fn render_getter(
         }
         TypeRef::Struct(n) => {
             let inner = local_type_name(n).to_upper_camel_case();
-            out.push_str(&format!("\treturn &{inner}{{ptr: {getter}(s.ptr)}}\n"));
+            out.push_str(&format!("\treturn new{inner}({getter}(s.ptr))\n"));
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
@@ -421,7 +438,7 @@ fn render_getter(
                 let inner_go = local_type_name(n).to_upper_camel_case();
                 out.push_str(&format!("\tcPtr := {getter}(s.ptr)\n"));
                 out.push_str("\tif cPtr == nil {\n\t\treturn nil\n\t}\n");
-                out.push_str(&format!("\treturn &{inner_go}{{ptr: cPtr}}\n"));
+                out.push_str(&format!("\treturn new{inner_go}(cPtr)\n"));
             }
             TypeRef::Bool => {
                 out.push_str(&format!("\tcVal := {getter}(s.ptr)\n"));
@@ -808,7 +825,7 @@ fn emit_return(out: &mut String, ty: &TypeRef, module: &str) {
         }
         TypeRef::Struct(n) => {
             let g = local_type_name(n).to_upper_camel_case();
-            out.push_str(&format!("\treturn &{g}{{ptr: result}}, nil\n"));
+            out.push_str(&format!("\treturn new{g}(result), nil\n"));
         }
         TypeRef::Optional(inner) => emit_optional_return(out, inner, module),
         TypeRef::List(inner) => emit_list_return(out, inner, module),
@@ -838,7 +855,7 @@ fn emit_optional_return(out: &mut String, inner: &TypeRef, _module: &str) {
         }
         TypeRef::Struct(n) => {
             let g = local_type_name(n).to_upper_camel_case();
-            out.push_str(&format!("\treturn &{g}{{ptr: result}}, nil\n"));
+            out.push_str(&format!("\treturn new{g}(result), nil\n"));
         }
         TypeRef::Bool => {
             out.push_str("\tv := cToBool(*result)\n");
@@ -888,7 +905,7 @@ fn emit_list_return(out: &mut String, inner: &TypeRef, module: &str) {
             "\tcSlice := unsafe.Slice((**{ct})(unsafe.Pointer(result)), count)\n"
         ));
         out.push_str("\tfor i, v := range cSlice {\n");
-        out.push_str(&format!("\t\tgoResult[i] = &{gs}{{ptr: v}}\n"));
+        out.push_str(&format!("\t\tgoResult[i] = new{gs}(v)\n"));
         out.push_str("\t}\n");
     }
 
@@ -1451,8 +1468,8 @@ mod tests {
             "missing struct return type: {go}"
         );
         assert!(
-            go.contains("&Contact{ptr: result}"),
-            "missing struct wrap: {go}"
+            go.contains("newContact(result)"),
+            "missing struct factory wrap: {go}"
         );
     }
 
@@ -2480,8 +2497,8 @@ mod tests {
             .find("if cErr.code != 0")
             .expect("error check in ContactsFindContact");
         let contact_wrap = fn_text
-            .find("&Contact{ptr: result}")
-            .expect("Contact wrap in ContactsFindContact");
+            .find("newContact(result)")
+            .expect("Contact factory call in ContactsFindContact");
         assert!(
             err_check < contact_wrap,
             "error must be checked before wrapping struct return: {fn_text}"
@@ -2539,8 +2556,8 @@ mod tests {
             .find("if result == nil")
             .expect("nil check in ContactsFindContact");
         let contact_wrap = fn_text
-            .find("&Contact{ptr: result}")
-            .expect("Contact wrap in ContactsFindContact");
+            .find("newContact(result)")
+            .expect("Contact factory call in ContactsFindContact");
         assert!(
             null_check < contact_wrap,
             "optional struct return should check nil before wrapping: {fn_text}"
@@ -2860,6 +2877,64 @@ mod tests {
         assert!(
             copy_pos < free_pos,
             "C.weaveffi_free_bytes must run AFTER C.GoBytes has copied the payload: {go}"
+        );
+    }
+
+    #[test]
+    fn go_struct_wrapper_calls_destroy() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "contacts".into(),
+                functions: vec![],
+                structs: vec![StructDef {
+                    name: "Contact".into(),
+                    doc: None,
+                    builder: false,
+                    fields: vec![StructField {
+                        name: "id".into(),
+                        ty: TypeRef::I32,
+                        doc: None,
+                        default: None,
+                    }],
+                }],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let go = render_go(&api);
+
+        assert!(
+            go.contains("\"runtime\""),
+            "Go output must import runtime for SetFinalizer: {go}"
+        );
+        assert!(
+            go.contains("func newContact(ptr *C.weaveffi_contacts_Contact) *Contact"),
+            "Go output must define newContact factory: {go}"
+        );
+        assert!(
+            go.contains("runtime.SetFinalizer(s, func(x *Contact) { x.Close() })"),
+            "newContact must register a finalizer: {go}"
+        );
+        assert!(
+            go.contains("func (s *Contact) Close()"),
+            "Contact must have a Close method: {go}"
+        );
+        assert!(
+            go.contains("C.weaveffi_contacts_Contact_destroy(s.ptr)"),
+            "Close must call the C destroy function: {go}"
+        );
+        assert!(
+            go.contains("runtime.SetFinalizer(s, nil)"),
+            "Close must clear the finalizer after destroying: {go}"
+        );
+        assert!(
+            go.contains("s.ptr = nil"),
+            "Close must null out the pointer: {go}"
         );
     }
 }

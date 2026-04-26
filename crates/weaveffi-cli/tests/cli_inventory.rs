@@ -38,19 +38,23 @@ fn generate_inventory_all_targets() {
         );
     }
 
-    // Node types.d.ts contains interfaces for all structs
+    // Node types.d.ts contains disposable class wrappers for all structs
     let types_dts =
         std::fs::read_to_string(out_path.join("node/types.d.ts")).expect("missing node/types.d.ts");
-    for iface in [
-        "interface Product",
-        "interface OrderItem",
-        "interface Order",
+    for class in [
+        "export declare class Product",
+        "export declare class OrderItem",
+        "export declare class Order",
     ] {
         assert!(
-            types_dts.contains(iface),
-            "node/types.d.ts should contain {iface}"
+            types_dts.contains(class),
+            "node/types.d.ts should contain {class}"
         );
     }
+    assert!(
+        types_dts.matches("dispose(): void").count() >= 3,
+        "node/types.d.ts should define dispose() on all struct wrappers"
+    );
 
     // Python weaveffi.py contains functions from both modules
     let weaveffi_py = std::fs::read_to_string(out_path.join("python/weaveffi/weaveffi.py"))

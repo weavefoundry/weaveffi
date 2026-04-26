@@ -4319,4 +4319,60 @@ mod tests {
             "weaveffi_free_bytes must run AFTER Marshal.Copy has copied the payload: {cs}"
         );
     }
+
+    #[test]
+    fn dotnet_struct_wrapper_calls_destroy() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                builder: false,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                    default: None,
+                }],
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let cs = render_csharp(&api, "WeaveFFI", true);
+
+        assert!(
+            cs.contains("public class Contact : IDisposable"),
+            "Contact must implement IDisposable: {cs}"
+        );
+        assert!(
+            cs.contains("private bool _disposed;"),
+            "Contact must track a _disposed flag for idempotent cleanup: {cs}"
+        );
+        let dispose_pos = cs
+            .find("public void Dispose()")
+            .expect("Contact must declare Dispose");
+        let dispose_guard_pos = cs[dispose_pos..]
+            .find("if (!_disposed)")
+            .map(|p| dispose_pos + p)
+            .expect("Dispose must guard on _disposed for idempotency");
+        let dispose_destroy_pos = cs[dispose_pos..]
+            .find("NativeMethods.weaveffi_contacts_Contact_destroy(_handle);")
+            .map(|p| dispose_pos + p)
+            .expect("Dispose must call the native destroy");
+        let suppress_pos = cs[dispose_pos..]
+            .find("GC.SuppressFinalize(this);")
+            .map(|p| dispose_pos + p)
+            .expect("Dispose must suppress finalization");
+        assert!(dispose_guard_pos < dispose_destroy_pos);
+        assert!(dispose_destroy_pos < suppress_pos);
+
+        let finalizer_pos = cs
+            .find("~Contact()")
+            .expect("Contact must declare a finalizer");
+        assert!(cs[finalizer_pos..].contains("Dispose();"));
+    }
 }

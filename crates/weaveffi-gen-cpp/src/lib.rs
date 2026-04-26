@@ -3576,4 +3576,31 @@ mod tests {
             "C++ wrapper must free AFTER copying data into std::vector: {h}"
         );
     }
+
+    #[test]
+    fn cpp_struct_wrapper_calls_destroy() {
+        let h = render_cpp_header(&contacts_api(), "weaveffi");
+        assert!(h.contains("class Contact {"), "missing class: {h}");
+        let dtor_pos = h
+            .find("~Contact()")
+            .expect("Contact class must declare a destructor");
+        let dtor_destroy_pos = h[dtor_pos..]
+            .find("weaveffi_contacts_Contact_destroy(static_cast<weaveffi_contacts_Contact*>(handle_))")
+            .map(|p| dtor_pos + p)
+            .expect("destructor must call weaveffi_contacts_Contact_destroy on the handle");
+        let move_assign_pos = h
+            .find("Contact& operator=(Contact&& other) noexcept")
+            .expect("Contact class must declare move-assignment operator");
+        let move_destroy_pos = h[move_assign_pos..]
+            .find("weaveffi_contacts_Contact_destroy(static_cast<weaveffi_contacts_Contact*>(handle_))")
+            .map(|p| move_assign_pos + p)
+            .expect("move-assignment must destroy the old handle before taking over");
+        let null_source_pos = h[move_assign_pos..]
+            .find("other.handle_ = nullptr;")
+            .map(|p| move_assign_pos + p)
+            .expect("move-assignment must null out the source handle");
+        assert!(dtor_destroy_pos > dtor_pos);
+        assert!(move_destroy_pos > move_assign_pos);
+        assert!(null_source_pos > move_destroy_pos);
+    }
 }

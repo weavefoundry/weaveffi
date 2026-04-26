@@ -2516,4 +2516,62 @@ mod tests {
             "weaveffi_free_bytes must run AFTER read_string has copied the payload: {rb}"
         );
     }
+
+    #[test]
+    fn ruby_struct_wrapper_calls_destroy() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                builder: false,
+                fields: vec![StructField {
+                    name: "id".into(),
+                    ty: TypeRef::I32,
+                    doc: None,
+                    default: None,
+                }],
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let rb = render_ruby_module(&api, "WeaveFFI");
+
+        assert!(
+            rb.contains("attach_function :weaveffi_contacts_Contact_destroy, [:pointer], :void"),
+            "Ruby output must attach the native _destroy function: {rb}"
+        );
+        assert!(
+            rb.contains("class ContactPtr < FFI::AutoPointer"),
+            "Ruby output must define a ContactPtr subclass of FFI::AutoPointer: {rb}"
+        );
+        assert!(
+            rb.contains("def self.release(ptr)"),
+            "ContactPtr must define the release callback: {rb}"
+        );
+        assert!(
+            rb.contains("WeaveFFI.weaveffi_contacts_Contact_destroy(ptr)"),
+            "release must invoke the C ABI destroy function: {rb}"
+        );
+        assert!(
+            rb.contains("@handle = ContactPtr.new(handle)"),
+            "Contact#initialize must wrap handle in ContactPtr so AutoPointer owns the resource: {rb}"
+        );
+        assert!(
+            rb.contains("def destroy"),
+            "Contact must expose an explicit destroy method: {rb}"
+        );
+        assert!(
+            rb.contains("@handle.free"),
+            "Contact#destroy must call handle.free to trigger AutoPointer.release: {rb}"
+        );
+        assert!(
+            rb.contains("@handle = nil"),
+            "Contact#destroy must null out @handle for idempotency: {rb}"
+        );
+    }
 }

@@ -4471,4 +4471,41 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn swift_struct_wrapper_calls_destroy() {
+        let api = make_api(vec![Module {
+            name: "contacts".to_string(),
+            functions: vec![],
+            structs: vec![StructDef {
+                name: "Contact".to_string(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".to_string(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                    default: None,
+                }],
+                builder: false,
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let swift = render_swift_wrapper(&api, true);
+        assert!(
+            swift.contains("public class Contact {"),
+            "Swift struct wrapper must be a class: {swift}"
+        );
+        let deinit_pos = swift
+            .find("deinit {")
+            .expect("Swift struct wrapper must declare deinit");
+        let destroy_pos = swift[deinit_pos..]
+            .find("weaveffi_contacts_Contact_destroy(ptr)")
+            .map(|p| deinit_pos + p)
+            .expect("deinit must call weaveffi_contacts_Contact_destroy");
+        assert!(destroy_pos > deinit_pos);
+    }
 }

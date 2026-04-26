@@ -39,8 +39,12 @@ fn generate_contacts_produces_all_targets() {
     let types_dts =
         std::fs::read_to_string(out_path.join("node/types.d.ts")).expect("missing node/types.d.ts");
     assert!(
-        types_dts.contains("interface Contact"),
-        "node/types.d.ts should contain interface Contact"
+        types_dts.contains("export declare class Contact"),
+        "node/types.d.ts should contain exported Contact class wrapper"
+    );
+    assert!(
+        types_dts.contains("dispose(): void"),
+        "node/types.d.ts Contact class must expose a dispose() method"
     );
 
     assert!(
