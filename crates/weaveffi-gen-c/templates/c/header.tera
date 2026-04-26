@@ -1,0 +1,38 @@
+{#
+  Built-in WeaveFFI C header template.
+
+  Place a file at `<templates>/c/header.tera` and pass `--templates <dir>` to
+  override this with your own rendering. The template receives the context
+  produced by `weaveffi_core::templates::api_to_context`:
+
+    * `version`  (string)   - IR schema version
+    * `modules`  (array)    - each module has `name`, `functions`, `structs`,
+                              `enums`, `callbacks`, `listeners`
+
+  This default template is intentionally minimal; the rich C header is still
+  produced by the built-in formatter when no override is supplied. Use this
+  file as a starting point for customisations.
+-#}
+#ifndef WEAVEFFI_H
+#define WEAVEFFI_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// WeaveFFI IR version {{ version }}
+{% for module in modules -%}
+// Module: {{ module.name }}
+{% for func in module.functions -%}
+// fn {{ func.name }}
+{% endfor -%}
+{% endfor %}
+#ifdef __cplusplus
+}
+#endif
+
+#endif // WEAVEFFI_H

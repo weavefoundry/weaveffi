@@ -3,13 +3,31 @@ use camino::Utf8Path;
 use heck::ToUpperCamelCase;
 use weaveffi_core::codegen::{stamp_header, Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
+use weaveffi_core::templates::{api_to_context, TemplateEngine};
 use weaveffi_core::utils::c_abi_struct_name;
 use weaveffi_ir::ir::{Api, EnumDef, Module, Param, StructDef, TypeRef};
 
 pub struct CGenerator;
 
+/// Name under which the C header template is registered.
+const HEADER_TEMPLATE: &str = "c/header.tera";
+
+/// Built-in C header template, compiled into the binary. Exposed so callers
+/// (and tests) can seed a [`TemplateEngine`] with the shipped default via
+/// [`TemplateEngine::load_builtin`].
+pub const BUILTIN_HEADER_TEMPLATE: &str = include_str!("../templates/c/header.tera");
+
 fn with_stamp(body: String) -> String {
     format!("// {}\n{body}", stamp_header("c"))
+}
+
+/// Build a [`TemplateEngine`] pre-loaded with this crate's built-in templates.
+/// User templates loaded via [`TemplateEngine::load_dir`] override entries of
+/// the same name.
+pub fn builtin_template_engine() -> Result<TemplateEngine> {
+    let mut engine = TemplateEngine::new();
+    engine.load_builtin(HEADER_TEMPLATE, BUILTIN_HEADER_TEMPLATE)?;
+    Ok(engine)
 }
 
 impl CGenerator {
@@ -44,6 +62,31 @@ impl Generator for CGenerator {
         config: &GeneratorConfig,
     ) -> Result<()> {
         self.generate_impl(api, out_dir, config.c_prefix())
+    }
+
+    fn generate_with_templates(
+        &self,
+        api: &Api,
+        out_dir: &Utf8Path,
+        config: &GeneratorConfig,
+        templates: Option<&TemplateEngine>,
+    ) -> Result<()> {
+        if let Some(engine) = templates {
+            if engine.has_template(HEADER_TEMPLATE) {
+                let prefix = config.c_prefix();
+                let dir = out_dir.join("c");
+                std::fs::create_dir_all(&dir)?;
+                let ctx = api_to_context(api);
+                let header_body = engine.render(HEADER_TEMPLATE, &ctx)?;
+                std::fs::write(dir.join(format!("{prefix}.h")), with_stamp(header_body))?;
+                std::fs::write(
+                    dir.join(format!("{prefix}.c")),
+                    with_stamp(render_c_convenience_c(prefix)),
+                )?;
+                return Ok(());
+            }
+        }
+        self.generate_with_config(api, out_dir, config)
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
@@ -3263,5 +3306,74 @@ mod tests {
                 "{rel} stamp missing DO NOT EDIT: {contents}"
             );
         }
+    }
+
+    #[test]
+    fn builtin_header_template_parses() {
+        let engine = builtin_template_engine().expect("built-in template should parse");
+        assert!(engine.has_template("c/header.tera"));
+    }
+
+    #[test]
+    fn c_user_template_overrides_builtin() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "math".to_string(),
+                functions: vec![Function {
+                    name: "add".to_string(),
+                    params: vec![],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let tpl_dir = tempfile::tempdir().unwrap();
+        let tpl_path = Utf8Path::from_path(tpl_dir.path()).unwrap();
+        std::fs::create_dir_all(tpl_path.join("c")).unwrap();
+        std::fs::write(
+            tpl_path.join("c").join("header.tera"),
+            "/*! custom doxygen header for {{ modules[0].name }} !*/\n",
+        )
+        .unwrap();
+
+        let mut engine = TemplateEngine::new();
+        engine
+            .load_builtin("c/header.tera", BUILTIN_HEADER_TEMPLATE)
+            .unwrap();
+        engine.load_dir(tpl_path).unwrap();
+
+        let out = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(out.path()).unwrap();
+        let config = GeneratorConfig::default();
+        CGenerator
+            .generate_with_templates(&api, out_dir, &config, Some(&engine))
+            .unwrap();
+
+        let header = std::fs::read_to_string(out_dir.join("c/weaveffi.h")).unwrap();
+        assert!(
+            header.contains("/*! custom doxygen header for math !*/"),
+            "user template output missing from generated header: {header}"
+        );
+        assert!(
+            !header.contains("#ifndef WEAVEFFI_H"),
+            "built-in formatter output must not appear when user override is used: {header}"
+        );
+        assert!(
+            header.starts_with("// WeaveFFI "),
+            "stamp header should still be emitted: {header}"
+        );
     }
 }

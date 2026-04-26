@@ -21,27 +21,44 @@ impl TemplateEngine {
             .with_context(|| format!("failed to load builtin template '{name}'"))
     }
 
+    /// Load every `.tera` file under `dir` (recursively). Each template is
+    /// registered under its path relative to `dir`, with `/` as the
+    /// separator (e.g. `c/header.tera`), so nested layouts like
+    /// `<dir>/c/header.tera` can override built-ins registered under the
+    /// same name.
     pub fn load_dir(&mut self, dir: &Utf8Path) -> Result<()> {
-        let entries = std::fs::read_dir(dir)
+        self.load_dir_rec(dir, dir)
+    }
+
+    fn load_dir_rec(&mut self, root: &Utf8Path, dir: &Utf8Path) -> Result<()> {
+        let entries = std::fs::read_dir(dir.as_std_path())
             .with_context(|| format!("failed to read template directory '{dir}'"))?;
 
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "tera") {
-                let name = path
-                    .file_name()
-                    .expect("file entry must have a name")
-                    .to_string_lossy();
-                let content = std::fs::read_to_string(&path).with_context(|| {
-                    format!("failed to read template file '{}'", path.display())
-                })?;
+            let utf8 = Utf8Path::from_path(&path)
+                .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path: {}", path.display()))?
+                .to_owned();
+            if utf8.is_dir() {
+                self.load_dir_rec(root, &utf8)?;
+            } else if utf8.extension() == Some("tera") {
+                let rel = utf8
+                    .strip_prefix(root)
+                    .with_context(|| format!("failed to strip template root from '{utf8}'"))?;
+                let name = rel.as_str().replace('\\', "/");
+                let content = std::fs::read_to_string(utf8.as_std_path())
+                    .with_context(|| format!("failed to read template file '{utf8}'"))?;
                 self.tera
                     .add_raw_template(&name, &content)
                     .with_context(|| format!("failed to parse template '{name}'"))?;
             }
         }
         Ok(())
+    }
+
+    pub fn has_template(&self, name: &str) -> bool {
+        self.tera.get_template_names().any(|n| n == name)
     }
 
     pub fn render(&self, name: &str, context: &tera::Context) -> Result<String> {
@@ -355,5 +372,36 @@ mod tests {
         ctx.insert("val", "ok");
         let output = engine.render("test.tera", &ctx).unwrap();
         assert_eq!(output, "override ok");
+    }
+
+    #[test]
+    fn load_dir_recurses_into_subdirs_and_uses_forward_slash_names() {
+        let mut engine = TemplateEngine::new();
+        engine
+            .load_builtin("c/header.tera", "builtin {{ val }}")
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = Utf8Path::from_path(dir.path()).unwrap();
+        std::fs::create_dir_all(dir_path.join("c")).unwrap();
+        std::fs::write(dir_path.join("c").join("header.tera"), "nested {{ val }}").unwrap();
+
+        engine.load_dir(dir_path).unwrap();
+
+        assert!(engine.has_template("c/header.tera"));
+
+        let mut ctx = tera::Context::new();
+        ctx.insert("val", "ok");
+        let output = engine.render("c/header.tera", &ctx).unwrap();
+        assert_eq!(output, "nested ok");
+    }
+
+    #[test]
+    fn has_template_reports_registered_names() {
+        let mut engine = TemplateEngine::new();
+        assert!(!engine.has_template("c/header.tera"));
+        engine.load_builtin("c/header.tera", "hi").unwrap();
+        assert!(engine.has_template("c/header.tera"));
+        assert!(!engine.has_template("c/missing.tera"));
     }
 }
