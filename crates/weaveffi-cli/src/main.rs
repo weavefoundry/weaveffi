@@ -257,6 +257,12 @@ enum Commands {
     },
     /// List every available target with language, runtime, status, and primary output file
     Targets,
+    /// List built-in generators and any external `weaveffi-gen-*` binaries discovered on PATH
+    ListGenerators {
+        /// Skip built-in generators; only show external binaries
+        #[arg(long)]
+        external_only: bool,
+    },
     SchemaVersion,
     CheckStamp {
         /// Directory of generated files to scan
@@ -412,6 +418,7 @@ fn main() -> Result<()> {
         }
         Commands::Completions { shell } => cmd_completions(shell),
         Commands::Targets => cmd_targets(format)?,
+        Commands::ListGenerators { external_only } => cmd_list_generators(external_only, format)?,
         Commands::SchemaVersion => println!("{CURRENT_SCHEMA_VERSION}"),
         Commands::CheckStamp {
             dir,
@@ -3010,6 +3017,100 @@ fn cmd_targets(format: OutputFormat) -> Result<()> {
     Ok(())
 }
 
+/// Machine-readable entry for one external generator emitted by
+/// `weaveffi list-generators --format json`.
+#[derive(Debug, Serialize)]
+struct ExternalGeneratorInfo {
+    name: String,
+    path: String,
+    versions: Vec<String>,
+}
+
+/// Shape of `weaveffi list-generators --format json` output.
+#[derive(Debug, Serialize)]
+struct GeneratorList {
+    builtin: Vec<&'static str>,
+    external: Vec<ExternalGeneratorInfo>,
+}
+
+/// Invoke `weaveffi-gen-<name> --abi-version` and parse stdout as one
+/// IR schema version per line. Returns an empty list if the binary
+/// does not implement `--abi-version` or exits non-zero.
+fn query_external_versions(gen: &ExternalGenerator) -> Vec<String> {
+    let Ok(output) = Command::new(gen.path.as_std_path())
+        .arg("--abi-version")
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+fn cmd_list_generators(external_only: bool, format: OutputFormat) -> Result<()> {
+    let external: Vec<ExternalGeneratorInfo> = discover_external_generators()
+        .into_iter()
+        .map(|g| ExternalGeneratorInfo {
+            versions: query_external_versions(&g),
+            name: g.name,
+            path: g.path.to_string(),
+        })
+        .collect();
+    let builtin: Vec<&'static str> = if external_only {
+        Vec::new()
+    } else {
+        TARGETS.iter().map(|t| t.name).collect()
+    };
+
+    if format.is_json() {
+        return emit_json(&GeneratorList { builtin, external });
+    }
+
+    if !external_only {
+        println!("Built-in generators:");
+        for name in &builtin {
+            println!("  {name}");
+        }
+    }
+
+    if external.is_empty() {
+        if external_only {
+            println!("(no external generators found on $PATH)");
+        }
+        return Ok(());
+    }
+
+    if !external_only {
+        println!();
+    }
+    println!("[external]");
+    let name_width = external.iter().map(|e| e.name.len()).max().unwrap_or(0);
+    let path_width = external.iter().map(|e| e.path.len()).max().unwrap_or(0);
+    for e in &external {
+        let versions = if e.versions.is_empty() {
+            "(unknown)".to_string()
+        } else {
+            e.versions.join(", ")
+        };
+        println!(
+            "  {:name_w$}  {:path_w$}  {}",
+            e.name,
+            e.path,
+            versions,
+            name_w = name_width,
+            path_w = path_width,
+        );
+    }
+    Ok(())
+}
+
 /// Machine-readable summary emitted by `weaveffi build --format json`.
 #[derive(Debug, Serialize)]
 struct BuildReport<'a> {
@@ -5123,6 +5224,113 @@ mod tests {
         assert!(
             discovered.iter().all(|g| g.name != "c"),
             "discovery must not surface binaries shadowing built-in targets: {discovered:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn list_generators_includes_external() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _ = color_eyre::install();
+        let temp = tempfile::tempdir().unwrap();
+        let bin_dir = temp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        let script = bin_dir.join("weaveffi-gen-listext");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nif [ \"${1-}\" = \"--abi-version\" ]; then\n  echo 0.1.0\n  echo 0.2.0\n  exit 0\nfi\nexit 1\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let script_path = script.to_str().unwrap().to_string();
+        let path_var = std::ffi::OsString::from(&bin_dir);
+
+        let text = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .env("PATH", &path_var)
+            .arg("list-generators")
+            .output()
+            .expect("failed to run weaveffi list-generators");
+        assert!(
+            text.status.success(),
+            "list-generators failed: {}",
+            String::from_utf8_lossy(&text.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&text.stdout);
+        assert!(
+            stdout.contains("Built-in generators:"),
+            "text output must include built-in section: {stdout}"
+        );
+        for name in ["c", "python", "swift"] {
+            assert!(
+                stdout.contains(name),
+                "text output missing built-in {name}: {stdout}"
+            );
+        }
+        assert!(
+            stdout.contains("[external]"),
+            "text output must include [external] section: {stdout}"
+        );
+        assert!(
+            stdout.contains("listext"),
+            "text output missing external name listext: {stdout}"
+        );
+        assert!(
+            stdout.contains(&script_path),
+            "text output missing external path {script_path}: {stdout}"
+        );
+        assert!(
+            stdout.contains("0.1.0") && stdout.contains("0.2.0"),
+            "text output missing supported IR versions: {stdout}"
+        );
+
+        let json = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .env("PATH", &path_var)
+            .args(["--format", "json", "list-generators"])
+            .output()
+            .expect("failed to run weaveffi --format json list-generators");
+        assert!(json.status.success());
+        let parsed: serde_json::Value = serde_json::from_slice(&json.stdout)
+            .expect("list-generators --format json must emit valid JSON");
+        let builtin = parsed["builtin"].as_array().expect("builtin must be array");
+        assert_eq!(builtin.len(), TARGETS.len());
+        let external = parsed["external"]
+            .as_array()
+            .expect("external must be array");
+        let ext = external
+            .iter()
+            .find(|e| e["name"] == "listext")
+            .expect("listext must appear in external list");
+        assert_eq!(ext["path"], script_path);
+        let versions: Vec<&str> = ext["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(versions, vec!["0.1.0", "0.2.0"]);
+
+        let only = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .env("PATH", &path_var)
+            .args(["list-generators", "--external-only"])
+            .output()
+            .expect("failed to run weaveffi list-generators --external-only");
+        assert!(only.status.success());
+        let only_stdout = String::from_utf8_lossy(&only.stdout);
+        assert!(
+            !only_stdout.contains("Built-in generators:"),
+            "--external-only must hide built-in section: {only_stdout}"
+        );
+        assert!(
+            only_stdout.contains("[external]") && only_stdout.contains("listext"),
+            "--external-only must still list external entries: {only_stdout}"
         );
     }
 }
