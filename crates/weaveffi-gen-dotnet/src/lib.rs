@@ -4194,6 +4194,142 @@ mod tests {
     }
 
     #[test]
+    fn dotnet_struct_setter_string_uses_pinned_byteslice() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "set_contact_name".into(),
+                params: vec![
+                    Param {
+                        name: "contact".into(),
+                        ty: TypeRef::TypedHandle("Contact".into()),
+                        mutable: false,
+                    },
+                    Param {
+                        name: "new_name".into(),
+                        ty: TypeRef::StringUtf8,
+                        mutable: false,
+                    },
+                ],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                builder: false,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                    default: None,
+                }],
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let cs = render_csharp(&api, "WeaveFFI", true);
+
+        assert!(
+            cs.contains(
+                "internal static extern void weaveffi_contacts_set_contact_name(IntPtr contact, IntPtr new_name_ptr, UIntPtr new_name_len, ref WeaveffiError err);"
+            ),
+            "struct setter P/Invoke should expand StringUtf8 into (IntPtr new_name_ptr, UIntPtr new_name_len): {cs}"
+        );
+        assert!(
+            cs.contains(
+                "var (new_namePin, new_namePtr, new_nameLen) = WeaveFFIHelpers.PinUtf8(new_name);"
+            ),
+            "struct setter wrapper must pin string param via PinUtf8 helper: {cs}"
+        );
+        assert!(
+            cs.contains(
+                "NativeMethods.weaveffi_contacts_set_contact_name(contact.Handle, new_namePtr, new_nameLen, ref err);"
+            ),
+            "struct setter wrapper must pass (ptr, len) to the P/Invoke call: {cs}"
+        );
+        assert!(
+            cs.contains("finally") && cs.contains("new_namePin.Free();"),
+            "struct setter wrapper must release the GCHandle in a finally block: {cs}"
+        );
+    }
+
+    #[test]
+    fn dotnet_builder_setter_string_uses_pinned_byteslice() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "Contact_Builder_set_name".into(),
+                params: vec![
+                    Param {
+                        name: "builder".into(),
+                        ty: TypeRef::Handle,
+                        mutable: true,
+                    },
+                    Param {
+                        name: "value".into(),
+                        ty: TypeRef::StringUtf8,
+                        mutable: false,
+                    },
+                ],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                builder: true,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                    default: None,
+                }],
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let cs = render_csharp(&api, "WeaveFFI", true);
+
+        assert!(
+            cs.contains(
+                "internal static extern void weaveffi_contacts_Contact_Builder_set_name(ulong builder, IntPtr value_ptr, UIntPtr value_len, ref WeaveffiError err);"
+            ),
+            "builder setter P/Invoke should expand StringUtf8 into (IntPtr value_ptr, UIntPtr value_len): {cs}"
+        );
+        assert!(
+            cs.contains("var (valuePin, valuePtr, valueLen) = WeaveFFIHelpers.PinUtf8(value);"),
+            "builder setter wrapper must pin string param via PinUtf8 helper: {cs}"
+        );
+        assert!(
+            cs.contains(
+                "NativeMethods.weaveffi_contacts_Contact_Builder_set_name(builder, valuePtr, valueLen, ref err);"
+            ),
+            "builder setter wrapper must pass (handle, ptr, len) to the P/Invoke call: {cs}"
+        );
+        assert!(
+            cs.contains("finally") && cs.contains("valuePin.Free();"),
+            "builder setter wrapper must release the GCHandle in a finally block: {cs}"
+        );
+    }
+
+    #[test]
     fn dotnet_bytes_param_uses_canonical_shape() {
         let api = make_api(vec![Module {
             name: "io".into(),
