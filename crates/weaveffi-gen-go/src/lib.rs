@@ -4,7 +4,9 @@ use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name};
-use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, StructField, TypeRef};
+use weaveffi_ir::ir::{
+    Api, CallbackDef, EnumDef, Function, Module, StructDef, StructField, TypeRef,
+};
 
 pub struct GoGenerator;
 
@@ -47,6 +49,7 @@ impl Generator for GoGenerator {
 
     fn capabilities(&self) -> &'static [Capability] {
         &[
+            Capability::Callbacks,
             Capability::CancellableAsync,
             Capability::TypedHandles,
             Capability::BorrowedTypes,
@@ -81,7 +84,7 @@ fn go_type(ty: &TypeRef) -> String {
         },
         TypeRef::List(inner) | TypeRef::Iterator(inner) => format!("[]{}", go_type(inner)),
         TypeRef::Map(k, v) => format!("map[{}]{}", go_type(k), go_type(v)),
-        TypeRef::Callback(_) => "interface{}".into(),
+        TypeRef::Callback(name) => name.to_upper_camel_case(),
     }
 }
 
@@ -192,19 +195,28 @@ fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Mo
     }
 }
 
-fn scan_imports(api: &Api) -> (bool, bool, bool, bool) {
+fn has_any_callbacks(api: &Api) -> bool {
+    collect_all_modules(&api.modules)
+        .iter()
+        .any(|m| !m.callbacks.is_empty())
+}
+
+fn scan_imports(api: &Api) -> (bool, bool, bool, bool, bool) {
     let has_sync_funcs = collect_all_modules(&api.modules)
         .iter()
         .any(|m| m.functions.iter().any(|f| !f.r#async));
 
     let needs_fmt = has_sync_funcs;
 
-    let needs_unsafe = collect_all_modules(&api.modules).iter().any(|m| {
-        m.functions.iter().filter(|f| !f.r#async).any(|f| {
-            f.params.iter().any(|p| param_uses_unsafe(&p.ty))
-                || f.returns.as_ref().is_some_and(return_uses_unsafe)
-        })
-    });
+    let has_callbacks = has_any_callbacks(api);
+
+    let needs_unsafe = has_callbacks
+        || collect_all_modules(&api.modules).iter().any(|m| {
+            m.functions.iter().filter(|f| !f.r#async).any(|f| {
+                f.params.iter().any(|p| param_uses_unsafe(&p.ty))
+                    || f.returns.as_ref().is_some_and(return_uses_unsafe)
+            })
+        });
 
     let needs_bool = collect_all_modules(&api.modules).iter().any(|m| {
         m.functions.iter().filter(|f| !f.r#async).any(|f| {
@@ -220,7 +232,13 @@ fn scan_imports(api: &Api) -> (bool, bool, bool, bool) {
         .iter()
         .any(|m| !m.structs.is_empty());
 
-    (needs_fmt, needs_unsafe, needs_bool, needs_runtime)
+    (
+        needs_fmt,
+        needs_unsafe,
+        needs_bool,
+        needs_runtime,
+        has_callbacks,
+    )
 }
 
 // ── Packaging scaffold ──
@@ -269,10 +287,237 @@ converts the result back to Go types. Errors are returned as Go `error` values.
     .into()
 }
 
+// ── Callback emission ──
+
+fn cb_c_elem_type(ty: &TypeRef, module: &str) -> String {
+    match ty {
+        TypeRef::I32 => "int32_t".into(),
+        TypeRef::U32 => "uint32_t".into(),
+        TypeRef::I64 => "int64_t".into(),
+        TypeRef::F64 => "double".into(),
+        TypeRef::Bool => "bool".into(),
+        TypeRef::Handle => "weaveffi_handle_t".into(),
+        TypeRef::Enum(n) => format!("weaveffi_{module}_{n}"),
+        TypeRef::TypedHandle(n) | TypeRef::Struct(n) => format!("weaveffi_{module}_{n}*"),
+        _ => "void*".into(),
+    }
+}
+
+fn cb_c_param_decl(ty: &TypeRef, name: &str, mutable: bool, module: &str) -> String {
+    let q = if mutable { "" } else { "const " };
+    match ty {
+        TypeRef::I32 => format!("int32_t {name}"),
+        TypeRef::U32 => format!("uint32_t {name}"),
+        TypeRef::I64 => format!("int64_t {name}"),
+        TypeRef::F64 => format!("double {name}"),
+        TypeRef::Bool => format!("bool {name}"),
+        TypeRef::StringUtf8 | TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            format!("{q}uint8_t* {name}_ptr, size_t {name}_len")
+        }
+        TypeRef::BorrowedStr => format!("{q}char* {name}"),
+        TypeRef::Handle => format!("weaveffi_handle_t {name}"),
+        TypeRef::Enum(n) => format!("weaveffi_{module}_{n} {name}"),
+        TypeRef::TypedHandle(n) => format!("weaveffi_{module}_{n}* {name}"),
+        TypeRef::Struct(n) => format!("{q}weaveffi_{module}_{n}* {name}"),
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+                cb_c_param_decl(inner, name, mutable, module)
+            }
+            _ => format!("{q}{}* {name}", cb_c_elem_type(inner, module)),
+        },
+        TypeRef::List(inner) => {
+            let elem = cb_c_elem_type(inner, module);
+            format!("{q}{elem}* {name}, size_t {name}_len")
+        }
+        _ => format!("{q}void* {name}"),
+    }
+}
+
+fn cb_c_ret_decl(ret: &Option<TypeRef>, module: &str) -> (String, Vec<String>) {
+    match ret {
+        None => ("void".into(), vec![]),
+        Some(TypeRef::I32) => ("int32_t".into(), vec![]),
+        Some(TypeRef::U32) => ("uint32_t".into(), vec![]),
+        Some(TypeRef::I64) | Some(TypeRef::Handle) => ("int64_t".into(), vec![]),
+        Some(TypeRef::F64) => ("double".into(), vec![]),
+        Some(TypeRef::Bool) => ("bool".into(), vec![]),
+        Some(TypeRef::StringUtf8) | Some(TypeRef::BorrowedStr) => ("const char*".into(), vec![]),
+        Some(TypeRef::Enum(n)) => (format!("weaveffi_{module}_{n}"), vec![]),
+        Some(TypeRef::TypedHandle(n)) => (format!("weaveffi_{module}_{n}*"), vec![]),
+        Some(TypeRef::Struct(n)) => (format!("weaveffi_{module}_{n}*"), vec![]),
+        _ => ("void*".into(), vec![]),
+    }
+}
+
+fn render_callback_extern_decl(out: &mut String, cb: &CallbackDef, module: &str) {
+    let (ret_ty, ret_extra) = cb_c_ret_decl(&cb.returns, module);
+    let mut params: Vec<String> = vec!["void* context".into()];
+    params.extend(
+        cb.params
+            .iter()
+            .map(|p| cb_c_param_decl(&p.ty, &p.name, p.mutable, module)),
+    );
+    params.extend(ret_extra);
+    out.push_str(&format!(
+        "extern {ret_ty} weaveffiGoCbTrampoline_{module}_{}({});\n",
+        cb.name,
+        params.join(", ")
+    ));
+}
+
+fn render_callback_registry(out: &mut String) {
+    out.push_str("var _callbackToken int64\n");
+    out.push_str("var _callbackRegistry sync.Map\n\n");
+    out.push_str("func _callbackRegister(cb interface{}) int64 {\n");
+    out.push_str("\ttoken := atomic.AddInt64(&_callbackToken, 1)\n");
+    out.push_str("\t_callbackRegistry.Store(token, cb)\n");
+    out.push_str("\treturn token\n");
+    out.push_str("}\n\n");
+}
+
+fn cb_trampoline_go_param(ty: &TypeRef, name: &str) -> String {
+    let cn = name.to_lower_camel_case();
+    match ty {
+        TypeRef::I32 => format!("{cn} C.int32_t"),
+        TypeRef::U32 => format!("{cn} C.uint32_t"),
+        TypeRef::I64 | TypeRef::Handle => format!("{cn} C.int64_t"),
+        TypeRef::F64 => format!("{cn} C.double"),
+        TypeRef::Bool => format!("{cn} C._Bool"),
+        TypeRef::StringUtf8 | TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            format!("{cn}Ptr *C.uint8_t, {cn}Len C.size_t")
+        }
+        TypeRef::BorrowedStr => format!("{cn} *C.char"),
+        TypeRef::Enum(_) | TypeRef::TypedHandle(_) | TypeRef::Struct(_) => {
+            format!("{cn} unsafe.Pointer")
+        }
+        _ => format!("{cn} unsafe.Pointer"),
+    }
+}
+
+fn cb_trampoline_convert(pre: &mut String, ty: &TypeRef, name: &str) -> String {
+    let cn = name.to_lower_camel_case();
+    match ty {
+        TypeRef::I32 => format!("int32({cn})"),
+        TypeRef::U32 => format!("uint32({cn})"),
+        TypeRef::I64 | TypeRef::Handle => format!("int64({cn})"),
+        TypeRef::F64 => format!("float64({cn})"),
+        TypeRef::Bool => format!("cToBool({cn})"),
+        TypeRef::StringUtf8 => {
+            let v = format!("{cn}Go");
+            pre.push_str(&format!(
+                "\t{v} := C.GoStringN((*C.char)(unsafe.Pointer({cn}Ptr)), C.int({cn}Len))\n"
+            ));
+            v
+        }
+        TypeRef::BorrowedStr => {
+            let v = format!("{cn}Go");
+            pre.push_str(&format!("\t{v} := C.GoString({cn})\n"));
+            v
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            let v = format!("{cn}Go");
+            pre.push_str(&format!(
+                "\t{v} := C.GoBytes(unsafe.Pointer({cn}Ptr), C.int({cn}Len))\n"
+            ));
+            v
+        }
+        _ => cn,
+    }
+}
+
+fn render_callback(out: &mut String, cb: &CallbackDef, module: &str) {
+    let type_name = cb.name.to_upper_camel_case();
+
+    let go_params: Vec<String> = cb
+        .params
+        .iter()
+        .map(|p| format!("{} {}", p.name.to_lower_camel_case(), go_type(&p.ty)))
+        .collect();
+    let go_ret = match &cb.returns {
+        None => String::new(),
+        Some(ret) => format!(" {}", go_type(ret)),
+    };
+
+    if let Some(doc) = &cb.doc {
+        out.push_str(&format!("// {type_name} -- {doc}\n"));
+    }
+    out.push_str(&format!(
+        "type {type_name} func({}){go_ret}\n\n",
+        go_params.join(", ")
+    ));
+
+    let (c_ret_ty, _) = cb_c_ret_decl(&cb.returns, module);
+    let mut c_params: Vec<String> = vec!["ctx unsafe.Pointer".into()];
+    c_params.extend(
+        cb.params
+            .iter()
+            .map(|p| cb_trampoline_go_param(&p.ty, &p.name)),
+    );
+
+    let trampoline_name = format!("weaveffiGoCbTrampoline_{module}_{}", cb.name);
+    let c_ret_sig = if c_ret_ty == "void" {
+        String::new()
+    } else {
+        format!(" C.{c_ret_ty}")
+    };
+
+    out.push_str(&format!("//export {trampoline_name}\n"));
+    out.push_str(&format!(
+        "func {trampoline_name}({}){c_ret_sig} {{\n",
+        c_params.join(", ")
+    ));
+    out.push_str("\tv, ok := _callbackRegistry.Load(int64(uintptr(ctx)))\n");
+    out.push_str("\tif !ok {\n");
+    if c_ret_ty == "void" {
+        out.push_str("\t\treturn\n");
+    } else {
+        out.push_str(&format!("\t\tvar zero C.{c_ret_ty}\n"));
+        out.push_str("\t\treturn zero\n");
+    }
+    out.push_str("\t}\n");
+    out.push_str(&format!("\tcb, ok := v.({type_name})\n"));
+    out.push_str("\tif !ok {\n");
+    if c_ret_ty == "void" {
+        out.push_str("\t\treturn\n");
+    } else {
+        out.push_str(&format!("\t\tvar zero C.{c_ret_ty}\n"));
+        out.push_str("\t\treturn zero\n");
+    }
+    out.push_str("\t}\n");
+
+    let mut pre = String::new();
+    let call_args: Vec<String> = cb
+        .params
+        .iter()
+        .map(|p| cb_trampoline_convert(&mut pre, &p.ty, &p.name))
+        .collect();
+    out.push_str(&pre);
+
+    let call = format!("cb({})", call_args.join(", "));
+    match &cb.returns {
+        None => {
+            out.push_str(&format!("\t{call}\n"));
+        }
+        Some(ret) => {
+            let conv = match ret {
+                TypeRef::I32 => format!("C.int32_t({call})"),
+                TypeRef::U32 => format!("C.uint32_t({call})"),
+                TypeRef::I64 | TypeRef::Handle => format!("C.int64_t({call})"),
+                TypeRef::F64 => format!("C.double({call})"),
+                TypeRef::Bool => format!("boolToC({call})"),
+                _ => call,
+            };
+            out.push_str(&format!("\treturn {conv}\n"));
+        }
+    }
+
+    out.push_str("}\n\n");
+}
+
 // ── Top-level rendering ──
 
 fn render_go(api: &Api) -> String {
-    let (needs_fmt, needs_unsafe, needs_bool, needs_runtime) = scan_imports(api);
+    let (needs_fmt, needs_unsafe, needs_bool, needs_runtime, has_callbacks) = scan_imports(api);
     let mut out = String::new();
 
     out.push_str("package weaveffi\n\n");
@@ -281,10 +526,17 @@ fn render_go(api: &Api) -> String {
     out.push_str("#cgo LDFLAGS: -lweaveffi\n");
     out.push_str("#include \"weaveffi.h\"\n");
     out.push_str("#include <stdlib.h>\n");
+    if has_callbacks {
+        for (m, path) in collect_modules_with_path(&api.modules) {
+            for cb in &m.callbacks {
+                render_callback_extern_decl(&mut out, cb, &path);
+            }
+        }
+    }
     out.push_str("*/\n");
     out.push_str("import \"C\"\n");
 
-    if needs_fmt || needs_unsafe || needs_runtime {
+    if needs_fmt || needs_unsafe || needs_runtime || has_callbacks {
         out.push_str("\nimport (\n");
         if needs_fmt {
             out.push_str("\t\"fmt\"\n");
@@ -292,12 +544,20 @@ fn render_go(api: &Api) -> String {
         if needs_runtime {
             out.push_str("\t\"runtime\"\n");
         }
+        if has_callbacks {
+            out.push_str("\t\"sync\"\n");
+            out.push_str("\t\"sync/atomic\"\n");
+        }
         if needs_unsafe {
             out.push_str("\t\"unsafe\"\n");
         }
         out.push_str(")\n");
     }
     out.push('\n');
+
+    if has_callbacks {
+        render_callback_registry(&mut out);
+    }
 
     if needs_bool {
         out.push_str("func boolToC(b bool) C._Bool {\n");
@@ -314,6 +574,9 @@ fn render_go(api: &Api) -> String {
     for (m, path) in collect_modules_with_path(&api.modules) {
         for e in &m.enums {
             render_enum(&mut out, e);
+        }
+        for cb in &m.callbacks {
+            render_callback(&mut out, cb, &path);
         }
         for s in &m.structs {
             render_struct(&mut out, &path, s);
@@ -604,9 +867,20 @@ fn emit_param(pre: &mut String, args: &mut Vec<String>, name: &str, ty: &TypeRef
         TypeRef::List(inner) => emit_list_param(pre, args, name, inner, module),
         TypeRef::Map(k, v) => emit_map_param(pre, args, name, k, v, module),
 
-        TypeRef::Callback(_) => {
-            args.push("nil".into());
-            args.push("nil".into());
+        TypeRef::Callback(cb_name) => {
+            let cn = name.to_upper_camel_case();
+            let tok_var = format!("c{cn}Token");
+            let fn_var = format!("c{cn}Fn");
+            let ctx_var = format!("c{cn}Ctx");
+            pre.push_str(&format!("\t{tok_var} := _callbackRegister({name})\n"));
+            pre.push_str(&format!(
+                "\t{fn_var} := (C.weaveffi_{module}_{cb_name})(unsafe.Pointer(C.weaveffiGoCbTrampoline_{module}_{cb_name}))\n"
+            ));
+            pre.push_str(&format!(
+                "\t{ctx_var} := unsafe.Pointer(uintptr({tok_var}))\n"
+            ));
+            args.push(fn_var);
+            args.push(ctx_var);
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
     }
@@ -3134,9 +3408,9 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_excludes_callbacks_listeners_async_iterators_builders() {
+    fn capabilities_includes_callbacks_excludes_listeners_async_iterators_builders() {
         let caps = GoGenerator.capabilities();
-        assert!(!caps.contains(&Capability::Callbacks));
+        assert!(caps.contains(&Capability::Callbacks));
         assert!(!caps.contains(&Capability::Listeners));
         assert!(!caps.contains(&Capability::AsyncFunctions));
         assert!(!caps.contains(&Capability::Iterators));
@@ -3144,8 +3418,7 @@ mod tests {
         for cap in Capability::ALL {
             if matches!(
                 cap,
-                Capability::Callbacks
-                    | Capability::Listeners
+                Capability::Listeners
                     | Capability::AsyncFunctions
                     | Capability::Iterators
                     | Capability::Builders
@@ -3154,5 +3427,110 @@ mod tests {
             }
             assert!(caps.contains(cap), "Go generator must support {cap:?}");
         }
+    }
+
+    #[test]
+    fn go_emits_callback_func_type_and_registry() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "events".into(),
+                functions: vec![Function {
+                    name: "subscribe".into(),
+                    params: vec![Param {
+                        name: "handler".into(),
+                        ty: TypeRef::Callback("OnData".into()),
+                        mutable: false,
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![CallbackDef {
+                    name: "OnData".into(),
+                    params: vec![Param {
+                        name: "payload".into(),
+                        ty: TypeRef::StringUtf8,
+                        mutable: false,
+                    }],
+                    returns: None,
+                    doc: None,
+                }],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let go = render_go(&api);
+
+        assert!(
+            go.contains("type OnData func(payload string)"),
+            "missing callback Go func type: {go}"
+        );
+        assert!(
+            go.contains("var _callbackRegistry sync.Map"),
+            "missing sync.Map registry: {go}"
+        );
+        assert!(
+            go.contains("var _callbackToken int64"),
+            "missing int64 token counter: {go}"
+        );
+        assert!(
+            go.contains("func _callbackRegister(cb interface{}) int64 {"),
+            "missing _callbackRegister helper: {go}"
+        );
+        assert!(
+            go.contains("atomic.AddInt64(&_callbackToken, 1)"),
+            "registry should use atomic.AddInt64 for tokens: {go}"
+        );
+        assert!(
+            go.contains("_callbackRegistry.Store(token, cb)"),
+            "registry should store the user callback: {go}"
+        );
+        assert!(go.contains("\"sync\""), "Go output must import sync: {go}");
+        assert!(
+            go.contains("\"sync/atomic\""),
+            "Go output must import sync/atomic: {go}"
+        );
+        assert!(
+            go.contains("//export weaveffiGoCbTrampoline_events_OnData"),
+            "missing //export trampoline directive: {go}"
+        );
+        assert!(
+            go.contains("func weaveffiGoCbTrampoline_events_OnData(ctx unsafe.Pointer,"),
+            "trampoline should accept ctx unsafe.Pointer: {go}"
+        );
+        assert!(
+            go.contains("extern void weaveffiGoCbTrampoline_events_OnData("),
+            "cgo preamble must declare the trampoline as extern: {go}"
+        );
+        assert!(
+            go.contains("_callbackRegistry.Load(int64(uintptr(ctx)))"),
+            "trampoline should decode token from context: {go}"
+        );
+        assert!(
+            go.contains("cHandlerToken := _callbackRegister(handler)"),
+            "wrapper should register the callback: {go}"
+        );
+        assert!(
+            go.contains(
+                "cHandlerFn := (C.weaveffi_events_OnData)(unsafe.Pointer(C.weaveffiGoCbTrampoline_events_OnData))"
+            ),
+            "wrapper should cast trampoline to the C callback type: {go}"
+        );
+        assert!(
+            go.contains("cHandlerCtx := unsafe.Pointer(uintptr(cHandlerToken))"),
+            "wrapper should pass token as the context void*: {go}"
+        );
+        assert!(
+            go.contains("C.weaveffi_events_subscribe(cHandlerFn, cHandlerCtx, &cErr)"),
+            "C call should receive trampoline fn and token context: {go}"
+        );
     }
 }
