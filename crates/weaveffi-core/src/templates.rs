@@ -590,4 +590,102 @@ mod tests {
             "unexpected error chain: {chain}"
         );
     }
+
+    /// Guard the Doxygen worked example in `docs/src/extending/templates.md`
+    /// by rendering the same template against a small API and asserting that
+    /// the documented output tokens appear. If this test breaks, the
+    /// documentation needs updating alongside the code.
+    #[test]
+    fn doxygen_worked_example_renders_expected_tokens() {
+        const TEMPLATE: &str = r#"/**
+ * @file weaveffi.h
+ * @brief Generated C ABI for WeaveFFI IR {{ version }}.
+ */
+{% for module in modules -%}
+/**
+ * @defgroup {{ module.name | to_snake_case }} {{ module.name | to_pascal_case }}
+ * @{
+ */
+{% for func in module.functions -%}
+/**
+ * @brief {{ func.doc | default(value=func.name) }}
+{%- for p in func.params %}
+ * @param {{ p.name }} {{ p.type.kind }}
+{%- endfor %}
+{%- if func.returns %}
+ * @return {{ func.returns.kind }}
+{%- endif %}
+ */
+{% endfor -%}
+/** @} */
+
+{% endfor -%}
+"#;
+
+        let api = Api {
+            version: "0.2.0".into(),
+            modules: vec![Module {
+                name: "math".into(),
+                functions: vec![Function {
+                    name: "add".into(),
+                    params: vec![
+                        Param {
+                            name: "a".into(),
+                            ty: TypeRef::I32,
+                            mutable: false,
+                        },
+                        Param {
+                            name: "b".into(),
+                            ty: TypeRef::I32,
+                            mutable: false,
+                        },
+                    ],
+                    returns: Some(TypeRef::I32),
+                    doc: Some("Add two numbers".into()),
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let mut engine = TemplateEngine::new();
+        engine.load_builtin("c/header.tera", TEMPLATE).unwrap();
+        let output = engine
+            .render("c/header.tera", &api_to_context(&api))
+            .unwrap();
+
+        assert!(
+            output.contains("@file weaveffi.h"),
+            "missing @file tag in:\n{output}"
+        );
+        assert!(
+            output.contains("WeaveFFI IR 0.2.0"),
+            "missing IR version in:\n{output}"
+        );
+        assert!(
+            output.contains("@defgroup math Math"),
+            "missing @defgroup line in:\n{output}"
+        );
+        assert!(
+            output.contains("@brief Add two numbers"),
+            "missing @brief line in:\n{output}"
+        );
+        assert!(
+            output.contains("@param a i32"),
+            "missing @param line in:\n{output}"
+        );
+        assert!(
+            output.contains("@return i32"),
+            "missing @return line in:\n{output}"
+        );
+    }
 }

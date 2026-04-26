@@ -33,4 +33,5 @@
   - [Android](tutorials/android.md)
   - [Python](tutorials/python.md)
   - [Node.js](tutorials/node.md)
+- [Custom Templates](extending/templates.md)
 - [External Generators](extending/external-generators.md)
