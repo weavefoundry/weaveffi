@@ -4,7 +4,7 @@ use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name, wrapper_name};
 use weaveffi_ir::ir::{
-    Api, CallbackDef, EnumDef, Function, Module, StructDef, StructField, TypeRef,
+    Api, CallbackDef, EnumDef, Function, ListenerDef, Module, StructDef, StructField, TypeRef,
 };
 
 pub struct PythonGenerator;
@@ -86,6 +86,7 @@ impl Generator for PythonGenerator {
     fn capabilities(&self) -> &'static [Capability] {
         &[
             Capability::Callbacks,
+            Capability::Listeners,
             Capability::Iterators,
             Capability::Builders,
             Capability::AsyncFunctions,
@@ -593,6 +594,9 @@ fn render_python_module_content(
             render_builder(out, s);
         }
     }
+    for l in &m.listeners {
+        render_listener(out, module_path, l);
+    }
     for f in &m.functions {
         render_function(out, module_path, f, strip_module_prefix);
     }
@@ -707,6 +711,49 @@ fn render_callback(out: &mut String, cb: &CallbackDef) {
         cb.name,
         parts.join(", ")
     ));
+}
+
+/// Emit a Python wrapper class for a listener. The class exposes:
+///   - `register(callback)`: builds a trampoline, wraps it in the
+///     callback's `CFUNCTYPE`, calls `weaveffi_{module}_register_{listener}`,
+///     stores the cfunc in a class-level dict keyed by the returned id to
+///     keep it alive against GC, and returns the id.
+///   - `unregister(id)`: calls `weaveffi_{module}_unregister_{listener}` and
+///     pops the cfunc from the class-level dict.
+fn render_listener(out: &mut String, module_path: &str, l: &ListenerDef) {
+    let class_name = snake_to_pascal(&l.name);
+    let reg_fn = format!("weaveffi_{module_path}_register_{}", l.name);
+    let unreg_fn = format!("weaveffi_{module_path}_unregister_{}", l.name);
+    let cfunctype = format!("_{}", l.event_callback);
+
+    out.push_str(&format!("\n\nclass {class_name}:"));
+    if let Some(doc) = &l.doc {
+        out.push_str(&format!("\n    \"\"\"{}\"\"\"", doc));
+    }
+    out.push_str("\n    _cfuncs: Dict[int, Any] = {}");
+
+    out.push_str("\n\n    @staticmethod");
+    out.push_str("\n    def register(callback: Callable[..., Any]) -> int:");
+    out.push_str("\n        def _tramp(_ctx, *args):");
+    out.push_str("\n            return callback(*args)");
+    out.push_str(&format!("\n        _cfunc = {cfunctype}(_tramp)"));
+    out.push_str(&format!("\n        _fn = _lib.{reg_fn}"));
+    out.push_str(&format!(
+        "\n        _fn.argtypes = [{cfunctype}, ctypes.c_void_p]"
+    ));
+    out.push_str("\n        _fn.restype = ctypes.c_uint64");
+    out.push_str("\n        _id = _fn(_cfunc, ctypes.c_void_p(0))");
+    out.push_str(&format!("\n        {class_name}._cfuncs[_id] = _cfunc"));
+    out.push_str("\n        return _id");
+
+    out.push_str("\n\n    @staticmethod");
+    out.push_str("\n    def unregister(id: int) -> None:");
+    out.push_str(&format!("\n        _fn = _lib.{unreg_fn}"));
+    out.push_str("\n        _fn.argtypes = [ctypes.c_uint64]");
+    out.push_str("\n        _fn.restype = None");
+    out.push_str("\n        _fn(id)");
+    out.push_str(&format!("\n        {class_name}._cfuncs.pop(id, None)"));
+    out.push('\n');
 }
 
 fn render_struct(out: &mut String, module_name: &str, s: &StructDef) {
@@ -1464,6 +1511,9 @@ fn render_pyi_module(api: &Api, strip_module_prefix: bool) -> String {
         for s in &m.structs {
             render_pyi_struct(&mut out, s);
         }
+        for l in &m.listeners {
+            render_pyi_listener(&mut out, l);
+        }
         for f in &m.functions {
             render_pyi_function(&mut out, &path, f, strip_module_prefix);
         }
@@ -1487,6 +1537,15 @@ fn render_pyi_struct(out: &mut String, s: &StructDef) {
             field.name, py_ty
         ));
     }
+}
+
+fn render_pyi_listener(out: &mut String, l: &ListenerDef) {
+    let class_name = snake_to_pascal(&l.name);
+    out.push_str(&format!("\nclass {class_name}:\n"));
+    out.push_str("    @staticmethod\n");
+    out.push_str("    def register(callback: Callable[..., Any]) -> int: ...\n");
+    out.push_str("    @staticmethod\n");
+    out.push_str("    def unregister(id: int) -> None: ...\n");
 }
 
 fn render_pyi_function(
@@ -1521,8 +1580,8 @@ mod tests {
     use camino::Utf8Path;
     use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{
-        Api, CallbackDef, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField,
-        TypeRef,
+        Api, CallbackDef, EnumDef, EnumVariant, Function, ListenerDef, Module, Param, StructDef,
+        StructField, TypeRef,
     };
 
     fn make_api(modules: Vec<Module>) -> Api {
@@ -5063,14 +5122,11 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_includes_callbacks_excludes_listeners() {
+    fn capabilities_includes_callbacks_and_listeners() {
         let caps = PythonGenerator.capabilities();
         assert!(caps.contains(&Capability::Callbacks));
-        assert!(!caps.contains(&Capability::Listeners));
+        assert!(caps.contains(&Capability::Listeners));
         for cap in Capability::ALL {
-            if matches!(cap, Capability::Listeners) {
-                continue;
-            }
             assert!(caps.contains(cap), "Python generator must support {cap:?}");
         }
     }
@@ -5161,6 +5217,106 @@ mod tests {
         assert!(
             pyi.contains("def subscribe(handler: Callable[..., Any]) -> None: ..."),
             "pyi must declare callback param as Python Callable: {pyi}"
+        );
+    }
+
+    #[test]
+    fn python_emits_listener_class() {
+        let api = make_api(vec![Module {
+            name: "events".into(),
+            functions: vec![],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![CallbackDef {
+                name: "OnData".into(),
+                params: vec![Param {
+                    name: "value".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+            }],
+            listeners: vec![ListenerDef {
+                name: "data_stream".into(),
+                event_callback: "OnData".into(),
+                doc: None,
+            }],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let py = render_python_module(&api, true);
+
+        assert!(
+            py.contains("class DataStream:"),
+            "missing listener class: {py}"
+        );
+        assert!(
+            py.contains("_cfuncs: Dict[int, Any] = {}"),
+            "listener must hold cfunc refs in a class-level dict to prevent GC: {py}"
+        );
+        assert!(
+            py.contains("@staticmethod\n    def register(callback: Callable[..., Any]) -> int:"),
+            "listener must expose @staticmethod register(callback) -> int: {py}"
+        );
+        assert!(
+            py.contains("@staticmethod\n    def unregister(id: int) -> None:"),
+            "listener must expose @staticmethod unregister(id: int): {py}"
+        );
+        assert!(
+            py.contains("def _tramp(_ctx, *args):"),
+            "register must emit a trampoline that ignores the context: {py}"
+        );
+        assert!(
+            py.contains("return callback(*args)"),
+            "trampoline must delegate to the user callable: {py}"
+        );
+        assert!(
+            py.contains("_cfunc = _OnData(_tramp)"),
+            "register must wrap the trampoline via the event callback's CFUNCTYPE: {py}"
+        );
+        assert!(
+            py.contains("_fn = _lib.weaveffi_events_register_data_stream"),
+            "register must bind the C register symbol: {py}"
+        );
+        assert!(
+            py.contains("_fn.argtypes = [_OnData, ctypes.c_void_p]"),
+            "register argtypes must be the CFUNCTYPE and a c_void_p context: {py}"
+        );
+        assert!(
+            py.contains("_fn.restype = ctypes.c_uint64"),
+            "register restype must be uint64 for the listener id: {py}"
+        );
+        assert!(
+            py.contains("_id = _fn(_cfunc, ctypes.c_void_p(0))"),
+            "register must call the C symbol with the cfunc and a null context: {py}"
+        );
+        assert!(
+            py.contains("DataStream._cfuncs[_id] = _cfunc"),
+            "register must store the cfunc in the class-level dict keyed by id: {py}"
+        );
+        assert!(
+            py.contains("_fn = _lib.weaveffi_events_unregister_data_stream"),
+            "unregister must bind the C unregister symbol: {py}"
+        );
+        assert!(
+            py.contains("DataStream._cfuncs.pop(id, None)"),
+            "unregister must pop the cfunc from the class-level dict: {py}"
+        );
+
+        let pyi = render_pyi_module(&api, true);
+        assert!(
+            pyi.contains("class DataStream:"),
+            "pyi must declare listener class: {pyi}"
+        );
+        assert!(
+            pyi.contains("def register(callback: Callable[..., Any]) -> int: ..."),
+            "pyi must declare static register(callback) -> int: {pyi}"
+        );
+        assert!(
+            pyi.contains("def unregister(id: int) -> None: ..."),
+            "pyi must declare static unregister(id: int) -> None: {pyi}"
         );
     }
 }
