@@ -1,0 +1,24 @@
+{#
+  Built-in WeaveFFI Python module template.
+
+  Place a file at `<templates>/python/module.tera` and pass `--templates <dir>`
+  to override this with your own rendering of `weaveffi.py`. The template
+  receives the context produced by `weaveffi_core::templates::api_to_context`:
+
+    * `version`  (string)   - IR schema version
+    * `modules`  (array)    - each module has `name`, `functions`, `structs`,
+                              `enums`, `callbacks`, `listeners`
+
+  This default template is intentionally minimal; the rich Python module is
+  still produced by the built-in formatter when no override is supplied. Use
+  this file as a starting point for customisations.
+-#}
+import ctypes
+
+# WeaveFFI IR version {{ version }}
+{% for module in modules -%}
+# Module: {{ module.name }}
+{% for func in module.functions -%}
+# fn {{ func.name }}
+{% endfor -%}
+{% endfor %}

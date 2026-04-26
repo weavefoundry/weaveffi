@@ -1,0 +1,22 @@
+{#
+  Built-in WeaveFFI Python stubs template.
+
+  Place a file at `<templates>/python/stubs.tera` and pass `--templates <dir>`
+  to override this with your own rendering of `weaveffi.pyi`. The template
+  receives the context produced by `weaveffi_core::templates::api_to_context`:
+
+    * `version`  (string)   - IR schema version
+    * `modules`  (array)    - each module has `name`, `functions`, `structs`,
+                              `enums`, `callbacks`, `listeners`
+
+  This default template is intentionally minimal; the rich Python stub file
+  is still produced by the built-in formatter when no override is supplied.
+  Use this file as a starting point for customisations.
+-#}
+# WeaveFFI IR version {{ version }}
+{% for module in modules -%}
+# Module: {{ module.name }}
+{% for func in module.functions -%}
+# fn {{ func.name }}
+{% endfor -%}
+{% endfor %}

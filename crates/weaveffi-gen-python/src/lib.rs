@@ -2,12 +2,37 @@ use anyhow::Result;
 use camino::Utf8Path;
 use weaveffi_core::codegen::{stamp_header, Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
+use weaveffi_core::templates::{api_to_context, TemplateEngine};
 use weaveffi_core::utils::{local_type_name, wrapper_name};
 use weaveffi_ir::ir::{
     Api, CallbackDef, EnumDef, Function, ListenerDef, Module, StructDef, StructField, TypeRef,
 };
 
 pub struct PythonGenerator;
+
+/// Name under which the Python module template is registered.
+const MODULE_TEMPLATE: &str = "python/module.tera";
+/// Name under which the Python stubs template is registered.
+const STUBS_TEMPLATE: &str = "python/stubs.tera";
+
+/// Built-in Python module template, compiled into the binary. Exposed so
+/// callers (and tests) can seed a [`TemplateEngine`] with the shipped default
+/// via [`TemplateEngine::load_builtin`].
+pub const BUILTIN_MODULE_TEMPLATE: &str = include_str!("../templates/python/module.tera");
+/// Built-in Python stubs template, compiled into the binary. Exposed so
+/// callers (and tests) can seed a [`TemplateEngine`] with the shipped default
+/// via [`TemplateEngine::load_builtin`].
+pub const BUILTIN_STUBS_TEMPLATE: &str = include_str!("../templates/python/stubs.tera");
+
+/// Build a [`TemplateEngine`] pre-loaded with this crate's built-in templates.
+/// User templates loaded via [`TemplateEngine::load_dir`] override entries of
+/// the same name.
+pub fn builtin_template_engine() -> Result<TemplateEngine> {
+    let mut engine = TemplateEngine::new();
+    engine.load_builtin(MODULE_TEMPLATE, BUILTIN_MODULE_TEMPLATE)?;
+    engine.load_builtin(STUBS_TEMPLATE, BUILTIN_STUBS_TEMPLATE)?;
+    Ok(engine)
+}
 
 fn stamp_hash(body: String) -> String {
     format!("# {}\n{body}", stamp_header("python"))
@@ -73,6 +98,59 @@ impl Generator for PythonGenerator {
             config.strip_module_prefix,
             config.c_prefix(),
         )
+    }
+
+    fn generate_with_templates(
+        &self,
+        api: &Api,
+        out_dir: &Utf8Path,
+        config: &GeneratorConfig,
+        templates: Option<&TemplateEngine>,
+    ) -> Result<()> {
+        if let Some(engine) = templates {
+            let has_module = engine.has_template(MODULE_TEMPLATE);
+            let has_stubs = engine.has_template(STUBS_TEMPLATE);
+            if has_module || has_stubs {
+                let package_name = config.python_package_name();
+                let strip_module_prefix = config.strip_module_prefix;
+                let c_prefix = config.c_prefix();
+                let dir = out_dir.join("python");
+                let pkg_dir = dir.join(package_name);
+                std::fs::create_dir_all(&pkg_dir)?;
+
+                std::fs::write(
+                    pkg_dir.join("__init__.py"),
+                    stamp_hash("from .weaveffi import *  # noqa: F401,F403\n".to_string()),
+                )?;
+
+                let ctx = api_to_context(api);
+                let module_body = if has_module {
+                    engine.render(MODULE_TEMPLATE, &ctx)?
+                } else {
+                    render_python_module(api, strip_module_prefix, c_prefix)
+                };
+                std::fs::write(pkg_dir.join("weaveffi.py"), stamp_hash(module_body))?;
+
+                let stubs_body = if has_stubs {
+                    engine.render(STUBS_TEMPLATE, &ctx)?
+                } else {
+                    render_pyi_module(api, strip_module_prefix)
+                };
+                std::fs::write(pkg_dir.join("weaveffi.pyi"), stamp_hash(stubs_body))?;
+
+                std::fs::write(
+                    dir.join("pyproject.toml"),
+                    stamp_hash(render_pyproject_toml(package_name)),
+                )?;
+                std::fs::write(
+                    dir.join("setup.py"),
+                    stamp_hash(render_setup_py(package_name)),
+                )?;
+                std::fs::write(dir.join("README.md"), render_readme())?;
+                return Ok(());
+            }
+        }
+        self.generate_with_config(api, out_dir, config)
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
@@ -5709,5 +5787,108 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn builtin_python_templates_parse() {
+        let engine = builtin_template_engine().expect("built-in templates should parse");
+        assert!(engine.has_template("python/module.tera"));
+        assert!(engine.has_template("python/stubs.tera"));
+    }
+
+    #[test]
+    fn python_user_template_overrides_builtin() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "math".to_string(),
+                functions: vec![Function {
+                    name: "add".to_string(),
+                    params: vec![],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let tpl_dir = tempfile::tempdir().unwrap();
+        let tpl_path = Utf8Path::from_path(tpl_dir.path()).unwrap();
+        std::fs::create_dir_all(tpl_path.join("python")).unwrap();
+        std::fs::write(
+            tpl_path.join("python").join("module.tera"),
+            "# custom python module for {{ modules[0].name }}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tpl_path.join("python").join("stubs.tera"),
+            "# custom python stubs for {{ modules[0].name }}\n",
+        )
+        .unwrap();
+
+        let mut engine = TemplateEngine::new();
+        engine
+            .load_builtin("python/module.tera", BUILTIN_MODULE_TEMPLATE)
+            .unwrap();
+        engine
+            .load_builtin("python/stubs.tera", BUILTIN_STUBS_TEMPLATE)
+            .unwrap();
+        engine.load_dir(tpl_path).unwrap();
+
+        let out = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(out.path()).unwrap();
+        let config = GeneratorConfig::default();
+        PythonGenerator
+            .generate_with_templates(&api, out_dir, &config, Some(&engine))
+            .unwrap();
+
+        let module = std::fs::read_to_string(out_dir.join("python/weaveffi/weaveffi.py")).unwrap();
+        assert!(
+            module.contains("# custom python module for math"),
+            "user template output missing from generated module: {module}"
+        );
+        assert!(
+            !module.contains("class WeaveffiError"),
+            "built-in formatter output must not appear when user override is used: {module}"
+        );
+        assert!(
+            module.starts_with("# WeaveFFI "),
+            "stamp header should still be emitted: {module}"
+        );
+
+        let stubs = std::fs::read_to_string(out_dir.join("python/weaveffi/weaveffi.pyi")).unwrap();
+        assert!(
+            stubs.contains("# custom python stubs for math"),
+            "user template output missing from generated stubs: {stubs}"
+        );
+        assert!(
+            !stubs.contains("from typing import"),
+            "built-in formatter output must not appear when user override is used: {stubs}"
+        );
+        assert!(
+            stubs.starts_with("# WeaveFFI "),
+            "stamp header should still be emitted: {stubs}"
+        );
+
+        let init = std::fs::read_to_string(out_dir.join("python/weaveffi/__init__.py")).unwrap();
+        assert!(
+            init.contains("from .weaveffi import *"),
+            "__init__.py must still be produced alongside the overridden templates: {init}"
+        );
+        let pyproject = std::fs::read_to_string(out_dir.join("python/pyproject.toml")).unwrap();
+        assert!(
+            pyproject.contains("[project]"),
+            "pyproject.toml must still be produced alongside the overridden templates: {pyproject}"
+        );
     }
 }
