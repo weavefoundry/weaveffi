@@ -2,12 +2,49 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use camino::Utf8Path;
-use tera::Tera;
+use heck::{ToLowerCamelCase, ToShoutySnakeCase, ToSnakeCase, ToUpperCamelCase};
+use tera::{Tera, Value};
 use weaveffi_ir::ir::{Api, TypeRef};
 
-#[derive(Default)]
 pub struct TemplateEngine {
     tera: Tera,
+}
+
+impl Default for TemplateEngine {
+    fn default() -> Self {
+        let mut tera = Tera::default();
+        register_case_filters(&mut tera);
+        Self { tera }
+    }
+}
+
+/// Register WeaveFFI's case-conversion filters on a Tera instance.
+///
+/// Templates can invoke these as `{{ name | to_snake_case }}`,
+/// `{{ name | to_camel_case }}`, `{{ name | to_pascal_case }}`, or
+/// `{{ name | to_shouty_snake_case }}` to adapt IR identifiers to the target
+/// language's conventions without having to pre-process the context in Rust.
+fn register_case_filters(tera: &mut Tera) {
+    tera.register_filter("to_snake_case", case_filter(|s| s.to_snake_case()));
+    tera.register_filter("to_camel_case", case_filter(|s| s.to_lower_camel_case()));
+    tera.register_filter("to_pascal_case", case_filter(|s| s.to_upper_camel_case()));
+    tera.register_filter(
+        "to_shouty_snake_case",
+        case_filter(|s| s.to_shouty_snake_case()),
+    );
+}
+
+/// Wrap a `&str -> String` transformer in a closure that satisfies Tera's
+/// `Filter` signature and rejects non-string inputs with a clear error.
+fn case_filter(
+    f: fn(&str) -> String,
+) -> impl Fn(&Value, &HashMap<String, Value>) -> tera::Result<Value> + Sync + Send + 'static {
+    move |value, _args| match value.as_str() {
+        Some(s) => Ok(Value::String(f(s))),
+        None => Err(tera::Error::msg(
+            "case-conversion filter expects a string input",
+        )),
+    }
 }
 
 impl TemplateEngine {
@@ -403,5 +440,57 @@ mod tests {
         engine.load_builtin("c/header.tera", "hi").unwrap();
         assert!(engine.has_template("c/header.tera"));
         assert!(!engine.has_template("c/missing.tera"));
+    }
+
+    #[test]
+    fn case_filters_transform_strings() {
+        let mut engine = TemplateEngine::new();
+        engine
+            .load_builtin(
+                "cases",
+                "{{ v | to_snake_case }}|{{ v | to_camel_case }}|{{ v | to_pascal_case }}|{{ v | to_shouty_snake_case }}",
+            )
+            .unwrap();
+
+        let mut ctx = tera::Context::new();
+        ctx.insert("v", "HelloWorld");
+
+        let output = engine.render("cases", &ctx).unwrap();
+        assert_eq!(output, "hello_world|helloWorld|HelloWorld|HELLO_WORLD");
+    }
+
+    #[test]
+    fn case_filters_round_trip_snake_input() {
+        let mut engine = TemplateEngine::new();
+        engine
+            .load_builtin(
+                "cases",
+                "{{ v | to_snake_case }}|{{ v | to_camel_case }}|{{ v | to_pascal_case }}",
+            )
+            .unwrap();
+
+        let mut ctx = tera::Context::new();
+        ctx.insert("v", "my_function_name");
+
+        let output = engine.render("cases", &ctx).unwrap();
+        assert_eq!(output, "my_function_name|myFunctionName|MyFunctionName");
+    }
+
+    #[test]
+    fn case_filter_rejects_non_string_input() {
+        let mut engine = TemplateEngine::new();
+        engine
+            .load_builtin("nums", "{{ v | to_snake_case }}")
+            .unwrap();
+
+        let mut ctx = tera::Context::new();
+        ctx.insert("v", &42_i64);
+
+        let err = engine.render("nums", &ctx).unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("case-conversion filter expects a string input"),
+            "unexpected error chain: {chain}"
+        );
     }
 }
