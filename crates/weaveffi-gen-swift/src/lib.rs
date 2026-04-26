@@ -47,7 +47,11 @@ fn stamp_swift_package(body: String) -> String {
 ///
 /// The default `weaveffi` prefix resolves to `CWeaveFFI` to preserve the canonical
 /// module name; any other prefix is pascal-cased via [`heck::ToUpperCamelCase`].
-fn c_system_module_name(c_prefix: &str) -> String {
+///
+/// Exposed so downstream tools (e.g. `weaveffi build --xcframework`) can
+/// resolve the expected `<module>.xcframework` name without re-implementing
+/// the naming rules.
+pub fn c_system_module_name(c_prefix: &str) -> String {
     if c_prefix == "weaveffi" {
         "CWeaveFFI".to_string()
     } else {

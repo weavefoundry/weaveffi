@@ -7,12 +7,16 @@ project.
 ## Prerequisites
 
 - [Rust toolchain](https://rustup.rs/) (stable channel)
-- Xcode 15+ with iOS SDK
+- Xcode 15+ with iOS SDK (and Xcode command-line tools for `xcodebuild` + `lipo`)
 - WeaveFFI CLI installed (`cargo install weaveffi-cli`)
-- iOS Rust targets:
+- Apple Rust targets:
 
 ```bash
-rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+rustup target add \
+  aarch64-apple-ios \
+  aarch64-apple-ios-sim \
+  aarch64-apple-darwin \
+  x86_64-apple-darwin
 ```
 
 ## 1) Define your API
@@ -130,67 +134,77 @@ Fill in the remaining functions (`weaveffi_greeter_greeting`,
 `weaveffi_greeter_Greeting_destroy`, getters, etc.) using the generated
 `scaffold.rs` as a guide.
 
-## 4) Build for iOS
+## 4) Build the `.xcframework`
 
-Build the static library for each iOS target:
+The quickest path from a Rust cdylib to a SwiftPM-ready binary is
+`weaveffi build --xcframework`. It cross-compiles the Rust crate for
+every Apple slice the generated SwiftPM package expects, merges the two
+macOS slices into a universal binary with `lipo`, and bundles the
+result with `xcodebuild -create-xcframework`:
 
 ```bash
-# Physical devices (arm64)
+weaveffi build greeter.yml -o generated --xcframework
+```
+
+The command:
+
+1. Re-runs `weaveffi generate` (ensuring both the C header and SwiftPM
+   scaffold exist under `generated/`).
+2. Builds the cdylib for `aarch64-apple-ios`, `aarch64-apple-ios-sim`,
+   `aarch64-apple-darwin`, and `x86_64-apple-darwin`.
+3. Runs `lipo -create` on the two macOS dylibs to produce a universal
+   `libmygreeter.dylib` under `target/universal-apple-darwin/release/`.
+4. Writes the final bundle to
+   `generated/swift/Frameworks/CWeaveFFI.xcframework`, the exact path
+   referenced by the `binaryTarget` in the generated `Package.swift`.
+
+`--xcframework` is macOS-only and requires Xcode + Xcode command-line
+tools (`xcodebuild`, `lipo`). The C header search path used for each
+slice is `generated/c/`.
+
+> **Custom module names.** When `[generators.c].prefix` (or
+> `[generators.swift].module_name`) is set, the output filename
+> follows suit — e.g. a C prefix of `mylib` produces
+> `generated/swift/Frameworks/CMylib.xcframework`.
+
+### Manual fallback
+
+If you'd rather drive the tools yourself, the equivalent commands are:
+
+```bash
 cargo build -p mygreeter --target aarch64-apple-ios --release
-
-# Simulator (arm64 Apple Silicon)
 cargo build -p mygreeter --target aarch64-apple-ios-sim --release
+cargo build -p mygreeter --target aarch64-apple-darwin --release
+cargo build -p mygreeter --target x86_64-apple-darwin --release
 
-# Simulator (x86_64 Intel Mac)
-cargo build -p mygreeter --target x86_64-apple-ios --release
-```
-
-Create a universal simulator library with `lipo`:
-
-```bash
-mkdir -p target/universal-ios-sim/release
-
+mkdir -p target/universal-apple-darwin/release
 lipo -create \
-  target/aarch64-apple-ios-sim/release/libmygreeter.a \
-  target/x86_64-apple-ios/release/libmygreeter.a \
-  -output target/universal-ios-sim/release/libmygreeter.a
-```
+  target/aarch64-apple-darwin/release/libmygreeter.dylib \
+  target/x86_64-apple-darwin/release/libmygreeter.dylib \
+  -output target/universal-apple-darwin/release/libmygreeter.dylib
 
-Optionally, create an XCFramework that bundles both device and simulator
-slices:
-
-```bash
 xcodebuild -create-xcframework \
-  -library target/aarch64-apple-ios/release/libmygreeter.a \
+  -library target/aarch64-apple-ios/release/libmygreeter.dylib \
   -headers generated/c/ \
-  -library target/universal-ios-sim/release/libmygreeter.a \
+  -library target/aarch64-apple-ios-sim/release/libmygreeter.dylib \
   -headers generated/c/ \
-  -output MyGreeter.xcframework
+  -library target/universal-apple-darwin/release/libmygreeter.dylib \
+  -headers generated/c/ \
+  -output generated/swift/Frameworks/CWeaveFFI.xcframework
 ```
 
 ## 5) Set up the Xcode project
 
 1. **Create a new iOS App** in Xcode (SwiftUI or UIKit).
 
-2. **Add the static library.** Drag `MyGreeter.xcframework` (or the
-   `.a` file for a single architecture) into your project navigator.
-   Ensure it appears under **Build Phases > Link Binary With Libraries**.
-
-3. **Add the generated Swift package.** In Xcode, go to
+2. **Add the generated Swift package.** In Xcode, go to
    **File > Add Package Dependencies > Add Local…** and select
-   `generated/swift/`. This adds the `CWeaveFFI` (C module map) and
-   `WeaveFFI` (Swift wrapper) targets.
+   `generated/swift/`. SwiftPM picks up the `CWeaveFFI.xcframework`
+   bundle from `generated/swift/Frameworks/` via the `binaryTarget` in
+   `Package.swift`, then builds the `CWeaveFFI` (C module map) and
+   `WeaveFFI` (Swift wrapper) targets on top of it.
 
-4. **Set the Header Search Path.** Under **Build Settings > Header
-   Search Paths**, add the path to `generated/c/` (e.g.
-   `$(SRCROOT)/../generated/c`). This lets the module map find
-   `weaveffi.h`.
-
-5. **Set the Library Search Path.** Under **Build Settings > Library
-   Search Paths**, add the path to the Rust static library (e.g.
-   `$(SRCROOT)/../target/aarch64-apple-ios/release` for device builds).
-
-6. **Add a bridging dependency.** In your app target's
+3. **Add a bridging dependency.** In your app target's
    **Build Phases > Dependencies**, ensure `WeaveFFI` is listed.
 
 ## 6) Call from Swift
@@ -227,20 +241,21 @@ The generated `WeaveFFI` module exposes:
 
 ## 7) Build and run
 
-Select an iOS Simulator target in Xcode and press **Cmd+R**. The app
-should display "Hello, Swift!" when you tap the button.
-
-For a physical device, ensure you built for `aarch64-apple-ios` and that
-the correct library search path is set.
+Select an iOS Simulator or device target in Xcode and press **Cmd+R**.
+The app should display "Hello, Swift!" when you tap the button. Because
+the `.xcframework` ships every relevant slice, the same project runs on
+macOS, an Apple Silicon simulator, and a real iPhone without any
+per-target configuration.
 
 ## Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
-| `Undefined symbols for architecture arm64` | Check that the static library is linked and the library search path is correct. |
-| `Module 'CWeaveFFI' not found` | Ensure the header search path points to `generated/c/`. |
+| `Undefined symbols for architecture arm64` | Rebuild with `weaveffi build --xcframework` and confirm the bundle exists at `generated/swift/Frameworks/CWeaveFFI.xcframework`. |
+| `Module 'CWeaveFFI' not found` | Ensure SwiftPM picked up the local package at `generated/swift/` (File > Add Package Dependencies > Add Local…). |
 | `No such module 'WeaveFFI'` | Add the `generated/swift/` local package to your Xcode project. |
-| Simulator crash on Intel Mac | Build with `x86_64-apple-ios` and create a universal binary with `lipo`. |
+| `xcodebuild: error: Both ... represent two equivalent library definitions` | You ran `xcodebuild -create-xcframework` manually with both macOS slices; let `weaveffi build --xcframework` handle the `lipo` step, or merge them yourself before passing a single macOS library. |
+| `error: toolchain ... does not support target aarch64-apple-ios` | Run the `rustup target add` command from the Prerequisites section. |
 
 ## Next steps
 

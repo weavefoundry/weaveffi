@@ -28,7 +28,7 @@ use weaveffi_gen_go::GoGenerator;
 use weaveffi_gen_node::NodeGenerator;
 use weaveffi_gen_python::PythonGenerator;
 use weaveffi_gen_ruby::RubyGenerator;
-use weaveffi_gen_swift::SwiftGenerator;
+use weaveffi_gen_swift::{c_system_module_name, SwiftGenerator};
 use weaveffi_gen_wasm::WasmGenerator;
 use weaveffi_ir::ir::{Api, Module, Span, SpanTable, CURRENT_SCHEMA_VERSION};
 use weaveffi_ir::parse::{parse_api_str_with_spans, ParseError};
@@ -313,6 +313,11 @@ enum Commands {
         /// Cargo profile to build with [default: release]
         #[arg(long)]
         profile: Option<String>,
+        /// Build the Rust cdylib for Apple targets and bundle the slices into
+        /// `<out>/swift/Frameworks/<module>.xcframework` with `xcodebuild -create-xcframework`.
+        /// macOS host only.
+        #[arg(long, conflicts_with = "cargo_target")]
+        xcframework: bool,
     },
     /// Watch the input IDL and regenerate bindings whenever it changes
     Watch {
@@ -456,12 +461,14 @@ fn main() -> Result<()> {
             target,
             cargo_target,
             profile,
+            xcframework,
         } => cmd_build(
             &input,
             out.as_deref(),
             target.as_deref(),
             cargo_target.as_deref(),
             profile.as_deref(),
+            xcframework,
             quiet,
             cli.verbose,
             format,
@@ -3834,8 +3841,33 @@ struct BuildReport<'a> {
     cargo_target: Option<&'a str>,
 }
 
+/// Machine-readable summary emitted by `weaveffi build --xcframework --format json`.
+#[derive(Debug, Serialize)]
+struct XcframeworkReport<'a> {
+    xcframework: &'a str,
+    package: &'a str,
+    profile: &'a str,
+    cargo_targets: &'a [&'a str],
+}
+
+/// Apple cargo target triples bundled into the generated `.xcframework`.
+///
+/// These correspond to the `binaryTarget` slices consumed by the generated
+/// SwiftPM package: iOS device, iOS simulator (Apple Silicon), and macOS
+/// (both Apple Silicon and Intel, later merged with `lipo`).
+const XCFRAMEWORK_APPLE_TARGETS: &[&str] = &[
+    "aarch64-apple-ios",
+    "aarch64-apple-ios-sim",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+];
+
 /// Runs `weaveffi generate` followed by `cargo build` for the current crate,
 /// then reports the path to the emitted cdylib / staticlib / wasm module.
+///
+/// When `xcframework` is set the build hands off to [`build_xcframework`] after
+/// generation, producing `<out>/swift/Frameworks/<module>.xcframework` instead
+/// of a single per-host artifact.
 #[allow(clippy::too_many_arguments)]
 fn cmd_build(
     input: &str,
@@ -3843,13 +3875,28 @@ fn cmd_build(
     targets: Option<&str>,
     cargo_target: Option<&str>,
     profile: Option<&str>,
+    xcframework: bool,
     quiet: bool,
     verbose: bool,
     format: OutputFormat,
 ) -> Result<()> {
     let out_dir = out.unwrap_or("./generated");
+    let effective_targets_owned =
+        xcframework.then(|| augment_targets_with(targets, &["c", "swift"]));
+    let targets_for_generate = effective_targets_owned.as_deref().or(targets);
     cmd_generate(
-        input, out_dir, targets, false, None, false, false, false, None, true, quiet, format,
+        input,
+        out_dir,
+        targets_for_generate,
+        false,
+        None,
+        false,
+        false,
+        false,
+        None,
+        true,
+        quiet,
+        format,
     )?;
 
     let cwd = env::current_dir().wrap_err("failed to read current directory")?;
@@ -3868,6 +3915,20 @@ fn cmd_build(
     let (package_name, crate_types) = parse_cargo_manifest(&cargo_toml_contents)?;
 
     let effective_profile = profile.unwrap_or("release");
+
+    if xcframework {
+        return build_xcframework(
+            &cwd,
+            &cwd_utf8,
+            out_dir,
+            &package_name,
+            &crate_types,
+            effective_profile,
+            quiet,
+            verbose,
+            format,
+        );
+    }
 
     let mut cargo = Command::new("cargo");
     cargo.current_dir(&cwd).arg("build");
@@ -3908,6 +3969,222 @@ fn cmd_build(
         })?;
     } else {
         println!("Built artifact: {}", artifact);
+    }
+    Ok(())
+}
+
+/// Merge `extras` into the comma-separated `targets` list, preserving any
+/// caller-supplied entries and de-duplicating the result. Used by
+/// `--xcframework` so the C header and SwiftPM scaffold are always generated
+/// alongside whatever the user explicitly requested.
+fn augment_targets_with(targets: Option<&str>, extras: &[&str]) -> String {
+    let mut set: BTreeSet<String> = targets
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    for e in extras {
+        set.insert((*e).to_string());
+    }
+    set.into_iter().collect::<Vec<_>>().join(",")
+}
+
+/// Determine the C system module name by peeking at the generated
+/// `Package.swift`.
+///
+/// Reading the freshly-written `Package.swift` is more robust than
+/// re-parsing the IDL + inline generator config in the CLI: it picks up
+/// whatever name the Swift generator actually committed. Falls back to
+/// the default `CWeaveFFI` (via [`c_system_module_name`]) when the file
+/// is missing or unparseable.
+fn detect_xcframework_module_name(out_dir: &Utf8Path) -> String {
+    let pkg = out_dir.join("swift").join("Package.swift");
+    if let Ok(contents) = std::fs::read_to_string(pkg.as_std_path()) {
+        for line in contents.lines() {
+            if let Some((_, rest)) = line.split_once("path: \"Frameworks/") {
+                if let Some(name) = rest.strip_suffix(".xcframework\"") {
+                    return name.to_string();
+                }
+                if let Some(name) = rest.strip_suffix(".xcframework\",") {
+                    return name.to_string();
+                }
+            }
+        }
+    }
+    c_system_module_name("weaveffi")
+}
+
+/// Build the Rust cdylib for the Apple target matrix and bundle the slices
+/// into `<out>/swift/Frameworks/<module>.xcframework` via
+/// `xcodebuild -create-xcframework`.
+///
+/// macOS device+simulator slices live under distinct triples, so the two
+/// macOS dylibs are first merged with `lipo` into a universal binary before
+/// being handed to `xcodebuild` (which rejects duplicate-platform inputs).
+#[allow(clippy::too_many_arguments)]
+fn build_xcframework(
+    cwd: &std::path::Path,
+    cwd_utf8: &Utf8Path,
+    out_dir: &str,
+    package_name: &str,
+    crate_types: &[String],
+    effective_profile: &str,
+    quiet: bool,
+    verbose: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    if !cfg!(target_os = "macos") {
+        bail!("`--xcframework` requires a macOS host (xcodebuild is only available on Apple)");
+    }
+
+    if !crate_types.iter().any(|c| c == "cdylib" || c == "dylib") {
+        bail!(
+            "Cargo.toml must declare `crate-type = [\"cdylib\"]` under `[lib]` to build an xcframework"
+        );
+    }
+
+    let out_path = std::path::absolute(out_dir)
+        .ok()
+        .and_then(|p| Utf8PathBuf::from_path_buf(p).ok())
+        .unwrap_or_else(|| {
+            if Utf8Path::new(out_dir).is_absolute() {
+                Utf8PathBuf::from(out_dir)
+            } else {
+                cwd_utf8.join(out_dir)
+            }
+        });
+    let module_name = detect_xcframework_module_name(&out_path);
+
+    let mut slices: Vec<(&str, Utf8PathBuf)> = Vec::with_capacity(XCFRAMEWORK_APPLE_TARGETS.len());
+    for triple in XCFRAMEWORK_APPLE_TARGETS {
+        let mut cargo = Command::new("cargo");
+        cargo.current_dir(cwd).arg("build");
+        if effective_profile == "release" {
+            cargo.arg("--release");
+        } else {
+            cargo.args(["--profile", effective_profile]);
+        }
+        cargo.args(["--target", triple]);
+        if quiet {
+            cargo.arg("--quiet");
+        }
+        if verbose {
+            cargo.arg("--verbose");
+        }
+        let status = cargo
+            .status()
+            .wrap_err_with(|| format!("failed to spawn `cargo build --target {triple}`"))?;
+        if !status.success() {
+            bail!(
+                "`cargo build --target {}` failed with status {}; is the target installed? (`rustup target add {}`)",
+                triple,
+                status,
+                triple
+            );
+        }
+        let artifact = locate_artifact(
+            cwd_utf8,
+            package_name,
+            crate_types,
+            Some(triple),
+            effective_profile,
+        )?;
+        slices.push((triple, artifact));
+    }
+
+    let pick = |triple: &str| -> Result<Utf8PathBuf> {
+        slices
+            .iter()
+            .find(|(t, _)| *t == triple)
+            .map(|(_, p)| p.clone())
+            .ok_or_else(|| eyre!("missing build slice for {triple}"))
+    };
+    let ios_device = pick("aarch64-apple-ios")?;
+    let ios_sim = pick("aarch64-apple-ios-sim")?;
+    let macos_arm64 = pick("aarch64-apple-darwin")?;
+    let macos_x86_64 = pick("x86_64-apple-darwin")?;
+
+    let macos_universal_dir = cwd_utf8
+        .join("target")
+        .join("universal-apple-darwin")
+        .join(cargo_profile_dir(effective_profile));
+    std::fs::create_dir_all(macos_universal_dir.as_std_path()).wrap_err_with(|| {
+        format!(
+            "failed to create universal macOS output dir: {}",
+            macos_universal_dir
+        )
+    })?;
+    let artifact_stem = package_name.replace('-', "_");
+    let macos_universal = macos_universal_dir.join(format!("lib{artifact_stem}.dylib"));
+
+    let lipo_status = Command::new("lipo")
+        .arg("-create")
+        .arg(macos_arm64.as_std_path())
+        .arg(macos_x86_64.as_std_path())
+        .arg("-output")
+        .arg(macos_universal.as_std_path())
+        .status()
+        .wrap_err("failed to spawn `lipo`; install Xcode command-line tools")?;
+    if !lipo_status.success() {
+        bail!(
+            "`lipo -create` failed with status {}; inputs: {}, {}",
+            lipo_status,
+            macos_arm64,
+            macos_x86_64
+        );
+    }
+
+    let header_dir = out_path.join("c");
+    if !header_dir.exists() {
+        bail!(
+            "generated C headers not found at {}; the `c` generator must run before --xcframework",
+            header_dir
+        );
+    }
+
+    let frameworks_dir = out_path.join("swift").join("Frameworks");
+    std::fs::create_dir_all(frameworks_dir.as_std_path())
+        .wrap_err_with(|| format!("failed to create {}", frameworks_dir))?;
+    let xcframework_path = frameworks_dir.join(format!("{module_name}.xcframework"));
+    if xcframework_path.exists() {
+        std::fs::remove_dir_all(xcframework_path.as_std_path()).wrap_err_with(|| {
+            format!(
+                "failed to remove existing xcframework at {}",
+                xcframework_path
+            )
+        })?;
+    }
+
+    let mut xc = Command::new("xcodebuild");
+    xc.arg("-create-xcframework");
+    for lib in [&ios_device, &ios_sim, &macos_universal] {
+        xc.arg("-library").arg(lib.as_std_path());
+        xc.arg("-headers").arg(header_dir.as_std_path());
+    }
+    xc.arg("-output").arg(xcframework_path.as_std_path());
+    let xc_status = xc
+        .status()
+        .wrap_err("failed to spawn `xcodebuild`; install Xcode to use --xcframework")?;
+    if !xc_status.success() {
+        bail!(
+            "`xcodebuild -create-xcframework` failed with status {}",
+            xc_status
+        );
+    }
+
+    if format.is_json() {
+        emit_json(&XcframeworkReport {
+            xcframework: xcframework_path.as_str(),
+            package: package_name,
+            profile: effective_profile,
+            cargo_targets: XCFRAMEWORK_APPLE_TARGETS,
+        })?;
+    } else {
+        println!("Built xcframework: {}", xcframework_path);
     }
     Ok(())
 }
@@ -5805,6 +6082,185 @@ mod tests {
         assert!(
             dir.path().join("generated/c/weaveffi.h").exists(),
             "weaveffi build should have invoked `weaveffi generate`",
+        );
+    }
+
+    #[test]
+    fn augment_targets_with_preserves_user_entries_and_dedupes() {
+        assert_eq!(augment_targets_with(None, &["c", "swift"]), "c,swift");
+        assert_eq!(
+            augment_targets_with(Some("swift"), &["c", "swift"]),
+            "c,swift"
+        );
+        assert_eq!(
+            augment_targets_with(Some("node, python"), &["c", "swift"]),
+            "c,node,python,swift"
+        );
+    }
+
+    #[test]
+    fn detect_xcframework_module_name_reads_package_swift() {
+        let dir = tempfile::tempdir().unwrap();
+        let swift_dir = dir.path().join("swift");
+        std::fs::create_dir_all(&swift_dir).unwrap();
+        std::fs::write(
+            swift_dir.join("Package.swift"),
+            concat!(
+                "// swift-tools-version:5.7\n",
+                "import PackageDescription\n",
+                "let package = Package(\n",
+                "    targets: [\n",
+                "        .binaryTarget(\n",
+                "            name: \"CMylib\",\n",
+                "            path: \"Frameworks/CMylib.xcframework\"\n",
+                "        ),\n",
+                "    ]\n",
+                ")\n",
+            ),
+        )
+        .unwrap();
+        let out = Utf8Path::from_path(dir.path()).unwrap();
+        assert_eq!(detect_xcframework_module_name(out), "CMylib");
+    }
+
+    #[test]
+    fn detect_xcframework_module_name_defaults_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = Utf8Path::from_path(dir.path()).unwrap();
+        assert_eq!(detect_xcframework_module_name(out), "CWeaveFFI");
+    }
+
+    /// macOS smoke test for `weaveffi build --xcframework`.
+    ///
+    /// Cross-compiles a minimal cdylib for all four Apple targets and drives
+    /// `xcodebuild -create-xcframework`, asserting the resulting bundle lands
+    /// at the SwiftPM-expected path and contains Apple's standard `Info.plist`.
+    ///
+    /// The test skips gracefully when `xcodebuild` is not on `$PATH` or when
+    /// any of the required `rustup` targets is not installed, so it can run
+    /// on developer machines without surprising failures.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn build_xcframework_smoke_test() {
+        let _ = color_eyre::install();
+
+        if Command::new("xcodebuild")
+            .arg("-version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skipping: `xcodebuild -version` not available on this host");
+            return;
+        }
+
+        let installed = Command::new("rustup")
+            .args(["target", "list", "--installed"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .map(str::to_string)
+                    .collect::<BTreeSet<String>>()
+            })
+            .unwrap_or_default();
+        for required in XCFRAMEWORK_APPLE_TARGETS {
+            if !installed.contains(*required) {
+                eprintln!(
+                    "skipping: rustup target `{required}` not installed (run `rustup target add {required}`)",
+                );
+                return;
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+
+        std::fs::write(
+            dir.path().join("api.yml"),
+            concat!(
+                "version: \"0.1.0\"\n",
+                "modules:\n",
+                "  - name: math\n",
+                "    functions:\n",
+                "      - name: add\n",
+                "        params:\n",
+                "          - { name: a, type: i32 }\n",
+                "          - { name: b, type: i32 }\n",
+                "        return: i32\n",
+            ),
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            concat!(
+                "[package]\n",
+                "name = \"weaveffi_xcf_smoke\"\n",
+                "version = \"0.1.0\"\n",
+                "edition = \"2021\"\n",
+                "\n",
+                "[lib]\n",
+                "crate-type = [\"cdylib\"]\n",
+            ),
+        )
+        .unwrap();
+
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("lib.rs"),
+            "#[no_mangle]\npub extern \"C\" fn smoke_answer() -> i32 { 42 }\n",
+        )
+        .unwrap();
+
+        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .current_dir(dir.path())
+            .args(["--quiet", "build", "api.yml", "--xcframework"])
+            .output()
+            .expect("failed to run weaveffi build --xcframework");
+
+        assert!(
+            cmd.status.success(),
+            "weaveffi build --xcframework failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&cmd.stdout),
+            String::from_utf8_lossy(&cmd.stderr),
+        );
+
+        let stdout = String::from_utf8_lossy(&cmd.stdout);
+        let path_line = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("Built xcframework: "))
+            .unwrap_or_else(|| panic!("stdout missing `Built xcframework:` line: {stdout}"));
+        let xcf = std::path::Path::new(path_line.trim());
+        assert!(
+            xcf.ends_with("generated/swift/Frameworks/CWeaveFFI.xcframework"),
+            "xcframework must live at the SwiftPM-expected path, got {xcf:?}",
+        );
+        assert!(
+            xcf.is_dir(),
+            "reported xcframework {xcf:?} must exist on disk",
+        );
+        assert!(
+            xcf.join("Info.plist").exists(),
+            "xcframework must contain Info.plist (got entries: {:?})",
+            std::fs::read_dir(xcf)
+                .map(|it| it
+                    .filter_map(Result::ok)
+                    .map(|e| e.file_name())
+                    .collect::<Vec<_>>())
+                .unwrap_or_default(),
+        );
+        let has_ios_device_slice = std::fs::read_dir(xcf)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().starts_with("ios-arm64"));
+        assert!(
+            has_ios_device_slice,
+            "xcframework must contain an ios-arm64 slice"
         );
     }
 
