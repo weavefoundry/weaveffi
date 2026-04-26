@@ -250,6 +250,9 @@ enum Commands {
         /// Treat optional checks as required (exit non-zero if any fail)
         #[arg(long)]
         all: bool,
+        /// Comma-separated list of targets to limit checks to (c, cpp, swift, android, node, wasm, python, dotnet, dart, go, ruby)
+        #[arg(long)]
+        target: Option<String>,
     },
     Completions {
         /// Shell to generate completions for
@@ -411,8 +414,8 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
-        Commands::Doctor { all } => {
-            if !cmd_doctor(all, format)? {
+        Commands::Doctor { all, target } => {
+            if !cmd_doctor(all, target.as_deref(), format)? {
                 std::process::exit(1);
             }
         }
@@ -2661,11 +2664,134 @@ fn strip_defaults(value: serde_yaml::Value) -> serde_yaml::Value {
     }
 }
 
+/// Generator targets that `weaveffi doctor` knows how to probe toolchains for.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum DoctorTarget {
+    C,
+    Cpp,
+    Swift,
+    Android,
+    Node,
+    Wasm,
+    Python,
+    Dotnet,
+    Dart,
+    Go,
+    Ruby,
+}
+
+impl DoctorTarget {
+    const ALL: &'static [DoctorTarget] = &[
+        DoctorTarget::C,
+        DoctorTarget::Cpp,
+        DoctorTarget::Swift,
+        DoctorTarget::Android,
+        DoctorTarget::Node,
+        DoctorTarget::Wasm,
+        DoctorTarget::Python,
+        DoctorTarget::Dotnet,
+        DoctorTarget::Dart,
+        DoctorTarget::Go,
+        DoctorTarget::Ruby,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            DoctorTarget::C => "c",
+            DoctorTarget::Cpp => "cpp",
+            DoctorTarget::Swift => "swift",
+            DoctorTarget::Android => "android",
+            DoctorTarget::Node => "node",
+            DoctorTarget::Wasm => "wasm",
+            DoctorTarget::Python => "python",
+            DoctorTarget::Dotnet => "dotnet",
+            DoctorTarget::Dart => "dart",
+            DoctorTarget::Go => "go",
+            DoctorTarget::Ruby => "ruby",
+        }
+    }
+
+    fn parse(s: &str) -> Result<DoctorTarget> {
+        for t in Self::ALL {
+            if t.name().eq_ignore_ascii_case(s.trim()) {
+                return Ok(*t);
+            }
+        }
+        let valid = Self::ALL
+            .iter()
+            .map(|t| t.name())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(eyre!(
+            "unknown doctor target `{}` (valid: {valid})",
+            s.trim()
+        ))
+    }
+}
+
+/// Install hints for a tool across supported package managers. At most one is
+/// emitted per run, matching the current OS.
+#[derive(Default)]
+struct InstallHints {
+    brew: Option<&'static str>,
+    apt: Option<&'static str>,
+    dnf: Option<&'static str>,
+    winget: Option<&'static str>,
+    extra: Option<&'static str>,
+}
+
+impl InstallHints {
+    fn format(&self) -> Option<String> {
+        if cfg!(target_os = "macos") {
+            if let Some(pkg) = self.brew {
+                return Some(format!("brew install {pkg}"));
+            }
+        } else if cfg!(target_os = "windows") {
+            if let Some(pkg) = self.winget {
+                return Some(format!("winget install {pkg}"));
+            }
+        } else if cfg!(target_os = "linux") {
+            let mut parts = Vec::new();
+            if let Some(pkg) = self.apt {
+                parts.push(format!("apt install {pkg} (Debian/Ubuntu)"));
+            }
+            if let Some(pkg) = self.dnf {
+                parts.push(format!("dnf install {pkg} (Fedora)"));
+            }
+            if !parts.is_empty() {
+                return Some(parts.join(" or "));
+            }
+        }
+        self.extra.map(|s| s.to_string())
+    }
+}
+
 /// Runs the doctor checks and returns `Ok(true)` when the process should exit
 /// 0. Required checks (rustc, cargo, weaveffi-cli) always gate success;
 /// optional checks only gate success when `all` is true.
-fn cmd_doctor(all: bool, format: OutputFormat) -> Result<bool> {
+fn cmd_doctor(all: bool, targets: Option<&str>, format: OutputFormat) -> Result<bool> {
     let json_mode = format.is_json();
+
+    let selected: Option<BTreeSet<DoctorTarget>> = match targets {
+        Some(s) => {
+            let mut set = BTreeSet::new();
+            for raw in s.split(',') {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                set.insert(DoctorTarget::parse(trimmed)?);
+            }
+            if set.is_empty() {
+                None
+            } else {
+                Some(set)
+            }
+        }
+        None => None,
+    };
+    let wants = |t: DoctorTarget| selected.as_ref().is_none_or(|s| s.contains(&t));
+
     if !json_mode {
         println!("WeaveFFI Doctor: checking toolchain prerequisites\n");
         println!("Required checks:");
@@ -2690,82 +2816,13 @@ fn cmd_doctor(all: bool, format: OutputFormat) -> Result<bool> {
     ));
     required.push(run_weaveffi_cli_check(json_mode));
 
-    if !json_mode {
-        println!("\nOptional checks:");
-    }
-    if cfg!(target_os = "macos") {
-        optional.push(run_tool_check(
-            "xcodebuild",
-            &["-version"],
-            "Xcode command-line tools",
-            Some("Install Xcode from the App Store, then run `xcode-select --install`"),
-            json_mode,
-        ));
-    } else if !json_mode {
-        println!("- Xcode: skipped (non-macOS)");
-    }
-
-    let ndk_hint = if cfg!(target_os = "macos") {
-        Some("Install via Android Studio SDK Manager or `brew install android-ndk`. Set ANDROID_NDK_HOME.")
-    } else {
-        Some("Install via Android Studio SDK Manager. Set ANDROID_NDK_HOME.")
-    };
-    let ndk_check = run_tool_check(
-        "ndk-build",
-        &["-v"],
-        "Android NDK (ndk-build)",
-        ndk_hint,
-        json_mode,
-    );
-    if !ndk_check.ok && !json_mode {
-        let env_ok = env::var_os("ANDROID_NDK_HOME")
-            .map(|p| std::path::Path::new(&p).exists())
-            .unwrap_or(false)
-            || env::var_os("ANDROID_NDK_ROOT")
-                .map(|p| std::path::Path::new(&p).exists())
-                .unwrap_or(false);
-        if env_ok {
-            println!(
-                "  note: ANDROID_NDK_HOME/ROOT is set and exists; ensure `ndk-build` is in PATH"
-            );
+    for target in DoctorTarget::ALL {
+        if !wants(*target) {
+            continue;
         }
+        let checks = run_target_checks(*target, json_mode);
+        optional.extend(checks);
     }
-    optional.push(ndk_check);
-
-    optional.push(run_tool_check(
-        "node",
-        &["-v"],
-        "Node.js",
-        Some("Install from https://nodejs.org or with your package manager"),
-        json_mode,
-    ));
-    optional.push(run_tool_check(
-        "npm",
-        &["-v"],
-        "npm",
-        Some("Install Node.js which includes npm, or use pnpm/yarn"),
-        json_mode,
-    ));
-
-    optional.extend(run_cross_target_checks(json_mode));
-
-    if !json_mode {
-        println!("\nWebAssembly tools:");
-    }
-    optional.push(run_tool_check(
-        "wasm-pack",
-        &["--version"],
-        "wasm-pack",
-        Some("install with `cargo install wasm-pack`"),
-        json_mode,
-    ));
-    optional.push(run_tool_check(
-        "wasm-bindgen",
-        &["--version"],
-        "wasm-bindgen-cli",
-        Some("install with `cargo install wasm-bindgen-cli`"),
-        json_mode,
-    ));
 
     let required_failures: Vec<String> = required
         .iter()
@@ -2822,6 +2879,662 @@ fn cmd_doctor(all: bool, format: OutputFormat) -> Result<bool> {
         println!("Doctor completed: all checks passed.");
     }
     Ok(true)
+}
+
+/// Emits the per-target section header and runs every tool check for the
+/// given target, returning the structured results for aggregation.
+fn run_target_checks(target: DoctorTarget, json_mode: bool) -> Vec<DoctorCheck> {
+    if !json_mode {
+        println!("\nTarget {}:", target.name());
+    }
+
+    match target {
+        DoctorTarget::C | DoctorTarget::Cpp => {
+            vec![
+                run_c_compiler_check(json_mode),
+                run_tool_check_with_hints(
+                    "cmake",
+                    &["--version"],
+                    "CMake",
+                    InstallHints {
+                        brew: Some("cmake"),
+                        apt: Some("cmake"),
+                        dnf: Some("cmake"),
+                        winget: Some("Kitware.CMake"),
+                        ..Default::default()
+                    },
+                    json_mode,
+                ),
+            ]
+        }
+        DoctorTarget::Swift => run_swift_target_checks(json_mode),
+        DoctorTarget::Android => run_android_target_checks(json_mode),
+        DoctorTarget::Node => vec![
+            run_versioned_tool_check(
+                "node",
+                &["-v"],
+                "Node.js",
+                Some((18, 0)),
+                InstallHints {
+                    brew: Some("node"),
+                    apt: Some("nodejs"),
+                    dnf: Some("nodejs"),
+                    winget: Some("OpenJS.NodeJS"),
+                    extra: Some("Install from https://nodejs.org"),
+                },
+                json_mode,
+            ),
+            run_tool_check_with_hints(
+                "npm",
+                &["-v"],
+                "npm",
+                InstallHints {
+                    brew: Some("node"),
+                    apt: Some("npm"),
+                    dnf: Some("npm"),
+                    winget: Some("OpenJS.NodeJS"),
+                    extra: Some("Install Node.js which includes npm"),
+                },
+                json_mode,
+            ),
+            run_tool_check_with_hints(
+                "node-gyp",
+                &["--version"],
+                "node-gyp",
+                InstallHints {
+                    extra: Some("Install with `npm install -g node-gyp`"),
+                    ..Default::default()
+                },
+                json_mode,
+            ),
+        ],
+        DoctorTarget::Wasm => run_wasm_target_checks(json_mode),
+        DoctorTarget::Python => vec![
+            run_versioned_tool_check(
+                "python3",
+                &["--version"],
+                "Python 3",
+                Some((3, 8)),
+                InstallHints {
+                    brew: Some("python@3"),
+                    apt: Some("python3"),
+                    dnf: Some("python3"),
+                    winget: Some("Python.Python.3"),
+                    ..Default::default()
+                },
+                json_mode,
+            ),
+            run_pip_check(json_mode),
+        ],
+        DoctorTarget::Dotnet => vec![run_versioned_tool_check(
+            "dotnet",
+            &["--version"],
+            ".NET SDK",
+            Some((8, 0)),
+            InstallHints {
+                brew: Some("dotnet"),
+                apt: Some("dotnet-sdk-8.0"),
+                dnf: Some("dotnet-sdk-8.0"),
+                winget: Some("Microsoft.DotNet.SDK.8"),
+                extra: Some("Install from https://dotnet.microsoft.com/download"),
+            },
+            json_mode,
+        )],
+        DoctorTarget::Dart => vec![
+            run_versioned_tool_check(
+                "dart",
+                &["--version"],
+                "Dart SDK",
+                Some((3, 0)),
+                InstallHints {
+                    brew: Some("dart"),
+                    apt: Some("dart"),
+                    dnf: Some("dart"),
+                    winget: Some("Google.DartSDK"),
+                    extra: Some("Install from https://dart.dev/get-dart"),
+                },
+                json_mode,
+            ),
+            run_tool_check_with_hints(
+                "flutter",
+                &["--version"],
+                "Flutter (optional)",
+                InstallHints {
+                    brew: Some("--cask flutter"),
+                    winget: Some("Google.Flutter"),
+                    extra: Some("Install from https://docs.flutter.dev/get-started/install"),
+                    ..Default::default()
+                },
+                json_mode,
+            ),
+        ],
+        DoctorTarget::Go => vec![run_versioned_tool_check(
+            "go",
+            &["version"],
+            "Go",
+            Some((1, 21)),
+            InstallHints {
+                brew: Some("go"),
+                apt: Some("golang-go"),
+                dnf: Some("golang"),
+                winget: Some("GoLang.Go"),
+                extra: Some("Install from https://go.dev/dl/"),
+            },
+            json_mode,
+        )],
+        DoctorTarget::Ruby => vec![
+            run_versioned_tool_check(
+                "ruby",
+                &["--version"],
+                "Ruby",
+                Some((3, 0)),
+                InstallHints {
+                    brew: Some("ruby"),
+                    apt: Some("ruby-full"),
+                    dnf: Some("ruby"),
+                    winget: Some("RubyInstallerTeam.Ruby.3.2"),
+                    extra: Some(
+                        "Install from https://www.ruby-lang.org/en/documentation/installation/",
+                    ),
+                },
+                json_mode,
+            ),
+            run_tool_check_with_hints(
+                "gem",
+                &["--version"],
+                "RubyGems (gem)",
+                InstallHints {
+                    brew: Some("ruby"),
+                    apt: Some("rubygems"),
+                    dnf: Some("rubygems"),
+                    extra: Some("Ships with Ruby; reinstall Ruby if missing"),
+                    ..Default::default()
+                },
+                json_mode,
+            ),
+            run_tool_check_with_hints(
+                "bundle",
+                &["--version"],
+                "Bundler",
+                InstallHints {
+                    extra: Some("Install with `gem install bundler`"),
+                    ..Default::default()
+                },
+                json_mode,
+            ),
+        ],
+    }
+}
+
+/// Checks that either `clang` or `gcc` is available. Emits a single combined
+/// result so the output doesn't double-fail when the user has one but not the
+/// other.
+fn run_c_compiler_check(json_mode: bool) -> DoctorCheck {
+    let candidates = [("clang", "clang"), ("gcc", "gcc")];
+    for (cmd, _label) in &candidates {
+        if let Ok(out) = Command::new(cmd).arg("--version").output() {
+            if out.status.success() {
+                let ver = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if !json_mode {
+                    if ver.is_empty() {
+                        println!("- C/C++ compiler: OK ({cmd})");
+                    } else {
+                        println!("- C/C++ compiler: OK ({cmd}: {ver})");
+                    }
+                }
+                return DoctorCheck {
+                    name: (*cmd).to_string(),
+                    ok: true,
+                    version: if ver.is_empty() { None } else { Some(ver) },
+                    hint: None,
+                };
+            }
+        }
+    }
+    let hint = InstallHints {
+        brew: Some("llvm"),
+        apt: Some("clang or build-essential"),
+        dnf: Some("clang or gcc"),
+        winget: Some("LLVM.LLVM"),
+        extra: Some("Install clang or gcc via your platform's developer tools"),
+    }
+    .format();
+    if !json_mode {
+        println!("- C/C++ compiler: MISSING (clang and gcc not found in PATH)");
+        if let Some(h) = &hint {
+            println!("  hint: {h}");
+        }
+    }
+    DoctorCheck {
+        name: "clang/gcc".to_string(),
+        ok: false,
+        version: None,
+        hint,
+    }
+}
+
+/// Swift-specific tools: swiftc and SwiftPM (macOS only), plus the iOS
+/// cross-compile target.
+fn run_swift_target_checks(json_mode: bool) -> Vec<DoctorCheck> {
+    let mut checks = Vec::new();
+
+    if cfg!(target_os = "macos") {
+        checks.push(run_tool_check_with_hints(
+            "swiftc",
+            &["--version"],
+            "Swift compiler",
+            InstallHints {
+                extra: Some("Install Xcode from the App Store, then `xcode-select --install`"),
+                ..Default::default()
+            },
+            json_mode,
+        ));
+        checks.push(run_swift_package_check(json_mode));
+        checks.push(run_tool_check_with_hints(
+            "xcodebuild",
+            &["-version"],
+            "Xcode command-line tools",
+            InstallHints {
+                extra: Some("Install Xcode from the App Store, then `xcode-select --install`"),
+                ..Default::default()
+            },
+            json_mode,
+        ));
+        checks.push(run_rustup_target_check(
+            "aarch64-apple-ios",
+            "iOS",
+            json_mode,
+        ));
+    } else {
+        checks.push(run_tool_check_with_hints(
+            "swiftc",
+            &["--version"],
+            "Swift compiler",
+            InstallHints {
+                apt: Some("swift (via swift.org)"),
+                dnf: Some("swift (via swift.org)"),
+                winget: Some("Swift.Toolchain"),
+                extra: Some("Install from https://www.swift.org/install/"),
+                ..Default::default()
+            },
+            json_mode,
+        ));
+        checks.push(run_swift_package_check(json_mode));
+    }
+    checks
+}
+
+/// Probes SwiftPM by invoking `swift package --help`; that succeeds on every
+/// Swift install that has SwiftPM bundled (macOS toolchain, swift.org builds).
+fn run_swift_package_check(json_mode: bool) -> DoctorCheck {
+    let hint = InstallHints {
+        extra: Some("SwiftPM ships with the Swift toolchain; reinstall Swift if missing"),
+        ..Default::default()
+    }
+    .format();
+    match Command::new("swift").args(["package", "--help"]).output() {
+        Ok(out) if out.status.success() => {
+            let ver = Command::new("swift")
+                .arg("--version")
+                .output()
+                .ok()
+                .and_then(|o| {
+                    if o.status.success() {
+                        String::from_utf8_lossy(&o.stdout)
+                            .lines()
+                            .next()
+                            .map(|l| l.trim().to_string())
+                    } else {
+                        None
+                    }
+                });
+            if !json_mode {
+                match &ver {
+                    Some(v) => println!("- SwiftPM (swift package): OK ({v})"),
+                    None => println!("- SwiftPM (swift package): OK"),
+                }
+            }
+            DoctorCheck {
+                name: "swift-package".to_string(),
+                ok: true,
+                version: ver,
+                hint: None,
+            }
+        }
+        _ => {
+            if !json_mode {
+                println!("- SwiftPM (swift package): MISSING");
+                if let Some(h) = &hint {
+                    println!("  hint: {h}");
+                }
+            }
+            DoctorCheck {
+                name: "swift-package".to_string(),
+                ok: false,
+                version: None,
+                hint,
+            }
+        }
+    }
+}
+
+/// Android-specific tools: NDK and the Android Rust cross-compile target.
+fn run_android_target_checks(json_mode: bool) -> Vec<DoctorCheck> {
+    let ndk_hints = InstallHints {
+        brew: Some("--cask android-ndk"),
+        extra: Some(
+            "Install via Android Studio SDK Manager. Set ANDROID_NDK_HOME or ANDROID_NDK_ROOT.",
+        ),
+        ..Default::default()
+    };
+    let ndk_check = run_tool_check_with_hints(
+        "ndk-build",
+        &["-v"],
+        "Android NDK (ndk-build)",
+        ndk_hints,
+        json_mode,
+    );
+    if !ndk_check.ok && !json_mode {
+        let env_ok = env::var_os("ANDROID_NDK_HOME")
+            .map(|p| std::path::Path::new(&p).exists())
+            .unwrap_or(false)
+            || env::var_os("ANDROID_NDK_ROOT")
+                .map(|p| std::path::Path::new(&p).exists())
+                .unwrap_or(false);
+        if env_ok {
+            println!(
+                "  note: ANDROID_NDK_HOME/ROOT is set and exists; ensure `ndk-build` is in PATH"
+            );
+        }
+    }
+    vec![
+        ndk_check,
+        run_rustup_target_check("aarch64-linux-android", "Android", json_mode),
+    ]
+}
+
+/// WebAssembly toolchain: Rust target plus wasm-pack and wasm-bindgen-cli.
+fn run_wasm_target_checks(json_mode: bool) -> Vec<DoctorCheck> {
+    vec![
+        run_rustup_target_check("wasm32-unknown-unknown", "WebAssembly", json_mode),
+        run_tool_check_with_hints(
+            "wasm-pack",
+            &["--version"],
+            "wasm-pack",
+            InstallHints {
+                brew: Some("wasm-pack"),
+                extra: Some("Install with `cargo install wasm-pack`"),
+                ..Default::default()
+            },
+            json_mode,
+        ),
+        run_tool_check_with_hints(
+            "wasm-bindgen",
+            &["--version"],
+            "wasm-bindgen-cli",
+            InstallHints {
+                extra: Some("Install with `cargo install wasm-bindgen-cli`"),
+                ..Default::default()
+            },
+            json_mode,
+        ),
+    ]
+}
+
+/// Checks that a Rust cross-compilation target is installed via rustup.
+fn run_rustup_target_check(target: &str, label: &str, json_mode: bool) -> DoctorCheck {
+    let installed = Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output();
+
+    let (ok, note) = match installed {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            let found = stdout.lines().any(|line| line.trim() == target);
+            (found, None)
+        }
+        _ => (false, Some("rustup not available")),
+    };
+
+    if !json_mode {
+        if ok {
+            println!("- {label} ({target}): installed");
+        } else if let Some(n) = note {
+            println!("- {label} ({target}): MISSING ({n})");
+            println!(
+                "  hint: install rustup via https://rustup.rs, then `rustup target add {target}`"
+            );
+        } else {
+            println!("- {label} ({target}): MISSING");
+            println!("  hint: install with `rustup target add {target}`");
+        }
+    }
+
+    DoctorCheck {
+        name: format!("target:{target}"),
+        ok,
+        version: if ok { Some(target.to_string()) } else { None },
+        hint: if ok {
+            None
+        } else {
+            Some(format!("install with `rustup target add {target}`"))
+        },
+    }
+}
+
+/// Resolves a `pip` invocation by trying `pip3 --version` first and falling
+/// back to `python3 -m pip --version`, which is present on most Python
+/// installs even when `pip3` isn't on PATH.
+fn run_pip_check(json_mode: bool) -> DoctorCheck {
+    let hint = InstallHints {
+        brew: Some("python@3"),
+        apt: Some("python3-pip"),
+        dnf: Some("python3-pip"),
+        winget: Some("Python.Python.3"),
+        extra: Some("Run `python3 -m ensurepip --upgrade`"),
+    }
+    .format();
+
+    if let Ok(out) = Command::new("pip3").arg("--version").output() {
+        if out.status.success() {
+            let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !json_mode {
+                println!("- pip: OK (pip3: {ver})");
+            }
+            return DoctorCheck {
+                name: "pip".to_string(),
+                ok: true,
+                version: Some(ver),
+                hint: None,
+            };
+        }
+    }
+    if let Ok(out) = Command::new("python3")
+        .args(["-m", "pip", "--version"])
+        .output()
+    {
+        if out.status.success() {
+            let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !json_mode {
+                println!("- pip: OK (python3 -m pip: {ver})");
+            }
+            return DoctorCheck {
+                name: "pip".to_string(),
+                ok: true,
+                version: Some(ver),
+                hint: None,
+            };
+        }
+    }
+
+    if !json_mode {
+        println!("- pip: MISSING (pip3 not found and `python3 -m pip` failed)");
+        if let Some(h) = &hint {
+            println!("  hint: {h}");
+        }
+    }
+    DoctorCheck {
+        name: "pip".to_string(),
+        ok: false,
+        version: None,
+        hint,
+    }
+}
+
+/// Runs a tool check with structured install hints, formatted for the current
+/// OS when the tool is missing.
+fn run_tool_check_with_hints<S: AsRef<OsStr>>(
+    cmd: &str,
+    args: &[S],
+    label: &str,
+    hints: InstallHints,
+    json_mode: bool,
+) -> DoctorCheck {
+    let hint_str = hints.format();
+    run_tool_check(cmd, args, label, hint_str.as_deref(), json_mode)
+}
+
+/// Runs a tool check and enforces a minimum `(major, minor)` version. The
+/// version is parsed from the first `\d+\.\d+` token of combined stdout/stderr
+/// so it works for `node -v` (`v20.x`) and `python3 --version` (`Python 3.x`)
+/// alike.
+fn run_versioned_tool_check<S: AsRef<OsStr>>(
+    cmd: &str,
+    args: &[S],
+    label: &str,
+    min_version: Option<(u32, u32)>,
+    hints: InstallHints,
+    json_mode: bool,
+) -> DoctorCheck {
+    let hint_str = hints.format();
+    match Command::new(cmd).args(args).output() {
+        Ok(out) if out.status.success() => {
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let ver_line = combined
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let parsed = parse_version(&combined);
+            let meets = match (min_version, parsed) {
+                (Some(min), Some(got)) => got >= min,
+                (Some(_), None) => false,
+                (None, _) => true,
+            };
+            if meets {
+                if !json_mode {
+                    if ver_line.is_empty() {
+                        println!("- {label}: OK ({cmd})");
+                    } else {
+                        println!("- {label}: OK ({cmd}: {ver_line})");
+                    }
+                }
+                DoctorCheck {
+                    name: cmd.to_string(),
+                    ok: true,
+                    version: if ver_line.is_empty() {
+                        None
+                    } else {
+                        Some(ver_line)
+                    },
+                    hint: None,
+                }
+            } else {
+                let min = min_version.expect("meets=false implies min_version is Some");
+                let detail = match parsed {
+                    Some((ma, mi)) => format!("{ma}.{mi}"),
+                    None => "unknown".to_string(),
+                };
+                if !json_mode {
+                    println!(
+                        "- {label}: MISSING ({cmd} version {detail} < required {}.{})",
+                        min.0, min.1
+                    );
+                    if let Some(h) = &hint_str {
+                        println!("  hint: {h}");
+                    }
+                }
+                DoctorCheck {
+                    name: cmd.to_string(),
+                    ok: false,
+                    version: Some(ver_line),
+                    hint: hint_str,
+                }
+            }
+        }
+        Ok(out) => {
+            if !json_mode {
+                println!(
+                    "- {label}: MISSING ({cmd} exited with status {})",
+                    out.status
+                );
+                if let Some(h) = &hint_str {
+                    println!("  hint: {h}");
+                }
+            }
+            DoctorCheck {
+                name: cmd.to_string(),
+                ok: false,
+                version: None,
+                hint: hint_str,
+            }
+        }
+        Err(_) => {
+            if !json_mode {
+                println!("- {label}: MISSING ({cmd} not found in PATH)");
+                if let Some(h) = &hint_str {
+                    println!("  hint: {h}");
+                }
+            }
+            DoctorCheck {
+                name: cmd.to_string(),
+                ok: false,
+                version: None,
+                hint: hint_str,
+            }
+        }
+    }
+}
+
+/// Extracts the first `\d+\.\d+` token from a tool's version output and
+/// returns it as `(major, minor)`. Returns `None` when no such token is found.
+fn parse_version(s: &str) -> Option<(u32, u32)> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b'.' {
+                let dot = i;
+                i += 1;
+                let minor_start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i > minor_start {
+                    let major: u32 = s[start..dot].parse().ok()?;
+                    let minor: u32 = s[minor_start..i].parse().ok()?;
+                    return Some((major, minor));
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
 }
 
 /// Verifies the currently running `weaveffi` binary can introspect its own
@@ -3327,67 +4040,6 @@ fn sanitize_module_name(name: &str) -> String {
     } else {
         out
     }
-}
-
-/// Returns a DoctorCheck per required cross-compilation target (plus a
-/// "rustup" entry when rustup itself is missing).
-fn run_cross_target_checks(json_mode: bool) -> Vec<DoctorCheck> {
-    if !json_mode {
-        println!("\nCross-compilation targets:");
-    }
-
-    let installed = match Command::new("rustup")
-        .args(["target", "list", "--installed"])
-        .output()
-    {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).to_string(),
-        _ => {
-            if !json_mode {
-                println!("- rustup: MISSING (cannot check installed targets)");
-                println!("  hint: install via https://rustup.rs");
-            }
-            return vec![DoctorCheck {
-                name: "rustup".to_string(),
-                ok: false,
-                version: None,
-                hint: Some("install via https://rustup.rs".to_string()),
-            }];
-        }
-    };
-
-    let required = [
-        ("aarch64-apple-ios", "iOS"),
-        ("aarch64-linux-android", "Android"),
-        ("wasm32-unknown-unknown", "WebAssembly"),
-    ];
-
-    let mut checks: Vec<DoctorCheck> = Vec::new();
-    for (target, label) in &required {
-        let ok = installed.lines().any(|line| line.trim() == *target);
-        if !json_mode {
-            if ok {
-                println!("- {} ({}): installed", label, target);
-            } else {
-                println!("- {} ({}): MISSING", label, target);
-                println!("  hint: install with `rustup target add {}`", target);
-            }
-        }
-        checks.push(DoctorCheck {
-            name: format!("target:{target}"),
-            ok,
-            version: if ok {
-                Some((*target).to_string())
-            } else {
-                None
-            },
-            hint: if ok {
-                None
-            } else {
-                Some(format!("install with `rustup target add {target}`"))
-            },
-        });
-    }
-    checks
 }
 
 fn run_tool_check<S: AsRef<OsStr>>(
@@ -4035,12 +4687,16 @@ mod tests {
         let stdout = String::from_utf8_lossy(&cmd.stdout);
         assert!(cmd.status.success(), "doctor failed: {stdout}");
         assert!(
-            stdout.contains("Cross-compilation targets:"),
-            "missing cross-target section in doctor output: {stdout}"
+            stdout.contains("Target swift:"),
+            "missing swift target section in doctor output: {stdout}"
         );
         assert!(
-            stdout.contains("aarch64-apple-ios"),
-            "missing iOS target check: {stdout}"
+            stdout.contains("Target android:"),
+            "missing android target section in doctor output: {stdout}"
+        );
+        assert!(
+            stdout.contains("Target wasm:"),
+            "missing wasm target section in doctor output: {stdout}"
         );
         assert!(
             stdout.contains("aarch64-linux-android"),
@@ -4051,10 +4707,6 @@ mod tests {
             "missing WASM target check: {stdout}"
         );
         assert!(
-            stdout.contains("WebAssembly tools:"),
-            "missing wasm tools section: {stdout}"
-        );
-        assert!(
             stdout.contains("wasm-pack"),
             "missing wasm-pack check: {stdout}"
         );
@@ -4062,6 +4714,131 @@ mod tests {
             stdout.contains("wasm-bindgen-cli"),
             "missing wasm-bindgen-cli check: {stdout}"
         );
+    }
+
+    #[test]
+    fn doctor_checks_per_target_toolchains() {
+        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .arg("doctor")
+            .output()
+            .expect("failed to run weaveffi doctor");
+
+        let stdout = String::from_utf8_lossy(&cmd.stdout);
+        for target in [
+            "c", "cpp", "swift", "android", "node", "wasm", "python", "dotnet", "dart", "go",
+            "ruby",
+        ] {
+            assert!(
+                stdout.contains(&format!("Target {target}:")),
+                "missing `Target {target}:` section in doctor output: {stdout}"
+            );
+        }
+        for tool in [
+            "C/C++ compiler",
+            "CMake",
+            "Swift compiler",
+            "SwiftPM (swift package)",
+            "Android NDK (ndk-build)",
+            "Node.js",
+            "npm",
+            "node-gyp",
+            "Python 3",
+            "pip",
+            ".NET SDK",
+            "Dart SDK",
+            "Flutter (optional)",
+            "Go",
+            "Ruby",
+            "RubyGems (gem)",
+            "Bundler",
+        ] {
+            assert!(
+                stdout.contains(tool),
+                "missing `{tool}` check in doctor output: {stdout}"
+            );
+        }
+
+        let filtered = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .args(["doctor", "--target", "node,python"])
+            .output()
+            .expect("failed to run weaveffi doctor --target");
+        let filtered_stdout = String::from_utf8_lossy(&filtered.stdout);
+        assert!(
+            filtered_stdout.contains("Target node:"),
+            "--target node,python should include node section: {filtered_stdout}"
+        );
+        assert!(
+            filtered_stdout.contains("Target python:"),
+            "--target node,python should include python section: {filtered_stdout}"
+        );
+        for excluded in [
+            "Target c:",
+            "Target cpp:",
+            "Target swift:",
+            "Target android:",
+            "Target wasm:",
+            "Target dotnet:",
+            "Target dart:",
+            "Target go:",
+            "Target ruby:",
+        ] {
+            assert!(
+                !filtered_stdout.contains(excluded),
+                "--target node,python should exclude `{excluded}` section: {filtered_stdout}"
+            );
+        }
+
+        let unknown = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .args(["doctor", "--target", "bogus"])
+            .output()
+            .expect("failed to run weaveffi doctor --target bogus");
+        assert!(
+            !unknown.status.success(),
+            "doctor must reject unknown --target values: stdout={}, stderr={}",
+            String::from_utf8_lossy(&unknown.stdout),
+            String::from_utf8_lossy(&unknown.stderr),
+        );
+    }
+
+    #[test]
+    fn doctor_hint_format_uses_current_os() {
+        let hints = InstallHints {
+            brew: Some("cmake"),
+            apt: Some("cmake"),
+            dnf: Some("cmake"),
+            winget: Some("Kitware.CMake"),
+            ..Default::default()
+        };
+        let formatted = hints.format().expect("install hints should format");
+        if cfg!(target_os = "macos") {
+            assert_eq!(formatted, "brew install cmake");
+        } else if cfg!(target_os = "windows") {
+            assert_eq!(formatted, "winget install Kitware.CMake");
+        } else if cfg!(target_os = "linux") {
+            assert!(
+                formatted.contains("apt install cmake"),
+                "linux hint should include apt: {formatted}"
+            );
+            assert!(
+                formatted.contains("dnf install cmake"),
+                "linux hint should include dnf: {formatted}"
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_parse_version_extracts_first_major_minor() {
+        assert_eq!(parse_version("v20.10.0"), Some((20, 10)));
+        assert_eq!(parse_version("Python 3.11.4"), Some((3, 11)));
+        assert_eq!(
+            parse_version("go version go1.21.5 darwin/arm64"),
+            Some((1, 21))
+        );
+        assert_eq!(parse_version("8.0.100"), Some((8, 0)));
+        assert_eq!(parse_version("no digits here"), None);
     }
 
     #[test]
