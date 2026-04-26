@@ -110,6 +110,13 @@ enum Commands {
         shell: clap_complete::Shell,
     },
     SchemaVersion,
+    CheckStamp {
+        /// Directory of generated files to scan
+        dir: String,
+        /// Expected IR schema version (defaults to the current schema version)
+        #[arg(long)]
+        expected_ir_version: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -174,6 +181,14 @@ fn main() -> Result<()> {
         Commands::Doctor => cmd_doctor()?,
         Commands::Completions { shell } => cmd_completions(shell),
         Commands::SchemaVersion => println!("{CURRENT_SCHEMA_VERSION}"),
+        Commands::CheckStamp {
+            dir,
+            expected_ir_version,
+        } => {
+            if !cmd_check_stamp(&dir, expected_ir_version.as_deref(), quiet)? {
+                std::process::exit(1);
+            }
+        }
     }
     Ok(())
 }
@@ -892,6 +907,89 @@ fn print_unified_diff(path: &str, old: &str, new: &str) {
     for hunk in diff.unified_diff().context_radius(3).iter_hunks() {
         println!("{hunk}");
     }
+}
+
+/// Returns `Ok(true)` when every file in `dir` carries a matching stamp,
+/// `Ok(false)` when one or more files are missing a stamp or carry a
+/// mismatching IR version. Callers convert a `false` result into exit code 1.
+fn cmd_check_stamp(dir: &str, expected_ir_version: Option<&str>, quiet: bool) -> Result<bool> {
+    let dir_path = Utf8Path::new(dir);
+    if !dir_path.exists() {
+        bail!("directory does not exist: {}", dir);
+    }
+    if !dir_path.is_dir() {
+        bail!("path is not a directory: {}", dir);
+    }
+    let expected = expected_ir_version.unwrap_or(CURRENT_SCHEMA_VERSION);
+
+    let files = collect_relative_files(dir_path)?;
+    let mut problems: Vec<String> = Vec::new();
+    let mut checked: usize = 0;
+
+    for rel in &files {
+        if should_skip_stamp_check(rel) {
+            continue;
+        }
+
+        let full_path = dir_path.join(rel);
+        let contents = match std::fs::read_to_string(full_path.as_std_path()) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        match extract_stamp_ir_version(&contents) {
+            Some(version) if version == expected => {
+                checked += 1;
+            }
+            Some(version) => {
+                checked += 1;
+                problems.push(format!(
+                    "{rel}: IR version mismatch (expected {expected}, got {version})"
+                ));
+            }
+            None => {
+                problems.push(format!("{rel}: missing stamp"));
+            }
+        }
+    }
+
+    if problems.is_empty() {
+        if !quiet {
+            println!("All {checked} files have matching stamps (IR version {expected})");
+        }
+        Ok(true)
+    } else {
+        for p in &problems {
+            eprintln!("{p}");
+        }
+        Ok(false)
+    }
+}
+
+/// Files that cannot carry a comment-based stamp (JSON, XML build manifests,
+/// known binary artefacts) are excluded so the check doesn't false-positive.
+fn should_skip_stamp_check(rel: &str) -> bool {
+    let ext = Utf8Path::new(rel).extension().unwrap_or("");
+    matches!(
+        ext,
+        "json" | "csproj" | "nuspec" | "node" | "wasm" | "so" | "dylib" | "dll" | "a" | "lib" | "o"
+    )
+}
+
+/// Pulls the IR version token out of a stamp line like
+/// `// WeaveFFI 0.4.0 c 0.1.0 - DO NOT EDIT - ...`.
+/// Scans the first few lines so files that put a language directive before the
+/// stamp (e.g. Swift's `swift-tools-version`) still parse.
+fn extract_stamp_ir_version(contents: &str) -> Option<&str> {
+    for line in contents.lines().take(20) {
+        if let Some(pos) = line.find("WeaveFFI ") {
+            let rest = &line[pos + "WeaveFFI ".len()..];
+            if rest.contains("DO NOT EDIT") {
+                return rest.split_whitespace().next();
+            }
+        }
+    }
+    None
 }
 
 fn format_parse_error(filename: &str, err: ParseError) -> Report {
@@ -1910,5 +2008,67 @@ mod tests {
                 "expected [new file] in every line, got: {line}"
             );
         }
+    }
+
+    #[test]
+    fn check_stamp_passes_for_freshly_generated_dir() {
+        let _ = color_eyre::install();
+        let dir = tempfile::tempdir().unwrap();
+        let yml = dir.path().join("api.yml");
+        std::fs::write(
+            &yml,
+            concat!(
+                "version: \"0.1.0\"\n",
+                "modules:\n",
+                "  - name: math\n",
+                "    functions:\n",
+                "      - name: add\n",
+                "        params:\n",
+                "          - { name: a, type: i32 }\n",
+                "          - { name: b, type: i32 }\n",
+                "        return: i32\n",
+            ),
+        )
+        .unwrap();
+
+        let out = dir.path().join("out");
+        let input = yml.to_str().unwrap();
+        let out_str = out.to_str().unwrap();
+
+        cmd_generate(
+            input,
+            out_str,
+            Some("c"),
+            false,
+            None,
+            false,
+            false,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            cmd_check_stamp(out_str, None, true).unwrap(),
+            "freshly generated dir should pass the default stamp check"
+        );
+        assert!(
+            cmd_check_stamp(out_str, Some(CURRENT_SCHEMA_VERSION), true).unwrap(),
+            "freshly generated dir should pass when expected IR version is supplied explicitly"
+        );
+        assert!(
+            !cmd_check_stamp(out_str, Some("9.9.9-mismatch"), true).unwrap(),
+            "stamp check should fail when the expected IR version does not match"
+        );
+    }
+
+    #[test]
+    fn extract_stamp_ir_version_parses_first_stamp() {
+        let stamped = "// WeaveFFI 1.2.3 c 0.4.0 - DO NOT EDIT - regenerate with 'weaveffi generate'\n\npub fn foo() {}\n";
+        assert_eq!(extract_stamp_ir_version(stamped), Some("1.2.3"));
+
+        let no_stamp = "# WeaveFFI Python Bindings\n\nAuto-generated docs.\n";
+        assert_eq!(extract_stamp_ir_version(no_stamp), None);
     }
 }
