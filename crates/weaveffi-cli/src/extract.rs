@@ -8,9 +8,12 @@ fn has_attr(attrs: &[syn::Attribute], name: &str) -> bool {
     attrs.iter().any(|a| a.path().is_ident(name))
 }
 
-fn has_repr_i32(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|a| {
-        a.path().is_ident("repr") && a.parse_args::<syn::Ident>().is_ok_and(|id| id == "i32")
+fn find_enum_repr(attrs: &[syn::Attribute]) -> Option<String> {
+    attrs.iter().find_map(|a| {
+        if !a.path().is_ident("repr") {
+            return None;
+        }
+        a.parse_args::<syn::Ident>().ok().map(|id| id.to_string())
     })
 }
 
@@ -470,11 +473,17 @@ fn extract_struct(item: &syn::ItemStruct) -> Result<StructDef> {
 }
 
 fn extract_enum(item: &syn::ItemEnum) -> Result<EnumDef> {
-    if !has_repr_i32(&item.attrs) {
-        bail!(
+    match find_enum_repr(&item.attrs).as_deref() {
+        None => bail!(
             "enum `{}` must have #[repr(i32)] to be a weaveffi_enum",
             item.ident
-        );
+        ),
+        Some("i32") => {}
+        Some(other) => bail!(
+            "enum `{}` has #[repr({})] but only #[repr(i32)] is currently supported",
+            item.ident,
+            other
+        ),
     }
     let name = item.ident.to_string();
     let variants = item
@@ -826,6 +835,29 @@ mod tests {
             format!("{err}").contains("repr(i32)"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn extract_enum_with_unsupported_repr_rejected() {
+        for repr in ["u8", "u32", "i64"] {
+            let src = format!(
+                r#"
+                mod m {{
+                    #[weaveffi_enum]
+                    #[repr({repr})]
+                    enum Bad {{
+                        A = 0,
+                    }}
+                }}
+            "#
+            );
+            let err = extract_api_from_rust(&src).unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(&format!("repr({repr})")) && msg.contains("repr(i32)"),
+                "unexpected error for repr({repr}): {msg}"
+            );
+        }
     }
 
     #[test]

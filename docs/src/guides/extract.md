@@ -69,6 +69,8 @@ mod status {
 - Negative discriminants are supported (e.g. `Neg = -1`).
 - Variants without explicit values cause an extraction error.
 - Enums without `#[repr(i32)]` cause an extraction error.
+- Other integer reprs (`#[repr(u8)]`, `#[repr(u32)]`, `#[repr(i64)]`, …) are
+  rejected with a clear error. Only `#[repr(i32)]` is currently supported.
 
 ## Type mapping rules
 
@@ -237,7 +239,8 @@ patterns are **not** supported:
 
 - **Enums without `#[repr(i32)]`.** The extractor requires `#[repr(i32)]` and
   explicit discriminants on every variant. Rust-style enums with data payloads
-  are not supported.
+  are not supported. Enums with other integer reprs (`u8`, `u32`, `i64`, …)
+  are rejected with a clear error; only `#[repr(i32)]` is currently accepted.
 
 - **Macro-generated items.** Items produced by procedural or declarative macros
   are invisible to the extractor since it operates on unexpanded source.
