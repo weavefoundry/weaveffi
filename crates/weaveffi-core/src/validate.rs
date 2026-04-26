@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use weaveffi_ir::ir::{Api, ErrorDomain, Function, Module, Param, TypeRef};
 
+use crate::codegen::Capability;
+
 #[derive(Debug, Clone)]
 pub enum ValidationWarning {
     LargeEnumVariantCount {
@@ -244,6 +246,12 @@ pub enum ValidationError {
     IteratorInInvalidPosition { location: String },
     #[error("builder struct '{name}' in module '{module}' must have at least one field")]
     BuilderStructEmpty { module: String, name: String },
+    #[error("target '{target}' does not support capability '{capability}' required by {location}")]
+    TargetMissingCapability {
+        target: String,
+        capability: String,
+        location: String,
+    },
 }
 
 const RESERVED: &[&str] = &[
@@ -708,6 +716,216 @@ fn validate_error_domain(
                 code: c.code,
             });
         }
+    }
+    Ok(())
+}
+
+fn capability_name(cap: Capability) -> &'static str {
+    match cap {
+        Capability::Callbacks => "callbacks",
+        Capability::Listeners => "listeners",
+        Capability::Iterators => "iterators",
+        Capability::Builders => "builders",
+        Capability::AsyncFunctions => "async_functions",
+        Capability::CancellableAsync => "cancellable_async",
+        Capability::TypedHandles => "typed_handles",
+        Capability::BorrowedTypes => "borrowed_types",
+        Capability::MapTypes => "map_types",
+        Capability::NestedModules => "nested_modules",
+        Capability::CrossModuleTypes => "cross_module_types",
+        Capability::ErrorDomains => "error_domains",
+        Capability::DeprecatedAnnotations => "deprecated_annotations",
+    }
+}
+
+fn require_capability(
+    generator_caps: &[(&str, &[Capability])],
+    cap: Capability,
+    location: &str,
+) -> Result<(), ValidationError> {
+    for (name, caps) in generator_caps {
+        if !caps.contains(&cap) {
+            return Err(ValidationError::TargetMissingCapability {
+                target: (*name).to_string(),
+                capability: capability_name(cap).to_string(),
+                location: location.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn check_type_ref_capabilities(
+    ty: &TypeRef,
+    location: &str,
+    generator_caps: &[(&str, &[Capability])],
+) -> Result<(), ValidationError> {
+    match ty {
+        TypeRef::Iterator(inner) => {
+            require_capability(generator_caps, Capability::Iterators, location)?;
+            check_type_ref_capabilities(inner, location, generator_caps)?;
+        }
+        TypeRef::TypedHandle(_) => {
+            require_capability(generator_caps, Capability::TypedHandles, location)?;
+        }
+        TypeRef::BorrowedStr | TypeRef::BorrowedBytes => {
+            require_capability(generator_caps, Capability::BorrowedTypes, location)?;
+        }
+        TypeRef::Map(k, v) => {
+            require_capability(generator_caps, Capability::MapTypes, location)?;
+            check_type_ref_capabilities(k, location, generator_caps)?;
+            check_type_ref_capabilities(v, location, generator_caps)?;
+        }
+        TypeRef::Optional(inner) | TypeRef::List(inner) => {
+            check_type_ref_capabilities(inner, location, generator_caps)?;
+        }
+        TypeRef::Struct(name) | TypeRef::Enum(name) => {
+            if name.contains('.') {
+                require_capability(generator_caps, Capability::CrossModuleTypes, location)?;
+            }
+        }
+        TypeRef::Callback(sig) => {
+            require_capability(generator_caps, Capability::Callbacks, location)?;
+            for p in &sig.params {
+                check_type_ref_capabilities(&p.ty, location, generator_caps)?;
+            }
+            if let Some(ret) = &sig.returns {
+                check_type_ref_capabilities(ret, location, generator_caps)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn check_module_capabilities(
+    module: &Module,
+    generator_caps: &[(&str, &[Capability])],
+) -> Result<(), ValidationError> {
+    if !module.callbacks.is_empty() {
+        require_capability(
+            generator_caps,
+            Capability::Callbacks,
+            &format!("module '{}' callbacks", module.name),
+        )?;
+        for cb in &module.callbacks {
+            for p in &cb.params {
+                check_type_ref_capabilities(
+                    &p.ty,
+                    &format!(
+                        "param '{}' of callback '{}::{}'",
+                        p.name, module.name, cb.name
+                    ),
+                    generator_caps,
+                )?;
+            }
+        }
+    }
+
+    if !module.listeners.is_empty() {
+        require_capability(
+            generator_caps,
+            Capability::Listeners,
+            &format!("module '{}' listeners", module.name),
+        )?;
+    }
+
+    if module.errors.is_some() {
+        require_capability(
+            generator_caps,
+            Capability::ErrorDomains,
+            &format!("module '{}' error domain", module.name),
+        )?;
+    }
+
+    if !module.modules.is_empty() {
+        require_capability(
+            generator_caps,
+            Capability::NestedModules,
+            &format!("module '{}' nested modules", module.name),
+        )?;
+    }
+
+    for f in &module.functions {
+        if f.r#async {
+            require_capability(
+                generator_caps,
+                Capability::AsyncFunctions,
+                &format!("async function '{}::{}'", module.name, f.name),
+            )?;
+            if f.cancellable {
+                require_capability(
+                    generator_caps,
+                    Capability::CancellableAsync,
+                    &format!("cancellable async function '{}::{}'", module.name, f.name),
+                )?;
+            }
+        }
+        if f.deprecated.is_some() {
+            require_capability(
+                generator_caps,
+                Capability::DeprecatedAnnotations,
+                &format!("deprecated function '{}::{}'", module.name, f.name),
+            )?;
+        }
+        for p in &f.params {
+            check_type_ref_capabilities(
+                &p.ty,
+                &format!(
+                    "param '{}' of function '{}::{}'",
+                    p.name, module.name, f.name
+                ),
+                generator_caps,
+            )?;
+        }
+        if let Some(ret) = &f.returns {
+            check_type_ref_capabilities(
+                ret,
+                &format!("return of function '{}::{}'", module.name, f.name),
+                generator_caps,
+            )?;
+        }
+    }
+
+    for s in &module.structs {
+        if s.builder {
+            require_capability(
+                generator_caps,
+                Capability::Builders,
+                &format!("builder struct '{}::{}'", module.name, s.name),
+            )?;
+        }
+        for fld in &s.fields {
+            check_type_ref_capabilities(
+                &fld.ty,
+                &format!(
+                    "field '{}' of struct '{}::{}'",
+                    fld.name, module.name, s.name
+                ),
+                generator_caps,
+            )?;
+        }
+    }
+
+    for sub in &module.modules {
+        check_module_capabilities(sub, generator_caps)?;
+    }
+
+    Ok(())
+}
+
+/// Validate that every IR feature used by `api` is supported by all selected generators.
+///
+/// `generator_caps` should contain an entry per user-selected generator, pairing the
+/// generator's name with its declared capability set. Call this after [`validate_api`]
+/// so type references are resolved (cross-module references are detected via the
+/// qualified `module.Name` form produced by `resolve_type_refs`).
+pub fn validate_capabilities(
+    api: &Api,
+    generator_caps: &[(&str, &[Capability])],
+) -> Result<(), ValidationError> {
+    for module in &api.modules {
+        check_module_capabilities(module, generator_caps)?;
     }
     Ok(())
 }
@@ -3342,5 +3560,148 @@ mod tests {
         assert!(!warnings
             .iter()
             .any(|w| matches!(w, ValidationWarning::DeprecatedFunction { .. })));
+    }
+
+    const NODE_CAPS: &[Capability] = &[
+        Capability::Iterators,
+        Capability::Builders,
+        Capability::AsyncFunctions,
+        Capability::TypedHandles,
+        Capability::BorrowedTypes,
+        Capability::MapTypes,
+        Capability::NestedModules,
+        Capability::CrossModuleTypes,
+        Capability::ErrorDomains,
+        Capability::DeprecatedAnnotations,
+    ];
+
+    const GO_CAPS: &[Capability] = &[
+        Capability::CancellableAsync,
+        Capability::TypedHandles,
+        Capability::BorrowedTypes,
+        Capability::MapTypes,
+        Capability::NestedModules,
+        Capability::CrossModuleTypes,
+        Capability::ErrorDomains,
+        Capability::DeprecatedAnnotations,
+    ];
+
+    const RUBY_CAPS: &[Capability] = &[
+        Capability::Builders,
+        Capability::CancellableAsync,
+        Capability::TypedHandles,
+        Capability::BorrowedTypes,
+        Capability::MapTypes,
+        Capability::NestedModules,
+        Capability::CrossModuleTypes,
+        Capability::ErrorDomains,
+        Capability::DeprecatedAnnotations,
+    ];
+
+    #[test]
+    fn callback_in_api_with_node_target_rejected() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "events".to_string(),
+                functions: vec![simple_function("subscribe")],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![CallbackDef {
+                    name: "on_data".to_string(),
+                    params: vec![Param {
+                        name: "payload".to_string(),
+                        ty: TypeRef::StringUtf8,
+                        mutable: false,
+                    }],
+                    doc: None,
+                }],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        validate_api(&mut api).unwrap();
+
+        let caps: &[(&str, &[Capability])] = &[("node", NODE_CAPS)];
+        let err = validate_capabilities(&api, caps).unwrap_err();
+        assert!(matches!(
+            err,
+            ValidationError::TargetMissingCapability { target, capability, .. }
+                if target == "node" && capability == "callbacks"
+        ));
+    }
+
+    #[test]
+    fn iterator_in_api_with_go_target_rejected() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "items".to_string(),
+                functions: vec![Function {
+                    name: "stream".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::Iterator(Box::new(TypeRef::I32))),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        validate_api(&mut api).unwrap();
+
+        let caps: &[(&str, &[Capability])] = &[("go", GO_CAPS)];
+        let err = validate_capabilities(&api, caps).unwrap_err();
+        assert!(matches!(
+            err,
+            ValidationError::TargetMissingCapability { target, capability, .. }
+                if target == "go" && capability == "iterators"
+        ));
+    }
+
+    #[test]
+    fn async_in_api_with_ruby_target_rejected() {
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "net".to_string(),
+                functions: vec![Function {
+                    name: "fetch".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::StringUtf8),
+                    doc: None,
+                    r#async: true,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        validate_api(&mut api).unwrap();
+
+        let caps: &[(&str, &[Capability])] = &[("ruby", RUBY_CAPS)];
+        let err = validate_capabilities(&api, caps).unwrap_err();
+        assert!(matches!(
+            err,
+            ValidationError::TargetMissingCapability { target, capability, .. }
+                if target == "ruby" && capability == "async_functions"
+        ));
     }
 }

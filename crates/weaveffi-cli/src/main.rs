@@ -11,10 +11,12 @@ use std::env;
 use std::ffi::OsStr;
 use std::process::Command;
 use tracing_subscriber::EnvFilter;
-use weaveffi_core::codegen::{Generator, Orchestrator};
+use weaveffi_core::codegen::{Capability, Generator, Orchestrator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::templates::TemplateEngine;
-use weaveffi_core::validate::{collect_warnings, validate_api, ValidationError};
+use weaveffi_core::validate::{
+    collect_warnings, validate_api, validate_capabilities, ValidationError,
+};
 use weaveffi_gen_android::AndroidGenerator;
 use weaveffi_gen_c::CGenerator;
 use weaveffi_gen_cpp::CppGenerator;
@@ -402,6 +404,12 @@ fn cmd_generate(
         .filter(|gen| filter.as_ref().is_none_or(|ts| ts.contains(&gen.name())))
         .collect();
 
+    let selected_caps: Vec<(&str, &[Capability])> = selected
+        .iter()
+        .map(|g| (g.name(), g.capabilities()))
+        .collect();
+    validate_capabilities(&api, &selected_caps).map_err(format_validation_error)?;
+
     if dry_run {
         for gen in &selected {
             for path in gen.output_files_with_config(&api, out_dir, &config) {
@@ -770,6 +778,9 @@ fn validation_suggestion(err: &ValidationError) -> &'static str {
         ValidationError::BuilderStructEmpty { .. } => {
             "builder structs must have at least one field; add a field or set builder: false"
         }
+        ValidationError::TargetMissingCapability { .. } => {
+            "the selected target does not support this IR feature; remove the target with --targets, or remove the unsupported feature from the API"
+        }
     }
 }
 
@@ -1067,6 +1078,11 @@ mod tests {
             ValidationError::DuplicateListenerName {
                 module: "m".into(),
                 name: "l".into(),
+            },
+            ValidationError::TargetMissingCapability {
+                target: "node".into(),
+                capability: "callbacks".into(),
+                location: "module 'events' callbacks".into(),
             },
         ];
 

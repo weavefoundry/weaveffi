@@ -16,6 +16,8 @@ fn generate_async_demo_all_targets() {
             input.to_str().unwrap(),
             "-o",
             out_path.to_str().unwrap(),
+            "--target",
+            "c,cpp,swift,android,node,wasm,python,dotnet,dart",
         ])
         .assert()
         .success();
