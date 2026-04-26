@@ -4,7 +4,9 @@ use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name, wrapper_name};
-use weaveffi_ir::ir::{Api, EnumDef, Function, Module, Param, StructDef, StructField, TypeRef};
+use weaveffi_ir::ir::{
+    Api, CallbackDef, EnumDef, Function, Module, Param, StructDef, StructField, TypeRef,
+};
 
 pub struct SwiftGenerator;
 
@@ -96,6 +98,7 @@ impl Generator for SwiftGenerator {
 
     fn capabilities(&self) -> &'static [Capability] {
         &[
+            Capability::Callbacks,
             Capability::Iterators,
             Capability::Builders,
             Capability::AsyncFunctions,
@@ -127,7 +130,7 @@ fn swift_type_for(t: &TypeRef) -> String {
         TypeRef::List(inner) => format!("[{}]", swift_type_for(inner)),
         TypeRef::Map(k, v) => format!("[{}: {}]", swift_type_for(k), swift_type_for(v)),
         TypeRef::Iterator(inner) => format!("[{}]", swift_type_for(inner)),
-        TypeRef::Callback(_) => unreachable!("validator should have rejected callback Swift type"),
+        TypeRef::Callback(name) => name.clone(),
     }
 }
 
@@ -275,6 +278,9 @@ fn render_swift_module_types(out: &mut String, m: &Module, module_path: &str) {
     for e in &m.enums {
         render_swift_enum(out, e);
     }
+    for cb in &m.callbacks {
+        render_swift_callback_type(out, cb);
+    }
     for s in &m.structs {
         render_swift_struct(out, module_path, s);
         if s.builder {
@@ -285,6 +291,28 @@ fn render_swift_module_types(out: &mut String, m: &Module, module_path: &str) {
         let sub_path = format!("{module_path}_{}", sub.name);
         render_swift_module_types(out, sub, &sub_path);
     }
+}
+
+fn render_swift_callback_type(out: &mut String, cb: &CallbackDef) {
+    let params: Vec<String> = cb.params.iter().map(|p| swift_type_for(&p.ty)).collect();
+    let ret = cb
+        .returns
+        .as_ref()
+        .map(swift_type_for)
+        .unwrap_or_else(|| "Void".to_string());
+    out.push_str(&format!(
+        "public typealias {} = ({}) -> {}\n",
+        cb.name,
+        params.join(", "),
+        ret
+    ));
+    out.push_str(&format!("private final class {}Ref {{\n", cb.name));
+    out.push_str(&format!("    let closure: {}\n", cb.name));
+    out.push_str(&format!(
+        "    init(_ closure: @escaping {}) {{ self.closure = closure }}\n",
+        cb.name
+    ));
+    out.push_str("}\n\n");
 }
 
 fn render_swift_module_body(
@@ -300,7 +328,7 @@ fn render_swift_module_body(
         if f.r#async {
             render_swift_async_function(&mut buf, module_path, f, strip_module_prefix);
         } else {
-            render_swift_function(&mut buf, module_path, f, strip_module_prefix);
+            render_swift_function(&mut buf, module_path, f, &m.callbacks, strip_module_prefix);
         }
         if depth > 1 {
             let extra = "    ".repeat(depth - 1);
@@ -526,6 +554,7 @@ fn render_swift_function(
     out: &mut String,
     module_name: &str,
     f: &Function,
+    callbacks: &[CallbackDef],
     strip_module_prefix: bool,
 ) {
     if let Some(msg) = &f.deprecated {
@@ -538,7 +567,14 @@ fn render_swift_function(
     let params_sig: Vec<String> = f
         .params
         .iter()
-        .map(|p| format!("_ {}: {}", p.name, swift_type_for(&p.ty)))
+        .map(|p| {
+            let prefix = if matches!(p.ty, TypeRef::Callback(_)) {
+                "@escaping "
+            } else {
+                ""
+            };
+            format!("_ {}: {}{}", p.name, prefix, swift_type_for(&p.ty))
+        })
         .collect();
     let ret_swift = f
         .returns
@@ -552,6 +588,16 @@ fn render_swift_function(
         ret_swift
     ));
     out.push_str("        var err = weaveffi_error(code: 0, message: nil)\n");
+
+    for p in &f.params {
+        if let TypeRef::Callback(cb_name) = &p.ty {
+            let cb = callbacks
+                .iter()
+                .find(|c| c.name == *cb_name)
+                .expect("validator should have ensured callback is defined in this module");
+            render_swift_callback_param_setup(out, &p.name, cb);
+        }
+    }
 
     let c_sym = c_symbol_name(module_name, &f.name);
     let call_args = build_c_call_args(&f.params, module_name);
@@ -568,6 +614,118 @@ fn render_swift_function(
     }
 
     out.push_str("    }\n");
+}
+
+/// Emit the Swift-to-C bridge for a callback parameter: box the closure via
+/// `Unmanaged.passRetained`, then define a `@convention(c)` static trampoline
+/// that recovers the closure from the context pointer and invokes it.
+fn render_swift_callback_param_setup(out: &mut String, param_name: &str, cb: &CallbackDef) {
+    out.push_str(&format!(
+        "        let {n}_ref = {cb}Ref({n})\n",
+        n = param_name,
+        cb = cb.name
+    ));
+    out.push_str(&format!(
+        "        let {n}_ctx = Unmanaged.passRetained({n}_ref).toOpaque()\n",
+        n = param_name
+    ));
+
+    let mut c_sig_types: Vec<String> = vec!["UnsafeMutableRawPointer?".to_string()];
+    let mut tramp_param_names: Vec<String> = vec!["context".to_string()];
+    for cp in &cb.params {
+        c_sig_types.extend(callback_c_param_types(&cp.ty));
+        tramp_param_names.extend(callback_c_param_names(&cp.ty, &cp.name));
+    }
+    let ret_c = cb
+        .returns
+        .as_ref()
+        .map(callback_c_return_type)
+        .unwrap_or_else(|| "Void".to_string());
+
+    out.push_str(&format!(
+        "        let {n}_cb: @convention(c) ({sig}) -> {ret} = {{ {args} in\n",
+        n = param_name,
+        sig = c_sig_types.join(", "),
+        ret = ret_c,
+        args = tramp_param_names.join(", "),
+    ));
+    out.push_str(&format!(
+        "            let ref = Unmanaged<{cb}Ref>.fromOpaque(context!).takeUnretainedValue()\n",
+        cb = cb.name
+    ));
+    let mut swift_args: Vec<String> = Vec::new();
+    for cp in &cb.params {
+        let (conv, arg) = callback_c_to_swift(&cp.ty, &cp.name);
+        if !conv.is_empty() {
+            out.push_str(&format!("            {conv}\n"));
+        }
+        swift_args.push(arg);
+    }
+    out.push_str(&format!(
+        "            ref.closure({args})\n",
+        args = swift_args.join(", ")
+    ));
+    out.push_str("        }\n");
+}
+
+/// C-side Swift types for a callback parameter of the given IR type.
+/// Returns one or two entries (two for string/bytes `ptr, len` pairs).
+fn callback_c_param_types(ty: &TypeRef) -> Vec<String> {
+    match ty {
+        TypeRef::I32 => vec!["Int32".into()],
+        TypeRef::U32 => vec!["UInt32".into()],
+        TypeRef::I64 => vec!["Int64".into()],
+        TypeRef::F64 => vec!["Double".into()],
+        TypeRef::Bool => vec!["Bool".into()],
+        TypeRef::Handle => vec!["UInt64".into()],
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr | TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            vec!["UnsafePointer<UInt8>?".into(), "Int".into()]
+        }
+        _ => unreachable!("unsupported callback parameter type: {ty:?}"),
+    }
+}
+
+fn callback_c_param_names(ty: &TypeRef, name: &str) -> Vec<String> {
+    match ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr | TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            vec![format!("{}_ptr", name), format!("{}_len", name)]
+        }
+        _ => vec![name.to_string()],
+    }
+}
+
+fn callback_c_return_type(ty: &TypeRef) -> String {
+    match ty {
+        TypeRef::I32 => "Int32".into(),
+        TypeRef::U32 => "UInt32".into(),
+        TypeRef::I64 => "Int64".into(),
+        TypeRef::F64 => "Double".into(),
+        TypeRef::Bool => "Bool".into(),
+        TypeRef::Handle => "UInt64".into(),
+        _ => unreachable!("unsupported callback return type: {ty:?}"),
+    }
+}
+
+/// Convert the C-side trampoline arguments back into Swift values before
+/// invoking the user's closure. Returns `(conversion_statement, swift_arg)`.
+fn callback_c_to_swift(ty: &TypeRef, name: &str) -> (String, String) {
+    match ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            let conv = format!(
+                "let {n} = {n}_ptr.map {{ String(decoding: UnsafeBufferPointer(start: $0, count: {n}_len), as: UTF8.self) }} ?? \"\"",
+                n = name
+            );
+            (conv, name.to_string())
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            let conv = format!(
+                "let {n} = {n}_ptr.map {{ Data(bytes: $0, count: {n}_len) }} ?? Data()",
+                n = name
+            );
+            (conv, name.to_string())
+        }
+        _ => (String::new(), name.to_string()),
+    }
 }
 
 fn render_swift_async_function(
@@ -1176,6 +1334,10 @@ fn build_c_call_args(params: &[Param], module_name: &str) -> String {
                 args.push(format!("{}_keys_ptr", p.name));
                 args.push(format!("{}_values_ptr", p.name));
                 args.push(format!("{}_len", p.name));
+            }
+            TypeRef::Callback(_) => {
+                args.push(format!("{}_cb", p.name));
+                args.push(format!("{}_ctx", p.name));
             }
             _ => args.push(p.name.clone()),
         }
@@ -4630,12 +4792,12 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_excludes_callbacks_and_listeners() {
+    fn capabilities_includes_callbacks_and_excludes_listeners() {
         let caps = SwiftGenerator.capabilities();
-        assert!(!caps.contains(&Capability::Callbacks));
+        assert!(caps.contains(&Capability::Callbacks));
         assert!(!caps.contains(&Capability::Listeners));
         for cap in Capability::ALL {
-            if matches!(cap, Capability::Callbacks | Capability::Listeners) {
+            if matches!(cap, Capability::Listeners) {
                 continue;
             }
             assert!(caps.contains(cap), "Swift generator must support {cap:?}");
@@ -4643,20 +4805,77 @@ mod tests {
     }
 
     #[test]
-    fn callback_type_panics_with_validator_message() {
-        let cb = TypeRef::Callback("OnEvent".into());
-        let err = std::panic::catch_unwind(|| {
-            let _ = swift_type_for(&cb);
-        })
-        .expect_err("callback must panic");
-        let msg = err
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| err.downcast_ref::<&'static str>().map(|s| s.to_string()))
-            .unwrap_or_default();
+    fn swift_emits_callback_typealias_and_wraps_closure() {
+        let api = make_api(vec![Module {
+            name: "events".to_string(),
+            functions: vec![Function {
+                name: "subscribe".to_string(),
+                params: vec![Param {
+                    name: "handler".to_string(),
+                    ty: TypeRef::Callback("OnData".into()),
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![CallbackDef {
+                name: "OnData".to_string(),
+                params: vec![Param {
+                    name: "value".to_string(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+            }],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let swift = render_swift_wrapper(&api, true);
+
         assert!(
-            msg.contains("validator should have rejected"),
-            "panic message did not mention validator: {msg}"
+            swift.contains("public typealias OnData = (Int32) -> Void"),
+            "missing Swift typealias for OnData: {swift}"
+        );
+        assert!(
+            swift.contains("private final class OnDataRef {"),
+            "missing ref box class for OnData: {swift}"
+        );
+        assert!(
+            swift.contains("_ handler: @escaping OnData"),
+            "wrapper must take an @escaping OnData closure: {swift}"
+        );
+        assert!(
+            swift.contains("let handler_ref = OnDataRef(handler)"),
+            "wrapper must box the closure: {swift}"
+        );
+        assert!(
+            swift.contains("Unmanaged.passRetained(handler_ref).toOpaque()"),
+            "wrapper must retain the box via Unmanaged.passRetained: {swift}"
+        );
+        assert!(
+            swift.contains("@convention(c) (UnsafeMutableRawPointer?, Int32) -> Void"),
+            "wrapper must declare a @convention(c) trampoline matching the C callback signature: {swift}"
+        );
+        assert!(
+            swift.contains("Unmanaged<OnDataRef>.fromOpaque(context!).takeUnretainedValue()"),
+            "trampoline must recover the closure from the context pointer: {swift}"
+        );
+        assert!(
+            swift.contains("ref.closure(value)"),
+            "trampoline must invoke the wrapped closure: {swift}"
+        );
+        assert!(
+            swift.contains("weaveffi_events_subscribe(handler_cb, handler_ctx, &err)"),
+            "C call must pass the trampoline and context: {swift}"
         );
     }
 }
