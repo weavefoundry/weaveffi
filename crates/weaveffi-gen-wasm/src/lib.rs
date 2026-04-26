@@ -4,7 +4,7 @@ use heck::ToUpperCamelCase;
 use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::local_type_name;
-use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, TypeRef};
+use weaveffi_ir::ir::{Api, EnumDef, Function, ListenerDef, Module, StructDef, TypeRef};
 
 pub struct WasmGenerator;
 
@@ -61,6 +61,7 @@ impl Generator for WasmGenerator {
     fn capabilities(&self) -> &'static [Capability] {
         &[
             Capability::Callbacks,
+            Capability::Listeners,
             Capability::Iterators,
             Capability::Builders,
             Capability::AsyncFunctions,
@@ -420,6 +421,12 @@ fn api_has_callback_params(api: &Api) -> bool {
     api.modules.iter().any(module_has)
 }
 
+fn api_has_listeners(api: &Api) -> bool {
+    collect_all_modules(&api.modules)
+        .iter()
+        .any(|m| !m.listeners.is_empty())
+}
+
 fn ts_type_for(ty: &TypeRef) -> String {
     match ty {
         TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 => "number".into(),
@@ -521,7 +528,10 @@ fn render_wasm_dts(api: &Api, module_name: &str) -> String {
 
     out.push_str(&format!("export interface {interface_name} {{\n"));
     let all_mods = collect_all_modules(&api.modules);
-    if all_mods.iter().any(|m| !m.functions.is_empty()) {
+    if all_mods
+        .iter()
+        .any(|m| !m.functions.is_empty() || !m.listeners.is_empty())
+    {
         out.push_str("  _raw: WebAssembly.Exports;\n");
         for module in &api.modules {
             render_dts_module_interface(&mut out, module, &module.name, "  ");
@@ -537,6 +547,7 @@ fn render_wasm_dts(api: &Api, module_name: &str) -> String {
 
 fn render_dts_module_interface(out: &mut String, m: &Module, module_path: &str, indent: &str) {
     let has_content = !m.functions.is_empty()
+        || !m.listeners.is_empty()
         || m.modules
             .iter()
             .any(|sub| !sub.functions.is_empty() || !sub.modules.is_empty());
@@ -573,10 +584,28 @@ fn render_dts_module_interface(out: &mut String, m: &Module, module_path: &str, 
             ret
         ));
     }
+    for l in &m.listeners {
+        render_dts_listener(out, l, &inner);
+    }
     for sub in &m.modules {
         let sub_path = format!("{module_path}_{}", sub.name);
         render_dts_module_interface(out, sub, &sub_path, &inner);
     }
+    out.push_str(&format!("{indent}}};\n"));
+}
+
+fn render_dts_listener(out: &mut String, l: &ListenerDef, indent: &str) {
+    let class_name = l.name.to_upper_camel_case();
+    if let Some(doc) = &l.doc {
+        out.push_str(&format!("{indent}/** {doc} */\n"));
+    }
+    let inner = format!("{indent}  ");
+    out.push_str(&format!("{indent}{class_name}: {{\n"));
+    out.push_str(&format!(
+        "{inner}register(callback: {}): bigint;\n",
+        l.event_callback
+    ));
+    out.push_str(&format!("{inner}unregister(id: bigint): void;\n"));
     out.push_str(&format!("{indent}}};\n"));
 }
 
@@ -627,8 +656,9 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
     let all_mods = collect_all_modules(&api.modules);
     let has_functions = all_mods.iter().any(|m| !m.functions.is_empty());
     let has_async = api_has_async(api);
+    let has_listeners = api_has_listeners(api);
     let has_callback_params = api_has_callback_params(api);
-    if has_functions {
+    if has_functions || has_listeners {
         out.push_str("function _allocError(wasm) {\n");
         out.push_str("  return wasm.weaveffi_alloc(8);\n");
         out.push_str("}\n\n");
@@ -660,7 +690,7 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
         out.push_str("}\n\n");
     }
 
-    if has_callback_params {
+    if has_callback_params || has_listeners {
         out.push_str("function _registerCallback(wasm, jsFn) {\n");
         out.push_str("  const table = wasm.__indirect_function_table;\n");
         out.push_str("  const idx = table.grow(1);\n");
@@ -821,6 +851,7 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
 
 fn render_js_module_object(out: &mut String, m: &Module, module_path: &str, indent: &str) {
     let has_content = !m.functions.is_empty()
+        || !m.listeners.is_empty()
         || m.modules
             .iter()
             .any(|sub| !sub.functions.is_empty() || !sub.modules.is_empty());
@@ -829,13 +860,7 @@ fn render_js_module_object(out: &mut String, m: &Module, module_path: &str, inde
     }
     out.push_str(&format!("{indent}{}: {{\n", m.name));
     let extra = indent.len().saturating_sub(4);
-    for func in &m.functions {
-        let mut buf = String::new();
-        if func.r#async {
-            emit_js_async_function_wrapper(&mut buf, module_path, func);
-        } else {
-            emit_js_function_wrapper(&mut buf, module_path, func);
-        }
+    let reindent = |buf: &str, out: &mut String| {
         if extra > 0 {
             let pad = " ".repeat(extra);
             for line in buf.lines() {
@@ -848,8 +873,22 @@ fn render_js_module_object(out: &mut String, m: &Module, module_path: &str, inde
                 }
             }
         } else {
-            out.push_str(&buf);
+            out.push_str(buf);
         }
+    };
+    for func in &m.functions {
+        let mut buf = String::new();
+        if func.r#async {
+            emit_js_async_function_wrapper(&mut buf, module_path, func);
+        } else {
+            emit_js_function_wrapper(&mut buf, module_path, func);
+        }
+        reindent(&buf, out);
+    }
+    for l in &m.listeners {
+        let mut buf = String::new();
+        emit_js_listener_wrapper(&mut buf, module_path, l);
+        reindent(&buf, out);
     }
     let child_indent = format!("{indent}  ");
     for sub in &m.modules {
@@ -1013,6 +1052,48 @@ fn emit_js_function_wrapper(out: &mut String, module_name: &str, func: &Function
         }
     }
 
+    out.push_str("      },\n");
+}
+
+/// Emit a JS listener object exposing `register` and `unregister`.
+///
+/// `register(callback)` pins the JS callback into the WASM indirect function
+/// table via `_registerCallback` (from the callback support phase), calls the
+/// C register symbol `weaveffi_{module}_register_{listener}` with
+/// `(table_index, 0, _err)`, stores the callback in a per-object Map keyed by
+/// the returned i64 id (exposed to JS as a BigInt), and returns the id.
+///
+/// `unregister(id)` calls `weaveffi_{module}_unregister_{listener}(id, _err)`
+/// and removes the callback from the Map.
+fn emit_js_listener_wrapper(out: &mut String, module_name: &str, l: &ListenerDef) {
+    let class_name = l.name.to_upper_camel_case();
+    let reg_fn = format!("weaveffi_{}_register_{}", module_name, l.name);
+    let unreg_fn = format!("weaveffi_{}_unregister_{}", module_name, l.name);
+    let indent = "        ";
+
+    if let Some(doc) = &l.doc {
+        out.push_str(&format!("      /** {doc} */\n"));
+    }
+    out.push_str(&format!("      {class_name}: {{\n"));
+    out.push_str(&format!("{indent}_callbacks: new Map(),\n"));
+    out.push_str(&format!("{indent}register(callback) {{\n"));
+    out.push_str(&format!("{indent}  const _err = _allocError(wasm);\n"));
+    out.push_str(&format!(
+        "{indent}  const idx = _registerCallback(wasm, callback);\n"
+    ));
+    out.push_str(&format!(
+        "{indent}  const id = wasm.{reg_fn}(idx, 0, _err);\n"
+    ));
+    out.push_str(&format!("{indent}  _checkError(wasm, _err);\n"));
+    out.push_str(&format!("{indent}  this._callbacks.set(id, callback);\n"));
+    out.push_str(&format!("{indent}  return id;\n"));
+    out.push_str(&format!("{indent}}},\n"));
+    out.push_str(&format!("{indent}unregister(id) {{\n"));
+    out.push_str(&format!("{indent}  const _err = _allocError(wasm);\n"));
+    out.push_str(&format!("{indent}  wasm.{unreg_fn}(id, _err);\n"));
+    out.push_str(&format!("{indent}  _checkError(wasm, _err);\n"));
+    out.push_str(&format!("{indent}  this._callbacks.delete(id);\n"));
+    out.push_str(&format!("{indent}}},\n"));
     out.push_str("      },\n");
 }
 
@@ -1199,7 +1280,7 @@ mod tests {
     use camino::Utf8Path;
     use weaveffi_core::codegen::Generator;
     use weaveffi_core::config::GeneratorConfig;
-    use weaveffi_ir::ir::{CallbackDef, EnumVariant, Module, Param, StructField};
+    use weaveffi_ir::ir::{CallbackDef, EnumVariant, ListenerDef, Module, Param, StructField};
 
     fn empty_api() -> Api {
         Api {
@@ -2613,14 +2694,11 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_include_callbacks_and_exclude_listeners() {
+    fn capabilities_include_callbacks_and_listeners() {
         let caps = WasmGenerator.capabilities();
         assert!(caps.contains(&Capability::Callbacks));
-        assert!(!caps.contains(&Capability::Listeners));
+        assert!(caps.contains(&Capability::Listeners));
         for cap in Capability::ALL {
-            if matches!(cap, Capability::Listeners) {
-                continue;
-            }
             assert!(caps.contains(cap), "WASM generator must support {cap:?}");
         }
     }
@@ -2712,6 +2790,93 @@ mod tests {
         assert!(
             readme.contains("| `handler` | `callback<OnData>` | `i32, i32` | function table index + context ptr |"),
             "API reference must render the callback param as (i32, i32) with a descriptive note: {readme}"
+        );
+    }
+
+    #[test]
+    fn wasm_emits_listener_object() {
+        let api = make_api(vec![Module {
+            name: "events".into(),
+            functions: vec![],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![CallbackDef {
+                name: "OnData".into(),
+                params: vec![Param {
+                    name: "value".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+            }],
+            listeners: vec![ListenerDef {
+                name: "data_stream".into(),
+                event_callback: "OnData".into(),
+                doc: None,
+            }],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        assert!(
+            js.contains("function _registerCallback(wasm, jsFn) {"),
+            "listeners must emit the shared _registerCallback helper from the callback phase: {js}"
+        );
+        assert!(
+            js.contains("DataStream: {"),
+            "listener must be emitted as a JS object named after the listener in PascalCase: {js}"
+        );
+        assert!(
+            js.contains("_callbacks: new Map(),"),
+            "listener object must hold callbacks in a Map to pin them against GC: {js}"
+        );
+        assert!(
+            js.contains("register(callback) {"),
+            "listener object must expose register(callback): {js}"
+        );
+        assert!(
+            js.contains("const idx = _registerCallback(wasm, callback);"),
+            "register must pin the JS callback via _registerCallback (function table indirection): {js}"
+        );
+        assert!(
+            js.contains("const id = wasm.weaveffi_events_register_data_stream(idx, 0, _err);"),
+            "register must call the C register symbol with (table_index, 0, _err): {js}"
+        );
+        assert!(
+            js.contains("this._callbacks.set(id, callback);"),
+            "register must store the callback keyed by the returned id: {js}"
+        );
+        assert!(
+            js.contains("return id;"),
+            "register must return the listener id: {js}"
+        );
+        assert!(
+            js.contains("unregister(id) {"),
+            "listener object must expose unregister(id): {js}"
+        );
+        assert!(
+            js.contains("wasm.weaveffi_events_unregister_data_stream(id, _err);"),
+            "unregister must call the C unregister symbol with (id, _err): {js}"
+        );
+        assert!(
+            js.contains("this._callbacks.delete(id);"),
+            "unregister must drop the callback from the Map: {js}"
+        );
+
+        let dts = render_wasm_dts(&api, DEFAULT_MODULE_NAME);
+        assert!(
+            dts.contains("DataStream: {"),
+            "dts must declare the listener object inside its module interface: {dts}"
+        );
+        assert!(
+            dts.contains("register(callback: OnData): bigint;"),
+            "dts listener must declare register(callback: OnData): bigint: {dts}"
+        );
+        assert!(
+            dts.contains("unregister(id: bigint): void;"),
+            "dts listener must declare unregister(id: bigint): void: {dts}"
         );
     }
 }
