@@ -76,6 +76,7 @@ impl Generator for NodeGenerator {
             Capability::Iterators,
             Capability::Builders,
             Capability::AsyncFunctions,
+            Capability::CancellableAsync,
             Capability::TypedHandles,
             Capability::BorrowedTypes,
             Capability::MapTypes,
@@ -235,13 +236,20 @@ fn render_addon_c(api: &Api, strip_module_prefix: bool) -> String {
         render_listener_registry(&mut out);
     }
 
+    let mut all_exports: Vec<(String, String)> = Vec::new();
+
+    let has_cancellable_async = collect_all_modules(&api.modules)
+        .iter()
+        .any(|m| m.functions.iter().any(|f| f.r#async && f.cancellable));
+    if has_cancellable_async {
+        render_cancel_token_napi(&mut out, &mut all_exports);
+    }
+
     for (m, path) in collect_modules_with_path(&api.modules) {
         for cb in &m.callbacks {
             render_callback_trampoline(&mut out, cb, &path);
         }
     }
-
-    let mut all_exports: Vec<(String, String)> = Vec::new();
 
     for (m, path) in collect_modules_with_path(&api.modules) {
         for s in &m.structs {
@@ -326,6 +334,72 @@ fn render_struct_destroy_napi(
         "    {c_name}((weaveffi_{module_path}_{struct_name}*)(intptr_t)handle_raw);\n"
     ));
     out.push_str("  }\n");
+    out.push_str("  napi_value ret;\n");
+    out.push_str("  napi_get_undefined(env, &ret);\n");
+    out.push_str("  return ret;\n");
+    out.push_str("}\n\n");
+}
+
+/// Emit N-API bindings for the three cancel-token lifecycle functions
+/// (`create`/`cancel`/`destroy`) that back `AbortSignal` wiring in the JS
+/// wrapper. The token pointer crosses the JS/native boundary as a `BigInt`.
+///
+/// Exports are registered under the leading-underscore names
+/// `_weaveffi_cancel_token_{create,cancel,destroy}` so they read as internal
+/// helpers of the generated JS wrapper, distinct from any user-defined
+/// `weaveffi_*` symbols.
+fn render_cancel_token_napi(out: &mut String, exports: &mut Vec<(String, String)>) {
+    let create_napi = "Napi__weaveffi_cancel_token_create";
+    let cancel_napi = "Napi__weaveffi_cancel_token_cancel";
+    let destroy_napi = "Napi__weaveffi_cancel_token_destroy";
+
+    exports.push((
+        "_weaveffi_cancel_token_create".to_string(),
+        create_napi.to_string(),
+    ));
+    exports.push((
+        "_weaveffi_cancel_token_cancel".to_string(),
+        cancel_napi.to_string(),
+    ));
+    exports.push((
+        "_weaveffi_cancel_token_destroy".to_string(),
+        destroy_napi.to_string(),
+    ));
+
+    out.push_str(&format!(
+        "static napi_value {create_napi}(napi_env env, napi_callback_info info) {{\n"
+    ));
+    out.push_str("  weaveffi_cancel_token* tok = weaveffi_cancel_token_create();\n");
+    out.push_str("  napi_value ret;\n");
+    out.push_str("  napi_create_bigint_uint64(env, (uint64_t)(uintptr_t)tok, &ret);\n");
+    out.push_str("  return ret;\n");
+    out.push_str("}\n\n");
+
+    out.push_str(&format!(
+        "static napi_value {cancel_napi}(napi_env env, napi_callback_info info) {{\n"
+    ));
+    out.push_str("  size_t argc = 1;\n");
+    out.push_str("  napi_value args[1];\n");
+    out.push_str("  napi_get_cb_info(env, info, &argc, args, NULL, NULL);\n");
+    out.push_str("  uint64_t raw = 0;\n");
+    out.push_str("  bool lossless = false;\n");
+    out.push_str("  napi_get_value_bigint_uint64(env, args[0], &raw, &lossless);\n");
+    out.push_str("  weaveffi_cancel_token_cancel((weaveffi_cancel_token*)(uintptr_t)raw);\n");
+    out.push_str("  napi_value ret;\n");
+    out.push_str("  napi_get_undefined(env, &ret);\n");
+    out.push_str("  return ret;\n");
+    out.push_str("}\n\n");
+
+    out.push_str(&format!(
+        "static napi_value {destroy_napi}(napi_env env, napi_callback_info info) {{\n"
+    ));
+    out.push_str("  size_t argc = 1;\n");
+    out.push_str("  napi_value args[1];\n");
+    out.push_str("  napi_get_cb_info(env, info, &argc, args, NULL, NULL);\n");
+    out.push_str("  uint64_t raw = 0;\n");
+    out.push_str("  bool lossless = false;\n");
+    out.push_str("  napi_get_value_bigint_uint64(env, args[0], &raw, &lossless);\n");
+    out.push_str("  weaveffi_cancel_token_destroy((weaveffi_cancel_token*)(uintptr_t)raw);\n");
     out.push_str("  napi_value ret;\n");
     out.push_str("  napi_get_undefined(env, &ret);\n");
     out.push_str("  return ret;\n");
@@ -737,9 +811,12 @@ fn render_async_callback(out: &mut String, f: &Function, c_name: &str, module: &
 
 fn render_async_napi_body(out: &mut String, f: &Function, c_name: &str, module: &str) {
     let n = f.params.len();
-    if n > 0 {
-        out.push_str(&format!("  size_t argc = {n};\n"));
-        out.push_str(&format!("  napi_value args[{n}];\n"));
+    // Cancellable async binds an extra BigInt argument (the cancel-token
+    // pointer) that the JS wrapper appends after the user-supplied params.
+    let argc = if f.cancellable { n + 1 } else { n };
+    if argc > 0 {
+        out.push_str(&format!("  size_t argc = {argc};\n"));
+        out.push_str(&format!("  napi_value args[{argc}];\n"));
         out.push_str("  napi_get_cb_info(env, info, &argc, args, NULL, NULL);\n");
     } else {
         out.push_str("  size_t argc = 0;\n");
@@ -760,7 +837,12 @@ fn render_async_napi_body(out: &mut String, f: &Function, c_name: &str, module: 
     out.push_str("  napi_create_promise(env, &ctx->deferred, &promise);\n");
 
     if f.cancellable {
-        c_args.push("NULL".into());
+        out.push_str("  uint64_t _cancel_token_raw = 0;\n");
+        out.push_str("  bool _cancel_token_lossless = false;\n");
+        out.push_str(&format!(
+            "  napi_get_value_bigint_uint64(env, args[{n}], &_cancel_token_raw, &_cancel_token_lossless);\n"
+        ));
+        c_args.push("(weaveffi_cancel_token*)(uintptr_t)_cancel_token_raw".into());
     }
 
     let cb_name = format!("{c_name}_napi_cb");
@@ -1625,9 +1707,35 @@ fn render_node_index_js(api: &Api, strip_module_prefix: bool) -> String {
                 .collect::<Vec<_>>()
         })
         .collect();
-    if structs.is_empty() && listeners.is_empty() && iterators.is_empty() {
+    // (js_name, param_names): cancellable async wrappers need to interleave the
+    // caller-supplied args with the native cancel-token BigInt, so we carry the
+    // param list through to the generator.
+    let cancellable_async: Vec<(String, Vec<String>)> = collect_modules_with_path(&api.modules)
+        .iter()
+        .flat_map(|(m, path)| {
+            m.functions
+                .iter()
+                .filter(|f| f.r#async && f.cancellable)
+                .map(|f| {
+                    (
+                        wrapper_name(path, &f.name, strip_module_prefix),
+                        f.params.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    if structs.is_empty()
+        && listeners.is_empty()
+        && iterators.is_empty()
+        && cancellable_async.is_empty()
+    {
         out.push_str("module.exports = addon;\n");
         return out;
+    }
+
+    if !cancellable_async.is_empty() {
+        render_cancellable_async_helper(&mut out);
     }
 
     if !structs.is_empty() {
@@ -1717,6 +1825,10 @@ fn render_node_index_js(api: &Api, strip_module_prefix: bool) -> String {
         out.push_str("}\n\n");
     }
 
+    for (js_name, params) in &cancellable_async {
+        render_cancellable_async_wrapper(&mut out, js_name, params);
+    }
+
     out.push_str("module.exports = Object.assign({}, addon, {\n");
     for (name, _path) in &structs {
         out.push_str(&format!("  {name}: {name},\n"));
@@ -1729,8 +1841,55 @@ fn render_node_index_js(api: &Api, strip_module_prefix: bool) -> String {
         let js_name = wrapper_name(path, fn_name, strip_module_prefix);
         out.push_str(&format!("  {js_name}: _makeIter_{js_name},\n"));
     }
+    for (js_name, _params) in &cancellable_async {
+        out.push_str(&format!("  {js_name}: _cancellable_{js_name},\n"));
+    }
     out.push_str("});\n");
     out
+}
+
+/// Emit the shared JS helper that bridges a caller's optional `AbortSignal` to
+/// the native cancel token used by cancellable async C ABI functions.
+///
+/// Creates the token via the `_weaveffi_cancel_token_create` binding, registers
+/// a one-shot `abort` listener on the signal that calls
+/// `_weaveffi_cancel_token_cancel`, invokes the real async binding with the
+/// token appended, and in `finally` removes the listener (if any) and destroys
+/// the token.
+fn render_cancellable_async_helper(out: &mut String) {
+    out.push_str("function _weaveffi_cancellableAsync(asyncFn, args, signal) {\n");
+    out.push_str("  const token = addon._weaveffi_cancel_token_create();\n");
+    out.push_str("  let listener;\n");
+    out.push_str("  if (signal) {\n");
+    out.push_str("    if (signal.aborted) {\n");
+    out.push_str("      addon._weaveffi_cancel_token_cancel(token);\n");
+    out.push_str("    } else {\n");
+    out.push_str("      listener = () => { addon._weaveffi_cancel_token_cancel(token); };\n");
+    out.push_str("      signal.addEventListener('abort', listener, { once: true });\n");
+    out.push_str("    }\n");
+    out.push_str("  }\n");
+    out.push_str("  return asyncFn(...args, token).finally(() => {\n");
+    out.push_str("    if (listener) signal.removeEventListener('abort', listener);\n");
+    out.push_str("    addon._weaveffi_cancel_token_destroy(token);\n");
+    out.push_str("  });\n");
+    out.push_str("}\n\n");
+}
+
+/// Emit a per-function wrapper named `_cancellable_{js_name}` that forwards the
+/// caller's args and optional `signal` to the shared helper, which in turn
+/// passes the cancel-token BigInt to the native binding.
+fn render_cancellable_async_wrapper(out: &mut String, js_name: &str, params: &[String]) {
+    let mut sig: Vec<String> = params.to_vec();
+    sig.push("signal".to_string());
+    let arg_list = params.join(", ");
+    out.push_str(&format!(
+        "function _cancellable_{js_name}({}) {{\n",
+        sig.join(", ")
+    ));
+    out.push_str(&format!(
+        "  return _weaveffi_cancellableAsync(addon.{js_name}, [{arg_list}], signal);\n"
+    ));
+    out.push_str("}\n\n");
 }
 
 fn render_node_dts(api: &Api, strip_module_prefix: bool) -> String {
@@ -1768,11 +1927,14 @@ fn render_node_dts(api: &Api, strip_module_prefix: bool) -> String {
         }
         out.push_str(&format!("// module {}\n", path));
         for f in &m.functions {
-            let params: Vec<String> = f
+            let mut params: Vec<String> = f
                 .params
                 .iter()
                 .map(|p| format!("{}: {}", p.name, ts_type_for(&p.ty)))
                 .collect();
+            if f.r#async && f.cancellable {
+                params.push("signal?: AbortSignal".to_string());
+            }
             let base_ret = match &f.returns {
                 Some(ty) => ts_type_for(ty),
                 None => "void".into(),
@@ -3052,6 +3214,121 @@ mod tests {
     }
 
     #[test]
+    fn node_cancellable_async_passes_real_token() {
+        let api = make_api(vec![{
+            let mut m = make_module("tasks");
+            m.functions.push(Function {
+                name: "run".into(),
+                params: vec![Param {
+                    name: "id".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: true,
+                cancellable: true,
+                deprecated: None,
+                since: None,
+            });
+            m
+        }]);
+
+        let addon = render_addon_c(&api, true);
+
+        assert!(
+            addon.contains("weaveffi_cancel_token* tok = weaveffi_cancel_token_create();"),
+            "addon must expose cancel_token_create helper: {addon}"
+        );
+        assert!(
+            addon.contains("weaveffi_cancel_token_cancel((weaveffi_cancel_token*)(uintptr_t)raw);"),
+            "addon must expose cancel_token_cancel helper: {addon}"
+        );
+        assert!(
+            addon
+                .contains("weaveffi_cancel_token_destroy((weaveffi_cancel_token*)(uintptr_t)raw);"),
+            "addon must expose cancel_token_destroy helper: {addon}"
+        );
+        assert!(
+            addon.contains(
+                "{ \"_weaveffi_cancel_token_create\", NULL, Napi__weaveffi_cancel_token_create"
+            ),
+            "addon must export the cancel_token_create binding: {addon}"
+        );
+        assert!(
+            addon.contains(
+                "{ \"_weaveffi_cancel_token_cancel\", NULL, Napi__weaveffi_cancel_token_cancel"
+            ),
+            "addon must export the cancel_token_cancel binding: {addon}"
+        );
+        assert!(
+            addon.contains(
+                "{ \"_weaveffi_cancel_token_destroy\", NULL, Napi__weaveffi_cancel_token_destroy"
+            ),
+            "addon must export the cancel_token_destroy binding: {addon}"
+        );
+
+        assert!(
+            addon.contains("size_t argc = 2;"),
+            "cancellable async binding must read one extra arg (the token): {addon}"
+        );
+        assert!(
+            addon.contains(
+                "napi_get_value_bigint_uint64(env, args[1], &_cancel_token_raw, &_cancel_token_lossless);"
+            ),
+            "cancellable async binding must read the token BigInt from args[n]: {addon}"
+        );
+        assert!(
+            addon.contains("weaveffi_tasks_run_async(id, (weaveffi_cancel_token*)(uintptr_t)_cancel_token_raw, weaveffi_tasks_run_napi_cb, ctx);"),
+            "cancellable async binding must pass the real token to the C function: {addon}"
+        );
+        assert!(
+            !addon.contains("weaveffi_tasks_run_async(id, NULL,"),
+            "cancellable async binding must not pass NULL as the token: {addon}"
+        );
+
+        let js = render_node_index_js(&api, true);
+        assert!(
+            js.contains("function _weaveffi_cancellableAsync(asyncFn, args, signal)"),
+            "index.js must define the cancellable async helper: {js}"
+        );
+        assert!(
+            js.contains("const token = addon._weaveffi_cancel_token_create();"),
+            "helper must create the native token: {js}"
+        );
+        assert!(
+            js.contains("signal.addEventListener('abort', listener, { once: true });"),
+            "helper must register a one-shot abort listener: {js}"
+        );
+        assert!(
+            js.contains("addon._weaveffi_cancel_token_cancel(token);"),
+            "helper must forward abort to cancel_token_cancel: {js}"
+        );
+        assert!(
+            js.contains("addon._weaveffi_cancel_token_destroy(token);"),
+            "helper must destroy the token on completion: {js}"
+        );
+        assert!(
+            js.contains("function _cancellable_run(id, signal)"),
+            "per-function wrapper must accept signal as the last param: {js}"
+        );
+        assert!(
+            js.contains("return _weaveffi_cancellableAsync(addon.run, [id], signal);"),
+            "wrapper must forward args and signal to the shared helper: {js}"
+        );
+        assert!(
+            js.contains("run: _cancellable_run,"),
+            "wrapper must override the raw binding in module.exports: {js}"
+        );
+
+        let dts = render_node_dts(&api, true);
+        assert!(
+            dts.contains("export function run(id: number, signal?: AbortSignal): Promise<number>"),
+            "TypeScript declaration must add `signal?: AbortSignal` for cancellable async: {dts}"
+        );
+    }
+
+    #[test]
     fn node_bytes_param_uses_canonical_shape() {
         let mut m = make_module("io");
         m.functions.push(Function {
@@ -3377,15 +3654,9 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_includes_callbacks_and_listeners_excludes_cancellable_async() {
+    fn capabilities_includes_all_capabilities() {
         let caps = NodeGenerator.capabilities();
-        assert!(caps.contains(&Capability::Callbacks));
-        assert!(caps.contains(&Capability::Listeners));
-        assert!(!caps.contains(&Capability::CancellableAsync));
         for cap in Capability::ALL {
-            if matches!(cap, Capability::CancellableAsync) {
-                continue;
-            }
             assert!(caps.contains(cap), "Node generator must support {cap:?}");
         }
     }
