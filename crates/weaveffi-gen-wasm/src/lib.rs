@@ -2265,9 +2265,56 @@ mod tests {
             js.contains("wasm.weaveffi_echo_shout(msg_ptr, msg_len, _err);"),
             "WASM call must pass (msg_ptr, msg_len, _err) matching the new (const uint8_t*, size_t) C signature: {js}"
         );
+
+        // Arity guard: the call site must have exactly 3 top-level args
+        // (ptr, len, err). Any regression that drops the `len` or reverts to
+        // a single NUL-terminated argument would trip this check.
+        let call_start = js
+            .find("wasm.weaveffi_echo_shout(")
+            .expect("wasm.weaveffi_echo_shout call site missing");
+        let open = call_start + "wasm.weaveffi_echo_shout".len();
+        let mut depth = 0i32;
+        let mut end = open;
+        for (i, &b) in js.as_bytes().iter().enumerate().skip(open) {
+            match b {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let args = &js[open + 1..end];
+        let mut top_commas = 0usize;
+        let mut d = 0i32;
+        for ch in args.chars() {
+            match ch {
+                '(' | '[' | '{' => d += 1,
+                ')' | ']' | '}' => d -= 1,
+                ',' if d == 0 => top_commas += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            top_commas, 2,
+            "call site arity must match the new C signature (ptr, len, err) = 3 args / 2 commas; got args: {args:?}"
+        );
+
+        // No legacy NUL-terminated convention may leak into the generated
+        // JS: those forms would mismatch the new (const uint8_t*, size_t) C
+        // prototype at the WASM boundary.
         assert!(
-            !js.contains("wasm.weaveffi_echo_shout(msg, _err)"),
-            "WASM call must NOT pass the string as a single NUL-terminated argument: {js}"
+            !js.contains("wasm.weaveffi_echo_shout(msg, _err)")
+                && !js.contains("wasm.weaveffi_echo_shout(msg,_err)"),
+            "WASM call must NOT pass the Raw JS string as a single NUL-terminated argument: {js}"
+        );
+        assert!(
+            !js.contains("wasm.weaveffi_echo_shout(msg_ptr, _err)"),
+            "WASM call must NOT drop the length and pass ptr as NUL-terminated: {js}"
         );
 
         let readme = render_wasm_readme(&api);
@@ -2282,6 +2329,10 @@ mod tests {
         assert!(
             readme.contains("not** NUL-terminated"),
             "README must clarify that the WASM string ABI is not NUL-terminated: {readme}"
+        );
+        assert!(
+            readme.contains("`[ptr, len]` tuple"),
+            "README must document that _encodeString returns a (ptr, len) tuple spread into the WASM call: {readme}"
         );
     }
 
