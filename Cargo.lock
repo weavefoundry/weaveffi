@@ -1935,6 +1935,7 @@ dependencies = [
  "color-eyre",
  "criterion",
  "predicates",
+ "proc-macro2",
  "quote",
  "serde",
  "serde_json",

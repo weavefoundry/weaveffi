@@ -769,7 +769,8 @@ fn cmd_generate(
     };
     let contents = std::fs::read_to_string(in_path.as_std_path())
         .wrap_err_with(|| format!("failed to read input file: {}", input))?;
-    let mut api = parse_api_str(&contents, fmt).map_err(|e| format_parse_error(input, e))?;
+    let mut api =
+        parse_api_str(&contents, fmt).map_err(|e| pretty_parse_error(input, &contents, e))?;
     validate_api(&mut api).map_err(format_validation_error)?;
 
     if let Some(ref generators) = api.generators {
@@ -896,7 +897,8 @@ fn cmd_validate_text(input: &str, warn: bool, quiet: bool) -> Result<()> {
     };
     let contents = std::fs::read_to_string(in_path.as_std_path())
         .wrap_err_with(|| format!("failed to read input file: {}", input))?;
-    let mut api = parse_api_str(&contents, fmt).map_err(|e| format_parse_error(input, e))?;
+    let mut api =
+        parse_api_str(&contents, fmt).map_err(|e| pretty_parse_error(input, &contents, e))?;
 
     match validate_api(&mut api) {
         Ok(()) => {
@@ -1026,7 +1028,8 @@ fn cmd_lint(input: &str, quiet: bool, format: OutputFormat) -> Result<bool> {
     };
     let contents = std::fs::read_to_string(in_path.as_std_path())
         .wrap_err_with(|| format!("failed to read input file: {}", input))?;
-    let mut api = parse_api_str(&contents, fmt).map_err(|e| format_parse_error(input, e))?;
+    let mut api =
+        parse_api_str(&contents, fmt).map_err(|e| pretty_parse_error(input, &contents, e))?;
     validate_api(&mut api).map_err(format_validation_error)?;
 
     let warnings = collect_warnings(&api);
@@ -1077,7 +1080,8 @@ fn cmd_diff(
     };
     let contents = std::fs::read_to_string(in_path.as_std_path())
         .wrap_err_with(|| format!("failed to read input file: {}", input))?;
-    let mut api = parse_api_str(&contents, fmt).map_err(|e| format_parse_error(input, e))?;
+    let mut api =
+        parse_api_str(&contents, fmt).map_err(|e| pretty_parse_error(input, &contents, e))?;
     validate_api(&mut api).map_err(format_validation_error)?;
 
     let tmp = tempfile::tempdir().wrap_err("failed to create temp directory")?;
@@ -1389,28 +1393,61 @@ fn extract_stamp_ir_version(contents: &str) -> Option<&str> {
     None
 }
 
-fn format_parse_error(filename: &str, err: ParseError) -> Report {
-    let suggestion = match &err {
-        ParseError::Yaml { .. } => {
-            "check YAML syntax: ensure correct indentation, quoting, and key-value formatting"
+/// Renders a parse error with source context: `filename:line:col` in bold,
+/// the offending source line with a gutter, and a `^^^` underline in bold red
+/// pointing at the column. Uses color-eyre for ANSI colour; callers pass the
+/// original input content so the source line can be looked up by line number.
+///
+/// Falls back to a filename-only note when the error carries no location
+/// (e.g. TOML, which embeds its own position inside the message).
+fn pretty_parse_error(filename: &str, input: &str, err: ParseError) -> Report {
+    let (line, column, suggestion) = match &err {
+        ParseError::Yaml { line, column, .. } => (
+            *line,
+            *column,
+            "check YAML syntax: ensure correct indentation, quoting, and key-value formatting",
+        ),
+        ParseError::Json { line, column, .. } => (
+            *line,
+            *column,
+            "check JSON syntax: ensure all brackets, braces, and commas are correct",
+        ),
+        ParseError::Toml { .. } => (
+            0,
+            0,
+            "check TOML syntax: ensure correct table headers, key-value pairs, and quoting",
+        ),
+        ParseError::UnsupportedFormat(_) => {
+            (0, 0, "use a supported format: yml, yaml, json, or toml")
         }
-        ParseError::Json { .. } => {
-            "check JSON syntax: ensure all brackets, braces, and commas are correct"
-        }
-        ParseError::Toml { .. } => {
-            "check TOML syntax: ensure correct table headers, key-value pairs, and quoting"
-        }
-        ParseError::UnsupportedFormat(_) => "use a supported format: yml, yaml, json, or toml",
     };
+    let note = render_source_context(filename, input, line, column);
+    eyre!(err).note(note).suggestion(suggestion)
+}
 
-    let location = match &err {
-        ParseError::Yaml { line, column, .. } | ParseError::Json { line, column, .. } => {
-            format!("{}:{}:{}", filename, line, column)
-        }
-        _ => filename.to_string(),
-    };
-
-    eyre!(err).note(location).suggestion(suggestion)
+/// Builds the coloured source-context note: `filename:line:col` header, the
+/// offending source line prefixed with a gutter, and a `^^^` caret pointing
+/// at `column`. When `line == 0` only `filename` is returned (for errors
+/// without usable location info).
+fn render_source_context(filename: &str, input: &str, line: usize, column: usize) -> String {
+    use color_eyre::owo_colors::OwoColorize;
+    if line == 0 {
+        return filename.to_string();
+    }
+    let source_line = input.lines().nth(line - 1).unwrap_or("");
+    let gutter = line.to_string();
+    let pad = " ".repeat(gutter.len());
+    let col_pad = " ".repeat(column.saturating_sub(1));
+    let location = format!("{filename}:{line}:{column}");
+    format!(
+        "{loc}\n {gutter} | {src}\n {pad} | {col_pad}{caret}",
+        loc = location.bold(),
+        gutter = gutter,
+        src = source_line,
+        pad = pad,
+        col_pad = col_pad,
+        caret = "^^^".red().bold(),
+    )
 }
 
 fn format_validation_error(err: ValidationError) -> Report {
@@ -1523,8 +1560,23 @@ fn cmd_extract(
     let source = std::fs::read_to_string(input)
         .wrap_err_with(|| format!("failed to read source file: {}", input))?;
 
-    let mut api = extract::extract_api_from_rust(&source)
-        .wrap_err("failed to extract API from Rust source")?;
+    let mut api = extract::extract_api_from_rust(&source).map_err(|e| {
+        // `extract_api_from_rust` runs `syn::parse_file` first; if that failed,
+        // render a pretty parse error with the same source-context style used
+        // by the IDL commands. ParseError has no Rust variant, so we reuse
+        // just the `render_source_context` primitive instead of routing
+        // through `pretty_parse_error` (which would tag the message as YAML).
+        if let Some(syn_err) = e.root_cause().downcast_ref::<syn::Error>() {
+            let start = syn_err.span().start();
+            let note =
+                render_source_context(input, &source, start.line, start.column.saturating_add(1));
+            eyre!("Rust parse error: {syn_err}")
+                .note(note)
+                .suggestion("check Rust syntax and fix the offending line")
+        } else {
+            e.wrap_err("failed to extract API from Rust source")
+        }
+    })?;
 
     if let Err(e) = validate_api(&mut api) {
         eprintln!("warning: {}", e);
@@ -1919,6 +1971,26 @@ mod tests {
     use weaveffi_core::validate::ValidationError;
     use weaveffi_ir::parse::ParseError;
 
+    /// Strip ANSI escape codes so assertions can match plain text. Keeps the test
+    /// robust when `render_source_context` wraps tokens in `owo_colors` styles.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' && chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
     #[test]
     fn validation_suggestion_covers_all_variants() {
         let cases: Vec<ValidationError> = vec![
@@ -2020,51 +2092,66 @@ mod tests {
     }
 
     #[test]
-    fn format_parse_error_preserves_yaml_error() {
-        let _ = color_eyre::install();
+    fn parse_error_shows_source_with_caret() {
+        let input = "version: \"0.1.0\"\nmodules:\n  - name: 123bad\n    functions: []\n";
+        let note = render_source_context("schema.yml", input, 3, 11);
+        let plain = strip_ansi(&note);
+
+        assert!(
+            plain.contains("schema.yml:3:11"),
+            "filename:line:col header should appear: {plain}"
+        );
+        assert!(
+            plain.contains("- name: 123bad"),
+            "offending source line should be shown: {plain}"
+        );
+        assert!(
+            plain.contains("^^^"),
+            "caret underline should be shown: {plain}"
+        );
+        let caret_line = plain
+            .lines()
+            .find(|l| l.contains("^^^"))
+            .expect("caret line missing");
+        let caret_col = caret_line.find("^^^").expect("caret in caret line");
+        assert!(
+            caret_col >= 11,
+            "caret should be indented to the error column (got col {caret_col}): {plain}"
+        );
+
+        assert!(
+            note.contains("\x1b["),
+            "note should contain ANSI colour escapes for terminal rendering: {note:?}"
+        );
+
         let err = ParseError::Yaml {
-            line: 5,
-            column: 3,
-            message: "test error".into(),
+            line: 3,
+            column: 11,
+            message: "invalid module name".into(),
         };
-        let report = format_parse_error("input.yml", err);
-        let msg = report.to_string();
+        let report = pretty_parse_error("schema.yml", input, err);
         assert!(
-            msg.contains("YAML parse error"),
-            "missing error type in: {msg}"
+            report.to_string().contains("YAML parse error"),
+            "main error message should be preserved: {report}"
         );
-        assert!(msg.contains("line 5"), "missing line number in: {msg}");
-        assert!(msg.contains("column 3"), "missing column number in: {msg}");
     }
 
     #[test]
-    fn format_parse_error_preserves_json_error() {
-        let _ = color_eyre::install();
-        let err = ParseError::Json {
-            line: 10,
-            column: 1,
-            message: "test error".into(),
-        };
-        let report = format_parse_error("data.json", err);
-        let msg = report.to_string();
+    fn parse_error_without_location_uses_filename_only() {
+        let note = render_source_context("config.toml", "", 0, 0);
+        assert_eq!(note, "config.toml");
         assert!(
-            msg.contains("JSON parse error"),
-            "missing error type in: {msg}"
+            !note.contains("^^^"),
+            "caret should be omitted for errors without location info: {note}"
         );
-        assert!(msg.contains("line 10"), "missing line in: {msg}");
-    }
 
-    #[test]
-    fn format_parse_error_preserves_toml_error() {
-        let _ = color_eyre::install();
         let err = ParseError::Toml {
-            message: "test error".into(),
+            message: "bad table header".into(),
         };
-        let report = format_parse_error("config.toml", err);
-        let msg = report.to_string();
+        let report = pretty_parse_error("config.toml", "", err);
         assert!(
-            msg.contains("TOML parse error"),
-            "missing error type in: {msg}"
+            report.to_string().contains("TOML parse error"),
+            "main error message should be preserved: {report}"
         );
     }
 
