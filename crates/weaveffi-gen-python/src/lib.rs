@@ -2,7 +2,7 @@ use anyhow::Result;
 use camino::Utf8Path;
 use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
-use weaveffi_core::utils::{c_symbol_name, local_type_name, wrapper_name};
+use weaveffi_core::utils::{local_type_name, wrapper_name};
 use weaveffi_ir::ir::{
     Api, CallbackDef, EnumDef, Function, ListenerDef, Module, StructDef, StructField, TypeRef,
 };
@@ -16,6 +16,7 @@ impl PythonGenerator {
         out_dir: &Utf8Path,
         package_name: &str,
         strip_module_prefix: bool,
+        c_prefix: &str,
     ) -> Result<()> {
         let dir = out_dir.join("python");
         let pkg_dir = dir.join(package_name);
@@ -26,7 +27,7 @@ impl PythonGenerator {
         )?;
         std::fs::write(
             pkg_dir.join("weaveffi.py"),
-            render_python_module(api, strip_module_prefix),
+            render_python_module(api, strip_module_prefix, c_prefix),
         )?;
         std::fs::write(
             pkg_dir.join("weaveffi.pyi"),
@@ -48,7 +49,7 @@ impl Generator for PythonGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "weaveffi", true)
+        self.generate_impl(api, out_dir, "weaveffi", true, "weaveffi")
     }
 
     fn generate_with_config(
@@ -62,6 +63,7 @@ impl Generator for PythonGenerator {
             out_dir,
             config.python_package_name(),
             config.strip_module_prefix,
+            config.c_prefix(),
         )
     }
 
@@ -131,9 +133,13 @@ fn snake_to_pascal(s: &str) -> String {
         .collect()
 }
 
-fn iter_type_name(func_name: &str, module: &str) -> String {
+fn iter_type_name(func_name: &str, module: &str, c_prefix: &str) -> String {
     let pascal = snake_to_pascal(func_name);
-    format!("weaveffi_{module}_{pascal}Iterator")
+    format!("{c_prefix}_{module}_{pascal}Iterator")
+}
+
+fn c_symbol_name(c_prefix: &str, module: &str, func: &str) -> String {
+    format!("{c_prefix}_{module}_{func}")
 }
 
 fn py_ctypes_scalar(ty: &TypeRef) -> &'static str {
@@ -283,7 +289,12 @@ fn py_async_cb_trailing_fields(ret: &Option<TypeRef>) -> Vec<(String, String)> {
     }
 }
 
-fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &str) {
+fn append_async_success_handler(
+    out: &mut String,
+    ret: &Option<TypeRef>,
+    ind: &str,
+    c_prefix: &str,
+) {
     match ret {
         None => {
             out.push_str(&format!("{ind}_state[\"val\"] = None\n"));
@@ -302,7 +313,7 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
             out.push_str(&format!(
                 "{ind}    _s = ctypes.cast(_ptr, ctypes.c_char_p).value.decode(\"utf-8\")\n"
             ));
-            out.push_str(&format!("{ind}    _lib.weaveffi_free_string(_ptr)\n"));
+            out.push_str(&format!("{ind}    _lib.{c_prefix}_free_string(_ptr)\n"));
             out.push_str(&format!("{ind}    _state[\"val\"] = _s\n"));
         }
         Some(TypeRef::Enum(name)) => {
@@ -332,7 +343,7 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
             out.push_str(&format!("{ind}    _n = int(result_len)\n"));
             out.push_str(&format!("{ind}    _state[\"val\"] = bytes(result[:_n])\n"));
             out.push_str(&format!(
-                "{ind}    _lib.weaveffi_free_bytes(result, ctypes.c_size_t(_n))\n"
+                "{ind}    _lib.{c_prefix}_free_bytes(result, ctypes.c_size_t(_n))\n"
             ));
         }
         Some(TypeRef::List(inner)) => {
@@ -367,7 +378,7 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
                         out.push_str(&format!(
                             "{ind}    _s = ctypes.cast(_ptr, ctypes.c_char_p).value.decode(\"utf-8\")\n"
                         ));
-                        out.push_str(&format!("{ind}    _lib.weaveffi_free_string(_ptr)\n"));
+                        out.push_str(&format!("{ind}    _lib.{c_prefix}_free_string(_ptr)\n"));
                         out.push_str(&format!("{ind}    _state[\"val\"] = _s\n"));
                     }
                     TypeRef::Struct(name) => {
@@ -390,7 +401,7 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
                         out.push_str(&format!("{ind}    _n = int(result_len)\n"));
                         out.push_str(&format!("{ind}    _b = bytes(result[:_n])\n"));
                         out.push_str(&format!(
-                            "{ind}    _lib.weaveffi_free_bytes(result, ctypes.c_size_t(_n))\n"
+                            "{ind}    _lib.{c_prefix}_free_bytes(result, ctypes.c_size_t(_n))\n"
                         ));
                         out.push_str(&format!("{ind}    _state[\"val\"] = _b\n"));
                     }
@@ -415,7 +426,7 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
                             "{ind}    _state[\"val\"] = {{{kread}: {vread} for _i in range(_ml)}}\n"
                         ));
                     }
-                    _ => append_async_success_handler(out, &Some(*inner.clone()), ind),
+                    _ => append_async_success_handler(out, &Some(*inner.clone()), ind, c_prefix),
                 }
             } else {
                 match inner.as_ref() {
@@ -449,8 +460,8 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
     }
 }
 
-fn render_async_ffi_call_body(out: &mut String, module_name: &str, f: &Function) {
-    let c_sym = c_symbol_name(module_name, &f.name);
+fn render_async_ffi_call_body(out: &mut String, module_name: &str, f: &Function, c_prefix: &str) {
+    let c_sym = c_symbol_name(c_prefix, module_name, &f.name);
     let c_async = format!("{c_sym}_async");
     let ind = "    ";
 
@@ -473,13 +484,13 @@ fn render_async_ffi_call_body(out: &mut String, module_name: &str, f: &Function)
         "{ind}            _msg = err.contents.message.decode(\"utf-8\") if err.contents.message else \"\"\n"
     ));
     out.push_str(&format!(
-        "{ind}            _lib.weaveffi_error_clear(ctypes.byref(err.contents))\n"
+        "{ind}            _lib.{c_prefix}_error_clear(ctypes.byref(err.contents))\n"
     ));
     out.push_str(&format!(
         "{ind}            _state[\"err\"] = WeaveffiError(_code, _msg)\n"
     ));
     out.push_str(&format!("{ind}        else:\n"));
-    append_async_success_handler(out, &f.returns, "            ");
+    append_async_success_handler(out, &f.returns, "            ", c_prefix);
     out.push_str(&format!("{ind}    finally:\n"));
     out.push_str(&format!("{ind}        _ev.set()\n"));
 
@@ -535,9 +546,9 @@ fn render_async_ffi_call_body(out: &mut String, module_name: &str, f: &Function)
 
 // ── Rendering ──
 
-fn render_python_module(api: &Api, strip_module_prefix: bool) -> String {
+fn render_python_module(api: &Api, strip_module_prefix: bool, c_prefix: &str) -> String {
     let mut out = String::new();
-    render_preamble(&mut out);
+    render_preamble(&mut out, c_prefix);
     let has_async = collect_all_modules(&api.modules)
         .iter()
         .any(|m| m.functions.iter().any(|f| f.r#async));
@@ -548,25 +559,37 @@ fn render_python_module(api: &Api, strip_module_prefix: bool) -> String {
         .iter()
         .any(|m| m.functions.iter().any(|f| f.r#async && f.cancellable));
     if has_cancellable_async {
-        render_cancel_token_bindings(&mut out);
+        render_cancel_token_bindings(&mut out, c_prefix);
     }
     for m in &api.modules {
-        render_python_module_content(&mut out, m, &m.name, strip_module_prefix);
+        render_python_module_content(&mut out, m, &m.name, strip_module_prefix, c_prefix);
     }
     out.push('\n');
     out
 }
 
-/// Emit `ctypes` argtype/restype declarations for the `weaveffi_cancel_token_*`
+/// Emit `ctypes` argtype/restype declarations for the `{c_prefix}_cancel_token_*`
 /// C ABI so cancellable `async def` wrappers can forward `asyncio.CancelledError`
-/// to `weaveffi_cancel_token_cancel`.
-fn render_cancel_token_bindings(out: &mut String) {
-    out.push_str("\n_lib.weaveffi_cancel_token_create.argtypes = []\n");
-    out.push_str("_lib.weaveffi_cancel_token_create.restype = ctypes.c_void_p\n");
-    out.push_str("_lib.weaveffi_cancel_token_cancel.argtypes = [ctypes.c_void_p]\n");
-    out.push_str("_lib.weaveffi_cancel_token_cancel.restype = None\n");
-    out.push_str("_lib.weaveffi_cancel_token_destroy.argtypes = [ctypes.c_void_p]\n");
-    out.push_str("_lib.weaveffi_cancel_token_destroy.restype = None\n");
+/// to `{c_prefix}_cancel_token_cancel`.
+fn render_cancel_token_bindings(out: &mut String, c_prefix: &str) {
+    out.push_str(&format!(
+        "\n_lib.{c_prefix}_cancel_token_create.argtypes = []\n"
+    ));
+    out.push_str(&format!(
+        "_lib.{c_prefix}_cancel_token_create.restype = ctypes.c_void_p\n"
+    ));
+    out.push_str(&format!(
+        "_lib.{c_prefix}_cancel_token_cancel.argtypes = [ctypes.c_void_p]\n"
+    ));
+    out.push_str(&format!(
+        "_lib.{c_prefix}_cancel_token_cancel.restype = None\n"
+    ));
+    out.push_str(&format!(
+        "_lib.{c_prefix}_cancel_token_destroy.argtypes = [ctypes.c_void_p]\n"
+    ));
+    out.push_str(&format!(
+        "_lib.{c_prefix}_cancel_token_destroy.restype = None\n"
+    ));
 }
 
 fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
@@ -598,6 +621,7 @@ fn render_python_module_content(
     m: &Module,
     module_path: &str,
     strip_module_prefix: bool,
+    c_prefix: &str,
 ) {
     out.push_str(&format!("\n\n# === Module: {} ===", module_path));
     for e in &m.enums {
@@ -607,25 +631,25 @@ fn render_python_module_content(
         render_callback(out, cb);
     }
     for s in &m.structs {
-        render_struct(out, module_path, s);
+        render_struct(out, module_path, s, c_prefix);
         if s.builder {
             render_builder(out, s);
         }
     }
     for l in &m.listeners {
-        render_listener(out, module_path, l);
+        render_listener(out, module_path, l, c_prefix);
     }
     for f in &m.functions {
-        render_function(out, module_path, f, strip_module_prefix);
+        render_function(out, module_path, f, strip_module_prefix, c_prefix);
     }
     for sub in &m.modules {
         let sub_path = format!("{module_path}_{}", sub.name);
-        render_python_module_content(out, sub, &sub_path, strip_module_prefix);
+        render_python_module_content(out, sub, &sub_path, strip_module_prefix, c_prefix);
     }
 }
 
-fn render_preamble(out: &mut String) {
-    out.push_str(
+fn render_preamble(out: &mut String, c_prefix: &str) {
+    out.push_str(&format!(
         r#""""WeaveFFI Python ctypes bindings (auto-generated)"""
 import contextlib
 import ctypes
@@ -638,7 +662,7 @@ class WeaveffiError(Exception):
     def __init__(self, code: int, message: str) -> None:
         self.code = code
         self.message = message
-        super().__init__(f"({code}) {message}")
+        super().__init__(f"({{code}}) {{message}}")
 
 
 class _WeaveffiErrorStruct(ctypes.Structure):
@@ -651,21 +675,21 @@ class _WeaveffiErrorStruct(ctypes.Structure):
 def _load_library() -> ctypes.CDLL:
     system = platform.system()
     if system == "Darwin":
-        name = "libweaveffi.dylib"
+        name = "lib{c_prefix}.dylib"
     elif system == "Windows":
-        name = "weaveffi.dll"
+        name = "{c_prefix}.dll"
     else:
-        name = "libweaveffi.so"
+        name = "lib{c_prefix}.so"
     return ctypes.CDLL(name)
 
 
 _lib = _load_library()
-_lib.weaveffi_error_clear.argtypes = [ctypes.POINTER(_WeaveffiErrorStruct)]
-_lib.weaveffi_error_clear.restype = None
-_lib.weaveffi_free_string.argtypes = [ctypes.c_void_p]
-_lib.weaveffi_free_string.restype = None
-_lib.weaveffi_free_bytes.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t]
-_lib.weaveffi_free_bytes.restype = None
+_lib.{c_prefix}_error_clear.argtypes = [ctypes.POINTER(_WeaveffiErrorStruct)]
+_lib.{c_prefix}_error_clear.restype = None
+_lib.{c_prefix}_free_string.argtypes = [ctypes.c_void_p]
+_lib.{c_prefix}_free_string.restype = None
+_lib.{c_prefix}_free_bytes.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t]
+_lib.{c_prefix}_free_bytes.restype = None
 
 _callback_refs: List[Any] = []
 
@@ -674,7 +698,7 @@ def _check_error(err: _WeaveffiErrorStruct) -> None:
     if err.code != 0:
         code = err.code
         message = err.message.decode("utf-8") if err.message else ""
-        _lib.weaveffi_error_clear(ctypes.byref(err))
+        _lib.{c_prefix}_error_clear(ctypes.byref(err))
         raise WeaveffiError(code, message)
 
 
@@ -701,7 +725,7 @@ def _bytes_to_string(ptr) -> Optional[str]:
         return None
     return ptr.decode("utf-8")
 "#,
-    );
+    ));
 }
 
 fn render_enum(out: &mut String, e: &EnumDef) {
@@ -733,15 +757,15 @@ fn render_callback(out: &mut String, cb: &CallbackDef) {
 
 /// Emit a Python wrapper class for a listener. The class exposes:
 ///   - `register(callback)`: builds a trampoline, wraps it in the
-///     callback's `CFUNCTYPE`, calls `weaveffi_{module}_register_{listener}`,
+///     callback's `CFUNCTYPE`, calls `{c_prefix}_{module}_register_{listener}`,
 ///     stores the cfunc in a class-level dict keyed by the returned id to
 ///     keep it alive against GC, and returns the id.
-///   - `unregister(id)`: calls `weaveffi_{module}_unregister_{listener}` and
+///   - `unregister(id)`: calls `{c_prefix}_{module}_unregister_{listener}` and
 ///     pops the cfunc from the class-level dict.
-fn render_listener(out: &mut String, module_path: &str, l: &ListenerDef) {
+fn render_listener(out: &mut String, module_path: &str, l: &ListenerDef, c_prefix: &str) {
     let class_name = snake_to_pascal(&l.name);
-    let reg_fn = format!("weaveffi_{module_path}_register_{}", l.name);
-    let unreg_fn = format!("weaveffi_{module_path}_unregister_{}", l.name);
+    let reg_fn = format!("{c_prefix}_{module_path}_register_{}", l.name);
+    let unreg_fn = format!("{c_prefix}_{module_path}_unregister_{}", l.name);
     let cfunctype = format!("_{}", l.event_callback);
 
     out.push_str(&format!("\n\nclass {class_name}:"));
@@ -774,8 +798,8 @@ fn render_listener(out: &mut String, module_path: &str, l: &ListenerDef) {
     out.push('\n');
 }
 
-fn render_struct(out: &mut String, module_name: &str, s: &StructDef) {
-    let prefix = format!("weaveffi_{}_{}", module_name, s.name);
+fn render_struct(out: &mut String, module_name: &str, s: &StructDef, c_prefix: &str) {
+    let prefix = format!("{c_prefix}_{}_{}", module_name, s.name);
 
     out.push_str(&format!("\n\nclass {}:", s.name));
     if let Some(doc) = &s.doc {
@@ -807,7 +831,7 @@ fn render_struct(out: &mut String, module_name: &str, s: &StructDef) {
     out.push_str("\n        return False");
 
     for field in &s.fields {
-        render_getter(out, &prefix, field);
+        render_getter(out, &prefix, field, c_prefix);
     }
     out.push('\n');
 }
@@ -847,7 +871,7 @@ fn render_builder(out: &mut String, s: &StructDef) {
     out.push('\n');
 }
 
-fn render_getter(out: &mut String, prefix: &str, field: &StructField) {
+fn render_getter(out: &mut String, prefix: &str, field: &StructField, c_prefix: &str) {
     let getter = format!("{prefix}_get_{}", field.name);
     let py_ty = py_type_hint(&field.ty);
     let ind = "        ";
@@ -885,10 +909,16 @@ fn render_getter(out: &mut String, prefix: &str, field: &StructField) {
         ));
     }
 
-    render_return_value(out, &field.ty, ind);
+    render_return_value(out, &field.ty, ind, c_prefix);
 }
 
-fn render_function(out: &mut String, module_name: &str, f: &Function, strip_module_prefix: bool) {
+fn render_function(
+    out: &mut String,
+    module_name: &str,
+    f: &Function,
+    strip_module_prefix: bool,
+    c_prefix: &str,
+) {
     let func_name = wrapper_name(module_name, &f.name, strip_module_prefix);
     let params_sig: Vec<String> = f
         .params
@@ -908,7 +938,7 @@ fn render_function(out: &mut String, module_name: &str, f: &Function, strip_modu
     };
 
     if let Some(TypeRef::Iterator(inner)) = &f.returns {
-        render_iterator_class(out, module_name, &f.name, inner);
+        render_iterator_class(out, module_name, &f.name, inner, c_prefix);
     }
 
     let mut sync_params_sig = params_sig.clone();
@@ -933,9 +963,9 @@ fn render_function(out: &mut String, module_name: &str, f: &Function, strip_modu
     }
 
     if f.r#async {
-        render_async_ffi_call_body(out, module_name, f);
+        render_async_ffi_call_body(out, module_name, f, c_prefix);
     } else {
-        let c_sym = c_symbol_name(module_name, &f.name);
+        let c_sym = c_symbol_name(c_prefix, module_name, &f.name);
         out.push_str(&format!("{ind}_fn = _lib.{c_sym}\n"));
 
         let mut argtypes: Vec<String> = Vec::new();
@@ -1007,9 +1037,9 @@ fn render_function(out: &mut String, module_name: &str, f: &Function, strip_modu
 
         if let Some(ret_ty) = &f.returns {
             if let TypeRef::Iterator(inner) = ret_ty {
-                render_iterator_return(out, module_name, &f.name, inner, ind);
+                render_iterator_return(out, module_name, &f.name, inner, ind, c_prefix);
             } else {
-                render_return_value(out, ret_ty, ind);
+                render_return_value(out, ret_ty, ind, c_prefix);
             }
         }
     }
@@ -1023,13 +1053,15 @@ fn render_function(out: &mut String, module_name: &str, f: &Function, strip_modu
         let arg_names: Vec<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
         if f.cancellable {
             // Create a native cancel token and forward `asyncio.CancelledError`
-            // from the awaiting Task to `weaveffi_cancel_token_cancel` so the
+            // from the awaiting Task to `{c_prefix}_cancel_token_cancel` so the
             // C side can observe cooperative cancellation.
             let mut executor_args_vec: Vec<&str> = vec![&def_name];
             executor_args_vec.extend(arg_names.iter().copied());
             executor_args_vec.push("_cancel_token");
             let executor_args = executor_args_vec.join(", ");
-            out.push_str("    _cancel_token = _lib.weaveffi_cancel_token_create()\n");
+            out.push_str(&format!(
+                "    _cancel_token = _lib.{c_prefix}_cancel_token_create()\n"
+            ));
             out.push_str("    try:\n");
             out.push_str("        _loop = asyncio.get_event_loop()\n");
             out.push_str("        try:\n");
@@ -1043,10 +1075,14 @@ fn render_function(out: &mut String, module_name: &str, f: &Function, strip_modu
                 ));
             }
             out.push_str("        except asyncio.CancelledError:\n");
-            out.push_str("            _lib.weaveffi_cancel_token_cancel(_cancel_token)\n");
+            out.push_str(&format!(
+                "            _lib.{c_prefix}_cancel_token_cancel(_cancel_token)\n"
+            ));
             out.push_str("            raise\n");
             out.push_str("    finally:\n");
-            out.push_str("        _lib.weaveffi_cancel_token_destroy(_cancel_token)\n");
+            out.push_str(&format!(
+                "        _lib.{c_prefix}_cancel_token_destroy(_cancel_token)\n"
+            ));
         } else {
             out.push_str("    _loop = asyncio.get_event_loop()\n");
             let executor_args = if arg_names.is_empty() {
@@ -1254,7 +1290,7 @@ fn py_read_element(expr: &str, ty: &TypeRef) -> String {
     }
 }
 
-fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
+fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str, c_prefix: &str) {
     match ty {
         TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => {
             out.push_str(&format!("{ind}return _result\n"));
@@ -1269,7 +1305,7 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
             out.push_str(&format!(
                 "{ind}_s = ctypes.cast(_ptr, ctypes.c_char_p).value.decode(\"utf-8\")\n"
             ));
-            out.push_str(&format!("{ind}_lib.weaveffi_free_string(_ptr)\n"));
+            out.push_str(&format!("{ind}_lib.{c_prefix}_free_string(_ptr)\n"));
             out.push_str(&format!("{ind}return _s\n"));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
@@ -1278,7 +1314,7 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
             out.push_str(&format!("{ind}_n = int(_out_len.value)\n"));
             out.push_str(&format!("{ind}_b = bytes(_result[:_n])\n"));
             out.push_str(&format!(
-                "{ind}_lib.weaveffi_free_bytes(_result, ctypes.c_size_t(_n))\n"
+                "{ind}_lib.{c_prefix}_free_bytes(_result, ctypes.c_size_t(_n))\n"
             ));
             out.push_str(&format!("{ind}return _b\n"));
         }
@@ -1300,7 +1336,7 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
         TypeRef::Enum(name) => {
             out.push_str(&format!("{ind}return {name}(_result)\n"));
         }
-        TypeRef::Optional(inner) => render_optional_return(out, inner, ind),
+        TypeRef::Optional(inner) => render_optional_return(out, inner, ind, c_prefix),
         TypeRef::List(inner) => render_list_return(out, inner, ind),
         TypeRef::Map(k, v) => render_map_return(out, k, v, ind),
         TypeRef::Iterator(_) => unreachable!("iterator return handled in render_function"),
@@ -1310,7 +1346,7 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
     }
 }
 
-fn render_optional_return(out: &mut String, inner: &TypeRef, ind: &str) {
+fn render_optional_return(out: &mut String, inner: &TypeRef, ind: &str, c_prefix: &str) {
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             out.push_str(&format!("{ind}_ptr = _result\n"));
@@ -1319,7 +1355,7 @@ fn render_optional_return(out: &mut String, inner: &TypeRef, ind: &str) {
             out.push_str(&format!(
                 "{ind}_s = ctypes.cast(_ptr, ctypes.c_char_p).value.decode(\"utf-8\")\n"
             ));
-            out.push_str(&format!("{ind}_lib.weaveffi_free_string(_ptr)\n"));
+            out.push_str(&format!("{ind}_lib.{c_prefix}_free_string(_ptr)\n"));
             out.push_str(&format!("{ind}return _s\n"));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
@@ -1328,7 +1364,7 @@ fn render_optional_return(out: &mut String, inner: &TypeRef, ind: &str) {
             out.push_str(&format!("{ind}_n = int(_out_len.value)\n"));
             out.push_str(&format!("{ind}_b = bytes(_result[:_n])\n"));
             out.push_str(&format!(
-                "{ind}_lib.weaveffi_free_bytes(_result, ctypes.c_size_t(_n))\n"
+                "{ind}_lib.{c_prefix}_free_bytes(_result, ctypes.c_size_t(_n))\n"
             ));
             out.push_str(&format!("{ind}return _b\n"));
         }
@@ -1399,8 +1435,14 @@ fn py_read_iter_item(inner: &TypeRef) -> String {
     }
 }
 
-fn render_iterator_class(out: &mut String, module_name: &str, func_name: &str, inner: &TypeRef) {
-    let iter_tag = iter_type_name(func_name, module_name);
+fn render_iterator_class(
+    out: &mut String,
+    module_name: &str,
+    func_name: &str,
+    inner: &TypeRef,
+    c_prefix: &str,
+) {
+    let iter_tag = iter_type_name(func_name, module_name, c_prefix);
     let pascal = snake_to_pascal(func_name);
     let class_name = format!("_{pascal}Iterator");
     let item_scalar = py_ctypes_scalar(inner);
@@ -1455,8 +1497,9 @@ fn render_iterator_return(
     func_name: &str,
     inner: &TypeRef,
     ind: &str,
+    c_prefix: &str,
 ) {
-    let iter_tag = iter_type_name(func_name, module_name);
+    let iter_tag = iter_type_name(func_name, module_name, c_prefix);
     let item_scalar = py_ctypes_scalar(inner);
     let read_expr = py_read_iter_item(inner);
 
@@ -1723,7 +1766,7 @@ mod tests {
     #[test]
     fn preamble_has_load_library() {
         let api = make_api(vec![]);
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(py.contains("def _load_library()"), "missing _load_library");
         assert!(
             py.contains("libweaveffi.dylib"),
@@ -1737,7 +1780,7 @@ mod tests {
     #[test]
     fn preamble_has_error_handling() {
         let api = make_api(vec![]);
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(
             py.contains("class WeaveffiError(Exception):"),
             "missing error class"
@@ -1777,7 +1820,7 @@ mod tests {
             since: None,
         }])]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(
             py.contains("def add(a: int, b: int) -> int:"),
             "missing function signature: {py}"
@@ -1827,7 +1870,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(
             py.contains("def echo(msg: str) -> str:"),
             "missing signature: {py}"
@@ -1876,7 +1919,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
 
         let cast_pos = py
             .find("ctypes.cast(_ptr, ctypes.c_char_p).value.decode(\"utf-8\")")
@@ -1905,7 +1948,7 @@ mod tests {
             since: None,
         }])]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(
             py.contains("def reset() -> None:"),
             "missing void signature: {py}"
@@ -1953,7 +1996,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(
             py.contains("class Color(IntEnum):"),
             "missing IntEnum class: {py}"
@@ -1993,7 +2036,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(py.contains("a: \"Color\""), "missing enum param hint: {py}");
         assert!(
             py.contains("-> \"Color\":"),
@@ -2037,7 +2080,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(py.contains("class Contact:"), "missing class: {py}");
         assert!(
             py.contains("def __init__(self, _ptr: int)"),
@@ -2151,7 +2194,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(
             py.contains("-> \"Contact\":"),
             "missing struct return hint: {py}"
@@ -2183,7 +2226,7 @@ mod tests {
             since: None,
         }])]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(py.contains("flag: bool"), "missing bool param: {py}");
         assert!(py.contains("-> bool:"), "missing bool return: {py}");
         assert!(
@@ -2213,7 +2256,7 @@ mod tests {
             since: None,
         }])]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(
             py.contains("ctypes.c_uint64"),
             "missing c_uint64 for Handle: {py}"
@@ -2246,7 +2289,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(py.contains("data: bytes"), "missing bytes param: {py}");
         assert!(py.contains("-> bytes:"), "missing bytes return: {py}");
         assert!(
@@ -2283,7 +2326,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(
             py.contains("id: Optional[int]"),
             "missing optional param: {py}"
@@ -2329,7 +2372,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(
             py.contains("-> Optional[str]:"),
             "missing optional str return: {py}"
@@ -2386,7 +2429,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(py.contains("ids: List[int]"), "missing list param: {py}");
         assert!(py.contains("-> List[int]:"), "missing list return: {py}");
         assert!(
@@ -2444,7 +2487,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(
             py.contains("scores: Dict[str, int]"),
             "missing map param: {py}"
@@ -2484,7 +2527,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(
             py.contains("def email(self) -> Optional[str]:"),
             "missing optional getter: {py}"
@@ -2522,7 +2565,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(
             py.contains("def role(self) -> \"Role\":"),
             "missing enum getter: {py}"
@@ -2753,7 +2796,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(
             py.contains("-> List[\"Item\"]:"),
             "missing list struct return: {py}"
@@ -2787,7 +2830,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(
             py.contains("def data(self) -> bytes:"),
             "missing bytes getter: {py}"
@@ -3087,7 +3130,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
 
         assert!(py.contains("class Contact:"), "missing class decl");
         assert!(
@@ -3159,7 +3202,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
 
         assert!(py.contains("class ContactType(IntEnum):"));
         assert!(py.contains("\"\"\"Type of contact\"\"\""));
@@ -3247,7 +3290,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
 
         assert!(
             py.contains("key: Optional[int]"),
@@ -3346,7 +3389,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
 
         assert!(py.contains("ids: List[int]"), "missing List[int] param");
         assert!(
@@ -3419,7 +3462,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
 
         assert!(
             py.contains("settings: Dict[str, int]"),
@@ -3920,7 +3963,7 @@ mod tests {
     #[test]
     fn python_has_memory_helpers() {
         let api = make_api(vec![]);
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(
             py.contains("import contextlib"),
             "missing contextlib import"
@@ -4093,6 +4136,99 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
         let _ = std::fs::remove_dir_all(&tmp2);
+    }
+
+    #[test]
+    fn python_load_library_respects_c_prefix() {
+        let api = make_api(vec![Module {
+            name: "math".into(),
+            functions: vec![Function {
+                name: "add".into(),
+                params: vec![
+                    Param {
+                        name: "a".into(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                    },
+                    Param {
+                        name: "b".into(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                    },
+                ],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let config = GeneratorConfig {
+            c_prefix: Some("myffi".into()),
+            ..Default::default()
+        };
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_python_c_prefix");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        PythonGenerator
+            .generate_with_config(&api, out_dir, &config)
+            .unwrap();
+
+        let py = std::fs::read_to_string(tmp.join("python/weaveffi/weaveffi.py")).unwrap();
+
+        assert!(
+            py.contains("name = \"libmyffi.dylib\""),
+            "_load_library must use libmyffi.dylib for Darwin: {py}"
+        );
+        assert!(
+            py.contains("name = \"libmyffi.so\""),
+            "_load_library must use libmyffi.so for Linux: {py}"
+        );
+        assert!(
+            py.contains("name = \"myffi.dll\""),
+            "_load_library must use myffi.dll for Windows: {py}"
+        );
+        assert!(
+            !py.contains("libweaveffi.dylib")
+                && !py.contains("libweaveffi.so")
+                && !py.contains("weaveffi.dll"),
+            "must not retain default weaveffi library names when c_prefix is set: {py}"
+        );
+
+        assert!(
+            py.contains("_lib.myffi_math_add"),
+            "function body must call _lib.{{c_prefix}}_X_Y: {py}"
+        );
+        assert!(
+            !py.contains("_lib.weaveffi_math_add"),
+            "function body must not retain default weaveffi prefix: {py}"
+        );
+
+        assert!(
+            py.contains("_lib.myffi_error_clear"),
+            "preamble bindings must use c_prefix: {py}"
+        );
+        assert!(
+            py.contains("_lib.myffi_free_string"),
+            "preamble bindings must use c_prefix: {py}"
+        );
+        assert!(
+            py.contains("_lib.myffi_free_bytes"),
+            "preamble bindings must use c_prefix: {py}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -4278,7 +4414,7 @@ mod tests {
             }],
             generators: None,
         };
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(
             py.contains("contact: \"Contact\""),
             "TypedHandle should use class type not int: {py}"
@@ -4329,7 +4465,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
 
         assert!(
             py.contains("_string_to_byteslice(name)"),
@@ -4424,7 +4560,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
 
         assert!(
             py.contains("if _result is None:\n        return None"),
@@ -4458,7 +4594,7 @@ mod tests {
             deprecated: None,
             since: None,
         }])]);
-        let code = render_python_module(&api, true);
+        let code = render_python_module(&api, true, "weaveffi");
         assert!(
             code.contains("import asyncio"),
             "should import asyncio: {code}"
@@ -4518,7 +4654,7 @@ mod tests {
             },
         ])]);
 
-        let code = render_python_module(&api, true);
+        let code = render_python_module(&api, true, "weaveffi");
 
         assert!(
             code.contains("_lib.weaveffi_cancel_token_create.restype = ctypes.c_void_p"),
@@ -4638,7 +4774,7 @@ mod tests {
             },
         ]);
 
-        let code = render_python_module(&api, true);
+        let code = render_python_module(&api, true, "weaveffi");
         let stubs = render_pyi_module(&api, true);
 
         assert!(
@@ -4698,7 +4834,7 @@ mod tests {
                 modules: vec![],
             }],
         }]);
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(
             py.contains("# === Module: parent ==="),
             "parent module section missing: {py}"
@@ -4757,7 +4893,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(
             py.contains("ListItemsIterator"),
             "should reference iterator type name: {py}"
@@ -4795,7 +4931,7 @@ mod tests {
             deprecated: Some("Use add_v2 instead".into()),
             since: Some("0.1.0".into()),
         }])]);
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(
             py.contains("warnings.warn(\"Use add_v2 instead\", DeprecationWarning, stacklevel=2)"),
             "missing deprecation warning: {py}"
@@ -4828,7 +4964,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
 
         assert!(
             py.contains("def _string_to_byteslice(s: str) -> tuple:"),
@@ -4888,7 +5024,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(
             py.contains(
                 "_fn.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.POINTER(_WeaveffiErrorStruct)]"
@@ -4926,7 +5062,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         assert!(
             py.contains("_fn.restype = ctypes.POINTER(ctypes.c_uint8)"),
             "Python ctypes restype for Bytes return must be uint8_t*: {py}"
@@ -4994,7 +5130,7 @@ mod tests {
             generators: None,
         };
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
         let def_pos = py
             .find("def _check_error(err: _WeaveffiErrorStruct) -> None:")
             .expect("_check_error must be defined");
@@ -5045,7 +5181,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
 
         let copy_pos = py
             .find("_b = bytes(_result[:_n])")
@@ -5081,7 +5217,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
 
         assert!(py.contains("class Contact:"), "missing class Contact: {py}");
         let del_pos = py
@@ -5159,7 +5295,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
 
         assert!(
             py.contains(
@@ -5226,7 +5362,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
 
         assert!(
             py.contains(
@@ -5295,7 +5431,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
 
         assert!(
             py.contains("_OnData = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_int32)"),
@@ -5375,7 +5511,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi");
 
         assert!(
             py.contains("class DataStream:"),
