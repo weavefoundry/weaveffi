@@ -25,7 +25,9 @@ impl RubyGenerator {
     ) -> Result<()> {
         let dir = out_dir.join("ruby");
         let lib_dir = dir.join("lib");
+        let spec_dir = dir.join("spec");
         std::fs::create_dir_all(&lib_dir)?;
+        std::fs::create_dir_all(&spec_dir)?;
         std::fs::write(
             lib_dir.join("weaveffi.rb"),
             stamp_hash(render_ruby_module(api, module_name, c_prefix)),
@@ -33,6 +35,16 @@ impl RubyGenerator {
         std::fs::write(
             dir.join("weaveffi.gemspec"),
             stamp_hash(render_gemspec(gem_name, has_any_async(api))),
+        )?;
+        std::fs::write(
+            dir.join("Gemfile"),
+            stamp_hash(render_gemfile().to_string()),
+        )?;
+        // Gemfile.lock is a placeholder; bundler regenerates it on `bundle install`.
+        std::fs::write(dir.join("Gemfile.lock"), render_gemfile_lock())?;
+        std::fs::write(
+            spec_dir.join(format!("{gem_name}_spec.rb")),
+            stamp_hash(render_smoke_spec(gem_name, module_name)),
         )?;
         // README.md is documentation, not a source file; leave it unstamped.
         std::fs::write(dir.join("README.md"), render_readme())?;
@@ -68,6 +80,28 @@ impl Generator for RubyGenerator {
         vec![
             out_dir.join("ruby/lib/weaveffi.rb").to_string(),
             out_dir.join("ruby/weaveffi.gemspec").to_string(),
+            out_dir.join("ruby/Gemfile").to_string(),
+            out_dir.join("ruby/Gemfile.lock").to_string(),
+            out_dir.join("ruby/spec/weaveffi_spec.rb").to_string(),
+            out_dir.join("ruby/README.md").to_string(),
+        ]
+    }
+
+    fn output_files_with_config(
+        &self,
+        _api: &Api,
+        out_dir: &Utf8Path,
+        config: &GeneratorConfig,
+    ) -> Vec<String> {
+        let gem_name = config.ruby_gem_name();
+        vec![
+            out_dir.join("ruby/lib/weaveffi.rb").to_string(),
+            out_dir.join("ruby/weaveffi.gemspec").to_string(),
+            out_dir.join("ruby/Gemfile").to_string(),
+            out_dir.join("ruby/Gemfile.lock").to_string(),
+            out_dir
+                .join(format!("ruby/spec/{gem_name}_spec.rb"))
+                .to_string(),
             out_dir.join("ruby/README.md").to_string(),
         ]
     }
@@ -1506,7 +1540,7 @@ fn render_map_return_code(out: &mut String, k: &TypeRef, v: &TypeRef, ind: &str,
 
 fn render_gemspec(gem_name: &str, has_async: bool) -> String {
     let extra_dep = if has_async {
-        "  s.add_dependency 'concurrent-ruby', '~> 1.1'\n"
+        "  s.add_runtime_dependency \"concurrent-ruby\", \"~> 1.1\"\n"
     } else {
         ""
     };
@@ -1518,8 +1552,16 @@ fn render_gemspec(gem_name: &str, has_async: bool) -> String {
   s.files       = Dir['lib/**/*.rb']
   s.require_paths = ['lib']
 
-  s.add_dependency 'ffi', '~> 1.15'
-{extra_dep}end
+  s.required_ruby_version = \">= 3.0\"
+
+  s.metadata = {{
+    \"source_code_uri\"   => \"https://github.com/weaveffi/{gem_name}\",
+    \"documentation_uri\" => \"https://rubydoc.info/gems/{gem_name}\",
+  }}
+
+  s.add_runtime_dependency \"ffi\", \"~> 1.16\"
+{extra_dep}  s.add_development_dependency \"rspec\", \"~> 3.12\"
+end
 "
     )
 }
@@ -1531,12 +1573,13 @@ Auto-generated Ruby bindings using the [ffi](https://github.com/ffi/ffi) gem.
 
 ## Prerequisites
 
-- Ruby >= 2.7
+- Ruby >= 3.0
 - The compiled shared library (`libweaveffi.so`, `libweaveffi.dylib`, or `weaveffi.dll`) available on your library search path.
 
 ## Install
 
 ```bash
+bundle install
 gem build weaveffi.gemspec
 gem install weaveffi-0.1.0.gem
 ```
@@ -1546,7 +1589,36 @@ gem install weaveffi-0.1.0.gem
 ```ruby
 require 'weaveffi'
 ```
+
+## Testing
+
+```bash
+bundle exec rspec
+```
 "#
+}
+
+fn render_gemfile() -> &'static str {
+    "source \"https://rubygems.org\"\n\ngemspec\n"
+}
+
+fn render_gemfile_lock() -> &'static str {
+    "# Placeholder Gemfile.lock. Run `bundle install` to regenerate.\n"
+}
+
+fn render_smoke_spec(gem_name: &str, module_name: &str) -> String {
+    format!(
+        "require \"rspec\"
+require \"weaveffi\"
+
+RSpec.describe \"{gem_name}\" do
+  it \"loads the generated FFI module\" do
+    expect(defined?({module_name})).to be_truthy
+    expect({module_name}).to be_a(Module)
+  end
+end
+"
+    )
 }
 
 #[cfg(test)]
@@ -1634,6 +1706,9 @@ mod tests {
             vec![
                 out_dir.join("ruby/lib/weaveffi.rb").to_string(),
                 out_dir.join("ruby/weaveffi.gemspec").to_string(),
+                out_dir.join("ruby/Gemfile").to_string(),
+                out_dir.join("ruby/Gemfile.lock").to_string(),
+                out_dir.join("ruby/spec/weaveffi_spec.rb").to_string(),
                 out_dir.join("ruby/README.md").to_string(),
             ]
         );
@@ -1641,21 +1716,25 @@ mod tests {
 
     #[test]
     fn ruby_output_files_with_config_respects_naming() {
-        // `ruby_gem_name` is only used inside the gemspec and `ruby_module_name`
-        // only appears inside the generated .rb source, so neither may change
-        // the output file paths.
+        // `ruby_module_name` only affects the contents of the generated .rb file,
+        // so it must not change output paths. `ruby_gem_name` does appear in the
+        // spec filename (`spec/{gem_name}_spec.rb`) and so must be reflected.
         let api = make_api(vec![]);
         let out_dir = Utf8Path::new("/tmp/out");
 
-        let expected = vec![
-            out_dir.join("ruby/lib/weaveffi.rb").to_string(),
-            out_dir.join("ruby/weaveffi.gemspec").to_string(),
-            out_dir.join("ruby/README.md").to_string(),
-        ];
-
         let default_files =
             RubyGenerator.output_files_with_config(&api, out_dir, &GeneratorConfig::default());
-        assert_eq!(default_files, expected);
+        assert_eq!(
+            default_files,
+            vec![
+                out_dir.join("ruby/lib/weaveffi.rb").to_string(),
+                out_dir.join("ruby/weaveffi.gemspec").to_string(),
+                out_dir.join("ruby/Gemfile").to_string(),
+                out_dir.join("ruby/Gemfile.lock").to_string(),
+                out_dir.join("ruby/spec/weaveffi_spec.rb").to_string(),
+                out_dir.join("ruby/README.md").to_string(),
+            ]
+        );
 
         let config = GeneratorConfig {
             ruby_gem_name: Some("my_ruby_gem".into()),
@@ -1664,8 +1743,16 @@ mod tests {
         };
         let custom_files = RubyGenerator.output_files_with_config(&api, out_dir, &config);
         assert_eq!(
-            custom_files, expected,
-            "ruby_gem_name / ruby_module_name must not affect output paths"
+            custom_files,
+            vec![
+                out_dir.join("ruby/lib/weaveffi.rb").to_string(),
+                out_dir.join("ruby/weaveffi.gemspec").to_string(),
+                out_dir.join("ruby/Gemfile").to_string(),
+                out_dir.join("ruby/Gemfile.lock").to_string(),
+                out_dir.join("ruby/spec/my_ruby_gem_spec.rb").to_string(),
+                out_dir.join("ruby/README.md").to_string(),
+            ],
+            "ruby_gem_name must drive the spec filename; ruby_module_name must not appear in paths"
         );
     }
 
@@ -1692,7 +1779,7 @@ mod tests {
             "require_paths: {contents}"
         );
         assert!(
-            contents.contains("s.add_dependency 'ffi', '~> 1.15'"),
+            contents.contains("s.add_runtime_dependency \"ffi\", \"~> 1.16\""),
             "ffi dependency: {contents}"
         );
 
@@ -1702,6 +1789,117 @@ mod tests {
         assert!(
             readme_contents.contains("gem build"),
             "usage instructions: {readme_contents}"
+        );
+    }
+
+    #[test]
+    fn ruby_gemspec_has_metadata() {
+        let api = make_api(vec![simple_module("math", vec![])]);
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
+        RubyGenerator.generate(&api, out_dir).unwrap();
+
+        let contents = std::fs::read_to_string(out_dir.join("ruby/weaveffi.gemspec")).unwrap();
+        assert!(
+            contents.contains("s.required_ruby_version = \">= 3.0\""),
+            "required_ruby_version: {contents}"
+        );
+        assert!(
+            contents.contains("s.metadata"),
+            "metadata block: {contents}"
+        );
+        assert!(
+            contents.contains("\"source_code_uri\""),
+            "source_code_uri key: {contents}"
+        );
+        assert!(
+            contents.contains("\"documentation_uri\""),
+            "documentation_uri key: {contents}"
+        );
+        assert!(
+            contents.contains("s.add_runtime_dependency \"ffi\", \"~> 1.16\""),
+            "runtime ffi dep: {contents}"
+        );
+        assert!(
+            contents.contains("s.add_development_dependency \"rspec\", \"~> 3.12\""),
+            "dev rspec dep: {contents}"
+        );
+    }
+
+    #[test]
+    fn ruby_has_gemfile() {
+        let api = make_api(vec![simple_module("math", vec![])]);
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
+        RubyGenerator.generate(&api, out_dir).unwrap();
+
+        let gemfile = out_dir.join("ruby/Gemfile");
+        assert!(gemfile.exists(), "Gemfile should exist");
+        let gemfile_contents = std::fs::read_to_string(&gemfile).unwrap();
+        assert!(
+            gemfile_contents.contains("source \"https://rubygems.org\""),
+            "Gemfile source: {gemfile_contents}"
+        );
+        assert!(
+            gemfile_contents.contains("gemspec"),
+            "Gemfile gemspec directive: {gemfile_contents}"
+        );
+
+        let lock = out_dir.join("ruby/Gemfile.lock");
+        assert!(lock.exists(), "Gemfile.lock placeholder should exist");
+        let lock_contents = std::fs::read_to_string(&lock).unwrap();
+        assert!(
+            lock_contents.contains("bundle install"),
+            "Gemfile.lock placeholder should mention `bundle install`: {lock_contents}"
+        );
+    }
+
+    #[test]
+    fn ruby_has_smoke_spec() {
+        let api = make_api(vec![simple_module("math", vec![])]);
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
+        RubyGenerator.generate(&api, out_dir).unwrap();
+
+        let spec = out_dir.join("ruby/spec/weaveffi_spec.rb");
+        assert!(spec.exists(), "default smoke spec should exist at {spec}");
+        let spec_contents = std::fs::read_to_string(&spec).unwrap();
+        assert!(
+            spec_contents.contains("require \"rspec\""),
+            "spec should require rspec: {spec_contents}"
+        );
+        assert!(
+            spec_contents.contains("require \"weaveffi\""),
+            "spec should require the generated library: {spec_contents}"
+        );
+        assert!(
+            spec_contents.contains("RSpec.describe"),
+            "spec should use RSpec.describe: {spec_contents}"
+        );
+        assert!(
+            spec_contents.contains("WeaveFFI"),
+            "spec should reference the default module name: {spec_contents}"
+        );
+
+        let config = GeneratorConfig {
+            ruby_gem_name: Some("my_gem".into()),
+            ruby_module_name: Some("MyMod".into()),
+            ..GeneratorConfig::default()
+        };
+        let dir2 = tempfile::tempdir().unwrap();
+        let out_dir2 = Utf8Path::from_path(dir2.path()).unwrap();
+        RubyGenerator
+            .generate_with_config(&api, out_dir2, &config)
+            .unwrap();
+        let custom_spec = out_dir2.join("ruby/spec/my_gem_spec.rb");
+        assert!(
+            custom_spec.exists(),
+            "custom gem_name drives spec filename: {custom_spec}"
+        );
+        let custom_contents = std::fs::read_to_string(&custom_spec).unwrap();
+        assert!(
+            custom_contents.contains("MyMod"),
+            "custom spec should reference configured module name: {custom_contents}"
         );
     }
 
@@ -2258,7 +2456,7 @@ mod tests {
 
         let gemspec = std::fs::read_to_string(out_dir.join("ruby/weaveffi.gemspec")).unwrap();
         assert!(
-            gemspec.contains("s.add_dependency 'concurrent-ruby', '~> 1.1'"),
+            gemspec.contains("s.add_runtime_dependency \"concurrent-ruby\", \"~> 1.1\""),
             "gemspec must add concurrent-ruby dependency when async is present: {gemspec}"
         );
     }
