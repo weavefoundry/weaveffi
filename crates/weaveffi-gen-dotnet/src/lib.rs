@@ -333,16 +333,23 @@ fn render_error_struct(out: &mut String) {
 
 fn render_helpers_class(out: &mut String) {
     out.push_str("    internal static class WeaveFFIHelpers\n    {\n");
-    out.push_str("        internal static IntPtr StringToPtr(string? s)\n        {\n");
     out.push_str(
-        "            return s == null ? IntPtr.Zero : Marshal.StringToCoTaskMemUTF8(s);\n",
+        "        internal static (IntPtr ptr, ulong len) StringToPtr(string? s)\n        {\n",
     );
+    out.push_str("            if (s == null) return (IntPtr.Zero, 0UL);\n");
+    out.push_str("            var bytes = System.Text.Encoding.UTF8.GetBytes(s);\n");
+    out.push_str("            var len = (ulong)(bytes.Length + 1);\n");
+    out.push_str("            var ptr = NativeMethods.weaveffi_alloc((UIntPtr)len);\n");
+    out.push_str("            Marshal.Copy(bytes, 0, ptr, bytes.Length);\n");
+    out.push_str("            Marshal.WriteByte(ptr, bytes.Length, 0);\n");
+    out.push_str("            return (ptr, len);\n");
     out.push_str("        }\n\n");
     out.push_str("        internal static string? PtrToString(IntPtr ptr)\n        {\n");
     out.push_str("            return ptr == IntPtr.Zero ? null : Marshal.PtrToStringUTF8(ptr);\n");
     out.push_str("        }\n\n");
-    out.push_str("        internal static void FreePtr(IntPtr ptr)\n        {\n");
-    out.push_str("            Marshal.FreeCoTaskMem(ptr);\n");
+    out.push_str("        internal static void FreePtr(IntPtr ptr, ulong len)\n        {\n");
+    out.push_str("            if (ptr == IntPtr.Zero) return;\n");
+    out.push_str("            NativeMethods.weaveffi_free(ptr, (UIntPtr)len);\n");
     out.push_str("        }\n\n");
     out.push_str(
         "        internal static (GCHandle handle, IntPtr ptr, UIntPtr len) PinUtf8(string s)\n        {\n",
@@ -661,6 +668,12 @@ fn render_native_methods(out: &mut String, api: &Api) {
     out.push_str("    internal static class NativeMethods\n    {\n");
     out.push_str("        private const string LibName = \"weaveffi\";\n\n");
 
+    out.push_str("        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]\n");
+    out.push_str("        internal static extern IntPtr weaveffi_alloc(UIntPtr size);\n\n");
+    out.push_str("        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]\n");
+    out.push_str(
+        "        internal static extern void weaveffi_free(IntPtr ptr, UIntPtr size);\n\n",
+    );
     out.push_str("        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]\n");
     out.push_str("        internal static extern void weaveffi_free_string(IntPtr ptr);\n\n");
     out.push_str("        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]\n");
@@ -1091,7 +1104,7 @@ fn render_marshal_setup(out: &mut String, p: &Param, indent: &str) {
         }
         TypeRef::BorrowedStr => {
             out.push_str(&format!(
-                "{indent}var {name}Ptr = Marshal.StringToCoTaskMemUTF8({name});\n"
+                "{indent}var ({name}Ptr, {name}Len) = WeaveFFIHelpers.StringToPtr({name});\n"
             ));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
@@ -1112,7 +1125,7 @@ fn render_marshal_setup(out: &mut String, p: &Param, indent: &str) {
             }
             TypeRef::BorrowedStr => {
                 out.push_str(&format!(
-                    "{indent}var {name}Ptr = {name} != null ? Marshal.StringToCoTaskMemUTF8({name}) : IntPtr.Zero;\n"
+                    "{indent}var ({name}Ptr, {name}Len) = WeaveFFIHelpers.StringToPtr({name});\n"
                 ));
             }
             TypeRef::I32 | TypeRef::Bool | TypeRef::Enum(_) | TypeRef::U32 => {
@@ -1168,7 +1181,9 @@ fn render_marshal_cleanup(out: &mut String, p: &Param, indent: &str) {
             out.push_str(&format!("{indent}{name}Pin.Free();\n"));
         }
         TypeRef::BorrowedStr => {
-            out.push_str(&format!("{indent}Marshal.FreeCoTaskMem({name}Ptr);\n"));
+            out.push_str(&format!(
+                "{indent}WeaveFFIHelpers.FreePtr({name}Ptr, {name}Len);\n"
+            ));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             out.push_str(&format!("{indent}{name}Pin.Free();\n"));
@@ -1179,7 +1194,7 @@ fn render_marshal_cleanup(out: &mut String, p: &Param, indent: &str) {
             }
             TypeRef::BorrowedStr => {
                 out.push_str(&format!(
-                    "{indent}if ({name}Ptr != IntPtr.Zero) Marshal.FreeCoTaskMem({name}Ptr);\n"
+                    "{indent}WeaveFFIHelpers.FreePtr({name}Ptr, {name}Len);\n"
                 ));
             }
             TypeRef::I32
@@ -3481,7 +3496,7 @@ mod tests {
             "missing WeaveFFIHelpers class: {cs}"
         );
         assert!(
-            cs.contains("internal static IntPtr StringToPtr(string? s)"),
+            cs.contains("internal static (IntPtr ptr, ulong len) StringToPtr(string? s)"),
             "missing StringToPtr: {cs}"
         );
         assert!(
@@ -3489,16 +3504,52 @@ mod tests {
             "missing PtrToString: {cs}"
         );
         assert!(
-            cs.contains("internal static void FreePtr(IntPtr ptr)"),
+            cs.contains("internal static void FreePtr(IntPtr ptr, ulong len)"),
             "missing FreePtr: {cs}"
         );
+    }
+
+    #[test]
+    fn dotnet_uses_weaveffi_alloc() {
+        let api = make_api(vec![simple_module(vec![])]);
+        let cs = render_csharp(&api, "WeaveFFI", true);
         assert!(
-            cs.contains("Marshal.StringToCoTaskMemUTF8(s)"),
-            "missing StringToCoTaskMemUTF8 in helper: {cs}"
+            cs.contains("internal static extern IntPtr weaveffi_alloc(UIntPtr size);"),
+            "missing weaveffi_alloc P/Invoke declaration: {cs}"
         );
         assert!(
-            cs.contains("Marshal.FreeCoTaskMem(ptr)"),
-            "missing FreeCoTaskMem in helper: {cs}"
+            cs.contains("NativeMethods.weaveffi_alloc((UIntPtr)len)"),
+            "StringToPtr helper must allocate via weaveffi_alloc: {cs}"
+        );
+        assert!(
+            cs.contains("Marshal.Copy(bytes, 0, ptr, bytes.Length);"),
+            "StringToPtr helper must copy UTF-8 bytes via Marshal.Copy: {cs}"
+        );
+        assert!(
+            cs.contains("Marshal.WriteByte(ptr, bytes.Length, 0);"),
+            "StringToPtr helper must write a trailing NUL terminator: {cs}"
+        );
+        assert!(
+            !cs.contains("Marshal.StringToCoTaskMemUTF8"),
+            "generator must not emit Marshal.StringToCoTaskMemUTF8: {cs}"
+        );
+    }
+
+    #[test]
+    fn dotnet_uses_weaveffi_free() {
+        let api = make_api(vec![simple_module(vec![])]);
+        let cs = render_csharp(&api, "WeaveFFI", true);
+        assert!(
+            cs.contains("internal static extern void weaveffi_free(IntPtr ptr, UIntPtr size);"),
+            "missing weaveffi_free P/Invoke declaration: {cs}"
+        );
+        assert!(
+            cs.contains("NativeMethods.weaveffi_free(ptr, (UIntPtr)len)"),
+            "FreePtr helper must release via weaveffi_free: {cs}"
+        );
+        assert!(
+            !cs.contains("Marshal.FreeCoTaskMem"),
+            "generator must not emit Marshal.FreeCoTaskMem: {cs}"
         );
     }
 
