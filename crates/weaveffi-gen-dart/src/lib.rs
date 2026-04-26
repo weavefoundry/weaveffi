@@ -4,7 +4,7 @@ use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_symbol_name, local_type_name};
-use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, TypeRef};
+use weaveffi_ir::ir::{Api, CallbackDef, EnumDef, Function, Module, StructDef, TypeRef};
 
 pub struct DartGenerator;
 
@@ -48,6 +48,7 @@ impl Generator for DartGenerator {
 
     fn capabilities(&self) -> &'static [Capability] {
         &[
+            Capability::Callbacks,
             Capability::Iterators,
             Capability::AsyncFunctions,
             Capability::CancellableAsync,
@@ -75,7 +76,7 @@ fn dart_type(ty: &TypeRef) -> String {
         TypeRef::List(inner) => format!("List<{}>", dart_type(inner)),
         TypeRef::Iterator(inner) => format!("Iterable<{}>", dart_type(inner)),
         TypeRef::Map(k, v) => format!("Map<{}, {}>", dart_type(k), dart_type(v)),
-        TypeRef::Callback(_) => "Function".into(),
+        TypeRef::Callback(n) => n.to_upper_camel_case(),
     }
 }
 
@@ -99,9 +100,13 @@ fn native_ffi_type(ty: &TypeRef) -> String {
         TypeRef::Bytes | TypeRef::BorrowedBytes => "Pointer<Uint8>".into(),
         TypeRef::TypedHandle(_) | TypeRef::Struct(_) => "Pointer<Void>".into(),
         TypeRef::Optional(inner) => native_ffi_type(inner),
-        TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) | TypeRef::Callback(_) => {
-            "Pointer<Void>".into()
+        TypeRef::Callback(n) => {
+            format!(
+                "Pointer<NativeFunction<_Native{}>>",
+                n.to_upper_camel_case()
+            )
         }
+        TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) => "Pointer<Void>".into(),
     }
 }
 
@@ -118,32 +123,39 @@ fn dart_ffi_type(ty: &TypeRef) -> String {
         TypeRef::Bytes | TypeRef::BorrowedBytes => "Pointer<Uint8>".into(),
         TypeRef::TypedHandle(_) | TypeRef::Struct(_) => "Pointer<Void>".into(),
         TypeRef::Optional(inner) => dart_ffi_type(inner),
-        TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) | TypeRef::Callback(_) => {
-            "Pointer<Void>".into()
+        TypeRef::Callback(n) => {
+            format!(
+                "Pointer<NativeFunction<_Native{}>>",
+                n.to_upper_camel_case()
+            )
         }
+        TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) => "Pointer<Void>".into(),
     }
 }
 
 /// Native FFI type(s) for a parameter. `StringUtf8` and `Bytes`/`BorrowedBytes` expand to a
-/// (ptr, len) pair to match the C ABI `(const uint8_t* X_ptr, size_t X_len)`.
+/// (ptr, len) pair to match the C ABI `(const uint8_t* X_ptr, size_t X_len)`. `Callback`
+/// expands to a `(function_ptr, context_ptr)` pair.
 fn native_ffi_param_types(ty: &TypeRef) -> Vec<String> {
     match ty {
         TypeRef::StringUtf8 => vec!["Pointer<Uint8>".into(), "IntPtr".into()],
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             vec!["Pointer<Uint8>".into(), "IntPtr".into()]
         }
+        TypeRef::Callback(_) => vec![native_ffi_type(ty), "Pointer<Void>".into()],
         _ => vec![native_ffi_type(ty)],
     }
 }
 
 /// Dart-side FFI type(s) for a parameter. `StringUtf8` and `Bytes`/`BorrowedBytes` expand to a
-/// (ptr, len) pair.
+/// (ptr, len) pair. `Callback` expands to a `(function_ptr, context_ptr)` pair.
 fn dart_ffi_param_types(ty: &TypeRef) -> Vec<String> {
     match ty {
         TypeRef::StringUtf8 => vec!["Pointer<Uint8>".into(), "int".into()],
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             vec!["Pointer<Uint8>".into(), "int".into()]
         }
+        TypeRef::Callback(_) => vec![dart_ffi_type(ty), "Pointer<Void>".into()],
         _ => vec![dart_ffi_type(ty)],
     }
 }
@@ -311,6 +323,9 @@ fn render_dart_module(api: &Api) -> String {
         for e in &module.enums {
             render_enum(&mut out, e);
         }
+        for cb in &module.callbacks {
+            render_callback(&mut out, cb);
+        }
         for s in &module.structs {
             render_struct(&mut out, &path, s);
             if s.builder {
@@ -347,6 +362,48 @@ fn render_enum(out: &mut String, e: &EnumDef) {
         "  static {name} fromValue(int value) =>\n      {name}.values.firstWhere((e) => e.value == value);\n"
     ));
     out.push_str("}\n");
+}
+
+fn render_callback(out: &mut String, cb: &CallbackDef) {
+    let name = cb.name.to_upper_camel_case();
+
+    let dart_ret = cb.returns.as_ref().map_or("void".into(), dart_type);
+    let user_params: Vec<String> = cb
+        .params
+        .iter()
+        .map(|p| format!("{} {}", dart_type(&p.ty), p.name.to_lower_camel_case()))
+        .collect();
+
+    if let Some(doc) = &cb.doc {
+        out.push_str(&format!("\n/// {doc}\n"));
+    } else {
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "typedef {name} = {dart_ret} Function({});\n",
+        user_params.join(", ")
+    ));
+
+    let native_ret = cb.returns.as_ref().map_or("Void".into(), native_ffi_type);
+    let dart_ffi_ret = cb.returns.as_ref().map_or("void".into(), dart_ffi_type);
+
+    let mut native_params: Vec<String> = vec!["Pointer<Void>".into()];
+    for p in &cb.params {
+        native_params.extend(native_ffi_param_types(&p.ty));
+    }
+    let mut dart_ffi_params: Vec<String> = vec!["Pointer<Void>".into()];
+    for p in &cb.params {
+        dart_ffi_params.extend(dart_ffi_param_types(&p.ty));
+    }
+
+    out.push_str(&format!(
+        "typedef _Native{name} = {native_ret} Function({});\n",
+        native_params.join(", ")
+    ));
+    out.push_str(&format!(
+        "typedef _Dart{name} = {dart_ffi_ret} Function({});\n",
+        dart_ffi_params.join(", ")
+    ));
 }
 
 fn render_struct(out: &mut String, module_path: &str, s: &StructDef) {
@@ -584,6 +641,12 @@ fn emit_function_body(out: &mut String, f: &Function, c_sym: &str) {
                 ));
                 allocations.push(buf);
             }
+            TypeRef::Callback(name) => {
+                let td = name.to_upper_camel_case();
+                out.push_str(&format!(
+                    "  final {pname}Ptr = Pointer.fromFunction<_Native{td}>({pname});\n"
+                ));
+            }
             _ => {}
         }
     }
@@ -615,6 +678,10 @@ fn emit_function_body(out: &mut String, f: &Function, c_sym: &str) {
             TypeRef::Enum(_) => call_args.push(format!("{pname}.value")),
             TypeRef::TypedHandle(_) | TypeRef::Struct(_) => {
                 call_args.push(format!("{pname}._handle"))
+            }
+            TypeRef::Callback(_) => {
+                call_args.push(format!("{pname}Ptr"));
+                call_args.push("nullptr".into());
             }
             _ => call_args.push(pname),
         }
@@ -2552,19 +2619,83 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_excludes_callbacks_listeners_and_builders() {
+    fn capabilities_excludes_listeners_and_builders() {
         let caps = DartGenerator.capabilities();
-        assert!(!caps.contains(&Capability::Callbacks));
+        assert!(caps.contains(&Capability::Callbacks));
         assert!(!caps.contains(&Capability::Listeners));
         assert!(!caps.contains(&Capability::Builders));
         for cap in Capability::ALL {
-            if matches!(
-                cap,
-                Capability::Callbacks | Capability::Listeners | Capability::Builders
-            ) {
+            if matches!(cap, Capability::Listeners | Capability::Builders) {
                 continue;
             }
             assert!(caps.contains(cap), "Dart generator must support {cap:?}");
         }
+    }
+
+    #[test]
+    fn dart_emits_callback_typedef_using_pointer_from_function() {
+        let api = make_api(vec![Module {
+            name: "events".into(),
+            functions: vec![Function {
+                name: "subscribe".into(),
+                params: vec![Param {
+                    name: "handler".into(),
+                    ty: TypeRef::Callback("OnMessage".into()),
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![CallbackDef {
+                name: "OnMessage".into(),
+                params: vec![Param {
+                    name: "msg".into(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+            }],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let dart = render_dart_module(&api);
+
+        assert!(
+            dart.contains("typedef OnMessage = void Function(String msg);"),
+            "missing user-facing OnMessage typedef: {dart}"
+        );
+        assert!(
+            dart.contains(
+                "typedef _NativeOnMessage = Void Function(Pointer<Void>, Pointer<Uint8>, IntPtr);"
+            ),
+            "missing native OnMessage typedef with context-first + expanded StringUtf8: {dart}"
+        );
+        assert!(
+            dart.contains(
+                "typedef _NativeWeaveffiEventsSubscribe = Void Function(Pointer<NativeFunction<_NativeOnMessage>>, Pointer<Void>, Pointer<_WeaveffiError>);"
+            ),
+            "subscribe typedef must pass callback pointer + context pointer: {dart}"
+        );
+        assert!(
+            dart.contains("void subscribe(OnMessage handler)"),
+            "wrapper should accept user-facing OnMessage type: {dart}"
+        );
+        assert!(
+            dart.contains("final handlerPtr = Pointer.fromFunction<_NativeOnMessage>(handler);"),
+            "wrapper must wrap callback via Pointer.fromFunction: {dart}"
+        );
+        assert!(
+            dart.contains("_weaveffiEventsSubscribe(handlerPtr, nullptr, err);"),
+            "wrapper must pass (pointer, nullptr context) to native fn: {dart}"
+        );
     }
 }
