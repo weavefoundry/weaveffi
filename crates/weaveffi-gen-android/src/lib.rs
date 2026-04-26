@@ -228,7 +228,7 @@ target_include_directories({c_prefix} PRIVATE ../../../../c)
 fn kotlin_type(t: &TypeRef) -> String {
     match t {
         TypeRef::I32 => "Int".to_string(),
-        TypeRef::U32 => "Long".to_string(),
+        TypeRef::U32 => "UInt".to_string(),
         TypeRef::I64 => "Long".to_string(),
         TypeRef::F64 => "Double".to_string(),
         TypeRef::Bool => "Boolean".to_string(),
@@ -248,6 +248,7 @@ fn kotlin_type(t: &TypeRef) -> String {
 
 fn kotlin_jni_type(t: &TypeRef) -> String {
     match t {
+        TypeRef::U32 => "Int".to_string(),
         TypeRef::TypedHandle(_) => "Long".to_string(),
         TypeRef::Callback(_) => "Long".to_string(),
         other => kotlin_type(other),
@@ -277,9 +278,8 @@ fn kotlin_list_type(inner: &TypeRef) -> String {
 
 fn jni_param_type(t: &TypeRef) -> String {
     match t {
-        TypeRef::I32 | TypeRef::Enum(_) => "jint".to_string(),
-        TypeRef::U32
-        | TypeRef::I64
+        TypeRef::I32 | TypeRef::U32 | TypeRef::Enum(_) => "jint".to_string(),
+        TypeRef::I64
         | TypeRef::TypedHandle(_)
         | TypeRef::Handle
         | TypeRef::Struct(_)
@@ -363,8 +363,8 @@ fn jni_default_return(t: Option<&TypeRef>) -> &'static str {
 
 fn jni_cast_for(t: &TypeRef) -> &'static str {
     match t {
-        TypeRef::I32 | TypeRef::Enum(_) => "(jint)",
-        TypeRef::U32 | TypeRef::I64 | TypeRef::TypedHandle(_) | TypeRef::Handle => "(jlong)",
+        TypeRef::I32 | TypeRef::U32 | TypeRef::Enum(_) => "(jint)",
+        TypeRef::I64 | TypeRef::TypedHandle(_) | TypeRef::Handle => "(jlong)",
         TypeRef::F64 => "(jdouble)",
         TypeRef::Struct(_) => "(jlong)(intptr_t)",
         _ => "",
@@ -390,6 +390,11 @@ fn has_callback_params(f: &Function) -> bool {
     f.params
         .iter()
         .any(|p| matches!(&p.ty, TypeRef::Callback(_)))
+}
+
+fn has_u32_involvement(f: &Function) -> bool {
+    f.params.iter().any(|p| matches!(&p.ty, TypeRef::U32))
+        || matches!(&f.returns, Some(TypeRef::U32))
 }
 
 fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
@@ -471,7 +476,7 @@ fn render_kotlin(api: &Api, package: &str, strip_module_prefix: bool, c_prefix: 
             }
             if f.r#async {
                 render_kotlin_async_fun(&mut kotlin, f, &func_name);
-            } else if has_enum_involvement(f) || has_callback_params(f) {
+            } else if has_enum_involvement(f) || has_callback_params(f) || has_u32_involvement(f) {
                 let native_params: Vec<String> = f
                     .params
                     .iter()
@@ -509,6 +514,7 @@ fn render_kotlin(api: &Api, package: &str, strip_module_prefix: bool, c_prefix: 
                         TypeRef::Callback(cb_name) => {
                             format!("register{}({})", cb_name, p.name)
                         }
+                        TypeRef::U32 => format!("{}.toInt()", p.name),
                         _ => p.name.clone(),
                     })
                     .collect();
@@ -522,6 +528,15 @@ fn render_kotlin(api: &Api, package: &str, strip_module_prefix: bool, c_prefix: 
                         public_params.join(", "),
                         public_ret,
                         name,
+                        call
+                    );
+                } else if matches!(&f.returns, Some(TypeRef::U32)) {
+                    let _ = writeln!(
+                        kotlin,
+                        "        @JvmStatic fun {}({}): {} = {}.toUInt()",
+                        func_name,
+                        public_params.join(", "),
+                        public_ret,
                         call
                     );
                 } else if f.returns.is_some() {
@@ -632,7 +647,7 @@ fn render_kotlin_async_fun(out: &mut String, f: &Function, func_name: &str) {
     let mut native_param_chain: Vec<String> = f
         .params
         .iter()
-        .map(|p| format!("{}: {}", p.name, kotlin_type(&p.ty)))
+        .map(|p| format!("{}: {}", p.name, kotlin_jni_type(&p.ty)))
         .collect();
     if f.cancellable {
         native_param_chain.push("cancelToken: Long".to_string());
@@ -656,7 +671,14 @@ fn render_kotlin_async_fun(out: &mut String, f: &Function, func_name: &str) {
         .as_ref()
         .map(kotlin_type)
         .unwrap_or_else(|| "Unit".to_string());
-    let mut call_arg_chain: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
+    let mut call_arg_chain: Vec<String> = f
+        .params
+        .iter()
+        .map(|p| match &p.ty {
+            TypeRef::U32 => format!("{}.toInt()", p.name),
+            _ => p.name.clone(),
+        })
+        .collect();
     if f.cancellable {
         call_arg_chain.push("token".to_string());
     }
@@ -866,7 +888,7 @@ fn callback_trampoline_c_params(ty: &TypeRef, name: &str) -> Vec<String> {
 
 fn write_callback_param_box(out: &mut String, ty: &TypeRef, name: &str) {
     match ty {
-        TypeRef::I32 | TypeRef::Enum(_) => {
+        TypeRef::I32 | TypeRef::U32 | TypeRef::Enum(_) => {
             let _ = writeln!(
                 out,
                 "    jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Integer\");",
@@ -875,7 +897,7 @@ fn write_callback_param_box(out: &mut String, ty: &TypeRef, name: &str) {
             let _ = writeln!(out, "    jmethodID {n}_vm = (*env)->GetStaticMethodID(env, {n}_cls, \"valueOf\", \"(I)Ljava/lang/Integer;\");", n = name);
             let _ = writeln!(out, "    jobject {n}_j = (*env)->CallStaticObjectMethod(env, {n}_cls, {n}_vm, (jint){n});", n = name);
         }
-        TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::TypedHandle(_) => {
+        TypeRef::I64 | TypeRef::Handle | TypeRef::TypedHandle(_) => {
             let _ = writeln!(
                 out,
                 "    jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Long\");",
@@ -934,18 +956,20 @@ fn write_callback_param_box(out: &mut String, ty: &TypeRef, name: &str) {
 
 fn write_callback_return_unbox(out: &mut String, ty: &TypeRef) {
     match ty {
-        TypeRef::I32 | TypeRef::Enum(_) => {
+        TypeRef::I32 | TypeRef::U32 | TypeRef::Enum(_) => {
             out.push_str("    jclass r_cls = (*env)->FindClass(env, \"java/lang/Integer\");\n");
             out.push_str(
                 "    jmethodID r_mid = (*env)->GetMethodID(env, r_cls, \"intValue\", \"()I\");\n",
             );
-            out.push_str(
-                "    int32_t rv = (int32_t)(*env)->CallIntMethod(env, result_j, r_mid);\n",
+            let ret_ty = callback_c_return_type(Some(ty));
+            let _ = writeln!(
+                out,
+                "    {ret_ty} rv = ({ret_ty})(*env)->CallIntMethod(env, result_j, r_mid);"
             );
             out.push_str("    (*env)->DeleteLocalRef(env, result_j);\n");
             out.push_str("    return rv;\n");
         }
-        TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::TypedHandle(_) => {
+        TypeRef::I64 | TypeRef::Handle | TypeRef::TypedHandle(_) => {
             out.push_str("    jclass r_cls = (*env)->FindClass(env, \"java/lang/Long\");\n");
             out.push_str(
                 "    jmethodID r_mid = (*env)->GetMethodID(env, r_cls, \"longValue\", \"()J\");\n",
@@ -1169,11 +1193,12 @@ fn render_jni_c(api: &Api, package: &str, strip_module_prefix: bool, c_prefix: &
                 jparams.push(format!("{} {}", jni_param_type(&p.ty), p.name));
             }
             let func_name = wrapper_name(&path, &f.name, strip_module_prefix);
-            let jni_name = if has_enum_involvement(f) || has_callback_params(f) {
-                format!("{}Jni", func_name)
-            } else {
-                func_name
-            };
+            let jni_name =
+                if has_enum_involvement(f) || has_callback_params(f) || has_u32_involvement(f) {
+                    format!("{}Jni", func_name)
+                } else {
+                    func_name
+                };
             let _ = writeln!(
                 jni_c,
                 "JNIEXPORT {} JNICALL Java_{}_WeaveFFI_{}({}) {{",
@@ -1246,20 +1271,14 @@ fn write_jni_box_result(out: &mut String, ret: Option<&TypeRef>) {
         None => {
             out.push_str("        jobject boxed = NULL;\n");
         }
-        Some(TypeRef::I32 | TypeRef::Enum(_)) => {
+        Some(TypeRef::I32 | TypeRef::U32 | TypeRef::Enum(_)) => {
             out.push_str(
                 "        jclass boxCls = (*env)->FindClass(env, \"java/lang/Integer\");\n",
             );
             out.push_str("        jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(I)Ljava/lang/Integer;\");\n");
             out.push_str("        jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jint)result);\n");
         }
-        Some(
-            TypeRef::U32
-            | TypeRef::I64
-            | TypeRef::Handle
-            | TypeRef::TypedHandle(_)
-            | TypeRef::Struct(_),
-        ) => {
+        Some(TypeRef::I64 | TypeRef::Handle | TypeRef::TypedHandle(_) | TypeRef::Struct(_)) => {
             out.push_str("        jclass boxCls = (*env)->FindClass(env, \"java/lang/Long\");\n");
             out.push_str("        jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(J)Ljava/lang/Long;\");\n");
             out.push_str("        jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jlong)result);\n");
@@ -1459,11 +1478,29 @@ fn write_optional_acquire(out: &mut String, name: &str, inner: &TypeRef) {
             let _ = writeln!(out, "        {n}_ptr = &{n}_val;", n = name);
             let _ = writeln!(out, "    }}");
         }
-        TypeRef::U32
-        | TypeRef::I64
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Handle
-        | TypeRef::Struct(_) => {
+        TypeRef::U32 => {
+            let _ = writeln!(out, "    uint32_t {n}_val = 0;", n = name);
+            let _ = writeln!(out, "    const uint32_t* {n}_ptr = NULL;", n = name);
+            let _ = writeln!(out, "    if ({n} != NULL) {{", n = name);
+            let _ = writeln!(
+                out,
+                "        jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Integer\");",
+                n = name
+            );
+            let _ = writeln!(
+                out,
+                "        jmethodID {n}_mid = (*env)->GetMethodID(env, {n}_cls, \"intValue\", \"()I\");",
+                n = name
+            );
+            let _ = writeln!(
+                out,
+                "        {n}_val = (uint32_t)(*env)->CallIntMethod(env, {n}, {n}_mid);",
+                n = name
+            );
+            let _ = writeln!(out, "        {n}_ptr = &{n}_val;", n = name);
+            let _ = writeln!(out, "    }}");
+        }
+        TypeRef::I64 | TypeRef::TypedHandle(_) | TypeRef::Handle | TypeRef::Struct(_) => {
             let _ = writeln!(out, "    int64_t {n}_val = 0;", n = name);
             let _ = writeln!(out, "    const int64_t* {n}_ptr = NULL;", n = name);
             let _ = writeln!(out, "    if ({n} != NULL) {{", n = name);
@@ -2032,11 +2069,29 @@ fn write_optional_return(
                 "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jint)*rv);"
             );
         }
-        TypeRef::U32
-        | TypeRef::I64
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Handle
-        | TypeRef::Struct(_) => {
+        TypeRef::U32 => {
+            let _ = writeln!(
+                out,
+                "    const uint32_t* rv = {}({}, &err);",
+                c_sym, args_str
+            );
+            write_error_check(out, returns);
+            release_jni_resources(out, params);
+            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
+            let _ = writeln!(
+                out,
+                "    jclass cls = (*env)->FindClass(env, \"java/lang/Integer\");"
+            );
+            let _ = writeln!(
+                out,
+                "    jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(I)Ljava/lang/Integer;\");"
+            );
+            let _ = writeln!(
+                out,
+                "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jint)*rv);"
+            );
+        }
+        TypeRef::I64 | TypeRef::TypedHandle(_) | TypeRef::Handle | TypeRef::Struct(_) => {
             let _ = writeln!(
                 out,
                 "    const int64_t* rv = (const int64_t*){}({}, &err);",
@@ -2457,7 +2512,12 @@ fn render_kotlin_struct(out: &mut String, s: &StructDef, c_prefix: &str) {
     let _ = writeln!(out, "        init {{ System.loadLibrary(\"{c_prefix}\") }}");
     let _ = writeln!(out);
 
-    let create_params: Vec<String> = s
+    let native_create_params: Vec<String> = s
+        .fields
+        .iter()
+        .map(|f| format!("{}: {}", f.name, kotlin_jni_type(&f.ty)))
+        .collect();
+    let public_create_params: Vec<String> = s
         .fields
         .iter()
         .map(|f| format!("{}: {}", f.name, kotlin_type(&f.ty)))
@@ -2465,7 +2525,7 @@ fn render_kotlin_struct(out: &mut String, s: &StructDef, c_prefix: &str) {
     let _ = writeln!(
         out,
         "        @JvmStatic external fun nativeCreate({}): Long",
-        create_params.join(", ")
+        native_create_params.join(", ")
     );
     let _ = writeln!(
         out,
@@ -2477,19 +2537,26 @@ fn render_kotlin_struct(out: &mut String, s: &StructDef, c_prefix: &str) {
             out,
             "        @JvmStatic external fun nativeGet{}(handle: Long): {}",
             pascal,
-            kotlin_type(&f.ty)
+            kotlin_jni_type(&f.ty)
         );
     }
 
-    let param_names: Vec<&str> = s.fields.iter().map(|f| f.name.as_str()).collect();
+    let create_call_args: Vec<String> = s
+        .fields
+        .iter()
+        .map(|f| match &f.ty {
+            TypeRef::U32 => format!("{}.toInt()", f.name),
+            _ => f.name.clone(),
+        })
+        .collect();
     let _ = writeln!(out);
     let _ = writeln!(
         out,
         "        fun create({}): {} = {}(nativeCreate({}))",
-        create_params.join(", "),
+        public_create_params.join(", "),
         s.name,
         s.name,
-        param_names.join(", ")
+        create_call_args.join(", ")
     );
     let _ = writeln!(out, "    }}");
     let _ = writeln!(out);
@@ -2504,6 +2571,13 @@ fn render_kotlin_struct(out: &mut String, s: &StructDef, c_prefix: &str) {
                     out,
                     "    val {}: {} get() = {}(nativeGet{}(handle))",
                     f.name, kt_type, local, pascal
+                );
+            }
+            TypeRef::U32 => {
+                let _ = writeln!(
+                    out,
+                    "    val {}: {} get() = nativeGet{}(handle).toUInt()",
+                    f.name, kt_type, pascal
                 );
             }
             _ => {
@@ -3310,6 +3384,73 @@ mod tests {
     #[test]
     fn kotlin_type_for_struct_returns_long() {
         assert_eq!(kotlin_type(&TypeRef::Struct("Contact".into())), "Long");
+    }
+
+    #[test]
+    fn kotlin_u32_maps_to_uint() {
+        assert_eq!(kotlin_type(&TypeRef::U32), "UInt");
+        assert_eq!(kotlin_jni_type(&TypeRef::U32), "Int");
+        assert_eq!(jni_param_type(&TypeRef::U32), "jint");
+        assert_eq!(jni_cast_for(&TypeRef::U32), "(jint)");
+    }
+
+    #[test]
+    fn kotlin_i64_maps_to_long() {
+        assert_eq!(kotlin_type(&TypeRef::I64), "Long");
+        assert_eq!(kotlin_jni_type(&TypeRef::I64), "Long");
+        assert_eq!(jni_param_type(&TypeRef::I64), "jlong");
+        assert_eq!(jni_cast_for(&TypeRef::I64), "(jlong)");
+    }
+
+    #[test]
+    fn kotlin_u32_function_uses_uint_wrapper_and_int_jni() {
+        let api = make_api(vec![Module {
+            name: "calc".into(),
+            functions: vec![Function {
+                name: "next".into(),
+                params: vec![Param {
+                    name: "seed".into(),
+                    ty: TypeRef::U32,
+                    mutable: false,
+                }],
+                returns: Some(TypeRef::U32),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi");
+        assert!(
+            kt.contains("@JvmStatic private external fun nextJni(seed: Int): Int"),
+            "missing Int-typed JNI bridge for U32 function: {kt}"
+        );
+        assert!(
+            kt.contains("@JvmStatic fun next(seed: UInt): UInt = nextJni(seed.toInt()).toUInt()"),
+            "missing UInt-typed public wrapper for U32 function: {kt}"
+        );
+
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi");
+        assert!(
+            jni.contains("jint JNICALL Java_com_weaveffi_WeaveFFI_nextJni"),
+            "JNI C bridge should return jint for U32 function: {jni}"
+        );
+        assert!(
+            jni.contains("jint seed"),
+            "JNI C bridge should receive jint for U32 param: {jni}"
+        );
+        assert!(
+            jni.contains("(uint32_t)seed"),
+            "JNI C bridge should cast jint to uint32_t for C call: {jni}"
+        );
     }
 
     #[test]
