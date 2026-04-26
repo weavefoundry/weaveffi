@@ -79,6 +79,72 @@ fn extract_typed_handle_attr(attrs: &[syn::Attribute]) -> Option<String> {
     })
 }
 
+#[derive(Default)]
+struct ExportArgs {
+    r#async: bool,
+    cancellable: bool,
+    since: Option<String>,
+}
+
+fn parse_export_args(attrs: &[syn::Attribute]) -> Result<ExportArgs> {
+    let mut out = ExportArgs::default();
+    for attr in attrs {
+        if !attr.path().is_ident("weaveffi_export") {
+            continue;
+        }
+        if !matches!(attr.meta, syn::Meta::List(_)) {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("async") {
+                out.r#async = true;
+            } else if meta.path.is_ident("cancellable") {
+                out.cancellable = true;
+            } else if meta.path.is_ident("since") {
+                let lit: syn::LitStr = meta.value()?.parse()?;
+                out.since = Some(lit.value());
+            } else {
+                return Err(meta.error("unknown weaveffi_export argument"));
+            }
+            Ok(())
+        })
+        .map_err(|e| eyre!("weaveffi_export: {e}"))?;
+    }
+    Ok(out)
+}
+
+fn extract_deprecated(attrs: &[syn::Attribute]) -> Option<String> {
+    attrs.iter().find_map(|attr| {
+        if !attr.path().is_ident("deprecated") {
+            return None;
+        }
+        match &attr.meta {
+            syn::Meta::Path(_) => Some(String::new()),
+            syn::Meta::NameValue(nv) => {
+                let syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(s),
+                    ..
+                }) = &nv.value
+                else {
+                    return None;
+                };
+                Some(s.value())
+            }
+            syn::Meta::List(_) => {
+                let mut note = None;
+                let _ = attr.parse_nested_meta(|meta| {
+                    if meta.path.is_ident("note") {
+                        let lit: syn::LitStr = meta.value()?.parse()?;
+                        note = Some(lit.value());
+                    }
+                    Ok(())
+                });
+                note
+            }
+        }
+    })
+}
+
 fn single_generic_arg(seg: &syn::PathSegment) -> Result<&syn::Type> {
     let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
         bail!("{}: expected generic arguments", seg.ident);
@@ -205,15 +271,17 @@ fn extract_function(item: &syn::ItemFn) -> Result<Function> {
         syn::ReturnType::Type(_, ty) => Some(map_type(ty)?),
     };
 
+    let export_args = parse_export_args(&item.attrs)?;
+
     Ok(Function {
         name,
         params,
         returns,
         doc: extract_doc(&item.attrs),
-        r#async: false,
-        cancellable: false,
-        deprecated: None,
-        since: None,
+        r#async: export_args.r#async,
+        cancellable: export_args.cancellable,
+        deprecated: extract_deprecated(&item.attrs),
+        since: export_args.since,
     })
 }
 
@@ -905,5 +973,62 @@ mod tests {
         let api = extract_api_from_rust(src).unwrap();
         let f = &api.modules[0].functions[0];
         assert_eq!(f.params[0].ty, TypeRef::BorrowedBytes);
+    }
+
+    #[test]
+    fn extract_async_function() {
+        let src = r#"
+            mod m {
+                #[weaveffi_export(async)]
+                fn fetch(url: String) -> String { String::new() }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert!(f.r#async);
+        assert!(!f.cancellable);
+        assert_eq!(f.deprecated, None);
+        assert_eq!(f.since, None);
+    }
+
+    #[test]
+    fn extract_cancellable_function() {
+        let src = r#"
+            mod m {
+                #[weaveffi_export(cancellable)]
+                fn download(url: String) -> Vec<u8> { vec![] }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert!(f.cancellable);
+        assert!(!f.r#async);
+    }
+
+    #[test]
+    fn extract_deprecated_function() {
+        let src = r#"
+            mod m {
+                #[deprecated(note = "use add_v2 instead")]
+                #[weaveffi_export]
+                fn add(a: i32, b: i32) -> i32 { a + b }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert_eq!(f.deprecated.as_deref(), Some("use add_v2 instead"));
+    }
+
+    #[test]
+    fn extract_since_attribute() {
+        let src = r#"
+            mod m {
+                #[weaveffi_export(since = "0.5.0")]
+                fn new_api(x: i32) -> i32 { x }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert_eq!(f.since.as_deref(), Some("0.5.0"));
     }
 }
