@@ -4,7 +4,9 @@ use heck::ToUpperCamelCase;
 use weaveffi_core::codegen::{Capability, Generator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{c_abi_struct_name, local_type_name};
-use weaveffi_ir::ir::{Api, ErrorCode, Function, Module, StructDef, StructField, TypeRef};
+use weaveffi_ir::ir::{
+    Api, CallbackDef, ErrorCode, Function, Module, StructDef, StructField, TypeRef,
+};
 
 pub struct CppGenerator;
 
@@ -60,6 +62,7 @@ impl Generator for CppGenerator {
 
     fn capabilities(&self) -> &'static [Capability] {
         &[
+            Capability::Callbacks,
             Capability::Iterators,
             Capability::Builders,
             Capability::AsyncFunctions,
@@ -161,6 +164,12 @@ fn render_cpp_header(api: &Api, namespace: &str) -> String {
     out.push_str("#include <stdexcept>\n");
     if collect_all_modules(&api.modules)
         .iter()
+        .any(|m| !m.callbacks.is_empty())
+    {
+        out.push_str("#include <functional>\n");
+    }
+    if collect_all_modules(&api.modules)
+        .iter()
         .any(|m| m.functions.iter().any(|f| f.r#async))
     {
         out.push_str("#include <future>\n");
@@ -182,6 +191,7 @@ fn render_cpp_header(api: &Api, namespace: &str) -> String {
 
     for (module, path) in collect_modules_with_path(&api.modules) {
         render_cpp_enums(&mut out, module);
+        render_cpp_callbacks(&mut out, module);
         render_cpp_classes(&mut out, module, &path);
         render_cpp_functions(&mut out, module, &error_codes, &path);
     }
@@ -275,7 +285,9 @@ fn c_param_type(ty: &TypeRef, name: &str, module: &str) -> String {
             };
             format!("{kp}, {vp}, size_t {name}_len")
         }
-        TypeRef::Callback(_) => unreachable!("validator should have rejected callback C++ type"),
+        TypeRef::Callback(n) => {
+            format!("weaveffi_{module}_{n} {name}, void* {name}_context")
+        }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
     }
 }
@@ -372,6 +384,25 @@ fn render_extern_c(out: &mut String, api: &Api) {
                 .map(|v| format!("{tag}_{} = {}", v.name, v.value))
                 .collect();
             out.push_str(&format!("typedef enum {{ {} }} {tag};\n", vars.join(", ")));
+        }
+
+        for cb in &module.callbacks {
+            let cb_type = format!("weaveffi_{}_{}", path, cb.name);
+            let (ret_ty, ret_extra) = match &cb.returns {
+                Some(r) => c_ret_type(r, &path),
+                None => ("void".to_string(), vec![]),
+            };
+            let mut params: Vec<String> = vec!["void* context".to_string()];
+            params.extend(
+                cb.params
+                    .iter()
+                    .map(|p| c_param_type(&p.ty, &p.name, &path)),
+            );
+            params.extend(ret_extra);
+            out.push_str(&format!(
+                "typedef {ret_ty} (*{cb_type})({});\n",
+                params.join(", ")
+            ));
         }
 
         for s in &module.structs {
@@ -498,7 +529,7 @@ fn cpp_type(ty: &TypeRef) -> String {
         TypeRef::Map(k, v) => {
             format!("std::unordered_map<{}, {}>", cpp_type(k), cpp_type(v))
         }
-        TypeRef::Callback(_) => unreachable!("validator should have rejected callback C++ type"),
+        TypeRef::Callback(n) => n.clone(),
     }
 }
 
@@ -513,6 +544,7 @@ fn cpp_param_decl(ty: &TypeRef, name: &str) -> String {
         TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
             format!("const {}& {name}", cpp_type(ty))
         }
+        TypeRef::Callback(n) => format!("{n} {name}"),
         _ => format!("{} {name}", cpp_type(ty)),
     }
 }
@@ -551,6 +583,24 @@ fn render_cpp_enums(out: &mut String, module: &Module) {
             out.push_str(&format!("    {} = {}{}\n", v.name, v.value, comma));
         }
         out.push_str("};\n\n");
+    }
+}
+
+// ── Namespace: callback typedefs ──
+
+fn render_cpp_callbacks(out: &mut String, module: &Module) {
+    for cb in &module.callbacks {
+        let params: Vec<String> = cb.params.iter().map(|p| cpp_type(&p.ty)).collect();
+        let ret = cb
+            .returns
+            .as_ref()
+            .map(cpp_type)
+            .unwrap_or_else(|| "void".to_string());
+        out.push_str(&format!(
+            "using {} = std::function<{ret}({})>;\n\n",
+            cb.name,
+            params.join(", ")
+        ));
     }
 }
 
@@ -854,6 +904,106 @@ fn render_getter_map(
     out.push_str("        return ret;\n");
 }
 
+// ── Callback param bridge ──
+
+/// Emit the C++-to-C bridge for a callback parameter: heap-allocate a
+/// `std::function`, register it in a thread-local registry for later cleanup,
+/// and define a non-capturing lambda trampoline (decays to a C function
+/// pointer) that invokes the function via the `void* context` pointer.
+fn render_cpp_callback_param_setup(out: &mut Vec<String>, param_name: &str, cb: &CallbackDef) {
+    let cb_ty = &cb.name;
+    out.push(format!(
+        "static thread_local std::vector<std::unique_ptr<{cb_ty}>> {param_name}_registry;"
+    ));
+    out.push(format!(
+        "auto* {param_name}_heap = new {cb_ty}(std::move({param_name}));"
+    ));
+    out.push(format!(
+        "{param_name}_registry.emplace_back({param_name}_heap);"
+    ));
+
+    let mut tramp_params: Vec<String> = vec!["void* context".to_string()];
+    for cp in &cb.params {
+        tramp_params.push(callback_c_param_decl(&cp.ty, &cp.name));
+    }
+    let ret_c = cb
+        .returns
+        .as_ref()
+        .map(callback_c_return_type)
+        .unwrap_or_else(|| "void".to_string());
+
+    out.push(format!(
+        "auto {param_name}_trampoline = +[]({}) -> {ret_c} {{",
+        tramp_params.join(", ")
+    ));
+
+    let mut cpp_args: Vec<String> = Vec::new();
+    for cp in &cb.params {
+        let (conv, arg) = callback_c_to_cpp(&cp.ty, &cp.name);
+        if !conv.is_empty() {
+            out.push(format!("    {conv}"));
+        }
+        cpp_args.push(arg);
+    }
+    out.push(format!(
+        "    return (*static_cast<{cb_ty}*>(context))({});",
+        cpp_args.join(", ")
+    ));
+    out.push("};".to_string());
+}
+
+/// C-side declaration for a callback parameter (type + name), matching the
+/// C ABI expansion used by `c_param_type` so the trampoline signature lines
+/// up with the C function pointer typedef.
+fn callback_c_param_decl(ty: &TypeRef, name: &str) -> String {
+    match ty {
+        TypeRef::I32 => format!("int32_t {name}"),
+        TypeRef::U32 => format!("uint32_t {name}"),
+        TypeRef::I64 => format!("int64_t {name}"),
+        TypeRef::F64 => format!("double {name}"),
+        TypeRef::Bool => format!("bool {name}"),
+        TypeRef::Handle => format!("weaveffi_handle_t {name}"),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr | TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            format!("const uint8_t* {name}_ptr, size_t {name}_len")
+        }
+        _ => unreachable!("unsupported C++ callback parameter type: {ty:?}"),
+    }
+}
+
+fn callback_c_return_type(ty: &TypeRef) -> String {
+    match ty {
+        TypeRef::I32 => "int32_t".into(),
+        TypeRef::U32 => "uint32_t".into(),
+        TypeRef::I64 => "int64_t".into(),
+        TypeRef::F64 => "double".into(),
+        TypeRef::Bool => "bool".into(),
+        TypeRef::Handle => "weaveffi_handle_t".into(),
+        _ => unreachable!("unsupported C++ callback return type: {ty:?}"),
+    }
+}
+
+/// Convert the C trampoline argument(s) back into a C++ value for the
+/// user's `std::function`. Returns `(conversion_stmt, cpp_arg_expression)`.
+fn callback_c_to_cpp(ty: &TypeRef, name: &str) -> (String, String) {
+    match ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => (
+            format!(
+                "std::string {name}({name}_ptr ? reinterpret_cast<const char*>({name}_ptr) : \"\", {name}_len);"
+            ),
+            name.to_string(),
+        ),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => (
+            format!("std::vector<uint8_t> {name}({name}_ptr, {name}_ptr + {name}_len);"),
+            name.to_string(),
+        ),
+        TypeRef::Handle => (
+            String::new(),
+            format!("reinterpret_cast<void*>(static_cast<uintptr_t>({name}))"),
+        ),
+        _ => (String::new(), name.to_string()),
+    }
+}
+
 // ── Namespace: free function wrappers ──
 
 fn render_cpp_functions(
@@ -866,7 +1016,7 @@ fn render_cpp_functions(
         if func.r#async {
             render_cpp_async_function(out, func, abi_module);
         } else {
-            render_cpp_function(out, func, abi_module, error_codes);
+            render_cpp_function(out, func, abi_module, error_codes, &module.callbacks);
         }
     }
 }
@@ -1042,6 +1192,7 @@ fn render_cpp_function(
     func: &Function,
     abi_module: &str,
     error_codes: &[&ErrorCode],
+    callbacks: &[CallbackDef],
 ) {
     let cpp_ret = func.returns.as_ref().map_or("void".to_string(), cpp_type);
     let cpp_params: Vec<String> = func
@@ -1064,9 +1215,19 @@ fn render_cpp_function(
     let mut setup = Vec::new();
     let mut c_args = Vec::new();
     for p in &func.params {
-        let (s, a) = param_to_c_args(&p.ty, &p.name, abi_module);
-        setup.extend(s);
-        c_args.extend(a);
+        if let TypeRef::Callback(cb_name) = &p.ty {
+            let cb = callbacks
+                .iter()
+                .find(|c| c.name == *cb_name)
+                .expect("validator should have ensured callback is defined in this module");
+            render_cpp_callback_param_setup(&mut setup, &p.name, cb);
+            c_args.push(format!("{}_trampoline", p.name));
+            c_args.push(format!("{}_heap", p.name));
+        } else {
+            let (s, a) = param_to_c_args(&p.ty, &p.name, abi_module);
+            setup.extend(s);
+            c_args.extend(a);
+        }
     }
 
     let is_void_c = func
@@ -1467,8 +1628,8 @@ mod tests {
     use weaveffi_core::codegen::Generator;
     use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{
-        Api, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param, StructDef,
-        StructField, TypeRef,
+        Api, CallbackDef, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param,
+        StructDef, StructField, TypeRef,
     };
 
     fn minimal_api() -> Api {
@@ -3694,12 +3855,12 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_excludes_callbacks_and_listeners() {
+    fn capabilities_excludes_listeners() {
         let caps = CppGenerator.capabilities();
-        assert!(!caps.contains(&Capability::Callbacks));
+        assert!(caps.contains(&Capability::Callbacks));
         assert!(!caps.contains(&Capability::Listeners));
         for cap in Capability::ALL {
-            if matches!(cap, Capability::Callbacks | Capability::Listeners) {
+            if matches!(cap, Capability::Listeners) {
                 continue;
             }
             assert!(caps.contains(cap), "C++ generator must support {cap:?}");
@@ -3707,20 +3868,97 @@ mod tests {
     }
 
     #[test]
-    fn callback_type_panics_with_validator_message() {
-        let cb = TypeRef::Callback("OnEvent".into());
-        let err = std::panic::catch_unwind(|| {
-            let _ = cpp_type(&cb);
-        })
-        .expect_err("callback must panic");
-        let msg = err
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| err.downcast_ref::<&'static str>().map(|s| s.to_string()))
-            .unwrap_or_default();
+    fn cpp_emits_callback_typedef_using_std_function() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "events".into(),
+                functions: vec![Function {
+                    name: "subscribe".into(),
+                    params: vec![Param {
+                        name: "cb".into(),
+                        ty: TypeRef::Callback("OnData".into()),
+                        mutable: false,
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![CallbackDef {
+                    name: "OnData".into(),
+                    params: vec![
+                        Param {
+                            name: "value".into(),
+                            ty: TypeRef::I32,
+                            mutable: false,
+                        },
+                        Param {
+                            name: "label".into(),
+                            ty: TypeRef::StringUtf8,
+                            mutable: false,
+                        },
+                    ],
+                    returns: None,
+                    doc: None,
+                }],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let h = render_cpp_header(&api, "weaveffi");
+
         assert!(
-            msg.contains("validator should have rejected"),
-            "panic message did not mention validator: {msg}"
+            h.contains("#include <functional>"),
+            "should include <functional> when callbacks are present: {h}"
+        );
+        assert!(
+            h.contains("using OnData = std::function<void(int32_t, std::string)>;"),
+            "should emit using-alias typedef with std::function: {h}"
+        );
+        assert!(
+            h.contains(
+                "typedef void (*weaveffi_events_OnData)(void* context, int32_t value, const uint8_t* label_ptr, size_t label_len);"
+            ),
+            "extern C should declare the callback as a C function pointer typedef: {h}"
+        );
+        assert!(
+            h.contains(
+                "void weaveffi_events_subscribe(weaveffi_events_OnData cb, void* cb_context, weaveffi_error* out_err);"
+            ),
+            "extern C function should take callback + void* context: {h}"
+        );
+        assert!(
+            h.contains("inline void events_subscribe(OnData cb)"),
+            "C++ wrapper should accept the std::function by value: {h}"
+        );
+        assert!(
+            h.contains("auto* cb_heap = new OnData(std::move(cb));"),
+            "wrapper must heap-allocate the std::function: {h}"
+        );
+        assert!(
+            h.contains("cb_registry.emplace_back(cb_heap);"),
+            "wrapper must register the heap pointer for later cleanup: {h}"
+        );
+        assert!(
+            h.contains(
+                "auto cb_trampoline = +[](void* context, int32_t value, const uint8_t* label_ptr, size_t label_len) -> void {"
+            ),
+            "wrapper must define a non-capturing C trampoline: {h}"
+        );
+        assert!(
+            h.contains("(*static_cast<OnData*>(context))(value, label)"),
+            "trampoline must invoke the std::function via the context pointer: {h}"
+        );
+        assert!(
+            h.contains("weaveffi_events_subscribe(cb_trampoline, cb_heap, &err);"),
+            "wrapper must pass trampoline and heap pointer as the C callback + context args: {h}"
         );
     }
 }
