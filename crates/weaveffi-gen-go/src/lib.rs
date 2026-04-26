@@ -2669,4 +2669,96 @@ mod tests {
             "optional string param must not use C.CString: {find_text}"
         );
     }
+
+    #[test]
+    fn go_bytes_param_uses_canonical_shape() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "io".into(),
+                functions: vec![Function {
+                    name: "send".into(),
+                    params: vec![Param {
+                        name: "payload".into(),
+                        ty: TypeRef::Bytes,
+                        mutable: false,
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let go = render_go(&api);
+        assert!(
+            go.contains("var cPayloadPtr *C.uint8_t"),
+            "Go wrapper must declare *C.uint8_t for Bytes param ptr: {go}"
+        );
+        assert!(
+            go.contains("cPayloadLen := C.size_t(len(payload))"),
+            "Go wrapper must capture payload length as C.size_t: {go}"
+        );
+        assert!(
+            go.contains("cPayloadPtr = (*C.uint8_t)(unsafe.Pointer(&payload[0]))"),
+            "Go wrapper must compute ptr from &payload[0]: {go}"
+        );
+        assert!(
+            go.contains("C.weaveffi_io_send(cPayloadPtr, cPayloadLen, &cErr)"),
+            "Go wrapper must call C with (ptr, len, &cErr) for Bytes param: {go}"
+        );
+    }
+
+    #[test]
+    fn go_bytes_return_uses_canonical_shape() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "io".into(),
+                functions: vec![Function {
+                    name: "read".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::Bytes),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let go = render_go(&api);
+        assert!(
+            go.contains("var cOutLen C.size_t"),
+            "Go wrapper must declare cOutLen out-param for Bytes return: {go}"
+        );
+        assert!(
+            go.contains("result := C.weaveffi_io_read(&cOutLen, &cErr)"),
+            "Go wrapper must call C with (&cOutLen, &cErr) for Bytes return: {go}"
+        );
+        assert!(
+            go.contains("C.GoBytes(unsafe.Pointer(result), C.int(cOutLen))"),
+            "Go wrapper must copy bytes via C.GoBytes(result, cOutLen): {go}"
+        );
+        assert!(
+            go.contains("C.weaveffi_free_bytes(result, cOutLen)"),
+            "Go wrapper must free returned bytes via C.weaveffi_free_bytes(result, cOutLen): {go}"
+        );
+    }
 }

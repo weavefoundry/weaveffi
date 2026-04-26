@@ -109,19 +109,26 @@ fn dart_ffi_type(ty: &TypeRef) -> String {
     }
 }
 
-/// Native FFI type(s) for a parameter. `StringUtf8` expands to a (ptr, len) pair
-/// to match the C ABI `(const uint8_t* X_ptr, size_t X_len)`.
+/// Native FFI type(s) for a parameter. `StringUtf8` and `Bytes`/`BorrowedBytes` expand to a
+/// (ptr, len) pair to match the C ABI `(const uint8_t* X_ptr, size_t X_len)`.
 fn native_ffi_param_types(ty: &TypeRef) -> Vec<String> {
     match ty {
         TypeRef::StringUtf8 => vec!["Pointer<Uint8>".into(), "IntPtr".into()],
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            vec!["Pointer<Uint8>".into(), "IntPtr".into()]
+        }
         _ => vec![native_ffi_type(ty)],
     }
 }
 
-/// Dart-side FFI type(s) for a parameter. `StringUtf8` expands to a (ptr, len) pair.
+/// Dart-side FFI type(s) for a parameter. `StringUtf8` and `Bytes`/`BorrowedBytes` expand to a
+/// (ptr, len) pair.
 fn dart_ffi_param_types(ty: &TypeRef) -> Vec<String> {
     match ty {
         TypeRef::StringUtf8 => vec!["Pointer<Uint8>".into(), "int".into()],
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            vec!["Pointer<Uint8>".into(), "int".into()]
+        }
         _ => vec![dart_ffi_type(ty)],
     }
 }
@@ -247,6 +254,15 @@ fn render_dart_module(api: &Api) -> String {
         "weaveffi_error_clear",
         "Pointer<_WeaveffiError>",
         "Pointer<_WeaveffiError>",
+        "Void",
+        "void",
+    );
+
+    emit_typedef_and_lookup(
+        &mut out,
+        "weaveffi_free_bytes",
+        "Pointer<Uint8>, IntPtr",
+        "Pointer<Uint8>, int",
         "Void",
         "void",
     );
@@ -421,12 +437,19 @@ fn render_function(out: &mut String, module_path: &str, f: &Function) {
         .iter()
         .flat_map(|p| native_ffi_param_types(&p.ty))
         .collect();
-    native_params.push("Pointer<_WeaveffiError>".into());
     let mut dart_params: Vec<String> = f
         .params
         .iter()
         .flat_map(|p| dart_ffi_param_types(&p.ty))
         .collect();
+    if matches!(
+        f.returns.as_ref(),
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes)
+    ) {
+        native_params.push("Pointer<IntPtr>".into());
+        dart_params.push("Pointer<IntPtr>".into());
+    }
+    native_params.push("Pointer<_WeaveffiError>".into());
     dart_params.push("Pointer<_WeaveffiError>".into());
 
     let native_ret = f.returns.as_ref().map_or("Void".into(), native_ffi_type);
@@ -519,8 +542,24 @@ fn emit_function_body(out: &mut String, f: &Function, c_sym: &str) {
                 out.push_str(&format!("  final {ptr} = {pname}.toNativeUtf8();\n"));
                 allocations.push(ptr);
             }
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
+                let buf = format!("{pname}Buf");
+                out.push_str(&format!("  final {buf} = calloc<Uint8>({pname}.length);\n"));
+                out.push_str(&format!(
+                    "  {buf}.asTypedList({pname}.length).setAll(0, {pname});\n"
+                ));
+                allocations.push(buf);
+            }
             _ => {}
         }
+    }
+
+    let returns_bytes = matches!(
+        f.returns.as_ref(),
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes)
+    );
+    if returns_bytes {
+        out.push_str("  final outLen = calloc<IntPtr>();\n");
     }
 
     out.push_str("  try {\n");
@@ -534,6 +573,10 @@ fn emit_function_body(out: &mut String, f: &Function, c_sym: &str) {
                 call_args.push(format!("{pname}Bytes.length"));
             }
             TypeRef::BorrowedStr => call_args.push(format!("{pname}Ptr")),
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
+                call_args.push(format!("{pname}Buf"));
+                call_args.push(format!("{pname}.length"));
+            }
             TypeRef::Bool => call_args.push(format!("{pname} ? 1 : 0")),
             TypeRef::Enum(_) => call_args.push(format!("{pname}.value")),
             TypeRef::TypedHandle(_) | TypeRef::Struct(_) => {
@@ -541,6 +584,9 @@ fn emit_function_body(out: &mut String, f: &Function, c_sym: &str) {
             }
             _ => call_args.push(pname),
         }
+    }
+    if returns_bytes {
+        call_args.push("outLen".into());
     }
     call_args.push("err".into());
 
@@ -561,6 +607,9 @@ fn emit_function_body(out: &mut String, f: &Function, c_sym: &str) {
     for alloc in &allocations {
         out.push_str(&format!("    calloc.free({alloc});\n"));
     }
+    if returns_bytes {
+        out.push_str("    calloc.free(outLen);\n");
+    }
     out.push_str("    calloc.free(err);\n");
     out.push_str("  }\n");
 }
@@ -572,6 +621,14 @@ fn emit_result_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
         }
         TypeRef::Bool => {
             out.push_str(&format!("{indent}return result != 0;\n"));
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            out.push_str(&format!("{indent}final len = outLen.value;\n"));
+            out.push_str(&format!(
+                "{indent}final bytes = List<int>.from(result.asTypedList(len));\n"
+            ));
+            out.push_str(&format!("{indent}_weaveffiFreeBytes(result, len);\n"));
+            out.push_str(&format!("{indent}return bytes;\n"));
         }
         TypeRef::Enum(name) => {
             let n = name.to_upper_camel_case();
@@ -1852,6 +1909,124 @@ mod tests {
         assert!(
             null_check < contact_wrap,
             "optional struct return should check null before wrapping: {dart}"
+        );
+    }
+
+    #[test]
+    fn dart_bytes_param_uses_canonical_shape() {
+        let api = make_api(vec![Module {
+            name: "io".into(),
+            functions: vec![Function {
+                name: "send".into(),
+                params: vec![Param {
+                    name: "payload".into(),
+                    ty: TypeRef::Bytes,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let dart = render_dart_module(&api);
+        assert!(
+            dart.contains(
+                "typedef _NativeWeaveffiIoSend = Void Function(Pointer<Uint8>, IntPtr, Pointer<_WeaveffiError>);"
+            ),
+            "native typedef must expand Bytes param to (Pointer<Uint8>, IntPtr) matching (const uint8_t* X_ptr, size_t X_len): {dart}"
+        );
+        assert!(
+            dart.contains(
+                "typedef _DartWeaveffiIoSend = void Function(Pointer<Uint8>, int, Pointer<_WeaveffiError>);"
+            ),
+            "Dart typedef must expand Bytes param to (Pointer<Uint8>, int): {dart}"
+        );
+        assert!(
+            dart.contains("final payloadBuf = calloc<Uint8>(payload.length);"),
+            "wrapper must allocate a Uint8 buffer sized to the payload: {dart}"
+        );
+        assert!(
+            dart.contains("payloadBuf.asTypedList(payload.length).setAll(0, payload);"),
+            "wrapper must copy payload bytes into the native buffer: {dart}"
+        );
+        assert!(
+            dart.contains("_weaveffiIoSend(payloadBuf, payload.length, err);"),
+            "wrapper must call native with (ptr, len, err) for Bytes param: {dart}"
+        );
+        assert!(
+            dart.contains("calloc.free(payloadBuf);"),
+            "wrapper must free the allocated buffer in the finally block: {dart}"
+        );
+    }
+
+    #[test]
+    fn dart_bytes_return_uses_canonical_shape() {
+        let api = make_api(vec![Module {
+            name: "io".into(),
+            functions: vec![Function {
+                name: "read".into(),
+                params: vec![],
+                returns: Some(TypeRef::Bytes),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let dart = render_dart_module(&api);
+        assert!(
+            dart.contains(
+                "typedef _NativeWeaveffiIoRead = Pointer<Uint8> Function(Pointer<IntPtr>, Pointer<_WeaveffiError>);"
+            ),
+            "native typedef for Bytes return must be Pointer<Uint8> with (Pointer<IntPtr> out_len, Pointer<_WeaveffiError> err): {dart}"
+        );
+        assert!(
+            dart.contains(
+                "typedef _DartWeaveffiIoRead = Pointer<Uint8> Function(Pointer<IntPtr>, Pointer<_WeaveffiError>);"
+            ),
+            "Dart typedef for Bytes return must keep Pointer<Uint8> + (Pointer<IntPtr>, Pointer<_WeaveffiError>): {dart}"
+        );
+        assert!(
+            dart.contains(
+                "typedef _NativeWeaveffiFreeBytes = Void Function(Pointer<Uint8>, IntPtr);"
+            ),
+            "weaveffi_free_bytes typedef must take (Pointer<Uint8>, IntPtr) (no const): {dart}"
+        );
+        assert!(
+            dart.contains("final outLen = calloc<IntPtr>();"),
+            "wrapper must allocate the out_len IntPtr cell: {dart}"
+        );
+        assert!(
+            dart.contains("final result = _weaveffiIoRead(outLen, err);"),
+            "wrapper must call native with (outLen, err) for Bytes return: {dart}"
+        );
+        assert!(
+            dart.contains("_weaveffiFreeBytes(result, len);"),
+            "wrapper must free the returned bytes via weaveffi_free_bytes(ptr, len): {dart}"
+        );
+        assert!(
+            dart.contains("List<int>.from(result.asTypedList(len))"),
+            "wrapper must copy returned bytes into a List<int> before returning: {dart}"
+        );
+        assert!(
+            dart.contains("calloc.free(outLen);"),
+            "wrapper must free outLen in the finally block: {dart}"
         );
     }
 }

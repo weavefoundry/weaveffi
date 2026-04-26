@@ -173,10 +173,9 @@ fn c_ret_type(ty: &TypeRef, module: &str, prefix: &str) -> (String, Vec<String>)
         TypeRef::F64 => ("double".to_string(), vec![]),
         TypeRef::Bool => ("bool".to_string(), vec![]),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => ("const char*".to_string(), vec![]),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => (
-            "const uint8_t*".to_string(),
-            vec!["size_t* out_len".to_string()],
-        ),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            ("uint8_t*".to_string(), vec!["size_t* out_len".to_string()])
+        }
         TypeRef::Handle => (format!("{prefix}_handle_t"), vec![]),
         TypeRef::TypedHandle(n) => (format!("{prefix}_{module}_{n}*"), vec![]),
         TypeRef::Struct(s) => (format!("{}*", c_abi_struct_name(s, module, prefix)), vec![]),
@@ -2858,6 +2857,107 @@ mod tests {
         assert!(
             header.contains("void weaveffi_contacts_Contact_Builder_set_age(weaveffi_contacts_ContactBuilder* builder, int32_t value);"),
             "builder int setter should be unchanged: {header}"
+        );
+    }
+
+    #[test]
+    fn c_bytes_param_uses_canonical_shape() {
+        for ty in [TypeRef::Bytes, TypeRef::BorrowedBytes] {
+            let result = c_type_for_param(&ty, "payload", "io", "weaveffi", false);
+            assert_eq!(
+                result, "const uint8_t* payload_ptr, size_t payload_len",
+                "bytes param must expand to canonical (const uint8_t* X_ptr, size_t X_len): {result}"
+            );
+        }
+
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "io".to_string(),
+                functions: vec![Function {
+                    name: "send".to_string(),
+                    params: vec![Param {
+                        name: "payload".to_string(),
+                        ty: TypeRef::Bytes,
+                        mutable: false,
+                    }],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let header = render_c_header(&api, "weaveffi");
+        assert!(
+            header.contains(
+                "void weaveffi_io_send(const uint8_t* payload_ptr, size_t payload_len, weaveffi_error* out_err);"
+            ),
+            "bytes param header signature must be canonical: {header}"
+        );
+    }
+
+    #[test]
+    fn c_bytes_return_uses_canonical_shape() {
+        let (ret_ty, out_params) = c_ret_type(&TypeRef::Bytes, "io", "weaveffi");
+        assert_eq!(
+            ret_ty, "uint8_t*",
+            "bytes return type must be uint8_t* (no const, so callers can free without cast)"
+        );
+        assert_eq!(
+            out_params,
+            vec!["size_t* out_len".to_string()],
+            "bytes return must add size_t* out_len out-parameter"
+        );
+
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "io".to_string(),
+                functions: vec![Function {
+                    name: "read".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::Bytes),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+
+        let header = render_c_header(&api, "weaveffi");
+        assert!(
+            header.contains(
+                "uint8_t* weaveffi_io_read(size_t* out_len, weaveffi_error* out_err);"
+            ),
+            "bytes return must use canonical (uint8_t* return, size_t* out_len, weaveffi_error* out_err): {header}"
+        );
+        assert!(
+            !header.contains("const uint8_t* weaveffi_io_read"),
+            "bytes return must NOT be const (caller frees via weaveffi_free_bytes which takes uint8_t*): {header}"
+        );
+        assert!(
+            header.contains("void weaveffi_free_bytes(uint8_t* ptr, size_t len);"),
+            "header must declare weaveffi_free_bytes(uint8_t* ptr, size_t len) for caller cleanup: {header}"
         );
     }
 }

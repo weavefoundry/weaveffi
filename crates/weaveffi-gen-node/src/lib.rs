@@ -141,7 +141,7 @@ fn c_ret_type_str(ty: &TypeRef, module: &str) -> String {
         TypeRef::F64 => "double".into(),
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*".into(),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => "const uint8_t*".into(),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => "uint8_t*".into(),
         TypeRef::TypedHandle(_) | TypeRef::Handle => "weaveffi_handle_t".into(),
         TypeRef::Struct(s) => format!("{}*", c_abi_struct_name(s, module, "weaveffi")),
         TypeRef::Enum(e) => format!("weaveffi_{module}_{e}"),
@@ -872,7 +872,7 @@ fn emit_ret_to_napi(out: &mut String, ty: &TypeRef, module: &str, fn_name: &str)
         }
         TypeRef::Bytes => {
             out.push_str("  napi_create_buffer_copy(env, out_len, result, NULL, &ret);\n");
-            out.push_str("  weaveffi_free_bytes((uint8_t*)result, out_len);\n");
+            out.push_str("  weaveffi_free_bytes(result, out_len);\n");
         }
         TypeRef::BorrowedBytes => {
             out.push_str("  napi_create_buffer_copy(env, out_len, result, NULL, &ret);\n");
@@ -2277,6 +2277,76 @@ mod tests {
         assert!(
             addon.contains("weaveffi_tasks_run_napi_cb"),
             "async addon should define the callback: {addon}"
+        );
+    }
+
+    #[test]
+    fn node_bytes_param_uses_canonical_shape() {
+        let mut m = make_module("io");
+        m.functions.push(Function {
+            name: "send".into(),
+            params: vec![Param {
+                name: "payload".into(),
+                ty: TypeRef::Bytes,
+                mutable: false,
+            }],
+            returns: None,
+            doc: None,
+            r#async: false,
+            cancellable: false,
+            deprecated: None,
+            since: None,
+        });
+        let api = make_api(vec![m]);
+        let addon = render_addon_c(&api, true);
+        assert!(
+            addon.contains("napi_get_buffer_info(env, args[0], &payload_raw, &payload_len);"),
+            "Node addon must read buffer ptr+len: {addon}"
+        );
+        assert!(
+            addon.contains("weaveffi_io_send((const uint8_t*)payload_raw, payload_len"),
+            "Node addon must call C with (const uint8_t*) ptr and len: {addon}"
+        );
+    }
+
+    #[test]
+    fn node_bytes_return_uses_canonical_shape() {
+        let mut m = make_module("io");
+        m.functions.push(Function {
+            name: "read".into(),
+            params: vec![],
+            returns: Some(TypeRef::Bytes),
+            doc: None,
+            r#async: false,
+            cancellable: false,
+            deprecated: None,
+            since: None,
+        });
+        let api = make_api(vec![m]);
+        let addon = render_addon_c(&api, true);
+        assert!(
+            addon.contains("uint8_t* result = weaveffi_io_read("),
+            "Node addon must capture C return as uint8_t* (no const): {addon}"
+        );
+        assert!(
+            !addon.contains("const uint8_t* result = weaveffi_io_read("),
+            "Node addon must not declare result as const uint8_t*: {addon}"
+        );
+        assert!(
+            addon.contains("size_t out_len"),
+            "Node addon must declare size_t out_len out-param: {addon}"
+        );
+        assert!(
+            addon.contains("&out_len"),
+            "Node addon must pass &out_len to C call: {addon}"
+        );
+        assert!(
+            addon.contains("weaveffi_free_bytes(result, out_len);"),
+            "Node addon must call weaveffi_free_bytes(result, out_len) with no cast: {addon}"
+        );
+        assert!(
+            !addon.contains("weaveffi_free_bytes((uint8_t*)result"),
+            "Node addon must not cast result to (uint8_t*) when freeing: {addon}"
         );
     }
 }

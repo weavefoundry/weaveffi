@@ -1093,7 +1093,12 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             out.push_str(&format!("{ind}if not _result:\n"));
             out.push_str(&format!("{ind}    return b\"\"\n"));
-            out.push_str(&format!("{ind}return bytes(_result[:_out_len.value])\n"));
+            out.push_str(&format!("{ind}_n = int(_out_len.value)\n"));
+            out.push_str(&format!("{ind}_b = bytes(_result[:_n])\n"));
+            out.push_str(&format!(
+                "{ind}_lib.weaveffi_free_bytes(_result, ctypes.c_size_t(_n))\n"
+            ));
+            out.push_str(&format!("{ind}return _b\n"));
         }
         TypeRef::Struct(name) => {
             let name = local_type_name(name);
@@ -1129,7 +1134,12 @@ fn render_optional_return(out: &mut String, inner: &TypeRef, ind: &str) {
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             out.push_str(&format!("{ind}if not _result:\n"));
             out.push_str(&format!("{ind}    return None\n"));
-            out.push_str(&format!("{ind}return bytes(_result[:_out_len.value])\n"));
+            out.push_str(&format!("{ind}_n = int(_out_len.value)\n"));
+            out.push_str(&format!("{ind}_b = bytes(_result[:_n])\n"));
+            out.push_str(&format!(
+                "{ind}_lib.weaveffi_free_bytes(_result, ctypes.c_size_t(_n))\n"
+            ));
+            out.push_str(&format!("{ind}return _b\n"));
         }
         TypeRef::Struct(name) => {
             let name = local_type_name(name);
@@ -2521,8 +2531,16 @@ mod tests {
             "missing out_len in bytes getter: {py}"
         );
         assert!(
-            py.contains("_result[:_out_len.value]"),
+            py.contains("_n = int(_out_len.value)"),
+            "missing _n length capture: {py}"
+        );
+        assert!(
+            py.contains("_b = bytes(_result[:_n])"),
             "missing bytes slice: {py}"
+        );
+        assert!(
+            py.contains("_lib.weaveffi_free_bytes(_result, ctypes.c_size_t(_n))"),
+            "struct getter must free returned bytes via weaveffi_free_bytes: {py}"
         );
     }
 
@@ -4490,6 +4508,100 @@ mod tests {
         assert!(
             pyi.contains("def log(msg: str) -> None: ..."),
             "pyi user-facing signature should still take str: {pyi}"
+        );
+    }
+
+    #[test]
+    fn python_bytes_param_uses_canonical_shape() {
+        let api = make_api(vec![Module {
+            name: "io".into(),
+            functions: vec![Function {
+                name: "send".into(),
+                params: vec![Param {
+                    name: "payload".into(),
+                    ty: TypeRef::Bytes,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let py = render_python_module(&api, true);
+        assert!(
+            py.contains(
+                "_fn.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.POINTER(_WeaveffiErrorStruct)]"
+            ),
+            "Python ctypes argtypes for Bytes param must lower to (uint8_t*, size_t): {py}"
+        );
+        assert!(
+            py.contains("_payload_arr = (ctypes.c_uint8 * len(payload))(*payload)"),
+            "Python wrapper must build a c_uint8 array from the bytes input: {py}"
+        );
+        assert!(
+            py.contains("_fn(_payload_arr, len(payload), ctypes.byref(_err))"),
+            "Python wrapper must call C with (ptr, len, &err) for Bytes param: {py}"
+        );
+    }
+
+    #[test]
+    fn python_bytes_return_uses_canonical_shape() {
+        let api = make_api(vec![Module {
+            name: "io".into(),
+            functions: vec![Function {
+                name: "read".into(),
+                params: vec![],
+                returns: Some(TypeRef::Bytes),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let py = render_python_module(&api, true);
+        assert!(
+            py.contains("_fn.restype = ctypes.POINTER(ctypes.c_uint8)"),
+            "Python ctypes restype for Bytes return must be uint8_t*: {py}"
+        );
+        assert!(
+            py.contains(
+                "_fn.argtypes = [ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_WeaveffiErrorStruct)]"
+            ),
+            "Python ctypes argtypes for Bytes return must include size_t* out-param + weaveffi_error*: {py}"
+        );
+        assert!(
+            py.contains("_out_len = ctypes.c_size_t(0)"),
+            "Python wrapper must allocate _out_len out-param: {py}"
+        );
+        assert!(
+            py.contains("_result = _fn(ctypes.byref(_out_len), ctypes.byref(_err))"),
+            "Python wrapper must call C with (&out_len, &err) for Bytes return: {py}"
+        );
+        assert!(
+            py.contains("_lib.weaveffi_free_bytes(_result, ctypes.c_size_t(_n))"),
+            "Python wrapper must free the returned bytes via weaveffi_free_bytes: {py}"
+        );
+        assert!(
+            py.contains(
+                "_lib.weaveffi_free_bytes.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t]"
+            ),
+            "weaveffi_free_bytes must take (uint8_t*, size_t) (no const): {py}"
         );
     }
 }

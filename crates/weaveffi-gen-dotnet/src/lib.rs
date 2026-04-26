@@ -4141,4 +4141,90 @@ mod tests {
             "struct create P/Invoke should expand string field to (IntPtr ptr, UIntPtr len): {cs}"
         );
     }
+
+    #[test]
+    fn dotnet_bytes_param_uses_canonical_shape() {
+        let api = make_api(vec![Module {
+            name: "io".into(),
+            functions: vec![Function {
+                name: "send".into(),
+                params: vec![Param {
+                    name: "payload".into(),
+                    ty: TypeRef::Bytes,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let cs = render_csharp(&api, "WeaveFFI", true);
+        assert!(
+            cs.contains(
+                "internal static extern void weaveffi_io_send(IntPtr payload_ptr, UIntPtr payload_len, ref WeaveffiError err);"
+            ),
+            "P/Invoke for Bytes param must expand to (IntPtr {{name}}_ptr, UIntPtr {{name}}_len, ref err): {cs}"
+        );
+        assert!(
+            cs.contains("var payloadPin = GCHandle.Alloc(payload, GCHandleType.Pinned);"),
+            "Wrapper must pin the byte[] to get a stable pointer: {cs}"
+        );
+        assert!(
+            cs.contains("payloadPin.AddrOfPinnedObject(), (UIntPtr)payload.Length"),
+            "Wrapper must pass (pinned addr, length) to native call: {cs}"
+        );
+    }
+
+    #[test]
+    fn dotnet_bytes_return_uses_canonical_shape() {
+        let api = make_api(vec![Module {
+            name: "io".into(),
+            functions: vec![Function {
+                name: "read".into(),
+                params: vec![],
+                returns: Some(TypeRef::Bytes),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let cs = render_csharp(&api, "WeaveFFI", true);
+        assert!(
+            cs.contains(
+                "internal static extern IntPtr weaveffi_io_read(out UIntPtr out_len, ref WeaveffiError err);"
+            ),
+            "P/Invoke for Bytes return must be IntPtr with (out UIntPtr out_len, ref err): {cs}"
+        );
+        assert!(
+            cs.contains(
+                "internal static extern void weaveffi_free_bytes(IntPtr ptr, UIntPtr len);"
+            ),
+            "weaveffi_free_bytes P/Invoke must take (IntPtr ptr, UIntPtr len) (no const): {cs}"
+        );
+        assert!(
+            cs.contains("NativeMethods.weaveffi_free_bytes(result, outLen);"),
+            "Wrapper must call weaveffi_free_bytes(result, outLen) without any cast: {cs}"
+        );
+        assert!(
+            cs.contains("Marshal.Copy(result, arr, 0, (int)outLen);"),
+            "Wrapper must Marshal.Copy the bytes out before freeing: {cs}"
+        );
+    }
 }

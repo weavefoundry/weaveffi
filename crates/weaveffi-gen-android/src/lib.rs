@@ -1359,7 +1359,7 @@ fn write_return_handling(
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             let _ = writeln!(
                 jni_c,
-                "    const uint8_t* rv = {}({}, &out_len, &err);",
+                "    uint8_t* rv = {}({}, &out_len, &err);",
                 c_sym, args_str
             );
             write_error_check(jni_c, returns);
@@ -1368,10 +1368,7 @@ fn write_return_handling(
                 "    jbyteArray out = (*env)->NewByteArray(env, (jsize)out_len);"
             );
             let _ = writeln!(jni_c, "    if (out && rv) {{ (*env)->SetByteArrayRegion(env, out, 0, (jsize)out_len, (const jbyte*)rv); }}");
-            let _ = writeln!(
-                jni_c,
-                "    weaveffi_free_bytes((uint8_t*)rv, (size_t)out_len);"
-            );
+            let _ = writeln!(jni_c, "    weaveffi_free_bytes(rv, (size_t)out_len);");
             release_jni_resources(jni_c, params);
             let _ = writeln!(jni_c, "    return out;");
         }
@@ -2082,7 +2079,7 @@ fn render_jni_struct(out: &mut String, module_name: &str, s: &StructDef, jni_pre
                 let _ = writeln!(out, "    size_t out_len = 0;");
                 let _ = writeln!(
                     out,
-                    "    const uint8_t* rv = {}((const {}*)(intptr_t)handle, &out_len);",
+                    "    uint8_t* rv = {}((const {}*)(intptr_t)handle, &out_len);",
                     getter_c, prefix
                 );
                 let _ = writeln!(
@@ -2093,10 +2090,7 @@ fn render_jni_struct(out: &mut String, module_name: &str, s: &StructDef, jni_pre
                     out,
                     "    if (jout && rv) {{ (*env)->SetByteArrayRegion(env, jout, 0, (jsize)out_len, (const jbyte*)rv); }}"
                 );
-                let _ = writeln!(
-                    out,
-                    "    weaveffi_free_bytes((uint8_t*)rv, (size_t)out_len);"
-                );
+                let _ = writeln!(out, "    weaveffi_free_bytes(rv, (size_t)out_len);");
                 let _ = writeln!(out, "    return jout;");
             }
             TypeRef::Bool => {
@@ -4449,6 +4443,90 @@ mod tests {
         assert!(
             jni.contains("(*env)->ReleaseStringUTFChars(env, msg, msg_chars);"),
             "JNI bridge must release the UTF-8 chars after the C call: {jni}"
+        );
+    }
+
+    #[test]
+    fn android_bytes_param_uses_canonical_shape() {
+        let api = make_api(vec![Module {
+            name: "io".to_string(),
+            functions: vec![Function {
+                name: "send".to_string(),
+                params: vec![Param {
+                    name: "payload".to_string(),
+                    ty: TypeRef::Bytes,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let jni = render_jni_c(&api, "com.weaveffi", true);
+        assert!(
+            jni.contains(
+                "weaveffi_io_send((const uint8_t*)payload_elems, (size_t)payload_len, &err);"
+            ),
+            "JNI must call C with canonical (const uint8_t*, size_t) shape for bytes param: {jni}"
+        );
+    }
+
+    #[test]
+    fn android_bytes_return_uses_canonical_shape() {
+        let api = make_api(vec![Module {
+            name: "io".to_string(),
+            functions: vec![Function {
+                name: "read".to_string(),
+                params: vec![Param {
+                    name: "id".to_string(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                }],
+                returns: Some(TypeRef::Bytes),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let jni = render_jni_c(&api, "com.weaveffi", true);
+        assert!(
+            jni.contains("size_t out_len = 0;"),
+            "JNI must declare out_len for canonical size_t* out_len out-param: {jni}"
+        );
+        assert!(
+            jni.contains("uint8_t* rv = weaveffi_io_read((int32_t)id, &out_len, &err);"),
+            "JNI must capture C return as uint8_t* with (params..., &out_len, &err): {jni}"
+        );
+        assert!(
+            !jni.contains("const uint8_t* rv = weaveffi_io_read("),
+            "JNI must NOT declare bytes return as const (C ABI now returns non-const uint8_t*): {jni}"
+        );
+        assert!(
+            jni.contains("weaveffi_free_bytes(rv, (size_t)out_len);"),
+            "JNI must free bytes return directly without (uint8_t*) cast: {jni}"
+        );
+        assert!(
+            !jni.contains("weaveffi_free_bytes((uint8_t*)rv"),
+            "JNI must NOT need (uint8_t*) cast on bytes return: {jni}"
         );
     }
 }

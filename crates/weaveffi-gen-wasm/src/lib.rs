@@ -175,6 +175,17 @@ fn render_wasm_readme(api: &Api) -> String {
         "into linear memory via `weaveffi_alloc`, and returns a `[ptr, len]` tuple that is spread ",
     );
     out.push_str("into the WASM call.\n\n");
+    out.push_str("### Bytes\n\n");
+    out.push_str(
+        "Byte buffers are passed as a **pointer + length** pair (`i32` pointer, `i32` length) ",
+    );
+    out.push_str("matching the C ABI signature `(const uint8_t* {name}_ptr, size_t {name}_len)`. ");
+    out.push_str("Byte returns follow the canonical `(uint8_t* out_ptr, size_t* out_len, weaveffi_error* out_err)` ");
+    out.push_str("convention: the WASM export writes the (`ptr`, `len`) pair into a caller-allocated 8-byte ");
+    out.push_str(
+        "retptr in linear memory, and the caller is responsible for freeing the returned buffer ",
+    );
+    out.push_str("via `weaveffi_free_bytes(ptr, len)`.\n\n");
     out.push_str("### Lists\n\n");
     out.push_str("Lists are passed as a **pointer + length** pair (`i32` pointer, `i32` length) ");
     out.push_str("referencing a contiguous region in linear memory. The caller is responsible ");
@@ -2133,6 +2144,96 @@ mod tests {
         assert!(
             readme.contains("not** NUL-terminated"),
             "README must clarify that the WASM string ABI is not NUL-terminated: {readme}"
+        );
+    }
+
+    #[test]
+    fn wasm_bytes_param_uses_canonical_shape() {
+        assert_eq!(
+            wasm_type(&TypeRef::Bytes),
+            "i32, i32",
+            "Bytes param must lower to (i32 ptr, i32 len) at the WASM ABI"
+        );
+        assert_eq!(
+            wasm_type(&TypeRef::BorrowedBytes),
+            "i32, i32",
+            "BorrowedBytes param must lower to (i32 ptr, i32 len) at the WASM ABI"
+        );
+        let api = make_api(vec![Module {
+            name: "io".into(),
+            functions: vec![Function {
+                name: "send".into(),
+                params: vec![Param {
+                    name: "payload".into(),
+                    ty: TypeRef::Bytes,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let readme = render_wasm_readme(&api);
+        assert!(
+            readme.contains("### Bytes"),
+            "README must document the canonical bytes ABI: {readme}"
+        );
+        assert!(
+            readme.contains("(const uint8_t* {name}_ptr, size_t {name}_len)"),
+            "README must reference the canonical C parameter signature for bytes: {readme}"
+        );
+        assert!(
+            readme.contains("| `payload` | `bytes` | `i32, i32` | ptr + len in linear memory |"),
+            "API reference must render the Bytes param as (i32, i32): {readme}"
+        );
+    }
+
+    #[test]
+    fn wasm_bytes_return_uses_canonical_shape() {
+        let api = make_api(vec![Module {
+            name: "io".into(),
+            functions: vec![Function {
+                name: "read".into(),
+                params: vec![],
+                returns: Some(TypeRef::Bytes),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let readme = render_wasm_readme(&api);
+        assert!(
+            readme.contains("### Bytes"),
+            "README must document the canonical bytes ABI: {readme}"
+        );
+        assert!(
+            readme.contains("(uint8_t* out_ptr, size_t* out_len, weaveffi_error* out_err)"),
+            "README must reference the canonical C return signature for bytes: {readme}"
+        );
+        assert!(
+            readme.contains("weaveffi_free_bytes(ptr, len)"),
+            "README must document caller-frees-via-weaveffi_free_bytes for bytes returns: {readme}"
+        );
+        assert!(
+            readme.contains("| _returns_ | `bytes` | `i32, i32` | ptr + len in linear memory |"),
+            "API reference must render the Bytes return as (i32, i32): {readme}"
         );
     }
 }

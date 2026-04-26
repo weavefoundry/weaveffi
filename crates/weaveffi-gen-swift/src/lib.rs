@@ -419,7 +419,7 @@ fn render_swift_getter(out: &mut String, prefix: &str, field: &StructField) {
             out.push_str("        var outLen: Int = 0\n");
             out.push_str(&format!("        let raw = {}(ptr, &outLen)\n", getter));
             out.push_str("        guard let raw = raw else { return Data() }\n");
-            out.push_str("        defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: raw), outLen) }\n");
+            out.push_str("        defer { weaveffi_free_bytes(raw, outLen) }\n");
             out.push_str("        return Data(bytes: raw, count: outLen)\n");
         }
         TypeRef::Struct(name) => {
@@ -440,7 +440,7 @@ fn render_swift_getter(out: &mut String, prefix: &str, field: &StructField) {
                 out.push_str("        var outLen: Int = 0\n");
                 out.push_str(&format!("        let p = {}(ptr, &outLen)\n", getter));
                 out.push_str("        guard let p = p else { return nil }\n");
-                out.push_str("        defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: p), outLen) }\n");
+                out.push_str("        defer { weaveffi_free_bytes(p, outLen) }\n");
                 out.push_str("        return Data(bytes: p, count: outLen)\n");
             }
             TypeRef::Struct(name) => {
@@ -1180,7 +1180,7 @@ fn render_direct_call(out: &mut String, f: &Function, call_with_err: &str, modul
             ));
             out.push_str("        try check(&err)\n");
             out.push_str("        guard let rv = rv else { return Data() }\n");
-            out.push_str("        defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen) }\n");
+            out.push_str("        defer { weaveffi_free_bytes(rv, outLen) }\n");
             out.push_str("        return Data(bytes: rv, count: outLen)\n");
         }
         Some(TypeRef::Struct(name)) => {
@@ -4256,5 +4256,99 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn swift_bytes_param_uses_canonical_shape() {
+        let api = make_api(vec![Module {
+            name: "io".to_string(),
+            functions: vec![Function {
+                name: "send".to_string(),
+                params: vec![Param {
+                    name: "payload".to_string(),
+                    ty: TypeRef::Bytes,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let swift = render_swift_wrapper(&api, true);
+        assert!(
+            swift.contains("let payload_bytes = Array(payload)"),
+            "bytes param should be materialised as a UInt8 array: {swift}"
+        );
+        assert!(
+            swift.contains("payload_bytes.withUnsafeBufferPointer"),
+            "bytes param should be borrowed via withUnsafeBufferPointer: {swift}"
+        );
+        assert!(
+            swift.contains("let payload_ptr = payload_buf.baseAddress!"),
+            "bytes param should expose payload_ptr from the buffer: {swift}"
+        );
+        assert!(
+            swift.contains("let payload_len = payload_buf.count"),
+            "bytes param should expose payload_len from the buffer: {swift}"
+        );
+        assert!(
+            swift.contains("weaveffi_io_send(payload_ptr, payload_len, &err)"),
+            "C call must pass (payload_ptr, payload_len, &err) matching canonical (const uint8_t*, size_t) shape: {swift}"
+        );
+    }
+
+    #[test]
+    fn swift_bytes_return_uses_canonical_shape() {
+        let api = make_api(vec![Module {
+            name: "io".to_string(),
+            functions: vec![Function {
+                name: "read".to_string(),
+                params: vec![],
+                returns: Some(TypeRef::Bytes),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let swift = render_swift_wrapper(&api, true);
+        assert!(
+            swift.contains("var outLen: Int = 0"),
+            "bytes return must declare outLen for the canonical size_t* out_len out-param: {swift}"
+        );
+        assert!(
+            swift.contains("let rv = weaveffi_io_read(&outLen, &err)"),
+            "C call must pass (&outLen, &err) for canonical (uint8_t*, size_t* out_len, weaveffi_error*) return shape: {swift}"
+        );
+        assert!(
+            swift.contains("weaveffi_free_bytes(rv, outLen)"),
+            "Swift wrapper must free directly with rv (no UnsafeMutablePointer(mutating:) cast since C returns uint8_t*): {swift}"
+        );
+        assert!(
+            !swift.contains("weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv)"),
+            "Swift wrapper must NOT use UnsafeMutablePointer(mutating:) cast (C return is now non-const): {swift}"
+        );
+        assert!(
+            swift.contains("Data(bytes: rv, count: outLen)"),
+            "Swift wrapper must convert bytes return to Data using outLen: {swift}"
+        );
     }
 }

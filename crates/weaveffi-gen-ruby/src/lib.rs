@@ -2322,4 +2322,100 @@ mod tests {
             "optional struct return should check nil before wrapping: {fn_text}"
         );
     }
+
+    #[test]
+    fn ruby_bytes_param_uses_canonical_shape() {
+        let api = make_api(vec![Module {
+            name: "io".into(),
+            functions: vec![Function {
+                name: "send".into(),
+                params: vec![Param {
+                    name: "payload".into(),
+                    ty: TypeRef::Bytes,
+                    mutable: false,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let rb = render_ruby_module(&api, "WeaveFFI");
+        assert!(
+            rb.contains("attach_function :weaveffi_io_send, [:pointer, :size_t, :pointer], :void"),
+            "Ruby attach_function for Bytes param must lower to (:pointer, :size_t) + (:pointer err): {rb}"
+        );
+        assert!(
+            rb.contains("payload_buf = FFI::MemoryPointer.new(:uint8, payload.bytesize)"),
+            "Ruby wrapper must allocate a uint8 MemoryPointer sized to payload: {rb}"
+        );
+        assert!(
+            rb.contains("payload_buf.put_bytes(0, payload)"),
+            "Ruby wrapper must copy payload bytes into the native buffer: {rb}"
+        );
+        assert!(
+            rb.contains("weaveffi_io_send(payload_buf, payload.bytesize, err)"),
+            "Ruby wrapper must call C with (ptr, len, err) for Bytes param: {rb}"
+        );
+    }
+
+    #[test]
+    fn ruby_bytes_return_uses_canonical_shape() {
+        let api = make_api(vec![Module {
+            name: "io".into(),
+            functions: vec![Function {
+                name: "read".into(),
+                params: vec![],
+                returns: Some(TypeRef::Bytes),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let rb = render_ruby_module(&api, "WeaveFFI");
+        assert!(
+            rb.contains("attach_function :weaveffi_io_read, [:pointer, :pointer], :pointer"),
+            "Ruby attach_function for Bytes return must add :pointer out_len + :pointer err and return :pointer: {rb}"
+        );
+        assert!(
+            rb.contains("attach_function :weaveffi_free_bytes, [:pointer, :size_t], :void"),
+            "Ruby must declare weaveffi_free_bytes with (:pointer, :size_t) (no const): {rb}"
+        );
+        assert!(
+            rb.contains("out_len = FFI::MemoryPointer.new(:size_t)"),
+            "Ruby wrapper must allocate out_len MemoryPointer: {rb}"
+        );
+        assert!(
+            rb.contains("result = weaveffi_io_read(out_len, err)"),
+            "Ruby wrapper must call C with (out_len, err) for Bytes return: {rb}"
+        );
+        assert!(
+            rb.contains("len = out_len.read(:size_t)"),
+            "Ruby wrapper must read out_len as :size_t: {rb}"
+        );
+        assert!(
+            rb.contains("data = result.read_string(len)"),
+            "Ruby wrapper must copy returned bytes via result.read_string(len): {rb}"
+        );
+        assert!(
+            rb.contains("weaveffi_free_bytes(result, len)"),
+            "Ruby wrapper must free returned bytes via weaveffi_free_bytes(result, len): {rb}"
+        );
+    }
 }
