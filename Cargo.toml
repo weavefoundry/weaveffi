@@ -22,6 +22,7 @@ members = [
     "samples/async-demo",
     "samples/events",
     "samples/sqlite-contacts",
+    "samples/http-fetch",
 ]
 resolver = "2"
 

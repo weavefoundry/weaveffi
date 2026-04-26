@@ -1,0 +1,27 @@
+version: "0.2.0"
+modules:
+  - name: http
+    enums:
+      - name: HttpMethod
+        variants:
+          - { name: Get, value: 0 }
+          - { name: Post, value: 1 }
+          - { name: Put, value: 2 }
+          - { name: Delete, value: 3 }
+    structs:
+      - name: HttpResponse
+        fields:
+          - { name: status, type: i32 }
+          - { name: body, type: bytes }
+          - { name: headers, type: "{string:string}" }
+    functions:
+      - name: fetch
+        doc: Issue an HTTP request and return the full response.
+        params:
+          - { name: url, type: string }
+          - { name: method, type: HttpMethod }
+          - { name: body, type: "bytes?" }
+          - { name: timeout_ms, type: i32 }
+        return: HttpResponse
+        async: true
+        cancellable: true

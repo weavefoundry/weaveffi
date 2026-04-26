@@ -1,0 +1,20 @@
+[package]
+name = "http-fetch"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+weaveffi-abi = { path = "../../crates/weaveffi-abi" }
+reqwest = { version = "0.12", features = ["rustls-tls", "json"], default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+serde_json = "1"
+
+[dev-dependencies]
+wiremock = "0.6"
+
+[lints]
+workspace = true
