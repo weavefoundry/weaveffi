@@ -45,6 +45,12 @@ impl NodeGenerator {
             dir.join("weaveffi_addon.c"),
             stamp_slash(render_addon_c(api, strip_module_prefix, c_prefix)),
         )?;
+        // Drop in a placeholder LICENSE so the published package always ships one.
+        // Consumers are expected to replace it with their real license text.
+        let license_path = dir.join("LICENSE");
+        if !license_path.exists() {
+            std::fs::write(&license_path, render_license_placeholder())?;
+        }
         Ok(())
     }
 }
@@ -80,6 +86,7 @@ impl Generator for NodeGenerator {
             out_dir.join("node/package.json").to_string(),
             out_dir.join("node/binding.gyp").to_string(),
             out_dir.join("node/weaveffi_addon.c").to_string(),
+            out_dir.join("node/LICENSE").to_string(),
         ]
     }
 
@@ -107,15 +114,43 @@ fn render_package_json(name: &str) -> String {
         r#"{{
   "name": "{name}",
   "version": "0.1.0",
+  "type": "module",
   "main": "index.js",
   "types": "types.d.ts",
+  "exports": {{
+    ".": "./index.js",
+    "./types": "./types.d.ts"
+  }},
+  "files": [
+    "index.js",
+    "types.d.ts",
+    "weaveffi_addon.c",
+    "binding.gyp",
+    "build/",
+    "*.node"
+  ],
+  "engines": {{
+    "node": ">=18"
+  }},
   "gypfile": true,
   "scripts": {{
-    "install": "node-gyp rebuild"
+    "install": "node-gyp rebuild",
+    "test": "node --test"
   }}
 }}
 "#
     )
+}
+
+fn render_license_placeholder() -> String {
+    "\
+This is a placeholder LICENSE file emitted by the WeaveFFI Node generator.
+
+Replace this file with your project's LICENSE (for example MIT, Apache-2.0,
+or BSD-3-Clause) before publishing the generated package to npm. The file
+is listed in package.json so npm will include it in the tarball.
+"
+    .to_string()
 }
 
 fn render_binding_gyp(c_prefix: &str) -> String {
@@ -2519,6 +2554,7 @@ mod tests {
             out.join("node/package.json").to_string(),
             out.join("node/binding.gyp").to_string(),
             out.join("node/weaveffi_addon.c").to_string(),
+            out.join("node/LICENSE").to_string(),
         ];
 
         let default_files =
@@ -4092,6 +4128,97 @@ mod tests {
         assert!(
             !pkg.contains("WeaveFFI 0."),
             "package.json must stay comment-free so it remains valid JSON: {pkg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn node_package_json_has_engines() {
+        let api = make_api(vec![make_module("math")]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_node_pkg_engines");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        NodeGenerator.generate(&api, out_dir).unwrap();
+
+        let pkg = std::fs::read_to_string(tmp.join("node/package.json")).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&pkg).expect("package.json must be valid JSON");
+        assert_eq!(
+            parsed["engines"]["node"], ">=18",
+            "package.json must declare engines.node = \">=18\": {pkg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn node_package_json_has_exports() {
+        let api = make_api(vec![make_module("math")]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_node_pkg_exports");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        NodeGenerator.generate(&api, out_dir).unwrap();
+
+        let pkg = std::fs::read_to_string(tmp.join("node/package.json")).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&pkg).expect("package.json must be valid JSON");
+        assert_eq!(
+            parsed["type"], "module",
+            "package.json must set type = \"module\": {pkg}"
+        );
+        assert_eq!(
+            parsed["exports"]["."], "./index.js",
+            "package.json exports['.'] must point at ./index.js: {pkg}"
+        );
+        assert_eq!(
+            parsed["exports"]["./types"], "./types.d.ts",
+            "package.json exports['./types'] must point at ./types.d.ts: {pkg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn node_package_json_lists_files() {
+        let api = make_api(vec![make_module("math")]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_node_pkg_files");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        NodeGenerator.generate(&api, out_dir).unwrap();
+
+        let pkg = std::fs::read_to_string(tmp.join("node/package.json")).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&pkg).expect("package.json must be valid JSON");
+        let files = parsed["files"]
+            .as_array()
+            .expect("package.json must declare a files array");
+        let entries: Vec<&str> = files.iter().map(|v| v.as_str().unwrap_or("")).collect();
+        for expected in [
+            "index.js",
+            "types.d.ts",
+            "weaveffi_addon.c",
+            "binding.gyp",
+            "build/",
+            "*.node",
+        ] {
+            assert!(
+                entries.contains(&expected),
+                "package.json files array missing {expected:?}: {pkg}"
+            );
+        }
+        assert_eq!(
+            parsed["scripts"]["test"], "node --test",
+            "package.json must set scripts.test = \"node --test\": {pkg}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
