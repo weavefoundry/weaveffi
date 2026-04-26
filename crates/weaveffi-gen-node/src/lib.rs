@@ -41,6 +41,7 @@ impl NodeGenerator {
             dir.join("binding.gyp"),
             stamp_hash(render_binding_gyp(c_prefix)),
         )?;
+        std::fs::write(dir.join(".npmignore"), stamp_hash(render_npmignore()))?;
         std::fs::write(
             dir.join("weaveffi_addon.c"),
             stamp_slash(render_addon_c(api, strip_module_prefix, c_prefix)),
@@ -85,6 +86,7 @@ impl Generator for NodeGenerator {
             out_dir.join("node/types.d.ts").to_string(),
             out_dir.join("node/package.json").to_string(),
             out_dir.join("node/binding.gyp").to_string(),
+            out_dir.join("node/.npmignore").to_string(),
             out_dir.join("node/weaveffi_addon.c").to_string(),
             out_dir.join("node/LICENSE").to_string(),
         ]
@@ -167,6 +169,18 @@ fn render_binding_gyp(c_prefix: &str) -> String {
 }}
 "#
     )
+}
+
+fn render_npmignore() -> String {
+    "\
+target/
+*.rs
+Cargo.toml
+node_modules/
+.git/
+build/intermediates/
+"
+    .to_string()
 }
 
 fn is_c_ptr_type(ty: &TypeRef) -> bool {
@@ -2553,6 +2567,7 @@ mod tests {
             out.join("node/types.d.ts").to_string(),
             out.join("node/package.json").to_string(),
             out.join("node/binding.gyp").to_string(),
+            out.join("node/.npmignore").to_string(),
             out.join("node/weaveffi_addon.c").to_string(),
             out.join("node/LICENSE").to_string(),
         ];
@@ -4219,6 +4234,44 @@ mod tests {
         assert_eq!(
             parsed["scripts"]["test"], "node --test",
             "package.json must set scripts.test = \"node --test\": {pkg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn node_generates_npmignore() {
+        let api = make_api(vec![make_module("math")]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_node_npmignore");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+
+        NodeGenerator.generate(&api, out_dir).unwrap();
+
+        let npmignore = std::fs::read_to_string(tmp.join("node/.npmignore"))
+            .expect(".npmignore must be written to the node output directory");
+        for expected in [
+            "target/",
+            "*.rs",
+            "Cargo.toml",
+            "node_modules/",
+            ".git/",
+            "build/intermediates/",
+        ] {
+            assert!(
+                npmignore.contains(expected),
+                ".npmignore must exclude {expected:?}: {npmignore}"
+            );
+        }
+
+        assert!(
+            NodeGenerator
+                .output_files(&api, out_dir)
+                .iter()
+                .any(|p| p.ends_with("node/.npmignore")),
+            "output_files must advertise node/.npmignore"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
