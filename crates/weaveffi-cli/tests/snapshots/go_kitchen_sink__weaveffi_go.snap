@@ -1,0 +1,465 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+package weaveffi
+
+/*
+#cgo LDFLAGS: -lweaveffi
+#include "weaveffi.h"
+#include <stdlib.h>
+*/
+import "C"
+
+import (
+	"fmt"
+	"unsafe"
+)
+
+func boolToC(b bool) C._Bool {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func cToBool(b C._Bool) bool {
+	return b != 0
+}
+
+type Token struct {
+	ptr *C.weaveffi_shared_Token
+}
+
+func (s *Token) Id() int64 {
+	return int64(C.weaveffi_shared_Token_get_id(s.ptr))
+}
+
+func (s *Token) Label() string {
+	return C.GoString(C.weaveffi_shared_Token_get_label(s.ptr))
+}
+
+func (s *Token) Close() {
+	if s.ptr != nil {
+		C.weaveffi_shared_Token_destroy(s.ptr)
+		s.ptr = nil
+	}
+}
+
+func SharedPing() (string, error) {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_shared_ping(&cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return "", goErr
+	}
+	goResult := C.GoString(result)
+	C.weaveffi_free_string(result)
+	return goResult, nil
+}
+
+type Priority int32
+
+const (
+	PriorityLow Priority = 0
+	PriorityNormal Priority = 1
+	PriorityHigh Priority = 2
+)
+
+type Item struct {
+	ptr *C.weaveffi_kitchen_Item
+}
+
+func (s *Item) Id() int64 {
+	return int64(C.weaveffi_kitchen_Item_get_id(s.ptr))
+}
+
+func (s *Item) Name() string {
+	return C.GoString(C.weaveffi_kitchen_Item_get_name(s.ptr))
+}
+
+func (s *Item) Count() int32 {
+	return int32(C.weaveffi_kitchen_Item_get_count(s.ptr))
+}
+
+func (s *Item) Enabled() bool {
+	return cToBool(C.weaveffi_kitchen_Item_get_enabled(s.ptr))
+}
+
+func (s *Item) Ratio() float64 {
+	return float64(C.weaveffi_kitchen_Item_get_ratio(s.ptr))
+}
+
+func (s *Item) Nick() uint32 {
+	return uint32(C.weaveffi_kitchen_Item_get_nick(s.ptr))
+}
+
+func (s *Item) Payload() []byte {
+	return []byte(C.weaveffi_kitchen_Item_get_payload(s.ptr))
+}
+
+func (s *Item) Tags() []string {
+	return []string(C.weaveffi_kitchen_Item_get_tags(s.ptr))
+}
+
+func (s *Item) Attrs() map[string]string {
+	return map[string]string(C.weaveffi_kitchen_Item_get_attrs(s.ptr))
+}
+
+func (s *Item) Parent() *int64 {
+	cVal := C.weaveffi_kitchen_Item_get_parent(s.ptr)
+	if cVal == nil {
+		return nil
+	}
+	v := int64(*cVal)
+	return &v
+}
+
+func (s *Item) Token() *Token {
+	return &Token{ptr: C.weaveffi_kitchen_Item_get_token(s.ptr)}
+}
+
+func (s *Item) Priority() Priority {
+	return Priority(C.weaveffi_kitchen_Item_get_priority(s.ptr))
+}
+
+func (s *Item) Close() {
+	if s.ptr != nil {
+		C.weaveffi_kitchen_Item_destroy(s.ptr)
+		s.ptr = nil
+	}
+}
+
+type ItemBuilder struct {
+	fields map[string]interface{}
+}
+
+func NewItemBuilder() *ItemBuilder {
+	return &ItemBuilder{fields: make(map[string]interface{})}
+}
+
+func (b *ItemBuilder) WithId(value int64) *ItemBuilder {
+	b.fields["id"] = value
+	return b
+}
+
+func (b *ItemBuilder) WithName(value string) *ItemBuilder {
+	b.fields["name"] = value
+	return b
+}
+
+func (b *ItemBuilder) WithCount(value int32) *ItemBuilder {
+	b.fields["count"] = value
+	return b
+}
+
+func (b *ItemBuilder) WithEnabled(value bool) *ItemBuilder {
+	b.fields["enabled"] = value
+	return b
+}
+
+func (b *ItemBuilder) WithRatio(value float64) *ItemBuilder {
+	b.fields["ratio"] = value
+	return b
+}
+
+func (b *ItemBuilder) WithNick(value uint32) *ItemBuilder {
+	b.fields["nick"] = value
+	return b
+}
+
+func (b *ItemBuilder) WithPayload(value []byte) *ItemBuilder {
+	b.fields["payload"] = value
+	return b
+}
+
+func (b *ItemBuilder) WithTags(value []string) *ItemBuilder {
+	b.fields["tags"] = value
+	return b
+}
+
+func (b *ItemBuilder) WithAttrs(value map[string]string) *ItemBuilder {
+	b.fields["attrs"] = value
+	return b
+}
+
+func (b *ItemBuilder) WithParent(value *int64) *ItemBuilder {
+	b.fields["parent"] = value
+	return b
+}
+
+func (b *ItemBuilder) WithToken(value *Token) *ItemBuilder {
+	b.fields["token"] = value
+	return b
+}
+
+func (b *ItemBuilder) WithPriority(value Priority) *ItemBuilder {
+	b.fields["priority"] = value
+	return b
+}
+
+func KitchenBoolId(x bool) (bool, error) {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kitchen_bool_id(boolToC(x), &cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return false, goErr
+	}
+	return cToBool(result), nil
+}
+
+func KitchenI32Id(x int32) (int32, error) {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kitchen_i32_id(C.int32_t(x), &cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return 0, goErr
+	}
+	return int32(result), nil
+}
+
+func KitchenU32Id(x uint32) (uint32, error) {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kitchen_u32_id(C.uint32_t(x), &cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return 0, goErr
+	}
+	return uint32(result), nil
+}
+
+func KitchenI64Id(x int64) (int64, error) {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kitchen_i64_id(C.int64_t(x), &cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return 0, goErr
+	}
+	return int64(result), nil
+}
+
+func KitchenF64Id(x float64) (float64, error) {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kitchen_f64_id(C.double(x), &cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return 0, goErr
+	}
+	return float64(result), nil
+}
+
+func KitchenEchoString(s string) (string, error) {
+	cS := C.CString(s)
+	defer C.free(unsafe.Pointer(cS))
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kitchen_echo_string(cS, &cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return "", goErr
+	}
+	goResult := C.GoString(result)
+	C.weaveffi_free_string(result)
+	return goResult, nil
+}
+
+func KitchenEchoBytes(b []byte) ([]byte, error) {
+	var cBPtr *C.uint8_t
+	cBLen := C.size_t(len(b))
+	if len(b) > 0 {
+		cBPtr = (*C.uint8_t)(unsafe.Pointer(&b[0]))
+	}
+	var cOutLen C.size_t
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kitchen_echo_bytes(cBPtr, cBLen, &cOutLen, &cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return nil, goErr
+	}
+	if result == nil {
+		return nil, nil
+	}
+	goResult := C.GoBytes(unsafe.Pointer(result), C.int(cOutLen))
+	C.weaveffi_free_bytes(result, cOutLen)
+	return goResult, nil
+}
+
+func KitchenEchoBorrowedStr(s string) (string, error) {
+	cS := C.CString(s)
+	defer C.free(unsafe.Pointer(cS))
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kitchen_echo_borrowed_str(cS, &cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return "", goErr
+	}
+	goResult := C.GoString(result)
+	C.weaveffi_free_string(result)
+	return goResult, nil
+}
+
+func KitchenEchoBorrowedBytes(b []byte) ([]byte, error) {
+	var cBPtr *C.uint8_t
+	cBLen := C.size_t(len(b))
+	if len(b) > 0 {
+		cBPtr = (*C.uint8_t)(unsafe.Pointer(&b[0]))
+	}
+	var cOutLen C.size_t
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kitchen_echo_borrowed_bytes(cBPtr, cBLen, &cOutLen, &cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return nil, goErr
+	}
+	if result == nil {
+		return nil, nil
+	}
+	goResult := C.GoBytes(unsafe.Pointer(result), C.int(cOutLen))
+	C.weaveffi_free_bytes(result, cOutLen)
+	return goResult, nil
+}
+
+func KitchenOpenHandle() (int64, error) {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kitchen_open_handle(&cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return 0, goErr
+	}
+	return int64(result), nil
+}
+
+func KitchenOpenTypedHandle() (*Token, error) {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kitchen_open_typed_handle(&cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return nil, goErr
+	}
+	return &Token{ptr: result}, nil
+}
+
+func KitchenMaybeItem(id int64) (*Item, error) {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kitchen_maybe_item(C.int64_t(id), &cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return nil, goErr
+	}
+	if result == nil {
+		return nil, nil
+	}
+	return &Item{ptr: result}, nil
+}
+
+func KitchenListItems() ([]*Item, error) {
+	var cOutLen C.size_t
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kitchen_list_items(&cOutLen, &cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return nil, goErr
+	}
+	count := int(cOutLen)
+	if count == 0 || result == nil {
+		return nil, nil
+	}
+	goResult := make([]*Item, count)
+	cSlice := unsafe.Slice((**C.weaveffi_kitchen_Item)(unsafe.Pointer(result)), count)
+	for i, v := range cSlice {
+		goResult[i] = &Item{ptr: v}
+	}
+	return goResult, nil
+}
+
+func KitchenGetAttrs() (map[string]int32, error) {
+	var cErr C.weaveffi_error
+	C.weaveffi_kitchen_get_attrs(&cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return nil, goErr
+	}
+	goResult := make(map[string]int32)
+	return goResult, nil
+}
+
+func KitchenStreamItems() ([]*Item, error) {
+	var cOutLen C.size_t
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kitchen_stream_items(&cOutLen, &cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return nil, goErr
+	}
+	count := int(cOutLen)
+	if count == 0 || result == nil {
+		return nil, nil
+	}
+	goResult := make([]*Item, count)
+	cSlice := unsafe.Slice((**C.weaveffi_kitchen_Item)(unsafe.Pointer(result)), count)
+	for i, v := range cSlice {
+		goResult[i] = &Item{ptr: v}
+	}
+	return goResult, nil
+}
+
+func KitchenCrossModuleToken() (*Token, error) {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kitchen_cross_module_token(&cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return nil, goErr
+	}
+	return &Token{ptr: result}, nil
+}
+
+// Deprecated: Use new_op instead
+func KitchenLegacyOp() (int32, error) {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kitchen_legacy_op(&cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return 0, goErr
+	}
+	return int32(result), nil
+}
+
+func KitchenNewOp() (int32, error) {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kitchen_new_op(&cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return 0, goErr
+	}
+	return int32(result), nil
+}
+
+func KitchenNestedHello() (string, error) {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kitchen_nested_hello(&cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return "", goErr
+	}
+	goResult := C.GoString(result)
+	C.weaveffi_free_string(result)
+	return goResult, nil
+}

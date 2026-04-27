@@ -1,0 +1,10 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+from setuptools import setup
+
+setup(
+    name="weaveffi",
+    version="0.1.0",
+    packages=["weaveffi"],
+)

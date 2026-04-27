@@ -1,0 +1,17 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+package com.weaveffi
+
+class WeaveFFI {
+    companion object {
+        init { System.loadLibrary("weaveffi") }
+
+        @JvmStatic external fun add(a: Int, b: Int): Int
+        @JvmStatic external fun mul(a: Int, b: Int): Int
+        @JvmStatic external fun div(a: Int, b: Int): Int
+        @JvmStatic external fun echo(s: String): String
+    }
+}
+
+open class WeaveFFIException(val code: Int, message: String) : Exception(message)

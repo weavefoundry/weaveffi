@@ -1,0 +1,75 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+#include <optional>
+#include <unordered_map>
+#include <memory>
+#include <stdexcept>
+
+extern "C" {
+
+typedef uint64_t weaveffi_handle_t;
+
+typedef struct weaveffi_error {
+    int32_t code;
+    const char* message;
+} weaveffi_error;
+
+void weaveffi_error_clear(weaveffi_error* err);
+void weaveffi_free_string(const char* ptr);
+void weaveffi_free_bytes(uint8_t* ptr, size_t len);
+
+typedef struct weaveffi_cancel_token weaveffi_cancel_token;
+weaveffi_cancel_token* weaveffi_cancel_token_create(void);
+void weaveffi_cancel_token_cancel(weaveffi_cancel_token* token);
+bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token* token);
+void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
+
+void weaveffi_events_send_message(const char* text, weaveffi_error* out_err);
+const char** weaveffi_events_get_messages(size_t* out_len, weaveffi_error* out_err);
+
+} // extern "C"
+
+namespace weaveffi {
+
+class WeaveFFIError : public std::runtime_error {
+    int32_t code_;
+
+public:
+    WeaveFFIError(int32_t code, const std::string& msg) : std::runtime_error(msg), code_(code) {}
+    int32_t code() const { return code_; }
+};
+
+inline void events_send_message(const std::string& text) {
+    weaveffi_error err{};
+    weaveffi_events_send_message(text.c_str(), &err);
+    if (err.code != 0) {
+        std::string msg(err.message ? err.message : "unknown error");
+        int32_t code = err.code;
+        weaveffi_error_clear(&err);
+        throw WeaveFFIError(code, msg);
+    }
+}
+
+inline std::vector<std::string> events_get_messages() {
+    size_t out_len = 0;
+    weaveffi_error err{};
+    auto result = weaveffi_events_get_messages(&out_len, &err);
+    if (err.code != 0) {
+        std::string msg(err.message ? err.message : "unknown error");
+        int32_t code = err.code;
+        weaveffi_error_clear(&err);
+        throw WeaveFFIError(code, msg);
+    }
+    std::vector<std::string> ret;
+    ret.reserve(out_len);
+    for (size_t i = 0; i < out_len; ++i) ret.emplace_back(result[i]);
+    return ret;
+}
+
+} // namespace weaveffi

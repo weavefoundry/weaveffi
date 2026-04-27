@@ -1,0 +1,104 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+# frozen_string_literal: true
+# WeaveFFI Ruby FFI bindings (auto-generated)
+
+require 'ffi'
+
+module WeaveFFI
+  extend FFI::Library
+
+  case FFI::Platform::OS
+  when /darwin/
+    ffi_lib 'libweaveffi.dylib'
+  when /mswin|mingw/
+    ffi_lib 'weaveffi.dll'
+  else
+    ffi_lib 'libweaveffi.so'
+  end
+
+  class ErrorStruct < FFI::Struct
+    layout :code, :int32,
+           :message, :pointer
+  end
+
+  class Error < StandardError
+    attr_reader :code
+
+    def initialize(code, message)
+      @code = code
+      super(message)
+    end
+  end
+
+  attach_function :weaveffi_error_clear, [:pointer], :void
+  attach_function :weaveffi_free_string, [:pointer], :void
+  attach_function :weaveffi_free_bytes, [:pointer, :size_t], :void
+
+  def self.check_error!(err)
+    return if err[:code].zero?
+    code = err[:code]
+    msg_ptr = err[:message]
+    msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    weaveffi_error_clear(err.to_ptr)
+    raise Error.new(code, msg)
+  end
+
+  # === Module: tasks ===
+
+  attach_function :weaveffi_tasks_TaskResult_destroy, [:pointer], :void
+  attach_function :weaveffi_tasks_TaskResult_get_id, [:pointer], :int64
+  attach_function :weaveffi_tasks_TaskResult_get_value, [:pointer], :pointer
+  attach_function :weaveffi_tasks_TaskResult_get_success, [:pointer], :int32
+  attach_function :weaveffi_tasks_cancel_task, [:int64, :pointer], :int32
+
+  class TaskResultPtr < FFI::AutoPointer
+    def self.release(ptr)
+      WeaveFFI.weaveffi_tasks_TaskResult_destroy(ptr)
+    end
+  end
+
+  class TaskResult
+    attr_reader :handle
+
+    def initialize(handle)
+      @handle = TaskResultPtr.new(handle)
+    end
+
+    def self.create(handle)
+      new(handle)
+    end
+
+    def destroy
+      return if @handle.nil?
+      @handle.free
+      @handle = nil
+    end
+
+    def id
+      result = WeaveFFI.weaveffi_tasks_TaskResult_get_id(@handle)
+      result
+    end
+
+    def value
+      result = WeaveFFI.weaveffi_tasks_TaskResult_get_value(@handle)
+      return '' if result.null?
+      str = result.read_string
+      WeaveFFI.weaveffi_free_string(result)
+      str
+    end
+
+    def success
+      result = WeaveFFI.weaveffi_tasks_TaskResult_get_success(@handle)
+      result != 0
+    end
+  end
+
+  def self.cancel_task(id)
+    err = ErrorStruct.new
+    result = weaveffi_tasks_cancel_task(id, err)
+    check_error!(err)
+    result != 0
+  end
+end

@@ -1,0 +1,141 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+#include <jni.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include "weaveffi.h"
+
+static void throw_weaveffi_error(JNIEnv* env, weaveffi_error* err) {
+    const char* msg = err->message ? err->message : "WeaveFFI error";
+    jclass exClass = (*env)->FindClass(env, "java/lang/RuntimeException");
+    (*env)->ThrowNew(env, exClass, msg);
+    weaveffi_error_clear(err);
+}
+
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_create_contactJni(JNIEnv* env, jclass clazz, jstring first_name, jstring last_name, jstring email, jint contact_type) {
+    weaveffi_error err = {0, NULL};
+    const char* first_name_chars = (*env)->GetStringUTFChars(env, first_name, NULL);
+    jsize first_name_len = (*env)->GetStringUTFLength(env, first_name);
+    const char* last_name_chars = (*env)->GetStringUTFChars(env, last_name, NULL);
+    jsize last_name_len = (*env)->GetStringUTFLength(env, last_name);
+    const char* email_chars = NULL;
+    jsize email_len = 0;
+    if (email != NULL) {
+        email_chars = (*env)->GetStringUTFChars(env, email, NULL);
+        email_len = (*env)->GetStringUTFLength(env, email);
+    }
+    weaveffi_handle_t rv = weaveffi_contacts_create_contact((const uint8_t*)first_name_chars, (size_t)first_name_len, (const uint8_t*)last_name_chars, (size_t)last_name_len, (const uint8_t*)email_chars, (size_t)email_len, (int32_t)contact_type, &err);
+    if (err.code != 0) {
+        throw_weaveffi_error(env, &err);
+        return 0;
+    }
+    (*env)->ReleaseStringUTFChars(env, first_name, first_name_chars);
+    (*env)->ReleaseStringUTFChars(env, last_name, last_name_chars);
+    if (email != NULL) { (*env)->ReleaseStringUTFChars(env, email, email_chars); }
+    return (jlong) rv;
+}
+
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_get_contact(JNIEnv* env, jclass clazz, jlong id) {
+    weaveffi_error err = {0, NULL};
+    weaveffi_contacts_Contact* rv = weaveffi_contacts_get_contact((weaveffi_handle_t)id, &err);
+    if (err.code != 0) {
+        throw_weaveffi_error(env, &err);
+        return 0;
+    }
+    return (jlong)(intptr_t)rv;
+}
+
+JNIEXPORT jlongArray JNICALL Java_com_weaveffi_WeaveFFI_list_contacts(JNIEnv* env, jclass clazz) {
+    weaveffi_error err = {0, NULL};
+    size_t out_len = 0;
+    const int64_t* rv = (const int64_t*)weaveffi_contacts_list_contacts(, &out_len, &err);
+    if (err.code != 0) {
+        throw_weaveffi_error(env, &err);
+        return NULL;
+    }
+    jlongArray result = (*env)->NewLongArray(env, (jsize)out_len);
+    if (result && rv) { (*env)->SetLongArrayRegion(env, result, 0, (jsize)out_len, (const jlong*)rv); }
+    return result;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_delete_contact(JNIEnv* env, jclass clazz, jlong id) {
+    weaveffi_error err = {0, NULL};
+    bool rv = weaveffi_contacts_delete_contact((weaveffi_handle_t)id, &err);
+    if (err.code != 0) {
+        throw_weaveffi_error(env, &err);
+        return JNI_FALSE;
+    }
+    return rv ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jint JNICALL Java_com_weaveffi_WeaveFFI_count_contacts(JNIEnv* env, jclass clazz) {
+    weaveffi_error err = {0, NULL};
+    int32_t rv = weaveffi_contacts_count_contacts(, &err);
+    if (err.code != 0) {
+        throw_weaveffi_error(env, &err);
+        return 0;
+    }
+    return (jint) rv;
+}
+
+JNIEXPORT jlong JNICALL Java_com_weaveffi_Contact_nativeCreate(JNIEnv* env, jclass clazz, jlong id, jstring first_name, jstring last_name, jstring email, jint contact_type) {
+    weaveffi_error err = {0, NULL};
+    const char* first_name_chars = (*env)->GetStringUTFChars(env, first_name, NULL);
+    jsize first_name_len = (*env)->GetStringUTFLength(env, first_name);
+    const char* last_name_chars = (*env)->GetStringUTFChars(env, last_name, NULL);
+    jsize last_name_len = (*env)->GetStringUTFLength(env, last_name);
+    const char* email_chars = NULL;
+    jsize email_len = 0;
+    if (email != NULL) {
+        email_chars = (*env)->GetStringUTFChars(env, email, NULL);
+        email_len = (*env)->GetStringUTFLength(env, email);
+    }
+    weaveffi_contacts_Contact* rv = weaveffi_contacts_Contact_create((int64_t)id, (const uint8_t*)first_name_chars, (size_t)first_name_len, (const uint8_t*)last_name_chars, (size_t)last_name_len, (const uint8_t*)email_chars, (size_t)email_len, (int32_t)contact_type, &err);
+    if (err.code != 0) {
+        throw_weaveffi_error(env, &err);
+        return 0;
+    }
+    (*env)->ReleaseStringUTFChars(env, first_name, first_name_chars);
+    (*env)->ReleaseStringUTFChars(env, last_name, last_name_chars);
+    if (email != NULL) { (*env)->ReleaseStringUTFChars(env, email, email_chars); }
+    return (jlong)(intptr_t)rv;
+}
+
+JNIEXPORT void JNICALL Java_com_weaveffi_Contact_nativeDestroy(JNIEnv* env, jclass clazz, jlong handle) {
+    weaveffi_contacts_Contact_destroy((weaveffi_contacts_Contact*)(intptr_t)handle);
+}
+
+JNIEXPORT jlong JNICALL Java_com_weaveffi_Contact_nativeGetId(JNIEnv* env, jclass clazz, jlong handle) {
+    int64_t rv = weaveffi_contacts_Contact_get_id((const weaveffi_contacts_Contact*)(intptr_t)handle);
+    return (jlong)rv;
+}
+
+JNIEXPORT jstring JNICALL Java_com_weaveffi_Contact_nativeGetFirstName(JNIEnv* env, jclass clazz, jlong handle) {
+    const char* rv = weaveffi_contacts_Contact_get_first_name((const weaveffi_contacts_Contact*)(intptr_t)handle);
+    jstring jout = rv ? (*env)->NewStringUTF(env, rv) : (*env)->NewStringUTF(env, "");
+    weaveffi_free_string(rv);
+    return jout;
+}
+
+JNIEXPORT jstring JNICALL Java_com_weaveffi_Contact_nativeGetLastName(JNIEnv* env, jclass clazz, jlong handle) {
+    const char* rv = weaveffi_contacts_Contact_get_last_name((const weaveffi_contacts_Contact*)(intptr_t)handle);
+    jstring jout = rv ? (*env)->NewStringUTF(env, rv) : (*env)->NewStringUTF(env, "");
+    weaveffi_free_string(rv);
+    return jout;
+}
+
+JNIEXPORT jstring JNICALL Java_com_weaveffi_Contact_nativeGetEmail(JNIEnv* env, jclass clazz, jlong handle) {
+    const char* rv = weaveffi_contacts_Contact_get_email((const weaveffi_contacts_Contact*)(intptr_t)handle);
+    if (rv == NULL) { return NULL; }
+    jstring jout = (*env)->NewStringUTF(env, rv);
+    weaveffi_free_string(rv);
+    return jout;
+}
+
+JNIEXPORT jint JNICALL Java_com_weaveffi_Contact_nativeGetContactType(JNIEnv* env, jclass clazz, jlong handle) {
+    int32_t rv = weaveffi_contacts_Contact_get_contact_type((const weaveffi_contacts_Contact*)(intptr_t)handle);
+    return (jint)rv;
+}

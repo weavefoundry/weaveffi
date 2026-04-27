@@ -1,0 +1,60 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+package weaveffi
+
+/*
+#cgo LDFLAGS: -lweaveffi
+#include "weaveffi.h"
+#include <stdlib.h>
+*/
+import "C"
+
+import (
+	"fmt"
+)
+
+func boolToC(b bool) C._Bool {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func cToBool(b C._Bool) bool {
+	return b != 0
+}
+
+type TaskResult struct {
+	ptr *C.weaveffi_tasks_TaskResult
+}
+
+func (s *TaskResult) Id() int64 {
+	return int64(C.weaveffi_tasks_TaskResult_get_id(s.ptr))
+}
+
+func (s *TaskResult) Value() string {
+	return C.GoString(C.weaveffi_tasks_TaskResult_get_value(s.ptr))
+}
+
+func (s *TaskResult) Success() bool {
+	return cToBool(C.weaveffi_tasks_TaskResult_get_success(s.ptr))
+}
+
+func (s *TaskResult) Close() {
+	if s.ptr != nil {
+		C.weaveffi_tasks_TaskResult_destroy(s.ptr)
+		s.ptr = nil
+	}
+}
+
+func TasksCancelTask(id int64) (bool, error) {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_tasks_cancel_task(C.int64_t(id), &cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return false, goErr
+	}
+	return cToBool(result), nil
+}

@@ -1,0 +1,154 @@
+version: "0.3.0"
+modules:
+  - name: shared
+    structs:
+      - name: Token
+        doc: A reusable token referenced across modules
+        fields:
+          - { name: id, type: i64 }
+          - { name: label, type: string }
+    functions:
+      - name: ping
+        doc: Trivial cross-module helper
+        params: []
+        return: string
+  - name: kitchen
+    enums:
+      - name: Priority
+        doc: Task priority levels
+        variants:
+          - { name: Low, value: 0, doc: Low priority }
+          - { name: Normal, value: 1, doc: Normal priority }
+          - { name: High, value: 2, doc: High priority }
+    structs:
+      - name: Item
+        doc: Kitchen sink struct exercising every field feature
+        builder: true
+        fields:
+          - { name: id, type: i64, doc: Stable identifier }
+          - { name: name, type: string, doc: Display name }
+          - { name: count, type: i32, default: 0, doc: Initial count }
+          - { name: enabled, type: bool, default: true, doc: Whether the item is enabled }
+          - { name: ratio, type: f64, default: 1.0, doc: Scaling ratio }
+          - { name: nick, type: u32, default: 0 }
+          - { name: payload, type: bytes }
+          - { name: tags, type: "[string]" }
+          - { name: attrs, type: "{string:string}" }
+          - { name: parent, type: "i64?" }
+          - { name: token, type: Token, doc: Cross-module struct reference }
+          - { name: priority, type: Priority }
+    callbacks:
+      - name: OnReady
+        doc: Fires when an item is ready
+        params:
+          - { name: code, type: i32 }
+          - { name: msg, type: string }
+    listeners:
+      - name: ready_listener
+        event_callback: OnReady
+        doc: Subscribe to OnReady events
+    errors:
+      name: KitchenErrors
+      codes:
+        - { name: not_found, code: 1, message: "Item not found" }
+        - { name: invalid_input, code: 2, message: "Invalid input" }
+    functions:
+      - name: bool_id
+        doc: Identity for bool
+        params:
+          - { name: x, type: bool }
+        return: bool
+      - name: i32_id
+        params:
+          - { name: x, type: i32 }
+        return: i32
+      - name: u32_id
+        params:
+          - { name: x, type: u32 }
+        return: u32
+      - name: i64_id
+        params:
+          - { name: x, type: i64 }
+        return: i64
+      - name: f64_id
+        params:
+          - { name: x, type: f64 }
+        return: f64
+      - name: echo_string
+        params:
+          - { name: s, type: string }
+        return: string
+      - name: echo_bytes
+        params:
+          - { name: b, type: bytes }
+        return: bytes
+      - name: echo_borrowed_str
+        doc: Borrowed string parameter
+        params:
+          - { name: s, type: "&str" }
+        return: string
+      - name: echo_borrowed_bytes
+        doc: Borrowed bytes parameter
+        params:
+          - { name: b, type: "&[u8]" }
+        return: bytes
+      - name: open_handle
+        doc: Returns an opaque handle
+        params: []
+        return: handle
+      - name: open_typed_handle
+        doc: Returns a typed handle
+        params: []
+        return: "handle<Token>"
+      - name: maybe_item
+        doc: Optional struct return
+        params:
+          - { name: id, type: i64 }
+        return: "Item?"
+      - name: list_items
+        doc: List of structs
+        params: []
+        return: "[Item]"
+      - name: get_attrs
+        doc: Map return type
+        params: []
+        return: "{string:i32}"
+      - name: stream_items
+        doc: Iterator return type
+        params: []
+        return: "iter<Item>"
+      - name: cross_module_token
+        doc: Returns the shared Token type from another module
+        params: []
+        return: Token
+      - name: do_async
+        doc: Async operation
+        params:
+          - { name: input, type: string }
+        return: string
+        async: true
+      - name: do_cancellable
+        doc: Cancellable async operation
+        params:
+          - { name: input, type: string }
+        return: string
+        async: true
+        cancellable: true
+      - name: legacy_op
+        doc: Legacy operation kept for compatibility
+        params: []
+        return: i32
+        deprecated: "Use new_op instead"
+        since: "0.1.0"
+      - name: new_op
+        doc: Replacement for legacy_op
+        params: []
+        return: i32
+        since: "0.3.0"
+    modules:
+      - name: nested
+        functions:
+          - name: hello
+            doc: Trivial nested-module function
+            params: []
+            return: string

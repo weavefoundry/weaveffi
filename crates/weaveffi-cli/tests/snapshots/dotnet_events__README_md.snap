@@ -1,0 +1,20 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+# WeaveFFI .NET Bindings
+
+Auto-generated P/Invoke bindings for the WeaveFFI native library.
+
+## Build
+
+```bash
+dotnet build
+```
+
+## Pack
+
+```bash
+dotnet pack
+```
+
+The resulting `.nupkg` will be in `bin/Debug/` (or `bin/Release/` with `-c Release`).

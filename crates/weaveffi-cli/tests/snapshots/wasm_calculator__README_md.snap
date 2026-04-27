@@ -1,0 +1,96 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+# WeaveFFI WASM (experimental)
+
+This folder contains a minimal stub to help you load a `wasm32-unknown-unknown` build of your WeaveFFI library.
+
+Build (example):
+
+```bash
+cargo build --target wasm32-unknown-unknown --release
+```
+
+Then serve the `.wasm` and use `weaveffi_wasm.js` to load it.
+
+## Complex Type Handling
+
+WASM only supports numeric types natively (`i32`, `i64`, `f32`, `f64`). Complex types are encoded at the boundary as follows:
+
+### Structs
+
+Structs are passed as **opaque handles** (`i64` pointers into linear memory). The host cannot inspect struct fields directly; use the generated accessor functions (`weaveffi_{module}_{struct}_get_{field}`) to read/write fields.
+
+### Enums
+
+Enums are passed as **`i32` values** corresponding to the variant's integer discriminant.
+
+### Optionals
+
+Optional values use **`0` / `null`** to represent the absent case. For numeric optionals, a separate `_is_present` flag (`i32`: 0 or 1) is used. For handle-typed optionals, a null pointer (`0`) signals absence.
+
+### Lists
+
+Lists are passed as a **pointer + length** pair (`i32` pointer, `i32` length) referencing a contiguous region in linear memory. The caller is responsible for allocating and freeing the backing memory.
+
+### Error Handling
+
+The generated JS wrappers automatically handle errors by passing an error
+pointer as the last argument to each WASM function. Your WASM module must
+export the following functions:
+
+- `weaveffi_alloc(size: i32) -> i32` — allocate `size` bytes in linear memory
+- `weaveffi_error_clear(err_ptr: i32)` — clear and free error resources
+
+## API Reference
+
+### Module: `calculator`
+
+#### Functions
+
+##### `weaveffi_calculator_add`
+
+Add two integers
+
+`weaveffi_calculator_add(a: i32, b: i32) -> i32`
+
+| Param | API Type | WASM | Notes |
+|-------|----------|------|-------|
+| `a` | `i32` | `i32` | native WASM i32 |
+| `b` | `i32` | `i32` | native WASM i32 |
+| _returns_ | `i32` | `i32` | native WASM i32 |
+
+##### `weaveffi_calculator_mul`
+
+Multiply two integers
+
+`weaveffi_calculator_mul(a: i32, b: i32) -> i32`
+
+| Param | API Type | WASM | Notes |
+|-------|----------|------|-------|
+| `a` | `i32` | `i32` | native WASM i32 |
+| `b` | `i32` | `i32` | native WASM i32 |
+| _returns_ | `i32` | `i32` | native WASM i32 |
+
+##### `weaveffi_calculator_div`
+
+Divide two integers
+
+`weaveffi_calculator_div(a: i32, b: i32) -> i32`
+
+| Param | API Type | WASM | Notes |
+|-------|----------|------|-------|
+| `a` | `i32` | `i32` | native WASM i32 |
+| `b` | `i32` | `i32` | native WASM i32 |
+| _returns_ | `i32` | `i32` | native WASM i32 |
+
+##### `weaveffi_calculator_echo`
+
+Echo a string back
+
+`weaveffi_calculator_echo(s: i32, i32) -> i32, i32`
+
+| Param | API Type | WASM | Notes |
+|-------|----------|------|-------|
+| `s` | `string` | `i32, i32` | ptr + len in linear memory |
+| _returns_ | `string` | `i32, i32` | ptr + len in linear memory |
