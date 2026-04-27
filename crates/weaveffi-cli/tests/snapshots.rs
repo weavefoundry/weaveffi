@@ -146,6 +146,7 @@ snapshot_test!(
     "docs_everywhere",
     "07_docs_everywhere.yml"
 );
+snapshot_test!(snapshot_c_kvstore, CGenerator, "kvstore", "08_kvstore.yml");
 
 snapshot_test!(
     snapshot_cpp_calculator,
@@ -183,6 +184,12 @@ snapshot_test!(
     CppGenerator,
     "docs_everywhere",
     "07_docs_everywhere.yml"
+);
+snapshot_test!(
+    snapshot_cpp_kvstore,
+    CppGenerator,
+    "kvstore",
+    "08_kvstore.yml"
 );
 
 snapshot_test!(
@@ -227,6 +234,12 @@ snapshot_test!(
     "docs_everywhere",
     "07_docs_everywhere.yml"
 );
+snapshot_test!(
+    snapshot_swift_kvstore,
+    SwiftGenerator,
+    "kvstore",
+    "08_kvstore.yml"
+);
 
 snapshot_test!(
     snapshot_android_calculator,
@@ -269,6 +282,12 @@ snapshot_test!(
     AndroidGenerator,
     "docs_everywhere",
     "07_docs_everywhere.yml"
+);
+snapshot_test!(
+    snapshot_android_kvstore,
+    AndroidGenerator,
+    "kvstore",
+    "08_kvstore.yml"
 );
 
 snapshot_test!(
@@ -313,6 +332,12 @@ snapshot_test!(
     "docs_everywhere",
     "07_docs_everywhere.yml"
 );
+snapshot_test!(
+    snapshot_node_kvstore,
+    NodeGenerator,
+    "kvstore",
+    "08_kvstore.yml"
+);
 
 snapshot_test!(
     snapshot_wasm_calculator,
@@ -355,6 +380,12 @@ snapshot_test!(
     WasmGenerator,
     "docs_everywhere",
     "07_docs_everywhere.yml"
+);
+snapshot_test!(
+    snapshot_wasm_kvstore,
+    WasmGenerator,
+    "kvstore",
+    "08_kvstore.yml"
 );
 
 snapshot_test!(
@@ -399,6 +430,12 @@ snapshot_test!(
     "docs_everywhere",
     "07_docs_everywhere.yml"
 );
+snapshot_test!(
+    snapshot_python_kvstore,
+    PythonGenerator,
+    "kvstore",
+    "08_kvstore.yml"
+);
 
 snapshot_test!(
     snapshot_dotnet_calculator,
@@ -441,6 +478,12 @@ snapshot_test!(
     DotnetGenerator,
     "docs_everywhere",
     "07_docs_everywhere.yml"
+);
+snapshot_test!(
+    snapshot_dotnet_kvstore,
+    DotnetGenerator,
+    "kvstore",
+    "08_kvstore.yml"
 );
 
 snapshot_test!(
@@ -485,6 +528,12 @@ snapshot_test!(
     "docs_everywhere",
     "07_docs_everywhere.yml"
 );
+snapshot_test!(
+    snapshot_dart_kvstore,
+    DartGenerator,
+    "kvstore",
+    "08_kvstore.yml"
+);
 
 snapshot_test!(
     snapshot_go_calculator,
@@ -522,6 +571,12 @@ snapshot_test!(
     GoGenerator,
     "docs_everywhere",
     "07_docs_everywhere.yml"
+);
+snapshot_test!(
+    snapshot_go_kvstore,
+    GoGenerator,
+    "kvstore",
+    "08_kvstore.yml"
 );
 
 snapshot_test!(
@@ -565,4 +620,10 @@ snapshot_test!(
     RubyGenerator,
     "docs_everywhere",
     "07_docs_everywhere.yml"
+);
+snapshot_test!(
+    snapshot_ruby_kvstore,
+    RubyGenerator,
+    "kvstore",
+    "08_kvstore.yml"
 );

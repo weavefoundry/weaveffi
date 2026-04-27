@@ -6,3 +6,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_executable(cpp_example main.cpp)
 target_link_libraries(cpp_example PRIVATE ${CMAKE_DL_LIBS})
+
+add_executable(cpp_kvstore_smoke kvstore_smoke.cpp)
+target_link_libraries(cpp_kvstore_smoke PRIVATE ${CMAKE_DL_LIBS})
