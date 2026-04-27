@@ -1,3 +1,6 @@
+//! N-API addon used by the Node.js consumer example to dynamically load
+//! a WeaveFFI cdylib at runtime.
+
 #![allow(unsafe_code)]
 
 use libloading::{Library, Symbol};

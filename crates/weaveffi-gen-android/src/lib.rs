@@ -1,3 +1,9 @@
+//! Android (Kotlin/JNI) binding generator for WeaveFFI.
+//!
+//! Generates a Gradle project skeleton with a Kotlin wrapper plus a JNI
+//! bridge layer that calls into the C ABI. `suspend fun` shims are emitted
+//! for async functions. Implements the [`Generator`] trait.
+
 use anyhow::Result;
 use camino::Utf8Path;
 use std::fmt::Write as _;

@@ -1,3 +1,9 @@
+//! Swift binding generator for WeaveFFI.
+//!
+//! Emits a SwiftPM package containing a thin Swift wrapper over the C ABI,
+//! including module map, `Package.swift`, and Swift `async/await` shims for
+//! functions marked `async: true`. Implements the [`Generator`] trait.
+
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};

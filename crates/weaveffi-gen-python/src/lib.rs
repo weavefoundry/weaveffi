@@ -1,3 +1,9 @@
+//! Python (`ctypes`) binding generator for WeaveFFI.
+//!
+//! Emits a pip-installable package containing `ctypes`-based bindings and
+//! `.pyi` type stubs over the C ABI. Async functions surface as
+//! `async def` wrappers. Implements the [`Generator`] trait.
+
 use anyhow::Result;
 use camino::Utf8Path;
 use weaveffi_core::codegen::Generator;

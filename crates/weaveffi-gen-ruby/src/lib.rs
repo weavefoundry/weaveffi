@@ -1,3 +1,9 @@
+//! Ruby (FFI gem) binding generator for WeaveFFI.
+//!
+//! Emits a Ruby gem (`.gemspec` + library) using the `ffi` gem to call
+//! into the C ABI exposed by the underlying cdylib. Implements the
+//! [`Generator`] trait.
+
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToShoutySnakeCase, ToSnakeCase};

@@ -1,3 +1,11 @@
+//! C++ RAII wrapper generator for WeaveFFI.
+//!
+//! Produces an idiomatic `weaveffi.hpp` header (with move semantics,
+//! `std::optional`, `std::vector`, exception-based error handling) plus a
+//! `CMakeLists.txt` skeleton on top of the C ABI emitted by
+//! [`weaveffi-gen-c`](../weaveffi_gen_c/index.html). Implements the
+//! [`Generator`] trait.
+
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;

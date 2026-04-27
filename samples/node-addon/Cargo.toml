@@ -18,5 +18,9 @@ weaveffi-abi = { path = "../../crates/weaveffi-abi" }
 [build-dependencies]
 napi-build = "2"
 
+[package.metadata.cargo-machete]
+# Used in build.rs (napi_build::setup()); cargo-machete only inspects src/.
+ignored = ["napi-build"]
+
 [lints]
 workspace = true

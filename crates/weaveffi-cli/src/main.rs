@@ -1,3 +1,10 @@
+//! `weaveffi` command-line entry point.
+//!
+//! Wires together the IR parser, validator, generator orchestrator, and
+//! supporting subcommands (`generate`, `validate`, `extract`, `new`,
+//! `lint`, `diff`, `doctor`, `completions`, `schema`, `format`, `watch`,
+//! `upgrade`).
+
 mod extract;
 mod scaffold;
 
@@ -851,10 +858,7 @@ fn print_unified_diff(path: &str, old: &str, new: &str) {
     }
 }
 
-/// Wrap a [`ParseError`] in a [`miette::Report`] and attach the input
-/// filename and contents as a [`NamedSource`] so the fancy renderer can
-/// display the offending line and caret.
-/// Wrap a [`miette::Diagnostic`] (e.g. a [`ParseError`]) in a [`Report`] while
+/// Wrap a [`miette::Diagnostic`] (e.g. a parse error) in a [`Report`] while
 /// forcing its source code to be a [`NamedSource`] so the fancy renderer prints
 /// the filename in the snippet header. miette's built-in `with_source_code` is
 /// a no-op when the inner diagnostic already provides `#[source_code]`, so we

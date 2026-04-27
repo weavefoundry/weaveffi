@@ -1,3 +1,9 @@
+//! .NET (P/Invoke) binding generator for WeaveFFI.
+//!
+//! Emits a C# project (`.csproj` + `.nuspec`) with P/Invoke declarations
+//! and idiomatic wrappers over the C ABI. Async functions surface as
+//! `Task<T>`-returning methods. Implements the [`Generator`] trait.
+
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
