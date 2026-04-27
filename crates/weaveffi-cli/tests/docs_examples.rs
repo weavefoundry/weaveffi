@@ -859,3 +859,96 @@ fn cpp_calculator_readme_documents_build_and_run() {
         );
     }
 }
+
+#[test]
+fn dart_contacts_example_files_exist() {
+    for file in [
+        "examples/dart/contacts/bin/main.dart",
+        "examples/dart/contacts/pubspec.yaml",
+        "examples/dart/contacts/README.md",
+    ] {
+        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        assert!(
+            workspace_root.join(file).exists(),
+            "Dart contacts example is missing {file}"
+        );
+    }
+}
+
+#[test]
+fn dart_contacts_main_exercises_generated_bindings() {
+    let main = read_doc("examples/dart/contacts/bin/main.dart");
+    assert!(
+        main.contains("import 'package:weaveffi/weaveffi.dart';"),
+        "main.dart must import the generated package: {main}"
+    );
+    for call in [
+        "createContact(",
+        "countContacts()",
+        "listContacts()",
+        "getContact(",
+        "deleteContact(",
+        "ContactType.personal",
+        "ContactType.work",
+    ] {
+        assert!(main.contains(call), "main.dart must call `{call}`: {main}");
+    }
+    // The example must show Dart's equivalent of RAII: explicit `dispose()`
+    // on every `Contact` obtained from the bindings, guarded by `finally` so
+    // native handles still release on exception paths.
+    assert!(
+        main.contains(".dispose()"),
+        "main.dart must demonstrate Contact.dispose(): {main}"
+    );
+    assert!(
+        main.contains("finally"),
+        "main.dart must dispose handles in a finally block: {main}"
+    );
+}
+
+#[test]
+fn dart_contacts_pubspec_is_pure_dart_and_depends_on_generated() {
+    let pubspec = read_doc("examples/dart/contacts/pubspec.yaml");
+    assert!(
+        pubspec.contains("sdk: '>=3.0.0 <4.0.0'"),
+        "pubspec must pin a modern pure-Dart SDK range: {pubspec}"
+    );
+    assert!(
+        !pubspec.contains("flutter:"),
+        "pubspec must not require Flutter so `dart pub get` works: {pubspec}"
+    );
+    assert!(
+        pubspec.contains("path: ../../../generated/dart"),
+        "pubspec must depend on the generated dart package via path: {pubspec}"
+    );
+}
+
+#[test]
+fn dart_contacts_readme_documents_build_and_run() {
+    let readme = read_doc("examples/dart/contacts/README.md");
+    assert!(
+        readme.contains("cargo build -p contacts"),
+        "README must instruct building the contacts cdylib: {readme}"
+    );
+    assert!(
+        readme.contains("cargo run -p weaveffi-cli -- generate samples/contacts/contacts.yml"),
+        "README must include the contacts generate command: {readme}"
+    );
+    for token in [
+        "dart pub get",
+        "dart run bin/main.dart",
+        "DYLD_LIBRARY_PATH=../../../target/debug",
+        "LD_LIBRARY_PATH=../../../target/debug",
+        "libweaveffi.dylib",
+        "libweaveffi.so",
+    ] {
+        assert!(
+            readme.contains(token),
+            "README must mention `{token}`: {readme}"
+        );
+    }
+}
