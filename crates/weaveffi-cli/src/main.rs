@@ -833,6 +833,9 @@ fn walk_dir(base: &Utf8Path, dir: &Utf8Path, out: &mut BTreeSet<String>) -> Resu
         let utf8 = Utf8Path::from_path(&path)
             .ok_or_else(|| miette!("non-UTF-8 path: {:?}", path))?
             .to_owned();
+        if utf8.file_name() == Some(".weaveffi-cache") {
+            continue;
+        }
         if utf8.is_dir() {
             walk_dir(base, &utf8, out)?;
         } else {
@@ -841,9 +844,7 @@ fn walk_dir(base: &Utf8Path, dir: &Utf8Path, out: &mut BTreeSet<String>) -> Resu
                 .into_diagnostic()
                 .wrap_err("failed to strip prefix")?
                 .to_string();
-            if rel != ".weaveffi-cache" {
-                out.insert(rel);
-            }
+            out.insert(rel);
         }
     }
     Ok(())

@@ -19,6 +19,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 tera = { workspace = true }
 miette = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -275,3 +275,41 @@ generators:
 Unknown target names (for example a future language target) and
 unknown keys inside a known target are silently ignored, so an older
 `weaveffi` CLI can still read an IDL written for a newer one.
+
+## Performance
+
+`weaveffi generate` is fast enough that you generally don't need to think
+about it, but two design choices keep large multi-generator runs snappy:
+
+### Parallel generator dispatch
+
+The orchestrator dispatches every selected generator in parallel using
+[rayon](https://docs.rs/rayon). The pre-generate hook still runs before
+any generator starts and the post-generate hook still runs after every
+generator finishes — only the codegen step itself is parallelised.
+
+You don't need to opt in or configure anything. Selecting all 11 targets
+on a multi-core machine is roughly as fast as running the slowest single
+generator alone.
+
+### Per-generator incremental cache
+
+WeaveFFI persists one hash per generator under
+`{out_dir}/.weaveffi-cache/{target}.hash`. On every run, each generator's
+hash is recomputed (the IR plus the generator's name) and compared
+against the persisted value. Only generators whose hashes have changed
+are re-executed; the rest are skipped.
+
+This means tweaking a single field that only affects, say, the C header
+will only re-run the C generator on the next `weaveffi generate` —
+the other 10 generators stay cached.
+
+To clear every cached entry and force a full rebuild, pass `--force`:
+
+```bash
+weaveffi generate api.yml -o generated --force
+```
+
+The legacy single-file `.weaveffi-cache` written by older CLIs is
+ignored on first run and replaced with the new per-generator directory
+layout automatically.

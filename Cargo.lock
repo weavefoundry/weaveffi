@@ -2398,6 +2398,7 @@ dependencies = [
  "camino",
  "criterion",
  "miette",
+ "rayon",
  "serde",
  "serde_json",
  "sha2",
