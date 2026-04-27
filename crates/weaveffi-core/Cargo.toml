@@ -30,5 +30,12 @@ toml = { workspace = true }
 name = "codegen_bench"
 harness = false
 
+[[bin]]
+name = "hook_helper"
+path = "tests/bin/hook_helper.rs"
+test = false
+doc = false
+bench = false
+
 [lints]
 workspace = true
