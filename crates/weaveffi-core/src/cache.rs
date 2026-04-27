@@ -8,8 +8,16 @@ use weaveffi_ir::ir::Api;
 const CACHE_FILE: &str = ".weaveffi-cache";
 
 /// Serialize the API to canonical JSON and return its SHA-256 hex digest.
+///
+/// The IR is first serialized to a `serde_json::Value`, whose `Object`
+/// representation is backed by a `BTreeMap` (when the `preserve_order`
+/// feature is not enabled). Re-serializing that `Value` therefore emits
+/// keys in deterministic, lexicographic order regardless of the iteration
+/// order of any source maps. This guarantees that two runs over the same
+/// IR always produce the same hash.
 pub fn hash_api(api: &Api) -> String {
-    let json = serde_json::to_string(api).expect("Api serialization should not fail");
+    let value = serde_json::to_value(api).expect("Api serialization should not fail");
+    let json = serde_json::to_string(&value).expect("Value serialization should not fail");
     let hash = Sha256::digest(json.as_bytes());
     format!("{hash:x}")
 }
@@ -97,6 +105,34 @@ mod tests {
         let h2 = hash_api(&api);
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 64); // SHA-256 hex digest
+    }
+
+    #[test]
+    fn hash_is_deterministic_across_runs() {
+        let mut api = minimal_api();
+        let mut generators = std::collections::BTreeMap::new();
+        let mut swift = toml::value::Table::new();
+        swift.insert(
+            "module_name".into(),
+            toml::Value::String("MySwiftModule".into()),
+        );
+        generators.insert("swift".into(), toml::Value::Table(swift));
+        let mut android = toml::value::Table::new();
+        android.insert(
+            "package".into(),
+            toml::Value::String("com.example.app".into()),
+        );
+        generators.insert("android".into(), toml::Value::Table(android));
+        api.generators = Some(generators);
+
+        let baseline = hash_api(&api);
+        for _ in 0..100 {
+            assert_eq!(
+                hash_api(&api),
+                baseline,
+                "hash_api must produce identical output on every call"
+            );
+        }
     }
 
     #[test]

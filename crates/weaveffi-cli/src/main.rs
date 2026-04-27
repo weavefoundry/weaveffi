@@ -6,7 +6,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use miette::{bail, miette, IntoDiagnostic, NamedSource, Report, Result, WrapErr};
 use serde::Deserialize;
 use similar::TextDiff;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsStr;
 use std::process::Command;
@@ -441,7 +441,7 @@ impl InlineGeneratorOverrides {
 /// ignored so that older CLIs can read newer IDL files without crashing.
 fn merge_inline_generators(
     config: &mut GeneratorConfig,
-    generators: &HashMap<String, toml::Value>,
+    generators: &BTreeMap<String, toml::Value>,
 ) {
     const KNOWN_TARGETS: &[&str] = &[
         "swift", "android", "node", "wasm", "c", "python", "dotnet", "cpp", "dart", "go", "ruby",
