@@ -110,6 +110,7 @@ impl Generator for RubyGenerator {
         &[
             Capability::Callbacks,
             Capability::Listeners,
+            Capability::Iterators,
             Capability::Builders,
             Capability::CancellableAsync,
             Capability::TypedHandles,
@@ -3666,7 +3667,7 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_includes_callbacks_listeners_excludes_async_and_iterators() {
+    fn capabilities_includes_callbacks_listeners_iterators_excludes_async() {
         let caps = RubyGenerator.capabilities();
         assert!(
             caps.contains(&Capability::Callbacks),
@@ -3677,15 +3678,15 @@ mod tests {
             "Ruby generator must advertise Listeners now that listener codegen is implemented"
         );
         assert!(
+            caps.contains(&Capability::Iterators),
+            "Ruby generator must advertise Iterators now that iterator codegen is implemented"
+        );
+        assert!(
             !caps.contains(&Capability::AsyncFunctions),
             "Ruby generator must not advertise AsyncFunctions until async codegen is implemented"
         );
-        assert!(
-            !caps.contains(&Capability::Iterators),
-            "Ruby generator must not advertise Iterators until iterator codegen is implemented"
-        );
         for cap in Capability::ALL {
-            if matches!(cap, Capability::AsyncFunctions | Capability::Iterators) {
+            if matches!(cap, Capability::AsyncFunctions) {
                 continue;
             }
             assert!(caps.contains(cap), "Ruby generator must support {cap:?}");
