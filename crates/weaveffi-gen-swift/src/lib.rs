@@ -4907,6 +4907,38 @@ mod tests {
             "Swift wrapper must not pass the Swift String directly as a single const char* arg: {swift}"
         );
 
+        // User-facing Swift signature must take `msg: String` so the `.utf8`
+        // byte-slice materialisation path is the sole conversion point between
+        // Swift and the C ABI. A regression that accepted `[UInt8]` or
+        // `Data` would silently reroute the ABI.
+        assert!(
+            swift.contains("func echo_shout(_ msg: String)")
+                || swift.contains("func shout(_ msg: String)"),
+            "Swift wrapper must expose msg as Swift.String so the String -> UTF-8 bytes conversion is the only transform: {swift}"
+        );
+
+        // Lifetime guard: the C call must happen lexically inside the
+        // `withUnsafeBufferPointer` closure, otherwise `msg_ptr` would dangle
+        // when the C function reads it.
+        let wubp_idx = swift
+            .find("msg_bytes.withUnsafeBufferPointer")
+            .expect("withUnsafeBufferPointer must frame the call");
+        let call_idx = swift
+            .find("weaveffi_echo_shout(msg_ptr, msg_len, &err)")
+            .expect("C call site must be present");
+        assert!(
+            call_idx > wubp_idx,
+            "C call must appear after withUnsafeBufferPointer opens so msg_ptr is live: {swift}"
+        );
+        let closure_close = swift[wubp_idx..]
+            .rfind('}')
+            .map(|o| wubp_idx + o)
+            .expect("withUnsafeBufferPointer closure must have a closing brace");
+        assert!(
+            call_idx < closure_close,
+            "C call must appear before the withUnsafeBufferPointer closure closes so msg_ptr is still live: {swift}"
+        );
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
