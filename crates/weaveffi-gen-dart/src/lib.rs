@@ -79,6 +79,7 @@ impl Generator for DartGenerator {
 
     fn capabilities(&self) -> &'static [Capability] {
         &[
+            Capability::Callbacks,
             Capability::Iterators,
             Capability::AsyncFunctions,
             Capability::CancellableAsync,
@@ -3295,11 +3296,11 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_excludes_callbacks_listeners_and_builders() {
+    fn capabilities_includes_callbacks_excludes_listeners_and_builders() {
         let caps = DartGenerator.capabilities();
         assert!(
-            !caps.contains(&Capability::Callbacks),
-            "Dart generator must not advertise Callbacks until callback codegen is implemented"
+            caps.contains(&Capability::Callbacks),
+            "Dart generator must advertise Callbacks now that callback codegen is implemented"
         );
         assert!(
             !caps.contains(&Capability::Listeners),
@@ -3310,10 +3311,7 @@ mod tests {
             "Dart generator must not advertise Builders while build() throws at runtime"
         );
         for cap in Capability::ALL {
-            if matches!(
-                cap,
-                Capability::Callbacks | Capability::Listeners | Capability::Builders
-            ) {
+            if matches!(cap, Capability::Listeners | Capability::Builders) {
                 continue;
             }
             assert!(caps.contains(cap), "Dart generator must support {cap:?}");
