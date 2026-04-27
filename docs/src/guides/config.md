@@ -187,3 +187,91 @@ c_prefix = "myapp"
 ```bash
 weaveffi generate api.yml -o generated --config weaveffi.toml
 ```
+
+## Inline generator configuration
+
+Every key from the TOML config file can also live directly inside the IDL
+under a top-level `generators:` map. Each subtable is a *target name* (or
+the special `weaveffi` / `global` section); inside each target, the keys
+omit the `{target}_` prefix from the TOML form.
+
+When the same option appears in both places, the inline IDL value wins.
+The IDL is checked into the repository alongside the API definition and
+is therefore the more specific, project-local source of truth, while a
+`--config` TOML file is typically per-environment (CI, developer machine,
+release pipeline). Putting an option in the IDL guarantees every
+consumer sees the same generator settings without remembering to pass
+`--config`.
+
+### Per-target keys
+
+Each entry below shows the inline form on the left and the equivalent
+TOML field on the right.
+
+| Inline (IDL) | TOML field | Type |
+|--------------|------------|------|
+| `swift.module_name` | `swift_module_name` | string |
+| `android.package` | `android_package` | string |
+| `node.package_name` | `node_package_name` | string |
+| `wasm.module_name` | `wasm_module_name` | string |
+| `c.prefix` | `c_prefix` | string |
+| `python.package_name` | `python_package_name` | string |
+| `dotnet.namespace` | `dotnet_namespace` | string |
+| `cpp.namespace` | `cpp_namespace` | string |
+| `cpp.header_name` | `cpp_header_name` | string |
+| `cpp.standard` | `cpp_standard` | string |
+| `dart.package_name` | `dart_package_name` | string |
+| `go.module_path` | `go_module_path` | string |
+| `ruby.module_name` | `ruby_module_name` | string |
+| `ruby.gem_name` | `ruby_gem_name` | string |
+
+### Global section
+
+Options that are not specific to one target live under a `weaveffi`
+section (the alias `global` is also accepted):
+
+| Inline (IDL) | TOML field | Type |
+|--------------|------------|------|
+| `weaveffi.strip_module_prefix` | `strip_module_prefix` | bool |
+| `weaveffi.template_dir` | `template_dir` | string |
+| `weaveffi.pre_generate` | `pre_generate` | string |
+| `weaveffi.post_generate` | `post_generate` | string |
+
+### YAML example
+
+```yaml
+version: "0.3.0"
+modules:
+  - name: math
+    functions:
+      - name: add
+        params:
+          - { name: a, type: i32 }
+          - { name: b, type: i32 }
+        return: i32
+generators:
+  swift:
+    module_name: MyAppFFI
+  android:
+    package: com.example.myapp
+  c:
+    prefix: myapp
+  cpp:
+    namespace: myapp
+    header_name: myapp.hpp
+    standard: "20"
+  dart:
+    package_name: my_dart_pkg
+  go:
+    module_path: github.com/example/myapp
+  ruby:
+    module_name: MyApp
+    gem_name: myapp
+  weaveffi:
+    strip_module_prefix: true
+    pre_generate: "cargo build --release"
+```
+
+Unknown target names (for example a future language target) and
+unknown keys inside a known target are silently ignored, so an older
+`weaveffi` CLI can still read an IDL written for a newer one.

@@ -1936,6 +1936,7 @@ dependencies = [
  "criterion",
  "predicates",
  "quote",
+ "serde",
  "serde_json",
  "serde_yaml",
  "similar",
