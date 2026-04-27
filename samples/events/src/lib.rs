@@ -1,3 +1,6 @@
+//! Events sample cdylib demonstrating module-level callbacks and listeners
+//! over the WeaveFFI C ABI.
+
 #![allow(unsafe_code)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 

@@ -1,3 +1,9 @@
+//! Dart (`dart:ffi`) binding generator for WeaveFFI.
+//!
+//! Emits a Dart package (`pubspec.yaml` + library) with `dart:ffi`
+//! bindings over the C ABI for use in Flutter and Dart projects.
+//! Implements the [`Generator`] trait.
+
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};

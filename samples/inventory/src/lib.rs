@@ -1,3 +1,5 @@
+//! Inventory sample cdylib showcasing maps and lists across the WeaveFFI C ABI.
+
 #![allow(unsafe_code)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 

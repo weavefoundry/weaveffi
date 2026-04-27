@@ -1,3 +1,10 @@
+//! C header and source-file generator for WeaveFFI.
+//!
+//! Emits a single `weaveffi.h` (plus optional helper sources) describing the
+//! stable C ABI surface defined by an [`weaveffi_ir::ir::Api`]. The generator
+//! is invoked through the [`Generator`] trait and is normally driven by
+//! [`weaveffi_core::codegen::Orchestrator`].
+
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;

@@ -1,3 +1,9 @@
+//! WebAssembly binding generator for WeaveFFI.
+//!
+//! Emits a JavaScript loader stub and TypeScript declarations targeting a
+//! `wasm32-unknown-unknown` cdylib build of the same Rust source.
+//! Implements the [`Generator`] trait.
+
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
