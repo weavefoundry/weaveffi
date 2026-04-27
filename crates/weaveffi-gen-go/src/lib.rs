@@ -68,7 +68,6 @@ fn go_type(ty: &TypeRef) -> String {
         },
         TypeRef::List(inner) | TypeRef::Iterator(inner) => format!("[]{}", go_type(inner)),
         TypeRef::Map(k, v) => format!("map[{}]{}", go_type(k), go_type(v)),
-        TypeRef::Callback(_) => "interface{}".into(),
     }
 }
 
@@ -558,10 +557,6 @@ fn emit_param(pre: &mut String, args: &mut Vec<String>, name: &str, ty: &TypeRef
         TypeRef::List(inner) => emit_list_param(pre, args, name, inner, module),
         TypeRef::Map(k, v) => emit_map_param(pre, args, name, k, v, module),
 
-        TypeRef::Callback(_) => {
-            args.push("nil".into());
-            args.push("nil".into());
-        }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
     }
 }
@@ -784,7 +779,6 @@ fn emit_return(out: &mut String, ty: &TypeRef, module: &str) {
             out.push_str("\treturn goResult, nil\n");
         }
         TypeRef::Map(k, v) => emit_map_return(out, k, v),
-        TypeRef::Callback(_) => out.push_str("\treturn nil, nil\n"),
         TypeRef::Iterator(inner) => emit_list_return(out, inner, module),
     }
 }

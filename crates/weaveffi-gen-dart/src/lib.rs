@@ -60,7 +60,6 @@ fn dart_type(ty: &TypeRef) -> String {
         TypeRef::List(inner) => format!("List<{}>", dart_type(inner)),
         TypeRef::Iterator(inner) => format!("Iterable<{}>", dart_type(inner)),
         TypeRef::Map(k, v) => format!("Map<{}, {}>", dart_type(k), dart_type(v)),
-        TypeRef::Callback(_) => "Function".into(),
     }
 }
 
@@ -84,9 +83,7 @@ fn native_ffi_type(ty: &TypeRef) -> String {
         TypeRef::Bytes | TypeRef::BorrowedBytes => "Pointer<Uint8>".into(),
         TypeRef::TypedHandle(_) | TypeRef::Struct(_) => "Pointer<Void>".into(),
         TypeRef::Optional(inner) => native_ffi_type(inner),
-        TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) | TypeRef::Callback(_) => {
-            "Pointer<Void>".into()
-        }
+        TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) => "Pointer<Void>".into(),
     }
 }
 
@@ -103,9 +100,7 @@ fn dart_ffi_type(ty: &TypeRef) -> String {
         TypeRef::Bytes | TypeRef::BorrowedBytes => "Pointer<Uint8>".into(),
         TypeRef::TypedHandle(_) | TypeRef::Struct(_) => "Pointer<Void>".into(),
         TypeRef::Optional(inner) => dart_ffi_type(inner),
-        TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) | TypeRef::Callback(_) => {
-            "Pointer<Void>".into()
-        }
+        TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) => "Pointer<Void>".into(),
     }
 }
 
