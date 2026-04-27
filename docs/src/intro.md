@@ -11,5 +11,14 @@ workflows.
 - Implementation: define your API once; WeaveFFI generates the C ABI contract
   and idiomatic wrappers for each platform.
 
-See the [roadmap](roadmap.md) for high-level milestones and the
-[getting started](getting-started.md) guide to try it.
+## Design principle: standalone generated packages
+
+Generated packages should be fully self-contained and publishable to their
+native ecosystem (npm, CocoaPods, Maven Central, PyPI, NuGet, pub.dev, etc.)
+without requiring consumers to install WeaveFFI tooling, runtimes, or support
+packages. WeaveFFI is a build-time tool for library authors — end users should
+never need to know it exists. Any helper code (error types, memory management
+utilities) is generated inline into each package rather than pulled from a
+shared runtime dependency.
+
+See the [getting started](getting-started.md) guide to try it.

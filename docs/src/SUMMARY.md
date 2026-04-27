@@ -1,7 +1,6 @@
 # Summary
 
 - [Introduction](intro.md)
-- [Roadmap](roadmap.md)
 - [Getting Started](getting-started.md)
 - [Samples](samples.md)
 - [Reference](reference/README.md)
