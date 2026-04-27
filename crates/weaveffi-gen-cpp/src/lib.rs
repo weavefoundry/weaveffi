@@ -112,6 +112,7 @@ impl Generator for CppGenerator {
     fn capabilities(&self) -> &'static [Capability] {
         &[
             Capability::Callbacks,
+            Capability::Listeners,
             Capability::Iterators,
             Capability::Builders,
             Capability::AsyncFunctions,
@@ -4391,20 +4392,17 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_excludes_listeners() {
+    fn capabilities_includes_callbacks_and_listeners() {
         let caps = CppGenerator.capabilities();
         assert!(
             caps.contains(&Capability::Callbacks),
             "C++ generator must advertise Callbacks now that callback codegen is implemented"
         );
         assert!(
-            !caps.contains(&Capability::Listeners),
-            "C++ generator must not advertise Listeners until listener codegen is implemented"
+            caps.contains(&Capability::Listeners),
+            "C++ generator must advertise Listeners now that listener codegen is implemented"
         );
         for cap in Capability::ALL {
-            if matches!(cap, Capability::Listeners) {
-                continue;
-            }
             assert!(caps.contains(cap), "C++ generator must support {cap:?}");
         }
     }

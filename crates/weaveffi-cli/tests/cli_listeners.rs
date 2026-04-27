@@ -31,8 +31,6 @@ modules:
           - { name: text, type: string }
 "#;
 
-// Re-enabled once generators advertise the Callbacks and Listeners capabilities.
-#[ignore = "no generator advertises Callbacks/Listeners yet; reactivate when later phases add the capabilities back"]
 #[test]
 fn listener_register_unregister_emitted_for_all_targets() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");

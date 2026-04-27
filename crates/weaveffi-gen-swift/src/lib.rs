@@ -268,6 +268,7 @@ impl Generator for SwiftGenerator {
     fn capabilities(&self) -> &'static [Capability] {
         &[
             Capability::Callbacks,
+            Capability::Listeners,
             Capability::Iterators,
             Capability::Builders,
             Capability::AsyncFunctions,
@@ -5213,20 +5214,17 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_includes_callbacks_excludes_listeners() {
+    fn capabilities_includes_callbacks_and_listeners() {
         let caps = SwiftGenerator.capabilities();
         assert!(
             caps.contains(&Capability::Callbacks),
             "Swift generator must advertise Callbacks now that callback codegen is implemented"
         );
         assert!(
-            !caps.contains(&Capability::Listeners),
-            "Swift generator must not advertise Listeners until listener codegen is implemented"
+            caps.contains(&Capability::Listeners),
+            "Swift generator must advertise Listeners now that listener codegen is implemented"
         );
         for cap in Capability::ALL {
-            if matches!(cap, Capability::Listeners) {
-                continue;
-            }
             assert!(caps.contains(cap), "Swift generator must support {cap:?}");
         }
     }
