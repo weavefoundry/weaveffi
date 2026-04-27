@@ -74,6 +74,7 @@ impl Generator for GoGenerator {
 
     fn capabilities(&self) -> &'static [Capability] {
         &[
+            Capability::Callbacks,
             Capability::CancellableAsync,
             Capability::TypedHandles,
             Capability::BorrowedTypes,
@@ -4587,11 +4588,11 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_excludes_callbacks_listeners_iterators_builders_async() {
+    fn capabilities_includes_callbacks_excludes_listeners_iterators_builders_async() {
         let caps = GoGenerator.capabilities();
         assert!(
-            !caps.contains(&Capability::Callbacks),
-            "Go generator must not advertise Callbacks until callback codegen is implemented"
+            caps.contains(&Capability::Callbacks),
+            "Go generator must advertise Callbacks now that callback codegen is implemented"
         );
         assert!(
             !caps.contains(&Capability::Listeners),
@@ -4612,8 +4613,7 @@ mod tests {
         for cap in Capability::ALL {
             if matches!(
                 cap,
-                Capability::Callbacks
-                    | Capability::Listeners
+                Capability::Listeners
                     | Capability::AsyncFunctions
                     | Capability::Iterators
                     | Capability::Builders
