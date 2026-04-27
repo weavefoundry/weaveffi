@@ -104,8 +104,11 @@ namespace WeaveFFI
     /// <summary>Task priority levels</summary>
     public enum Priority
     {
+        /// <summary>Low priority</summary>
         Low = 0,
+        /// <summary>Normal priority</summary>
         Normal = 1,
+        /// <summary>High priority</summary>
         High = 2,
     }
 
@@ -122,6 +125,7 @@ namespace WeaveFFI
 
         internal IntPtr Handle => _handle;
 
+        /// <summary>Stable identifier</summary>
         public long Id
         {
             get
@@ -130,6 +134,7 @@ namespace WeaveFFI
             }
         }
 
+        /// <summary>Display name</summary>
         public string Name
         {
             get
@@ -141,6 +146,7 @@ namespace WeaveFFI
             }
         }
 
+        /// <summary>Initial count</summary>
         public int Count
         {
             get
@@ -149,6 +155,7 @@ namespace WeaveFFI
             }
         }
 
+        /// <summary>Whether the item is enabled</summary>
         public bool Enabled
         {
             get
@@ -157,6 +164,7 @@ namespace WeaveFFI
             }
         }
 
+        /// <summary>Scaling ratio</summary>
         public double Ratio
         {
             get
@@ -220,6 +228,7 @@ namespace WeaveFFI
             }
         }
 
+        /// <summary>Cross-module struct reference</summary>
         public Token Token
         {
             get
@@ -252,6 +261,7 @@ namespace WeaveFFI
         }
     }
 
+    /// <summary>Kitchen sink struct exercising every field feature</summary>
     public class ItemBuilder
     {
         private long? _id;
@@ -267,30 +277,35 @@ namespace WeaveFFI
         private Token? _token;
         private Priority? _priority;
 
+        /// <summary>Stable identifier</summary>
         public ItemBuilder WithId(long value)
         {
             _id = value;
             return this;
         }
 
+        /// <summary>Display name</summary>
         public ItemBuilder WithName(string value)
         {
             _name = value;
             return this;
         }
 
+        /// <summary>Initial count</summary>
         public ItemBuilder WithCount(int value)
         {
             _count = value;
             return this;
         }
 
+        /// <summary>Whether the item is enabled</summary>
         public ItemBuilder WithEnabled(bool value)
         {
             _enabled = value;
             return this;
         }
 
+        /// <summary>Scaling ratio</summary>
         public ItemBuilder WithRatio(double value)
         {
             _ratio = value;
@@ -327,6 +342,7 @@ namespace WeaveFFI
             return this;
         }
 
+        /// <summary>Cross-module struct reference</summary>
         public ItemBuilder WithToken(Token value)
         {
             _token = value;
@@ -503,6 +519,7 @@ namespace WeaveFFI
 
     public static class Shared
     {
+        /// <summary>Trivial cross-module helper</summary>
         public static string Ping()
         {
             var err = new WeaveffiError();
@@ -517,6 +534,7 @@ namespace WeaveFFI
 
     public static class Kitchen
     {
+        /// <summary>Identity for bool</summary>
         public static bool BoolId(bool x)
         {
             var err = new WeaveffiError();
@@ -595,6 +613,7 @@ namespace WeaveFFI
             }
         }
 
+        /// <summary>Borrowed string parameter</summary>
         public static string EchoBorrowedStr(string s)
         {
             var err = new WeaveffiError();
@@ -613,6 +632,7 @@ namespace WeaveFFI
             }
         }
 
+        /// <summary>Borrowed bytes parameter</summary>
         public static byte[] EchoBorrowedBytes(byte[] b)
         {
             var err = new WeaveffiError();
@@ -633,6 +653,7 @@ namespace WeaveFFI
             }
         }
 
+        /// <summary>Returns an opaque handle</summary>
         public static ulong OpenHandle()
         {
             var err = new WeaveffiError();
@@ -641,6 +662,7 @@ namespace WeaveFFI
             return result;
         }
 
+        /// <summary>Returns a typed handle</summary>
         public static Token OpenTypedHandle()
         {
             var err = new WeaveffiError();
@@ -649,6 +671,7 @@ namespace WeaveFFI
             return new Token(result);
         }
 
+        /// <summary>Optional struct return</summary>
         public static Item? MaybeItem(long id)
         {
             var err = new WeaveffiError();
@@ -657,6 +680,7 @@ namespace WeaveFFI
             return result == IntPtr.Zero ? null : new Item(result);
         }
 
+        /// <summary>List of structs</summary>
         public static Item[] ListItems()
         {
             var err = new WeaveffiError();
@@ -671,6 +695,7 @@ namespace WeaveFFI
             return arr;
         }
 
+        /// <summary>Map return type</summary>
         public static Dictionary<string, int> GetAttrs()
         {
             var err = new WeaveffiError();
@@ -684,6 +709,7 @@ namespace WeaveFFI
             return dict;
         }
 
+        /// <summary>Iterator return type</summary>
         public static IEnumerable<Item> StreamItems()
         {
             var err = new WeaveffiError();
@@ -698,6 +724,7 @@ namespace WeaveFFI
             return arr;
         }
 
+        /// <summary>Returns the shared Token type from another module</summary>
         public static Token CrossModuleToken()
         {
             var err = new WeaveffiError();
@@ -706,6 +733,7 @@ namespace WeaveFFI
             return new Token(result);
         }
 
+        /// <summary>Async operation</summary>
         public static async Task<string> DoAsync(string input)
         {
             var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -738,6 +766,7 @@ namespace WeaveFFI
             return await tcs.Task;
         }
 
+        /// <summary>Cancellable async operation</summary>
         public static async Task<string> DoCancellable(string input)
         {
             var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -770,6 +799,7 @@ namespace WeaveFFI
             return await tcs.Task;
         }
 
+        /// <summary>Legacy operation kept for compatibility</summary>
         [Obsolete("Use new_op instead")]
         public static int LegacyOp()
         {
@@ -779,6 +809,7 @@ namespace WeaveFFI
             return result;
         }
 
+        /// <summary>Replacement for legacy_op</summary>
         public static int NewOp()
         {
             var err = new WeaveffiError();
@@ -789,6 +820,7 @@ namespace WeaveFFI
 
         public static class Nested
         {
+            /// <summary>Trivial nested-module function</summary>
             public static string Hello()
             {
                 var err = new WeaveffiError();

@@ -7,9 +7,21 @@ class WeaveFFI {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
+        /**
+         * Add two integers
+         */
         @JvmStatic external fun add(a: Int, b: Int): Int
+        /**
+         * Multiply two integers
+         */
         @JvmStatic external fun mul(a: Int, b: Int): Int
+        /**
+         * Divide two integers
+         */
         @JvmStatic external fun div(a: Int, b: Int): Int
+        /**
+         * Echo a string back
+         */
         @JvmStatic external fun echo(s: String): String
     }
 }

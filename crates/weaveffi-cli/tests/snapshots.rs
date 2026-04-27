@@ -140,6 +140,12 @@ snapshot_test!(
     "kitchen_sink",
     "06_kitchen_sink.yml"
 );
+snapshot_test!(
+    snapshot_c_docs_everywhere,
+    CGenerator,
+    "docs_everywhere",
+    "07_docs_everywhere.yml"
+);
 
 snapshot_test!(
     snapshot_cpp_calculator,
@@ -171,6 +177,12 @@ snapshot_test!(
     CppGenerator,
     "kitchen_sink",
     "06_kitchen_sink.yml"
+);
+snapshot_test!(
+    snapshot_cpp_docs_everywhere,
+    CppGenerator,
+    "docs_everywhere",
+    "07_docs_everywhere.yml"
 );
 
 snapshot_test!(
@@ -209,6 +221,12 @@ snapshot_test!(
     "kitchen_sink",
     "06_kitchen_sink.yml"
 );
+snapshot_test!(
+    snapshot_swift_docs_everywhere,
+    SwiftGenerator,
+    "docs_everywhere",
+    "07_docs_everywhere.yml"
+);
 
 snapshot_test!(
     snapshot_android_calculator,
@@ -245,6 +263,12 @@ snapshot_test!(
     AndroidGenerator,
     "kitchen_sink",
     "06_kitchen_sink.yml"
+);
+snapshot_test!(
+    snapshot_android_docs_everywhere,
+    AndroidGenerator,
+    "docs_everywhere",
+    "07_docs_everywhere.yml"
 );
 
 snapshot_test!(
@@ -283,6 +307,12 @@ snapshot_test!(
     "kitchen_sink",
     "06_kitchen_sink.yml"
 );
+snapshot_test!(
+    snapshot_node_docs_everywhere,
+    NodeGenerator,
+    "docs_everywhere",
+    "07_docs_everywhere.yml"
+);
 
 snapshot_test!(
     snapshot_wasm_calculator,
@@ -319,6 +349,12 @@ snapshot_test!(
     WasmGenerator,
     "kitchen_sink",
     "06_kitchen_sink.yml"
+);
+snapshot_test!(
+    snapshot_wasm_docs_everywhere,
+    WasmGenerator,
+    "docs_everywhere",
+    "07_docs_everywhere.yml"
 );
 
 snapshot_test!(
@@ -357,6 +393,12 @@ snapshot_test!(
     "kitchen_sink",
     "06_kitchen_sink.yml"
 );
+snapshot_test!(
+    snapshot_python_docs_everywhere,
+    PythonGenerator,
+    "docs_everywhere",
+    "07_docs_everywhere.yml"
+);
 
 snapshot_test!(
     snapshot_dotnet_calculator,
@@ -393,6 +435,12 @@ snapshot_test!(
     DotnetGenerator,
     "kitchen_sink",
     "06_kitchen_sink.yml"
+);
+snapshot_test!(
+    snapshot_dotnet_docs_everywhere,
+    DotnetGenerator,
+    "docs_everywhere",
+    "07_docs_everywhere.yml"
 );
 
 snapshot_test!(
@@ -431,6 +479,12 @@ snapshot_test!(
     "kitchen_sink",
     "06_kitchen_sink.yml"
 );
+snapshot_test!(
+    snapshot_dart_docs_everywhere,
+    DartGenerator,
+    "docs_everywhere",
+    "07_docs_everywhere.yml"
+);
 
 snapshot_test!(
     snapshot_go_calculator,
@@ -462,6 +516,12 @@ snapshot_test!(
     GoGenerator,
     "kitchen_sink",
     "06_kitchen_sink.yml"
+);
+snapshot_test!(
+    snapshot_go_docs_everywhere,
+    GoGenerator,
+    "docs_everywhere",
+    "07_docs_everywhere.yml"
 );
 
 snapshot_test!(
@@ -499,4 +559,10 @@ snapshot_test!(
     RubyGenerator,
     "kitchen_sink",
     "06_kitchen_sink.yml"
+);
+snapshot_test!(
+    snapshot_ruby_docs_everywhere,
+    RubyGenerator,
+    "docs_everywhere",
+    "07_docs_everywhere.yml"
 );

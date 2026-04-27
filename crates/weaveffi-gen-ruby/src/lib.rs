@@ -273,6 +273,28 @@ fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Mo
 
 // ── Rendering ──
 
+/// Emits a Ruby `# ...` doc comment at `indent`. Each input line is prefixed
+/// with `# `; blank lines become `#`.
+fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
+    let Some(doc) = doc else {
+        return;
+    };
+    let doc = doc.trim();
+    if doc.is_empty() {
+        return;
+    }
+    for line in doc.lines() {
+        out.push_str(indent);
+        if line.is_empty() {
+            out.push_str("#\n");
+        } else {
+            out.push_str("# ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+}
+
 fn render_ruby_module(api: &Api, module_name: &str) -> String {
     let mut out = String::new();
     render_preamble(&mut out, module_name);
@@ -355,8 +377,11 @@ module {module_name}
 }
 
 fn render_enum(out: &mut String, e: &EnumDef) {
-    out.push_str(&format!("\n  module {}\n", e.name));
+    out.push('\n');
+    emit_doc(out, &e.doc, "  ");
+    out.push_str(&format!("  module {}\n", e.name));
     for v in &e.variants {
+        emit_doc(out, &v.doc, "    ");
         out.push_str(&format!(
             "    {} = {}\n",
             v.name.to_shouty_snake_case(),
@@ -368,8 +393,9 @@ fn render_enum(out: &mut String, e: &EnumDef) {
 
 fn render_struct_ffi(out: &mut String, module_name: &str, s: &StructDef) {
     let prefix = format!("weaveffi_{}_{}", module_name, s.name);
+    out.push('\n');
     out.push_str(&format!(
-        "\n  attach_function :{prefix}_destroy, [:pointer], :void\n"
+        "  attach_function :{prefix}_destroy, [:pointer], :void\n"
     ));
     for field in &s.fields {
         let getter = format!("{prefix}_get_{}", field.name);
@@ -380,6 +406,7 @@ fn render_struct_ffi(out: &mut String, module_name: &str, s: &StructDef) {
                 .map(|s| s.to_string()),
         );
         let restype = rb_return_ffi_type(&field.ty);
+        emit_doc(out, &field.doc, "  ");
         out.push_str(&format!(
             "  attach_function :{getter}, [{}], {restype}\n",
             argtypes.join(", ")
@@ -402,6 +429,7 @@ fn render_attach_function(out: &mut String, module_name: &str, f: &Function) {
         .as_ref()
         .map(|ty| rb_return_ffi_type(ty))
         .unwrap_or(":void");
+    emit_doc(out, &f.doc, "  ");
     out.push_str(&format!(
         "  attach_function :{c_sym}, [{}], {restype}\n",
         argtypes.join(", ")
@@ -422,6 +450,7 @@ fn render_struct_class(
     ));
     out.push_str("  end\n\n");
 
+    emit_doc(out, &s.doc, "  ");
     out.push_str(&format!("  class {}\n", s.name));
     out.push_str("    attr_reader :handle\n\n");
     out.push_str(&format!(
@@ -442,7 +471,9 @@ fn render_struct_class(
 
 fn render_ruby_builder_class(out: &mut String, s: &StructDef) {
     let builder = format!("{}Builder", s.name);
-    out.push_str(&format!("\n  class {builder}\n"));
+    out.push('\n');
+    emit_doc(out, &s.doc, "  ");
+    out.push_str(&format!("  class {builder}\n"));
     out.push_str("    def initialize\n");
     for field in &s.fields {
         out.push_str(&format!("      @{} = nil\n", field.name));
@@ -450,6 +481,7 @@ fn render_ruby_builder_class(out: &mut String, s: &StructDef) {
     out.push_str("    end\n\n");
 
     for field in &s.fields {
+        emit_doc(out, &field.doc, "    ");
         out.push_str(&format!(
             "    def with_{}(value)\n      @{} = value\n      self\n    end\n\n",
             field.name, field.name
@@ -474,7 +506,9 @@ fn render_getter(out: &mut String, prefix: &str, field: &StructField, rb_module_
     let getter = format!("{prefix}_get_{}", field.name);
     let ind = "      ";
 
-    out.push_str(&format!("\n    def {}\n", field.name));
+    out.push('\n');
+    emit_doc(out, &field.doc, "    ");
+    out.push_str(&format!("    def {}\n", field.name));
 
     let out_params = rb_return_out_params(&field.ty);
     let is_map = get_map_kv(&field.ty).is_some();
@@ -515,8 +549,33 @@ fn render_function_wrapper(out: &mut String, module_name: &str, f: &Function) {
     let ind = "    ";
 
     let params: Vec<String> = f.params.iter().map(|p| p.name.to_snake_case()).collect();
+    out.push('\n');
+    emit_doc(out, &f.doc, "  ");
+    for p in &f.params {
+        if let Some(pdoc) = &p.doc {
+            let trimmed = pdoc.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let mut lines = trimmed.lines();
+            if let Some(first) = lines.next() {
+                out.push_str(&format!(
+                    "  # @param {} [Object] {}\n",
+                    p.name.to_snake_case(),
+                    first
+                ));
+            }
+            for line in lines {
+                if line.is_empty() {
+                    out.push_str("  #\n");
+                } else {
+                    out.push_str(&format!("  #   {}\n", line));
+                }
+            }
+        }
+    }
     out.push_str(&format!(
-        "\n  def self.{}({})\n",
+        "  def self.{}({})\n",
         func_name,
         params.join(", ")
     ));
@@ -934,11 +993,13 @@ mod tests {
                         name: "a".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "b".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::I32),
@@ -1173,11 +1234,13 @@ mod tests {
                         name: "a".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "b".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::I32),
@@ -1232,6 +1295,7 @@ mod tests {
                     name: "value".into(),
                     ty: TypeRef::Bool,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Bool),
                 doc: None,
@@ -1332,6 +1396,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::I64,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Struct("Item".into())),
                 doc: None,
@@ -1471,6 +1536,7 @@ mod tests {
                     name: "color".into(),
                     ty: TypeRef::Enum("Color".into()),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -1555,6 +1621,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::I64,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct("Item".into())))),
                 doc: None,
@@ -1591,21 +1658,25 @@ mod tests {
                                 name: "first_name".into(),
                                 ty: TypeRef::StringUtf8,
                                 mutable: false,
+                                doc: None,
                             },
                             Param {
                                 name: "last_name".into(),
                                 ty: TypeRef::StringUtf8,
                                 mutable: false,
+                                doc: None,
                             },
                             Param {
                                 name: "email".into(),
                                 ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                                 mutable: false,
+                                doc: None,
                             },
                             Param {
                                 name: "contact_type".into(),
                                 ty: TypeRef::Enum("ContactType".into()),
                                 mutable: false,
+                                doc: None,
                             },
                         ],
                         returns: Some(TypeRef::Handle),
@@ -1621,6 +1692,7 @@ mod tests {
                             name: "id".into(),
                             ty: TypeRef::Handle,
                             mutable: false,
+                            doc: None,
                         }],
                         returns: Some(TypeRef::Struct("Contact".into())),
                         doc: None,
@@ -1645,6 +1717,7 @@ mod tests {
                             name: "id".into(),
                             ty: TypeRef::Handle,
                             mutable: false,
+                            doc: None,
                         }],
                         returns: Some(TypeRef::Bool),
                         doc: None,
@@ -1742,11 +1815,13 @@ mod tests {
                         name: "a".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "b".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::I32),
@@ -1785,6 +1860,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::Handle,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -1851,6 +1927,7 @@ mod tests {
                     name: "ct".into(),
                     ty: TypeRef::Enum("ContactType".into()),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Enum("ContactType".into())),
                 doc: None,
@@ -1913,6 +1990,7 @@ mod tests {
                         name: "id".into(),
                         ty: TypeRef::I64,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
                     doc: None,
@@ -1927,6 +2005,7 @@ mod tests {
                         name: "key".into(),
                         ty: TypeRef::Optional(Box::new(TypeRef::I32)),
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Optional(Box::new(TypeRef::I32))),
                     doc: None,
@@ -1977,6 +2056,7 @@ mod tests {
                         name: "names".into(),
                         ty: TypeRef::List(Box::new(TypeRef::StringUtf8)),
                         mutable: false,
+                        doc: None,
                     }],
                     returns: None,
                     doc: None,
@@ -2064,11 +2144,13 @@ mod tests {
                         name: "a".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "b".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::I32),
@@ -2134,6 +2216,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -2188,6 +2271,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::I64,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                     "Contact".into(),
@@ -2225,5 +2309,81 @@ mod tests {
             null_check < contact_wrap,
             "optional struct return should check nil before wrapping: {fn_text}"
         );
+    }
+
+    fn doc_api() -> Api {
+        make_api(vec![Module {
+            name: "docs".into(),
+            functions: vec![Function {
+                name: "do_thing".into(),
+                params: vec![Param {
+                    name: "x".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: Some("the input value".into()),
+                }],
+                returns: Some(TypeRef::I32),
+                doc: Some("Performs a thing.".into()),
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![StructDef {
+                name: "Item".into(),
+                doc: Some("An item we track.".into()),
+                fields: vec![StructField {
+                    name: "id".into(),
+                    ty: TypeRef::I64,
+                    doc: Some("Stable id".into()),
+                    default: None,
+                }],
+                builder: false,
+            }],
+            enums: vec![EnumDef {
+                name: "Kind".into(),
+                doc: Some("Kind of item.".into()),
+                variants: vec![EnumVariant {
+                    name: "Small".into(),
+                    value: 0,
+                    doc: Some("A small one".into()),
+                }],
+            }],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }])
+    }
+
+    #[test]
+    fn ruby_emits_doc_on_function() {
+        let rb = render_ruby_module(&doc_api(), "Weaveffi");
+        assert!(rb.contains("# Performs a thing."), "{rb}");
+    }
+
+    #[test]
+    fn ruby_emits_doc_on_struct() {
+        let rb = render_ruby_module(&doc_api(), "Weaveffi");
+        assert!(rb.contains("# An item we track."), "{rb}");
+    }
+
+    #[test]
+    fn ruby_emits_doc_on_enum_variant() {
+        let rb = render_ruby_module(&doc_api(), "Weaveffi");
+        assert!(rb.contains("# Kind of item."), "{rb}");
+        assert!(rb.contains("# A small one"), "{rb}");
+    }
+
+    #[test]
+    fn ruby_emits_doc_on_field() {
+        let rb = render_ruby_module(&doc_api(), "Weaveffi");
+        assert!(rb.contains("# Stable id"), "{rb}");
+    }
+
+    #[test]
+    fn ruby_emits_doc_on_param() {
+        let rb = render_ruby_module(&doc_api(), "Weaveffi");
+        assert!(rb.contains("# @param x [Object] the input value"), "{rb}");
     }
 }

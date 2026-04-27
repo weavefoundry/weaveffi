@@ -7,7 +7,13 @@ class WeaveFFI {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
+        /**
+         * Send a message, triggering the OnMessage callback
+         */
         @JvmStatic external fun send_message(text: String): Unit
+        /**
+         * Return an iterator over all sent messages
+         */
         @JvmStatic external fun get_messages(): Iterator<String>
     }
 }

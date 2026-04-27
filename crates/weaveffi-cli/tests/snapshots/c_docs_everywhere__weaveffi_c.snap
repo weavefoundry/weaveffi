@@ -1,0 +1,6 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+#include "weaveffi.h"
+
+// Optional convenience wrappers can be added here in future versions.

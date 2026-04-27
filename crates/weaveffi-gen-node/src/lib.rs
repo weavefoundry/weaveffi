@@ -1044,12 +1044,108 @@ fn ts_type_for(ty: &TypeRef) -> String {
     }
 }
 
+/// Emits a JSDoc comment at `indent`. Single-line docs collapse to
+/// `/** text */`; multi-line docs expand to a block with ` * ` prefixed lines.
+fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
+    let Some(doc) = doc else {
+        return;
+    };
+    let doc = doc.trim();
+    if doc.is_empty() {
+        return;
+    }
+    if doc.contains('\n') {
+        out.push_str(indent);
+        out.push_str("/**\n");
+        for line in doc.lines() {
+            out.push_str(indent);
+            if line.is_empty() {
+                out.push_str(" *\n");
+            } else {
+                out.push_str(" * ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out.push_str(indent);
+        out.push_str(" */\n");
+    } else {
+        out.push_str(indent);
+        out.push_str("/** ");
+        out.push_str(doc);
+        out.push_str(" */\n");
+    }
+}
+
+/// Emits a JSDoc block for a function: function doc, `@param name desc` for
+/// each documented parameter, and an optional trailing tag list.
+fn emit_fn_doc(
+    out: &mut String,
+    doc: &Option<String>,
+    params: &[weaveffi_ir::ir::Param],
+    indent: &str,
+    extra_tags: &[String],
+) {
+    let has_param_docs = params.iter().any(|p| p.doc.is_some());
+    let trimmed_doc = doc.as_ref().map(|d| d.trim()).filter(|d| !d.is_empty());
+    if trimmed_doc.is_none() && !has_param_docs && extra_tags.is_empty() {
+        return;
+    }
+    out.push_str(indent);
+    out.push_str("/**\n");
+    if let Some(d) = trimmed_doc {
+        for line in d.lines() {
+            out.push_str(indent);
+            if line.is_empty() {
+                out.push_str(" *\n");
+            } else {
+                out.push_str(" * ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    for p in params {
+        if let Some(pdoc) = &p.doc {
+            let pdoc = pdoc.trim();
+            if pdoc.is_empty() {
+                continue;
+            }
+            let mut lines = pdoc.lines();
+            if let Some(first) = lines.next() {
+                out.push_str(indent);
+                out.push_str(&format!(" * @param {} {}\n", p.name, first));
+            }
+            for line in lines {
+                out.push_str(indent);
+                if line.is_empty() {
+                    out.push_str(" *\n");
+                } else {
+                    out.push_str(" *   ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    for tag in extra_tags {
+        out.push_str(indent);
+        out.push_str(" * ");
+        out.push_str(tag);
+        out.push('\n');
+    }
+    out.push_str(indent);
+    out.push_str(" */\n");
+}
+
 fn render_struct_builder_dts(out: &mut String, s: &StructDef) {
     let name = &s.name;
+    emit_doc(out, &s.doc, "");
     out.push_str(&format!("export interface {}Builder {{\n", s.name));
     for field in &s.fields {
         let method = format!("with{}", field.name.to_upper_camel_case());
         let ts = ts_type_for(&field.ty);
+        emit_doc(out, &field.doc, "  ");
         out.push_str(&format!("  {method}(value: {ts}): {name}Builder;\n"));
     }
     out.push_str(&format!("  build(): {name};\n"));
@@ -1060,8 +1156,10 @@ fn render_node_dts(api: &Api, strip_module_prefix: bool) -> String {
     let mut out = String::from("// Generated types for WeaveFFI functions\n");
     for (m, path) in collect_modules_with_path(&api.modules) {
         for s in &m.structs {
+            emit_doc(&mut out, &s.doc, "");
             out.push_str(&format!("export interface {} {{\n", s.name));
             for field in &s.fields {
+                emit_doc(&mut out, &field.doc, "  ");
                 out.push_str(&format!("  {}: {};\n", field.name, ts_type_for(&field.ty)));
             }
             out.push_str("}\n");
@@ -1070,8 +1168,10 @@ fn render_node_dts(api: &Api, strip_module_prefix: bool) -> String {
             }
         }
         for e in &m.enums {
+            emit_doc(&mut out, &e.doc, "");
             out.push_str(&format!("export enum {} {{\n", e.name));
             for v in &e.variants {
+                emit_doc(&mut out, &v.doc, "  ");
                 out.push_str(&format!("  {} = {},\n", v.name, v.value));
             }
             out.push_str("}\n");
@@ -1093,13 +1193,11 @@ fn render_node_dts(api: &Api, strip_module_prefix: bool) -> String {
                 base_ret
             };
             let ts_name = wrapper_name(&path, &f.name, strip_module_prefix);
-            out.push_str(&format!(
-                "/** Maps to C function: weaveffi_{}_{} */\n",
-                path, f.name
-            ));
+            let mut tags = vec![format!("Maps to C function: weaveffi_{}_{}", path, f.name)];
             if let Some(msg) = &f.deprecated {
-                out.push_str(&format!("/** @deprecated {} */\n", msg));
+                tags.push(format!("@deprecated {}", msg));
             }
+            emit_fn_doc(&mut out, &f.doc, &f.params, "", &tags);
             out.push_str(&format!(
                 "export function {}({}): {}\n",
                 ts_name,
@@ -1238,6 +1336,7 @@ mod tests {
                 name: "id".into(),
                 ty: TypeRef::I32,
                 mutable: false,
+                doc: None,
             }],
             returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                 "Contact".into(),
@@ -1293,11 +1392,13 @@ mod tests {
                         name: "a".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "b".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::I32),
@@ -1362,6 +1463,7 @@ mod tests {
                         name: "id".to_string(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                         "Contact".into(),
@@ -1389,11 +1491,13 @@ mod tests {
                             name: "contact_id".to_string(),
                             ty: TypeRef::I32,
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "color".to_string(),
                             ty: TypeRef::Optional(Box::new(TypeRef::Enum("Color".into()))),
                             mutable: false,
+                            doc: None,
                         },
                     ],
                     returns: None,
@@ -1409,6 +1513,7 @@ mod tests {
                         name: "contact_id".to_string(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
                     doc: None,
@@ -1573,11 +1678,13 @@ mod tests {
                         name: "a".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "b".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::I32),
@@ -1594,11 +1701,13 @@ mod tests {
                         name: "a".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "b".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::I32),
@@ -1614,13 +1723,11 @@ mod tests {
         let dts = render_node_dts(&api, true);
 
         assert!(
-            dts.contains("/** Maps to C function: weaveffi_math_add */\nexport function add("),
+            dts.contains("Maps to C function: weaveffi_math_add"),
             "missing JSDoc for add: {dts}"
         );
         assert!(
-            dts.contains(
-                "/** Maps to C function: weaveffi_math_subtract */\nexport function subtract("
-            ),
+            dts.contains("Maps to C function: weaveffi_math_subtract"),
             "missing JSDoc for subtract: {dts}"
         );
     }
@@ -1636,11 +1743,13 @@ mod tests {
                         name: "a".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "b".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::I32),
@@ -1670,11 +1779,13 @@ mod tests {
                         name: "a".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "b".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::I32),
@@ -1703,6 +1814,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::StringUtf8),
                 doc: None,
@@ -1743,11 +1855,13 @@ mod tests {
                         name: "a".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "b".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::I32),
@@ -1776,6 +1890,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -1862,6 +1977,7 @@ mod tests {
                     name: "contact".into(),
                     ty: TypeRef::TypedHandle("Contact".into()),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -1891,6 +2007,7 @@ mod tests {
                         Box::new(TypeRef::Struct("Contact".into())),
                     ))))),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -1936,6 +2053,7 @@ mod tests {
                         Box::new(TypeRef::List(Box::new(TypeRef::I32))),
                     ),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -1971,6 +2089,7 @@ mod tests {
                         Box::new(TypeRef::Struct("Contact".into())),
                     ),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -2044,6 +2163,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -2108,6 +2228,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                     "Contact".into(),
@@ -2141,6 +2262,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::StringUtf8),
                 doc: None,
@@ -2186,6 +2308,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -2221,5 +2344,81 @@ mod tests {
             addon.contains("weaveffi_tasks_run_napi_cb"),
             "async addon should define the callback: {addon}"
         );
+    }
+
+    fn doc_module() -> Module {
+        Module {
+            name: "docs".into(),
+            functions: vec![Function {
+                name: "do_thing".into(),
+                params: vec![Param {
+                    name: "x".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: Some("the input value".into()),
+                }],
+                returns: Some(TypeRef::I32),
+                doc: Some("Performs a thing.".into()),
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![StructDef {
+                name: "Item".into(),
+                doc: Some("An item we track.".into()),
+                fields: vec![StructField {
+                    name: "id".into(),
+                    ty: TypeRef::I64,
+                    doc: Some("Stable id".into()),
+                    default: None,
+                }],
+                builder: false,
+            }],
+            enums: vec![EnumDef {
+                name: "Kind".into(),
+                doc: Some("Kind of item.".into()),
+                variants: vec![EnumVariant {
+                    name: "Small".into(),
+                    value: 0,
+                    doc: Some("A small one".into()),
+                }],
+            }],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }
+    }
+
+    #[test]
+    fn node_emits_doc_on_function() {
+        let dts = render_node_dts(&make_api(vec![doc_module()]), true);
+        assert!(dts.contains("Performs a thing."), "{dts}");
+    }
+
+    #[test]
+    fn node_emits_doc_on_struct() {
+        let dts = render_node_dts(&make_api(vec![doc_module()]), true);
+        assert!(dts.contains("/** An item we track. */"), "{dts}");
+    }
+
+    #[test]
+    fn node_emits_doc_on_enum_variant() {
+        let dts = render_node_dts(&make_api(vec![doc_module()]), true);
+        assert!(dts.contains("/** Kind of item. */"), "{dts}");
+        assert!(dts.contains("/** A small one */"), "{dts}");
+    }
+
+    #[test]
+    fn node_emits_doc_on_field() {
+        let dts = render_node_dts(&make_api(vec![doc_module()]), true);
+        assert!(dts.contains("/** Stable id */"), "{dts}");
+    }
+
+    #[test]
+    fn node_emits_doc_on_param() {
+        let dts = render_node_dts(&make_api(vec![doc_module()]), true);
+        assert!(dts.contains("@param x the input value"), "{dts}");
     }
 }

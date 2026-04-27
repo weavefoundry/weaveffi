@@ -6,9 +6,15 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 export interface WeaveffiWasmModule {
   _raw: WebAssembly.Exports;
   events: {
-    /** @throws {Error} if the native call fails */
+    /**
+     * Send a message, triggering the OnMessage callback
+     * @throws {Error} if the native call fails
+     */
     send_message(text: string): void;
-    /** @throws {Error} if the native call fails */
+    /**
+     * Return an iterator over all sent messages
+     * @throws {Error} if the native call fails
+     */
     get_messages(): string[];
   };
 }

@@ -35,9 +35,13 @@ void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
  */
 
 // Module: calculator
+/** Add two integers */
 int32_t weaveffi_calculator_add(int32_t a, int32_t b, weaveffi_error* out_err);
+/** Multiply two integers */
 int32_t weaveffi_calculator_mul(int32_t a, int32_t b, weaveffi_error* out_err);
+/** Divide two integers */
 int32_t weaveffi_calculator_div(int32_t a, int32_t b, weaveffi_error* out_err);
+/** Echo a string back */
 const char* weaveffi_calculator_echo(const char* s, weaveffi_error* out_err);
 
 

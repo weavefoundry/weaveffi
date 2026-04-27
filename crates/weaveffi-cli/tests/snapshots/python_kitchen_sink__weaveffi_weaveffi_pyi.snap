@@ -4,28 +4,40 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 from enum import IntEnum
 from typing import Dict, Iterator, List, Optional
 
+# A reusable token referenced across modules
 class Token:
     @property
     def id(self) -> int: ...
     @property
     def label(self) -> str: ...
 
+# Trivial cross-module helper
 def ping() -> str: ...
 
+# Task priority levels
 class Priority(IntEnum):
+    # Low priority
     Low: int
+    # Normal priority
     Normal: int
+    # High priority
     High: int
 
+# Kitchen sink struct exercising every field feature
 class Item:
+    # Stable identifier
     @property
     def id(self) -> int: ...
+    # Display name
     @property
     def name(self) -> str: ...
+    # Initial count
     @property
     def count(self) -> int: ...
+    # Whether the item is enabled
     @property
     def enabled(self) -> bool: ...
+    # Scaling ratio
     @property
     def ratio(self) -> float: ...
     @property
@@ -38,11 +50,13 @@ class Item:
     def attrs(self) -> Dict[str, str]: ...
     @property
     def parent(self) -> Optional[int]: ...
+    # Cross-module struct reference
     @property
     def token(self) -> "Token": ...
     @property
     def priority(self) -> "Priority": ...
 
+# Identity for bool
 def bool_id(x: bool) -> bool: ...
 
 def i32_id(x: int) -> int: ...
@@ -57,30 +71,44 @@ def echo_string(s: str) -> str: ...
 
 def echo_bytes(b: bytes) -> bytes: ...
 
+# Borrowed string parameter
 def echo_borrowed_str(s: str) -> str: ...
 
+# Borrowed bytes parameter
 def echo_borrowed_bytes(b: bytes) -> bytes: ...
 
+# Returns an opaque handle
 def open_handle() -> int: ...
 
+# Returns a typed handle
 def open_typed_handle() -> "Token": ...
 
+# Optional struct return
 def maybe_item(id: int) -> Optional["Item"]: ...
 
+# List of structs
 def list_items() -> List["Item"]: ...
 
+# Map return type
 def get_attrs() -> Dict[str, int]: ...
 
+# Iterator return type
 def stream_items() -> Iterator["Item"]: ...
 
+# Returns the shared Token type from another module
 def cross_module_token() -> "Token": ...
 
+# Async operation
 async def do_async(input: str) -> str: ...
 
+# Cancellable async operation
 async def do_cancellable(input: str) -> str: ...
 
+# Legacy operation kept for compatibility
 def legacy_op() -> int: ...
 
+# Replacement for legacy_op
 def new_op() -> int: ...
 
+# Trivial nested-module function
 def hello() -> str: ...

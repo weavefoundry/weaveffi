@@ -1,0 +1,111 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+#ifndef WEAVEFFI_H
+#define WEAVEFFI_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef uint64_t weaveffi_handle_t;
+
+typedef struct weaveffi_error { int32_t code; const char* message; } weaveffi_error;
+
+void weaveffi_error_clear(weaveffi_error* err);
+void weaveffi_free_string(const char* ptr);
+void weaveffi_free_bytes(uint8_t* ptr, size_t len);
+
+typedef struct weaveffi_cancel_token weaveffi_cancel_token;
+weaveffi_cancel_token* weaveffi_cancel_token_create(void);
+void weaveffi_cancel_token_cancel(weaveffi_cancel_token* token);
+bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token* token);
+void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
+
+/*
+ * Map convention: Maps are passed as parallel arrays of keys and values.
+ * A map parameter {K:V} named "m" expands to:
+ *   const K* m_keys, const V* m_values, size_t m_len
+ * A map return value expands to out-parameters:
+ *   K* out_keys, V* out_values, size_t* out_len
+ */
+
+// Module: docs
+/**
+ * Lifecycle status of a document.
+ *
+ * Used to drive UI badges and filters.
+ */
+typedef enum {
+    /** Document is being edited */
+    weaveffi_docs_Status_Draft = 0,
+    /** Document is publicly visible */
+    weaveffi_docs_Status_Published = 1,
+    /** Document is hidden from listings */
+    weaveffi_docs_Status_Archived = 2
+} weaveffi_docs_Status;
+/**
+ * Represents a single document tracked by the system.
+ *
+ * Documents are persisted to disk and exposed via the public API.
+ */
+typedef struct weaveffi_docs_Document weaveffi_docs_Document;
+weaveffi_docs_Document* weaveffi_docs_Document_create(int64_t id, const char* title, weaveffi_docs_Status status, const char* const* tags, size_t tags_len, weaveffi_error* out_err);
+void weaveffi_docs_Document_destroy(weaveffi_docs_Document* ptr);
+/** Stable opaque identifier */
+int64_t weaveffi_docs_Document_get_id(const weaveffi_docs_Document* ptr);
+/** Human-readable title shown in lists */
+const char* weaveffi_docs_Document_get_title(const weaveffi_docs_Document* ptr);
+/** Current lifecycle status */
+weaveffi_docs_Status weaveffi_docs_Document_get_status(const weaveffi_docs_Document* ptr);
+/** Free-form tags for grouping */
+const char** weaveffi_docs_Document_get_tags(const weaveffi_docs_Document* ptr, size_t* out_len);
+
+typedef struct weaveffi_docs_DocumentBuilder weaveffi_docs_DocumentBuilder;
+weaveffi_docs_DocumentBuilder* weaveffi_docs_Document_Builder_new(void);
+/** Stable opaque identifier */
+void weaveffi_docs_Document_Builder_set_id(weaveffi_docs_DocumentBuilder* builder, int64_t value);
+/** Human-readable title shown in lists */
+void weaveffi_docs_Document_Builder_set_title(weaveffi_docs_DocumentBuilder* builder, const char* value);
+/** Current lifecycle status */
+void weaveffi_docs_Document_Builder_set_status(weaveffi_docs_DocumentBuilder* builder, weaveffi_docs_Status value);
+/** Free-form tags for grouping */
+void weaveffi_docs_Document_Builder_set_tags(weaveffi_docs_DocumentBuilder* builder, const char* const* value, size_t value_len);
+weaveffi_docs_Document* weaveffi_docs_Document_Builder_build(weaveffi_docs_DocumentBuilder* builder, weaveffi_error* out_err);
+void weaveffi_docs_Document_Builder_destroy(weaveffi_docs_DocumentBuilder* builder);
+
+/** Fires after a document has been persisted successfully */
+typedef void (*weaveffi_docs_OnSaved_fn)(int64_t doc_id, int32_t revision, void* context);
+/** Subscribe to document-saved notifications */
+uint64_t weaveffi_docs_register_saved_listener(weaveffi_docs_OnSaved_fn callback, void* context);
+/** Subscribe to document-saved notifications */
+void weaveffi_docs_unregister_saved_listener(uint64_t id);
+/**
+ * Create a brand new document.
+ *
+ * The document starts in `Draft` status; callers must publish
+ * it explicitly to make it visible.
+ */
+weaveffi_docs_Document* weaveffi_docs_create_document(const char* title, const char* const* tags, size_t tags_len, weaveffi_error* out_err);
+/** Look up a document by identifier */
+weaveffi_docs_Document* weaveffi_docs_get_document(int64_t id, weaveffi_error* out_err);
+/** Publish a document in the background */
+typedef void (*weaveffi_docs_publish_async_callback)(void* context, weaveffi_error* err, bool result);
+/*
+ * Async: weaveffi_docs_publish_async
+ * The callback is called exactly once, on any thread.
+ * On success, err is NULL and result (if any) is valid.
+ * On failure, err is non-NULL with a non-zero code.
+ */
+void weaveffi_docs_publish_async_async(int64_t id, weaveffi_docs_publish_async_callback callback, void* context);
+
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // WEAVEFFI_H

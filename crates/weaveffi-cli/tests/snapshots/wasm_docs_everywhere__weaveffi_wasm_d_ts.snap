@@ -1,0 +1,64 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+// Generated TypeScript declarations for WeaveFFI WASM bindings
+
+/**
+ * Represents a single document tracked by the system.
+ *
+ * Documents are persisted to disk and exposed via the public API.
+ */
+export interface Document {
+  /** Stable opaque identifier */
+  readonly id: number;
+  /** Human-readable title shown in lists */
+  readonly title: string;
+  /** Current lifecycle status */
+  readonly status: Status;
+  /** Free-form tags for grouping */
+  readonly tags: string[];
+}
+
+/**
+ * Lifecycle status of a document.
+ *
+ * Used to drive UI badges and filters.
+ */
+export declare const Status: Readonly<{
+  /** Document is being edited */
+  Draft: 0;
+  /** Document is publicly visible */
+  Published: 1;
+  /** Document is hidden from listings */
+  Archived: 2;
+}>;
+
+export interface WeaveffiWasmModule {
+  _raw: WebAssembly.Exports;
+  docs: {
+    /**
+     * Create a brand new document.
+     *
+     * The document starts in `Draft` status; callers must publish
+     * it explicitly to make it visible.
+     * @param title Human-readable title for the new document
+     * @param tags Initial set of tags (may be empty)
+     * @throws {Error} if the native call fails
+     */
+    create_document(title: string, tags: string[]): Document;
+    /**
+     * Look up a document by identifier
+     * @param id Identifier returned from create_document
+     * @throws {Error} if the native call fails
+     */
+    get_document(id: number): Document | null;
+    /**
+     * Publish a document in the background
+     * @param id Identifier of the document to publish
+     * @throws {Error} if the native call fails
+     */
+    publish_async(id: number): Promise<boolean>;
+  };
+}
+
+export function loadWeaveffiWasm(url: string): Promise<WeaveffiWasmModule>;

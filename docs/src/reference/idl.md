@@ -77,6 +77,7 @@ generators:
 | `name`    | string  | yes      | Parameter name                           |
 | `type`    | TypeRef | yes      | Parameter type                           |
 | `mutable` | bool    | no       | Mark as mutable (default `false`). Indicates the callee may modify the value in-place. |
+| `doc`     | string  | no       | Documentation string (see [Documentation comments](#documentation-comments)) |
 
 ---
 
@@ -905,3 +906,60 @@ errors:
 
 Error codes must be non-zero and unique. Error domain names must not collide
 with function names in the same module.
+
+## Documentation comments
+
+Every IR element accepts an optional `doc:` field. WeaveFFI propagates that
+text into the generated bindings using each language's native doc-comment
+syntax. Multi-line strings (use YAML's `|` block form) are preserved across
+the boundary; single-line strings collapse to a one-liner where the target
+syntax allows.
+
+Supported sites:
+
+- `Function.doc`, `Param.doc`
+- `StructDef.doc`, `StructField.doc`
+- `EnumDef.doc`, `EnumVariant.doc`
+- `CallbackDef.doc`, `ListenerDef.doc`
+- `ErrorCode.doc`
+
+Per-target syntax:
+
+| Target              | Comment syntax                                    | Param docs                              |
+|---------------------|---------------------------------------------------|-----------------------------------------|
+| C / C++             | `/** ... */` directly above the declaration       | not emitted                             |
+| Swift               | `/// ...` per line                                | `/// - Parameter name: ...`             |
+| Kotlin / Android    | `/** ... */` KDoc block                           | `@param name ...` inside the KDoc block |
+| TypeScript (Node)   | `/** ... */` JSDoc                                | `@param name ...`                       |
+| TypeScript (WASM)   | `/** ... */` JSDoc                                | `@param name ...`                       |
+| Python              | `"""..."""` first statement; `# ...` above C ABI binds | NumPy-style `Parameters` section in the wrapper docstring |
+| .NET (C#)           | `/// <summary>...</summary>` XML doc              | `/// <param name="name">...</param>`    |
+| Dart                | `/// ...`                                         | not emitted                             |
+| Go                  | `// SymbolName ...` per Go's convention           | trailing `// Parameters:` block         |
+| Ruby                | `# ...` lines above the `def`                     | `# @param name [Object] ...`            |
+
+Example IDL:
+
+```yaml
+modules:
+  - name: docs
+    structs:
+      - name: Document
+        doc: |
+          Represents a single document tracked by the system.
+
+          Documents are persisted to disk and exposed via the public API.
+        fields:
+          - { name: id, type: i64, doc: Stable opaque identifier }
+          - { name: title, type: string, doc: Human-readable title }
+    functions:
+      - name: create_document
+        doc: Create a brand new document
+        params:
+          - { name: title, type: string, doc: Human-readable title }
+        return: Document
+```
+
+All eleven generators emit `emit_doc` calls before every documented
+declaration; absent or empty `doc:` fields produce no extra output, so the
+feature is fully opt-in.

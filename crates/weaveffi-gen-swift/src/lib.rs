@@ -101,6 +101,65 @@ impl Generator for SwiftGenerator {
     }
 }
 
+/// Emits a `///`-prefixed Swift doc comment at `indent`. Each line of the
+/// (possibly multi-line) doc gets its own `///` prefix.
+fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
+    let Some(doc) = doc else {
+        return;
+    };
+    let doc = doc.trim();
+    if doc.is_empty() {
+        return;
+    }
+    for line in doc.lines() {
+        out.push_str(indent);
+        if line.is_empty() {
+            out.push_str("///\n");
+        } else {
+            out.push_str("/// ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+}
+
+/// Emits Swift doc comments for a function: the function's own doc followed by
+/// `/// - Parameter name: ...` lines for each documented parameter.
+fn emit_fn_doc(out: &mut String, doc: &Option<String>, params: &[Param], indent: &str) {
+    let has_param_docs = params.iter().any(|p| p.doc.is_some());
+    if doc.is_none() && !has_param_docs {
+        return;
+    }
+    emit_doc(out, doc, indent);
+    for p in params {
+        if let Some(pdoc) = &p.doc {
+            let pdoc = pdoc.trim();
+            if pdoc.is_empty() {
+                continue;
+            }
+            let mut lines = pdoc.lines();
+            if let Some(first) = lines.next() {
+                out.push_str(indent);
+                out.push_str(&format!(
+                    "/// - Parameter {}: {}\n",
+                    p.name.to_lower_camel_case(),
+                    first
+                ));
+            }
+            for line in lines {
+                out.push_str(indent);
+                if line.is_empty() {
+                    out.push_str("///\n");
+                } else {
+                    out.push_str("///   ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+}
+
 fn swift_type_for(t: &TypeRef) -> String {
     match t {
         TypeRef::I32 => "Int32".to_string(),
@@ -151,8 +210,10 @@ fn has_buffer_params(params: &[Param]) -> bool {
 }
 
 fn render_swift_enum(out: &mut String, e: &EnumDef) {
+    emit_doc(out, &e.doc, "");
     out.push_str(&format!("public enum {}: Int32 {{\n", e.name));
     for v in &e.variants {
+        emit_doc(out, &v.doc, "    ");
         out.push_str(&format!(
             "    case {} = {}\n",
             v.name.to_lower_camel_case(),
@@ -176,6 +237,7 @@ fn render_swift_wrapper(api: &Api, strip_module_prefix: bool) -> String {
     out.push_str("public enum WeaveFFIError: Error, LocalizedError {\n");
     out.push_str("    case error(code: Int32, message: String)\n");
     for ec in &error_codes {
+        emit_doc(&mut out, &ec.doc, "    ");
         out.push_str(&format!("    case {}\n", ec.name.to_lower_camel_case()));
     }
     out.push_str("    public var errorDescription: String? {\n");
@@ -318,6 +380,7 @@ fn render_swift_module_body(
 fn render_swift_struct(out: &mut String, module_name: &str, s: &StructDef) {
     let prefix = format!("weaveffi_{}_{}", module_name, s.name);
 
+    emit_doc(out, &s.doc, "");
     out.push_str(&format!("public class {} {{\n", s.name));
     out.push_str("    let ptr: OpaquePointer\n\n");
     out.push_str("    init(ptr: OpaquePointer) {\n");
@@ -342,6 +405,7 @@ fn struct_fields_as_params(fields: &[StructField]) -> Vec<Param> {
             name: f.name.clone(),
             ty: f.ty.clone(),
             mutable: false,
+            doc: f.doc.clone(),
         })
         .collect()
 }
@@ -351,6 +415,7 @@ fn render_swift_builder(out: &mut String, module_name: &str, s: &StructDef) {
     let class_name = local_type_name(&s.name);
     let builder_name = format!("{class_name}Builder");
 
+    emit_doc(out, &s.doc, "");
     out.push_str(&format!("public class {} {{\n", builder_name));
     for field in &s.fields {
         let swift_ty = swift_type_for(&field.ty);
@@ -361,6 +426,7 @@ fn render_swift_builder(out: &mut String, module_name: &str, s: &StructDef) {
     for field in &s.fields {
         let pascal = field.name.to_upper_camel_case();
         let swift_ty = swift_type_for(&field.ty);
+        emit_doc(out, &field.doc, "    ");
         out.push_str("    @discardableResult\n");
         out.push_str(&format!(
             "    public func with{}(_ value: {}) -> Self {{\n        self._{} = value\n        return self\n    }}\n\n",
@@ -408,10 +474,9 @@ fn render_swift_getter(out: &mut String, prefix: &str, field: &StructField) {
     let getter = format!("{}_get_{}", prefix, field.name);
     let swift_ty = swift_type_for(&field.ty);
 
-    out.push_str(&format!(
-        "\n    public var {}: {} {{\n",
-        field.name, swift_ty
-    ));
+    out.push('\n');
+    emit_doc(out, &field.doc, "    ");
+    out.push_str(&format!("    public var {}: {} {{\n", field.name, swift_ty));
 
     match &field.ty {
         TypeRef::StringUtf8 => {
@@ -517,6 +582,7 @@ fn render_swift_function(
     f: &Function,
     strip_module_prefix: bool,
 ) {
+    emit_fn_doc(out, &f.doc, &f.params, "    ");
     if let Some(msg) = &f.deprecated {
         out.push_str(&format!(
             "    @available(*, deprecated, message: \"{}\")\n",
@@ -565,6 +631,7 @@ fn render_swift_async_function(
     f: &Function,
     strip_module_prefix: bool,
 ) {
+    emit_fn_doc(out, &f.doc, &f.params, "    ");
     if let Some(msg) = &f.deprecated {
         out.push_str(&format!(
             "    @available(*, deprecated, message: \"{}\")\n",
@@ -2250,6 +2317,7 @@ mod tests {
                     name: "a".to_string(),
                     ty: TypeRef::Enum("Color".into()),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Enum("Color".into())),
                 doc: None,
@@ -2292,6 +2360,7 @@ mod tests {
                     name: "id".to_string(),
                     ty: TypeRef::Optional(Box::new(TypeRef::I32)),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -2330,6 +2399,7 @@ mod tests {
                     name: "person".to_string(),
                     ty: TypeRef::Optional(Box::new(TypeRef::Struct("Contact".into()))),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -2367,6 +2437,7 @@ mod tests {
                     name: "key".to_string(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::I32))),
                 doc: None,
@@ -2441,6 +2512,7 @@ mod tests {
                     name: "ids".to_string(),
                     ty: TypeRef::List(Box::new(TypeRef::I32)),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -2518,6 +2590,7 @@ mod tests {
                     name: "id".to_string(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                     "Contact".into(),
@@ -2704,6 +2777,7 @@ mod tests {
                     name: "age".to_string(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -2741,6 +2815,7 @@ mod tests {
                     name: "contact".to_string(),
                     ty: TypeRef::Struct("Contact".into()),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -2846,6 +2921,7 @@ mod tests {
                     name: "query".to_string(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -2883,6 +2959,7 @@ mod tests {
                     name: "id".to_string(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -3033,6 +3110,7 @@ mod tests {
                     name: "scores".to_string(),
                     ty: TypeRef::Map(Box::new(TypeRef::I32), Box::new(TypeRef::F64)),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3206,11 +3284,13 @@ mod tests {
                         name: "a".to_string(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "b".to_string(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::I32),
@@ -3290,6 +3370,7 @@ mod tests {
                     name: "id".to_string(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -3309,11 +3390,13 @@ mod tests {
                         name: "ContactNotFound".to_string(),
                         code: 1001,
                         message: "Contact not found".to_string(),
+                        doc: None,
                     },
                     ErrorCode {
                         name: "InvalidInput".to_string(),
                         code: 1002,
                         message: "Invalid input provided".to_string(),
+                        doc: None,
                     },
                 ],
             }),
@@ -3442,6 +3525,7 @@ mod tests {
                     name: "name".to_string(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -3529,6 +3613,7 @@ mod tests {
                         Box::new(TypeRef::Struct("Contact".into())),
                     ))))),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3574,6 +3659,7 @@ mod tests {
                         Box::new(TypeRef::List(Box::new(TypeRef::I32))),
                     ),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3609,6 +3695,7 @@ mod tests {
                         Box::new(TypeRef::Struct("Contact".into())),
                     ),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3681,6 +3768,7 @@ mod tests {
                     name: "msg".to_string(),
                     ty: TypeRef::BorrowedStr,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3718,6 +3806,7 @@ mod tests {
                     name: "data".to_string(),
                     ty: TypeRef::BorrowedBytes,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3755,6 +3844,7 @@ mod tests {
                     name: "contact".into(),
                     ty: TypeRef::TypedHandle("Contact".into()),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3815,6 +3905,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -3865,6 +3956,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                     "Contact".into(),
@@ -3900,6 +3992,7 @@ mod tests {
                     name: "id".to_string(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -3937,6 +4030,7 @@ mod tests {
                     name: "id".to_string(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -4003,6 +4097,7 @@ mod tests {
                         name: "id".to_string(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Struct("types.Name".to_string())),
                     doc: None,
@@ -4155,11 +4250,13 @@ mod tests {
                         name: "a".to_string(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "b".to_string(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::I32),
@@ -4185,5 +4282,89 @@ mod tests {
             out.contains("func add_old("),
             "missing function declaration: {out}"
         );
+    }
+
+    fn doc_api() -> Api {
+        make_api(vec![Module {
+            name: "docs".into(),
+            functions: vec![Function {
+                name: "do_thing".into(),
+                params: vec![Param {
+                    name: "x".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: Some("the input value".into()),
+                }],
+                returns: Some(TypeRef::I32),
+                doc: Some("Performs a thing.".into()),
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![StructDef {
+                name: "Item".into(),
+                doc: Some("An item we track.".into()),
+                fields: vec![StructField {
+                    name: "id".into(),
+                    ty: TypeRef::I64,
+                    doc: Some("Stable id".into()),
+                    default: None,
+                }],
+                builder: false,
+            }],
+            enums: vec![EnumDef {
+                name: "Kind".into(),
+                doc: Some("Kind of item.".into()),
+                variants: vec![EnumVariant {
+                    name: "Small".into(),
+                    value: 0,
+                    doc: Some("A small one".into()),
+                }],
+            }],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: Some(ErrorDomain {
+                name: "DocsErrors".into(),
+                codes: vec![ErrorCode {
+                    name: "not_found".into(),
+                    code: 1,
+                    message: "Not found".into(),
+                    doc: Some("Raised when missing".into()),
+                }],
+            }),
+            modules: vec![],
+        }])
+    }
+
+    #[test]
+    fn swift_emits_doc_on_function() {
+        let out = render_swift_wrapper(&doc_api(), true);
+        assert!(out.contains("/// Performs a thing."), "{out}");
+    }
+
+    #[test]
+    fn swift_emits_doc_on_struct() {
+        let out = render_swift_wrapper(&doc_api(), true);
+        assert!(out.contains("/// An item we track."), "{out}");
+    }
+
+    #[test]
+    fn swift_emits_doc_on_enum_variant() {
+        let out = render_swift_wrapper(&doc_api(), true);
+        assert!(out.contains("/// Kind of item."), "{out}");
+        assert!(out.contains("/// A small one"), "{out}");
+    }
+
+    #[test]
+    fn swift_emits_doc_on_field() {
+        let out = render_swift_wrapper(&doc_api(), true);
+        assert!(out.contains("/// Stable id"), "{out}");
+    }
+
+    #[test]
+    fn swift_emits_doc_on_param() {
+        let out = render_swift_wrapper(&doc_api(), true);
+        assert!(out.contains("/// - Parameter x: the input value"), "{out}");
     }
 }

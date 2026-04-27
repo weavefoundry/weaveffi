@@ -46,11 +46,16 @@ module WeaveFFI
   end
 
   # === Module: calculator ===
+  # Add two integers
   attach_function :weaveffi_calculator_add, [:int32, :int32, :pointer], :int32
+  # Multiply two integers
   attach_function :weaveffi_calculator_mul, [:int32, :int32, :pointer], :int32
+  # Divide two integers
   attach_function :weaveffi_calculator_div, [:int32, :int32, :pointer], :int32
+  # Echo a string back
   attach_function :weaveffi_calculator_echo, [:string, :pointer], :pointer
 
+  # Add two integers
   def self.add(a, b)
     err = ErrorStruct.new
     result = weaveffi_calculator_add(a, b, err)
@@ -58,6 +63,7 @@ module WeaveFFI
     result
   end
 
+  # Multiply two integers
   def self.mul(a, b)
     err = ErrorStruct.new
     result = weaveffi_calculator_mul(a, b, err)
@@ -65,6 +71,7 @@ module WeaveFFI
     result
   end
 
+  # Divide two integers
   def self.div(a, b)
     err = ErrorStruct.new
     result = weaveffi_calculator_div(a, b, err)
@@ -72,6 +79,7 @@ module WeaveFFI
     result
   end
 
+  # Echo a string back
   def self.echo(s)
     err = ErrorStruct.new
     result = weaveffi_calculator_echo(s, err)
