@@ -20,9 +20,6 @@
 
 use std::path::Path;
 
-// Re-enabled once generators advertise the Callbacks/Listeners capability used by events.yml,
-// and Go/Ruby advertise the Iterators capability.
-#[ignore = "events.yml uses callbacks/listeners which no generator advertises yet, and Go/Ruby do not advertise Iterators; reactivate when later phases add the capabilities back"]
 #[test]
 fn iterator_return_emits_streaming_in_all_targets() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
