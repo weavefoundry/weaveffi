@@ -952,3 +952,99 @@ fn dart_contacts_readme_documents_build_and_run() {
         );
     }
 }
+
+#[test]
+fn dart_sqlite_contacts_example_files_exist() {
+    for file in [
+        "examples/dart/sqlite-contacts/bin/main.dart",
+        "examples/dart/sqlite-contacts/pubspec.yaml",
+        "examples/dart/sqlite-contacts/README.md",
+    ] {
+        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        assert!(
+            workspace_root.join(file).exists(),
+            "Dart SQLite contacts example is missing {file}"
+        );
+    }
+}
+
+#[test]
+fn dart_sqlite_contacts_main_exercises_async_generated_bindings() {
+    let main = read_doc("examples/dart/sqlite-contacts/bin/main.dart");
+    assert!(
+        main.contains("import 'package:weaveffi/weaveffi.dart';"),
+        "main.dart must import the generated package: {main}"
+    );
+    assert!(
+        main.contains("Future<void> main() async"),
+        "main.dart must expose an async entry point: {main}"
+    );
+    for call in [
+        "await createContact(",
+        "await findContact(",
+        "await updateContact(",
+        "await countContacts(",
+        "await deleteContact(",
+        "Status.active",
+    ] {
+        assert!(main.contains(call), "main.dart must call `{call}`: {main}");
+    }
+    assert!(
+        main.contains(".dispose()"),
+        "main.dart must dispose Contact handles: {main}"
+    );
+    assert!(
+        main.contains("finally"),
+        "main.dart must release handles in a finally block: {main}"
+    );
+}
+
+#[test]
+fn dart_sqlite_contacts_pubspec_is_pure_dart_and_depends_on_generated() {
+    let pubspec = read_doc("examples/dart/sqlite-contacts/pubspec.yaml");
+    assert!(
+        pubspec.contains("sdk: '>=3.0.0 <4.0.0'"),
+        "pubspec must pin a modern pure-Dart SDK range: {pubspec}"
+    );
+    assert!(
+        !pubspec.contains("flutter:"),
+        "pubspec must not require Flutter so `dart pub get` works: {pubspec}"
+    );
+    assert!(
+        pubspec.contains("path: ../../../generated/dart"),
+        "pubspec must depend on the generated dart package via path: {pubspec}"
+    );
+}
+
+#[test]
+fn dart_sqlite_contacts_readme_documents_build_generate_and_run() {
+    let readme = read_doc("examples/dart/sqlite-contacts/README.md");
+    assert!(
+        readme.contains("cargo build -p sqlite-contacts"),
+        "README must instruct building the sqlite-contacts cdylib: {readme}"
+    );
+    assert!(
+        readme.contains(
+            "cargo run -p weaveffi-cli -- generate samples/sqlite-contacts/sqlite_contacts.yml"
+        ),
+        "README must include the sqlite-contacts generate command: {readme}"
+    );
+    for token in [
+        "dart pub get",
+        "dart run bin/main.dart",
+        "DYLD_LIBRARY_PATH=../../../target/debug",
+        "LD_LIBRARY_PATH=../../../target/debug",
+        "libweaveffi.dylib",
+        "libweaveffi.so",
+        "await createContact",
+    ] {
+        assert!(
+            readme.contains(token),
+            "README must mention `{token}`: {readme}"
+        );
+    }
+}

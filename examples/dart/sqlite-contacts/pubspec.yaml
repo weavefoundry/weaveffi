@@ -1,0 +1,9 @@
+name: weaveffi_sqlite_contacts_example
+description: Dart async/await consumer example for the weaveffi SQLite contacts sample.
+publish_to: none
+version: 0.0.1
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+dependencies:
+  weaveffi:
+    path: ../../../generated/dart
