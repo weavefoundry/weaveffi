@@ -20,7 +20,7 @@ rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-and
 Create a file called `greeter.yml`:
 
 ```yaml
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: greeter
     structs:

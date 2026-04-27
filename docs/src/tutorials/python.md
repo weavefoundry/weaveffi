@@ -14,7 +14,7 @@ ctypes bindings with WeaveFFI, and packaging it for `pip install`.
 Create a file called `greeter.yml`:
 
 ```yaml
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: greeter
     structs:

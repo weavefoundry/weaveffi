@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use weaveffi_ir::ir::{Api, ErrorDomain, Function, Module, Param, TypeRef};
+use weaveffi_ir::ir::{Api, ErrorDomain, Function, Module, Param, TypeRef, SUPPORTED_VERSIONS};
 
 #[derive(Debug, Clone)]
 pub enum ValidationWarning {
@@ -244,6 +244,8 @@ pub enum ValidationError {
     IteratorInInvalidPosition { location: String },
     #[error("builder struct '{name}' in module '{module}' must have at least one field")]
     BuilderStructEmpty { module: String, name: String },
+    #[error("unsupported schema version '{version}'; supported versions: {supported}")]
+    UnsupportedSchemaVersion { version: String, supported: String },
 }
 
 const RESERVED: &[&str] = &[
@@ -274,6 +276,12 @@ fn check_identifier(name: &str) -> Result<(), ValidationError> {
 }
 
 pub fn validate_api(api: &mut Api) -> Result<(), ValidationError> {
+    if !SUPPORTED_VERSIONS.contains(&api.version.as_str()) {
+        return Err(ValidationError::UnsupportedSchemaVersion {
+            version: api.version.clone(),
+            supported: SUPPORTED_VERSIONS.join(", "),
+        });
+    }
     let mut module_names = BTreeSet::new();
     for m in &api.modules {
         if !module_names.insert(m.name.clone()) {

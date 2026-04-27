@@ -7,7 +7,7 @@ uses YAML throughout.
 ## Top-level structure
 
 ```yaml
-version: "0.2.0"
+version: "0.3.0"
 modules:
   - name: my_module
     structs: [...]
@@ -24,7 +24,7 @@ generators:
 
 | Field        | Type                        | Required | Description                              |
 |--------------|-----------------------------|----------|------------------------------------------|
-| `version`    | string                      | yes      | Schema version (`"0.1.0"` or `"0.2.0"`) |
+| `version`    | string                      | yes      | Schema version (`"0.1.0"`, `"0.2.0"`, or `"0.3.0"`) |
 | `modules`    | array of Module             | yes      | One or more modules                      |
 | `generators` | map of string to object     | no       | Per-generator configuration (see [generators section](#generators-section)) |
 
@@ -621,7 +621,7 @@ modules.
 ### Nested module example
 
 ```yaml
-version: "0.2.0"
+version: "0.3.0"
 modules:
   - name: app
     functions:
@@ -732,7 +732,7 @@ directly in the IDL file. This is an alternative to using a separate
 TOML configuration file with `--config`.
 
 ```yaml
-version: "0.2.0"
+version: "0.3.0"
 modules:
   - name: math
     functions:
@@ -796,7 +796,7 @@ A full API definition combining structs, enums, optionals, lists, and nested
 types:
 
 ```yaml
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: contacts
     enums:
