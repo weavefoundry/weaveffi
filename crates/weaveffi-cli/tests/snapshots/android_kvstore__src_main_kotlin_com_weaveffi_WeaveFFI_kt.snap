@@ -1,0 +1,265 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+package com.weaveffi
+
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+
+class WeaveFFI {
+    companion object {
+        init { System.loadLibrary("weaveffi") }
+
+        /**
+         * Open (or create) a store backed by the given filesystem path
+         */
+        @JvmStatic external fun open_store(path: String): Store
+        /**
+         * Close the store and release all in-memory resources
+         */
+        @JvmStatic private external fun close_storeJni(store: Long): Unit
+        @JvmStatic fun close_store(store: Store) { close_storeJni(store.handle) }
+        /**
+         * Insert or replace a value, returning true on success
+         */
+        @JvmStatic private external fun putJni(store: Long, key: String, value: ByteArray, kind: Int, ttl_seconds: Long?): Boolean
+        @JvmStatic fun put(store: Store, key: String, value: ByteArray, kind: EntryKind, ttl_seconds: Long?): Boolean = putJni(store.handle, key, value, kind.value, ttl_seconds)
+        /**
+         * Look up an entry by key; returns null if missing or expired
+         */
+        @JvmStatic private external fun getJni(store: Long, key: String): Long?
+        @JvmStatic fun get(store: Store, key: String): Long? = getJni(store.handle, key)
+        /**
+         * Remove the entry for the given key, returning true if it existed
+         */
+        @JvmStatic private external fun deleteJni(store: Long, key: String): Boolean
+        @JvmStatic fun delete(store: Store, key: String): Boolean = deleteJni(store.handle, key)
+        /**
+         * Stream every key, optionally filtered by a prefix
+         */
+        @JvmStatic private external fun list_keysJni(store: Long, prefix: String?): Iterator<String>
+        @JvmStatic fun list_keys(store: Store, prefix: String?): Iterator<String> = list_keysJni(store.handle, prefix)
+        /**
+         * Return the number of live entries in the store
+         */
+        @JvmStatic private external fun countJni(store: Long): Long
+        @JvmStatic fun count(store: Store): Long = countJni(store.handle)
+        /**
+         * Drop every entry from the store
+         */
+        @JvmStatic private external fun clearJni(store: Long): Unit
+        @JvmStatic fun clear(store: Store) { clearJni(store.handle) }
+        /**
+         * Reclaim space asynchronously; returns the number of bytes reclaimed
+         */
+        @JvmStatic private external fun compact_asyncAsync(store: Store, cancelToken: Long, callback: Any)
+        @JvmStatic suspend fun compact_async(store: Store): Long = suspendCancellableCoroutine { cont ->
+            compact_asyncAsync(store, 0L, WeaveContinuation(cont))
+        }
+        /**
+         * Legacy single-shot put kept for compatibility
+         */
+        @Deprecated("use put() with explicit kind")
+        @JvmStatic private external fun legacy_putJni(store: Long, key: String, value: ByteArray): Boolean
+        @JvmStatic fun legacy_put(store: Store, key: String, value: ByteArray): Boolean = legacy_putJni(store.handle, key, value)
+        /**
+         * Snapshot the current store statistics
+         */
+        @JvmStatic private external fun get_statsJni(store: Long): Long
+        @JvmStatic fun get_stats(store: Store): Long = get_statsJni(store.handle)
+    }
+}
+
+/** Persistence semantics applied to a stored entry */
+enum class EntryKind(val value: Int) {
+    /** In-memory only; lost on close */
+    Volatile(0),
+    /** Flushed to durable storage */
+    Persistent(1),
+    /** Persistent and encrypted at rest */
+    Encrypted(2);
+
+    companion object {
+        fun fromValue(value: Int): EntryKind = entries.first { it.value == value }
+    }
+}
+
+/** Opaque key-value store handle target type */
+class Store internal constructor(private var handle: Long) : java.io.Closeable {
+    companion object {
+        init { System.loadLibrary("weaveffi") }
+
+        @JvmStatic external fun nativeCreate(id: Long): Long
+        @JvmStatic external fun nativeDestroy(handle: Long)
+        @JvmStatic external fun nativeGetId(handle: Long): Long
+
+        fun create(id: Long): Store = Store(nativeCreate(id))
+    }
+
+    /** Internal store identifier */
+    val id: Long get() = nativeGetId(handle)
+
+    override fun close() {
+        if (handle != 0L) {
+            nativeDestroy(handle)
+            handle = 0L
+        }
+    }
+
+    protected fun finalize() {
+        close()
+    }
+}
+
+/** A single key-value entry persisted in the store */
+class Entry internal constructor(private var handle: Long) : java.io.Closeable {
+    companion object {
+        init { System.loadLibrary("weaveffi") }
+
+        @JvmStatic external fun nativeCreate(id: Long, key: String, value: ByteArray, created_at: Long, expires_at: Long?, tags: Array<String>, metadata: Map<String, String>): Long
+        @JvmStatic external fun nativeDestroy(handle: Long)
+        @JvmStatic external fun nativeGetId(handle: Long): Long
+        @JvmStatic external fun nativeGetKey(handle: Long): String
+        @JvmStatic external fun nativeGetValue(handle: Long): ByteArray
+        @JvmStatic external fun nativeGetCreatedAt(handle: Long): Long
+        @JvmStatic external fun nativeGetExpiresAt(handle: Long): Long?
+        @JvmStatic external fun nativeGetTags(handle: Long): Array<String>
+        @JvmStatic external fun nativeGetMetadata(handle: Long): Map<String, String>
+
+        fun create(id: Long, key: String, value: ByteArray, created_at: Long, expires_at: Long?, tags: Array<String>, metadata: Map<String, String>): Entry = Entry(nativeCreate(id, key, value, created_at, expires_at, tags, metadata))
+    }
+
+    /** Stable monotonic identifier assigned on insert */
+    val id: Long get() = nativeGetId(handle)
+    /** UTF-8 lookup key */
+    val key: String get() = nativeGetKey(handle)
+    /** Opaque binary payload */
+    val value: ByteArray get() = nativeGetValue(handle)
+    /** Unix-timestamp seconds when the entry was created */
+    val created_at: Long get() = nativeGetCreatedAt(handle)
+    /** Optional unix-timestamp seconds at which the entry expires */
+    val expires_at: Long? get() = nativeGetExpiresAt(handle)
+    /** Free-form labels attached to the entry */
+    val tags: Array<String> get() = nativeGetTags(handle)
+    /** Arbitrary string-valued metadata pairs */
+    val metadata: Map<String, String> get() = nativeGetMetadata(handle)
+
+    override fun close() {
+        if (handle != 0L) {
+            nativeDestroy(handle)
+            handle = 0L
+        }
+    }
+
+    protected fun finalize() {
+        close()
+    }
+}
+
+/** A single key-value entry persisted in the store */
+class EntryBuilder {
+    private var id: Long? = null
+    private var key: String? = null
+    private var value: ByteArray? = null
+    private var created_at: Long? = null
+    private var expires_at: Long?? = null
+    private var tags: Array<String>? = null
+    private var metadata: Map<String, String>? = null
+    /** Stable monotonic identifier assigned on insert */
+    fun withId(id: Long): EntryBuilder {
+        this.id = id
+        return this
+    }
+    /** UTF-8 lookup key */
+    fun withKey(key: String): EntryBuilder {
+        this.key = key
+        return this
+    }
+    /** Opaque binary payload */
+    fun withValue(value: ByteArray): EntryBuilder {
+        this.value = value
+        return this
+    }
+    /** Unix-timestamp seconds when the entry was created */
+    fun withCreatedAt(created_at: Long): EntryBuilder {
+        this.created_at = created_at
+        return this
+    }
+    /** Optional unix-timestamp seconds at which the entry expires */
+    fun withExpiresAt(expires_at: Long?): EntryBuilder {
+        this.expires_at = expires_at
+        return this
+    }
+    /** Free-form labels attached to the entry */
+    fun withTags(tags: Array<String>): EntryBuilder {
+        this.tags = tags
+        return this
+    }
+    /** Arbitrary string-valued metadata pairs */
+    fun withMetadata(metadata: Map<String, String>): EntryBuilder {
+        this.metadata = metadata
+        return this
+    }
+    fun build(): Entry {
+        return Entry.create(
+            id ?: throw IllegalStateException("missing field: id"),
+            key ?: throw IllegalStateException("missing field: key"),
+            value ?: throw IllegalStateException("missing field: value"),
+            created_at ?: throw IllegalStateException("missing field: created_at"),
+            expires_at ?: throw IllegalStateException("missing field: expires_at"),
+            tags ?: throw IllegalStateException("missing field: tags"),
+            metadata ?: throw IllegalStateException("missing field: metadata")
+        )
+    }
+}
+
+/** Aggregate store statistics */
+class Stats internal constructor(private var handle: Long) : java.io.Closeable {
+    companion object {
+        init { System.loadLibrary("weaveffi") }
+
+        @JvmStatic external fun nativeCreate(total_entries: Long, total_bytes: Long, expired_entries: Long): Long
+        @JvmStatic external fun nativeDestroy(handle: Long)
+        @JvmStatic external fun nativeGetTotalEntries(handle: Long): Long
+        @JvmStatic external fun nativeGetTotalBytes(handle: Long): Long
+        @JvmStatic external fun nativeGetExpiredEntries(handle: Long): Long
+
+        fun create(total_entries: Long, total_bytes: Long, expired_entries: Long): Stats = Stats(nativeCreate(total_entries, total_bytes, expired_entries))
+    }
+
+    /** Number of live entries */
+    val total_entries: Long get() = nativeGetTotalEntries(handle)
+    /** Sum of all value byte lengths */
+    val total_bytes: Long get() = nativeGetTotalBytes(handle)
+    /** Number of entries past their TTL but not yet evicted */
+    val expired_entries: Long get() = nativeGetExpiredEntries(handle)
+
+    override fun close() {
+        if (handle != 0L) {
+            nativeDestroy(handle)
+            handle = 0L
+        }
+    }
+
+    protected fun finalize() {
+        close()
+    }
+}
+
+sealed class WeaveFFIException(val code: Int, message: String) : Exception(message) {
+    /** No entry exists for the requested key */
+    class KEY_NOT_FOUND(message: String = "Key not found") : WeaveFFIException(1001, message)
+    /** The entry exists but its TTL has elapsed */
+    class EXPIRED(message: String = "Entry expired") : WeaveFFIException(1002, message)
+    /** The store has reached its capacity limit */
+    class STORE_FULL(message: String = "Store is full") : WeaveFFIException(1003, message)
+    /** Underlying storage reported an I/O failure */
+    class IO_ERROR(message: String = "I/O error") : WeaveFFIException(1004, message)
+}
+
+internal class WeaveContinuation<T>(private val cont: kotlinx.coroutines.CancellableContinuation<T>) {
+    @Suppress("UNCHECKED_CAST")
+    fun onSuccess(result: Any?) { cont.resume(result as T) }
+    fun onError(message: String) { cont.resumeWithException(RuntimeException(message)) }
+}

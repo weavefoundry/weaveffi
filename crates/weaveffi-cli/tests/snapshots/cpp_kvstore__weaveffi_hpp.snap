@@ -1,0 +1,634 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+#include <optional>
+#include <unordered_map>
+#include <memory>
+#include <stdexcept>
+#include <future>
+
+extern "C" {
+
+typedef uint64_t weaveffi_handle_t;
+
+typedef struct weaveffi_error {
+    int32_t code;
+    const char* message;
+} weaveffi_error;
+
+void weaveffi_error_clear(weaveffi_error* err);
+void weaveffi_free_string(const char* ptr);
+void weaveffi_free_bytes(uint8_t* ptr, size_t len);
+
+typedef struct weaveffi_cancel_token weaveffi_cancel_token;
+weaveffi_cancel_token* weaveffi_cancel_token_create(void);
+void weaveffi_cancel_token_cancel(weaveffi_cancel_token* token);
+bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token* token);
+void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
+
+/** Persistence semantics applied to a stored entry */
+typedef enum {
+    /** In-memory only; lost on close */
+    weaveffi_kv_EntryKind_Volatile = 0,
+    /** Flushed to durable storage */
+    weaveffi_kv_EntryKind_Persistent = 1,
+    /** Persistent and encrypted at rest */
+    weaveffi_kv_EntryKind_Encrypted = 2
+} weaveffi_kv_EntryKind;
+/** Opaque key-value store handle target type */
+typedef struct weaveffi_kv_Store weaveffi_kv_Store;
+weaveffi_kv_Store* weaveffi_kv_Store_create(int64_t id, weaveffi_error* out_err);
+void weaveffi_kv_Store_destroy(weaveffi_kv_Store* ptr);
+/** Internal store identifier */
+int64_t weaveffi_kv_Store_get_id(const weaveffi_kv_Store* ptr);
+/** A single key-value entry persisted in the store */
+typedef struct weaveffi_kv_Entry weaveffi_kv_Entry;
+weaveffi_kv_Entry* weaveffi_kv_Entry_create(int64_t id, const char* key, const uint8_t* value_ptr, size_t value_len, int64_t created_at, const int64_t* expires_at, const char* const* tags, size_t tags_len, const char* const* metadata_keys, const char* const* metadata_values, size_t metadata_len, weaveffi_error* out_err);
+void weaveffi_kv_Entry_destroy(weaveffi_kv_Entry* ptr);
+/** Stable monotonic identifier assigned on insert */
+int64_t weaveffi_kv_Entry_get_id(const weaveffi_kv_Entry* ptr);
+/** UTF-8 lookup key */
+const char* weaveffi_kv_Entry_get_key(const weaveffi_kv_Entry* ptr);
+/** Opaque binary payload */
+const uint8_t* weaveffi_kv_Entry_get_value(const weaveffi_kv_Entry* ptr, size_t* out_len);
+/** Unix-timestamp seconds when the entry was created */
+int64_t weaveffi_kv_Entry_get_created_at(const weaveffi_kv_Entry* ptr);
+/** Optional unix-timestamp seconds at which the entry expires */
+int64_t* weaveffi_kv_Entry_get_expires_at(const weaveffi_kv_Entry* ptr);
+/** Free-form labels attached to the entry */
+const char** weaveffi_kv_Entry_get_tags(const weaveffi_kv_Entry* ptr, size_t* out_len);
+/** Arbitrary string-valued metadata pairs */
+void weaveffi_kv_Entry_get_metadata(const weaveffi_kv_Entry* ptr, const char** out_keys, const char** out_values, size_t* out_len);
+typedef struct weaveffi_kv_EntryBuilder weaveffi_kv_EntryBuilder;
+weaveffi_kv_EntryBuilder* weaveffi_kv_Entry_Builder_new(void);
+/** Stable monotonic identifier assigned on insert */
+void weaveffi_kv_Entry_Builder_set_id(weaveffi_kv_EntryBuilder* builder, int64_t value);
+/** UTF-8 lookup key */
+void weaveffi_kv_Entry_Builder_set_key(weaveffi_kv_EntryBuilder* builder, const char* value);
+/** Opaque binary payload */
+void weaveffi_kv_Entry_Builder_set_value(weaveffi_kv_EntryBuilder* builder, const uint8_t* value_ptr, size_t value_len);
+/** Unix-timestamp seconds when the entry was created */
+void weaveffi_kv_Entry_Builder_set_created_at(weaveffi_kv_EntryBuilder* builder, int64_t value);
+/** Optional unix-timestamp seconds at which the entry expires */
+void weaveffi_kv_Entry_Builder_set_expires_at(weaveffi_kv_EntryBuilder* builder, const int64_t* value);
+/** Free-form labels attached to the entry */
+void weaveffi_kv_Entry_Builder_set_tags(weaveffi_kv_EntryBuilder* builder, const char* const* value, size_t value_len);
+/** Arbitrary string-valued metadata pairs */
+void weaveffi_kv_Entry_Builder_set_metadata(weaveffi_kv_EntryBuilder* builder, const char* const* value_keys, const char* const* value_values, size_t value_len);
+weaveffi_kv_Entry* weaveffi_kv_Entry_Builder_build(weaveffi_kv_EntryBuilder* builder, weaveffi_error* out_err);
+void weaveffi_kv_Entry_Builder_destroy(weaveffi_kv_EntryBuilder* builder);
+/** Open (or create) a store backed by the given filesystem path */
+weaveffi_kv_Store* weaveffi_kv_open_store(const char* path, weaveffi_error* out_err);
+/** Close the store and release all in-memory resources */
+void weaveffi_kv_close_store(weaveffi_kv_Store* store, weaveffi_error* out_err);
+/** Insert or replace a value, returning true on success */
+bool weaveffi_kv_put(weaveffi_kv_Store* store, const char* key, const uint8_t* value_ptr, size_t value_len, weaveffi_kv_EntryKind kind, const int64_t* ttl_seconds, weaveffi_error* out_err);
+/** Look up an entry by key; returns null if missing or expired */
+weaveffi_kv_Entry* weaveffi_kv_get(weaveffi_kv_Store* store, const char* key, weaveffi_error* out_err);
+/** Remove the entry for the given key, returning true if it existed */
+bool weaveffi_kv_delete(weaveffi_kv_Store* store, const char* key, weaveffi_error* out_err);
+/** Stream every key, optionally filtered by a prefix */
+const char** weaveffi_kv_list_keys(weaveffi_kv_Store* store, const char* prefix, size_t* out_len, weaveffi_error* out_err);
+/** Return the number of live entries in the store */
+int64_t weaveffi_kv_count(weaveffi_kv_Store* store, weaveffi_error* out_err);
+/** Drop every entry from the store */
+void weaveffi_kv_clear(weaveffi_kv_Store* store, weaveffi_error* out_err);
+/** Reclaim space asynchronously; returns the number of bytes reclaimed */
+typedef void (*weaveffi_kv_compact_async_callback)(void* context, weaveffi_error* err, int64_t result);
+void weaveffi_kv_compact_async_async(weaveffi_kv_Store* store, weaveffi_cancel_token* cancel_token, weaveffi_kv_compact_async_callback callback, void* context);
+/** Legacy single-shot put kept for compatibility */
+bool weaveffi_kv_legacy_put(weaveffi_kv_Store* store, const char* key, const uint8_t* value_ptr, size_t value_len, weaveffi_error* out_err);
+
+/** Aggregate store statistics */
+typedef struct weaveffi_kv_stats_Stats weaveffi_kv_stats_Stats;
+weaveffi_kv_stats_Stats* weaveffi_kv_stats_Stats_create(int64_t total_entries, int64_t total_bytes, int64_t expired_entries, weaveffi_error* out_err);
+void weaveffi_kv_stats_Stats_destroy(weaveffi_kv_stats_Stats* ptr);
+/** Number of live entries */
+int64_t weaveffi_kv_stats_Stats_get_total_entries(const weaveffi_kv_stats_Stats* ptr);
+/** Sum of all value byte lengths */
+int64_t weaveffi_kv_stats_Stats_get_total_bytes(const weaveffi_kv_stats_Stats* ptr);
+/** Number of entries past their TTL but not yet evicted */
+int64_t weaveffi_kv_stats_Stats_get_expired_entries(const weaveffi_kv_stats_Stats* ptr);
+/** Snapshot the current store statistics */
+weaveffi_kv_stats_Stats* weaveffi_kv_stats_get_stats(weaveffi_kv_stats_Store* store, weaveffi_error* out_err);
+
+} // extern "C"
+
+namespace weaveffi {
+
+class WeaveFFIError : public std::runtime_error {
+    int32_t code_;
+
+public:
+    WeaveFFIError(int32_t code, const std::string& msg) : std::runtime_error(msg), code_(code) {}
+    int32_t code() const { return code_; }
+};
+
+/** No entry exists for the requested key */
+class KEY_NOT_FOUNDError : public WeaveFFIError {
+public:
+    KEY_NOT_FOUNDError(const std::string& msg) : WeaveFFIError(1001, msg) {}
+};
+
+/** The entry exists but its TTL has elapsed */
+class EXPIREDError : public WeaveFFIError {
+public:
+    EXPIREDError(const std::string& msg) : WeaveFFIError(1002, msg) {}
+};
+
+/** The store has reached its capacity limit */
+class STORE_FULLError : public WeaveFFIError {
+public:
+    STORE_FULLError(const std::string& msg) : WeaveFFIError(1003, msg) {}
+};
+
+/** Underlying storage reported an I/O failure */
+class IO_ERRORError : public WeaveFFIError {
+public:
+    IO_ERRORError(const std::string& msg) : WeaveFFIError(1004, msg) {}
+};
+
+/** Persistence semantics applied to a stored entry */
+enum class EntryKind : int32_t {
+    /** In-memory only; lost on close */
+    Volatile = 0,
+    /** Flushed to durable storage */
+    Persistent = 1,
+    /** Persistent and encrypted at rest */
+    Encrypted = 2
+};
+
+/** Opaque key-value store handle target type */
+class Store {
+    void* handle_;
+
+public:
+    explicit Store(void* h) : handle_(h) {}
+
+    ~Store() {
+        if (handle_) weaveffi_kv_Store_destroy(static_cast<weaveffi_kv_Store*>(handle_));
+    }
+
+    Store(const Store&) = delete;
+    Store& operator=(const Store&) = delete;
+
+    Store(Store&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+
+    Store& operator=(Store&& other) noexcept {
+        if (this != &other) {
+            if (handle_) weaveffi_kv_Store_destroy(static_cast<weaveffi_kv_Store*>(handle_));
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    void* handle() const { return handle_; }
+
+    /** Internal store identifier */
+    int64_t id() const {
+        return weaveffi_kv_Store_get_id(static_cast<const weaveffi_kv_Store*>(handle_));
+    }
+
+};
+
+/** A single key-value entry persisted in the store */
+class Entry {
+    void* handle_;
+
+public:
+    explicit Entry(void* h) : handle_(h) {}
+
+    ~Entry() {
+        if (handle_) weaveffi_kv_Entry_destroy(static_cast<weaveffi_kv_Entry*>(handle_));
+    }
+
+    Entry(const Entry&) = delete;
+    Entry& operator=(const Entry&) = delete;
+
+    Entry(Entry&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+
+    Entry& operator=(Entry&& other) noexcept {
+        if (this != &other) {
+            if (handle_) weaveffi_kv_Entry_destroy(static_cast<weaveffi_kv_Entry*>(handle_));
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    void* handle() const { return handle_; }
+
+    /** Stable monotonic identifier assigned on insert */
+    int64_t id() const {
+        return weaveffi_kv_Entry_get_id(static_cast<const weaveffi_kv_Entry*>(handle_));
+    }
+
+    /** UTF-8 lookup key */
+    std::string key() const {
+        const char* raw = weaveffi_kv_Entry_get_key(static_cast<const weaveffi_kv_Entry*>(handle_));
+        std::string ret(raw);
+        weaveffi_free_string(raw);
+        return ret;
+    }
+
+    /** Opaque binary payload */
+    std::vector<uint8_t> value() const {
+        size_t len = 0;
+        auto* raw = weaveffi_kv_Entry_get_value(static_cast<const weaveffi_kv_Entry*>(handle_), &len);
+        return std::vector<uint8_t>(raw, raw + len);
+    }
+
+    /** Unix-timestamp seconds when the entry was created */
+    int64_t created_at() const {
+        return weaveffi_kv_Entry_get_created_at(static_cast<const weaveffi_kv_Entry*>(handle_));
+    }
+
+    /** Optional unix-timestamp seconds at which the entry expires */
+    std::optional<int64_t> expires_at() const {
+        auto* raw = weaveffi_kv_Entry_get_expires_at(static_cast<const weaveffi_kv_Entry*>(handle_));
+        if (!raw) return std::nullopt;
+        return *raw;
+    }
+
+    /** Free-form labels attached to the entry */
+    std::vector<std::string> tags() const {
+        size_t len = 0;
+        auto* raw = weaveffi_kv_Entry_get_tags(static_cast<const weaveffi_kv_Entry*>(handle_), &len);
+        std::vector<std::string> ret;
+        ret.reserve(len);
+        for (size_t i = 0; i < len; ++i) ret.emplace_back(raw[i]);
+        return ret;
+    }
+
+    /** Arbitrary string-valued metadata pairs */
+    std::unordered_map<std::string, std::string> metadata() const {
+        const char** out_keys = nullptr;
+        const char** out_values = nullptr;
+        size_t len = 0;
+        weaveffi_kv_Entry_get_metadata(static_cast<const weaveffi_kv_Entry*>(handle_), out_keys, out_values, &len);
+        std::unordered_map<std::string, std::string> ret;
+        for (size_t i = 0; i < len; ++i) {
+            ret[std::string(out_keys[i])] = std::string(out_values[i]);
+        }
+        return ret;
+    }
+
+};
+
+/** A single key-value entry persisted in the store */
+class EntryBuilder {
+    void* handle_;
+
+public:
+    EntryBuilder() : handle_(reinterpret_cast<void*>(weaveffi_kv_Entry_Builder_new())) {}
+
+    ~EntryBuilder() {
+        if (handle_) weaveffi_kv_Entry_Builder_destroy(static_cast<weaveffi_kv_EntryBuilder*>(handle_));
+    }
+
+    EntryBuilder(const EntryBuilder&) = delete;
+    EntryBuilder& operator=(const EntryBuilder&) = delete;
+
+    EntryBuilder(EntryBuilder&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+
+    EntryBuilder& operator=(EntryBuilder&& other) noexcept {
+        if (this != &other) {
+            if (handle_) weaveffi_kv_Entry_Builder_destroy(static_cast<weaveffi_kv_EntryBuilder*>(handle_));
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    /** Stable monotonic identifier assigned on insert */
+    EntryBuilder& withId(int64_t value) {
+        weaveffi_kv_Entry_Builder_set_id(static_cast<weaveffi_kv_EntryBuilder*>(handle_), value);
+        return *this;
+    }
+
+    /** UTF-8 lookup key */
+    EntryBuilder& withKey(const std::string& value) {
+        weaveffi_kv_Entry_Builder_set_key(static_cast<weaveffi_kv_EntryBuilder*>(handle_), value.c_str());
+        return *this;
+    }
+
+    /** Opaque binary payload */
+    EntryBuilder& withValue(const std::vector<uint8_t>& value) {
+        weaveffi_kv_Entry_Builder_set_value(static_cast<weaveffi_kv_EntryBuilder*>(handle_), value.data(), value.size());
+        return *this;
+    }
+
+    /** Unix-timestamp seconds when the entry was created */
+    EntryBuilder& withCreatedAt(int64_t value) {
+        weaveffi_kv_Entry_Builder_set_created_at(static_cast<weaveffi_kv_EntryBuilder*>(handle_), value);
+        return *this;
+    }
+
+    /** Optional unix-timestamp seconds at which the entry expires */
+    EntryBuilder& withExpiresAt(const std::optional<int64_t>& value) {
+        const int64_t* value_ptr = nullptr;
+        int64_t value_tmp{};
+        if (value.has_value()) { value_tmp = *value; value_ptr = &value_tmp; }
+        weaveffi_kv_Entry_Builder_set_expires_at(static_cast<weaveffi_kv_EntryBuilder*>(handle_), value_ptr);
+        return *this;
+    }
+
+    /** Free-form labels attached to the entry */
+    EntryBuilder& withTags(const std::vector<std::string>& value) {
+        std::vector<const char*> value_cstrs;
+        value_cstrs.reserve(value.size());
+        for (const auto& s : value) value_cstrs.push_back(s.c_str());
+        weaveffi_kv_Entry_Builder_set_tags(static_cast<weaveffi_kv_EntryBuilder*>(handle_), value_cstrs.data(), value_cstrs.size());
+        return *this;
+    }
+
+    /** Arbitrary string-valued metadata pairs */
+    EntryBuilder& withMetadata(const std::unordered_map<std::string, std::string>& value) {
+        std::vector<const char*> value_keys_v;
+        std::vector<const char*> value_vals_v;
+        for (const auto& kv : value) { value_keys_v.push_back(kv.first.c_str()); value_vals_v.push_back(kv.second.c_str()); }
+        weaveffi_kv_Entry_Builder_set_metadata(static_cast<weaveffi_kv_EntryBuilder*>(handle_), value_keys_v.data(), value_vals_v.data(), value_keys_v.size());
+        return *this;
+    }
+
+    Entry build() {
+        weaveffi_error err{};
+        auto* ptr = weaveffi_kv_Entry_Builder_build(static_cast<weaveffi_kv_EntryBuilder*>(handle_), &err);
+        if (err.code != 0) throw std::runtime_error(err.message ? err.message : "build failed");
+        return Entry(ptr);
+    }
+};
+
+/** Open (or create) a store backed by the given filesystem path */
+inline Store kv_open_store(const std::string& path) {
+    weaveffi_error err{};
+    auto result = weaveffi_kv_open_store(path.c_str(), &err);
+    if (err.code != 0) {
+        std::string msg(err.message ? err.message : "unknown error");
+        int32_t code = err.code;
+        weaveffi_error_clear(&err);
+        switch (code) {
+        case 1001: throw KEY_NOT_FOUNDError(msg);
+        case 1002: throw EXPIREDError(msg);
+        case 1003: throw STORE_FULLError(msg);
+        case 1004: throw IO_ERRORError(msg);
+        default: throw WeaveFFIError(code, msg);
+        }
+    }
+    return Store(result);
+}
+
+/** Close the store and release all in-memory resources */
+inline void kv_close_store(Store& store) {
+    weaveffi_error err{};
+    weaveffi_kv_close_store(static_cast<weaveffi_kv_Store*>(store.handle()), &err);
+    if (err.code != 0) {
+        std::string msg(err.message ? err.message : "unknown error");
+        int32_t code = err.code;
+        weaveffi_error_clear(&err);
+        switch (code) {
+        case 1001: throw KEY_NOT_FOUNDError(msg);
+        case 1002: throw EXPIREDError(msg);
+        case 1003: throw STORE_FULLError(msg);
+        case 1004: throw IO_ERRORError(msg);
+        default: throw WeaveFFIError(code, msg);
+        }
+    }
+}
+
+/** Insert or replace a value, returning true on success */
+inline bool kv_put(Store& store, const std::string& key, const std::vector<uint8_t>& value, EntryKind kind, const std::optional<int64_t>& ttl_seconds) {
+    const int64_t* ttl_seconds_ptr = nullptr;
+    int64_t ttl_seconds_tmp{};
+    if (ttl_seconds.has_value()) { ttl_seconds_tmp = *ttl_seconds; ttl_seconds_ptr = &ttl_seconds_tmp; }
+    weaveffi_error err{};
+    auto result = weaveffi_kv_put(static_cast<weaveffi_kv_Store*>(store.handle()), key.c_str(), value.data(), value.size(), static_cast<weaveffi_kv_EntryKind>(static_cast<int32_t>(kind)), ttl_seconds_ptr, &err);
+    if (err.code != 0) {
+        std::string msg(err.message ? err.message : "unknown error");
+        int32_t code = err.code;
+        weaveffi_error_clear(&err);
+        switch (code) {
+        case 1001: throw KEY_NOT_FOUNDError(msg);
+        case 1002: throw EXPIREDError(msg);
+        case 1003: throw STORE_FULLError(msg);
+        case 1004: throw IO_ERRORError(msg);
+        default: throw WeaveFFIError(code, msg);
+        }
+    }
+    return result;
+}
+
+/** Look up an entry by key; returns null if missing or expired */
+inline std::optional<Entry> kv_get(Store& store, const std::string& key) {
+    weaveffi_error err{};
+    auto result = weaveffi_kv_get(static_cast<weaveffi_kv_Store*>(store.handle()), key.c_str(), &err);
+    if (err.code != 0) {
+        std::string msg(err.message ? err.message : "unknown error");
+        int32_t code = err.code;
+        weaveffi_error_clear(&err);
+        switch (code) {
+        case 1001: throw KEY_NOT_FOUNDError(msg);
+        case 1002: throw EXPIREDError(msg);
+        case 1003: throw STORE_FULLError(msg);
+        case 1004: throw IO_ERRORError(msg);
+        default: throw WeaveFFIError(code, msg);
+        }
+    }
+    if (!result) return std::nullopt;
+    return Entry(result);
+}
+
+/** Remove the entry for the given key, returning true if it existed */
+inline bool kv_delete(Store& store, const std::string& key) {
+    weaveffi_error err{};
+    auto result = weaveffi_kv_delete(static_cast<weaveffi_kv_Store*>(store.handle()), key.c_str(), &err);
+    if (err.code != 0) {
+        std::string msg(err.message ? err.message : "unknown error");
+        int32_t code = err.code;
+        weaveffi_error_clear(&err);
+        switch (code) {
+        case 1001: throw KEY_NOT_FOUNDError(msg);
+        case 1002: throw EXPIREDError(msg);
+        case 1003: throw STORE_FULLError(msg);
+        case 1004: throw IO_ERRORError(msg);
+        default: throw WeaveFFIError(code, msg);
+        }
+    }
+    return result;
+}
+
+/** Stream every key, optionally filtered by a prefix */
+inline std::vector<std::string> kv_list_keys(Store& store, const std::optional<std::string>& prefix) {
+    size_t out_len = 0;
+    weaveffi_error err{};
+    auto result = weaveffi_kv_list_keys(static_cast<weaveffi_kv_Store*>(store.handle()), prefix.has_value() ? prefix.value().c_str() : nullptr, &out_len, &err);
+    if (err.code != 0) {
+        std::string msg(err.message ? err.message : "unknown error");
+        int32_t code = err.code;
+        weaveffi_error_clear(&err);
+        switch (code) {
+        case 1001: throw KEY_NOT_FOUNDError(msg);
+        case 1002: throw EXPIREDError(msg);
+        case 1003: throw STORE_FULLError(msg);
+        case 1004: throw IO_ERRORError(msg);
+        default: throw WeaveFFIError(code, msg);
+        }
+    }
+    std::vector<std::string> ret;
+    ret.reserve(out_len);
+    for (size_t i = 0; i < out_len; ++i) ret.emplace_back(result[i]);
+    return ret;
+}
+
+/** Return the number of live entries in the store */
+inline int64_t kv_count(Store& store) {
+    weaveffi_error err{};
+    auto result = weaveffi_kv_count(static_cast<weaveffi_kv_Store*>(store.handle()), &err);
+    if (err.code != 0) {
+        std::string msg(err.message ? err.message : "unknown error");
+        int32_t code = err.code;
+        weaveffi_error_clear(&err);
+        switch (code) {
+        case 1001: throw KEY_NOT_FOUNDError(msg);
+        case 1002: throw EXPIREDError(msg);
+        case 1003: throw STORE_FULLError(msg);
+        case 1004: throw IO_ERRORError(msg);
+        default: throw WeaveFFIError(code, msg);
+        }
+    }
+    return result;
+}
+
+/** Drop every entry from the store */
+inline void kv_clear(Store& store) {
+    weaveffi_error err{};
+    weaveffi_kv_clear(static_cast<weaveffi_kv_Store*>(store.handle()), &err);
+    if (err.code != 0) {
+        std::string msg(err.message ? err.message : "unknown error");
+        int32_t code = err.code;
+        weaveffi_error_clear(&err);
+        switch (code) {
+        case 1001: throw KEY_NOT_FOUNDError(msg);
+        case 1002: throw EXPIREDError(msg);
+        case 1003: throw STORE_FULLError(msg);
+        case 1004: throw IO_ERRORError(msg);
+        default: throw WeaveFFIError(code, msg);
+        }
+    }
+}
+
+/** Reclaim space asynchronously; returns the number of bytes reclaimed */
+inline std::future<int64_t> kv_compact_async(Store& store, weaveffi_cancel_token* cancel_token = nullptr) {
+    auto* promise_ptr = new std::promise<int64_t>();
+    auto future = promise_ptr->get_future();
+    weaveffi_kv_compact_async_async(static_cast<weaveffi_kv_Store*>(store.handle()), cancel_token, [](void* context, weaveffi_error* err, int64_t result) {
+        auto* p = static_cast<std::promise<int64_t>*>(context);
+        if (err && err->code != 0) {
+            std::string msg(err->message ? err->message : "unknown error");
+            p->set_exception(std::make_exception_ptr(WeaveFFIError(err->code, msg)));
+        } else {
+            p->set_value(result);
+        }
+        delete p;
+    }, static_cast<void*>(promise_ptr));
+    return future;
+}
+
+/** Legacy single-shot put kept for compatibility */
+[[deprecated("use put() with explicit kind")]]
+inline bool kv_legacy_put(Store& store, const std::string& key, const std::vector<uint8_t>& value) {
+    weaveffi_error err{};
+    auto result = weaveffi_kv_legacy_put(static_cast<weaveffi_kv_Store*>(store.handle()), key.c_str(), value.data(), value.size(), &err);
+    if (err.code != 0) {
+        std::string msg(err.message ? err.message : "unknown error");
+        int32_t code = err.code;
+        weaveffi_error_clear(&err);
+        switch (code) {
+        case 1001: throw KEY_NOT_FOUNDError(msg);
+        case 1002: throw EXPIREDError(msg);
+        case 1003: throw STORE_FULLError(msg);
+        case 1004: throw IO_ERRORError(msg);
+        default: throw WeaveFFIError(code, msg);
+        }
+    }
+    return result;
+}
+
+/** Aggregate store statistics */
+class Stats {
+    void* handle_;
+
+public:
+    explicit Stats(void* h) : handle_(h) {}
+
+    ~Stats() {
+        if (handle_) weaveffi_kv_stats_Stats_destroy(static_cast<weaveffi_kv_stats_Stats*>(handle_));
+    }
+
+    Stats(const Stats&) = delete;
+    Stats& operator=(const Stats&) = delete;
+
+    Stats(Stats&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+
+    Stats& operator=(Stats&& other) noexcept {
+        if (this != &other) {
+            if (handle_) weaveffi_kv_stats_Stats_destroy(static_cast<weaveffi_kv_stats_Stats*>(handle_));
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    void* handle() const { return handle_; }
+
+    /** Number of live entries */
+    int64_t total_entries() const {
+        return weaveffi_kv_stats_Stats_get_total_entries(static_cast<const weaveffi_kv_stats_Stats*>(handle_));
+    }
+
+    /** Sum of all value byte lengths */
+    int64_t total_bytes() const {
+        return weaveffi_kv_stats_Stats_get_total_bytes(static_cast<const weaveffi_kv_stats_Stats*>(handle_));
+    }
+
+    /** Number of entries past their TTL but not yet evicted */
+    int64_t expired_entries() const {
+        return weaveffi_kv_stats_Stats_get_expired_entries(static_cast<const weaveffi_kv_stats_Stats*>(handle_));
+    }
+
+};
+
+/** Snapshot the current store statistics */
+inline Stats kv_stats_get_stats(Store& store) {
+    weaveffi_error err{};
+    auto result = weaveffi_kv_stats_get_stats(static_cast<weaveffi_kv_stats_Store*>(store.handle()), &err);
+    if (err.code != 0) {
+        std::string msg(err.message ? err.message : "unknown error");
+        int32_t code = err.code;
+        weaveffi_error_clear(&err);
+        switch (code) {
+        case 1001: throw KEY_NOT_FOUNDError(msg);
+        case 1002: throw EXPIREDError(msg);
+        case 1003: throw STORE_FULLError(msg);
+        case 1004: throw IO_ERRORError(msg);
+        default: throw WeaveFFIError(code, msg);
+        }
+    }
+    return Stats(result);
+}
+
+} // namespace weaveffi

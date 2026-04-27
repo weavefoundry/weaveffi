@@ -1,0 +1,89 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+from enum import IntEnum
+from typing import Dict, Iterator, List, Optional
+
+# Persistence semantics applied to a stored entry
+class EntryKind(IntEnum):
+    # In-memory only; lost on close
+    Volatile: int
+    # Flushed to durable storage
+    Persistent: int
+    # Persistent and encrypted at rest
+    Encrypted: int
+
+# Opaque key-value store handle target type
+class Store:
+    # Internal store identifier
+    @property
+    def id(self) -> int: ...
+
+# A single key-value entry persisted in the store
+class Entry:
+    # Stable monotonic identifier assigned on insert
+    @property
+    def id(self) -> int: ...
+    # UTF-8 lookup key
+    @property
+    def key(self) -> str: ...
+    # Opaque binary payload
+    @property
+    def value(self) -> bytes: ...
+    # Unix-timestamp seconds when the entry was created
+    @property
+    def created_at(self) -> int: ...
+    # Optional unix-timestamp seconds at which the entry expires
+    @property
+    def expires_at(self) -> Optional[int]: ...
+    # Free-form labels attached to the entry
+    @property
+    def tags(self) -> List[str]: ...
+    # Arbitrary string-valued metadata pairs
+    @property
+    def metadata(self) -> Dict[str, str]: ...
+
+# Open (or create) a store backed by the given filesystem path
+def open_store(path: str) -> "Store": ...
+
+# Close the store and release all in-memory resources
+def close_store(store: "Store") -> None: ...
+
+# Insert or replace a value, returning true on success
+def put(store: "Store", key: str, value: bytes, kind: "EntryKind", ttl_seconds: Optional[int]) -> bool: ...
+
+# Look up an entry by key; returns null if missing or expired
+def get(store: "Store", key: str) -> Optional["Entry"]: ...
+
+# Remove the entry for the given key, returning true if it existed
+def delete(store: "Store", key: str) -> bool: ...
+
+# Stream every key, optionally filtered by a prefix
+def list_keys(store: "Store", prefix: Optional[str]) -> Iterator[str]: ...
+
+# Return the number of live entries in the store
+def count(store: "Store") -> int: ...
+
+# Drop every entry from the store
+def clear(store: "Store") -> None: ...
+
+# Reclaim space asynchronously; returns the number of bytes reclaimed
+async def compact_async(store: "Store") -> int: ...
+
+# Legacy single-shot put kept for compatibility
+def legacy_put(store: "Store", key: str, value: bytes) -> bool: ...
+
+# Aggregate store statistics
+class Stats:
+    # Number of live entries
+    @property
+    def total_entries(self) -> int: ...
+    # Sum of all value byte lengths
+    @property
+    def total_bytes(self) -> int: ...
+    # Number of entries past their TTL but not yet evicted
+    @property
+    def expired_entries(self) -> int: ...
+
+# Snapshot the current store statistics
+def get_stats(store: "Store") -> "Stats": ...

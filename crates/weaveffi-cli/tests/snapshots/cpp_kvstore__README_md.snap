@@ -1,0 +1,33 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+# WeaveFFI C++ Bindings
+
+## Prerequisites
+
+- CMake 3.14+
+- C++17 compiler
+- The `weaveffi` static/shared library built from the Rust crate
+
+## Usage with CMake
+
+Add the generated `cpp/` directory as a subdirectory in your `CMakeLists.txt` and
+link against `weaveffi_cpp`:
+
+```cmake
+add_subdirectory(path/to/generated/cpp)
+add_executable(myapp main.cpp)
+target_link_libraries(myapp weaveffi_cpp)
+```
+
+The `weaveffi_cpp` target is an INTERFACE library that:
+
+- Adds the generated header directory to your include path
+- Links against the `weaveffi` library
+- Requires C++17
+
+Then include the header in your code:
+
+```cpp
+#include "weaveffi.hpp"
+```

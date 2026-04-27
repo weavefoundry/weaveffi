@@ -13,10 +13,15 @@
 # Optional env vars:
 #   CONTACTS_LIB    Path to libcontacts.{so,dylib,dll}. Defaults to a
 #                   sibling of WEAVEFFI_LIB named libcontacts.<same-ext>.
+#   KVSTORE_LIB     Path to libkvstore.{so,dylib,dll}. Defaults to a
+#                   sibling of WEAVEFFI_LIB named libkvstore.<same-ext>.
+#                   When unset and the default does not exist, every
+#                   "<lang>-kvstore" target is skipped automatically.
 #   CALCULATOR_WASM Path to calculator.wasm for the WASM target. Defaults
 #                   to target/wasm32-unknown-unknown/release/calculator.wasm.
 #   SKIP            Comma-separated targets to skip (c,cpp,dart,dotnet,
-#                   go,node,python,ruby,swift,wasm,android).
+#                   go,node,python,ruby,swift,wasm,android, and the
+#                   matching <lang>-kvstore variants).
 #   ONLY            Comma-separated targets to run (overrides SKIP).
 #
 # Per-target prerequisites (script does not install these):
@@ -49,7 +54,8 @@ WEAVEFFI_LIB="${WEAVEFFI_LIB:-$ROOT/target/debug/libcalculator.$DEFAULT_EXT}"
 LIB_DIR=$(cd "$(dirname "$WEAVEFFI_LIB")" && pwd)
 LIB_EXT="${WEAVEFFI_LIB##*.}"
 CONTACTS_LIB="${CONTACTS_LIB:-$LIB_DIR/libcontacts.$LIB_EXT}"
-export WEAVEFFI_LIB CONTACTS_LIB
+KVSTORE_LIB="${KVSTORE_LIB:-$LIB_DIR/libkvstore.$LIB_EXT}"
+export WEAVEFFI_LIB CONTACTS_LIB KVSTORE_LIB
 
 case "$(uname -s)" in
     Darwin) export DYLD_LIBRARY_PATH="$LIB_DIR:${DYLD_LIBRARY_PATH:-}" ;;
@@ -63,6 +69,10 @@ fi
 if [ ! -f "$CONTACTS_LIB" ]; then
     echo "CONTACTS_LIB not found: $CONTACTS_LIB" >&2
     exit 1
+fi
+HAS_KVSTORE=0
+if [ -f "$KVSTORE_LIB" ]; then
+    HAS_KVSTORE=1
 fi
 
 selected() {
@@ -88,6 +98,16 @@ run() {
         echo "[FAIL] $target" >&2
         exit 1
     fi
+}
+
+run_kvstore() {
+    local target=$1
+    shift
+    if [ "$HAS_KVSTORE" != "1" ]; then
+        echo "[SKIP] $target (KVSTORE_LIB not found at $KVSTORE_LIB)"
+        return 0
+    fi
+    run "$target" "$@"
 }
 
 run_c() {
@@ -141,16 +161,55 @@ run_android() {
         -include-runtime -d "$OUT/android-smoke.jar" 2>/dev/null
 }
 
-run c       run_c
-run cpp     run_cpp
-run python  run_python
-run node    run_node
-run dotnet  run_dotnet
-run go      run_go
-run ruby    run_ruby
-run dart    run_dart
-run swift   run_swift
-run wasm    run_wasm
-run android run_android
+run_c_kvstore() {
+    cc "$EXAMPLES/c/kvstore_smoke.c" \
+        -L "$LIB_DIR" -lkvstore \
+        -o "$OUT/c_kvstore_smoke" \
+        && "$OUT/c_kvstore_smoke"
+}
+
+run_cpp_kvstore() {
+    "$OUT/cpp/cpp_kvstore_smoke"
+}
+
+run_python_kvstore() {
+    python3 "$EXAMPLES/python/kvstore_smoke.py"
+}
+
+run_ruby_kvstore() {
+    ruby "$EXAMPLES/ruby/kvstore_smoke.rb"
+}
+
+run_go_kvstore() {
+    (cd "$EXAMPLES/go" && go mod download && go run ./kvstore)
+}
+
+run_dart_kvstore() {
+    (cd "$EXAMPLES/dart" && dart pub get > /dev/null && dart run kvstore_smoke.dart)
+}
+
+run_dotnet_kvstore() {
+    dotnet run --project "$EXAMPLES/dotnet/Kvstore" --configuration Release \
+        --verbosity quiet --nologo
+}
+
+run c             run_c
+run cpp           run_cpp
+run python        run_python
+run node          run_node
+run dotnet        run_dotnet
+run go            run_go
+run ruby          run_ruby
+run dart          run_dart
+run swift         run_swift
+run wasm          run_wasm
+run android       run_android
+run_kvstore c-kvstore       run_c_kvstore
+run_kvstore cpp-kvstore     run_cpp_kvstore
+run_kvstore python-kvstore  run_python_kvstore
+run_kvstore ruby-kvstore    run_ruby_kvstore
+run_kvstore go-kvstore      run_go_kvstore
+run_kvstore dart-kvstore    run_dart_kvstore
+run_kvstore dotnet-kvstore  run_dotnet_kvstore
 
 echo "All selected end-to-end consumer examples passed."

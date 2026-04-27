@@ -1,0 +1,114 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+// Generated TypeScript declarations for WeaveFFI WASM bindings
+
+/** Opaque key-value store handle target type */
+export interface Store {
+  /** Internal store identifier */
+  readonly id: number;
+}
+
+/** A single key-value entry persisted in the store */
+export interface Entry {
+  /** Stable monotonic identifier assigned on insert */
+  readonly id: number;
+  /** UTF-8 lookup key */
+  readonly key: string;
+  /** Opaque binary payload */
+  readonly value: Buffer;
+  /** Unix-timestamp seconds when the entry was created */
+  readonly created_at: number;
+  /** Optional unix-timestamp seconds at which the entry expires */
+  readonly expires_at: number | null;
+  /** Free-form labels attached to the entry */
+  readonly tags: string[];
+  /** Arbitrary string-valued metadata pairs */
+  readonly metadata: Record<string, string>;
+}
+
+/** Persistence semantics applied to a stored entry */
+export declare const EntryKind: Readonly<{
+  /** In-memory only; lost on close */
+  Volatile: 0;
+  /** Flushed to durable storage */
+  Persistent: 1;
+  /** Persistent and encrypted at rest */
+  Encrypted: 2;
+}>;
+
+/** Aggregate store statistics */
+export interface Stats {
+  /** Number of live entries */
+  readonly total_entries: number;
+  /** Sum of all value byte lengths */
+  readonly total_bytes: number;
+  /** Number of entries past their TTL but not yet evicted */
+  readonly expired_entries: number;
+}
+
+export interface WeaveffiWasmModule {
+  _raw: WebAssembly.Exports;
+  kv: {
+    /**
+     * Open (or create) a store backed by the given filesystem path
+     * @throws {Error} if the native call fails
+     */
+    open_store(path: string): Store;
+    /**
+     * Close the store and release all in-memory resources
+     * @throws {Error} if the native call fails
+     */
+    close_store(store: Store): void;
+    /**
+     * Insert or replace a value, returning true on success
+     * @throws {Error} if the native call fails
+     */
+    put(store: Store, key: string, value: Buffer, kind: EntryKind, ttl_seconds: number | null): boolean;
+    /**
+     * Look up an entry by key; returns null if missing or expired
+     * @throws {Error} if the native call fails
+     */
+    get(store: Store, key: string): Entry | null;
+    /**
+     * Remove the entry for the given key, returning true if it existed
+     * @throws {Error} if the native call fails
+     */
+    delete(store: Store, key: string): boolean;
+    /**
+     * Stream every key, optionally filtered by a prefix
+     * @throws {Error} if the native call fails
+     */
+    list_keys(store: Store, prefix: string | null): string[];
+    /**
+     * Return the number of live entries in the store
+     * @throws {Error} if the native call fails
+     */
+    count(store: Store): number;
+    /**
+     * Drop every entry from the store
+     * @throws {Error} if the native call fails
+     */
+    clear(store: Store): void;
+    /**
+     * Reclaim space asynchronously; returns the number of bytes reclaimed
+     * @throws {Error} if the native call fails
+     */
+    compact_async(store: Store): Promise<number>;
+    /**
+     * Legacy single-shot put kept for compatibility
+     * @deprecated use put() with explicit kind
+     * @throws {Error} if the native call fails
+     */
+    legacy_put(store: Store, key: string, value: Buffer): boolean;
+    stats: {
+      /**
+       * Snapshot the current store statistics
+       * @throws {Error} if the native call fails
+       */
+      get_stats(store: Store): Stats;
+    };
+  };
+}
+
+export function loadWeaveffiWasm(url: string): Promise<WeaveffiWasmModule>;
