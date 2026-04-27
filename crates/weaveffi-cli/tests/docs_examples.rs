@@ -778,3 +778,84 @@ fn node_addon_readme_has_required_sections() {
         );
     }
 }
+
+#[test]
+fn cpp_calculator_example_files_exist() {
+    for file in [
+        "examples/cpp/calculator/CMakeLists.txt",
+        "examples/cpp/calculator/main.cpp",
+        "examples/cpp/calculator/README.md",
+    ] {
+        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        assert!(
+            workspace_root.join(file).exists(),
+            "C++ calculator example is missing {file}"
+        );
+    }
+}
+
+#[test]
+fn cpp_calculator_main_cpp_exercises_generated_wrappers() {
+    let main = read_doc("examples/cpp/calculator/main.cpp");
+    assert!(
+        main.contains("#include \"weaveffi.hpp\""),
+        "main.cpp must include the generated header: {main}"
+    );
+    for call in [
+        "weaveffi::calculator_add",
+        "weaveffi::calculator_mul",
+        "weaveffi::calculator_div",
+        "weaveffi::calculator_echo",
+        "weaveffi::WeaveFFIError",
+    ] {
+        assert!(main.contains(call), "main.cpp must call `{call}`: {main}");
+    }
+}
+
+#[test]
+fn cpp_calculator_cmake_links_calculator_cdylib() {
+    let cmake = read_doc("examples/cpp/calculator/CMakeLists.txt");
+    assert!(
+        cmake.contains("CALCULATOR_LIB_DIR"),
+        "CMakeLists.txt must expose a CALCULATOR_LIB_DIR override: {cmake}"
+    );
+    for token in [
+        "libcalculator.dylib",
+        "libcalculator.so",
+        "calculator.dll",
+        "add_subdirectory(../../../generated/cpp",
+        "add_executable(calculator main.cpp)",
+    ] {
+        assert!(
+            cmake.contains(token),
+            "CMakeLists.txt must contain `{token}`: {cmake}"
+        );
+    }
+}
+
+#[test]
+fn cpp_calculator_readme_documents_build_and_run() {
+    let readme = read_doc("examples/cpp/calculator/README.md");
+    assert!(
+        readme.contains("cargo build -p calculator"),
+        "README must instruct building the calculator cdylib: {readme}"
+    );
+    assert!(
+        readme.contains("cargo run -p weaveffi-cli -- generate samples/calculator/calculator.yml"),
+        "README must include the calculator generate command: {readme}"
+    );
+    for token in [
+        "cmake -S . -B build",
+        "cmake --build build",
+        "./build/calculator",
+    ] {
+        assert!(
+            readme.contains(token),
+            "README must mention `{token}`: {readme}"
+        );
+    }
+}
