@@ -78,6 +78,7 @@ impl Generator for GoGenerator {
             Capability::Listeners,
             Capability::CancellableAsync,
             Capability::Iterators,
+            Capability::Builders,
             Capability::TypedHandles,
             Capability::BorrowedTypes,
             Capability::MapTypes,
@@ -4590,7 +4591,7 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_includes_callbacks_listeners_iterators_excludes_builders_async() {
+    fn capabilities_includes_callbacks_listeners_iterators_builders_excludes_async() {
         let caps = GoGenerator.capabilities();
         assert!(
             caps.contains(&Capability::Callbacks),
@@ -4605,15 +4606,15 @@ mod tests {
             "Go generator must advertise Iterators now that iterator codegen is implemented"
         );
         assert!(
+            caps.contains(&Capability::Builders),
+            "Go generator must advertise Builders now that builder codegen is implemented"
+        );
+        assert!(
             !caps.contains(&Capability::AsyncFunctions),
             "Go generator must not advertise AsyncFunctions until async codegen is implemented"
         );
-        assert!(
-            !caps.contains(&Capability::Builders),
-            "Go generator must not advertise Builders until builder codegen is implemented"
-        );
         for cap in Capability::ALL {
-            if matches!(cap, Capability::AsyncFunctions | Capability::Builders) {
+            if matches!(cap, Capability::AsyncFunctions) {
                 continue;
             }
             assert!(caps.contains(cap), "Go generator must support {cap:?}");
