@@ -126,3 +126,73 @@ fn ruby_contacts_readme_documents_build_generate_and_run() {
         );
     }
 }
+
+#[test]
+fn ruby_sqlite_contacts_example_files_exist() {
+    for file in [
+        "examples/ruby/sqlite-contacts/Gemfile",
+        "examples/ruby/sqlite-contacts/bin/contacts.rb",
+        "examples/ruby/sqlite-contacts/README.md",
+    ] {
+        assert!(
+            workspace_root().join(file).exists(),
+            "Ruby SQLite contacts example is missing {file}"
+        );
+    }
+}
+
+#[test]
+fn ruby_sqlite_contacts_example_uses_async_blocks_and_enumerator() {
+    let gemfile = read_example("examples/ruby/sqlite-contacts/Gemfile");
+    assert!(
+        gemfile.contains("gem \"weaveffi\", path: \"../../../generated/ruby\""),
+        "Gemfile must use the generated Ruby gem: {gemfile}"
+    );
+
+    let script = read_example("examples/ruby/sqlite-contacts/bin/contacts.rb");
+    for token in [
+        "require \"weaveffi\"",
+        "Queue.new",
+        "WeaveFFI.create_contact_async(",
+        "do |result, err|",
+        "WeaveFFI.update_contact_async(",
+        "WeaveFFI.find_contact_async(",
+        "WeaveFFI.count_contacts_async(",
+        "WeaveFFI.delete_contact_async(",
+        "WeaveFFI.list_contacts(nil)",
+        "contacts.each do |contact|",
+        "WeaveFFI::Status::ACTIVE",
+        "contact.destroy",
+    ] {
+        assert!(
+            script.contains(token),
+            "contacts.rb must mention `{token}`: {script}"
+        );
+    }
+    assert!(
+        script.contains("contacts.class"),
+        "contacts.rb must surface that list_contacts returns an Enumerator: {script}"
+    );
+}
+
+#[test]
+fn ruby_sqlite_contacts_readme_documents_build_generate_and_run() {
+    let readme = read_example("examples/ruby/sqlite-contacts/README.md");
+    for token in [
+        "cargo build -p sqlite-contacts",
+        "cargo run -p weaveffi-cli -- generate samples/sqlite-contacts/sqlite_contacts.yml -o generated --target ruby",
+        "create_contact_async(name, email) { |result, err| ... }",
+        "list_contacts(nil)",
+        "Enumerator",
+        "libweaveffi.dylib",
+        "libweaveffi.so",
+        "bundle install",
+        "LD_LIBRARY_PATH=\"$PWD/../../../target/debug\" bundle exec ruby bin/contacts.rb",
+        "DYLD_LIBRARY_PATH=\"$PWD/../../../target/debug\" bundle exec ruby bin/contacts.rb",
+    ] {
+        assert!(
+            readme.contains(token),
+            "README must mention `{token}`: {readme}"
+        );
+    }
+}
