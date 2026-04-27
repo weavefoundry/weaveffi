@@ -111,6 +111,7 @@ impl Generator for CGenerator {
 
     fn capabilities(&self) -> &'static [Capability] {
         &[
+            Capability::Callbacks,
             Capability::Listeners,
             Capability::Iterators,
             Capability::Builders,
@@ -3253,16 +3254,9 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_excludes_callbacks() {
+    fn capabilities_includes_callbacks() {
         let caps = CGenerator.capabilities();
-        assert!(
-            !caps.contains(&Capability::Callbacks),
-            "C generator must not advertise Callbacks until callback codegen is implemented"
-        );
         for cap in Capability::ALL {
-            if *cap == Capability::Callbacks {
-                continue;
-            }
             assert!(caps.contains(cap), "C generator must support {cap:?}");
         }
     }
