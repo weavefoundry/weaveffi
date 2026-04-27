@@ -1,0 +1,4 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+rootProject.name = 'weaveffi'

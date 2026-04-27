@@ -1,0 +1,16 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+// Generated TypeScript declarations for WeaveFFI WASM bindings
+
+export interface WeaveffiWasmModule {
+  _raw: WebAssembly.Exports;
+  events: {
+    /** @throws {Error} if the native call fails */
+    send_message(text: string): void;
+    /** @throws {Error} if the native call fails */
+    get_messages(): string[];
+  };
+}
+
+export function loadWeaveffiWasm(url: string): Promise<WeaveffiWasmModule>;

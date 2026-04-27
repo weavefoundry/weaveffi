@@ -1,0 +1,24 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+# WeaveFFI Ruby Bindings
+
+Auto-generated Ruby bindings using the [ffi](https://github.com/ffi/ffi) gem.
+
+## Prerequisites
+
+- Ruby >= 2.7
+- The compiled shared library (`libweaveffi.so`, `libweaveffi.dylib`, or `weaveffi.dll`) available on your library search path.
+
+## Install
+
+```bash
+gem build weaveffi.gemspec
+gem install weaveffi-0.1.0.gem
+```
+
+## Usage
+
+```ruby
+require 'weaveffi'
+```

@@ -1,0 +1,27 @@
+version: "0.3.0"
+modules:
+  - name: calculator
+    functions:
+      - name: add
+        doc: Add two integers
+        params:
+          - { name: a, type: i32 }
+          - { name: b, type: i32 }
+        return: i32
+      - name: mul
+        doc: Multiply two integers
+        params:
+          - { name: a, type: i32 }
+          - { name: b, type: i32 }
+        return: i32
+      - name: div
+        doc: Divide two integers
+        params:
+          - { name: a, type: i32 }
+          - { name: b, type: i32 }
+        return: i32
+      - name: echo
+        doc: Echo a string back
+        params:
+          - { name: s, type: string }
+        return: string

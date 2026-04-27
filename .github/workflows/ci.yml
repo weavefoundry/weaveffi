@@ -45,6 +45,12 @@ jobs:
       - name: Run unit tests
         run: cargo test --workspace --all-features --no-fail-fast
 
+      - name: Install cargo-insta
+        run: cargo install --locked cargo-insta
+
+      - name: Verify generator snapshots
+        run: cargo insta test --workspace --check
+
       - name: Build CLI (release)
         run: cargo build -p weaveffi-cli --release
 

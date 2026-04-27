@@ -1,0 +1,214 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+#include <node_api.h>
+#include "weaveffi.h"
+#include <stdlib.h>
+#include <string.h>
+
+static napi_value Napi_weaveffi_products_create_product(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value args[3];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  size_t name_len;
+  napi_get_value_string_utf8(env, args[0], NULL, 0, &name_len);
+  char* name = (char*)malloc(name_len + 1);
+  napi_get_value_string_utf8(env, args[0], name, name_len + 1, &name_len);
+  double price;
+  napi_get_value_double(env, args[1], &price);
+  int32_t category;
+  napi_get_value_int32(env, args[2], &category);
+  weaveffi_error err = {0};
+  weaveffi_handle_t result = weaveffi_products_create_product(name, price, (weaveffi_products_Category)category, &err);
+  free(name);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_int64(env, (int64_t)result, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_products_get_product(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  int64_t id_raw;
+  napi_get_value_int64(env, args[0], &id_raw);
+  weaveffi_error err = {0};
+  weaveffi_products_Product* result = weaveffi_products_get_product((weaveffi_handle_t)id_raw, &err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_products_search_products(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  int32_t category;
+  napi_get_value_int32(env, args[0], &category);
+  weaveffi_error err = {0};
+  size_t out_len;
+  weaveffi_products_Product** result = weaveffi_products_search_products((weaveffi_products_Category)category, &out_len, &err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_array_with_length(env, out_len, &ret);
+  for (size_t ret_i = 0; ret_i < out_len; ret_i++) {
+    napi_value elem;
+    napi_create_int64(env, (int64_t)(intptr_t)result[ret_i], &elem);
+    napi_set_element(env, ret, (uint32_t)ret_i, elem);
+  }
+  free(result);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_products_update_price(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value args[2];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  int64_t id_raw;
+  napi_get_value_int64(env, args[0], &id_raw);
+  double price;
+  napi_get_value_double(env, args[1], &price);
+  weaveffi_error err = {0};
+  bool result = weaveffi_products_update_price((weaveffi_handle_t)id_raw, price, &err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_get_boolean(env, result, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_products_delete_product(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  int64_t id_raw;
+  napi_get_value_int64(env, args[0], &id_raw);
+  weaveffi_error err = {0};
+  bool result = weaveffi_products_delete_product((weaveffi_handle_t)id_raw, &err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_get_boolean(env, result, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_orders_create_order(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  uint32_t items_count;
+  napi_get_array_length(env, args[0], &items_count);
+  weaveffi_orders_OrderItem** items_arr = (weaveffi_orders_OrderItem**)malloc(sizeof(weaveffi_orders_OrderItem*) * (items_count + 1));
+  for (uint32_t items_i = 0; items_i < items_count; items_i++) {
+    napi_value items_el;
+    napi_get_element(env, args[0], items_i, &items_el);
+    int64_t items_sp;
+    napi_get_value_int64(env, items_el, &items_sp);
+    items_arr[items_i] = (weaveffi_orders_OrderItem*)(intptr_t)items_sp;
+  }
+  weaveffi_error err = {0};
+  weaveffi_handle_t result = weaveffi_orders_create_order(items_arr, (size_t)items_count, &err);
+  free(items_arr);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_int64(env, (int64_t)result, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_orders_get_order(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  int64_t id_raw;
+  napi_get_value_int64(env, args[0], &id_raw);
+  weaveffi_error err = {0};
+  weaveffi_orders_Order* result = weaveffi_orders_get_order((weaveffi_handle_t)id_raw, &err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_orders_cancel_order(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  int64_t id_raw;
+  napi_get_value_int64(env, args[0], &id_raw);
+  weaveffi_error err = {0};
+  bool result = weaveffi_orders_cancel_order((weaveffi_handle_t)id_raw, &err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_get_boolean(env, result, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_orders_add_product_to_order(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value args[2];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  int64_t order_id_raw;
+  napi_get_value_int64(env, args[0], &order_id_raw);
+  int64_t product_raw;
+  napi_get_value_int64(env, args[1], &product_raw);
+  weaveffi_error err = {0};
+  bool result = weaveffi_orders_add_product_to_order((weaveffi_handle_t)order_id_raw, (const weaveffi_products_Product*)(intptr_t)product_raw, &err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_get_boolean(env, result, &ret);
+  return ret;
+}
+
+static napi_value Init(napi_env env, napi_value exports) {
+  napi_property_descriptor props[] = {
+    { "create_product", NULL, Napi_weaveffi_products_create_product, NULL, NULL, NULL, napi_default, NULL },
+    { "get_product", NULL, Napi_weaveffi_products_get_product, NULL, NULL, NULL, napi_default, NULL },
+    { "search_products", NULL, Napi_weaveffi_products_search_products, NULL, NULL, NULL, napi_default, NULL },
+    { "update_price", NULL, Napi_weaveffi_products_update_price, NULL, NULL, NULL, napi_default, NULL },
+    { "delete_product", NULL, Napi_weaveffi_products_delete_product, NULL, NULL, NULL, napi_default, NULL },
+    { "create_order", NULL, Napi_weaveffi_orders_create_order, NULL, NULL, NULL, napi_default, NULL },
+    { "get_order", NULL, Napi_weaveffi_orders_get_order, NULL, NULL, NULL, napi_default, NULL },
+    { "cancel_order", NULL, Napi_weaveffi_orders_cancel_order, NULL, NULL, NULL, napi_default, NULL },
+    { "add_product_to_order", NULL, Napi_weaveffi_orders_add_product_to_order, NULL, NULL, NULL, napi_default, NULL },
+  };
+  napi_define_properties(env, exports, 9, props);
+  return exports;
+}
+
+NAPI_MODULE(NODE_GYP_MODULE_NAME, Init)

@@ -1,0 +1,26 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+# WeaveFFI Dart Bindings
+
+Auto-generated Dart bindings using `dart:ffi`.
+
+## Usage
+
+1. Place the compiled shared library (`libweaveffi.dylib`, `libweaveffi.so`,
+   or `weaveffi.dll`) where the Dart process can find it.
+
+2. Add this package as a dependency and import the bindings:
+
+```dart
+import 'package:weaveffi/weaveffi.dart';
+```
+
+3. Call the generated functions directly. The bindings use `dart:ffi` to load
+   the native library at runtime via `DynamicLibrary.open` and resolve symbols
+   with `lookupFunction`.
+
+## Requirements
+
+- Dart SDK >= 3.0.0
+- The `ffi` package (`^2.0.0`) for `Utf8` and `calloc` helpers.

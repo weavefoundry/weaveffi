@@ -1,0 +1,153 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+#include <optional>
+#include <unordered_map>
+#include <memory>
+#include <stdexcept>
+#include <future>
+
+extern "C" {
+
+typedef uint64_t weaveffi_handle_t;
+
+typedef struct weaveffi_error {
+    int32_t code;
+    const char* message;
+} weaveffi_error;
+
+void weaveffi_error_clear(weaveffi_error* err);
+void weaveffi_free_string(const char* ptr);
+void weaveffi_free_bytes(uint8_t* ptr, size_t len);
+
+typedef struct weaveffi_cancel_token weaveffi_cancel_token;
+weaveffi_cancel_token* weaveffi_cancel_token_create(void);
+void weaveffi_cancel_token_cancel(weaveffi_cancel_token* token);
+bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token* token);
+void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
+
+typedef struct weaveffi_tasks_TaskResult weaveffi_tasks_TaskResult;
+weaveffi_tasks_TaskResult* weaveffi_tasks_TaskResult_create(int64_t id, const char* value, bool success, weaveffi_error* out_err);
+void weaveffi_tasks_TaskResult_destroy(weaveffi_tasks_TaskResult* ptr);
+int64_t weaveffi_tasks_TaskResult_get_id(const weaveffi_tasks_TaskResult* ptr);
+const char* weaveffi_tasks_TaskResult_get_value(const weaveffi_tasks_TaskResult* ptr);
+bool weaveffi_tasks_TaskResult_get_success(const weaveffi_tasks_TaskResult* ptr);
+typedef void (*weaveffi_tasks_run_task_callback)(void* context, weaveffi_error* err, weaveffi_tasks_TaskResult* result);
+void weaveffi_tasks_run_task_async(const char* name, weaveffi_tasks_run_task_callback callback, void* context);
+typedef void (*weaveffi_tasks_run_batch_callback)(void* context, weaveffi_error* err, weaveffi_tasks_TaskResult** result, size_t result_len);
+void weaveffi_tasks_run_batch_async(const char* const* names, size_t names_len, weaveffi_tasks_run_batch_callback callback, void* context);
+bool weaveffi_tasks_cancel_task(int64_t id, weaveffi_error* out_err);
+
+} // extern "C"
+
+namespace weaveffi {
+
+class WeaveFFIError : public std::runtime_error {
+    int32_t code_;
+
+public:
+    WeaveFFIError(int32_t code, const std::string& msg) : std::runtime_error(msg), code_(code) {}
+    int32_t code() const { return code_; }
+};
+
+class TaskResult {
+    void* handle_;
+
+public:
+    explicit TaskResult(void* h) : handle_(h) {}
+
+    ~TaskResult() {
+        if (handle_) weaveffi_tasks_TaskResult_destroy(static_cast<weaveffi_tasks_TaskResult*>(handle_));
+    }
+
+    TaskResult(const TaskResult&) = delete;
+    TaskResult& operator=(const TaskResult&) = delete;
+
+    TaskResult(TaskResult&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+
+    TaskResult& operator=(TaskResult&& other) noexcept {
+        if (this != &other) {
+            if (handle_) weaveffi_tasks_TaskResult_destroy(static_cast<weaveffi_tasks_TaskResult*>(handle_));
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    void* handle() const { return handle_; }
+
+    int64_t id() const {
+        return weaveffi_tasks_TaskResult_get_id(static_cast<const weaveffi_tasks_TaskResult*>(handle_));
+    }
+
+    std::string value() const {
+        const char* raw = weaveffi_tasks_TaskResult_get_value(static_cast<const weaveffi_tasks_TaskResult*>(handle_));
+        std::string ret(raw);
+        weaveffi_free_string(raw);
+        return ret;
+    }
+
+    bool success() const {
+        return weaveffi_tasks_TaskResult_get_success(static_cast<const weaveffi_tasks_TaskResult*>(handle_));
+    }
+
+};
+
+inline std::future<TaskResult> tasks_run_task(const std::string& name) {
+    auto* promise_ptr = new std::promise<TaskResult>();
+    auto future = promise_ptr->get_future();
+    weaveffi_tasks_run_task_async(name.c_str(), [](void* context, weaveffi_error* err, weaveffi_tasks_TaskResult* result) {
+        auto* p = static_cast<std::promise<TaskResult>*>(context);
+        if (err && err->code != 0) {
+            std::string msg(err->message ? err->message : "unknown error");
+            p->set_exception(std::make_exception_ptr(WeaveFFIError(err->code, msg)));
+        } else {
+            p->set_value(TaskResult(result));
+        }
+        delete p;
+    }, static_cast<void*>(promise_ptr));
+    return future;
+}
+
+inline std::future<std::vector<TaskResult>> tasks_run_batch(const std::vector<std::string>& names) {
+    auto* promise_ptr = new std::promise<std::vector<TaskResult>>();
+    auto future = promise_ptr->get_future();
+    std::vector<const char*> names_cstrs;
+    names_cstrs.reserve(names.size());
+    for (const auto& s : names) names_cstrs.push_back(s.c_str());
+    weaveffi_tasks_run_batch_async(names_cstrs.data(), names_cstrs.size(), [](void* context, weaveffi_error* err, weaveffi_tasks_TaskResult** result, size_t result_len) {
+        auto* p = static_cast<std::promise<std::vector<TaskResult>>*>(context);
+        if (err && err->code != 0) {
+            std::string msg(err->message ? err->message : "unknown error");
+            p->set_exception(std::make_exception_ptr(WeaveFFIError(err->code, msg)));
+        } else {
+            std::vector<TaskResult> ret;
+            ret.reserve(result_len);
+            for (size_t i = 0; i < result_len; ++i) ret.emplace_back(TaskResult(result[i]));
+            p->set_value(std::move(ret));
+        }
+        delete p;
+    }, static_cast<void*>(promise_ptr));
+    return future;
+}
+
+inline bool tasks_cancel_task(int64_t id) {
+    weaveffi_error err{};
+    auto result = weaveffi_tasks_cancel_task(id, &err);
+    if (err.code != 0) {
+        std::string msg(err.message ? err.message : "unknown error");
+        int32_t code = err.code;
+        weaveffi_error_clear(&err);
+        throw WeaveFFIError(code, msg);
+    }
+    return result;
+}
+
+} // namespace weaveffi

@@ -1,0 +1,4 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+module.exports = require('./index.node')

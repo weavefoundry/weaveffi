@@ -1,0 +1,50 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+package weaveffi
+
+/*
+#cgo LDFLAGS: -lweaveffi
+#include "weaveffi.h"
+#include <stdlib.h>
+*/
+import "C"
+
+import (
+	"fmt"
+	"unsafe"
+)
+
+func EventsSendMessage(text string) error {
+	cText := C.CString(text)
+	defer C.free(unsafe.Pointer(cText))
+	var cErr C.weaveffi_error
+	C.weaveffi_events_send_message(cText, &cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return goErr
+	}
+	return nil
+}
+
+func EventsGetMessages() ([]string, error) {
+	var cOutLen C.size_t
+	var cErr C.weaveffi_error
+	result := C.weaveffi_events_get_messages(&cOutLen, &cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return nil, goErr
+	}
+	count := int(cOutLen)
+	if count == 0 || result == nil {
+		return nil, nil
+	}
+	goResult := make([]string, count)
+	cSlice := unsafe.Slice((**C.char)(unsafe.Pointer(result)), count)
+	for i, v := range cSlice {
+		goResult[i] = C.GoString(v)
+	}
+	return goResult, nil
+}

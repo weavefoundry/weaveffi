@@ -1,0 +1,8 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+module CWeaveFFI [system] {
+  header "../../c/weaveffi.h"
+  link "weaveffi"
+  export *
+}

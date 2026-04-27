@@ -1,0 +1,131 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+#ifndef WEAVEFFI_H
+#define WEAVEFFI_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef uint64_t weaveffi_handle_t;
+
+typedef struct weaveffi_error { int32_t code; const char* message; } weaveffi_error;
+
+void weaveffi_error_clear(weaveffi_error* err);
+void weaveffi_free_string(const char* ptr);
+void weaveffi_free_bytes(uint8_t* ptr, size_t len);
+
+typedef struct weaveffi_cancel_token weaveffi_cancel_token;
+weaveffi_cancel_token* weaveffi_cancel_token_create(void);
+void weaveffi_cancel_token_cancel(weaveffi_cancel_token* token);
+bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token* token);
+void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
+
+/*
+ * Map convention: Maps are passed as parallel arrays of keys and values.
+ * A map parameter {K:V} named "m" expands to:
+ *   const K* m_keys, const V* m_values, size_t m_len
+ * A map return value expands to out-parameters:
+ *   K* out_keys, V* out_values, size_t* out_len
+ */
+
+// Module: shared
+typedef struct weaveffi_shared_Token weaveffi_shared_Token;
+weaveffi_shared_Token* weaveffi_shared_Token_create(int64_t id, const char* label, weaveffi_error* out_err);
+void weaveffi_shared_Token_destroy(weaveffi_shared_Token* ptr);
+int64_t weaveffi_shared_Token_get_id(const weaveffi_shared_Token* ptr);
+const char* weaveffi_shared_Token_get_label(const weaveffi_shared_Token* ptr);
+
+const char* weaveffi_shared_ping(weaveffi_error* out_err);
+
+// Module: kitchen
+typedef enum { weaveffi_kitchen_Priority_Low = 0, weaveffi_kitchen_Priority_Normal = 1, weaveffi_kitchen_Priority_High = 2 } weaveffi_kitchen_Priority;
+typedef struct weaveffi_kitchen_Item weaveffi_kitchen_Item;
+weaveffi_kitchen_Item* weaveffi_kitchen_Item_create(int64_t id, const char* name, int32_t count, bool enabled, double ratio, uint32_t nick, const uint8_t* payload_ptr, size_t payload_len, const char* const* tags, size_t tags_len, const char* const* attrs_keys, const char* const* attrs_values, size_t attrs_len, const int64_t* parent, const weaveffi_shared_Token* token, weaveffi_kitchen_Priority priority, weaveffi_error* out_err);
+void weaveffi_kitchen_Item_destroy(weaveffi_kitchen_Item* ptr);
+int64_t weaveffi_kitchen_Item_get_id(const weaveffi_kitchen_Item* ptr);
+const char* weaveffi_kitchen_Item_get_name(const weaveffi_kitchen_Item* ptr);
+int32_t weaveffi_kitchen_Item_get_count(const weaveffi_kitchen_Item* ptr);
+bool weaveffi_kitchen_Item_get_enabled(const weaveffi_kitchen_Item* ptr);
+double weaveffi_kitchen_Item_get_ratio(const weaveffi_kitchen_Item* ptr);
+uint32_t weaveffi_kitchen_Item_get_nick(const weaveffi_kitchen_Item* ptr);
+const uint8_t* weaveffi_kitchen_Item_get_payload(const weaveffi_kitchen_Item* ptr, size_t* out_len);
+const char** weaveffi_kitchen_Item_get_tags(const weaveffi_kitchen_Item* ptr, size_t* out_len);
+void weaveffi_kitchen_Item_get_attrs(const weaveffi_kitchen_Item* ptr, const char** out_keys, const char** out_values, size_t* out_len);
+int64_t* weaveffi_kitchen_Item_get_parent(const weaveffi_kitchen_Item* ptr);
+weaveffi_shared_Token* weaveffi_kitchen_Item_get_token(const weaveffi_kitchen_Item* ptr);
+weaveffi_kitchen_Priority weaveffi_kitchen_Item_get_priority(const weaveffi_kitchen_Item* ptr);
+
+typedef struct weaveffi_kitchen_ItemBuilder weaveffi_kitchen_ItemBuilder;
+weaveffi_kitchen_ItemBuilder* weaveffi_kitchen_Item_Builder_new(void);
+void weaveffi_kitchen_Item_Builder_set_id(weaveffi_kitchen_ItemBuilder* builder, int64_t value);
+void weaveffi_kitchen_Item_Builder_set_name(weaveffi_kitchen_ItemBuilder* builder, const char* value);
+void weaveffi_kitchen_Item_Builder_set_count(weaveffi_kitchen_ItemBuilder* builder, int32_t value);
+void weaveffi_kitchen_Item_Builder_set_enabled(weaveffi_kitchen_ItemBuilder* builder, bool value);
+void weaveffi_kitchen_Item_Builder_set_ratio(weaveffi_kitchen_ItemBuilder* builder, double value);
+void weaveffi_kitchen_Item_Builder_set_nick(weaveffi_kitchen_ItemBuilder* builder, uint32_t value);
+void weaveffi_kitchen_Item_Builder_set_payload(weaveffi_kitchen_ItemBuilder* builder, const uint8_t* value_ptr, size_t value_len);
+void weaveffi_kitchen_Item_Builder_set_tags(weaveffi_kitchen_ItemBuilder* builder, const char* const* value, size_t value_len);
+void weaveffi_kitchen_Item_Builder_set_attrs(weaveffi_kitchen_ItemBuilder* builder, const char* const* value_keys, const char* const* value_values, size_t value_len);
+void weaveffi_kitchen_Item_Builder_set_parent(weaveffi_kitchen_ItemBuilder* builder, const int64_t* value);
+void weaveffi_kitchen_Item_Builder_set_token(weaveffi_kitchen_ItemBuilder* builder, const weaveffi_shared_Token* value);
+void weaveffi_kitchen_Item_Builder_set_priority(weaveffi_kitchen_ItemBuilder* builder, weaveffi_kitchen_Priority value);
+weaveffi_kitchen_Item* weaveffi_kitchen_Item_Builder_build(weaveffi_kitchen_ItemBuilder* builder, weaveffi_error* out_err);
+void weaveffi_kitchen_Item_Builder_destroy(weaveffi_kitchen_ItemBuilder* builder);
+
+typedef void (*weaveffi_kitchen_OnReady_fn)(int32_t code, const char* msg, void* context);
+uint64_t weaveffi_kitchen_register_ready_listener(weaveffi_kitchen_OnReady_fn callback, void* context);
+void weaveffi_kitchen_unregister_ready_listener(uint64_t id);
+bool weaveffi_kitchen_bool_id(bool x, weaveffi_error* out_err);
+int32_t weaveffi_kitchen_i32_id(int32_t x, weaveffi_error* out_err);
+uint32_t weaveffi_kitchen_u32_id(uint32_t x, weaveffi_error* out_err);
+int64_t weaveffi_kitchen_i64_id(int64_t x, weaveffi_error* out_err);
+double weaveffi_kitchen_f64_id(double x, weaveffi_error* out_err);
+const char* weaveffi_kitchen_echo_string(const char* s, weaveffi_error* out_err);
+const uint8_t* weaveffi_kitchen_echo_bytes(const uint8_t* b_ptr, size_t b_len, size_t* out_len, weaveffi_error* out_err);
+const char* weaveffi_kitchen_echo_borrowed_str(const char* s, weaveffi_error* out_err);
+const uint8_t* weaveffi_kitchen_echo_borrowed_bytes(const uint8_t* b_ptr, size_t b_len, size_t* out_len, weaveffi_error* out_err);
+weaveffi_handle_t weaveffi_kitchen_open_handle(weaveffi_error* out_err);
+weaveffi_kitchen_Token* weaveffi_kitchen_open_typed_handle(weaveffi_error* out_err);
+weaveffi_kitchen_Item* weaveffi_kitchen_maybe_item(int64_t id, weaveffi_error* out_err);
+weaveffi_kitchen_Item** weaveffi_kitchen_list_items(size_t* out_len, weaveffi_error* out_err);
+void weaveffi_kitchen_get_attrs(const char** out_keys, int32_t* out_values, size_t* out_len, weaveffi_error* out_err);
+typedef struct weaveffi_kitchen_StreamItemsIterator weaveffi_kitchen_StreamItemsIterator;
+weaveffi_kitchen_StreamItemsIterator* weaveffi_kitchen_stream_items(weaveffi_error* out_err);
+int32_t weaveffi_kitchen_StreamItemsIterator_next(weaveffi_kitchen_StreamItemsIterator* iter, weaveffi_kitchen_Item** out_item, weaveffi_error* out_err);
+void weaveffi_kitchen_StreamItemsIterator_destroy(weaveffi_kitchen_StreamItemsIterator* iter);
+weaveffi_shared_Token* weaveffi_kitchen_cross_module_token(weaveffi_error* out_err);
+typedef void (*weaveffi_kitchen_do_async_callback)(void* context, weaveffi_error* err, const char* result);
+/*
+ * Async: weaveffi_kitchen_do_async
+ * The callback is called exactly once, on any thread.
+ * On success, err is NULL and result (if any) is valid.
+ * On failure, err is non-NULL with a non-zero code.
+ */
+void weaveffi_kitchen_do_async_async(const char* input, weaveffi_kitchen_do_async_callback callback, void* context);
+typedef void (*weaveffi_kitchen_do_cancellable_callback)(void* context, weaveffi_error* err, const char* result);
+/*
+ * Async: weaveffi_kitchen_do_cancellable
+ * The callback is called exactly once, on any thread.
+ * On success, err is NULL and result (if any) is valid.
+ * On failure, err is non-NULL with a non-zero code.
+ */
+void weaveffi_kitchen_do_cancellable_async(const char* input, weaveffi_cancel_token* cancel_token, weaveffi_kitchen_do_cancellable_callback callback, void* context);
+__attribute__((deprecated("Use new_op instead")))
+int32_t weaveffi_kitchen_legacy_op(weaveffi_error* out_err);
+int32_t weaveffi_kitchen_new_op(weaveffi_error* out_err);
+// Module: kitchen_nested
+const char* weaveffi_kitchen_nested_hello(weaveffi_error* out_err);
+
+
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // WEAVEFFI_H

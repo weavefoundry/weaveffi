@@ -359,6 +359,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
+name = "console"
+version = "0.16.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d64e8af5551369d19cf50138de61f1c42074ab970f74e99be916646777f8fc87"
+dependencies = [
+ "encode_unicode",
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
 name = "contacts"
 version = "0.1.0"
 dependencies = [
@@ -524,6 +535,12 @@ name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
+
+[[package]]
+name = "encode_unicode"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34aa73646ffb006b8f5147f3dc182bd4bcb190227ce861fc4a4844bf8e3cb2c0"
 
 [[package]]
 name = "equivalent"
@@ -846,6 +863,19 @@ dependencies = [
  "hashbrown 0.16.1",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "insta"
+version = "1.47.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b4a6248eb93a4401ed2f37dfe8ea592d3cf05b7cf4f8efa867b6895af7e094e"
+dependencies = [
+ "console",
+ "once_cell",
+ "serde",
+ "similar",
+ "tempfile",
 ]
 
 [[package]]
@@ -2038,6 +2068,7 @@ dependencies = [
  "clap_complete",
  "color-eyre",
  "criterion",
+ "insta",
  "miette",
  "predicates",
  "quote",
@@ -2087,6 +2118,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "camino",
+ "insta",
  "tempfile",
  "weaveffi-core",
  "weaveffi-ir",
@@ -2099,6 +2131,7 @@ dependencies = [
  "anyhow",
  "camino",
  "heck",
+ "insta",
  "tempfile",
  "weaveffi-core",
  "weaveffi-ir",
@@ -2111,6 +2144,7 @@ dependencies = [
  "anyhow",
  "camino",
  "heck",
+ "insta",
  "weaveffi-core",
  "weaveffi-ir",
 ]
@@ -2122,6 +2156,7 @@ dependencies = [
  "anyhow",
  "camino",
  "heck",
+ "insta",
  "weaveffi-core",
  "weaveffi-ir",
 ]
@@ -2133,6 +2168,7 @@ dependencies = [
  "anyhow",
  "camino",
  "heck",
+ "insta",
  "tempfile",
  "weaveffi-core",
  "weaveffi-ir",
@@ -2145,6 +2181,7 @@ dependencies = [
  "anyhow",
  "camino",
  "heck",
+ "insta",
  "weaveffi-core",
  "weaveffi-ir",
 ]
@@ -2156,6 +2193,7 @@ dependencies = [
  "anyhow",
  "camino",
  "heck",
+ "insta",
  "weaveffi-core",
  "weaveffi-ir",
 ]
@@ -2166,6 +2204,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "camino",
+ "insta",
  "tempfile",
  "weaveffi-core",
  "weaveffi-ir",
@@ -2178,6 +2217,7 @@ dependencies = [
  "anyhow",
  "camino",
  "heck",
+ "insta",
  "tempfile",
  "weaveffi-core",
  "weaveffi-ir",
@@ -2190,6 +2230,7 @@ dependencies = [
  "anyhow",
  "camino",
  "heck",
+ "insta",
  "weaveffi-core",
  "weaveffi-ir",
 ]
@@ -2201,6 +2242,7 @@ dependencies = [
  "anyhow",
  "camino",
  "heck",
+ "insta",
  "weaveffi-core",
  "weaveffi-ir",
 ]

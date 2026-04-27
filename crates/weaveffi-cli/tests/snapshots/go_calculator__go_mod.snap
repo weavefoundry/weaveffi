@@ -1,0 +1,6 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+module weaveffi
+
+go 1.21

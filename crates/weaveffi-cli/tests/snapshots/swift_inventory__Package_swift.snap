@@ -1,0 +1,16 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+// swift-tools-version:5.7
+import PackageDescription
+
+let package = Package(
+    name: "WeaveFFI",
+    products: [
+        .library(name: "WeaveFFI", targets: ["WeaveFFI"]),
+    ],
+    targets: [
+        .systemLibrary(name: "CWeaveFFI"),
+        .target(name: "WeaveFFI", dependencies: ["CWeaveFFI"]),
+    ]
+)

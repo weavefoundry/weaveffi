@@ -1,0 +1,15 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "weaveffi"
+version = "0.1.0"
+description = "Python bindings for WeaveFFI (auto-generated)"
+requires-python = ">=3.8"
+
+[tool.setuptools]
+packages = ["weaveffi"]

@@ -1,0 +1,7 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+cmake_minimum_required(VERSION 3.22)
+project(weaveffi)
+add_library(weaveffi SHARED weaveffi_jni.c)
+target_include_directories(weaveffi PRIVATE ../../../../c)

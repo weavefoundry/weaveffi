@@ -1,0 +1,16 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+// Generated types for WeaveFFI functions
+export interface TaskResult {
+  id: number;
+  value: string;
+  success: boolean;
+}
+// module tasks
+/** Maps to C function: weaveffi_tasks_run_task */
+export function run_task(name: string): Promise<TaskResult>
+/** Maps to C function: weaveffi_tasks_run_batch */
+export function run_batch(names: string[]): Promise<TaskResult[]>
+/** Maps to C function: weaveffi_tasks_cancel_task */
+export function cancel_task(id: number): boolean

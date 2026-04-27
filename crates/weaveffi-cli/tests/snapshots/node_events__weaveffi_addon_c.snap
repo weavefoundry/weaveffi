@@ -1,0 +1,63 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+#include <node_api.h>
+#include "weaveffi.h"
+#include <stdlib.h>
+#include <string.h>
+
+static napi_value Napi_weaveffi_events_send_message(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  size_t text_len;
+  napi_get_value_string_utf8(env, args[0], NULL, 0, &text_len);
+  char* text = (char*)malloc(text_len + 1);
+  napi_get_value_string_utf8(env, args[0], text, text_len + 1, &text_len);
+  weaveffi_error err = {0};
+  weaveffi_events_send_message(text, &err);
+  free(text);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_get_undefined(env, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_events_get_messages(napi_env env, napi_callback_info info) {
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, NULL, NULL, NULL);
+  weaveffi_error err = {0};
+  void* result = weaveffi_events_get_messages(&err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_array(env, &ret);
+  uint32_t iter_idx = 0;
+  const char* iter_item;
+  while (weaveffi_events_GetMessagesIterator_next(result, &iter_item)) {
+    napi_value elem;
+    napi_create_string_utf8(env, iter_item, NAPI_AUTO_LENGTH, &elem);
+    weaveffi_free_string(iter_item);
+    napi_set_element(env, ret, iter_idx++, elem);
+  }
+  weaveffi_events_GetMessagesIterator_destroy(result);
+  return ret;
+}
+
+static napi_value Init(napi_env env, napi_value exports) {
+  napi_property_descriptor props[] = {
+    { "send_message", NULL, Napi_weaveffi_events_send_message, NULL, NULL, NULL, napi_default, NULL },
+    { "get_messages", NULL, Napi_weaveffi_events_get_messages, NULL, NULL, NULL, napi_default, NULL },
+  };
+  napi_define_properties(env, exports, 2, props);
+  return exports;
+}
+
+NAPI_MODULE(NODE_GYP_MODULE_NAME, Init)

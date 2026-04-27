@@ -1,0 +1,61 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+package com.weaveffi
+
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+
+class WeaveFFI {
+    companion object {
+        init { System.loadLibrary("weaveffi") }
+
+        @JvmStatic private external fun run_taskAsync(name: String, callback: Any)
+        @JvmStatic suspend fun run_task(name: String): Long = suspendCancellableCoroutine { cont ->
+            run_taskAsync(name, WeaveContinuation(cont))
+        }
+        @JvmStatic private external fun run_batchAsync(names: Array<String>, callback: Any)
+        @JvmStatic suspend fun run_batch(names: Array<String>): LongArray = suspendCancellableCoroutine { cont ->
+            run_batchAsync(names, WeaveContinuation(cont))
+        }
+        @JvmStatic external fun cancel_task(id: Long): Boolean
+    }
+}
+
+class TaskResult internal constructor(private var handle: Long) : java.io.Closeable {
+    companion object {
+        init { System.loadLibrary("weaveffi") }
+
+        @JvmStatic external fun nativeCreate(id: Long, value: String, success: Boolean): Long
+        @JvmStatic external fun nativeDestroy(handle: Long)
+        @JvmStatic external fun nativeGetId(handle: Long): Long
+        @JvmStatic external fun nativeGetValue(handle: Long): String
+        @JvmStatic external fun nativeGetSuccess(handle: Long): Boolean
+
+        fun create(id: Long, value: String, success: Boolean): TaskResult = TaskResult(nativeCreate(id, value, success))
+    }
+
+    val id: Long get() = nativeGetId(handle)
+    val value: String get() = nativeGetValue(handle)
+    val success: Boolean get() = nativeGetSuccess(handle)
+
+    override fun close() {
+        if (handle != 0L) {
+            nativeDestroy(handle)
+            handle = 0L
+        }
+    }
+
+    protected fun finalize() {
+        close()
+    }
+}
+
+open class WeaveFFIException(val code: Int, message: String) : Exception(message)
+
+internal class WeaveContinuation<T>(private val cont: kotlinx.coroutines.CancellableContinuation<T>) {
+    @Suppress("UNCHECKED_CAST")
+    fun onSuccess(result: Any?) { cont.resume(result as T) }
+    fun onError(message: String) { cont.resumeWithException(RuntimeException(message)) }
+}
