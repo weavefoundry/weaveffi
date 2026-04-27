@@ -16,6 +16,7 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
 miette = { workspace = true }
+schemars = { workspace = true }
 
 [lints]
 workspace = true

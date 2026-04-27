@@ -57,6 +57,8 @@ criterion = { version = "0.5", features = ["html_reports"] }
 tera = "1.20"
 miette = { version = "7", features = ["fancy"] }
 insta = { version = "1", features = ["yaml", "json"] }
+notify = "6"
+schemars = { version = "0.8", features = ["preserve_order"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
