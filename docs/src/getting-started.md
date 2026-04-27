@@ -44,7 +44,7 @@ Open `weaveffi.yml` and replace its contents with an API that has a struct and
 a function:
 
 ```yaml
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: math
     structs:

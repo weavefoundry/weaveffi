@@ -77,7 +77,7 @@ cargo install weaveffi-cli
 2. **Define your API** in a YAML file (e.g. `contacts.yml`):
 
 ```yaml
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: contacts
     structs:

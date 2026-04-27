@@ -20,7 +20,7 @@ rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 Create a file called `greeter.yml`:
 
 ```yaml
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: greeter
     structs:
