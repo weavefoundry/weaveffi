@@ -210,7 +210,7 @@ fn bench_validate_small_api(c: &mut Criterion) {
     c.bench_function("validate_small_api", |b| {
         b.iter(|| {
             let mut api = api.clone();
-            weaveffi_core::validate::validate_api(black_box(&mut api)).unwrap();
+            weaveffi_core::validate::validate_api(black_box(&mut api), None).unwrap();
         });
     });
 }
@@ -220,14 +220,14 @@ fn bench_validate_large_api(c: &mut Criterion) {
     c.bench_function("validate_large_api", |b| {
         b.iter(|| {
             let mut api = api.clone();
-            weaveffi_core::validate::validate_api(black_box(&mut api)).unwrap();
+            weaveffi_core::validate::validate_api(black_box(&mut api), None).unwrap();
         });
     });
 }
 
 fn bench_hash_api(c: &mut Criterion) {
     let mut api = large_api();
-    weaveffi_core::validate::validate_api(&mut api).unwrap();
+    weaveffi_core::validate::validate_api(&mut api, None).unwrap();
     c.bench_function("hash_large_api", |b| {
         b.iter(|| {
             weaveffi_core::cache::hash_api(black_box(&api));

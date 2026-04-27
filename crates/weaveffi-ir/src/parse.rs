@@ -1,23 +1,73 @@
 use crate::ir::Api;
+use miette::{Diagnostic, SourceSpan};
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, Diagnostic)]
 pub enum ParseError {
     #[error("unsupported format: {0}")]
+    #[diagnostic(help("supported formats are 'yaml', 'yml', 'json', and 'toml'"))]
     UnsupportedFormat(String),
     #[error("YAML parse error at line {line}, column {column}: {message}")]
+    #[diagnostic(help(
+        "check YAML indentation, quoting, and that all required fields have valid values"
+    ))]
     Yaml {
         line: usize,
         column: usize,
         message: String,
+        #[source_code]
+        src: String,
+        #[label("here")]
+        span: Option<SourceSpan>,
     },
     #[error("TOML parse error: {message}")]
-    Toml { message: String },
+    #[diagnostic(help(
+        "check TOML syntax: keys, table headers, and that values use the correct types"
+    ))]
+    Toml {
+        message: String,
+        #[source_code]
+        src: String,
+        #[label("here")]
+        span: Option<SourceSpan>,
+    },
     #[error("JSON parse error at line {line}, column {column}: {message}")]
+    #[diagnostic(help(
+        "check JSON syntax: matching braces/brackets, quoted keys, and trailing commas"
+    ))]
     Json {
         line: usize,
         column: usize,
         message: String,
+        #[source_code]
+        src: String,
+        #[label("here")]
+        span: Option<SourceSpan>,
     },
+}
+
+/// Convert a 1-indexed `(line, col)` pair into a 0-indexed byte offset within
+/// `src`. Returns `0` when either coordinate is `0` (i.e., unknown), and
+/// clamps to `src.len()` when the requested location is past the end.
+pub fn line_col_to_offset(src: &str, line: usize, col: usize) -> usize {
+    if line == 0 {
+        return 0;
+    }
+    let line_idx = line - 1;
+    let col_idx = col.saturating_sub(1);
+
+    let mut start = 0usize;
+    for (i, l) in src.split('\n').enumerate() {
+        if i == line_idx {
+            let line_offset = l
+                .char_indices()
+                .nth(col_idx)
+                .map(|(b, _)| b)
+                .unwrap_or(l.len());
+            return (start + line_offset).min(src.len());
+        }
+        start += l.len() + 1;
+    }
+    src.len()
 }
 
 pub fn parse_api_str(s: &str, format: &str) -> Result<Api, ParseError> {
@@ -27,19 +77,48 @@ pub fn parse_api_str(s: &str, format: &str) -> Result<Api, ParseError> {
                 .location()
                 .map(|m| (m.line(), m.column()))
                 .unwrap_or((0, 0));
+            let span = if line > 0 && column > 0 {
+                Some(SourceSpan::new(
+                    line_col_to_offset(s, line, column).into(),
+                    1,
+                ))
+            } else {
+                None
+            };
             ParseError::Yaml {
                 line,
                 column,
                 message: e.to_string(),
+                src: s.to_string(),
+                span,
             }
         }),
-        "json" => serde_json::from_str(s).map_err(|e| ParseError::Json {
-            line: e.line(),
-            column: e.column(),
-            message: e.to_string(),
+        "json" => serde_json::from_str(s).map_err(|e| {
+            let line = e.line();
+            let column = e.column();
+            let span = if line > 0 && column > 0 {
+                Some(SourceSpan::new(
+                    line_col_to_offset(s, line, column).into(),
+                    1,
+                ))
+            } else {
+                None
+            };
+            ParseError::Json {
+                line,
+                column,
+                message: e.to_string(),
+                src: s.to_string(),
+                span,
+            }
         }),
-        "toml" => toml::from_str(s).map_err(|e| ParseError::Toml {
-            message: e.to_string(),
+        "toml" => toml::from_str(s).map_err(|e| {
+            let span = e.span().map(|r| SourceSpan::new(r.start.into(), r.len()));
+            ParseError::Toml {
+                message: e.to_string(),
+                src: s.to_string(),
+                span,
+            }
         }),
         other => Err(ParseError::UnsupportedFormat(other.to_string())),
     }
@@ -225,6 +304,63 @@ modules:
     fn unsupported_format_returns_error() {
         let err = parse_api_str("{}", "xml").unwrap_err();
         assert!(matches!(err, ParseError::UnsupportedFormat(f) if f == "xml"));
+    }
+
+    #[test]
+    fn line_col_to_offset_basic() {
+        let src = "abc\ndefg\nhi";
+        assert_eq!(line_col_to_offset(src, 1, 1), 0);
+        assert_eq!(line_col_to_offset(src, 1, 3), 2);
+        assert_eq!(line_col_to_offset(src, 2, 1), 4);
+        assert_eq!(line_col_to_offset(src, 2, 4), 7);
+        assert_eq!(line_col_to_offset(src, 3, 2), 10);
+    }
+
+    #[test]
+    fn line_col_to_offset_unknown_returns_zero() {
+        assert_eq!(line_col_to_offset("anything", 0, 0), 0);
+        assert_eq!(line_col_to_offset("anything", 0, 5), 0);
+    }
+
+    #[test]
+    fn line_col_to_offset_clamps_past_end() {
+        let src = "abc";
+        assert_eq!(line_col_to_offset(src, 99, 99), src.len());
+    }
+
+    #[test]
+    fn yaml_parse_error_carries_span() {
+        let bad = "version: [unterminated\n";
+        let err = parse_api_str(bad, "yaml").unwrap_err();
+        match err {
+            ParseError::Yaml {
+                line, column, span, ..
+            } => {
+                assert!(line >= 1);
+                assert!(column >= 1);
+                assert!(span.is_some(), "expected span on yaml error");
+            }
+            other => panic!("expected ParseError::Yaml, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_parse_error_carries_span() {
+        let bad = "{ invalid }";
+        let err = parse_api_str(bad, "json").unwrap_err();
+        assert!(matches!(err, ParseError::Json { .. }));
+    }
+
+    #[test]
+    fn toml_parse_error_carries_source() {
+        let bad = "version = [unterminated\n";
+        let err = parse_api_str(bad, "toml").unwrap_err();
+        match err {
+            ParseError::Toml { src, .. } => {
+                assert!(!src.is_empty());
+            }
+            other => panic!("expected ParseError::Toml, got {other:?}"),
+        }
     }
 
     #[test]
