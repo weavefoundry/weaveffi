@@ -1,0 +1,415 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+import CWeaveFFI
+import Foundation
+
+public enum WeaveFFIError: Error, LocalizedError {
+    case error(code: Int32, message: String)
+    /// No entry exists for the requested key
+    case keyNotFound
+    /// The entry exists but its TTL has elapsed
+    case expired
+    /// The store has reached its capacity limit
+    case storeFull
+    /// Underlying storage reported an I/O failure
+    case ioError
+    public var errorDescription: String? {
+        switch self {
+        case let .error(_, message): return message
+        case .keyNotFound: return "Key not found"
+        case .expired: return "Entry expired"
+        case .storeFull: return "Store is full"
+        case .ioError: return "I/O error"
+        }
+    }
+    public var errorCode: Int32 {
+        switch self {
+        case let .error(code, _): return code
+        case .keyNotFound: return 1001
+        case .expired: return 1002
+        case .storeFull: return 1003
+        case .ioError: return 1004
+        }
+    }
+}
+
+@inline(__always)
+func check(_ err: inout weaveffi_error) throws {
+    if err.code != 0 {
+        let code = err.code
+        let message = err.message.flatMap { String(cString: $0) } ?? ""
+        weaveffi_error_clear(&err)
+        switch code {
+        case 1001: throw WeaveFFIError.keyNotFound
+        case 1002: throw WeaveFFIError.expired
+        case 1003: throw WeaveFFIError.storeFull
+        case 1004: throw WeaveFFIError.ioError
+        default: throw WeaveFFIError.error(code: code, message: message)
+        }
+    }
+}
+
+@inline(__always)
+func withOptionalPointer<T, R>(to value: T?, _ body: (UnsafePointer<T>?) throws -> R) rethrows -> R {
+    guard let value = value else { return try body(nil) }
+    return try withUnsafePointer(to: value) { try body($0) }
+}
+
+private final class ContinuationRef<T> {
+    let value: CheckedContinuation<T, Error>
+    init(_ value: CheckedContinuation<T, Error>) { self.value = value }
+}
+
+/// Persistence semantics applied to a stored entry
+public enum EntryKind: Int32 {
+    /// In-memory only; lost on close
+    case volatile = 0
+    /// Flushed to durable storage
+    case persistent = 1
+    /// Persistent and encrypted at rest
+    case encrypted = 2
+}
+
+/// Opaque key-value store handle target type
+public class Store {
+    let ptr: OpaquePointer
+
+    init(ptr: OpaquePointer) {
+        self.ptr = ptr
+    }
+
+    deinit {
+        weaveffi_kv_Store_destroy(ptr)
+    }
+
+    /// Internal store identifier
+    public var id: Int64 {
+        return weaveffi_kv_Store_get_id(ptr)
+    }
+}
+
+/// A single key-value entry persisted in the store
+public class Entry {
+    let ptr: OpaquePointer
+
+    init(ptr: OpaquePointer) {
+        self.ptr = ptr
+    }
+
+    deinit {
+        weaveffi_kv_Entry_destroy(ptr)
+    }
+
+    /// Stable monotonic identifier assigned on insert
+    public var id: Int64 {
+        return weaveffi_kv_Entry_get_id(ptr)
+    }
+
+    /// UTF-8 lookup key
+    public var key: String {
+        let raw = weaveffi_kv_Entry_get_key(ptr)
+        guard let raw = raw else { return "" }
+        defer { weaveffi_free_string(raw) }
+        return String(cString: raw)
+    }
+
+    /// Opaque binary payload
+    public var value: Data {
+        var outLen: Int = 0
+        let raw = weaveffi_kv_Entry_get_value(ptr, &outLen)
+        guard let raw = raw else { return Data() }
+        defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: raw), outLen) }
+        return Data(bytes: raw, count: outLen)
+    }
+
+    /// Unix-timestamp seconds when the entry was created
+    public var created_at: Int64 {
+        return weaveffi_kv_Entry_get_created_at(ptr)
+    }
+
+    /// Optional unix-timestamp seconds at which the entry expires
+    public var expires_at: Int64? {
+        let p = weaveffi_kv_Entry_get_expires_at(ptr)
+        return p?.pointee
+    }
+
+    /// Free-form labels attached to the entry
+    public var tags: [String] {
+        var outLen: Int = 0
+        let rv = weaveffi_kv_Entry_get_tags(ptr, &outLen)
+        guard let rv = rv else { return [] }
+        return Array(UnsafeBufferPointer(start: rv, count: outLen))
+    }
+
+    /// Arbitrary string-valued metadata pairs
+    public var metadata: [String: String] {
+        return weaveffi_kv_Entry_get_metadata(ptr)
+    }
+}
+
+/// A single key-value entry persisted in the store
+public class EntryBuilder {
+    private var _id: Int64?
+    private var _key: String?
+    private var _value: Data?
+    private var _created_at: Int64?
+    private var _expires_at: Int64??
+    private var _tags: [String]?
+    private var _metadata: [String: String]?
+
+    public init() {}
+
+    /// Stable monotonic identifier assigned on insert
+    @discardableResult
+    public func withId(_ value: Int64) -> Self {
+        self._id = value
+        return self
+    }
+
+    /// UTF-8 lookup key
+    @discardableResult
+    public func withKey(_ value: String) -> Self {
+        self._key = value
+        return self
+    }
+
+    /// Opaque binary payload
+    @discardableResult
+    public func withValue(_ value: Data) -> Self {
+        self._value = value
+        return self
+    }
+
+    /// Unix-timestamp seconds when the entry was created
+    @discardableResult
+    public func withCreatedAt(_ value: Int64) -> Self {
+        self._created_at = value
+        return self
+    }
+
+    /// Optional unix-timestamp seconds at which the entry expires
+    @discardableResult
+    public func withExpiresAt(_ value: Int64?) -> Self {
+        self._expires_at = value
+        return self
+    }
+
+    /// Free-form labels attached to the entry
+    @discardableResult
+    public func withTags(_ value: [String]) -> Self {
+        self._tags = value
+        return self
+    }
+
+    /// Arbitrary string-valued metadata pairs
+    @discardableResult
+    public func withMetadata(_ value: [String: String]) -> Self {
+        self._metadata = value
+        return self
+    }
+
+    public func build() throws -> Entry {
+        guard let id = _id else { fatalError("missing field: id") }
+        guard let key = _key else { fatalError("missing field: key") }
+        guard let value = _value else { fatalError("missing field: value") }
+        guard let created_at = _created_at else { fatalError("missing field: created_at") }
+        guard let expires_at = _expires_at else { fatalError("missing field: expires_at") }
+        guard let tags = _tags else { fatalError("missing field: tags") }
+        guard let metadata = _metadata else { fatalError("missing field: metadata") }
+        var err = weaveffi_error(code: 0, message: nil)
+        let key_bytes = Array(key.utf8)
+        let value_bytes = Array(value)
+        let metadata_keys = Array(metadata.keys)
+        let metadata_values = metadata_keys.map { metadata[$0]! }
+        let result: OpaquePointer? = key_bytes.withUnsafeBufferPointer { key_buf in
+            let key_ptr = key_buf.baseAddress!
+            let key_len = key_buf.count
+            value_bytes.withUnsafeBufferPointer { value_buf in
+                let value_ptr = value_buf.baseAddress!
+                let value_len = value_buf.count
+                withOptionalPointer(to: expires_at) { expires_at_ptr in
+                    tags.withUnsafeBufferPointer { tags_buf in
+                        let tags_ptr = tags_buf.baseAddress
+                        let tags_len = tags_buf.count
+                        metadata_keys.withUnsafeBufferPointer { metadata_keys_buf in
+                            let metadata_keys_ptr = metadata_keys_buf.baseAddress
+                            metadata_values.withUnsafeBufferPointer { metadata_values_buf in
+                                let metadata_values_ptr = metadata_values_buf.baseAddress
+                                let metadata_len = metadata_values_buf.count
+                                    return weaveffi_kv_Entry_create(id, key_ptr, key_len, value_ptr, value_len, created_at, expires_at_ptr, tags_ptr, tags_len, metadata_keys_ptr, metadata_values_ptr, metadata_len, &err)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        try check(&err)
+        guard let result = result else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
+        return Entry(ptr: result)
+    }
+}
+
+/// Aggregate store statistics
+public class Stats {
+    let ptr: OpaquePointer
+
+    init(ptr: OpaquePointer) {
+        self.ptr = ptr
+    }
+
+    deinit {
+        weaveffi_kv_stats_Stats_destroy(ptr)
+    }
+
+    /// Number of live entries
+    public var total_entries: Int64 {
+        return weaveffi_kv_stats_Stats_get_total_entries(ptr)
+    }
+
+    /// Sum of all value byte lengths
+    public var total_bytes: Int64 {
+        return weaveffi_kv_stats_Stats_get_total_bytes(ptr)
+    }
+
+    /// Number of entries past their TTL but not yet evicted
+    public var expired_entries: Int64 {
+        return weaveffi_kv_stats_Stats_get_expired_entries(ptr)
+    }
+}
+
+public enum Kv {
+    /// Open (or create) a store backed by the given filesystem path
+    public static func open_store(_ path: String) throws -> Store {
+        var err = weaveffi_error(code: 0, message: nil)
+        let path_bytes = Array(path.utf8)
+        let result: OpaquePointer? = path_bytes.withUnsafeBufferPointer { path_buf in
+            let path_ptr = path_buf.baseAddress!
+            let path_len = path_buf.count
+                return weaveffi_kv_open_store(path_ptr, path_len, &err)
+        }
+        try check(&err)
+        guard let result = result else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
+        return Store(ptr: result)
+    }
+    /// Close the store and release all in-memory resources
+    public static func close_store(_ store: Store) throws -> Void {
+        var err = weaveffi_error(code: 0, message: nil)
+        weaveffi_kv_close_store(store.ptr, &err)
+        try check(&err)
+    }
+    /// Insert or replace a value, returning true on success
+    public static func put(_ store: Store, _ key: String, _ value: Data, _ kind: EntryKind, _ ttl_seconds: Int64?) throws -> Bool {
+        var err = weaveffi_error(code: 0, message: nil)
+        let key_bytes = Array(key.utf8)
+        let value_bytes = Array(value)
+        let result: Bool = key_bytes.withUnsafeBufferPointer { key_buf in
+            let key_ptr = key_buf.baseAddress!
+            let key_len = key_buf.count
+            value_bytes.withUnsafeBufferPointer { value_buf in
+                let value_ptr = value_buf.baseAddress!
+                let value_len = value_buf.count
+                withOptionalPointer(to: ttl_seconds) { ttl_seconds_ptr in
+                        return weaveffi_kv_put(store.ptr, key_ptr, key_len, value_ptr, value_len, weaveffi_kv_EntryKind(kind.rawValue), ttl_seconds_ptr, &err)
+                }
+            }
+        }
+        try check(&err)
+        return result
+    }
+    /// Look up an entry by key; returns null if missing or expired
+    public static func get(_ store: Store, _ key: String) throws -> Entry? {
+        var err = weaveffi_error(code: 0, message: nil)
+        let key_bytes = Array(key.utf8)
+        let result: Entry? = key_bytes.withUnsafeBufferPointer { key_buf in
+            let key_ptr = key_buf.baseAddress!
+            let key_len = key_buf.count
+                let rv = weaveffi_kv_get(store.ptr, key_ptr, key_len, &err)
+                try check(&err)
+                return rv.map { Entry(ptr: $0) }
+        }
+        return result
+    }
+    /// Remove the entry for the given key, returning true if it existed
+    public static func delete(_ store: Store, _ key: String) throws -> Bool {
+        var err = weaveffi_error(code: 0, message: nil)
+        let key_bytes = Array(key.utf8)
+        let result: Bool = key_bytes.withUnsafeBufferPointer { key_buf in
+            let key_ptr = key_buf.baseAddress!
+            let key_len = key_buf.count
+                return weaveffi_kv_delete(store.ptr, key_ptr, key_len, &err)
+        }
+        try check(&err)
+        return result
+    }
+    /// Stream every key, optionally filtered by a prefix
+    public static func list_keys(_ store: Store, _ prefix: String?) throws -> [String] {
+        var err = weaveffi_error(code: 0, message: nil)
+        let iter = weaveffi_kv_list_keys(store.ptr, prefix_ptr, prefix_len, &err)
+        try check(&err)
+        guard let iter = iter else { return [] }
+        var items: [String] = []
+        while let ptr = weaveffi_kv_ListKeysIterator_next(iter) {
+            items.append(String(cString: ptr))
+        }
+        weaveffi_kv_ListKeysIterator_destroy(iter)
+        return items
+    }
+    /// Return the number of live entries in the store
+    public static func count(_ store: Store) throws -> Int64 {
+        var err = weaveffi_error(code: 0, message: nil)
+        let rv = weaveffi_kv_count(store.ptr, &err)
+        try check(&err)
+        return rv
+    }
+    /// Drop every entry from the store
+    public static func clear(_ store: Store) throws -> Void {
+        var err = weaveffi_error(code: 0, message: nil)
+        weaveffi_kv_clear(store.ptr, &err)
+        try check(&err)
+    }
+    /// Reclaim space asynchronously; returns the number of bytes reclaimed
+    public static func compact_async(_ store: Store) async throws -> Int64 {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Int64, Error>) in
+            let ctx = Unmanaged.passRetained(ContinuationRef(continuation)).toOpaque()
+            weaveffi_kv_compact_async_async(store.ptr, nil, { context, err, result in
+                let contRef = Unmanaged<ContinuationRef<Int64>>.fromOpaque(context!).takeRetainedValue()
+                if let err = err, err.pointee.code != 0 {
+                    let code = err.pointee.code
+                    let msg = err.pointee.message.flatMap { String(cString: $0) } ?? ""
+                    contRef.value.resume(throwing: WeaveFFIError.error(code: code, message: msg))
+                } else {
+                    contRef.value.resume(returning: result)
+                }
+            }, ctx)
+        }
+    }
+    /// Legacy single-shot put kept for compatibility
+    @available(*, deprecated, message: "use put() with explicit kind")
+    public static func legacy_put(_ store: Store, _ key: String, _ value: Data) throws -> Bool {
+        var err = weaveffi_error(code: 0, message: nil)
+        let key_bytes = Array(key.utf8)
+        let value_bytes = Array(value)
+        let result: Bool = key_bytes.withUnsafeBufferPointer { key_buf in
+            let key_ptr = key_buf.baseAddress!
+            let key_len = key_buf.count
+            value_bytes.withUnsafeBufferPointer { value_buf in
+                let value_ptr = value_buf.baseAddress!
+                let value_len = value_buf.count
+                    return weaveffi_kv_legacy_put(store.ptr, key_ptr, key_len, value_ptr, value_len, &err)
+            }
+        }
+        try check(&err)
+        return result
+    }
+    public enum Stats {
+        /// Snapshot the current store statistics
+        public static func get_stats(_ store: Store) throws -> Stats {
+            var err = weaveffi_error(code: 0, message: nil)
+            let rv = weaveffi_kv_stats_get_stats(store.ptr, &err)
+            try check(&err)
+            guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
+            return Stats(ptr: rv)
+        }
+    }
+}

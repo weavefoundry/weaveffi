@@ -1,0 +1,538 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+"""WeaveFFI Python ctypes bindings (auto-generated)"""
+import contextlib
+import ctypes
+import platform
+from enum import IntEnum
+from typing import Dict, Iterator, List, Optional
+
+
+class WeaveffiError(Exception):
+    def __init__(self, code: int, message: str) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(f"({code}) {message}")
+
+
+class _WeaveffiErrorStruct(ctypes.Structure):
+    _fields_ = [
+        ("code", ctypes.c_int32),
+        ("message", ctypes.c_char_p),
+    ]
+
+
+def _load_library() -> ctypes.CDLL:
+    system = platform.system()
+    if system == "Darwin":
+        name = "libweaveffi.dylib"
+    elif system == "Windows":
+        name = "weaveffi.dll"
+    else:
+        name = "libweaveffi.so"
+    return ctypes.CDLL(name)
+
+
+_lib = _load_library()
+_lib.weaveffi_error_clear.argtypes = [ctypes.POINTER(_WeaveffiErrorStruct)]
+_lib.weaveffi_error_clear.restype = None
+_lib.weaveffi_free_string.argtypes = [ctypes.c_char_p]
+_lib.weaveffi_free_string.restype = None
+_lib.weaveffi_free_bytes.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t]
+_lib.weaveffi_free_bytes.restype = None
+
+
+def _check_error(err: _WeaveffiErrorStruct) -> None:
+    if err.code != 0:
+        code = err.code
+        message = err.message.decode("utf-8") if err.message else ""
+        _lib.weaveffi_error_clear(ctypes.byref(err))
+        raise WeaveffiError(code, message)
+
+
+class _PointerGuard(contextlib.AbstractContextManager):
+    def __init__(self, ptr, free_fn) -> None:
+        self.ptr = ptr
+        self._free_fn = free_fn
+
+    def __exit__(self, *exc) -> bool:
+        if self.ptr is not None:
+            self._free_fn(self.ptr)
+            self.ptr = None
+        return False
+
+
+def _string_to_bytes(s: Optional[str]) -> Optional[bytes]:
+    if s is None:
+        return None
+    return s.encode("utf-8")
+
+
+def _bytes_to_string(ptr) -> Optional[str]:
+    if ptr is None:
+        return None
+    return ptr.decode("utf-8")
+
+import asyncio
+import threading
+
+
+# === Module: kv ===
+
+class EntryKind(IntEnum):
+    """Persistence semantics applied to a stored entry"""
+    # In-memory only; lost on close
+    Volatile = 0
+    # Flushed to durable storage
+    Persistent = 1
+    # Persistent and encrypted at rest
+    Encrypted = 2
+
+
+class Store:
+    """Opaque key-value store handle target type"""
+
+    def __init__(self, _ptr: int) -> None:
+        self._ptr = _ptr
+
+    def __del__(self) -> None:
+        if self._ptr is not None:
+            _lib.weaveffi_kv_Store_destroy.argtypes = [ctypes.c_void_p]
+            _lib.weaveffi_kv_Store_destroy.restype = None
+            _lib.weaveffi_kv_Store_destroy(self._ptr)
+            self._ptr = None
+
+    @property
+    def id(self) -> int:
+        """Internal store identifier"""
+        _fn = _lib.weaveffi_kv_Store_get_id
+        _fn.argtypes = [ctypes.c_void_p]
+        _fn.restype = ctypes.c_int64
+        _result = _fn(self._ptr)
+        return _result
+
+
+
+class Entry:
+    """A single key-value entry persisted in the store"""
+
+    def __init__(self, _ptr: int) -> None:
+        self._ptr = _ptr
+
+    def __del__(self) -> None:
+        if self._ptr is not None:
+            _lib.weaveffi_kv_Entry_destroy.argtypes = [ctypes.c_void_p]
+            _lib.weaveffi_kv_Entry_destroy.restype = None
+            _lib.weaveffi_kv_Entry_destroy(self._ptr)
+            self._ptr = None
+
+    @property
+    def id(self) -> int:
+        """Stable monotonic identifier assigned on insert"""
+        _fn = _lib.weaveffi_kv_Entry_get_id
+        _fn.argtypes = [ctypes.c_void_p]
+        _fn.restype = ctypes.c_int64
+        _result = _fn(self._ptr)
+        return _result
+
+
+    @property
+    def key(self) -> str:
+        """UTF-8 lookup key"""
+        _fn = _lib.weaveffi_kv_Entry_get_key
+        _fn.argtypes = [ctypes.c_void_p]
+        _fn.restype = ctypes.c_char_p
+        _result = _fn(self._ptr)
+        return _bytes_to_string(_result) or ""
+
+
+    @property
+    def value(self) -> bytes:
+        """Opaque binary payload"""
+        _fn = _lib.weaveffi_kv_Entry_get_value
+        _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
+        _fn.restype = ctypes.POINTER(ctypes.c_uint8)
+        _out_len = ctypes.c_size_t(0)
+        _result = _fn(self._ptr, ctypes.byref(_out_len))
+        if not _result:
+            return b""
+        return bytes(_result[:_out_len.value])
+
+
+    @property
+    def created_at(self) -> int:
+        """Unix-timestamp seconds when the entry was created"""
+        _fn = _lib.weaveffi_kv_Entry_get_created_at
+        _fn.argtypes = [ctypes.c_void_p]
+        _fn.restype = ctypes.c_int64
+        _result = _fn(self._ptr)
+        return _result
+
+
+    @property
+    def expires_at(self) -> Optional[int]:
+        """Optional unix-timestamp seconds at which the entry expires"""
+        _fn = _lib.weaveffi_kv_Entry_get_expires_at
+        _fn.argtypes = [ctypes.c_void_p]
+        _fn.restype = ctypes.POINTER(ctypes.c_int64)
+        _result = _fn(self._ptr)
+        if not _result:
+            return None
+        return _result[0]
+
+
+    @property
+    def tags(self) -> List[str]:
+        """Free-form labels attached to the entry"""
+        _fn = _lib.weaveffi_kv_Entry_get_tags
+        _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
+        _fn.restype = ctypes.POINTER(ctypes.c_char_p)
+        _out_len = ctypes.c_size_t(0)
+        _result = _fn(self._ptr, ctypes.byref(_out_len))
+        if not _result:
+            return []
+        return [_bytes_to_string(_result[_i]) for _i in range(_out_len.value)]
+
+
+    @property
+    def metadata(self) -> Dict[str, str]:
+        """Arbitrary string-valued metadata pairs"""
+        _fn = _lib.weaveffi_kv_Entry_get_metadata
+        _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.POINTER(ctypes.c_char_p)), ctypes.POINTER(ctypes.POINTER(ctypes.c_char_p)), ctypes.POINTER(ctypes.c_size_t)]
+        _fn.restype = None
+        _out_keys = ctypes.POINTER(ctypes.c_char_p)()
+        _out_values = ctypes.POINTER(ctypes.c_char_p)()
+        _out_len = ctypes.c_size_t(0)
+        _fn(self._ptr, ctypes.byref(_out_keys), ctypes.byref(_out_values), ctypes.byref(_out_len))
+        if not _out_keys or not _out_values:
+            return {}
+        return {_bytes_to_string(_out_keys[_i]): _bytes_to_string(_out_values[_i]) for _i in range(_out_len.value)}
+
+
+
+class EntryBuilder:
+    """A single key-value entry persisted in the store"""
+    def __init__(self) -> None:
+        self._id: Optional[int] = None
+        self._key: Optional[str] = None
+        self._value: Optional[bytes] = None
+        self._created_at: Optional[int] = None
+        self._expires_at: Optional[Optional[int]] = None
+        self._tags: Optional[List[str]] = None
+        self._metadata: Optional[Dict[str, str]] = None
+
+    def with_id(self, value: int) -> "EntryBuilder":
+        """Stable monotonic identifier assigned on insert"""
+        self._id = value
+        return self
+
+    def with_key(self, value: str) -> "EntryBuilder":
+        """UTF-8 lookup key"""
+        self._key = value
+        return self
+
+    def with_value(self, value: bytes) -> "EntryBuilder":
+        """Opaque binary payload"""
+        self._value = value
+        return self
+
+    def with_created_at(self, value: int) -> "EntryBuilder":
+        """Unix-timestamp seconds when the entry was created"""
+        self._created_at = value
+        return self
+
+    def with_expires_at(self, value: Optional[int]) -> "EntryBuilder":
+        """Optional unix-timestamp seconds at which the entry expires"""
+        self._expires_at = value
+        return self
+
+    def with_tags(self, value: List[str]) -> "EntryBuilder":
+        """Free-form labels attached to the entry"""
+        self._tags = value
+        return self
+
+    def with_metadata(self, value: Dict[str, str]) -> "EntryBuilder":
+        """Arbitrary string-valued metadata pairs"""
+        self._metadata = value
+        return self
+
+    def build(self) -> "Entry":
+        if self._id is None:
+            raise ValueError("missing field: id")
+        if self._key is None:
+            raise ValueError("missing field: key")
+        if self._value is None:
+            raise ValueError("missing field: value")
+        if self._created_at is None:
+            raise ValueError("missing field: created_at")
+        if self._expires_at is None:
+            raise ValueError("missing field: expires_at")
+        if self._tags is None:
+            raise ValueError("missing field: tags")
+        if self._metadata is None:
+            raise ValueError("missing field: metadata")
+        raise NotImplementedError("EntryBuilder.build requires FFI backing")
+
+
+def open_store(path: str) -> "Store":
+    """Open (or create) a store backed by the given filesystem path
+    """
+    _fn = _lib.weaveffi_kv_open_store
+    _fn.argtypes = [ctypes.c_char_p, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.restype = ctypes.c_void_p
+    _err = _WeaveffiErrorStruct()
+    _result = _fn(_string_to_bytes(path), ctypes.byref(_err))
+    _check_error(_err)
+    if _result is None:
+        raise WeaveffiError(-1, "null pointer")
+    return Store(_result)
+
+
+def close_store(store: "Store") -> None:
+    """Close the store and release all in-memory resources
+    """
+    _fn = _lib.weaveffi_kv_close_store
+    _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.restype = None
+    _err = _WeaveffiErrorStruct()
+    _fn(store._ptr, ctypes.byref(_err))
+    _check_error(_err)
+
+
+def put(store: "Store", key: str, value: bytes, kind: "EntryKind", ttl_seconds: Optional[int]) -> bool:
+    """Insert or replace a value, returning true on success
+    """
+    _fn = _lib.weaveffi_kv_put
+    _fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.c_int32, ctypes.POINTER(ctypes.c_int64), ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.restype = ctypes.c_int32
+    _value_arr = (ctypes.c_uint8 * len(value))(*value)
+    _ttl_seconds_c = ctypes.byref(ctypes.c_int64(ttl_seconds)) if ttl_seconds is not None else None
+    _err = _WeaveffiErrorStruct()
+    _result = _fn(store._ptr, _string_to_bytes(key), _value_arr, len(value), kind.value, _ttl_seconds_c, ctypes.byref(_err))
+    _check_error(_err)
+    return bool(_result)
+
+
+def get(store: "Store", key: str) -> Optional["Entry"]:
+    """Look up an entry by key; returns null if missing or expired
+    """
+    _fn = _lib.weaveffi_kv_get
+    _fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.restype = ctypes.c_void_p
+    _err = _WeaveffiErrorStruct()
+    _result = _fn(store._ptr, _string_to_bytes(key), ctypes.byref(_err))
+    _check_error(_err)
+    if _result is None:
+        return None
+    return Entry(_result)
+
+
+def delete(store: "Store", key: str) -> bool:
+    """Remove the entry for the given key, returning true if it existed
+    """
+    _fn = _lib.weaveffi_kv_delete
+    _fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.restype = ctypes.c_int32
+    _err = _WeaveffiErrorStruct()
+    _result = _fn(store._ptr, _string_to_bytes(key), ctypes.byref(_err))
+    _check_error(_err)
+    return bool(_result)
+
+
+class _ListKeysIterator:
+    def __init__(self, ptr):
+        self._ptr = ptr
+        self._done = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._done:
+            raise StopIteration
+        _next_fn = _lib.weaveffi_kv_ListKeysIterator_next
+        _next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(_WeaveffiErrorStruct)]
+        _next_fn.restype = ctypes.c_int32
+        _out_item = ctypes.c_char_p()
+        _err = _WeaveffiErrorStruct()
+        _has = _next_fn(self._ptr, ctypes.byref(_out_item), ctypes.byref(_err))
+        _check_error(_err)
+        if not _has:
+            self._done = True
+            self._destroy()
+            raise StopIteration
+        return _bytes_to_string(_out_item.value)
+
+    def _destroy(self):
+        if self._ptr is not None:
+            _destroy_fn = _lib.weaveffi_kv_ListKeysIterator_destroy
+            _destroy_fn.argtypes = [ctypes.c_void_p]
+            _destroy_fn.restype = None
+            _destroy_fn(self._ptr)
+            self._ptr = None
+
+    def __del__(self):
+        self._destroy()
+
+
+def list_keys(store: "Store", prefix: Optional[str]) -> Iterator[str]:
+    """Stream every key, optionally filtered by a prefix
+    """
+    _fn = _lib.weaveffi_kv_list_keys
+    _fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.restype = ctypes.c_void_p
+    _prefix_c = _string_to_bytes(prefix)
+    _err = _WeaveffiErrorStruct()
+    _result = _fn(store._ptr, _prefix_c, ctypes.byref(_err))
+    _check_error(_err)
+    _next_fn = _lib.weaveffi_kv_ListKeysIterator_next
+    _next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(_WeaveffiErrorStruct)]
+    _next_fn.restype = ctypes.c_int32
+    _destroy_fn = _lib.weaveffi_kv_ListKeysIterator_destroy
+    _destroy_fn.argtypes = [ctypes.c_void_p]
+    _destroy_fn.restype = None
+    _items = []
+    while True:
+        _out_item = ctypes.c_char_p()
+        _item_err = _WeaveffiErrorStruct()
+        _has = _next_fn(_result, ctypes.byref(_out_item), ctypes.byref(_item_err))
+        _check_error(_item_err)
+        if not _has:
+            break
+        _items.append(_bytes_to_string(_out_item.value))
+    _destroy_fn(_result)
+    return _items
+
+
+def count(store: "Store") -> int:
+    """Return the number of live entries in the store
+    """
+    _fn = _lib.weaveffi_kv_count
+    _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.restype = ctypes.c_int64
+    _err = _WeaveffiErrorStruct()
+    _result = _fn(store._ptr, ctypes.byref(_err))
+    _check_error(_err)
+    return _result
+
+
+def clear(store: "Store") -> None:
+    """Drop every entry from the store
+    """
+    _fn = _lib.weaveffi_kv_clear
+    _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.restype = None
+    _err = _WeaveffiErrorStruct()
+    _fn(store._ptr, ctypes.byref(_err))
+    _check_error(_err)
+
+
+def _compact_async_sync(store: "Store") -> int:
+    """Reclaim space asynchronously; returns the number of bytes reclaimed
+    """
+    _fn = _lib.weaveffi_kv_compact_async_async
+    _ev = threading.Event()
+    _state = {"err": None, "val": None}
+    def _cb_impl(context, err, result):
+        try:
+            if err and err.contents.code != 0:
+                _code = err.contents.code
+                _msg = err.contents.message.decode("utf-8") if err.contents.message else ""
+                _lib.weaveffi_error_clear(ctypes.byref(err.contents))
+                _state["err"] = WeaveffiError(_code, _msg)
+            else:
+            _state["val"] = result
+        finally:
+            _ev.set()
+    _cb_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(_WeaveffiErrorStruct), ctypes.c_int64)
+    _cb = _cb_type(_cb_impl)
+    _fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, _cb_type, ctypes.c_void_p]
+    _fn.restype = None
+    _fn(store._ptr, None, _cb, None)
+    _ev.wait()
+    if _state["err"] is not None:
+        raise _state["err"]
+    return _state["val"]
+
+
+async def compact_async(store: "Store") -> int:
+    """Reclaim space asynchronously; returns the number of bytes reclaimed
+    """
+    _loop = asyncio.get_event_loop()
+    return await _loop.run_in_executor(None, _compact_async_sync, store)
+
+
+def legacy_put(store: "Store", key: str, value: bytes) -> bool:
+    """Legacy single-shot put kept for compatibility
+    """
+    import warnings
+    warnings.warn("use put() with explicit kind", DeprecationWarning, stacklevel=2)
+    _fn = _lib.weaveffi_kv_legacy_put
+    _fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.restype = ctypes.c_int32
+    _value_arr = (ctypes.c_uint8 * len(value))(*value)
+    _err = _WeaveffiErrorStruct()
+    _result = _fn(store._ptr, _string_to_bytes(key), _value_arr, len(value), ctypes.byref(_err))
+    _check_error(_err)
+    return bool(_result)
+
+
+# === Module: kv_stats ===
+
+class Stats:
+    """Aggregate store statistics"""
+
+    def __init__(self, _ptr: int) -> None:
+        self._ptr = _ptr
+
+    def __del__(self) -> None:
+        if self._ptr is not None:
+            _lib.weaveffi_kv_stats_Stats_destroy.argtypes = [ctypes.c_void_p]
+            _lib.weaveffi_kv_stats_Stats_destroy.restype = None
+            _lib.weaveffi_kv_stats_Stats_destroy(self._ptr)
+            self._ptr = None
+
+    @property
+    def total_entries(self) -> int:
+        """Number of live entries"""
+        _fn = _lib.weaveffi_kv_stats_Stats_get_total_entries
+        _fn.argtypes = [ctypes.c_void_p]
+        _fn.restype = ctypes.c_int64
+        _result = _fn(self._ptr)
+        return _result
+
+
+    @property
+    def total_bytes(self) -> int:
+        """Sum of all value byte lengths"""
+        _fn = _lib.weaveffi_kv_stats_Stats_get_total_bytes
+        _fn.argtypes = [ctypes.c_void_p]
+        _fn.restype = ctypes.c_int64
+        _result = _fn(self._ptr)
+        return _result
+
+
+    @property
+    def expired_entries(self) -> int:
+        """Number of entries past their TTL but not yet evicted"""
+        _fn = _lib.weaveffi_kv_stats_Stats_get_expired_entries
+        _fn.argtypes = [ctypes.c_void_p]
+        _fn.restype = ctypes.c_int64
+        _result = _fn(self._ptr)
+        return _result
+
+
+
+def get_stats(store: "Store") -> "Stats":
+    """Snapshot the current store statistics
+    """
+    _fn = _lib.weaveffi_kv_stats_get_stats
+    _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.restype = ctypes.c_void_p
+    _err = _WeaveffiErrorStruct()
+    _result = _fn(store._ptr, ctypes.byref(_err))
+    _check_error(_err)
+    if _result is None:
+        raise WeaveffiError(-1, "null pointer")
+    return Stats(_result)

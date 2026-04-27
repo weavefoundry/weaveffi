@@ -1,0 +1,247 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+// WeaveFFI WASM bindings (auto-generated)
+//
+// Complex type conventions at the WASM boundary:
+//
+//   Structs   -> i64 opaque handle (pointer into linear memory)
+//   Enums     -> i32 discriminant value
+//   Optionals -> 0/null for absent; for numerics a separate _is_present i32 flag
+//   Lists     -> (i32 pointer, i32 length) pair into linear memory
+
+const _encoder = new TextEncoder();
+const _decoder = new TextDecoder();
+
+function _encodeString(wasm, str) {
+  const bytes = _encoder.encode(str);
+  const ptr = wasm.weaveffi_alloc(bytes.length);
+  new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);
+  return [ptr, bytes.length];
+}
+
+function _decodeString(wasm, ptr, len) {
+  return _decoder.decode(new Uint8Array(wasm.memory.buffer, ptr, len));
+}
+
+function _allocError(wasm) {
+  return wasm.weaveffi_alloc(8);
+}
+
+function _checkError(wasm, errPtr) {
+  const buffer = wasm.memory.buffer;
+  const code = new Int32Array(buffer, errPtr, 1)[0];
+  if (code !== 0) {
+    const msgPtr = new Uint32Array(buffer, errPtr + 4, 1)[0];
+    const bytes = new Uint8Array(buffer, msgPtr);
+    let end = 0;
+    while (bytes[end] !== 0) end++;
+    const msg = new TextDecoder().decode(new Uint8Array(buffer, msgPtr, end));
+    wasm.weaveffi_error_clear(errPtr);
+    throw new Error(`WeaveFFI error ${code}: ${msg}`);
+  }
+}
+
+function _registerTrampoline(table, paramTypes, handler) {
+  const idx = table.grow(1);
+  table.set(idx, new WebAssembly.Function(
+    { parameters: paramTypes, results: [] },
+    handler
+  ));
+  return idx;
+}
+
+export const EntryKind = Object.freeze({
+  Volatile: 0,
+  Persistent: 1,
+  Encrypted: 2,
+});
+
+class Store {
+  constructor(wasm, handle) {
+    this._wasm = wasm;
+    this._handle = handle;
+  }
+  get id() {
+    return this._wasm.weaveffi_kv_Store_get_id(this._handle);
+  }
+}
+
+class Entry {
+  constructor(wasm, handle) {
+    this._wasm = wasm;
+    this._handle = handle;
+  }
+  get id() {
+    return this._wasm.weaveffi_kv_Entry_get_id(this._handle);
+  }
+  get key() {
+    const retptr = this._wasm.weaveffi_alloc(8);
+    this._wasm.weaveffi_kv_Entry_get_key(retptr, this._handle);
+    const view = new DataView(this._wasm.memory.buffer);
+    return _decodeString(this._wasm, view.getInt32(retptr, true), view.getInt32(retptr + 4, true));
+  }
+  get value() {
+    return this._wasm.weaveffi_kv_Entry_get_value(this._handle);
+  }
+  get created_at() {
+    return this._wasm.weaveffi_kv_Entry_get_created_at(this._handle);
+  }
+  get expires_at() {
+    return this._wasm.weaveffi_kv_Entry_get_expires_at(this._handle);
+  }
+  get tags() {
+    return this._wasm.weaveffi_kv_Entry_get_tags(this._handle);
+  }
+  get metadata() {
+    return this._wasm.weaveffi_kv_Entry_get_metadata(this._handle);
+  }
+}
+
+class Stats {
+  constructor(wasm, handle) {
+    this._wasm = wasm;
+    this._handle = handle;
+  }
+  get total_entries() {
+    return this._wasm.weaveffi_kv_stats_Stats_get_total_entries(this._handle);
+  }
+  get total_bytes() {
+    return this._wasm.weaveffi_kv_stats_Stats_get_total_bytes(this._handle);
+  }
+  get expired_entries() {
+    return this._wasm.weaveffi_kv_stats_Stats_get_expired_entries(this._handle);
+  }
+}
+
+/**
+ * Load a WeaveFFI WASM module from the given URL.
+ *
+ * @param {string} url - URL to the `.wasm` file.
+ * @returns {Promise<Object>} The API bindings.
+ *
+ * Exported functions follow the C ABI naming convention:
+ *   weaveffi_{module}_{function}(params...) -> result
+ *
+ * @example
+ * const api = await loadWeaveffiWasm('lib.wasm');
+ *
+ * // Primitive: (i32, i32) -> i32
+ * const sum = api.math.add(1, 2);
+ *
+ * // Struct handle: () -> i64 (opaque pointer)
+ * const handle = api.contacts.create();
+ *
+ * // Enum: (i32 discriminant) -> void
+ * api.ui.set_color(0); // 0 = first variant
+ *
+ * // Optional: (i32 is_present, i32 value) -> void
+ * api.config.set_timeout(1, 5000); // present
+ * api.config.set_timeout(0, 0);    // absent
+ *
+ * // List: (i32 pointer, i32 length) -> void
+ * api.data.process(ptr, len);
+ */
+export async function loadWeaveffiWasm(url) {
+  const response = await fetch(url);
+  const bytes = await response.arrayBuffer();
+  const { instance } = await WebAssembly.instantiate(bytes, {});
+  const wasm = instance.exports;
+
+  let _nextCtxId = 1;
+  const _asyncContexts = new Map();
+  const _table = wasm.__indirect_function_table;
+
+  function _asyncHandler(ctxId, errPtr, ...results) {
+    const ctx = _asyncContexts.get(ctxId);
+    if (!ctx) return;
+    _asyncContexts.delete(ctxId);
+    try {
+      if (errPtr !== 0) _checkError(wasm, errPtr);
+      ctx.resolve(ctx.unwrap ? ctx.unwrap(wasm, ...results) : results[0]);
+    } catch (e) {
+      ctx.reject(e);
+    }
+  }
+
+  const _cbPtr_i32_i32_i64 = _registerTrampoline(_table, ['i32', 'i32', 'i64'], _asyncHandler);
+
+  return {
+    _raw: wasm,
+    kv: {
+      open_store(path) {
+        const _err = _allocError(wasm);
+        const [path_ptr, path_len] = _encodeString(wasm, path);
+        const _result = wasm.weaveffi_kv_open_store(path_ptr, path_len, _err);
+        _checkError(wasm, _err);
+        return _result;
+      },
+      close_store(store) {
+        const _err = _allocError(wasm);
+        wasm.weaveffi_kv_close_store(store._handle, _err);
+        _checkError(wasm, _err);
+      },
+      put(store, key, value, kind, ttl_seconds) {
+        const _err = _allocError(wasm);
+        const [key_ptr, key_len] = _encodeString(wasm, key);
+        const _result = wasm.weaveffi_kv_put(store._handle, key_ptr, key_len, value, kind, ttl_seconds, _err);
+        _checkError(wasm, _err);
+        return _result !== 0;
+      },
+      get(store, key) {
+        const _err = _allocError(wasm);
+        const [key_ptr, key_len] = _encodeString(wasm, key);
+        const result = wasm.weaveffi_kv_get(store._handle, key_ptr, key_len, _err);
+        _checkError(wasm, _err);
+        return result === 0n ? null : new Entry(wasm, result);
+      },
+      delete(store, key) {
+        const _err = _allocError(wasm);
+        const [key_ptr, key_len] = _encodeString(wasm, key);
+        const _result = wasm.weaveffi_kv_delete(store._handle, key_ptr, key_len, _err);
+        _checkError(wasm, _err);
+        return _result !== 0;
+      },
+      list_keys(store, prefix) {
+        const _err = _allocError(wasm);
+        const _result = wasm.weaveffi_kv_list_keys(store._handle, prefix, _err);
+        _checkError(wasm, _err);
+        return _result;
+      },
+      count(store) {
+        const _err = _allocError(wasm);
+        const _result = wasm.weaveffi_kv_count(store._handle, _err);
+        _checkError(wasm, _err);
+        return _result;
+      },
+      clear(store) {
+        const _err = _allocError(wasm);
+        wasm.weaveffi_kv_clear(store._handle, _err);
+        _checkError(wasm, _err);
+      },
+      compact_async(store) {
+        return new Promise((resolve, reject) => {
+          const ctxId = _nextCtxId++;
+          _asyncContexts.set(ctxId, { resolve, reject });
+          wasm.weaveffi_kv_compact_async_async(store._handle, 0, _cbPtr_i32_i32_i64, ctxId);
+        }));
+      },
+      /** @deprecated use put() with explicit kind */
+      legacy_put(store, key, value) {
+        const _err = _allocError(wasm);
+        const [key_ptr, key_len] = _encodeString(wasm, key);
+        const _result = wasm.weaveffi_kv_legacy_put(store._handle, key_ptr, key_len, value, _err);
+        _checkError(wasm, _err);
+        return _result !== 0;
+      },
+      stats: {
+        get_stats(store) {
+          const _err = _allocError(wasm);
+          const _result = wasm.weaveffi_kv_stats_get_stats(store._handle, _err);
+          _checkError(wasm, _err);
+          return new Stats(wasm, _result);
+        },
+      },
+    },
+  };
+}

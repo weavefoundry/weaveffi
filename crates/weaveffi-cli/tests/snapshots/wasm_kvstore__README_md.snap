@@ -1,0 +1,227 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+# WeaveFFI WASM (experimental)
+
+This folder contains a minimal stub to help you load a `wasm32-unknown-unknown` build of your WeaveFFI library.
+
+Build (example):
+
+```bash
+cargo build --target wasm32-unknown-unknown --release
+```
+
+Then serve the `.wasm` and use `weaveffi_wasm.js` to load it.
+
+## Complex Type Handling
+
+WASM only supports numeric types natively (`i32`, `i64`, `f32`, `f64`). Complex types are encoded at the boundary as follows:
+
+### Structs
+
+Structs are passed as **opaque handles** (`i64` pointers into linear memory). The host cannot inspect struct fields directly; use the generated accessor functions (`weaveffi_{module}_{struct}_get_{field}`) to read/write fields.
+
+### Enums
+
+Enums are passed as **`i32` values** corresponding to the variant's integer discriminant.
+
+### Optionals
+
+Optional values use **`0` / `null`** to represent the absent case. For numeric optionals, a separate `_is_present` flag (`i32`: 0 or 1) is used. For handle-typed optionals, a null pointer (`0`) signals absence.
+
+### Lists
+
+Lists are passed as a **pointer + length** pair (`i32` pointer, `i32` length) referencing a contiguous region in linear memory. The caller is responsible for allocating and freeing the backing memory.
+
+### Error Handling
+
+The generated JS wrappers automatically handle errors by passing an error
+pointer as the last argument to each WASM function. Your WASM module must
+export the following functions:
+
+- `weaveffi_alloc(size: i32) -> i32` — allocate `size` bytes in linear memory
+- `weaveffi_error_clear(err_ptr: i32)` — clear and free error resources
+
+## API Reference
+
+### Module: `kv`
+
+#### Functions
+
+##### `weaveffi_kv_open_store`
+
+Open (or create) a store backed by the given filesystem path
+
+`weaveffi_kv_open_store(path: i32, i32) -> i64`
+
+| Param | API Type | WASM | Notes |
+|-------|----------|------|-------|
+| `path` | `string` | `i32, i32` | ptr + len in linear memory |
+| _returns_ | `handle` | `i64` | opaque pointer |
+
+##### `weaveffi_kv_close_store`
+
+Close the store and release all in-memory resources
+
+`weaveffi_kv_close_store(store: i64) -> void`
+
+| Param | API Type | WASM | Notes |
+|-------|----------|------|-------|
+| `store` | `handle` | `i64` | opaque pointer |
+
+##### `weaveffi_kv_put`
+
+Insert or replace a value, returning true on success
+
+`weaveffi_kv_put(store: i64, key: i32, i32, value: i32, i32, kind: i32, ttl_seconds: i32, i32) -> i32`
+
+| Param | API Type | WASM | Notes |
+|-------|----------|------|-------|
+| `store` | `handle` | `i64` | opaque pointer |
+| `key` | `string` | `i32, i32` | ptr + len in linear memory |
+| `value` | `bytes` | `i32, i32` | ptr + len in linear memory |
+| `kind` | `EntryKind` | `i32` | variant discriminant |
+| `ttl_seconds` | `i64?` | `i32, i32` | is_present flag + value |
+| _returns_ | `bool` | `i32` | 0 = false, 1 = true |
+
+##### `weaveffi_kv_get`
+
+Look up an entry by key; returns null if missing or expired
+
+`weaveffi_kv_get(store: i64, key: i32, i32) -> i64`
+
+| Param | API Type | WASM | Notes |
+|-------|----------|------|-------|
+| `store` | `handle` | `i64` | opaque pointer |
+| `key` | `string` | `i32, i32` | ptr + len in linear memory |
+| _returns_ | `Entry?` | `i64` | opaque handle, 0 = absent |
+
+##### `weaveffi_kv_delete`
+
+Remove the entry for the given key, returning true if it existed
+
+`weaveffi_kv_delete(store: i64, key: i32, i32) -> i32`
+
+| Param | API Type | WASM | Notes |
+|-------|----------|------|-------|
+| `store` | `handle` | `i64` | opaque pointer |
+| `key` | `string` | `i32, i32` | ptr + len in linear memory |
+| _returns_ | `bool` | `i32` | 0 = false, 1 = true |
+
+##### `weaveffi_kv_list_keys`
+
+Stream every key, optionally filtered by a prefix
+
+`weaveffi_kv_list_keys(store: i64, prefix: i32, i32) -> i64`
+
+| Param | API Type | WASM | Notes |
+|-------|----------|------|-------|
+| `store` | `handle` | `i64` | opaque pointer |
+| `prefix` | `string?` | `i32, i32` | is_present flag + value |
+| _returns_ | `iter<string>` | `i64` | opaque iterator handle |
+
+##### `weaveffi_kv_count`
+
+Return the number of live entries in the store
+
+`weaveffi_kv_count(store: i64) -> i64`
+
+| Param | API Type | WASM | Notes |
+|-------|----------|------|-------|
+| `store` | `handle` | `i64` | opaque pointer |
+| _returns_ | `i64` | `i64` | native WASM i64 |
+
+##### `weaveffi_kv_clear`
+
+Drop every entry from the store
+
+`weaveffi_kv_clear(store: i64) -> void`
+
+| Param | API Type | WASM | Notes |
+|-------|----------|------|-------|
+| `store` | `handle` | `i64` | opaque pointer |
+
+##### `weaveffi_kv_compact_async`
+
+Reclaim space asynchronously; returns the number of bytes reclaimed
+
+`weaveffi_kv_compact_async(store: i64) -> i64`
+
+| Param | API Type | WASM | Notes |
+|-------|----------|------|-------|
+| `store` | `handle` | `i64` | opaque pointer |
+| _returns_ | `i64` | `i64` | native WASM i64 |
+
+##### `weaveffi_kv_legacy_put`
+
+Legacy single-shot put kept for compatibility
+
+**Deprecated:** use put() with explicit kind
+
+`weaveffi_kv_legacy_put(store: i64, key: i32, i32, value: i32, i32) -> i32`
+
+| Param | API Type | WASM | Notes |
+|-------|----------|------|-------|
+| `store` | `handle` | `i64` | opaque pointer |
+| `key` | `string` | `i32, i32` | ptr + len in linear memory |
+| `value` | `bytes` | `i32, i32` | ptr + len in linear memory |
+| _returns_ | `bool` | `i32` | 0 = false, 1 = true |
+
+#### Structs
+
+##### `Store`
+
+Opaque key-value store handle target type
+
+Passed as opaque handle (`i64`).
+
+| Accessor | WASM Return |
+|----------|-------------|
+| `weaveffi_kv_Store_get_id` | `i64` |
+
+##### `Entry`
+
+A single key-value entry persisted in the store
+
+Passed as opaque handle (`i64`).
+
+| Accessor | WASM Return |
+|----------|-------------|
+| `weaveffi_kv_Entry_get_id` | `i64` |
+| `weaveffi_kv_Entry_get_key` | `i32, i32` |
+| `weaveffi_kv_Entry_get_value` | `i32, i32` |
+| `weaveffi_kv_Entry_get_created_at` | `i64` |
+| `weaveffi_kv_Entry_get_expires_at` | `i32, i32` |
+| `weaveffi_kv_Entry_get_tags` | `i32, i32` |
+| `weaveffi_kv_Entry_get_metadata` | `i64` |
+
+##### `EntryBuilder`
+
+Builder for `Entry`.
+
+| Function | Args | Return |
+|----------|------|--------|
+| `weaveffi_kv_Entry_Builder_new` | none | `i32` (handle) |
+| `weaveffi_kv_Entry_Builder_set_id` | `i32` handle, `i64` value | none |
+| `weaveffi_kv_Entry_Builder_set_key` | `i32` handle, `i32, i32` value | none |
+| `weaveffi_kv_Entry_Builder_set_value` | `i32` handle, `i32, i32` value | none |
+| `weaveffi_kv_Entry_Builder_set_created_at` | `i32` handle, `i64` value | none |
+| `weaveffi_kv_Entry_Builder_set_expires_at` | `i32` handle, `i32, i32` value | none |
+| `weaveffi_kv_Entry_Builder_set_tags` | `i32` handle, `i32, i32` value | none |
+| `weaveffi_kv_Entry_Builder_set_metadata` | `i32` handle, `i64` value | none |
+| `weaveffi_kv_Entry_Builder_build` | `i32` handle | `i32` (handle) |
+| `weaveffi_kv_Entry_Builder_destroy` | `i32` handle | none |
+
+#### Enums
+
+##### `EntryKind`
+
+Persistence semantics applied to a stored entry
+
+Passed as `i32` discriminant.
+
+| Variant | Value |
+|---------|-------|
+| `Volatile` | `0` |
+| `Persistent` | `1` |
+| `Encrypted` | `2` |

@@ -4,6 +4,49 @@ This repo includes sample projects under `samples/` that showcase end-to-end
 usage of the C ABI layer. Each sample contains a YAML API definition and a Rust
 crate that implements the corresponding `weaveffi_*` C ABI functions.
 
+## Kvstore (kitchen-sink reference)
+
+Path: `samples/kvstore`
+
+A production-quality, in-memory key/value store that exercises **every IDL
+feature WeaveFFI supports** in a single sample. Use this as the canonical
+reference when learning the IDL surface or when you need to copy/paste a
+real-world pattern for a new generator.
+
+**What it demonstrates:**
+
+- Typed handles (`handle<Store>`) for opaque resource lifecycle
+- A struct (`Entry`) with every primitive — `i64`, `string`, `bytes`, optional
+  field (`expires_at: i64?`), list field (`tags: [string]`), and map field
+  (`metadata: {string:string}`) — plus per-field doc strings and `builder: true`
+- A documented enum (`EntryKind` with `Volatile`, `Persistent`, `Encrypted`)
+- A documented error domain (`KvError` with `KEY_NOT_FOUND`, `EXPIRED`,
+  `STORE_FULL`, `IO_ERROR`)
+- A module-level callback (`OnEvict`) and listener (`eviction_listener`)
+- A streaming iterator return (`list_keys -> iter<string>`) with prefix filter
+- A cancellable async function (`compact_async`, `async: true, cancellable: true`)
+  that respects a `weaveffi_cancel_token` while reclaiming bytes on a worker
+  thread
+- A deprecated function (`legacy_put`) and `since: "0.3.0"` on every other
+  function
+- A nested sub-module (`kv.stats`) with its own struct (`Stats`) and a function
+  that takes a cross-module `handle<Store>`
+- Inline `generators:` overrides for `swift.module_name`, `cpp.namespace`,
+  `dotnet.namespace`, `dart.package_name`, `go.module_path`, and
+  `ruby.module_name`
+
+**Build, generate bindings, and run the C ABI tests:**
+
+```bash
+cargo build -p kvstore
+cargo test -p kvstore
+weaveffi generate samples/kvstore/kvstore.yml -o generated
+```
+
+Every consumer language under `examples/` ships with a kvstore smoke test
+(`open -> put -> get -> delete -> close`) that runs against the generated
+bindings and the produced `libkvstore` cdylib; see `examples/run_all.sh`.
+
 ## Calculator
 
 Path: `samples/calculator`
