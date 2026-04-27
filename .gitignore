@@ -59,3 +59,8 @@ examples/swift/.swiftpm/
 examples/swift/Package.resolved
 examples/dotnet/Contacts/bin/
 examples/dotnet/Contacts/obj/
+
+# cargo-fuzz runtime artifacts (seeds/ is committed; the rest is generated)
+crates/weaveffi-fuzz/fuzz/artifacts/
+crates/weaveffi-fuzz/fuzz/corpus/
+crates/weaveffi-fuzz/fuzz/coverage/

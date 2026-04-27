@@ -36,6 +36,13 @@ confidence-threshold = 0.93
 # samples/* are all `publish = false`).
 ignore = true
 
+[[licenses.exceptions]]
+# libfuzzer-sys vendors LLVM's libFuzzer, whose runtime is NCSA-licensed.
+# It's OSI-approved and FSF Free, but only relevant inside the fuzz crate,
+# so allow it narrowly here instead of globally widening `allow`.
+name = "libfuzzer-sys"
+allow = ["NCSA"]
+
 [bans]
 # We tolerate at most a handful of duplicate versions of the same crate; any
 # more than that is a sign of dependency churn we should clean up. cargo-deny

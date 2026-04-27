@@ -1,0 +1,62 @@
+[package]
+name = "weaveffi-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[features]
+fuzzing = ["dep:libfuzzer-sys"]
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", optional = true }
+weaveffi-ir = { path = "../weaveffi-ir" }
+weaveffi-core = { path = "../weaveffi-core" }
+
+[lib]
+name = "weaveffi_fuzz"
+path = "fuzz_targets/lib.rs"
+
+[[bin]]
+name = "fuzz_parse_yaml"
+path = "fuzz_targets/parse_yaml.rs"
+test = false
+doc = false
+required-features = ["fuzzing"]
+
+[[bin]]
+name = "fuzz_parse_json"
+path = "fuzz_targets/parse_json.rs"
+test = false
+doc = false
+required-features = ["fuzzing"]
+
+[[bin]]
+name = "fuzz_parse_toml"
+path = "fuzz_targets/parse_toml.rs"
+test = false
+doc = false
+required-features = ["fuzzing"]
+
+[[bin]]
+name = "fuzz_parse_type_ref"
+path = "fuzz_targets/parse_type_ref.rs"
+test = false
+doc = false
+required-features = ["fuzzing"]
+
+[[bin]]
+name = "fuzz_validate"
+path = "fuzz_targets/fuzz_validate.rs"
+test = false
+doc = false
+required-features = ["fuzzing"]
+
+[lints.rust]
+unsafe_code = "deny"
+# `cargo-fuzz` sets `--cfg fuzzing` automatically when it builds a target.
+# Declaring it here keeps `cargo build --all-features` quiet under
+# unexpected_cfgs without losing the warning elsewhere.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
