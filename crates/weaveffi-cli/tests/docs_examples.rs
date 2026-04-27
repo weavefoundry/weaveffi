@@ -1040,6 +1040,101 @@ fn go_contacts_readme_documents_cgo_build_and_run() {
 }
 
 #[test]
+fn go_sqlite_contacts_example_files_exist() {
+    for file in [
+        "examples/go/sqlite-contacts/main.go",
+        "examples/go/sqlite-contacts/go.mod",
+        "examples/go/sqlite-contacts/README.md",
+    ] {
+        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        assert!(
+            workspace_root.join(file).exists(),
+            "Go SQLite contacts example is missing {file}"
+        );
+    }
+}
+
+#[test]
+fn go_sqlite_contacts_main_exercises_async_and_iterator_channels() {
+    let main = read_doc("examples/go/sqlite-contacts/main.go");
+    assert!(
+        main.contains("weaveffi \"github.com/example/weaveffi\""),
+        "main.go must import the generated Go module: {main}"
+    );
+    assert!(
+        main.contains("context.WithTimeout("),
+        "main.go must pass context to cancellable async create_contact: {main}"
+    );
+    for call in [
+        "<-weaveffi.ContactsCreateContact(",
+        "<-weaveffi.ContactsUpdateContact(",
+        "<-weaveffi.ContactsFindContact(",
+        "<-weaveffi.ContactsCountContacts(",
+        "<-weaveffi.ContactsDeleteContact(",
+        "weaveffi.ContactsListContacts(nil)",
+        "list_contacts := func() <-chan *weaveffi.Contact",
+        "weaveffi.StatusActive",
+    ] {
+        assert!(main.contains(call), "main.go must call `{call}`: {main}");
+    }
+    assert!(
+        main.contains("for contact := range list_contacts() {"),
+        "main.go must consume the iterator channel with range over list_contacts(): {main}"
+    );
+    assert!(
+        main.contains("contact.Close()"),
+        "main.go must close contacts yielded by the iterator channel: {main}"
+    );
+}
+
+#[test]
+fn go_sqlite_contacts_go_mod_replaces_generated_module() {
+    let go_mod = read_doc("examples/go/sqlite-contacts/go.mod");
+    assert!(
+        go_mod.contains("module github.com/example/weaveffi-go-sqlite-contacts"),
+        "go.mod must declare the consumer example module: {go_mod}"
+    );
+    assert!(
+        go_mod.contains("require github.com/example/weaveffi v0.0.0"),
+        "go.mod must require the generated module path: {go_mod}"
+    );
+    assert!(
+        go_mod.contains("replace github.com/example/weaveffi => ../../generated/go"),
+        "go.mod must replace the generated module with ../../generated/go: {go_mod}"
+    );
+}
+
+#[test]
+fn go_sqlite_contacts_readme_documents_cgo_async_and_iterator_run() {
+    let readme = read_doc("examples/go/sqlite-contacts/README.md");
+    assert!(
+        readme.contains("cargo build -p sqlite-contacts"),
+        "README must instruct building the sqlite-contacts cdylib: {readme}"
+    );
+    for token in [
+        "cargo run -p weaveffi-cli -- generate samples/sqlite-contacts/sqlite_contacts.yml -o examples/generated --target c",
+        "cargo run -p weaveffi-cli -- generate samples/sqlite-contacts/sqlite_contacts.yml -o examples/generated --target go",
+        "replace github.com/example/weaveffi => ../../generated/go",
+        "CGO_CFLAGS=\"-I$ROOT/examples/generated/c\"",
+        "CGO_LDFLAGS=\"-L$ROOT/target/debug -lweaveffi\"",
+        "<-weaveffi.ContactsCreateContact(ctx, ...)",
+        "for contact := range list_contacts() { ... }",
+        "go run .",
+        "libweaveffi.dylib",
+        "libweaveffi.so",
+    ] {
+        assert!(
+            readme.contains(token),
+            "README must mention `{token}`: {readme}"
+        );
+    }
+}
+
+#[test]
 fn dart_flutter_contacts_example_files_exist() {
     for file in [
         "examples/dart/flutter-contacts/lib/main.dart",
