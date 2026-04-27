@@ -129,7 +129,6 @@ fn c_elem_type(ty: &TypeRef, module: &str) -> String {
             c_elem_type(inner, module)
         }
         TypeRef::Map(_, _) => "void*".into(),
-        TypeRef::Callback(_) => todo!("callback Node type"),
     }
 }
 
@@ -155,7 +154,6 @@ fn c_ret_type_str(ty: &TypeRef, module: &str) -> String {
         TypeRef::List(inner) => format!("{}*", c_elem_type(inner, module)),
         TypeRef::Map(_, _) => "void".into(),
         TypeRef::Iterator(_) => "void*".into(),
-        TypeRef::Callback(_) => todo!("callback Node type"),
     }
 }
 
@@ -498,7 +496,6 @@ fn emit_param(
             emit_map_param(out, c_args, cleanups, k, v, name, idx, module);
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
-        TypeRef::Callback(_) => todo!("callback Node param"),
     }
 }
 
@@ -921,7 +918,6 @@ fn emit_ret_to_napi(out: &mut String, ty: &TypeRef, module: &str, fn_name: &str)
             out.push_str("  }\n");
             out.push_str(&format!("  {iter_type}_destroy(result);\n"));
         }
-        TypeRef::Callback(_) => todo!("callback Node return"),
     }
     out.push_str("  return ret;\n");
 }
@@ -1039,7 +1035,6 @@ fn ts_type_for(ty: &TypeRef) -> String {
             let t = ts_type_for(inner);
             format!("{t}[]")
         }
-        TypeRef::Callback(_) => todo!("callback Node type"),
     }
 }
 

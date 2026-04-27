@@ -132,14 +132,12 @@ fn kotlin_type(t: &TypeRef) -> String {
         TypeRef::List(inner) => kotlin_list_type(inner),
         TypeRef::Iterator(inner) => format!("Iterator<{}>", kotlin_type(inner)),
         TypeRef::Map(k, v) => format!("Map<{}, {}>", kotlin_type(k), kotlin_type(v)),
-        TypeRef::Callback(_) => todo!("callback Android type"),
     }
 }
 
 fn kotlin_jni_type(t: &TypeRef) -> String {
     match t {
         TypeRef::TypedHandle(_) => "Long".to_string(),
-        TypeRef::Callback(_) => todo!("callback Android type"),
         other => kotlin_type(other),
     }
 }
@@ -159,7 +157,6 @@ fn kotlin_list_type(inner: &TypeRef) -> String {
         TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) => {
             "LongArray".to_string()
         }
-        TypeRef::Callback(_) => todo!("callback Android type"),
     }
 }
 
@@ -182,7 +179,6 @@ fn jni_param_type(t: &TypeRef) -> String {
         },
         TypeRef::List(inner) | TypeRef::Iterator(inner) => jni_array_type(inner),
         TypeRef::Map(_, _) => "jobject".to_string(),
-        TypeRef::Callback(_) => todo!("callback Android type"),
     }
 }
 
@@ -222,7 +218,6 @@ fn c_type_for_return(t: &TypeRef) -> &'static str {
         | TypeRef::List(_)
         | TypeRef::Iterator(_)
         | TypeRef::Map(_, _) => "void*",
-        TypeRef::Callback(_) => todo!("callback Android type"),
     }
 }
 
@@ -241,7 +236,6 @@ fn jni_default_return(t: Option<&TypeRef>) -> &'static str {
         Some(
             TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _),
         ) => "return NULL;",
-        Some(TypeRef::Callback(_)) => todo!("callback Android type"),
     }
 }
 
@@ -258,7 +252,6 @@ fn jni_cast_for(t: &TypeRef) -> &'static str {
 fn kotlin_public_type(t: &TypeRef) -> String {
     match t {
         TypeRef::Enum(name) => name.clone(),
-        TypeRef::Callback(_) => todo!("callback Android type"),
         other => kotlin_type(other),
     }
 }
@@ -952,7 +945,6 @@ fn write_optional_acquire(out: &mut String, name: &str, inner: &TypeRef) {
             let _ = writeln!(out, "    }}");
         }
         TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) => {}
-        TypeRef::Callback(_) => todo!(),
     }
 }
 
@@ -1331,7 +1323,6 @@ fn build_c_call_args(args: &mut Vec<String>, name: &str, ty: &TypeRef, module: &
             args.push(format!("{}{n}_c_vals", map_elem_c_call_cast(v), n = name));
             args.push(format!("(size_t){n}_len", n = name));
         }
-        TypeRef::Callback(_) => todo!(),
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
     }
 }
@@ -1397,7 +1388,6 @@ fn write_return_handling(
         TypeRef::Map(k, v) => {
             write_map_return(jni_c, k, v, c_sym, &args_str, returns, params);
         }
-        TypeRef::Callback(_) => todo!(),
         ret_type => {
             let c_ty = c_type_for_return(ret_type);
             let jcast = jni_cast_for(ret_type);
@@ -1857,7 +1847,6 @@ fn kotlin_getter_type(t: &TypeRef) -> String {
     match t {
         TypeRef::Struct(name) => local_type_name(name).to_string(),
         TypeRef::Enum(name) => name.clone(),
-        TypeRef::Callback(_) => todo!("callback Android type"),
         other => kotlin_type(other),
     }
 }
@@ -2125,7 +2114,6 @@ fn render_jni_struct(out: &mut String, module_name: &str, s: &StructDef, jni_pre
             TypeRef::List(inner) => {
                 write_struct_list_getter(out, inner, &getter_c, &prefix);
             }
-            TypeRef::Callback(_) => todo!(),
             other => {
                 let c_ty = c_type_for_return(other);
                 let jcast = jni_cast_for(other);
