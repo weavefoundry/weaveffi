@@ -149,3 +149,25 @@ exports. Used by the Node.js example in `examples/`.
 cargo build -p calculator
 cargo build -p weaveffi-node-addon
 ```
+
+## End-to-end testing
+
+Every consumer language under `examples/` ships with an executable
+test that loads the calculator and contacts cdylibs at runtime and
+asserts a representative slice of the C ABI (basic add, contact
+create/list/cleanup). The `examples/run_all.sh` orchestrator builds
+and runs each one in turn:
+
+```bash
+cargo build -p calculator -p contacts
+
+WEAVEFFI_LIB=target/debug/libcalculator.dylib \
+  bash examples/run_all.sh
+```
+
+It prints `[OK] {target}` for each example that succeeds and exits
+non-zero on the first failure. Use `ONLY=python,ruby` to run a
+subset, or `SKIP=android,go` to omit individual targets. CI runs the
+full matrix on Linux, most targets on macOS, and the Python path on
+Windows. See the comment block at the top of `examples/run_all.sh`
+for the full list of env vars and per-target prerequisites.

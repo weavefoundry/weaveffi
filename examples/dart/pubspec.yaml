@@ -1,0 +1,10 @@
+name: weaveffi_dart_example
+description: End-to-end consumer test for WeaveFFI from Dart via dart:ffi.
+publish_to: none
+version: 0.1.0
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  ffi: ^2.1.0
