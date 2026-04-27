@@ -35,25 +35,43 @@ export interface Order {
 export interface WeaveffiWasmModule {
   _raw: WebAssembly.Exports;
   products: {
-    /** @throws {Error} if the native call fails */
+    /**
+     * @throws {Error} if the native call fails
+     */
     create_product(name: string, price: number, category: Category): bigint;
-    /** @throws {Error} if the native call fails */
+    /**
+     * @throws {Error} if the native call fails
+     */
     get_product(id: bigint): Product;
-    /** @throws {Error} if the native call fails */
+    /**
+     * @throws {Error} if the native call fails
+     */
     search_products(category: Category): Product[];
-    /** @throws {Error} if the native call fails */
+    /**
+     * @throws {Error} if the native call fails
+     */
     update_price(id: bigint, price: number): boolean;
-    /** @throws {Error} if the native call fails */
+    /**
+     * @throws {Error} if the native call fails
+     */
     delete_product(id: bigint): boolean;
   };
   orders: {
-    /** @throws {Error} if the native call fails */
+    /**
+     * @throws {Error} if the native call fails
+     */
     create_order(items: OrderItem[]): bigint;
-    /** @throws {Error} if the native call fails */
+    /**
+     * @throws {Error} if the native call fails
+     */
     get_order(id: bigint): Order;
-    /** @throws {Error} if the native call fails */
+    /**
+     * @throws {Error} if the native call fails
+     */
     cancel_order(id: bigint): boolean;
-    /** @throws {Error} if the native call fails */
+    /**
+     * @throws {Error} if the native call fails
+     */
     add_product_to_order(order_id: bigint, product: Product): boolean;
   };
 }

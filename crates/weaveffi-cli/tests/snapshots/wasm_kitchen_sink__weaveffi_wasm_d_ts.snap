@@ -3,82 +3,154 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 ---
 // Generated TypeScript declarations for WeaveFFI WASM bindings
 
+/** A reusable token referenced across modules */
 export interface Token {
   readonly id: number;
   readonly label: string;
 }
 
+/** Kitchen sink struct exercising every field feature */
 export interface Item {
+  /** Stable identifier */
   readonly id: number;
+  /** Display name */
   readonly name: string;
+  /** Initial count */
   readonly count: number;
+  /** Whether the item is enabled */
   readonly enabled: boolean;
+  /** Scaling ratio */
   readonly ratio: number;
   readonly nick: number;
   readonly payload: Buffer;
   readonly tags: string[];
   readonly attrs: Record<string, string>;
   readonly parent: number | null;
+  /** Cross-module struct reference */
   readonly token: Token;
   readonly priority: Priority;
 }
 
+/** Task priority levels */
 export declare const Priority: Readonly<{
+  /** Low priority */
   Low: 0;
+  /** Normal priority */
   Normal: 1;
+  /** High priority */
   High: 2;
 }>;
 
 export interface WeaveffiWasmModule {
   _raw: WebAssembly.Exports;
   shared: {
-    /** @throws {Error} if the native call fails */
+    /**
+     * Trivial cross-module helper
+     * @throws {Error} if the native call fails
+     */
     ping(): string;
   };
   kitchen: {
-    /** @throws {Error} if the native call fails */
+    /**
+     * Identity for bool
+     * @throws {Error} if the native call fails
+     */
     bool_id(x: boolean): boolean;
-    /** @throws {Error} if the native call fails */
+    /**
+     * @throws {Error} if the native call fails
+     */
     i32_id(x: number): number;
-    /** @throws {Error} if the native call fails */
+    /**
+     * @throws {Error} if the native call fails
+     */
     u32_id(x: number): number;
-    /** @throws {Error} if the native call fails */
+    /**
+     * @throws {Error} if the native call fails
+     */
     i64_id(x: number): number;
-    /** @throws {Error} if the native call fails */
+    /**
+     * @throws {Error} if the native call fails
+     */
     f64_id(x: number): number;
-    /** @throws {Error} if the native call fails */
+    /**
+     * @throws {Error} if the native call fails
+     */
     echo_string(s: string): string;
-    /** @throws {Error} if the native call fails */
+    /**
+     * @throws {Error} if the native call fails
+     */
     echo_bytes(b: Buffer): Buffer;
-    /** @throws {Error} if the native call fails */
+    /**
+     * Borrowed string parameter
+     * @throws {Error} if the native call fails
+     */
     echo_borrowed_str(s: string): string;
-    /** @throws {Error} if the native call fails */
+    /**
+     * Borrowed bytes parameter
+     * @throws {Error} if the native call fails
+     */
     echo_borrowed_bytes(b: Buffer): Buffer;
-    /** @throws {Error} if the native call fails */
+    /**
+     * Returns an opaque handle
+     * @throws {Error} if the native call fails
+     */
     open_handle(): bigint;
-    /** @throws {Error} if the native call fails */
+    /**
+     * Returns a typed handle
+     * @throws {Error} if the native call fails
+     */
     open_typed_handle(): Token;
-    /** @throws {Error} if the native call fails */
+    /**
+     * Optional struct return
+     * @throws {Error} if the native call fails
+     */
     maybe_item(id: number): Item | null;
-    /** @throws {Error} if the native call fails */
+    /**
+     * List of structs
+     * @throws {Error} if the native call fails
+     */
     list_items(): Item[];
-    /** @throws {Error} if the native call fails */
+    /**
+     * Map return type
+     * @throws {Error} if the native call fails
+     */
     get_attrs(): Record<string, number>;
-    /** @throws {Error} if the native call fails */
+    /**
+     * Iterator return type
+     * @throws {Error} if the native call fails
+     */
     stream_items(): Item[];
-    /** @throws {Error} if the native call fails */
+    /**
+     * Returns the shared Token type from another module
+     * @throws {Error} if the native call fails
+     */
     cross_module_token(): Token;
-    /** @throws {Error} if the native call fails */
+    /**
+     * Async operation
+     * @throws {Error} if the native call fails
+     */
     do_async(input: string): Promise<string>;
-    /** @throws {Error} if the native call fails */
+    /**
+     * Cancellable async operation
+     * @throws {Error} if the native call fails
+     */
     do_cancellable(input: string): Promise<string>;
-    /** @deprecated Use new_op instead */
-    /** @throws {Error} if the native call fails */
+    /**
+     * Legacy operation kept for compatibility
+     * @deprecated Use new_op instead
+     * @throws {Error} if the native call fails
+     */
     legacy_op(): number;
-    /** @throws {Error} if the native call fails */
+    /**
+     * Replacement for legacy_op
+     * @throws {Error} if the native call fails
+     */
     new_op(): number;
     nested: {
-      /** @throws {Error} if the native call fails */
+      /**
+       * Trivial nested-module function
+       * @throws {Error} if the native call fails
+       */
       hello(): string;
     };
   };

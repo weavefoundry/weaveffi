@@ -15,6 +15,7 @@ import (
 	"unsafe"
 )
 
+// EventsSendMessage: Send a message, triggering the OnMessage callback
 func EventsSendMessage(text string) error {
 	cText := C.CString(text)
 	defer C.free(unsafe.Pointer(cText))
@@ -28,6 +29,7 @@ func EventsSendMessage(text string) error {
 	return nil
 }
 
+// EventsGetMessages: Return an iterator over all sent messages
 func EventsGetMessages() ([]string, error) {
 	var cOutLen C.size_t
 	var cErr C.weaveffi_error

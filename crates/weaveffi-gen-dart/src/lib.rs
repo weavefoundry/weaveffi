@@ -194,6 +194,28 @@ fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Mo
     }
 }
 
+/// Emits a Dart `///` doc comment at `indent`. Each input line is prefixed
+/// with `/// `; blank lines become `///`.
+fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
+    let Some(doc) = doc else {
+        return;
+    };
+    let doc = doc.trim();
+    if doc.is_empty() {
+        return;
+    }
+    for line in doc.lines() {
+        out.push_str(indent);
+        if line.is_empty() {
+            out.push_str("///\n");
+        } else {
+            out.push_str("/// ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+}
+
 fn render_dart_module(api: &Api) -> String {
     let mut out = String::new();
     let has_async = collect_all_modules(&api.modules)
@@ -270,17 +292,12 @@ fn render_dart_module(api: &Api) -> String {
 
 fn render_enum(out: &mut String, e: &EnumDef) {
     let name = e.name.to_upper_camel_case();
-    if let Some(doc) = &e.doc {
-        out.push_str(&format!("\n/// {doc}\n"));
-    } else {
-        out.push('\n');
-    }
+    out.push('\n');
+    emit_doc(out, &e.doc, "");
     out.push_str(&format!("enum {name} {{\n"));
     for v in &e.variants {
         let vname = v.name.to_lower_camel_case();
-        if let Some(doc) = &v.doc {
-            out.push_str(&format!("  /// {doc}\n"));
-        }
+        emit_doc(out, &v.doc, "  ");
         out.push_str(&format!("  {vname}({}),\n", v.value));
     }
     out.push_str("  ;\n");
@@ -320,11 +337,8 @@ fn render_struct(out: &mut String, module_path: &str, s: &StructDef) {
         );
     }
 
-    if let Some(doc) = &s.doc {
-        out.push_str(&format!("\n/// {doc}\n"));
-    } else {
-        out.push('\n');
-    }
+    out.push('\n');
+    emit_doc(out, &s.doc, "");
     out.push_str(&format!("class {class_name} {{\n"));
     out.push_str("  final Pointer<Void> _handle;\n");
     out.push_str(&format!("  {class_name}._(this._handle);\n\n"));
@@ -341,7 +355,9 @@ fn render_struct(out: &mut String, module_path: &str, s: &StructDef) {
         let dart_ret = dart_type(&field.ty);
         let fname = field.name.to_lower_camel_case();
 
-        out.push_str(&format!("\n  {dart_ret} get {fname} {{\n"));
+        out.push('\n');
+        emit_doc(out, &field.doc, "  ");
+        out.push_str(&format!("  {dart_ret} get {fname} {{\n"));
         out.push_str("    final err = calloc<_WeaveffiError>();\n");
         out.push_str("    try {\n");
         out.push_str(&format!(
@@ -363,7 +379,9 @@ fn render_dart_builder(out: &mut String, s: &StructDef) {
     let class_name = s.name.to_upper_camel_case();
     let builder_name = format!("{class_name}Builder");
 
-    out.push_str(&format!("\nclass {builder_name} {{\n"));
+    out.push('\n');
+    emit_doc(out, &s.doc, "");
+    out.push_str(&format!("class {builder_name} {{\n"));
     for field in &s.fields {
         let dt = dart_nullable_type_for_builder_field(&field.ty);
         let priv_name = field.name.to_lower_camel_case();
@@ -374,8 +392,10 @@ fn render_dart_builder(out: &mut String, s: &StructDef) {
         let pascal = field.name.to_upper_camel_case();
         let dt = dart_type(&field.ty);
         let priv_name = field.name.to_lower_camel_case();
+        out.push('\n');
+        emit_doc(out, &field.doc, "  ");
         out.push_str(&format!(
-            "\n  {builder_name} with{pascal}({dt} value) {{\n    _{priv_name} = value;\n    return this;\n  }}\n"
+            "  {builder_name} with{pascal}({dt} value) {{\n    _{priv_name} = value;\n    return this;\n  }}\n"
         ));
     }
 
@@ -444,6 +464,7 @@ fn render_function(out: &mut String, module_path: &str, f: &Function) {
             .map(|p| p.name.to_lower_camel_case())
             .collect();
         out.push('\n');
+        emit_doc(out, &f.doc, "");
         if let Some(msg) = &f.deprecated {
             let escaped = msg.replace('\'', "\\'");
             out.push_str(&format!("@Deprecated('{escaped}')\n"));
@@ -459,6 +480,7 @@ fn render_function(out: &mut String, module_path: &str, f: &Function) {
         out.push_str("}\n");
     } else {
         out.push('\n');
+        emit_doc(out, &f.doc, "");
         if let Some(msg) = &f.deprecated {
             let escaped = msg.replace('\'', "\\'");
             out.push_str(&format!("@Deprecated('{escaped}')\n"));
@@ -680,11 +702,13 @@ mod tests {
                     name: "a".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
                 Param {
                     name: "b".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
             ],
             returns: Some(TypeRef::I32),
@@ -912,6 +936,7 @@ mod tests {
                     name: "color".into(),
                     ty: TypeRef::Enum("Color".into()),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Enum("Color".into())),
                 doc: None,
@@ -1014,6 +1039,7 @@ mod tests {
                     name: "msg".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::StringUtf8),
                 doc: None,
@@ -1057,6 +1083,7 @@ mod tests {
                 name: "flag".into(),
                 ty: TypeRef::Bool,
                 mutable: false,
+                doc: None,
             }],
             returns: Some(TypeRef::Bool),
             doc: None,
@@ -1083,6 +1110,7 @@ mod tests {
                 name: "id".into(),
                 ty: TypeRef::I32,
                 mutable: false,
+                doc: None,
             }],
             returns: Some(TypeRef::StringUtf8),
             doc: None,
@@ -1118,6 +1146,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::Handle,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -1216,6 +1245,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::I64,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
                 doc: None,
@@ -1257,6 +1287,7 @@ mod tests {
                     name: "items".into(),
                     ty: TypeRef::List(Box::new(TypeRef::I32)),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
                 doc: None,
@@ -1327,6 +1358,7 @@ mod tests {
                         name: "name".into(),
                         ty: TypeRef::StringUtf8,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::TypedHandle("Session".into())),
                     doc: None,
@@ -1341,6 +1373,7 @@ mod tests {
                         name: "session".into(),
                         ty: TypeRef::TypedHandle("Session".into()),
                         mutable: false,
+                        doc: None,
                     }],
                     returns: None,
                     doc: None,
@@ -1389,21 +1422,25 @@ mod tests {
                             name: "first_name".into(),
                             ty: TypeRef::StringUtf8,
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "last_name".into(),
                             ty: TypeRef::StringUtf8,
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "email".into(),
                             ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "contact_type".into(),
                             ty: TypeRef::Enum("ContactType".into()),
                             mutable: false,
+                            doc: None,
                         },
                     ],
                     returns: Some(TypeRef::Handle),
@@ -1419,6 +1456,7 @@ mod tests {
                         name: "id".into(),
                         ty: TypeRef::Handle,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Struct("Contact".into())),
                     doc: None,
@@ -1443,6 +1481,7 @@ mod tests {
                         name: "id".into(),
                         ty: TypeRef::Handle,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Bool),
                     doc: None,
@@ -1640,6 +1679,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -1691,6 +1731,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                     "Contact".into(),
@@ -1726,5 +1767,75 @@ mod tests {
             null_check < contact_wrap,
             "optional struct return should check null before wrapping: {dart}"
         );
+    }
+
+    fn doc_api() -> Api {
+        make_api(vec![Module {
+            name: "docs".into(),
+            functions: vec![Function {
+                name: "do_thing".into(),
+                params: vec![Param {
+                    name: "x".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: None,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: Some("Performs a thing.".into()),
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![StructDef {
+                name: "Item".into(),
+                doc: Some("An item we track.".into()),
+                fields: vec![StructField {
+                    name: "id".into(),
+                    ty: TypeRef::I64,
+                    doc: Some("Stable id".into()),
+                    default: None,
+                }],
+                builder: false,
+            }],
+            enums: vec![EnumDef {
+                name: "Kind".into(),
+                doc: Some("Kind of item.".into()),
+                variants: vec![EnumVariant {
+                    name: "Small".into(),
+                    value: 0,
+                    doc: Some("A small one".into()),
+                }],
+            }],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }])
+    }
+
+    #[test]
+    fn dart_emits_doc_on_function() {
+        let dart = render_dart_module(&doc_api());
+        assert!(dart.contains("/// Performs a thing."), "{dart}");
+    }
+
+    #[test]
+    fn dart_emits_doc_on_struct() {
+        let dart = render_dart_module(&doc_api());
+        assert!(dart.contains("/// An item we track."), "{dart}");
+    }
+
+    #[test]
+    fn dart_emits_doc_on_enum_variant() {
+        let dart = render_dart_module(&doc_api());
+        assert!(dart.contains("/// Kind of item."), "{dart}");
+        assert!(dart.contains("/// A small one"), "{dart}");
+    }
+
+    #[test]
+    fn dart_emits_doc_on_field() {
+        let dart = render_dart_module(&doc_api());
+        assert!(dart.contains("/// Stable id"), "{dart}");
     }
 }

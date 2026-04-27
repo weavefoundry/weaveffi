@@ -72,6 +72,7 @@ namespace WeaveFFI
 
     public static class Events
     {
+        /// <summary>Send a message, triggering the OnMessage callback</summary>
         public static void SendMessage(string text)
         {
             var err = new WeaveffiError();
@@ -87,6 +88,7 @@ namespace WeaveFFI
             }
         }
 
+        /// <summary>Return an iterator over all sent messages</summary>
         public static IEnumerable<string> GetMessages()
         {
             var err = new WeaveffiError();

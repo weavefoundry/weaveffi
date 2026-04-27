@@ -35,24 +35,28 @@ func withOptionalPointer<T, R>(to value: T?, _ body: (UnsafePointer<T>?) throws 
 }
 
 public enum Calculator {
+    /// Add two integers
     public static func add(_ a: Int32, _ b: Int32) throws -> Int32 {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_calculator_add(a, b, &err)
         try check(&err)
         return rv
     }
+    /// Multiply two integers
     public static func mul(_ a: Int32, _ b: Int32) throws -> Int32 {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_calculator_mul(a, b, &err)
         try check(&err)
         return rv
     }
+    /// Divide two integers
     public static func div(_ a: Int32, _ b: Int32) throws -> Int32 {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_calculator_div(a, b, &err)
         try check(&err)
         return rv
     }
+    /// Echo a string back
     public static func echo(_ s: String) throws -> String {
         var err = weaveffi_error(code: 0, message: nil)
         let s_bytes = Array(s.utf8)

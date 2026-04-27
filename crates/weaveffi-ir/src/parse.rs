@@ -141,11 +141,13 @@ mod tests {
                             name: "a".to_string(),
                             ty: TypeRef::I32,
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "b".to_string(),
                             ty: TypeRef::I32,
                             mutable: false,
+                            doc: None,
                         },
                     ],
                     returns: Some(TypeRef::I32),

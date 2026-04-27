@@ -49,6 +49,7 @@ private final class ContinuationRef<T> {
     init(_ value: CheckedContinuation<T, Error>) { self.value = value }
 }
 
+/// A reusable token referenced across modules
 public class Token {
     let ptr: OpaquePointer
 
@@ -73,6 +74,7 @@ public class Token {
 }
 
 public enum Shared {
+    /// Trivial cross-module helper
     public static func ping() throws -> String {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_shared_ping(&err)
@@ -83,12 +85,17 @@ public enum Shared {
     }
 }
 
+/// Task priority levels
 public enum Priority: Int32 {
+    /// Low priority
     case low = 0
+    /// Normal priority
     case normal = 1
+    /// High priority
     case high = 2
 }
 
+/// Kitchen sink struct exercising every field feature
 public class Item {
     let ptr: OpaquePointer
 
@@ -100,10 +107,12 @@ public class Item {
         weaveffi_kitchen_Item_destroy(ptr)
     }
 
+    /// Stable identifier
     public var id: Int64 {
         return weaveffi_kitchen_Item_get_id(ptr)
     }
 
+    /// Display name
     public var name: String {
         let raw = weaveffi_kitchen_Item_get_name(ptr)
         guard let raw = raw else { return "" }
@@ -111,14 +120,17 @@ public class Item {
         return String(cString: raw)
     }
 
+    /// Initial count
     public var count: Int32 {
         return weaveffi_kitchen_Item_get_count(ptr)
     }
 
+    /// Whether the item is enabled
     public var enabled: Bool {
         return weaveffi_kitchen_Item_get_enabled(ptr)
     }
 
+    /// Scaling ratio
     public var ratio: Double {
         return weaveffi_kitchen_Item_get_ratio(ptr)
     }
@@ -151,6 +163,7 @@ public class Item {
         return p?.pointee
     }
 
+    /// Cross-module struct reference
     public var token: Token {
         return Token(ptr: weaveffi_kitchen_Item_get_token(ptr)!)
     }
@@ -160,6 +173,7 @@ public class Item {
     }
 }
 
+/// Kitchen sink struct exercising every field feature
 public class ItemBuilder {
     private var _id: Int64?
     private var _name: String?
@@ -176,30 +190,35 @@ public class ItemBuilder {
 
     public init() {}
 
+    /// Stable identifier
     @discardableResult
     public func withId(_ value: Int64) -> Self {
         self._id = value
         return self
     }
 
+    /// Display name
     @discardableResult
     public func withName(_ value: String) -> Self {
         self._name = value
         return self
     }
 
+    /// Initial count
     @discardableResult
     public func withCount(_ value: Int32) -> Self {
         self._count = value
         return self
     }
 
+    /// Whether the item is enabled
     @discardableResult
     public func withEnabled(_ value: Bool) -> Self {
         self._enabled = value
         return self
     }
 
+    /// Scaling ratio
     @discardableResult
     public func withRatio(_ value: Double) -> Self {
         self._ratio = value
@@ -236,6 +255,7 @@ public class ItemBuilder {
         return self
     }
 
+    /// Cross-module struct reference
     @discardableResult
     public func withToken(_ value: Token) -> Self {
         self._token = value
@@ -295,6 +315,7 @@ public class ItemBuilder {
 }
 
 public enum Kitchen {
+    /// Identity for bool
     public static func bool_id(_ x: Bool) throws -> Bool {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_kitchen_bool_id(x, &err)
@@ -350,6 +371,7 @@ public enum Kitchen {
         try check(&err)
         return result
     }
+    /// Borrowed string parameter
     public static func echo_borrowed_str(_ s: String) throws -> String {
         var err = weaveffi_error(code: 0, message: nil)
         let s_bytes = Array(s.utf8)
@@ -364,6 +386,7 @@ public enum Kitchen {
         }
         return result
     }
+    /// Borrowed bytes parameter
     public static func echo_borrowed_bytes(_ b: Data) throws -> Data {
         var err = weaveffi_error(code: 0, message: nil)
         let b_bytes = Array(b)
@@ -375,12 +398,14 @@ public enum Kitchen {
         try check(&err)
         return result
     }
+    /// Returns an opaque handle
     public static func open_handle() throws -> UInt64 {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_kitchen_open_handle(&err)
         try check(&err)
         return rv
     }
+    /// Returns a typed handle
     public static func open_typed_handle() throws -> Token {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_kitchen_open_typed_handle(&err)
@@ -388,12 +413,14 @@ public enum Kitchen {
         guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
         return Token(ptr: rv)
     }
+    /// Optional struct return
     public static func maybe_item(_ id: Int64) throws -> Item? {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_kitchen_maybe_item(id, &err)
         try check(&err)
         return rv.map { Item(ptr: $0) }
     }
+    /// List of structs
     public static func list_items() throws -> [Item] {
         var err = weaveffi_error(code: 0, message: nil)
         var outLen: Int = 0
@@ -402,6 +429,7 @@ public enum Kitchen {
         guard let rv = rv else { return [] }
         return (0..<outLen).map { Item(ptr: rv[$0]!) }
     }
+    /// Map return type
     public static func get_attrs() throws -> [String: Int32] {
         var err = weaveffi_error(code: 0, message: nil)
         var outKeysPtr: UnsafeMutablePointer<UnsafePointer<CChar>?>? = nil
@@ -416,6 +444,7 @@ public enum Kitchen {
         }
         return result
     }
+    /// Iterator return type
     public static func stream_items() throws -> [Item] {
         var err = weaveffi_error(code: 0, message: nil)
         let iter = weaveffi_kitchen_stream_items(&err)
@@ -428,6 +457,7 @@ public enum Kitchen {
         weaveffi_kitchen_StreamItemsIterator_destroy(iter)
         return items
     }
+    /// Returns the shared Token type from another module
     public static func cross_module_token() throws -> Token {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_kitchen_cross_module_token(&err)
@@ -435,6 +465,7 @@ public enum Kitchen {
         guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
         return Token(ptr: rv)
     }
+    /// Async operation
     public static func do_async(_ input: String) async throws -> String {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
             let ctx = Unmanaged.passRetained(ContinuationRef(continuation)).toOpaque()
@@ -461,6 +492,7 @@ public enum Kitchen {
             }
         }
     }
+    /// Cancellable async operation
     public static func do_cancellable(_ input: String) async throws -> String {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
             let ctx = Unmanaged.passRetained(ContinuationRef(continuation)).toOpaque()
@@ -487,6 +519,7 @@ public enum Kitchen {
             }
         }
     }
+    /// Legacy operation kept for compatibility
     @available(*, deprecated, message: "Use new_op instead")
     public static func legacy_op() throws -> Int32 {
         var err = weaveffi_error(code: 0, message: nil)
@@ -494,6 +527,7 @@ public enum Kitchen {
         try check(&err)
         return rv
     }
+    /// Replacement for legacy_op
     public static func new_op() throws -> Int32 {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_kitchen_new_op(&err)
@@ -501,6 +535,7 @@ public enum Kitchen {
         return rv
     }
     public enum Nested {
+        /// Trivial nested-module function
         public static func hello() throws -> String {
             var err = weaveffi_error(code: 0, message: nil)
             let rv = weaveffi_kitchen_nested_hello(&err)

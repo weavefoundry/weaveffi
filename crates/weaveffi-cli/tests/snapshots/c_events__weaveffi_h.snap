@@ -38,7 +38,9 @@ void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
 typedef void (*weaveffi_events_OnMessage_fn)(const char* message, void* context);
 uint64_t weaveffi_events_register_message_listener(weaveffi_events_OnMessage_fn callback, void* context);
 void weaveffi_events_unregister_message_listener(uint64_t id);
+/** Send a message, triggering the OnMessage callback */
 void weaveffi_events_send_message(const char* text, weaveffi_error* out_err);
+/** Return an iterator over all sent messages */
 typedef struct weaveffi_events_GetMessagesIterator weaveffi_events_GetMessagesIterator;
 weaveffi_events_GetMessagesIterator* weaveffi_events_get_messages(weaveffi_error* out_err);
 int32_t weaveffi_events_GetMessagesIterator_next(weaveffi_events_GetMessagesIterator* iter, const char** out_item, weaveffi_error* out_err);

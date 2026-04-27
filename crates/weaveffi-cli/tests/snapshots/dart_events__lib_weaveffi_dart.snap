@@ -49,6 +49,7 @@ typedef _DartWeaveffiEventsSendMessage = void Function(Pointer<Utf8>, Pointer<_W
 final _weaveffiEventsSendMessage = _lib.lookupFunction<
     _NativeWeaveffiEventsSendMessage, _DartWeaveffiEventsSendMessage>('weaveffi_events_send_message');
 
+/// Send a message, triggering the OnMessage callback
 void sendMessage(String text) {
   final err = calloc<_WeaveffiError>();
   final textPtr = text.toNativeUtf8();
@@ -66,6 +67,7 @@ typedef _DartWeaveffiEventsGetMessages = Pointer<Void> Function(Pointer<_Weaveff
 final _weaveffiEventsGetMessages = _lib.lookupFunction<
     _NativeWeaveffiEventsGetMessages, _DartWeaveffiEventsGetMessages>('weaveffi_events_get_messages');
 
+/// Return an iterator over all sent messages
 Iterable<String> getMessages() {
   final err = calloc<_WeaveffiError>();
   try {

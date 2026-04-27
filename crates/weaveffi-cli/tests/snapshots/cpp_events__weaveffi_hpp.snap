@@ -30,7 +30,9 @@ void weaveffi_cancel_token_cancel(weaveffi_cancel_token* token);
 bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token* token);
 void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
 
+/** Send a message, triggering the OnMessage callback */
 void weaveffi_events_send_message(const char* text, weaveffi_error* out_err);
+/** Return an iterator over all sent messages */
 const char** weaveffi_events_get_messages(size_t* out_len, weaveffi_error* out_err);
 
 } // extern "C"
@@ -45,6 +47,7 @@ public:
     int32_t code() const { return code_; }
 };
 
+/** Send a message, triggering the OnMessage callback */
 inline void events_send_message(const std::string& text) {
     weaveffi_error err{};
     weaveffi_events_send_message(text.c_str(), &err);
@@ -56,6 +59,7 @@ inline void events_send_message(const std::string& text) {
     }
 }
 
+/** Return an iterator over all sent messages */
 inline std::vector<std::string> events_get_messages() {
     size_t out_len = 0;
     weaveffi_error err{};

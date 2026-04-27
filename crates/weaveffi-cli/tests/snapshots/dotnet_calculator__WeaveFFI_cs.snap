@@ -78,6 +78,7 @@ namespace WeaveFFI
 
     public static class Calculator
     {
+        /// <summary>Add two integers</summary>
         public static int Add(int a, int b)
         {
             var err = new WeaveffiError();
@@ -86,6 +87,7 @@ namespace WeaveFFI
             return result;
         }
 
+        /// <summary>Multiply two integers</summary>
         public static int Mul(int a, int b)
         {
             var err = new WeaveffiError();
@@ -94,6 +96,7 @@ namespace WeaveFFI
             return result;
         }
 
+        /// <summary>Divide two integers</summary>
         public static int Div(int a, int b)
         {
             var err = new WeaveffiError();
@@ -102,6 +105,7 @@ namespace WeaveFFI
             return result;
         }
 
+        /// <summary>Echo a string back</summary>
         public static string Echo(string s)
         {
             var err = new WeaveffiError();

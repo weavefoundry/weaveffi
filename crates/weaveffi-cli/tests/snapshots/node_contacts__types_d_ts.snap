@@ -15,13 +15,23 @@ export enum ContactType {
   Other = 2,
 }
 // module contacts
-/** Maps to C function: weaveffi_contacts_create_contact */
+/**
+ * Maps to C function: weaveffi_contacts_create_contact
+ */
 export function create_contact(first_name: string, last_name: string, email: string | null, contact_type: ContactType): bigint
-/** Maps to C function: weaveffi_contacts_get_contact */
+/**
+ * Maps to C function: weaveffi_contacts_get_contact
+ */
 export function get_contact(id: bigint): Contact
-/** Maps to C function: weaveffi_contacts_list_contacts */
+/**
+ * Maps to C function: weaveffi_contacts_list_contacts
+ */
 export function list_contacts(): Contact[]
-/** Maps to C function: weaveffi_contacts_delete_contact */
+/**
+ * Maps to C function: weaveffi_contacts_delete_contact
+ */
 export function delete_contact(id: bigint): boolean
-/** Maps to C function: weaveffi_contacts_count_contacts */
+/**
+ * Maps to C function: weaveffi_contacts_count_contacts
+ */
 export function count_contacts(): number

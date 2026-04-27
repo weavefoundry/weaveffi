@@ -65,6 +65,8 @@ pub struct Param {
     pub ty: TypeRef,
     #[serde(default)]
     pub mutable: bool,
+    #[serde(default)]
+    pub doc: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -284,6 +286,8 @@ pub struct ErrorCode {
     pub name: String,
     pub code: i32,
     pub message: String,
+    #[serde(default)]
+    pub doc: Option<String>,
 }
 
 #[cfg(test)]
@@ -1055,6 +1059,7 @@ modules:
                 name: "data".to_string(),
                 ty: TypeRef::I32,
                 mutable: false,
+                doc: None,
             }],
             doc: Some("event callback".to_string()),
         };

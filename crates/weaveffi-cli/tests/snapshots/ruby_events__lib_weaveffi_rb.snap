@@ -46,15 +46,19 @@ module WeaveFFI
   end
 
   # === Module: events ===
+  # Send a message, triggering the OnMessage callback
   attach_function :weaveffi_events_send_message, [:string, :pointer], :void
+  # Return an iterator over all sent messages
   attach_function :weaveffi_events_get_messages, [:pointer, :pointer], :pointer
 
+  # Send a message, triggering the OnMessage callback
   def self.send_message(text)
     err = ErrorStruct.new
     weaveffi_events_send_message(text, err)
     check_error!(err)
   end
 
+  # Return an iterator over all sent messages
   def self.get_messages()
     err = ErrorStruct.new
     out_len = FFI::MemoryPointer.new(:size_t)

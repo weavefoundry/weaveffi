@@ -2,89 +2,168 @@
 source: crates/weaveffi-cli/tests/snapshots.rs
 ---
 // Generated types for WeaveFFI functions
+/** A reusable token referenced across modules */
 export interface Token {
   id: number;
   label: string;
 }
 // module shared
-/** Maps to C function: weaveffi_shared_ping */
+/**
+ * Trivial cross-module helper
+ * Maps to C function: weaveffi_shared_ping
+ */
 export function ping(): string
+/** Kitchen sink struct exercising every field feature */
 export interface Item {
+  /** Stable identifier */
   id: number;
+  /** Display name */
   name: string;
+  /** Initial count */
   count: number;
+  /** Whether the item is enabled */
   enabled: boolean;
+  /** Scaling ratio */
   ratio: number;
   nick: number;
   payload: Buffer;
   tags: string[];
   attrs: Record<string, string>;
   parent: number | null;
+  /** Cross-module struct reference */
   token: Token;
   priority: Priority;
 }
+/** Kitchen sink struct exercising every field feature */
 export interface ItemBuilder {
+  /** Stable identifier */
   withId(value: number): ItemBuilder;
+  /** Display name */
   withName(value: string): ItemBuilder;
+  /** Initial count */
   withCount(value: number): ItemBuilder;
+  /** Whether the item is enabled */
   withEnabled(value: boolean): ItemBuilder;
+  /** Scaling ratio */
   withRatio(value: number): ItemBuilder;
   withNick(value: number): ItemBuilder;
   withPayload(value: Buffer): ItemBuilder;
   withTags(value: string[]): ItemBuilder;
   withAttrs(value: Record<string, string>): ItemBuilder;
   withParent(value: number | null): ItemBuilder;
+  /** Cross-module struct reference */
   withToken(value: Token): ItemBuilder;
   withPriority(value: Priority): ItemBuilder;
   build(): Item;
 }
+/** Task priority levels */
 export enum Priority {
+  /** Low priority */
   Low = 0,
+  /** Normal priority */
   Normal = 1,
+  /** High priority */
   High = 2,
 }
 // module kitchen
-/** Maps to C function: weaveffi_kitchen_bool_id */
+/**
+ * Identity for bool
+ * Maps to C function: weaveffi_kitchen_bool_id
+ */
 export function bool_id(x: boolean): boolean
-/** Maps to C function: weaveffi_kitchen_i32_id */
+/**
+ * Maps to C function: weaveffi_kitchen_i32_id
+ */
 export function i32_id(x: number): number
-/** Maps to C function: weaveffi_kitchen_u32_id */
+/**
+ * Maps to C function: weaveffi_kitchen_u32_id
+ */
 export function u32_id(x: number): number
-/** Maps to C function: weaveffi_kitchen_i64_id */
+/**
+ * Maps to C function: weaveffi_kitchen_i64_id
+ */
 export function i64_id(x: number): number
-/** Maps to C function: weaveffi_kitchen_f64_id */
+/**
+ * Maps to C function: weaveffi_kitchen_f64_id
+ */
 export function f64_id(x: number): number
-/** Maps to C function: weaveffi_kitchen_echo_string */
+/**
+ * Maps to C function: weaveffi_kitchen_echo_string
+ */
 export function echo_string(s: string): string
-/** Maps to C function: weaveffi_kitchen_echo_bytes */
+/**
+ * Maps to C function: weaveffi_kitchen_echo_bytes
+ */
 export function echo_bytes(b: Buffer): Buffer
-/** Maps to C function: weaveffi_kitchen_echo_borrowed_str */
+/**
+ * Borrowed string parameter
+ * Maps to C function: weaveffi_kitchen_echo_borrowed_str
+ */
 export function echo_borrowed_str(s: string): string
-/** Maps to C function: weaveffi_kitchen_echo_borrowed_bytes */
+/**
+ * Borrowed bytes parameter
+ * Maps to C function: weaveffi_kitchen_echo_borrowed_bytes
+ */
 export function echo_borrowed_bytes(b: Buffer): Buffer
-/** Maps to C function: weaveffi_kitchen_open_handle */
+/**
+ * Returns an opaque handle
+ * Maps to C function: weaveffi_kitchen_open_handle
+ */
 export function open_handle(): bigint
-/** Maps to C function: weaveffi_kitchen_open_typed_handle */
+/**
+ * Returns a typed handle
+ * Maps to C function: weaveffi_kitchen_open_typed_handle
+ */
 export function open_typed_handle(): Token
-/** Maps to C function: weaveffi_kitchen_maybe_item */
+/**
+ * Optional struct return
+ * Maps to C function: weaveffi_kitchen_maybe_item
+ */
 export function maybe_item(id: number): Item | null
-/** Maps to C function: weaveffi_kitchen_list_items */
+/**
+ * List of structs
+ * Maps to C function: weaveffi_kitchen_list_items
+ */
 export function list_items(): Item[]
-/** Maps to C function: weaveffi_kitchen_get_attrs */
+/**
+ * Map return type
+ * Maps to C function: weaveffi_kitchen_get_attrs
+ */
 export function get_attrs(): Record<string, number>
-/** Maps to C function: weaveffi_kitchen_stream_items */
+/**
+ * Iterator return type
+ * Maps to C function: weaveffi_kitchen_stream_items
+ */
 export function stream_items(): Item[]
-/** Maps to C function: weaveffi_kitchen_cross_module_token */
+/**
+ * Returns the shared Token type from another module
+ * Maps to C function: weaveffi_kitchen_cross_module_token
+ */
 export function cross_module_token(): Token
-/** Maps to C function: weaveffi_kitchen_do_async */
+/**
+ * Async operation
+ * Maps to C function: weaveffi_kitchen_do_async
+ */
 export function do_async(input: string): Promise<string>
-/** Maps to C function: weaveffi_kitchen_do_cancellable */
+/**
+ * Cancellable async operation
+ * Maps to C function: weaveffi_kitchen_do_cancellable
+ */
 export function do_cancellable(input: string): Promise<string>
-/** Maps to C function: weaveffi_kitchen_legacy_op */
-/** @deprecated Use new_op instead */
+/**
+ * Legacy operation kept for compatibility
+ * Maps to C function: weaveffi_kitchen_legacy_op
+ * @deprecated Use new_op instead
+ */
 export function legacy_op(): number
-/** Maps to C function: weaveffi_kitchen_new_op */
+/**
+ * Replacement for legacy_op
+ * Maps to C function: weaveffi_kitchen_new_op
+ */
 export function new_op(): number
 // module kitchen_nested
-/** Maps to C function: weaveffi_kitchen_nested_hello */
+/**
+ * Trivial nested-module function
+ * Maps to C function: weaveffi_kitchen_nested_hello
+ */
 export function hello(): string

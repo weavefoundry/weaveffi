@@ -3,7 +3,13 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 ---
 // Generated types for WeaveFFI functions
 // module events
-/** Maps to C function: weaveffi_events_send_message */
+/**
+ * Send a message, triggering the OnMessage callback
+ * Maps to C function: weaveffi_events_send_message
+ */
 export function send_message(text: string): void
-/** Maps to C function: weaveffi_events_get_messages */
+/**
+ * Return an iterator over all sent messages
+ * Maps to C function: weaveffi_events_get_messages
+ */
 export function get_messages(): string[]
