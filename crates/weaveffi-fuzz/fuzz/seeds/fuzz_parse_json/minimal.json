@@ -1,0 +1,11 @@
+{
+  "version": "0.3.0",
+  "modules": [
+    {
+      "name": "m",
+      "functions": [
+        { "name": "noop", "params": [] }
+      ]
+    }
+  ]
+}
