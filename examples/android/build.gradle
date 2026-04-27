@@ -1,0 +1,17 @@
+// Minimal Kotlin/JVM build for the Android consumer smoke test.
+//
+// We intentionally avoid the Android Gradle Plugin to keep CI fast: the
+// sample only verifies that the JNI binding declarations compile via
+// kotlinc. On-device execution is out of scope and exercised separately
+// by the Android tutorial.
+plugins {
+    id 'org.jetbrains.kotlin.jvm' version '1.9.22'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'org.jetbrains.kotlin:kotlin-stdlib'
+}

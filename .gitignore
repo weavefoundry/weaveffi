@@ -48,3 +48,14 @@ node_modules/
 # insta snapshot review artifacts (committed `.snap` files only)
 **/*.snap.new
 **/*.pending-snap
+
+# Consumer example build artifacts
+examples/dart/.dart_tool/
+examples/dart/.packages
+examples/go/go.sum
+examples/ruby/Gemfile.lock
+examples/swift/.build/
+examples/swift/.swiftpm/
+examples/swift/Package.resolved
+examples/dotnet/Contacts/bin/
+examples/dotnet/Contacts/obj/
