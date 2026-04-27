@@ -5,6 +5,7 @@ use camino::Utf8Path;
 use clap::{CommandFactory, Parser, Subcommand};
 use color_eyre::eyre::{bail, eyre, Report, Result, WrapErr};
 use color_eyre::Section;
+use serde::Deserialize;
 use similar::TextDiff;
 use std::collections::{BTreeSet, HashMap};
 use std::env;
@@ -321,30 +322,142 @@ fn load_config(path: Option<&str>) -> Result<GeneratorConfig> {
     }
 }
 
+/// Subset of `GeneratorConfig` fields with every value optional so that inline
+/// IDL overrides only touch keys the user actually set.
+#[derive(Default, Deserialize)]
+struct InlineGeneratorOverrides {
+    swift_module_name: Option<String>,
+    android_package: Option<String>,
+    node_package_name: Option<String>,
+    wasm_module_name: Option<String>,
+    c_prefix: Option<String>,
+    python_package_name: Option<String>,
+    dotnet_namespace: Option<String>,
+    cpp_namespace: Option<String>,
+    cpp_header_name: Option<String>,
+    cpp_standard: Option<String>,
+    dart_package_name: Option<String>,
+    go_module_path: Option<String>,
+    ruby_module_name: Option<String>,
+    ruby_gem_name: Option<String>,
+    strip_module_prefix: Option<bool>,
+    template_dir: Option<String>,
+    pre_generate: Option<String>,
+    post_generate: Option<String>,
+}
+
+impl InlineGeneratorOverrides {
+    fn apply(self, config: &mut GeneratorConfig) {
+        if let Some(v) = self.swift_module_name {
+            config.swift_module_name = Some(v);
+        }
+        if let Some(v) = self.android_package {
+            config.android_package = Some(v);
+        }
+        if let Some(v) = self.node_package_name {
+            config.node_package_name = Some(v);
+        }
+        if let Some(v) = self.wasm_module_name {
+            config.wasm_module_name = Some(v);
+        }
+        if let Some(v) = self.c_prefix {
+            config.c_prefix = Some(v);
+        }
+        if let Some(v) = self.python_package_name {
+            config.python_package_name = Some(v);
+        }
+        if let Some(v) = self.dotnet_namespace {
+            config.dotnet_namespace = Some(v);
+        }
+        if let Some(v) = self.cpp_namespace {
+            config.cpp_namespace = Some(v);
+        }
+        if let Some(v) = self.cpp_header_name {
+            config.cpp_header_name = Some(v);
+        }
+        if let Some(v) = self.cpp_standard {
+            config.cpp_standard = Some(v);
+        }
+        if let Some(v) = self.dart_package_name {
+            config.dart_package_name = Some(v);
+        }
+        if let Some(v) = self.go_module_path {
+            config.go_module_path = Some(v);
+        }
+        if let Some(v) = self.ruby_module_name {
+            config.ruby_module_name = Some(v);
+        }
+        if let Some(v) = self.ruby_gem_name {
+            config.ruby_gem_name = Some(v);
+        }
+        if let Some(v) = self.strip_module_prefix {
+            config.strip_module_prefix = v;
+        }
+        if let Some(v) = self.template_dir {
+            config.template_dir = Some(v);
+        }
+        if let Some(v) = self.pre_generate {
+            config.pre_generate = Some(v);
+        }
+        if let Some(v) = self.post_generate {
+            config.post_generate = Some(v);
+        }
+    }
+}
+
+/// Merge `[generators]` overrides from the IDL into `config`.
+///
+/// Inline IDL values **override** anything supplied via `--config <toml>`,
+/// because the IDL is project-local and committed alongside the API
+/// definition while a TOML file is typically per-environment.
+///
+/// Each `(target, table)` pair is interpreted as follows:
+///
+/// * For per-target sections (`swift`, `android`, `node`, `wasm`, `c`,
+///   `python`, `dotnet`, `cpp`, `dart`, `go`, `ruby`), every key in `table`
+///   is prefixed with `{target}_` and the resulting flat table is
+///   deserialized into [`InlineGeneratorOverrides`]. So `swift.module_name`
+///   maps to `swift_module_name`, `cpp.standard` maps to `cpp_standard`,
+///   and so on.
+/// * For the special section `weaveffi` (or its alias `global`), the table
+///   keys are treated as direct [`GeneratorConfig`] field names:
+///   `strip_module_prefix`, `template_dir`, `pre_generate`, `post_generate`.
+///
+/// Unknown target names and unknown keys within a known target are silently
+/// ignored so that older CLIs can read newer IDL files without crashing.
 fn merge_inline_generators(
     config: &mut GeneratorConfig,
     generators: &HashMap<String, toml::Value>,
 ) {
+    const KNOWN_TARGETS: &[&str] = &[
+        "swift", "android", "node", "wasm", "c", "python", "dotnet", "cpp", "dart", "go", "ruby",
+    ];
+
     for (target, value) in generators {
         let Some(table) = value.as_table() else {
             continue;
         };
-        for (key, val) in table {
-            let Some(s) = val.as_str() else { continue };
-            let field = format!("{target}_{key}");
-            match field.as_str() {
-                "swift_module_name" => config.swift_module_name = Some(s.to_owned()),
-                "android_package" => config.android_package = Some(s.to_owned()),
-                "node_package_name" => config.node_package_name = Some(s.to_owned()),
-                "wasm_module_name" => config.wasm_module_name = Some(s.to_owned()),
-                "c_prefix" => config.c_prefix = Some(s.to_owned()),
-                "python_package_name" => config.python_package_name = Some(s.to_owned()),
-                "dotnet_namespace" => config.dotnet_namespace = Some(s.to_owned()),
-                "cpp_namespace" => config.cpp_namespace = Some(s.to_owned()),
-                "cpp_header_name" => config.cpp_header_name = Some(s.to_owned()),
-                "cpp_standard" => config.cpp_standard = Some(s.to_owned()),
-                _ => {}
+
+        if target == "weaveffi" || target == "global" {
+            if let Ok(overrides) =
+                InlineGeneratorOverrides::deserialize(toml::Value::Table(table.clone()))
+            {
+                overrides.apply(config);
             }
+            continue;
+        }
+
+        if !KNOWN_TARGETS.contains(&target.as_str()) {
+            continue;
+        }
+
+        let mut prefixed = toml::value::Table::new();
+        for (key, val) in table {
+            prefixed.insert(format!("{target}_{key}"), val.clone());
+        }
+
+        if let Ok(overrides) = InlineGeneratorOverrides::deserialize(toml::Value::Table(prefixed)) {
+            overrides.apply(config);
         }
     }
 }
@@ -1580,6 +1693,166 @@ mod tests {
         let mut config = GeneratorConfig::default();
         merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
         assert_eq!(config.swift_module_name, Some("MySwiftModule".to_string()));
+    }
+
+    #[test]
+    fn inline_dart_package_name_merges() {
+        let yaml = concat!(
+            "version: \"0.1.0\"\n",
+            "modules:\n",
+            "  - name: m\n",
+            "    functions: []\n",
+            "generators:\n",
+            "  dart:\n",
+            "    package_name: my_dart_pkg\n",
+        );
+        let api: weaveffi_ir::ir::Api = serde_yaml::from_str(yaml).unwrap();
+        let mut config = GeneratorConfig::default();
+        merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
+        assert_eq!(config.dart_package_name.as_deref(), Some("my_dart_pkg"));
+    }
+
+    #[test]
+    fn inline_go_module_path_merges() {
+        let yaml = concat!(
+            "version: \"0.1.0\"\n",
+            "modules:\n",
+            "  - name: m\n",
+            "    functions: []\n",
+            "generators:\n",
+            "  go:\n",
+            "    module_path: github.com/me/myffi\n",
+        );
+        let api: weaveffi_ir::ir::Api = serde_yaml::from_str(yaml).unwrap();
+        let mut config = GeneratorConfig::default();
+        merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
+        assert_eq!(
+            config.go_module_path.as_deref(),
+            Some("github.com/me/myffi")
+        );
+    }
+
+    #[test]
+    fn inline_ruby_module_name_merges() {
+        let yaml = concat!(
+            "version: \"0.1.0\"\n",
+            "modules:\n",
+            "  - name: m\n",
+            "    functions: []\n",
+            "generators:\n",
+            "  ruby:\n",
+            "    module_name: MyRubyMod\n",
+        );
+        let api: weaveffi_ir::ir::Api = serde_yaml::from_str(yaml).unwrap();
+        let mut config = GeneratorConfig::default();
+        merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
+        assert_eq!(config.ruby_module_name.as_deref(), Some("MyRubyMod"));
+    }
+
+    #[test]
+    fn inline_ruby_gem_name_merges() {
+        let yaml = concat!(
+            "version: \"0.1.0\"\n",
+            "modules:\n",
+            "  - name: m\n",
+            "    functions: []\n",
+            "generators:\n",
+            "  ruby:\n",
+            "    gem_name: my_ruby_gem\n",
+        );
+        let api: weaveffi_ir::ir::Api = serde_yaml::from_str(yaml).unwrap();
+        let mut config = GeneratorConfig::default();
+        merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
+        assert_eq!(config.ruby_gem_name.as_deref(), Some("my_ruby_gem"));
+    }
+
+    #[test]
+    fn inline_global_strip_module_prefix_merges() {
+        let yaml = concat!(
+            "version: \"0.1.0\"\n",
+            "modules:\n",
+            "  - name: m\n",
+            "    functions: []\n",
+            "generators:\n",
+            "  weaveffi:\n",
+            "    strip_module_prefix: true\n",
+        );
+        let api: weaveffi_ir::ir::Api = serde_yaml::from_str(yaml).unwrap();
+        let mut config = GeneratorConfig::default();
+        assert!(!config.strip_module_prefix);
+        merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
+        assert!(config.strip_module_prefix);
+    }
+
+    #[test]
+    fn inline_global_template_dir_merges() {
+        let yaml = concat!(
+            "version: \"0.1.0\"\n",
+            "modules:\n",
+            "  - name: m\n",
+            "    functions: []\n",
+            "generators:\n",
+            "  weaveffi:\n",
+            "    template_dir: ./my_templates\n",
+        );
+        let api: weaveffi_ir::ir::Api = serde_yaml::from_str(yaml).unwrap();
+        let mut config = GeneratorConfig::default();
+        merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
+        assert_eq!(config.template_dir.as_deref(), Some("./my_templates"));
+    }
+
+    #[test]
+    fn inline_global_pre_generate_merges() {
+        let yaml = concat!(
+            "version: \"0.1.0\"\n",
+            "modules:\n",
+            "  - name: m\n",
+            "    functions: []\n",
+            "generators:\n",
+            "  global:\n",
+            "    pre_generate: \"echo hi\"\n",
+        );
+        let api: weaveffi_ir::ir::Api = serde_yaml::from_str(yaml).unwrap();
+        let mut config = GeneratorConfig::default();
+        merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
+        assert_eq!(config.pre_generate.as_deref(), Some("echo hi"));
+    }
+
+    #[test]
+    fn inline_unknown_target_silently_ignored() {
+        let yaml = concat!(
+            "version: \"0.1.0\"\n",
+            "modules:\n",
+            "  - name: m\n",
+            "    functions: []\n",
+            "generators:\n",
+            "  rustlang:\n",
+            "    crate_name: future_target\n",
+            "  swift:\n",
+            "    module_name: KeptSwift\n",
+        );
+        let api: weaveffi_ir::ir::Api = serde_yaml::from_str(yaml).unwrap();
+        let mut config = GeneratorConfig::default();
+        merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
+        assert_eq!(config.swift_module_name.as_deref(), Some("KeptSwift"));
+    }
+
+    #[test]
+    fn inline_unknown_key_silently_ignored() {
+        let yaml = concat!(
+            "version: \"0.1.0\"\n",
+            "modules:\n",
+            "  - name: m\n",
+            "    functions: []\n",
+            "generators:\n",
+            "  swift:\n",
+            "    module_name: KeptSwift\n",
+            "    unrecognized_future_key: \"some value\"\n",
+        );
+        let api: weaveffi_ir::ir::Api = serde_yaml::from_str(yaml).unwrap();
+        let mut config = GeneratorConfig::default();
+        merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
+        assert_eq!(config.swift_module_name.as_deref(), Some("KeptSwift"));
     }
 
     #[test]
