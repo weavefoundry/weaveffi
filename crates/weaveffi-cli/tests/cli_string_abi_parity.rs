@@ -8,9 +8,8 @@
 //! so a string param contributes two C parameters. Every target's wrapper
 //! must agree on this contract or interop will silently corrupt the stack.
 //!
-//! WASM is the only ABI that is allowed to differ: aggregate return types
-//! (string, struct, list) are returned via a leading `retptr` out-param,
-//! so the JS call site must have exactly one extra argument.
+//! WASM must also call string-returning functions with the C ABI arity:
+//! the returned C string pointer is decoded and freed by the JS wrapper.
 
 const PARITY_YML: &str = "version: \"0.1.0\"
 modules:
@@ -109,8 +108,8 @@ fn string_param_signature_consistent_across_generators() {
     let wasm_commas = count_top_level_commas(&wasm_args);
     assert_eq!(
         wasm_commas,
-        c_commas + 1,
-        "wasm call site should have C arity + 1 (leading retptr for string return): C has {c_commas} commas, wasm has {wasm_commas} (args: {wasm_args:?})"
+        c_commas,
+        "wasm call site arity mismatch: C has {c_commas} commas, wasm has {wasm_commas} (args: {wasm_args:?})"
     );
 }
 

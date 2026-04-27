@@ -665,6 +665,12 @@ fn render_wasm_js_stub(api: &Api, module_name: &str, c_prefix: &str) -> String {
         out.push_str("function _decodeString(wasm, ptr, len) {\n");
         out.push_str("  return _decoder.decode(new Uint8Array(wasm.memory.buffer, ptr, len));\n");
         out.push_str("}\n\n");
+        out.push_str("function _decodeCString(wasm, ptr) {\n");
+        out.push_str("  const bytes = new Uint8Array(wasm.memory.buffer, ptr);\n");
+        out.push_str("  let end = 0;\n");
+        out.push_str("  while (bytes[end] !== 0) end++;\n");
+        out.push_str("  return _decoder.decode(new Uint8Array(wasm.memory.buffer, ptr, end));\n");
+        out.push_str("}\n\n");
     }
 
     if needs_bytes {
@@ -953,18 +959,12 @@ fn emit_js_function_wrapper(out: &mut String, module_name: &str, func: &Function
     out.push_str(&format!("{indent}const _err = _allocError(wasm);\n"));
 
     let mut wasm_args = Vec::new();
-    let returns_string = matches!(func.returns.as_ref(), Some(TypeRef::StringUtf8));
     let returns_bytes = matches!(
         func.returns.as_ref(),
         Some(TypeRef::Bytes | TypeRef::BorrowedBytes)
     );
 
-    if returns_string {
-        out.push_str(&format!(
-            "{indent}const retptr = wasm.{c_prefix}_alloc(8);\n"
-        ));
-        wasm_args.push("retptr".to_string());
-    } else if returns_bytes {
+    if returns_bytes {
         // Mirror the C ABI: retptr receives the returned `uint8_t*` (i32),
         // while `out_len` stays an explicit out-parameter for the length.
         out.push_str(&format!(
@@ -1029,19 +1029,10 @@ fn emit_js_function_wrapper(out: &mut String, module_name: &str, func: &Function
             out.push_str(&format!("{indent}return _result !== 0;\n"));
         }
         Some(TypeRef::StringUtf8) => {
-            out.push_str(&format!("{indent}{wasm_call};\n"));
+            out.push_str(&format!("{indent}const _strPtr = {wasm_call};\n"));
             out.push_str(&format!("{indent}_checkError(wasm, _err);\n"));
             out.push_str(&format!(
-                "{indent}const view = new DataView(wasm.memory.buffer);\n"
-            ));
-            out.push_str(&format!(
-                "{indent}const _strPtr = view.getInt32(retptr, true);\n"
-            ));
-            out.push_str(&format!(
-                "{indent}const _strLen = view.getInt32(retptr + 4, true);\n"
-            ));
-            out.push_str(&format!(
-                "{indent}const _result = _decodeString(wasm, _strPtr, _strLen);\n"
+                "{indent}const _result = _decodeCString(wasm, _strPtr);\n"
             ));
             out.push_str(&format!("{indent}wasm.{c_prefix}_free_string(_strPtr);\n"));
             out.push_str(&format!("{indent}return _result;\n"));
@@ -2185,11 +2176,13 @@ mod tests {
         }]);
         let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME, DEFAULT_C_PREFIX);
 
-        let decode_pos = js
-            .find("_decodeString(wasm, _strPtr, _strLen)")
-            .unwrap_or_else(|| {
-                panic!("expected _decodeString(wasm, _strPtr, _strLen) in generated JS: {js}")
-            });
+        assert!(
+            js.contains("const _strPtr = wasm.weaveffi_text_echo(s_ptr, s_len, _err);"),
+            "string return must use the C ABI return pointer directly: {js}"
+        );
+        let decode_pos = js.find("_decodeCString(wasm, _strPtr)").unwrap_or_else(|| {
+            panic!("expected _decodeCString(wasm, _strPtr) in generated JS: {js}")
+        });
         let free_pos = js
             .find("wasm.weaveffi_free_string(_strPtr)")
             .unwrap_or_else(|| {

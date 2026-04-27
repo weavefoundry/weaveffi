@@ -780,6 +780,95 @@ fn node_addon_readme_has_required_sections() {
 }
 
 #[test]
+fn wasm_browser_example_files_exist() {
+    for file in [
+        "examples/wasm/browser/index.html",
+        "examples/wasm/browser/app.js",
+        "examples/wasm/browser/build.sh",
+        "examples/wasm/browser/serve.sh",
+        "examples/wasm/browser/README.md",
+    ] {
+        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        assert!(
+            workspace_root.join(file).exists(),
+            "WASM browser example is missing {file}"
+        );
+    }
+}
+
+#[test]
+fn wasm_browser_app_uses_worker_generated_loader_and_calculator() {
+    let app = read_doc("examples/wasm/browser/app.js");
+    for token in [
+        "new Worker(new URL(\"./app.js?worker\", import.meta.url), { type: \"module\" })",
+        "import(\"../../generated/wasm/weaveffi_wasm.js\")",
+        "loadWeaveffiWasm(wasmUrl)",
+        "api.calculator.add(args.a, args.b)",
+        "api.calculator.echo(args.s)",
+        "api.calculator.div(1, 0)",
+        "ok: false,",
+    ] {
+        assert!(app.contains(token), "app.js must contain `{token}`: {app}");
+    }
+}
+
+#[test]
+fn wasm_browser_index_exposes_calculator_ui() {
+    let html = read_doc("examples/wasm/browser/index.html");
+    for token in [
+        "weaveffi_wasm.js",
+        "id=\"add-button\"",
+        "id=\"echo-button\"",
+        "id=\"error-button\"",
+        "type=\"module\" src=\"./app.js\"",
+    ] {
+        assert!(
+            html.contains(token),
+            "index.html must contain `{token}`: {html}"
+        );
+    }
+}
+
+#[test]
+fn wasm_browser_scripts_and_readme_document_build_and_serve() {
+    let build = read_doc("examples/wasm/browser/build.sh");
+    let build_pos = build
+        .find("cargo build -p calculator --target wasm32-unknown-unknown --release")
+        .unwrap_or_else(|| panic!("build.sh must compile the calculator cdylib: {build}"));
+    let generate_pos = build
+        .find("cargo run -p weaveffi-cli -- generate samples/calculator/calculator.yml")
+        .unwrap_or_else(|| panic!("build.sh must generate the WASM wrapper: {build}"));
+    assert!(
+        build_pos < generate_pos,
+        "build.sh must compile the calculator cdylib before generating bindings: {build}"
+    );
+
+    let serve = read_doc("examples/wasm/browser/serve.sh");
+    assert!(
+        serve.contains("python3 -m http.server 8080"),
+        "serve.sh must wrap python's static server: {serve}"
+    );
+
+    let readme = read_doc("examples/wasm/browser/README.md");
+    for token in [
+        "./examples/wasm/browser/build.sh",
+        "wasm32-unknown-unknown",
+        "examples/generated/wasm/",
+        "python3 -m http.server 8080",
+        "http://localhost:8080/examples/wasm/browser/",
+    ] {
+        assert!(
+            readme.contains(token),
+            "README.md must contain `{token}`: {readme}"
+        );
+    }
+}
+
+#[test]
 fn cpp_calculator_example_files_exist() {
     for file in [
         "examples/cpp/calculator/CMakeLists.txt",
