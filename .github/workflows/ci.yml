@@ -62,6 +62,10 @@ jobs:
         if: runner.os != 'Windows'
         run: cargo build -p calculator
 
+      - name: Build contacts cdylib (debug)
+        if: runner.os != 'Windows'
+        run: cargo build -p contacts
+
       - name: Compile C example
         if: runner.os != 'Windows'
         run: cc -I generated/c examples/c/main.c -L target/debug -lcalculator -o c_example
@@ -99,6 +103,64 @@ jobs:
             export WEAVEFFI_LIB="$PWD/target/debug/libcalculator.so"
           fi
           node examples/node/main.mjs
+
+      - name: Add wasm target
+        if: runner.os != 'Windows'
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Build calculator wasm (release)
+        if: runner.os != 'Windows'
+        run: cargo build -p calculator --target wasm32-unknown-unknown --release
+
+      - name: Install consumer toolchains (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            g++ cmake python3 golang-go ruby-ffi unzip
+          sudo apt-get install -y dotnet-sdk-8.0 || true
+          curl -sLO https://github.com/JetBrains/kotlin/releases/download/v1.9.22/kotlin-compiler-1.9.22.zip
+          unzip -q kotlin-compiler-1.9.22.zip -d "$HOME/.kotlin"
+          echo "$HOME/.kotlin/kotlinc/bin" >> "$GITHUB_PATH"
+
+      - name: Install consumer toolchains (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake go kotlin
+          gem install --no-document --user-install ffi
+          echo "$(ruby -e 'puts Gem.user_dir')/bin" >> "$GITHUB_PATH"
+
+      - name: Set up Dart
+        if: runner.os != 'Windows'
+        uses: dart-lang/setup-dart@v1
+
+      - name: Set up Swift (Linux)
+        if: runner.os == 'Linux'
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "5.10"
+
+      - name: Run end-to-end consumer tests (Linux)
+        if: runner.os == 'Linux'
+        env:
+          WEAVEFFI_LIB: ${{ github.workspace }}/target/debug/libcalculator.so
+        run: bash examples/run_all.sh
+
+      - name: Run end-to-end consumer tests (macOS)
+        if: runner.os == 'macOS'
+        env:
+          WEAVEFFI_LIB: ${{ github.workspace }}/target/debug/libcalculator.dylib
+        run: bash examples/run_all.sh
+
+      - name: Run end-to-end consumer tests (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          ONLY: python
+        run: |
+          export WEAVEFFI_LIB="$GITHUB_WORKSPACE/target/debug/calculator.dll"
+          export CONTACTS_LIB="$GITHUB_WORKSPACE/target/debug/contacts.dll"
+          bash examples/run_all.sh
 
       - name: Verify weaveffi.schema.json is up to date
         if: runner.os == 'Linux'
