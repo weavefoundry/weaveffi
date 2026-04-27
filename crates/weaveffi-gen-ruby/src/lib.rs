@@ -224,7 +224,6 @@ fn rb_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
             format!("{name}_vals_buf"),
             format!("{name}.length"),
         ],
-        TypeRef::Callback(_) => vec![name.to_string()],
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
     }
 }
@@ -739,7 +738,7 @@ fn render_return_code(out: &mut String, ty: &TypeRef, ind: &str, qualifier: Opti
             out.push_str(&format!("{ind}return [] if result.null?\n"));
             render_list_return_body(out, inner, ind);
         }
-        TypeRef::Map(_, _) | TypeRef::Callback(_) => {
+        TypeRef::Map(_, _) => {
             out.push_str(&format!("{ind}result\n"));
         }
     }

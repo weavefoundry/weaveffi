@@ -132,7 +132,6 @@ fn py_ctypes_scalar(ty: &TypeRef) -> &'static str {
         TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) | TypeRef::Iterator(_) => {
             "ctypes.c_void_p"
         }
-        TypeRef::Callback(_) => todo!("callback Python type"),
     }
 }
 
@@ -150,7 +149,6 @@ fn py_type_hint(ty: &TypeRef) -> String {
         TypeRef::List(inner) => format!("List[{}]", py_type_hint(inner)),
         TypeRef::Map(k, v) => format!("Dict[{}, {}]", py_type_hint(k), py_type_hint(v)),
         TypeRef::Iterator(inner) => format!("Iterator[{}]", py_type_hint(inner)),
-        TypeRef::Callback(_) => todo!("callback Python type"),
     }
 }
 
@@ -249,7 +247,6 @@ fn py_async_cb_trailing_fields(ret: &Option<TypeRef>) -> Vec<(String, String)> {
                 )]
             }
         }
-        Some(TypeRef::Callback(_)) => todo!("async Python callback return type"),
         Some(ty) => vec![("result".into(), py_ctypes_scalar(ty).to_string())],
     }
 }
@@ -406,7 +403,6 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
             }
         }
         Some(TypeRef::Iterator(_)) => todo!("async iterator return"),
-        Some(TypeRef::Callback(_)) => todo!("async Python callback return type"),
     }
 }
 
@@ -1035,7 +1031,6 @@ fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
             format!("len(_{name}_keys)"),
         ],
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
-        TypeRef::Callback(_) => todo!("callback Python param call args"),
     }
 }
 
@@ -1093,7 +1088,6 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
         TypeRef::List(inner) => render_list_return(out, inner, ind),
         TypeRef::Map(k, v) => render_map_return(out, k, v, ind),
         TypeRef::Iterator(_) => unreachable!("iterator return handled in render_function"),
-        TypeRef::Callback(_) => todo!("callback Python return"),
     }
 }
 

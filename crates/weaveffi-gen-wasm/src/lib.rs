@@ -90,7 +90,6 @@ fn wasm_type(ty: &TypeRef) -> &'static str {
             | TypeRef::Map(_, _) => "i64",
             _ => "i32, i32",
         },
-        TypeRef::Callback(_) => todo!("callback WASM type"),
     }
 }
 
@@ -118,7 +117,6 @@ fn wasm_type_note(ty: &TypeRef) -> &'static str {
             | TypeRef::Map(_, _) => "opaque handle, 0 = absent",
             _ => "is_present flag + value",
         },
-        TypeRef::Callback(_) => todo!("callback WASM type"),
     }
 }
 
@@ -138,7 +136,6 @@ fn type_display(ty: &TypeRef) -> String {
         TypeRef::List(inner) => format!("[{}]", type_display(inner)),
         TypeRef::Iterator(inner) => format!("iter<{}>", type_display(inner)),
         TypeRef::Map(k, v) => format!("{{{}:{}}}", type_display(k), type_display(v)),
-        TypeRef::Callback(_) => todo!("callback WASM type"),
     }
 }
 
@@ -362,7 +359,6 @@ fn ts_type_for(ty: &TypeRef) -> String {
             format!("{t}[]")
         }
         TypeRef::Map(k, v) => format!("Record<{}, {}>", ts_type_for(k), ts_type_for(v)),
-        TypeRef::Callback(_) => todo!("callback WASM type"),
     }
 }
 
@@ -887,7 +883,6 @@ fn async_cb_wasm_params(returns: Option<&TypeRef>) -> Vec<&'static str> {
                 params.push("i32");
             }
         },
-        Some(TypeRef::Callback(_)) => todo!("callback WASM type"),
     }
     params
 }

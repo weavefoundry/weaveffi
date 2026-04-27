@@ -95,7 +95,6 @@ fn c_element_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
             c_element_type(inner, module, prefix)
         }
         TypeRef::Map(_, _) => "void*".to_string(),
-        TypeRef::Callback(_) => todo!("callback C type"),
     }
 }
 
@@ -160,7 +159,6 @@ fn c_type_for_param(ty: &TypeRef, name: &str, module: &str, prefix: &str, mutabl
             }
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
-        TypeRef::Callback(_) => todo!("callback C type"),
     }
 }
 
@@ -205,7 +203,6 @@ fn c_ret_type(ty: &TypeRef, module: &str, prefix: &str) -> (String, Vec<String>)
             )
         }
         TypeRef::Iterator(_) => unreachable!("iterator return handled specially"),
-        TypeRef::Callback(_) => todo!("callback C return type"),
     }
 }
 

@@ -569,15 +569,12 @@ modules:
         params:
           - { name: code, type: i32 }
           - { name: message, type: string }
-
-    functions:
-      - name: subscribe
-        params:
-          - { name: callback, type: on_data }
 ```
 
-Callbacks are referenced by name in function parameters, similar to how
-structs and enums are referenced.
+Callback names are not a valid `TypeRef`. Callbacks are wired up at the
+module level: declare them under `callbacks:`, reference them from a
+`listeners:` entry via `event_callback`, and emit asynchronous results
+from functions marked `async: true`.
 
 ---
 

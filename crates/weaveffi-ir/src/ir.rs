@@ -60,24 +60,6 @@ pub struct Param {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CallbackSignature {
-    pub params: Vec<Param>,
-    #[serde(rename = "return", default)]
-    pub returns: Option<TypeRef>,
-}
-
-impl std::hash::Hash for CallbackSignature {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.params.len().hash(state);
-        for p in &self.params {
-            p.name.hash(state);
-            p.ty.hash(state);
-        }
-        self.returns.hash(state);
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallbackDef {
     pub name: String,
     pub params: Vec<Param>,
@@ -93,6 +75,15 @@ pub struct ListenerDef {
     pub doc: Option<String>,
 }
 
+/// A reference to a type in the IDL.
+///
+/// Callback-style behavior is **not** expressed as a `TypeRef` variant.
+/// Instead, callbacks and listeners are declared at the module level via
+/// `Module.callbacks` (see [`CallbackDef`]) and `Module.listeners` (see
+/// [`ListenerDef`]), and asynchronous functions use `async: true`. These
+/// primitives cover every pattern the FFI boundary needs to support, and
+/// keep the type system free of function-typed values that the C ABI
+/// cannot represent uniformly.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeRef {
     I32,
@@ -112,7 +103,6 @@ pub enum TypeRef {
     List(Box<TypeRef>),
     Map(Box<TypeRef>, Box<TypeRef>),
     Iterator(Box<TypeRef>),
-    Callback(Box<CallbackSignature>),
 }
 
 pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
@@ -181,7 +171,6 @@ fn type_ref_to_string(ty: &TypeRef) -> String {
         TypeRef::List(inner) => format!("[{}]", type_ref_to_string(inner)),
         TypeRef::Map(k, v) => format!("{{{}:{}}}", type_ref_to_string(k), type_ref_to_string(v)),
         TypeRef::Iterator(inner) => format!("iter<{}>", type_ref_to_string(inner)),
-        TypeRef::Callback(_) => "callback".to_string(),
     }
 }
 
@@ -1216,6 +1205,14 @@ modules:
         assert_eq!(
             fields[1].default,
             Some(serde_yaml::Value::Number(serde_yaml::Number::from(0)))
+        );
+    }
+
+    #[test]
+    fn parse_type_ref_does_not_yield_callback() {
+        assert_eq!(
+            parse_type_ref("callback"),
+            Ok(TypeRef::Struct("callback".into()))
         );
     }
 }
