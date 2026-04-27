@@ -147,6 +147,22 @@ weaveffi_contacts_Contact* weaveffi_contacts_create_contact(
 | `weaveffi doctor` | Check for required toolchains (Rust, Xcode, NDK, Node) |
 | `weaveffi completions <shell>` | Print shell completion scripts (bash, zsh, fish, etc.) |
 | `weaveffi schema-version` | Print the current IR schema version |
+| `weaveffi schema --format json-schema` | Print the JSON Schema for the IDL |
+| `weaveffi format <file>` | Rewrite an IDL file in canonical form (sorted keys) |
+| `weaveffi watch <file>` | Re-run `generate` whenever the IDL file changes |
+
+## JSON Schema
+
+WeaveFFI publishes a JSON Schema for the IDL at
+[weaveffi.schema.json](./weaveffi.schema.json) (regenerate with
+`weaveffi schema --format json-schema > weaveffi.schema.json`). Reference it
+from the top of your YAML file to get editor autocompletion and validation:
+
+```yaml
+# yaml-language-server: $schema=./weaveffi.schema.json
+version: "0.3.0"
+modules: ...
+```
 
 ## Documentation
 

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub const CURRENT_SCHEMA_VERSION: &str = "0.3.0";
@@ -7,16 +8,21 @@ pub const CURRENT_SCHEMA_VERSION: &str = "0.3.0";
 pub const SUPPORTED_VERSIONS: &[&str] = &["0.1.0", "0.2.0", "0.3.0"];
 
 /// `Eq` is omitted because `toml::Value` contains `f64`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Top-level WeaveFFI API definition.")]
 pub struct Api {
     pub version: String,
     pub modules: Vec<Module>,
     #[serde(default)]
+    #[schemars(with = "Option<BTreeMap<String, serde_json::Value>>")]
     pub generators: Option<BTreeMap<String, toml::Value>>,
 }
 
 /// `Eq` is omitted because `StructField::default` contains `serde_yaml::Value`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(
+    description = "A WeaveFFI module: a named group of functions, types, callbacks, listeners, and errors."
+)]
 pub struct Module {
     pub name: String,
     pub functions: Vec<Function>,
@@ -34,7 +40,7 @@ pub struct Module {
     pub modules: Vec<Module>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Function {
     pub name: String,
     pub params: Vec<Param>,
@@ -52,7 +58,7 @@ pub struct Function {
     pub since: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Param {
     pub name: String,
     #[serde(rename = "type")]
@@ -61,7 +67,7 @@ pub struct Param {
     pub mutable: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CallbackDef {
     pub name: String,
     pub params: Vec<Param>,
@@ -69,7 +75,7 @@ pub struct CallbackDef {
     pub doc: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ListenerDef {
     pub name: String,
     pub event_callback: String,
@@ -195,7 +201,39 @@ impl<'de> Deserialize<'de> for TypeRef {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Manual `JsonSchema` impl because `TypeRef` (de)serializes as a string with
+/// custom syntax: primitive names (`i32`, `string`, ...), `&str`, `&[u8]`,
+/// `handle<{name}>`, `iter<{T}>`, `[{T}]`, `{ {K}: {V} }`, `{name}?`, or any
+/// user-defined struct/enum name.
+impl JsonSchema for TypeRef {
+    fn schema_name() -> String {
+        "TypeRef".to_string()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed(concat!(module_path!(), "::TypeRef"))
+    }
+
+    fn json_schema(_generator: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        let mut schema = schemars::schema::SchemaObject {
+            instance_type: Some(schemars::schema::InstanceType::String.into()),
+            ..Default::default()
+        };
+        let meta = schema.metadata();
+        meta.title = Some("TypeRef".to_string());
+        meta.description = Some(
+            "Reference to a type. Encoded as a string with custom syntax: \
+             primitives (`i32`, `u32`, `i64`, `f64`, `bool`, `string`, `bytes`, `handle`), \
+             borrowed types (`&str`, `&[u8]`), typed handles (`handle<{name}>`), \
+             iterators (`iter<{T}>`), lists (`[{T}]`), maps (`{{K:V}}`), \
+             optionals (`{T}?`), or any user-defined struct/enum name."
+                .to_string(),
+        );
+        schema.into()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct EnumDef {
     pub name: String,
     #[serde(default)]
@@ -203,7 +241,7 @@ pub struct EnumDef {
     pub variants: Vec<EnumVariant>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct EnumVariant {
     pub name: String,
     pub value: i32,
@@ -212,7 +250,8 @@ pub struct EnumVariant {
 }
 
 /// `Eq` is omitted because `StructField::default` contains `serde_yaml::Value`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "A struct (record) type with named fields.")]
 pub struct StructDef {
     pub name: String,
     #[serde(default)]
@@ -222,7 +261,7 @@ pub struct StructDef {
     pub builder: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct StructField {
     pub name: String,
     #[serde(rename = "type")]
@@ -230,16 +269,17 @@ pub struct StructField {
     #[serde(default)]
     pub doc: Option<String>,
     #[serde(default)]
+    #[schemars(with = "Option<serde_json::Value>")]
     pub default: Option<serde_yaml::Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorDomain {
     pub name: String,
     pub codes: Vec<ErrorCode>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorCode {
     pub name: String,
     pub code: i32,
@@ -1216,5 +1256,41 @@ modules:
             parse_type_ref("callback"),
             Ok(TypeRef::Struct("callback".into()))
         );
+    }
+
+    #[test]
+    fn api_json_schema_derives() {
+        let schema = schemars::schema_for!(Api);
+        let json = serde_json::to_value(&schema).unwrap();
+        assert!(json.get("$schema").is_some());
+        assert!(json.get("properties").is_some());
+        assert_eq!(json.get("title").and_then(|v| v.as_str()), Some("Api"));
+        let defs = json
+            .get("definitions")
+            .and_then(|v| v.as_object())
+            .expect("definitions");
+        assert!(defs.contains_key("Module"));
+        assert!(defs.contains_key("Function"));
+        assert!(defs.contains_key("Param"));
+        assert!(defs.contains_key("TypeRef"));
+        assert!(defs.contains_key("StructDef"));
+        assert!(defs.contains_key("StructField"));
+        assert!(defs.contains_key("EnumDef"));
+        assert!(defs.contains_key("EnumVariant"));
+        assert!(defs.contains_key("CallbackDef"));
+        assert!(defs.contains_key("ListenerDef"));
+        assert!(defs.contains_key("ErrorDomain"));
+        assert!(defs.contains_key("ErrorCode"));
+    }
+
+    #[test]
+    fn typeref_json_schema_is_string_with_description() {
+        let schema = schemars::schema_for!(TypeRef);
+        let json = serde_json::to_value(&schema).unwrap();
+        assert_eq!(json.get("type").and_then(|v| v.as_str()), Some("string"));
+        assert!(json
+            .get("description")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.contains("handle<") && s.contains("iter<")));
     }
 }
