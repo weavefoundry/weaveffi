@@ -25,8 +25,6 @@ modules:
           - { name: z, type: f64 }
 ";
 
-// Re-enabled once Dart and Go advertise the Builders capability.
-#[ignore = "Dart and Go do not advertise Builders yet; reactivate when later phases add the capability back"]
 #[test]
 fn builder_pattern_emits_real_build_in_all_targets() {
     let dir = tempfile::tempdir().expect("failed to create temp dir");
