@@ -1140,6 +1140,15 @@ modules:
     #[test]
     fn parse_type_ref_callback_empty_name_is_error() {
         assert!(parse_type_ref("callback<>").is_err());
+        assert!(parse_type_ref("callback< >").is_err());
+    }
+
+    #[test]
+    fn parse_type_ref_callback_trims_whitespace() {
+        assert_eq!(
+            parse_type_ref("callback< MyCallback >"),
+            Ok(TypeRef::Callback("MyCallback".into()))
+        );
     }
 
     #[test]
@@ -1147,6 +1156,36 @@ modules:
         let ty = TypeRef::Callback("OnData".into());
         let json = serde_json::to_string(&ty).unwrap();
         assert_eq!(json, r#""callback<OnData>""#);
+        let back: TypeRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ty);
+    }
+
+    #[test]
+    fn typeref_callback_in_list_round_trip() {
+        let ty = TypeRef::List(Box::new(TypeRef::Callback("OnEvent".into())));
+        let json = serde_json::to_string(&ty).unwrap();
+        assert_eq!(json, r#""[callback<OnEvent>]""#);
+        let back: TypeRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ty);
+    }
+
+    #[test]
+    fn typeref_optional_callback_round_trip() {
+        let ty = TypeRef::Optional(Box::new(TypeRef::Callback("OnEvent".into())));
+        let json = serde_json::to_string(&ty).unwrap();
+        assert_eq!(json, r#""callback<OnEvent>?""#);
+        let back: TypeRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ty);
+    }
+
+    #[test]
+    fn typeref_callback_in_map_value_round_trip() {
+        let ty = TypeRef::Map(
+            Box::new(TypeRef::StringUtf8),
+            Box::new(TypeRef::Callback("OnEvent".into())),
+        );
+        let json = serde_json::to_string(&ty).unwrap();
+        assert_eq!(json, r#""{string:callback<OnEvent>}""#);
         let back: TypeRef = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ty);
     }
