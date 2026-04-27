@@ -1,3 +1,9 @@
+//! Go (CGo) binding generator for WeaveFFI.
+//!
+//! Emits a Go module (`go.mod` + package) with CGo bindings over the C
+//! ABI exposed by the underlying cdylib. Implements the [`Generator`]
+//! trait.
+
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};

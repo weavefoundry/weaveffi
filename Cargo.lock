@@ -2264,7 +2264,6 @@ dependencies = [
  "miette",
  "notify",
  "predicates",
- "quote",
  "schemars",
  "serde",
  "serde_json",
@@ -2313,7 +2312,6 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "camino",
- "insta",
  "tempfile",
  "weaveffi-core",
  "weaveffi-ir",
@@ -2326,7 +2324,6 @@ dependencies = [
  "anyhow",
  "camino",
  "heck",
- "insta",
  "tempfile",
  "weaveffi-core",
  "weaveffi-ir",
@@ -2339,7 +2336,6 @@ dependencies = [
  "anyhow",
  "camino",
  "heck",
- "insta",
  "weaveffi-core",
  "weaveffi-ir",
 ]
@@ -2351,7 +2347,6 @@ dependencies = [
  "anyhow",
  "camino",
  "heck",
- "insta",
  "weaveffi-core",
  "weaveffi-ir",
 ]
@@ -2363,7 +2358,6 @@ dependencies = [
  "anyhow",
  "camino",
  "heck",
- "insta",
  "tempfile",
  "weaveffi-core",
  "weaveffi-ir",
@@ -2376,7 +2370,6 @@ dependencies = [
  "anyhow",
  "camino",
  "heck",
- "insta",
  "weaveffi-core",
  "weaveffi-ir",
 ]
@@ -2388,7 +2381,6 @@ dependencies = [
  "anyhow",
  "camino",
  "heck",
- "insta",
  "weaveffi-core",
  "weaveffi-ir",
 ]
@@ -2399,7 +2391,6 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "camino",
- "insta",
  "tempfile",
  "weaveffi-core",
  "weaveffi-ir",
@@ -2412,7 +2403,6 @@ dependencies = [
  "anyhow",
  "camino",
  "heck",
- "insta",
  "tempfile",
  "weaveffi-core",
  "weaveffi-ir",
@@ -2425,7 +2415,6 @@ dependencies = [
  "anyhow",
  "camino",
  "heck",
- "insta",
  "weaveffi-core",
  "weaveffi-ir",
 ]
@@ -2437,7 +2426,6 @@ dependencies = [
  "anyhow",
  "camino",
  "heck",
- "insta",
  "weaveffi-core",
  "weaveffi-ir",
 ]

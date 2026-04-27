@@ -1,3 +1,9 @@
+//! Node.js (N-API) binding generator for WeaveFFI.
+//!
+//! Emits a JavaScript loader plus TypeScript type definitions for the
+//! companion N-API addon. Async functions surface as `Promise`-returning
+//! methods. Implements the [`Generator`] trait.
+
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
