@@ -30,9 +30,13 @@ void weaveffi_cancel_token_cancel(weaveffi_cancel_token* token);
 bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token* token);
 void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
 
+/** Add two integers */
 int32_t weaveffi_calculator_add(int32_t a, int32_t b, weaveffi_error* out_err);
+/** Multiply two integers */
 int32_t weaveffi_calculator_mul(int32_t a, int32_t b, weaveffi_error* out_err);
+/** Divide two integers */
 int32_t weaveffi_calculator_div(int32_t a, int32_t b, weaveffi_error* out_err);
+/** Echo a string back */
 const char* weaveffi_calculator_echo(const char* s, weaveffi_error* out_err);
 
 } // extern "C"
@@ -47,6 +51,7 @@ public:
     int32_t code() const { return code_; }
 };
 
+/** Add two integers */
 inline int32_t calculator_add(int32_t a, int32_t b) {
     weaveffi_error err{};
     auto result = weaveffi_calculator_add(a, b, &err);
@@ -59,6 +64,7 @@ inline int32_t calculator_add(int32_t a, int32_t b) {
     return result;
 }
 
+/** Multiply two integers */
 inline int32_t calculator_mul(int32_t a, int32_t b) {
     weaveffi_error err{};
     auto result = weaveffi_calculator_mul(a, b, &err);
@@ -71,6 +77,7 @@ inline int32_t calculator_mul(int32_t a, int32_t b) {
     return result;
 }
 
+/** Divide two integers */
 inline int32_t calculator_div(int32_t a, int32_t b) {
     weaveffi_error err{};
     auto result = weaveffi_calculator_div(a, b, &err);
@@ -83,6 +90,7 @@ inline int32_t calculator_div(int32_t a, int32_t b) {
     return result;
 }
 
+/** Echo a string back */
 inline std::string calculator_echo(const std::string& s) {
     weaveffi_error err{};
     auto result = weaveffi_calculator_echo(s.c_str(), &err);

@@ -11,7 +11,13 @@ class WeaveFFI {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
+        /**
+         * Trivial cross-module helper
+         */
         @JvmStatic external fun ping(): String
+        /**
+         * Identity for bool
+         */
         @JvmStatic external fun bool_id(x: Boolean): Boolean
         @JvmStatic external fun i32_id(x: Int): Int
         @JvmStatic external fun u32_id(x: Long): Long
@@ -19,30 +25,73 @@ class WeaveFFI {
         @JvmStatic external fun f64_id(x: Double): Double
         @JvmStatic external fun echo_string(s: String): String
         @JvmStatic external fun echo_bytes(b: ByteArray): ByteArray
+        /**
+         * Borrowed string parameter
+         */
         @JvmStatic external fun echo_borrowed_str(s: String): String
+        /**
+         * Borrowed bytes parameter
+         */
         @JvmStatic external fun echo_borrowed_bytes(b: ByteArray): ByteArray
+        /**
+         * Returns an opaque handle
+         */
         @JvmStatic external fun open_handle(): Long
+        /**
+         * Returns a typed handle
+         */
         @JvmStatic external fun open_typed_handle(): Token
+        /**
+         * Optional struct return
+         */
         @JvmStatic external fun maybe_item(id: Long): Long?
+        /**
+         * List of structs
+         */
         @JvmStatic external fun list_items(): LongArray
+        /**
+         * Map return type
+         */
         @JvmStatic external fun get_attrs(): Map<String, Int>
+        /**
+         * Iterator return type
+         */
         @JvmStatic external fun stream_items(): Iterator<Long>
+        /**
+         * Returns the shared Token type from another module
+         */
         @JvmStatic external fun cross_module_token(): Long
+        /**
+         * Async operation
+         */
         @JvmStatic private external fun do_asyncAsync(input: String, callback: Any)
         @JvmStatic suspend fun do_async(input: String): String = suspendCancellableCoroutine { cont ->
             do_asyncAsync(input, WeaveContinuation(cont))
         }
+        /**
+         * Cancellable async operation
+         */
         @JvmStatic private external fun do_cancellableAsync(input: String, cancelToken: Long, callback: Any)
         @JvmStatic suspend fun do_cancellable(input: String): String = suspendCancellableCoroutine { cont ->
             do_cancellableAsync(input, 0L, WeaveContinuation(cont))
         }
+        /**
+         * Legacy operation kept for compatibility
+         */
         @Deprecated("Use new_op instead")
         @JvmStatic external fun legacy_op(): Int
+        /**
+         * Replacement for legacy_op
+         */
         @JvmStatic external fun new_op(): Int
+        /**
+         * Trivial nested-module function
+         */
         @JvmStatic external fun hello(): String
     }
 }
 
+/** A reusable token referenced across modules */
 class Token internal constructor(private var handle: Long) : java.io.Closeable {
     companion object {
         init { System.loadLibrary("weaveffi") }
@@ -70,9 +119,13 @@ class Token internal constructor(private var handle: Long) : java.io.Closeable {
     }
 }
 
+/** Task priority levels */
 enum class Priority(val value: Int) {
+    /** Low priority */
     Low(0),
+    /** Normal priority */
     Normal(1),
+    /** High priority */
     High(2);
 
     companion object {
@@ -80,6 +133,7 @@ enum class Priority(val value: Int) {
     }
 }
 
+/** Kitchen sink struct exercising every field feature */
 class Item internal constructor(private var handle: Long) : java.io.Closeable {
     companion object {
         init { System.loadLibrary("weaveffi") }
@@ -102,16 +156,22 @@ class Item internal constructor(private var handle: Long) : java.io.Closeable {
         fun create(id: Long, name: String, count: Int, enabled: Boolean, ratio: Double, nick: Long, payload: ByteArray, tags: Array<String>, attrs: Map<String, String>, parent: Long?, token: Long, priority: Int): Item = Item(nativeCreate(id, name, count, enabled, ratio, nick, payload, tags, attrs, parent, token, priority))
     }
 
+    /** Stable identifier */
     val id: Long get() = nativeGetId(handle)
+    /** Display name */
     val name: String get() = nativeGetName(handle)
+    /** Initial count */
     val count: Int get() = nativeGetCount(handle)
+    /** Whether the item is enabled */
     val enabled: Boolean get() = nativeGetEnabled(handle)
+    /** Scaling ratio */
     val ratio: Double get() = nativeGetRatio(handle)
     val nick: Long get() = nativeGetNick(handle)
     val payload: ByteArray get() = nativeGetPayload(handle)
     val tags: Array<String> get() = nativeGetTags(handle)
     val attrs: Map<String, String> get() = nativeGetAttrs(handle)
     val parent: Long? get() = nativeGetParent(handle)
+    /** Cross-module struct reference */
     val token: Token get() = Token(nativeGetToken(handle))
     val priority: Priority get() = nativeGetPriority(handle)
 
@@ -127,6 +187,7 @@ class Item internal constructor(private var handle: Long) : java.io.Closeable {
     }
 }
 
+/** Kitchen sink struct exercising every field feature */
 class ItemBuilder {
     private var id: Long? = null
     private var name: String? = null
@@ -140,22 +201,27 @@ class ItemBuilder {
     private var parent: Long?? = null
     private var token: Token? = null
     private var priority: Priority? = null
+    /** Stable identifier */
     fun withId(id: Long): ItemBuilder {
         this.id = id
         return this
     }
+    /** Display name */
     fun withName(name: String): ItemBuilder {
         this.name = name
         return this
     }
+    /** Initial count */
     fun withCount(count: Int): ItemBuilder {
         this.count = count
         return this
     }
+    /** Whether the item is enabled */
     fun withEnabled(enabled: Boolean): ItemBuilder {
         this.enabled = enabled
         return this
     }
+    /** Scaling ratio */
     fun withRatio(ratio: Double): ItemBuilder {
         this.ratio = ratio
         return this
@@ -180,6 +246,7 @@ class ItemBuilder {
         this.parent = parent
         return this
     }
+    /** Cross-module struct reference */
     fun withToken(token: Token): ItemBuilder {
         this.token = token
         return this

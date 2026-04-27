@@ -12,11 +12,17 @@ export interface TaskResult {
 export interface WeaveffiWasmModule {
   _raw: WebAssembly.Exports;
   tasks: {
-    /** @throws {Error} if the native call fails */
+    /**
+     * @throws {Error} if the native call fails
+     */
     run_task(name: string): Promise<TaskResult>;
-    /** @throws {Error} if the native call fails */
+    /**
+     * @throws {Error} if the native call fails
+     */
     run_batch(names: string[]): Promise<TaskResult[]>;
-    /** @throws {Error} if the native call fails */
+    /**
+     * @throws {Error} if the native call fails
+     */
     cancel_task(id: number): boolean;
   };
 }

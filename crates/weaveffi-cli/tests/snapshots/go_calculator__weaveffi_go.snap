@@ -15,6 +15,7 @@ import (
 	"unsafe"
 )
 
+// CalculatorAdd: Add two integers
 func CalculatorAdd(a int32, b int32) (int32, error) {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_calculator_add(C.int32_t(a), C.int32_t(b), &cErr)
@@ -26,6 +27,7 @@ func CalculatorAdd(a int32, b int32) (int32, error) {
 	return int32(result), nil
 }
 
+// CalculatorMul: Multiply two integers
 func CalculatorMul(a int32, b int32) (int32, error) {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_calculator_mul(C.int32_t(a), C.int32_t(b), &cErr)
@@ -37,6 +39,7 @@ func CalculatorMul(a int32, b int32) (int32, error) {
 	return int32(result), nil
 }
 
+// CalculatorDiv: Divide two integers
 func CalculatorDiv(a int32, b int32) (int32, error) {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_calculator_div(C.int32_t(a), C.int32_t(b), &cErr)
@@ -48,6 +51,7 @@ func CalculatorDiv(a int32, b int32) (int32, error) {
 	return int32(result), nil
 }
 
+// CalculatorEcho: Echo a string back
 func CalculatorEcho(s string) (string, error) {
 	cS := C.CString(s)
 	defer C.free(unsafe.Pointer(cS))

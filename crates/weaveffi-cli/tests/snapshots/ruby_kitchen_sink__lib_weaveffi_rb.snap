@@ -50,6 +50,7 @@ module WeaveFFI
   attach_function :weaveffi_shared_Token_destroy, [:pointer], :void
   attach_function :weaveffi_shared_Token_get_id, [:pointer], :int64
   attach_function :weaveffi_shared_Token_get_label, [:pointer], :pointer
+  # Trivial cross-module helper
   attach_function :weaveffi_shared_ping, [:pointer], :pointer
 
   class TokenPtr < FFI::AutoPointer
@@ -58,6 +59,7 @@ module WeaveFFI
     end
   end
 
+  # A reusable token referenced across modules
   class Token
     attr_reader :handle
 
@@ -89,6 +91,7 @@ module WeaveFFI
     end
   end
 
+  # Trivial cross-module helper
   def self.ping()
     err = ErrorStruct.new
     result = weaveffi_shared_ping(err)
@@ -101,25 +104,36 @@ module WeaveFFI
 
   # === Module: kitchen ===
 
+  # Task priority levels
   module Priority
+    # Low priority
     LOW = 0
+    # Normal priority
     NORMAL = 1
+    # High priority
     HIGH = 2
   end
 
   attach_function :weaveffi_kitchen_Item_destroy, [:pointer], :void
+  # Stable identifier
   attach_function :weaveffi_kitchen_Item_get_id, [:pointer], :int64
+  # Display name
   attach_function :weaveffi_kitchen_Item_get_name, [:pointer], :pointer
+  # Initial count
   attach_function :weaveffi_kitchen_Item_get_count, [:pointer], :int32
+  # Whether the item is enabled
   attach_function :weaveffi_kitchen_Item_get_enabled, [:pointer], :int32
+  # Scaling ratio
   attach_function :weaveffi_kitchen_Item_get_ratio, [:pointer], :double
   attach_function :weaveffi_kitchen_Item_get_nick, [:pointer], :uint32
   attach_function :weaveffi_kitchen_Item_get_payload, [:pointer, :pointer], :pointer
   attach_function :weaveffi_kitchen_Item_get_tags, [:pointer, :pointer], :pointer
   attach_function :weaveffi_kitchen_Item_get_attrs, [:pointer, :pointer, :pointer, :pointer], :void
   attach_function :weaveffi_kitchen_Item_get_parent, [:pointer], :pointer
+  # Cross-module struct reference
   attach_function :weaveffi_kitchen_Item_get_token, [:pointer], :pointer
   attach_function :weaveffi_kitchen_Item_get_priority, [:pointer], :int32
+  # Identity for bool
   attach_function :weaveffi_kitchen_bool_id, [:int32, :pointer], :int32
   attach_function :weaveffi_kitchen_i32_id, [:int32, :pointer], :int32
   attach_function :weaveffi_kitchen_u32_id, [:uint32, :pointer], :uint32
@@ -127,16 +141,27 @@ module WeaveFFI
   attach_function :weaveffi_kitchen_f64_id, [:double, :pointer], :double
   attach_function :weaveffi_kitchen_echo_string, [:string, :pointer], :pointer
   attach_function :weaveffi_kitchen_echo_bytes, [:pointer, :size_t, :pointer, :pointer], :pointer
+  # Borrowed string parameter
   attach_function :weaveffi_kitchen_echo_borrowed_str, [:string, :pointer], :pointer
+  # Borrowed bytes parameter
   attach_function :weaveffi_kitchen_echo_borrowed_bytes, [:pointer, :size_t, :pointer, :pointer], :pointer
+  # Returns an opaque handle
   attach_function :weaveffi_kitchen_open_handle, [:pointer], :uint64
+  # Returns a typed handle
   attach_function :weaveffi_kitchen_open_typed_handle, [:pointer], :pointer
+  # Optional struct return
   attach_function :weaveffi_kitchen_maybe_item, [:int64, :pointer], :pointer
+  # List of structs
   attach_function :weaveffi_kitchen_list_items, [:pointer, :pointer], :pointer
+  # Map return type
   attach_function :weaveffi_kitchen_get_attrs, [:pointer, :pointer, :pointer, :pointer], :void
+  # Iterator return type
   attach_function :weaveffi_kitchen_stream_items, [:pointer, :pointer], :pointer
+  # Returns the shared Token type from another module
   attach_function :weaveffi_kitchen_cross_module_token, [:pointer], :pointer
+  # Legacy operation kept for compatibility
   attach_function :weaveffi_kitchen_legacy_op, [:pointer], :int32
+  # Replacement for legacy_op
   attach_function :weaveffi_kitchen_new_op, [:pointer], :int32
 
   class ItemPtr < FFI::AutoPointer
@@ -145,6 +170,7 @@ module WeaveFFI
     end
   end
 
+  # Kitchen sink struct exercising every field feature
   class Item
     attr_reader :handle
 
@@ -162,11 +188,13 @@ module WeaveFFI
       @handle = nil
     end
 
+    # Stable identifier
     def id
       result = WeaveFFI.weaveffi_kitchen_Item_get_id(@handle)
       result
     end
 
+    # Display name
     def name
       result = WeaveFFI.weaveffi_kitchen_Item_get_name(@handle)
       return '' if result.null?
@@ -175,16 +203,19 @@ module WeaveFFI
       str
     end
 
+    # Initial count
     def count
       result = WeaveFFI.weaveffi_kitchen_Item_get_count(@handle)
       result
     end
 
+    # Whether the item is enabled
     def enabled
       result = WeaveFFI.weaveffi_kitchen_Item_get_enabled(@handle)
       result != 0
     end
 
+    # Scaling ratio
     def ratio
       result = WeaveFFI.weaveffi_kitchen_Item_get_ratio(@handle)
       result
@@ -231,6 +262,7 @@ module WeaveFFI
       result.read_int64
     end
 
+    # Cross-module struct reference
     def token
       result = WeaveFFI.weaveffi_kitchen_Item_get_token(@handle)
       raise Error.new(-1, 'null pointer') if result.null?
@@ -243,6 +275,7 @@ module WeaveFFI
     end
   end
 
+  # Kitchen sink struct exercising every field feature
   class ItemBuilder
     def initialize
       @id = nil
@@ -259,26 +292,31 @@ module WeaveFFI
       @priority = nil
     end
 
+    # Stable identifier
     def with_id(value)
       @id = value
       self
     end
 
+    # Display name
     def with_name(value)
       @name = value
       self
     end
 
+    # Initial count
     def with_count(value)
       @count = value
       self
     end
 
+    # Whether the item is enabled
     def with_enabled(value)
       @enabled = value
       self
     end
 
+    # Scaling ratio
     def with_ratio(value)
       @ratio = value
       self
@@ -309,6 +347,7 @@ module WeaveFFI
       self
     end
 
+    # Cross-module struct reference
     def with_token(value)
       @token = value
       self
@@ -336,6 +375,7 @@ module WeaveFFI
     end
   end
 
+  # Identity for bool
   def self.bool_id(x)
     err = ErrorStruct.new
     x_c = x ? 1 : 0
@@ -396,6 +436,7 @@ module WeaveFFI
     data
   end
 
+  # Borrowed string parameter
   def self.echo_borrowed_str(s)
     err = ErrorStruct.new
     result = weaveffi_kitchen_echo_borrowed_str(s, err)
@@ -406,6 +447,7 @@ module WeaveFFI
     str
   end
 
+  # Borrowed bytes parameter
   def self.echo_borrowed_bytes(b)
     err = ErrorStruct.new
     b_buf = FFI::MemoryPointer.new(:uint8, b.bytesize)
@@ -420,6 +462,7 @@ module WeaveFFI
     data
   end
 
+  # Returns an opaque handle
   def self.open_handle()
     err = ErrorStruct.new
     result = weaveffi_kitchen_open_handle(err)
@@ -427,6 +470,7 @@ module WeaveFFI
     result
   end
 
+  # Returns a typed handle
   def self.open_typed_handle()
     err = ErrorStruct.new
     result = weaveffi_kitchen_open_typed_handle(err)
@@ -435,6 +479,7 @@ module WeaveFFI
     Token.new(result)
   end
 
+  # Optional struct return
   def self.maybe_item(id)
     err = ErrorStruct.new
     result = weaveffi_kitchen_maybe_item(id, err)
@@ -443,6 +488,7 @@ module WeaveFFI
     Item.new(result)
   end
 
+  # List of structs
   def self.list_items()
     err = ErrorStruct.new
     out_len = FFI::MemoryPointer.new(:size_t)
@@ -453,6 +499,7 @@ module WeaveFFI
     result.read_array_of_pointer(len).map { |p| Item.new(p) }
   end
 
+  # Map return type
   def self.get_attrs()
     err = ErrorStruct.new
     out_keys = FFI::MemoryPointer.new(:pointer)
@@ -467,6 +514,7 @@ module WeaveFFI
     keys_ptr.read_array_of_pointer(len).zip(vals_ptr.read_array_of_int32(len)).each_with_object({}) { |(k, v), h| h[k.null? ? '' : k.read_string] = v }
   end
 
+  # Iterator return type
   def self.stream_items()
     err = ErrorStruct.new
     out_len = FFI::MemoryPointer.new(:size_t)
@@ -477,6 +525,7 @@ module WeaveFFI
     result.read_array_of_pointer(len).map { |p| Item.new(p) }
   end
 
+  # Returns the shared Token type from another module
   def self.cross_module_token()
     err = ErrorStruct.new
     result = weaveffi_kitchen_cross_module_token(err)
@@ -485,6 +534,7 @@ module WeaveFFI
     Token.new(result)
   end
 
+  # Legacy operation kept for compatibility
   def self.legacy_op()
     warn "[DEPRECATED] Use new_op instead"
     err = ErrorStruct.new
@@ -493,6 +543,7 @@ module WeaveFFI
     result
   end
 
+  # Replacement for legacy_op
   def self.new_op()
     err = ErrorStruct.new
     result = weaveffi_kitchen_new_op(err)
@@ -501,8 +552,10 @@ module WeaveFFI
   end
 
   # === Module: kitchen_nested ===
+  # Trivial nested-module function
   attach_function :weaveffi_kitchen_nested_hello, [:pointer], :pointer
 
+  # Trivial nested-module function
   def self.hello()
     err = ErrorStruct.new
     result = weaveffi_kitchen_nested_hello(err)

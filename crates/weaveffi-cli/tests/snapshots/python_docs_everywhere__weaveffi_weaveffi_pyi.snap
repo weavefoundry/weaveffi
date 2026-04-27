@@ -1,0 +1,45 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+from enum import IntEnum
+from typing import Dict, Iterator, List, Optional
+
+# Lifecycle status of a document.
+#
+# Used to drive UI badges and filters.
+class Status(IntEnum):
+    # Document is being edited
+    Draft: int
+    # Document is publicly visible
+    Published: int
+    # Document is hidden from listings
+    Archived: int
+
+# Represents a single document tracked by the system.
+#
+# Documents are persisted to disk and exposed via the public API.
+class Document:
+    # Stable opaque identifier
+    @property
+    def id(self) -> int: ...
+    # Human-readable title shown in lists
+    @property
+    def title(self) -> str: ...
+    # Current lifecycle status
+    @property
+    def status(self) -> "Status": ...
+    # Free-form tags for grouping
+    @property
+    def tags(self) -> List[str]: ...
+
+# Create a brand new document.
+#
+# The document starts in `Draft` status; callers must publish
+# it explicitly to make it visible.
+def create_document(title: str, tags: List[str]) -> "Document": ...
+
+# Look up a document by identifier
+def get_document(id: int) -> Optional["Document"]: ...
+
+# Publish a document in the background
+async def publish_async(id: int) -> bool: ...

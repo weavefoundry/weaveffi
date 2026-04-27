@@ -49,6 +49,7 @@ typedef _DartWeaveffiCalculatorAdd = int Function(int, int, Pointer<_WeaveffiErr
 final _weaveffiCalculatorAdd = _lib.lookupFunction<
     _NativeWeaveffiCalculatorAdd, _DartWeaveffiCalculatorAdd>('weaveffi_calculator_add');
 
+/// Add two integers
 int add(int a, int b) {
   final err = calloc<_WeaveffiError>();
   try {
@@ -65,6 +66,7 @@ typedef _DartWeaveffiCalculatorMul = int Function(int, int, Pointer<_WeaveffiErr
 final _weaveffiCalculatorMul = _lib.lookupFunction<
     _NativeWeaveffiCalculatorMul, _DartWeaveffiCalculatorMul>('weaveffi_calculator_mul');
 
+/// Multiply two integers
 int mul(int a, int b) {
   final err = calloc<_WeaveffiError>();
   try {
@@ -81,6 +83,7 @@ typedef _DartWeaveffiCalculatorDiv = int Function(int, int, Pointer<_WeaveffiErr
 final _weaveffiCalculatorDiv = _lib.lookupFunction<
     _NativeWeaveffiCalculatorDiv, _DartWeaveffiCalculatorDiv>('weaveffi_calculator_div');
 
+/// Divide two integers
 int div(int a, int b) {
   final err = calloc<_WeaveffiError>();
   try {
@@ -97,6 +100,7 @@ typedef _DartWeaveffiCalculatorEcho = Pointer<Utf8> Function(Pointer<Utf8>, Poin
 final _weaveffiCalculatorEcho = _lib.lookupFunction<
     _NativeWeaveffiCalculatorEcho, _DartWeaveffiCalculatorEcho>('weaveffi_calculator_echo');
 
+/// Echo a string back
 String echo(String s) {
   final err = calloc<_WeaveffiError>();
   final sPtr = s.toNativeUtf8();

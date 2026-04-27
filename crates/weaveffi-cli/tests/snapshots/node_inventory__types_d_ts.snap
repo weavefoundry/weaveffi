@@ -17,15 +17,25 @@ export enum Category {
   Books = 3,
 }
 // module products
-/** Maps to C function: weaveffi_products_create_product */
+/**
+ * Maps to C function: weaveffi_products_create_product
+ */
 export function create_product(name: string, price: number, category: Category): bigint
-/** Maps to C function: weaveffi_products_get_product */
+/**
+ * Maps to C function: weaveffi_products_get_product
+ */
 export function get_product(id: bigint): Product
-/** Maps to C function: weaveffi_products_search_products */
+/**
+ * Maps to C function: weaveffi_products_search_products
+ */
 export function search_products(category: Category): Product[]
-/** Maps to C function: weaveffi_products_update_price */
+/**
+ * Maps to C function: weaveffi_products_update_price
+ */
 export function update_price(id: bigint, price: number): boolean
-/** Maps to C function: weaveffi_products_delete_product */
+/**
+ * Maps to C function: weaveffi_products_delete_product
+ */
 export function delete_product(id: bigint): boolean
 export interface OrderItem {
   product_id: number;
@@ -39,11 +49,19 @@ export interface Order {
   status: string;
 }
 // module orders
-/** Maps to C function: weaveffi_orders_create_order */
+/**
+ * Maps to C function: weaveffi_orders_create_order
+ */
 export function create_order(items: OrderItem[]): bigint
-/** Maps to C function: weaveffi_orders_get_order */
+/**
+ * Maps to C function: weaveffi_orders_get_order
+ */
 export function get_order(id: bigint): Order
-/** Maps to C function: weaveffi_orders_cancel_order */
+/**
+ * Maps to C function: weaveffi_orders_cancel_order
+ */
 export function cancel_order(id: bigint): boolean
-/** Maps to C function: weaveffi_orders_add_product_to_order */
+/**
+ * Maps to C function: weaveffi_orders_add_product_to_order
+ */
 export function add_product_to_order(order_id: bigint, product: Product): boolean

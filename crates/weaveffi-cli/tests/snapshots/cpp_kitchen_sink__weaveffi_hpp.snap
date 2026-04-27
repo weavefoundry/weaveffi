@@ -31,45 +31,69 @@ void weaveffi_cancel_token_cancel(weaveffi_cancel_token* token);
 bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token* token);
 void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
 
+/** A reusable token referenced across modules */
 typedef struct weaveffi_shared_Token weaveffi_shared_Token;
 weaveffi_shared_Token* weaveffi_shared_Token_create(int64_t id, const char* label, weaveffi_error* out_err);
 void weaveffi_shared_Token_destroy(weaveffi_shared_Token* ptr);
 int64_t weaveffi_shared_Token_get_id(const weaveffi_shared_Token* ptr);
 const char* weaveffi_shared_Token_get_label(const weaveffi_shared_Token* ptr);
+/** Trivial cross-module helper */
 const char* weaveffi_shared_ping(weaveffi_error* out_err);
 
-typedef enum { weaveffi_kitchen_Priority_Low = 0, weaveffi_kitchen_Priority_Normal = 1, weaveffi_kitchen_Priority_High = 2 } weaveffi_kitchen_Priority;
+/** Task priority levels */
+typedef enum {
+    /** Low priority */
+    weaveffi_kitchen_Priority_Low = 0,
+    /** Normal priority */
+    weaveffi_kitchen_Priority_Normal = 1,
+    /** High priority */
+    weaveffi_kitchen_Priority_High = 2
+} weaveffi_kitchen_Priority;
+/** Kitchen sink struct exercising every field feature */
 typedef struct weaveffi_kitchen_Item weaveffi_kitchen_Item;
 weaveffi_kitchen_Item* weaveffi_kitchen_Item_create(int64_t id, const char* name, int32_t count, bool enabled, double ratio, uint32_t nick, const uint8_t* payload_ptr, size_t payload_len, const char* const* tags, size_t tags_len, const char* const* attrs_keys, const char* const* attrs_values, size_t attrs_len, const int64_t* parent, const weaveffi_shared_Token* token, weaveffi_kitchen_Priority priority, weaveffi_error* out_err);
 void weaveffi_kitchen_Item_destroy(weaveffi_kitchen_Item* ptr);
+/** Stable identifier */
 int64_t weaveffi_kitchen_Item_get_id(const weaveffi_kitchen_Item* ptr);
+/** Display name */
 const char* weaveffi_kitchen_Item_get_name(const weaveffi_kitchen_Item* ptr);
+/** Initial count */
 int32_t weaveffi_kitchen_Item_get_count(const weaveffi_kitchen_Item* ptr);
+/** Whether the item is enabled */
 bool weaveffi_kitchen_Item_get_enabled(const weaveffi_kitchen_Item* ptr);
+/** Scaling ratio */
 double weaveffi_kitchen_Item_get_ratio(const weaveffi_kitchen_Item* ptr);
 uint32_t weaveffi_kitchen_Item_get_nick(const weaveffi_kitchen_Item* ptr);
 const uint8_t* weaveffi_kitchen_Item_get_payload(const weaveffi_kitchen_Item* ptr, size_t* out_len);
 const char** weaveffi_kitchen_Item_get_tags(const weaveffi_kitchen_Item* ptr, size_t* out_len);
 void weaveffi_kitchen_Item_get_attrs(const weaveffi_kitchen_Item* ptr, const char** out_keys, const char** out_values, size_t* out_len);
 int64_t* weaveffi_kitchen_Item_get_parent(const weaveffi_kitchen_Item* ptr);
+/** Cross-module struct reference */
 weaveffi_shared_Token* weaveffi_kitchen_Item_get_token(const weaveffi_kitchen_Item* ptr);
 weaveffi_kitchen_Priority weaveffi_kitchen_Item_get_priority(const weaveffi_kitchen_Item* ptr);
 typedef struct weaveffi_kitchen_ItemBuilder weaveffi_kitchen_ItemBuilder;
 weaveffi_kitchen_ItemBuilder* weaveffi_kitchen_Item_Builder_new(void);
+/** Stable identifier */
 void weaveffi_kitchen_Item_Builder_set_id(weaveffi_kitchen_ItemBuilder* builder, int64_t value);
+/** Display name */
 void weaveffi_kitchen_Item_Builder_set_name(weaveffi_kitchen_ItemBuilder* builder, const char* value);
+/** Initial count */
 void weaveffi_kitchen_Item_Builder_set_count(weaveffi_kitchen_ItemBuilder* builder, int32_t value);
+/** Whether the item is enabled */
 void weaveffi_kitchen_Item_Builder_set_enabled(weaveffi_kitchen_ItemBuilder* builder, bool value);
+/** Scaling ratio */
 void weaveffi_kitchen_Item_Builder_set_ratio(weaveffi_kitchen_ItemBuilder* builder, double value);
 void weaveffi_kitchen_Item_Builder_set_nick(weaveffi_kitchen_ItemBuilder* builder, uint32_t value);
 void weaveffi_kitchen_Item_Builder_set_payload(weaveffi_kitchen_ItemBuilder* builder, const uint8_t* value_ptr, size_t value_len);
 void weaveffi_kitchen_Item_Builder_set_tags(weaveffi_kitchen_ItemBuilder* builder, const char* const* value, size_t value_len);
 void weaveffi_kitchen_Item_Builder_set_attrs(weaveffi_kitchen_ItemBuilder* builder, const char* const* value_keys, const char* const* value_values, size_t value_len);
 void weaveffi_kitchen_Item_Builder_set_parent(weaveffi_kitchen_ItemBuilder* builder, const int64_t* value);
+/** Cross-module struct reference */
 void weaveffi_kitchen_Item_Builder_set_token(weaveffi_kitchen_ItemBuilder* builder, const weaveffi_shared_Token* value);
 void weaveffi_kitchen_Item_Builder_set_priority(weaveffi_kitchen_ItemBuilder* builder, weaveffi_kitchen_Priority value);
 weaveffi_kitchen_Item* weaveffi_kitchen_Item_Builder_build(weaveffi_kitchen_ItemBuilder* builder, weaveffi_error* out_err);
 void weaveffi_kitchen_Item_Builder_destroy(weaveffi_kitchen_ItemBuilder* builder);
+/** Identity for bool */
 bool weaveffi_kitchen_bool_id(bool x, weaveffi_error* out_err);
 int32_t weaveffi_kitchen_i32_id(int32_t x, weaveffi_error* out_err);
 uint32_t weaveffi_kitchen_u32_id(uint32_t x, weaveffi_error* out_err);
@@ -77,22 +101,36 @@ int64_t weaveffi_kitchen_i64_id(int64_t x, weaveffi_error* out_err);
 double weaveffi_kitchen_f64_id(double x, weaveffi_error* out_err);
 const char* weaveffi_kitchen_echo_string(const char* s, weaveffi_error* out_err);
 const uint8_t* weaveffi_kitchen_echo_bytes(const uint8_t* b_ptr, size_t b_len, size_t* out_len, weaveffi_error* out_err);
+/** Borrowed string parameter */
 const char* weaveffi_kitchen_echo_borrowed_str(const char* s, weaveffi_error* out_err);
+/** Borrowed bytes parameter */
 const uint8_t* weaveffi_kitchen_echo_borrowed_bytes(const uint8_t* b_ptr, size_t b_len, size_t* out_len, weaveffi_error* out_err);
+/** Returns an opaque handle */
 weaveffi_handle_t weaveffi_kitchen_open_handle(weaveffi_error* out_err);
+/** Returns a typed handle */
 weaveffi_kitchen_Token* weaveffi_kitchen_open_typed_handle(weaveffi_error* out_err);
+/** Optional struct return */
 weaveffi_kitchen_Item* weaveffi_kitchen_maybe_item(int64_t id, weaveffi_error* out_err);
+/** List of structs */
 weaveffi_kitchen_Item** weaveffi_kitchen_list_items(size_t* out_len, weaveffi_error* out_err);
+/** Map return type */
 void weaveffi_kitchen_get_attrs(const char** out_keys, int32_t* out_values, size_t* out_len, weaveffi_error* out_err);
+/** Iterator return type */
 weaveffi_kitchen_Item** weaveffi_kitchen_stream_items(size_t* out_len, weaveffi_error* out_err);
+/** Returns the shared Token type from another module */
 weaveffi_shared_Token* weaveffi_kitchen_cross_module_token(weaveffi_error* out_err);
+/** Async operation */
 typedef void (*weaveffi_kitchen_do_async_callback)(void* context, weaveffi_error* err, const char* result);
 void weaveffi_kitchen_do_async_async(const char* input, weaveffi_kitchen_do_async_callback callback, void* context);
+/** Cancellable async operation */
 typedef void (*weaveffi_kitchen_do_cancellable_callback)(void* context, weaveffi_error* err, const char* result);
 void weaveffi_kitchen_do_cancellable_async(const char* input, weaveffi_cancel_token* cancel_token, weaveffi_kitchen_do_cancellable_callback callback, void* context);
+/** Legacy operation kept for compatibility */
 int32_t weaveffi_kitchen_legacy_op(weaveffi_error* out_err);
+/** Replacement for legacy_op */
 int32_t weaveffi_kitchen_new_op(weaveffi_error* out_err);
 
+/** Trivial nested-module function */
 const char* weaveffi_kitchen_nested_hello(weaveffi_error* out_err);
 
 } // extern "C"
@@ -117,6 +155,7 @@ public:
     invalid_inputError(const std::string& msg) : WeaveFFIError(2, msg) {}
 };
 
+/** A reusable token referenced across modules */
 class Token {
     void* handle_;
 
@@ -158,6 +197,7 @@ public:
 
 };
 
+/** Trivial cross-module helper */
 inline std::string shared_ping() {
     weaveffi_error err{};
     auto result = weaveffi_shared_ping(&err);
@@ -176,12 +216,17 @@ inline std::string shared_ping() {
     return ret;
 }
 
+/** Task priority levels */
 enum class Priority : int32_t {
+    /** Low priority */
     Low = 0,
+    /** Normal priority */
     Normal = 1,
+    /** High priority */
     High = 2
 };
 
+/** Kitchen sink struct exercising every field feature */
 class Item {
     void* handle_;
 
@@ -210,10 +255,12 @@ public:
 
     void* handle() const { return handle_; }
 
+    /** Stable identifier */
     int64_t id() const {
         return weaveffi_kitchen_Item_get_id(static_cast<const weaveffi_kitchen_Item*>(handle_));
     }
 
+    /** Display name */
     std::string name() const {
         const char* raw = weaveffi_kitchen_Item_get_name(static_cast<const weaveffi_kitchen_Item*>(handle_));
         std::string ret(raw);
@@ -221,14 +268,17 @@ public:
         return ret;
     }
 
+    /** Initial count */
     int32_t count() const {
         return weaveffi_kitchen_Item_get_count(static_cast<const weaveffi_kitchen_Item*>(handle_));
     }
 
+    /** Whether the item is enabled */
     bool enabled() const {
         return weaveffi_kitchen_Item_get_enabled(static_cast<const weaveffi_kitchen_Item*>(handle_));
     }
 
+    /** Scaling ratio */
     double ratio() const {
         return weaveffi_kitchen_Item_get_ratio(static_cast<const weaveffi_kitchen_Item*>(handle_));
     }
@@ -270,6 +320,7 @@ public:
         return *raw;
     }
 
+    /** Cross-module struct reference */
     Token token() const {
         return Token(weaveffi_kitchen_Item_get_token(static_cast<const weaveffi_kitchen_Item*>(handle_)));
     }
@@ -280,6 +331,7 @@ public:
 
 };
 
+/** Kitchen sink struct exercising every field feature */
 class ItemBuilder {
     void* handle_;
 
@@ -306,26 +358,31 @@ public:
         return *this;
     }
 
+    /** Stable identifier */
     ItemBuilder& withId(int64_t value) {
         weaveffi_kitchen_Item_Builder_set_id(static_cast<weaveffi_kitchen_ItemBuilder*>(handle_), value);
         return *this;
     }
 
+    /** Display name */
     ItemBuilder& withName(const std::string& value) {
         weaveffi_kitchen_Item_Builder_set_name(static_cast<weaveffi_kitchen_ItemBuilder*>(handle_), value.c_str());
         return *this;
     }
 
+    /** Initial count */
     ItemBuilder& withCount(int32_t value) {
         weaveffi_kitchen_Item_Builder_set_count(static_cast<weaveffi_kitchen_ItemBuilder*>(handle_), value);
         return *this;
     }
 
+    /** Whether the item is enabled */
     ItemBuilder& withEnabled(bool value) {
         weaveffi_kitchen_Item_Builder_set_enabled(static_cast<weaveffi_kitchen_ItemBuilder*>(handle_), value);
         return *this;
     }
 
+    /** Scaling ratio */
     ItemBuilder& withRatio(double value) {
         weaveffi_kitchen_Item_Builder_set_ratio(static_cast<weaveffi_kitchen_ItemBuilder*>(handle_), value);
         return *this;
@@ -365,6 +422,7 @@ public:
         return *this;
     }
 
+    /** Cross-module struct reference */
     ItemBuilder& withToken(const Token& value) {
         weaveffi_kitchen_Item_Builder_set_token(static_cast<weaveffi_kitchen_ItemBuilder*>(handle_), static_cast<const weaveffi_shared_Token*>(value.handle()));
         return *this;
@@ -383,6 +441,7 @@ public:
     }
 };
 
+/** Identity for bool */
 inline bool kitchen_bool_id(bool x) {
     weaveffi_error err{};
     auto result = weaveffi_kitchen_bool_id(x, &err);
@@ -500,6 +559,7 @@ inline std::vector<uint8_t> kitchen_echo_bytes(const std::vector<uint8_t>& b) {
     return ret;
 }
 
+/** Borrowed string parameter */
 inline std::string kitchen_echo_borrowed_str(const std::string& s) {
     weaveffi_error err{};
     auto result = weaveffi_kitchen_echo_borrowed_str(s.c_str(), &err);
@@ -518,6 +578,7 @@ inline std::string kitchen_echo_borrowed_str(const std::string& s) {
     return ret;
 }
 
+/** Borrowed bytes parameter */
 inline std::vector<uint8_t> kitchen_echo_borrowed_bytes(const std::vector<uint8_t>& b) {
     size_t out_len = 0;
     weaveffi_error err{};
@@ -537,6 +598,7 @@ inline std::vector<uint8_t> kitchen_echo_borrowed_bytes(const std::vector<uint8_
     return ret;
 }
 
+/** Returns an opaque handle */
 inline void* kitchen_open_handle() {
     weaveffi_error err{};
     auto result = weaveffi_kitchen_open_handle(&err);
@@ -553,6 +615,7 @@ inline void* kitchen_open_handle() {
     return reinterpret_cast<void*>(static_cast<uintptr_t>(result));
 }
 
+/** Returns a typed handle */
 inline Token kitchen_open_typed_handle() {
     weaveffi_error err{};
     auto result = weaveffi_kitchen_open_typed_handle(&err);
@@ -569,6 +632,7 @@ inline Token kitchen_open_typed_handle() {
     return Token(result);
 }
 
+/** Optional struct return */
 inline std::optional<Item> kitchen_maybe_item(int64_t id) {
     weaveffi_error err{};
     auto result = weaveffi_kitchen_maybe_item(id, &err);
@@ -586,6 +650,7 @@ inline std::optional<Item> kitchen_maybe_item(int64_t id) {
     return Item(result);
 }
 
+/** List of structs */
 inline std::vector<Item> kitchen_list_items() {
     size_t out_len = 0;
     weaveffi_error err{};
@@ -606,6 +671,7 @@ inline std::vector<Item> kitchen_list_items() {
     return ret;
 }
 
+/** Map return type */
 inline std::unordered_map<std::string, int32_t> kitchen_get_attrs() {
     const char** out_keys = nullptr;
     int32_t* out_values = nullptr;
@@ -629,6 +695,7 @@ inline std::unordered_map<std::string, int32_t> kitchen_get_attrs() {
     return ret;
 }
 
+/** Iterator return type */
 inline std::vector<Item> kitchen_stream_items() {
     size_t out_len = 0;
     weaveffi_error err{};
@@ -649,6 +716,7 @@ inline std::vector<Item> kitchen_stream_items() {
     return ret;
 }
 
+/** Returns the shared Token type from another module */
 inline Token kitchen_cross_module_token() {
     weaveffi_error err{};
     auto result = weaveffi_kitchen_cross_module_token(&err);
@@ -665,6 +733,7 @@ inline Token kitchen_cross_module_token() {
     return Token(result);
 }
 
+/** Async operation */
 inline std::future<std::string> kitchen_do_async(const std::string& input) {
     auto* promise_ptr = new std::promise<std::string>();
     auto future = promise_ptr->get_future();
@@ -683,6 +752,7 @@ inline std::future<std::string> kitchen_do_async(const std::string& input) {
     return future;
 }
 
+/** Cancellable async operation */
 inline std::future<std::string> kitchen_do_cancellable(const std::string& input, weaveffi_cancel_token* cancel_token = nullptr) {
     auto* promise_ptr = new std::promise<std::string>();
     auto future = promise_ptr->get_future();
@@ -701,6 +771,7 @@ inline std::future<std::string> kitchen_do_cancellable(const std::string& input,
     return future;
 }
 
+/** Legacy operation kept for compatibility */
 [[deprecated("Use new_op instead")]]
 inline int32_t kitchen_legacy_op() {
     weaveffi_error err{};
@@ -718,6 +789,7 @@ inline int32_t kitchen_legacy_op() {
     return result;
 }
 
+/** Replacement for legacy_op */
 inline int32_t kitchen_new_op() {
     weaveffi_error err{};
     auto result = weaveffi_kitchen_new_op(&err);
@@ -734,6 +806,7 @@ inline int32_t kitchen_new_op() {
     return result;
 }
 
+/** Trivial nested-module function */
 inline std::string kitchen_nested_hello() {
     weaveffi_error err{};
     auto result = weaveffi_kitchen_nested_hello(&err);

@@ -392,6 +392,100 @@ fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Mo
     }
 }
 
+/// Emits a JSDoc comment at `indent`. Single-line docs collapse to
+/// `/** text */`; multi-line docs expand to a block with ` * ` prefixed lines.
+fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
+    let Some(doc) = doc else {
+        return;
+    };
+    let doc = doc.trim();
+    if doc.is_empty() {
+        return;
+    }
+    if doc.contains('\n') {
+        out.push_str(indent);
+        out.push_str("/**\n");
+        for line in doc.lines() {
+            out.push_str(indent);
+            if line.is_empty() {
+                out.push_str(" *\n");
+            } else {
+                out.push_str(" * ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out.push_str(indent);
+        out.push_str(" */\n");
+    } else {
+        out.push_str(indent);
+        out.push_str("/** ");
+        out.push_str(doc);
+        out.push_str(" */\n");
+    }
+}
+
+/// Emits a JSDoc block for a function: function doc, `@param name desc` for
+/// each documented parameter, and an optional trailing tag list.
+fn emit_fn_doc(
+    out: &mut String,
+    doc: &Option<String>,
+    params: &[weaveffi_ir::ir::Param],
+    indent: &str,
+    extra_tags: &[String],
+) {
+    let has_param_docs = params.iter().any(|p| p.doc.is_some());
+    let trimmed_doc = doc.as_ref().map(|d| d.trim()).filter(|d| !d.is_empty());
+    if trimmed_doc.is_none() && !has_param_docs && extra_tags.is_empty() {
+        return;
+    }
+    out.push_str(indent);
+    out.push_str("/**\n");
+    if let Some(d) = trimmed_doc {
+        for line in d.lines() {
+            out.push_str(indent);
+            if line.is_empty() {
+                out.push_str(" *\n");
+            } else {
+                out.push_str(" * ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    for p in params {
+        if let Some(pdoc) = &p.doc {
+            let pdoc = pdoc.trim();
+            if pdoc.is_empty() {
+                continue;
+            }
+            let mut lines = pdoc.lines();
+            if let Some(first) = lines.next() {
+                out.push_str(indent);
+                out.push_str(&format!(" * @param {} {}\n", p.name, first));
+            }
+            for line in lines {
+                out.push_str(indent);
+                if line.is_empty() {
+                    out.push_str(" *\n");
+                } else {
+                    out.push_str(" *   ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    for tag in extra_tags {
+        out.push_str(indent);
+        out.push_str(" * ");
+        out.push_str(tag);
+        out.push('\n');
+    }
+    out.push_str(indent);
+    out.push_str(" */\n");
+}
+
 fn render_wasm_dts(api: &Api, module_name: &str) -> String {
     let pascal_name = module_name.to_upper_camel_case();
     let interface_name = format!("{pascal_name}Module");
@@ -401,8 +495,10 @@ fn render_wasm_dts(api: &Api, module_name: &str) -> String {
 
     for (m, _path) in collect_modules_with_path(&api.modules) {
         for s in &m.structs {
+            emit_doc(&mut out, &s.doc, "");
             out.push_str(&format!("export interface {} {{\n", s.name));
             for field in &s.fields {
+                emit_doc(&mut out, &field.doc, "  ");
                 out.push_str(&format!(
                     "  readonly {}: {};\n",
                     field.name,
@@ -413,8 +509,10 @@ fn render_wasm_dts(api: &Api, module_name: &str) -> String {
         }
 
         for e in &m.enums {
+            emit_doc(&mut out, &e.doc, "");
             out.push_str(&format!("export declare const {}: Readonly<{{\n", e.name));
             for v in &e.variants {
+                emit_doc(&mut out, &v.doc, "  ");
                 out.push_str(&format!("  {}: {};\n", v.name, v.value));
             }
             out.push_str("}>;\n\n");
@@ -462,12 +560,11 @@ fn render_dts_module_interface(out: &mut String, m: &Module, module_path: &str, 
         } else {
             base_ret
         };
+        let mut tags = vec!["@throws {Error} if the native call fails".to_string()];
         if let Some(msg) = &func.deprecated {
-            out.push_str(&format!("{inner}/** @deprecated {msg} */\n"));
+            tags.insert(0, format!("@deprecated {msg}"));
         }
-        out.push_str(&format!(
-            "{inner}/** @throws {{Error}} if the native call fails */\n"
-        ));
+        emit_fn_doc(out, &func.doc, &func.params, &inner, &tags);
         out.push_str(&format!(
             "{inner}{}({}): {};\n",
             func.name,
@@ -1034,11 +1131,13 @@ mod tests {
                         name: "a".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "b".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::I32),
@@ -1321,6 +1420,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                     "Contact".into(),
@@ -1373,6 +1473,7 @@ mod tests {
                     name: "msg".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -1490,6 +1591,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::StringUtf8),
                 doc: None,
@@ -1540,7 +1642,7 @@ mod tests {
             dts.contains("@throws"),
             "Expected .d.ts to contain @throws JSDoc comment"
         );
-        assert!(dts.contains("/** @throws {Error} if the native call fails */"));
+        assert!(dts.contains("@throws {Error} if the native call fails"));
     }
 
     #[test]
@@ -1584,6 +1686,7 @@ mod tests {
                     name: "contact".into(),
                     ty: TypeRef::TypedHandle("Contact".into()),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -1633,6 +1736,7 @@ mod tests {
                         Box::new(TypeRef::Struct("Contact".into())),
                     ))))),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -1678,6 +1782,7 @@ mod tests {
                         Box::new(TypeRef::List(Box::new(TypeRef::I32))),
                     ),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -1713,6 +1818,7 @@ mod tests {
                         Box::new(TypeRef::Struct("Contact".into())),
                     ),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -1775,6 +1881,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -1835,6 +1942,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                     "Contact".into(),
@@ -1879,6 +1987,7 @@ mod tests {
                     name: "x".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -1936,6 +2045,7 @@ mod tests {
                         name: "x".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::I32),
                     doc: None,
@@ -1951,11 +2061,13 @@ mod tests {
                             name: "a".into(),
                             ty: TypeRef::I32,
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "b".into(),
                             ty: TypeRef::I32,
                             mutable: false,
+                            doc: None,
                         },
                     ],
                     returns: Some(TypeRef::I32),
@@ -2053,5 +2165,81 @@ mod tests {
             js.contains("weaveffi_parent_child_inner_fn"),
             "nested child C ABI call in JS missing: {js}"
         );
+    }
+
+    fn doc_module() -> Module {
+        Module {
+            name: "docs".into(),
+            functions: vec![Function {
+                name: "do_thing".into(),
+                params: vec![Param {
+                    name: "x".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: Some("the input value".into()),
+                }],
+                returns: Some(TypeRef::I32),
+                doc: Some("Performs a thing.".into()),
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![StructDef {
+                name: "Item".into(),
+                doc: Some("An item we track.".into()),
+                fields: vec![StructField {
+                    name: "id".into(),
+                    ty: TypeRef::I64,
+                    doc: Some("Stable id".into()),
+                    default: None,
+                }],
+                builder: false,
+            }],
+            enums: vec![EnumDef {
+                name: "Kind".into(),
+                doc: Some("Kind of item.".into()),
+                variants: vec![EnumVariant {
+                    name: "Small".into(),
+                    value: 0,
+                    doc: Some("A small one".into()),
+                }],
+            }],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }
+    }
+
+    #[test]
+    fn wasm_emits_doc_on_function() {
+        let dts = render_wasm_dts(&make_api(vec![doc_module()]), "weaveffi");
+        assert!(dts.contains("Performs a thing."), "{dts}");
+    }
+
+    #[test]
+    fn wasm_emits_doc_on_struct() {
+        let dts = render_wasm_dts(&make_api(vec![doc_module()]), "weaveffi");
+        assert!(dts.contains("/** An item we track. */"), "{dts}");
+    }
+
+    #[test]
+    fn wasm_emits_doc_on_enum_variant() {
+        let dts = render_wasm_dts(&make_api(vec![doc_module()]), "weaveffi");
+        assert!(dts.contains("/** Kind of item. */"), "{dts}");
+        assert!(dts.contains("/** A small one */"), "{dts}");
+    }
+
+    #[test]
+    fn wasm_emits_doc_on_field() {
+        let dts = render_wasm_dts(&make_api(vec![doc_module()]), "weaveffi");
+        assert!(dts.contains("/** Stable id */"), "{dts}");
+    }
+
+    #[test]
+    fn wasm_emits_doc_on_param() {
+        let dts = render_wasm_dts(&make_api(vec![doc_module()]), "weaveffi");
+        assert!(dts.contains("@param x the input value"), "{dts}");
     }
 }

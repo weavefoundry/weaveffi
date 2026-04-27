@@ -242,11 +242,13 @@ mod tests {
                             name: "a".into(),
                             ty: TypeRef::I32,
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "b".into(),
                             ty: TypeRef::I32,
                             mutable: false,
+                            doc: None,
                         },
                     ],
                     returns: Some(TypeRef::I32),

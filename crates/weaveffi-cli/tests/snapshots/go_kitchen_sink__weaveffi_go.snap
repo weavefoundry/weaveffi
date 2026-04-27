@@ -26,6 +26,7 @@ func cToBool(b C._Bool) bool {
 	return b != 0
 }
 
+// Token: A reusable token referenced across modules
 type Token struct {
 	ptr *C.weaveffi_shared_Token
 }
@@ -45,6 +46,7 @@ func (s *Token) Close() {
 	}
 }
 
+// SharedPing: Trivial cross-module helper
 func SharedPing() (string, error) {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_shared_ping(&cErr)
@@ -58,34 +60,44 @@ func SharedPing() (string, error) {
 	return goResult, nil
 }
 
+// Priority: Task priority levels
 type Priority int32
 
 const (
+	// PriorityLow: Low priority
 	PriorityLow Priority = 0
+	// PriorityNormal: Normal priority
 	PriorityNormal Priority = 1
+	// PriorityHigh: High priority
 	PriorityHigh Priority = 2
 )
 
+// Item: Kitchen sink struct exercising every field feature
 type Item struct {
 	ptr *C.weaveffi_kitchen_Item
 }
 
+// Id: Stable identifier
 func (s *Item) Id() int64 {
 	return int64(C.weaveffi_kitchen_Item_get_id(s.ptr))
 }
 
+// Name: Display name
 func (s *Item) Name() string {
 	return C.GoString(C.weaveffi_kitchen_Item_get_name(s.ptr))
 }
 
+// Count: Initial count
 func (s *Item) Count() int32 {
 	return int32(C.weaveffi_kitchen_Item_get_count(s.ptr))
 }
 
+// Enabled: Whether the item is enabled
 func (s *Item) Enabled() bool {
 	return cToBool(C.weaveffi_kitchen_Item_get_enabled(s.ptr))
 }
 
+// Ratio: Scaling ratio
 func (s *Item) Ratio() float64 {
 	return float64(C.weaveffi_kitchen_Item_get_ratio(s.ptr))
 }
@@ -115,6 +127,7 @@ func (s *Item) Parent() *int64 {
 	return &v
 }
 
+// Token: Cross-module struct reference
 func (s *Item) Token() *Token {
 	return &Token{ptr: C.weaveffi_kitchen_Item_get_token(s.ptr)}
 }
@@ -130,6 +143,7 @@ func (s *Item) Close() {
 	}
 }
 
+// ItemBuilder: Kitchen sink struct exercising every field feature
 type ItemBuilder struct {
 	fields map[string]interface{}
 }
@@ -138,26 +152,31 @@ func NewItemBuilder() *ItemBuilder {
 	return &ItemBuilder{fields: make(map[string]interface{})}
 }
 
+// WithId: Stable identifier
 func (b *ItemBuilder) WithId(value int64) *ItemBuilder {
 	b.fields["id"] = value
 	return b
 }
 
+// WithName: Display name
 func (b *ItemBuilder) WithName(value string) *ItemBuilder {
 	b.fields["name"] = value
 	return b
 }
 
+// WithCount: Initial count
 func (b *ItemBuilder) WithCount(value int32) *ItemBuilder {
 	b.fields["count"] = value
 	return b
 }
 
+// WithEnabled: Whether the item is enabled
 func (b *ItemBuilder) WithEnabled(value bool) *ItemBuilder {
 	b.fields["enabled"] = value
 	return b
 }
 
+// WithRatio: Scaling ratio
 func (b *ItemBuilder) WithRatio(value float64) *ItemBuilder {
 	b.fields["ratio"] = value
 	return b
@@ -188,6 +207,7 @@ func (b *ItemBuilder) WithParent(value *int64) *ItemBuilder {
 	return b
 }
 
+// WithToken: Cross-module struct reference
 func (b *ItemBuilder) WithToken(value *Token) *ItemBuilder {
 	b.fields["token"] = value
 	return b
@@ -198,6 +218,7 @@ func (b *ItemBuilder) WithPriority(value Priority) *ItemBuilder {
 	return b
 }
 
+// KitchenBoolId: Identity for bool
 func KitchenBoolId(x bool) (bool, error) {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_bool_id(boolToC(x), &cErr)
@@ -290,6 +311,7 @@ func KitchenEchoBytes(b []byte) ([]byte, error) {
 	return goResult, nil
 }
 
+// KitchenEchoBorrowedStr: Borrowed string parameter
 func KitchenEchoBorrowedStr(s string) (string, error) {
 	cS := C.CString(s)
 	defer C.free(unsafe.Pointer(cS))
@@ -305,6 +327,7 @@ func KitchenEchoBorrowedStr(s string) (string, error) {
 	return goResult, nil
 }
 
+// KitchenEchoBorrowedBytes: Borrowed bytes parameter
 func KitchenEchoBorrowedBytes(b []byte) ([]byte, error) {
 	var cBPtr *C.uint8_t
 	cBLen := C.size_t(len(b))
@@ -327,6 +350,7 @@ func KitchenEchoBorrowedBytes(b []byte) ([]byte, error) {
 	return goResult, nil
 }
 
+// KitchenOpenHandle: Returns an opaque handle
 func KitchenOpenHandle() (int64, error) {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_open_handle(&cErr)
@@ -338,6 +362,7 @@ func KitchenOpenHandle() (int64, error) {
 	return int64(result), nil
 }
 
+// KitchenOpenTypedHandle: Returns a typed handle
 func KitchenOpenTypedHandle() (*Token, error) {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_open_typed_handle(&cErr)
@@ -349,6 +374,7 @@ func KitchenOpenTypedHandle() (*Token, error) {
 	return &Token{ptr: result}, nil
 }
 
+// KitchenMaybeItem: Optional struct return
 func KitchenMaybeItem(id int64) (*Item, error) {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_maybe_item(C.int64_t(id), &cErr)
@@ -363,6 +389,7 @@ func KitchenMaybeItem(id int64) (*Item, error) {
 	return &Item{ptr: result}, nil
 }
 
+// KitchenListItems: List of structs
 func KitchenListItems() ([]*Item, error) {
 	var cOutLen C.size_t
 	var cErr C.weaveffi_error
@@ -384,6 +411,7 @@ func KitchenListItems() ([]*Item, error) {
 	return goResult, nil
 }
 
+// KitchenGetAttrs: Map return type
 func KitchenGetAttrs() (map[string]int32, error) {
 	var cErr C.weaveffi_error
 	C.weaveffi_kitchen_get_attrs(&cErr)
@@ -396,6 +424,7 @@ func KitchenGetAttrs() (map[string]int32, error) {
 	return goResult, nil
 }
 
+// KitchenStreamItems: Iterator return type
 func KitchenStreamItems() ([]*Item, error) {
 	var cOutLen C.size_t
 	var cErr C.weaveffi_error
@@ -417,6 +446,7 @@ func KitchenStreamItems() ([]*Item, error) {
 	return goResult, nil
 }
 
+// KitchenCrossModuleToken: Returns the shared Token type from another module
 func KitchenCrossModuleToken() (*Token, error) {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_cross_module_token(&cErr)
@@ -428,6 +458,7 @@ func KitchenCrossModuleToken() (*Token, error) {
 	return &Token{ptr: result}, nil
 }
 
+// KitchenLegacyOp: Legacy operation kept for compatibility
 // Deprecated: Use new_op instead
 func KitchenLegacyOp() (int32, error) {
 	var cErr C.weaveffi_error
@@ -440,6 +471,7 @@ func KitchenLegacyOp() (int32, error) {
 	return int32(result), nil
 }
 
+// KitchenNewOp: Replacement for legacy_op
 func KitchenNewOp() (int32, error) {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_new_op(&cErr)
@@ -451,6 +483,7 @@ func KitchenNewOp() (int32, error) {
 	return int32(result), nil
 }
 
+// KitchenNestedHello: Trivial nested-module function
 func KitchenNestedHello() (string, error) {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_nested_hello(&cErr)

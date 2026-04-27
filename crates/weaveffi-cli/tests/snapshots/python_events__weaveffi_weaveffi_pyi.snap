@@ -4,6 +4,8 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 from enum import IntEnum
 from typing import Dict, Iterator, List, Optional
 
+# Send a message, triggering the OnMessage callback
 def send_message(text: str) -> None: ...
 
+# Return an iterator over all sent messages
 def get_messages() -> Iterator[str]: ...

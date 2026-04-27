@@ -87,6 +87,94 @@ impl Generator for AndroidGenerator {
     }
 }
 
+/// Emits a Kotlin KDoc comment at `indent`. Single-line docs collapse to
+/// `/** text */`; multi-line docs expand to a block with ` * ` prefixed lines.
+fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
+    let Some(doc) = doc else {
+        return;
+    };
+    let doc = doc.trim();
+    if doc.is_empty() {
+        return;
+    }
+    if doc.contains('\n') {
+        out.push_str(indent);
+        out.push_str("/**\n");
+        for line in doc.lines() {
+            out.push_str(indent);
+            if line.is_empty() {
+                out.push_str(" *\n");
+            } else {
+                out.push_str(" * ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out.push_str(indent);
+        out.push_str(" */\n");
+    } else {
+        out.push_str(indent);
+        out.push_str("/** ");
+        out.push_str(doc);
+        out.push_str(" */\n");
+    }
+}
+
+/// Emits a KDoc block for a function: function doc plus `@param name desc`
+/// lines for each documented parameter. Skips entirely when there is nothing
+/// to document.
+fn emit_fn_doc(
+    out: &mut String,
+    doc: &Option<String>,
+    params: &[weaveffi_ir::ir::Param],
+    indent: &str,
+) {
+    let has_param_docs = params.iter().any(|p| p.doc.is_some());
+    let trimmed_doc = doc.as_ref().map(|d| d.trim()).filter(|d| !d.is_empty());
+    if trimmed_doc.is_none() && !has_param_docs {
+        return;
+    }
+    out.push_str(indent);
+    out.push_str("/**\n");
+    if let Some(d) = trimmed_doc {
+        for line in d.lines() {
+            out.push_str(indent);
+            if line.is_empty() {
+                out.push_str(" *\n");
+            } else {
+                out.push_str(" * ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    for p in params {
+        if let Some(pdoc) = &p.doc {
+            let pdoc = pdoc.trim();
+            if pdoc.is_empty() {
+                continue;
+            }
+            let mut lines = pdoc.lines();
+            if let Some(first) = lines.next() {
+                out.push_str(indent);
+                out.push_str(&format!(" * @param {} {}\n", p.name, first));
+            }
+            for line in lines {
+                out.push_str(indent);
+                if line.is_empty() {
+                    out.push_str(" *\n");
+                } else {
+                    out.push_str(" *   ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    out.push_str(indent);
+    out.push_str(" */\n");
+}
+
 fn build_gradle(namespace: &str) -> String {
     format!(
         r#"plugins {{
@@ -308,6 +396,7 @@ fn render_kotlin(api: &Api, package: &str, strip_module_prefix: bool) -> String 
     for (m, path) in collect_modules_with_path(&api.modules) {
         for f in &m.functions {
             let func_name = wrapper_name(&path, &f.name, strip_module_prefix);
+            emit_fn_doc(&mut kotlin, &f.doc, &f.params, "        ");
             if let Some(msg) = &f.deprecated {
                 let _ = writeln!(
                     kotlin,
@@ -488,8 +577,10 @@ fn render_kotlin_async_fun(out: &mut String, f: &Function, func_name: &str) {
 
 fn render_kotlin_enum(out: &mut String, e: &EnumDef) {
     let _ = writeln!(out);
+    emit_doc(out, &e.doc, "");
     let _ = writeln!(out, "enum class {}(val value: Int) {{", e.name);
     for (i, v) in e.variants.iter().enumerate() {
+        emit_doc(out, &v.doc, "    ");
         let comma = if i < e.variants.len() - 1 { "," } else { ";" };
         let _ = writeln!(out, "    {}({}){}", v.name, v.value, comma);
     }
@@ -523,6 +614,7 @@ fn render_kotlin_error_types(out: &mut String, api: &Api) {
             "sealed class WeaveFFIException(val code: Int, message: String) : Exception(message) {{"
         );
         for ec in &error_codes {
+            emit_doc(out, &ec.doc, "    ");
             let _ = writeln!(
                 out,
                 "    class {}(message: String = \"{}\") : WeaveFFIException({}, message)",
@@ -1859,6 +1951,7 @@ fn kotlin_getter_type(t: &TypeRef) -> String {
 
 fn render_kotlin_struct(out: &mut String, s: &StructDef) {
     let _ = writeln!(out);
+    emit_doc(out, &s.doc, "");
     let _ = writeln!(
         out,
         "class {} internal constructor(private var handle: Long) : java.io.Closeable {{",
@@ -1908,6 +2001,7 @@ fn render_kotlin_struct(out: &mut String, s: &StructDef) {
     for f in &s.fields {
         let pascal = to_pascal_case(&f.name);
         let kt_type = kotlin_getter_type(&f.ty);
+        emit_doc(out, &f.doc, "    ");
         match &f.ty {
             TypeRef::Struct(name) => {
                 let local = local_type_name(name);
@@ -1946,6 +2040,7 @@ fn render_kotlin_builder(out: &mut String, s: &StructDef) {
         return;
     }
     let _ = writeln!(out);
+    emit_doc(out, &s.doc, "");
     let _ = writeln!(out, "class {}Builder {{", s.name);
     for f in &s.fields {
         let kt_getter = kotlin_getter_type(&f.ty);
@@ -1954,6 +2049,7 @@ fn render_kotlin_builder(out: &mut String, s: &StructDef) {
     for f in &s.fields {
         let pascal = to_pascal_case(&f.name);
         let kt_getter = kotlin_getter_type(&f.ty);
+        emit_doc(out, &f.doc, "    ");
         let _ = writeln!(
             out,
             "    fun with{}({}: {}): {}Builder {{",
@@ -2748,6 +2844,7 @@ mod tests {
                     name: "contact".to_string(),
                     ty: TypeRef::Struct("Contact".into()),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -2787,6 +2884,7 @@ mod tests {
                     name: "age".to_string(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -2890,6 +2988,7 @@ mod tests {
                     name: "color".to_string(),
                     ty: TypeRef::Enum("Color".into()),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -2932,11 +3031,13 @@ mod tests {
                         name: "name".to_string(),
                         ty: TypeRef::StringUtf8,
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "contact_type".to_string(),
                         ty: TypeRef::Enum("ContactType".into()),
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::Enum("ContactType".into())),
@@ -2991,6 +3092,7 @@ mod tests {
                     name: "color".to_string(),
                     ty: TypeRef::Enum("Color".into()),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3084,6 +3186,7 @@ mod tests {
                     name: "id".to_string(),
                     ty: TypeRef::Optional(Box::new(TypeRef::I32)),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3114,6 +3217,7 @@ mod tests {
                     name: "id".to_string(),
                     ty: TypeRef::Optional(Box::new(TypeRef::I32)),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3153,6 +3257,7 @@ mod tests {
                     name: "query".to_string(),
                     ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3291,6 +3396,7 @@ mod tests {
                     name: "ids".to_string(),
                     ty: TypeRef::List(Box::new(TypeRef::I32)),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3321,6 +3427,7 @@ mod tests {
                     name: "ids".to_string(),
                     ty: TypeRef::List(Box::new(TypeRef::I32)),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3434,6 +3541,7 @@ mod tests {
                     name: "id".to_string(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -3613,6 +3721,7 @@ mod tests {
                     name: "scores".to_string(),
                     ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3646,6 +3755,7 @@ mod tests {
                     name: "scores".to_string(),
                     ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3774,11 +3884,13 @@ mod tests {
                         name: "a".to_string(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "b".to_string(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::I32),
@@ -3851,6 +3963,7 @@ mod tests {
                     name: "id".to_string(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -3870,11 +3983,13 @@ mod tests {
                         name: "ContactNotFound".to_string(),
                         code: 1001,
                         message: "Contact not found".to_string(),
+                        doc: None,
                     },
                     ErrorCode {
                         name: "InvalidInput".to_string(),
                         code: 1002,
                         message: "Invalid input provided".to_string(),
+                        doc: None,
                     },
                 ],
             }),
@@ -3928,6 +4043,7 @@ mod tests {
                     name: "name".to_string(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -4013,6 +4129,7 @@ mod tests {
                         Box::new(TypeRef::Struct("Contact".into())),
                     ))))),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -4058,6 +4175,7 @@ mod tests {
                         Box::new(TypeRef::List(Box::new(TypeRef::I32))),
                     ),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -4093,6 +4211,7 @@ mod tests {
                         Box::new(TypeRef::Struct("Contact".into())),
                     ),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -4155,6 +4274,7 @@ mod tests {
                     name: "contact".into(),
                     ty: TypeRef::TypedHandle("Contact".into()),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -4197,6 +4317,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -4272,6 +4393,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                     "Contact".into(),
@@ -4321,6 +4443,7 @@ mod tests {
                     name: "id".to_string(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -4358,6 +4481,7 @@ mod tests {
                     name: "id".to_string(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -4387,5 +4511,89 @@ mod tests {
             kt.contains("import kotlinx.coroutines.suspendCancellableCoroutine"),
             "should import suspendCancellableCoroutine: {kt}"
         );
+    }
+
+    fn doc_api() -> Api {
+        make_api(vec![Module {
+            name: "docs".into(),
+            functions: vec![Function {
+                name: "do_thing".into(),
+                params: vec![Param {
+                    name: "x".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: Some("the input value".into()),
+                }],
+                returns: Some(TypeRef::I32),
+                doc: Some("Performs a thing.".into()),
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![StructDef {
+                name: "Item".into(),
+                doc: Some("An item we track.".into()),
+                fields: vec![StructField {
+                    name: "id".into(),
+                    ty: TypeRef::I64,
+                    doc: Some("Stable id".into()),
+                    default: None,
+                }],
+                builder: false,
+            }],
+            enums: vec![EnumDef {
+                name: "Kind".into(),
+                doc: Some("Kind of item.".into()),
+                variants: vec![EnumVariant {
+                    name: "Small".into(),
+                    value: 0,
+                    doc: Some("A small one".into()),
+                }],
+            }],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: Some(ErrorDomain {
+                name: "DocsErrors".into(),
+                codes: vec![ErrorCode {
+                    name: "not_found".into(),
+                    code: 1,
+                    message: "Not found".into(),
+                    doc: Some("Raised when missing".into()),
+                }],
+            }),
+            modules: vec![],
+        }])
+    }
+
+    #[test]
+    fn android_emits_doc_on_function() {
+        let kt = render_kotlin(&doc_api(), "com.weaveffi", true);
+        assert!(kt.contains("Performs a thing."), "{kt}");
+    }
+
+    #[test]
+    fn android_emits_doc_on_struct() {
+        let kt = render_kotlin(&doc_api(), "com.weaveffi", true);
+        assert!(kt.contains("/** An item we track. */"), "{kt}");
+    }
+
+    #[test]
+    fn android_emits_doc_on_enum_variant() {
+        let kt = render_kotlin(&doc_api(), "com.weaveffi", true);
+        assert!(kt.contains("/** Kind of item. */"), "{kt}");
+        assert!(kt.contains("/** A small one */"), "{kt}");
+    }
+
+    #[test]
+    fn android_emits_doc_on_field() {
+        let kt = render_kotlin(&doc_api(), "com.weaveffi", true);
+        assert!(kt.contains("/** Stable id */"), "{kt}");
+    }
+
+    #[test]
+    fn android_emits_doc_on_param() {
+        let kt = render_kotlin(&doc_api(), "com.weaveffi", true);
+        assert!(kt.contains("@param x the input value"), "{kt}");
     }
 }

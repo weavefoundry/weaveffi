@@ -182,6 +182,39 @@ fn render_cpp_header(api: &Api, namespace: &str) -> String {
     out
 }
 
+/// Emits a `/** ... */` doc comment at `indent`. Single-line docs collapse to
+/// `/** text */`; multi-line docs expand to a block with ` * ` prefixed lines.
+fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
+    let Some(doc) = doc else {
+        return;
+    };
+    let doc = doc.trim();
+    if doc.is_empty() {
+        return;
+    }
+    if doc.contains('\n') {
+        out.push_str(indent);
+        out.push_str("/**\n");
+        for line in doc.lines() {
+            out.push_str(indent);
+            if line.is_empty() {
+                out.push_str(" *\n");
+            } else {
+                out.push_str(" * ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out.push_str(indent);
+        out.push_str(" */\n");
+    } else {
+        out.push_str(indent);
+        out.push_str("/** ");
+        out.push_str(doc);
+        out.push_str(" */\n");
+    }
+}
+
 // ── C ABI type helpers (mirrors the C generator logic) ──
 
 fn is_c_pointer_type(ty: &TypeRef) -> bool {
@@ -354,16 +387,28 @@ fn render_extern_c(out: &mut String, api: &Api) {
     for (module, path) in collect_modules_with_path(&api.modules) {
         for e in &module.enums {
             let tag = format!("weaveffi_{}_{}", path, e.name);
-            let vars: Vec<String> = e
-                .variants
-                .iter()
-                .map(|v| format!("{tag}_{} = {}", v.name, v.value))
-                .collect();
-            out.push_str(&format!("typedef enum {{ {} }} {tag};\n", vars.join(", ")));
+            emit_doc(out, &e.doc, "");
+            if e.variants.iter().any(|v| v.doc.is_some()) {
+                out.push_str("typedef enum {\n");
+                for (i, v) in e.variants.iter().enumerate() {
+                    emit_doc(out, &v.doc, "    ");
+                    let comma = if i + 1 == e.variants.len() { "" } else { "," };
+                    out.push_str(&format!("    {tag}_{} = {}{comma}\n", v.name, v.value));
+                }
+                out.push_str(&format!("}} {tag};\n"));
+            } else {
+                let vars: Vec<String> = e
+                    .variants
+                    .iter()
+                    .map(|v| format!("{tag}_{} = {}", v.name, v.value))
+                    .collect();
+                out.push_str(&format!("typedef enum {{ {} }} {tag};\n", vars.join(", ")));
+            }
         }
 
         for s in &module.structs {
             let tag = format!("weaveffi_{}_{}", path, s.name);
+            emit_doc(out, &s.doc, "");
             out.push_str(&format!("typedef struct {tag} {tag};\n"));
 
             let mut params: Vec<String> = s
@@ -378,6 +423,7 @@ fn render_extern_c(out: &mut String, api: &Api) {
             for field in &s.fields {
                 let (ret_ty, extra) = c_ret_type(&field.ty, &path);
                 let getter = format!("{tag}_get_{}", field.name);
+                emit_doc(out, &field.doc, "");
                 if extra.is_empty() {
                     out.push_str(&format!("{ret_ty} {getter}(const {tag}* ptr);\n"));
                 } else {
@@ -394,6 +440,7 @@ fn render_extern_c(out: &mut String, api: &Api) {
                 out.push_str(&format!("{builder_ty}* {tag}_Builder_new(void);\n"));
                 for field in &s.fields {
                     let param = c_param_type(&field.ty, "value", &path);
+                    emit_doc(out, &field.doc, "");
                     out.push_str(&format!(
                         "void {tag}_Builder_set_{}({builder_ty}* builder, {});\n",
                         field.name, param
@@ -409,6 +456,7 @@ fn render_extern_c(out: &mut String, api: &Api) {
         }
 
         for f in &module.functions {
+            emit_doc(out, &f.doc, "");
             if f.r#async {
                 let fn_base = format!("weaveffi_{}_{}", path, f.name);
                 let cb_name = format!("{fn_base}_callback");
@@ -515,6 +563,7 @@ fn render_cpp_error_classes(out: &mut String, error_codes: &[&ErrorCode]) {
     out.push_str("};\n\n");
 
     for ec in error_codes {
+        emit_doc(out, &ec.doc, "");
         out.push_str(&format!(
             "class {}Error : public WeaveFFIError {{\n",
             ec.name
@@ -532,8 +581,10 @@ fn render_cpp_error_classes(out: &mut String, error_codes: &[&ErrorCode]) {
 
 fn render_cpp_enums(out: &mut String, module: &Module) {
     for e in &module.enums {
+        emit_doc(out, &e.doc, "");
         out.push_str(&format!("enum class {} : int32_t {{\n", e.name));
         for (i, v) in e.variants.iter().enumerate() {
+            emit_doc(out, &v.doc, "    ");
             let comma = if i + 1 < e.variants.len() { "," } else { "" };
             out.push_str(&format!("    {} = {}{}\n", v.name, v.value, comma));
         }
@@ -548,6 +599,7 @@ fn render_cpp_classes(out: &mut String, module: &Module, abi_module: &str) {
         let tag = format!("weaveffi_{}_{}", abi_module, s.name);
         let name = &s.name;
 
+        emit_doc(out, &s.doc, "");
         out.push_str(&format!("class {name} {{\n"));
         out.push_str("    void* handle_;\n\n");
         out.push_str("public:\n");
@@ -608,6 +660,7 @@ fn render_cpp_builder(out: &mut String, s: &StructDef, abi_module: &str) {
     let builder_ty = format!("{tag}Builder");
     let name = &s.name;
 
+    emit_doc(out, &s.doc, "");
     out.push_str(&format!("class {name}Builder {{\n"));
     out.push_str("    void* handle_;\n\n");
     out.push_str("public:\n");
@@ -647,6 +700,7 @@ fn render_cpp_builder(out: &mut String, s: &StructDef, abi_module: &str) {
     for field in &s.fields {
         let pascal = field.name.to_upper_camel_case();
         let decl = cpp_param_decl(&field.ty, "value");
+        emit_doc(out, &field.doc, "    ");
         out.push_str(&format!("    {name}Builder& with{pascal}({decl}) {{\n"));
         let (setup, args) = param_to_c_args(&field.ty, "value", abi_module);
         for line in &setup {
@@ -680,6 +734,7 @@ fn render_cpp_getter(out: &mut String, struct_name: &str, module: &str, field: &
     let cast = format!("static_cast<const {tag}*>(handle_)");
     let ret_type = cpp_type(&field.ty);
 
+    emit_doc(out, &field.doc, "    ");
     out.push_str(&format!("    {ret_type} {}() const {{\n", field.name));
 
     match &field.ty {
@@ -1012,6 +1067,7 @@ fn render_cpp_function(
         .collect();
     let fn_name = format!("{}_{}", abi_module, func.name);
 
+    emit_doc(out, &func.doc, "");
     if let Some(msg) = &func.deprecated {
         let escaped = msg.replace('"', "\\\"");
         out.push_str(&format!("[[deprecated(\"{escaped}\")]]\n"));
@@ -1218,6 +1274,7 @@ fn render_cpp_async_function(out: &mut String, func: &Function, abi_module: &str
     }
     let fn_name = format!("{}_{}", abi_module, func.name);
 
+    emit_doc(out, &func.doc, "");
     if let Some(msg) = &func.deprecated {
         let escaped = msg.replace('"', "\\\"");
         out.push_str(&format!("[[deprecated(\"{escaped}\")]]\n"));
@@ -1438,11 +1495,13 @@ mod tests {
                             name: "a".to_string(),
                             ty: TypeRef::I32,
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "b".to_string(),
                             ty: TypeRef::I32,
                             mutable: false,
+                            doc: None,
                         },
                     ],
                     returns: Some(TypeRef::I32),
@@ -1524,6 +1583,7 @@ mod tests {
                             name: "id".to_string(),
                             ty: TypeRef::Handle,
                             mutable: false,
+                            doc: None,
                         }],
                         returns: Some(TypeRef::Struct("Contact".to_string())),
                         doc: None,
@@ -1538,6 +1598,7 @@ mod tests {
                             name: "id".to_string(),
                             ty: TypeRef::Handle,
                             mutable: false,
+                            doc: None,
                         }],
                         returns: None,
                         doc: None,
@@ -1913,6 +1974,7 @@ mod tests {
                         name: "msg".into(),
                         ty: TypeRef::StringUtf8,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::StringUtf8),
                     doc: None,
@@ -1994,6 +2056,7 @@ mod tests {
                         name: "id".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Optional(Box::new(TypeRef::I32))),
                     doc: None,
@@ -2035,6 +2098,7 @@ mod tests {
                         name: "color".into(),
                         ty: TypeRef::Enum("Color".into()),
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Enum("Color".into())),
                     doc: None,
@@ -2332,6 +2396,7 @@ mod tests {
                         name: "conn".into(),
                         ty: TypeRef::TypedHandle("Connection".into()),
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::I32),
                     doc: None,
@@ -2392,6 +2457,7 @@ mod tests {
                         name: "user".into(),
                         ty: TypeRef::StringUtf8,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::I32),
                     doc: None,
@@ -2411,11 +2477,13 @@ mod tests {
                             name: "NotFound".into(),
                             code: 1,
                             message: "not found".into(),
+                            doc: None,
                         },
                         ErrorCode {
                             name: "InvalidCredentials".into(),
                             code: 2,
                             message: "invalid credentials".into(),
+                            doc: None,
                         },
                     ],
                 }),
@@ -2735,6 +2803,7 @@ mod tests {
                         name: "key".into(),
                         ty: TypeRef::StringUtf8,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
                     doc: None,
@@ -2790,6 +2859,7 @@ mod tests {
                         name: "ids".into(),
                         ty: TypeRef::List(Box::new(TypeRef::I32)),
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
                     doc: None,
@@ -2905,6 +2975,7 @@ mod tests {
                         name: "sess".into(),
                         ty: TypeRef::TypedHandle("Session".into()),
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::I32),
                     doc: None,
@@ -3026,6 +3097,7 @@ mod tests {
                         name: "id".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::I32),
                     doc: None,
@@ -3081,6 +3153,7 @@ mod tests {
                             name: "id".into(),
                             ty: TypeRef::I32,
                             mutable: false,
+                            doc: None,
                         }],
                         returns: Some(TypeRef::I32),
                         doc: None,
@@ -3163,6 +3236,7 @@ mod tests {
                         name: "name".into(),
                         ty: TypeRef::StringUtf8,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Struct("Contact".into())),
                     doc: None,
@@ -3220,6 +3294,7 @@ mod tests {
                         name: "id".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                         "Contact".into(),
@@ -3259,5 +3334,93 @@ mod tests {
             null_check < contact_wrap,
             "optional struct return should check null before wrapping: {fn_text}"
         );
+    }
+
+    fn doc_api() -> Api {
+        Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "docs".into(),
+                functions: vec![Function {
+                    name: "do_thing".into(),
+                    params: vec![Param {
+                        name: "x".into(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                        doc: None,
+                    }],
+                    returns: Some(TypeRef::I32),
+                    doc: Some("Performs a thing.".into()),
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![StructDef {
+                    name: "Item".into(),
+                    doc: Some("An item we track.".into()),
+                    fields: vec![StructField {
+                        name: "id".into(),
+                        ty: TypeRef::I64,
+                        doc: Some("Stable id".into()),
+                        default: None,
+                    }],
+                    builder: false,
+                }],
+                enums: vec![EnumDef {
+                    name: "Kind".into(),
+                    doc: Some("Kind of item.".into()),
+                    variants: vec![EnumVariant {
+                        name: "Small".into(),
+                        value: 0,
+                        doc: Some("A small one".into()),
+                    }],
+                }],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: Some(ErrorDomain {
+                    name: "DocsErrors".into(),
+                    codes: vec![ErrorCode {
+                        name: "not_found".into(),
+                        code: 1,
+                        message: "Not found".into(),
+                        doc: Some("Raised when missing".into()),
+                    }],
+                }),
+                modules: vec![],
+            }],
+            generators: None,
+        }
+    }
+
+    #[test]
+    fn cpp_emits_doc_on_function() {
+        let h = render_cpp_header(&doc_api(), "weaveffi");
+        assert!(h.contains("/** Performs a thing. */"), "{h}");
+    }
+
+    #[test]
+    fn cpp_emits_doc_on_struct() {
+        let h = render_cpp_header(&doc_api(), "weaveffi");
+        assert!(h.contains("/** An item we track. */"), "{h}");
+    }
+
+    #[test]
+    fn cpp_emits_doc_on_enum_variant() {
+        let h = render_cpp_header(&doc_api(), "weaveffi");
+        assert!(h.contains("/** Kind of item. */"), "{h}");
+        assert!(h.contains("/** A small one */"), "{h}");
+    }
+
+    #[test]
+    fn cpp_emits_doc_on_field() {
+        let h = render_cpp_header(&doc_api(), "weaveffi");
+        assert!(h.contains("/** Stable id */"), "{h}");
+    }
+
+    #[test]
+    fn cpp_emits_doc_on_error_code() {
+        let h = render_cpp_header(&doc_api(), "weaveffi");
+        assert!(h.contains("/** Raised when missing */"), "{h}");
     }
 }

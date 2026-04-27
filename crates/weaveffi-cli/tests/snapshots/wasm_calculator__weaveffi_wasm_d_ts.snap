@@ -6,13 +6,25 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 export interface WeaveffiWasmModule {
   _raw: WebAssembly.Exports;
   calculator: {
-    /** @throws {Error} if the native call fails */
+    /**
+     * Add two integers
+     * @throws {Error} if the native call fails
+     */
     add(a: number, b: number): number;
-    /** @throws {Error} if the native call fails */
+    /**
+     * Multiply two integers
+     * @throws {Error} if the native call fails
+     */
     mul(a: number, b: number): number;
-    /** @throws {Error} if the native call fails */
+    /**
+     * Divide two integers
+     * @throws {Error} if the native call fails
+     */
     div(a: number, b: number): number;
-    /** @throws {Error} if the native call fails */
+    /**
+     * Echo a string back
+     * @throws {Error} if the native call fails
+     */
     echo(s: string): string;
   };
 }
