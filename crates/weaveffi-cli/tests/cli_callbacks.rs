@@ -22,8 +22,6 @@ modules:
         return: i32
 ";
 
-// Re-enabled once generators advertise the Callbacks capability.
-#[ignore = "no generator advertises Callbacks yet; reactivate when later phases add the capability back"]
 #[test]
 fn callback_typedef_emitted_by_all_generators() {
     let dir = tempfile::tempdir().expect("failed to create temp dir");
