@@ -55,53 +55,72 @@ jobs:
         run: cargo build -p weaveffi-cli --release
 
       - name: Generate bindings from calculator IDL
-        if: runner.os != 'Windows'
-        run: target/release/weaveffi generate samples/calculator/calculator.yml -o generated
+        shell: bash
+        run: |
+          BIN=target/release/weaveffi
+          [ "${{ runner.os }}" = "Windows" ] && BIN="${BIN}.exe"
+          "$BIN" generate samples/calculator/calculator.yml -o generated
 
       - name: Build calculator cdylib (debug)
-        if: runner.os != 'Windows'
         run: cargo build -p calculator
 
       - name: Build contacts cdylib (debug)
-        if: runner.os != 'Windows'
         run: cargo build -p contacts
 
       - name: Compile C example
-        if: runner.os != 'Windows'
-        run: cc -I generated/c examples/c/main.c -L target/debug -lcalculator -o c_example
+        shell: bash
+        run: |
+          case "${{ runner.os }}" in
+            Windows)
+              # Use clang to link directly against the MSVC import library that
+              # cargo emits next to the cdylib (calculator.dll.lib).
+              clang -I generated/c examples/c/main.c \
+                target/debug/calculator.dll.lib \
+                -o c_example.exe
+              ;;
+            *)
+              cc -I generated/c examples/c/main.c -L target/debug -lcalculator -o c_example
+              ;;
+          esac
 
       - name: Run C example
-        if: runner.os != 'Windows'
+        shell: bash
         run: |
-          if [ "${{ runner.os }}" = "macOS" ]; then
-            DYLD_LIBRARY_PATH=target/debug ./c_example
-          else
-            LD_LIBRARY_PATH=target/debug ./c_example
-          fi
+          case "${{ runner.os }}" in
+            macOS)   DYLD_LIBRARY_PATH=target/debug ./c_example ;;
+            Windows) PATH="$PWD/target/debug:$PATH" ./c_example.exe ;;
+            *)       LD_LIBRARY_PATH=target/debug ./c_example ;;
+          esac
 
       - name: Build Node addon (debug)
-        if: runner.os != 'Windows'
         run: cargo build -p weaveffi-node-addon
 
       - name: Place Node addon next to generated loader
-        if: runner.os != 'Windows'
+        shell: bash
         run: |
-          if [ "${{ runner.os }}" = "macOS" ]; then
-            cp target/debug/libindex.dylib generated/node/index.node
-          else
-            cp target/debug/libindex.so generated/node/index.node
-          fi
+          case "${{ runner.os }}" in
+            macOS)   cp target/debug/libindex.dylib generated/node/index.node ;;
+            Windows) cp target/debug/index.dll      generated/node/index.node ;;
+            *)       cp target/debug/libindex.so    generated/node/index.node ;;
+          esac
 
       - name: Smoke run Node example
-        if: runner.os != 'Windows'
+        shell: bash
         run: |
-          if [ "${{ runner.os }}" = "macOS" ]; then
-            export DYLD_LIBRARY_PATH="$PWD/target/debug"
-            export WEAVEFFI_LIB="$PWD/target/debug/libcalculator.dylib"
-          else
-            export LD_LIBRARY_PATH="$PWD/target/debug"
-            export WEAVEFFI_LIB="$PWD/target/debug/libcalculator.so"
-          fi
+          case "${{ runner.os }}" in
+            macOS)
+              export DYLD_LIBRARY_PATH="$PWD/target/debug"
+              export WEAVEFFI_LIB="$PWD/target/debug/libcalculator.dylib"
+              ;;
+            Windows)
+              export PATH="$PWD/target/debug:$PATH"
+              export WEAVEFFI_LIB="$PWD/target/debug/calculator.dll"
+              ;;
+            *)
+              export LD_LIBRARY_PATH="$PWD/target/debug"
+              export WEAVEFFI_LIB="$PWD/target/debug/libcalculator.so"
+              ;;
+          esac
           node examples/node/main.mjs
 
       - name: Add wasm target
@@ -231,3 +250,167 @@ jobs:
             exit 1
           }
           Write-Host "All expected generated files present"
+
+  windows-e2e-extended:
+    name: Windows E2E (Python + .NET)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build CLI (release)
+        run: cargo build -p weaveffi-cli --release
+
+      - name: Build calculator and contacts cdylibs (debug)
+        run: cargo build -p calculator -p contacts
+
+      - name: Generate bindings (calculator + contacts)
+        shell: bash
+        run: |
+          target/release/weaveffi.exe generate samples/calculator/calculator.yml -o generated
+          target/release/weaveffi.exe generate samples/contacts/contacts.yml   -o generated
+
+      - name: Run Python consumer
+        shell: bash
+        env:
+          WEAVEFFI_LIB: ${{ github.workspace }}\target\debug\calculator.dll
+          CONTACTS_LIB: ${{ github.workspace }}\target\debug\contacts.dll
+        run: |
+          export PATH="$GITHUB_WORKSPACE/target/debug:$PATH"
+          python examples/python/test.py
+
+      - name: Run .NET consumer
+        shell: bash
+        env:
+          WEAVEFFI_LIB: ${{ github.workspace }}\target\debug\calculator.dll
+          CONTACTS_LIB: ${{ github.workspace }}\target\debug\contacts.dll
+        run: |
+          export PATH="$GITHUB_WORKSPACE/target/debug:$PATH"
+          dotnet run --project examples/dotnet/Contacts --configuration Release \
+            --verbosity quiet --nologo
+
+  android-ndk:
+    name: Android NDK JNI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: true
+
+      - name: Install Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+
+      - name: Add aarch64-linux-android Rust target
+        run: rustup target add aarch64-linux-android
+
+      - name: Build CLI (release)
+        run: cargo build -p weaveffi-cli --release
+
+      - name: Generate Android + C bindings for contacts
+        run: |
+          target/release/weaveffi generate samples/contacts/contacts.yml -o generated --target c
+          target/release/weaveffi generate samples/contacts/contacts.yml -o generated --target android
+
+      - name: Compile JNI shim with NDK clang
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euxo pipefail
+          CLANG="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+          if [ ! -x "$CLANG" ]; then
+            echo "expected NDK clang at $CLANG" >&2
+            ls "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin" >&2
+            exit 1
+          fi
+          "$CLANG" -shared -fPIC \
+            -I generated/c \
+            -Wl,--unresolved-symbols=ignore-all \
+            -o libweaveffi_jni_test.so \
+            generated/android/src/main/cpp/weaveffi_jni.c
+
+      - name: Assert exported JNI symbols
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euxo pipefail
+          NM="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          file libweaveffi_jni_test.so
+          ldd libweaveffi_jni_test.so || true
+          "$NM" -D --defined-only libweaveffi_jni_test.so > nm.out
+          for sym in \
+              Java_com_weaveffi_WeaveFFI_create_contactJni \
+              Java_com_weaveffi_WeaveFFI_count_contacts \
+              Java_com_weaveffi_WeaveFFI_delete_contact \
+              Java_com_weaveffi_Contact_nativeGetId; do
+            if ! grep -q " T $sym\$" nm.out; then
+              echo "missing exported JNI symbol: $sym" >&2
+              cat nm.out >&2
+              exit 1
+            fi
+          done
+          echo "All expected JNI symbols are exported."
+
+  swift-spm:
+    name: Swift SPM consumer
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: true
+
+      - name: Build CLI (release)
+        run: cargo build -p weaveffi-cli --release
+
+      - name: Build calculator and contacts cdylibs (debug)
+        run: cargo build -p calculator -p contacts
+
+      - name: Generate Swift bindings for contacts
+        run: target/release/weaveffi generate samples/contacts/contacts.yml -o generated --target swift
+
+      - name: Build Swift consumer (SPM)
+        run: swift build --package-path examples/swift
+
+      - name: Run Swift consumer against calculator dylib
+        env:
+          WEAVEFFI_LIB: ${{ github.workspace }}/target/debug/libcalculator.dylib
+          CONTACTS_LIB: ${{ github.workspace }}/target/debug/libcontacts.dylib
+        run: |
+          export DYLD_LIBRARY_PATH="$GITHUB_WORKSPACE/target/debug"
+          out=$(examples/swift/.build/debug/App)
+          echo "$out"
+          echo "$out" | grep -q "^OK$"
