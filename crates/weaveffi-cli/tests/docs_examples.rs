@@ -954,6 +954,130 @@ fn dart_contacts_readme_documents_build_and_run() {
 }
 
 #[test]
+fn dart_flutter_contacts_example_files_exist() {
+    for file in [
+        "examples/dart/flutter-contacts/lib/main.dart",
+        "examples/dart/flutter-contacts/test/widget_test.dart",
+        "examples/dart/flutter-contacts/pubspec.yaml",
+        "examples/dart/flutter-contacts/analysis_options.yaml",
+        "examples/dart/flutter-contacts/tool/flutter_ci.sh",
+        "examples/dart/flutter-contacts/README.md",
+    ] {
+        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        assert!(
+            workspace_root.join(file).exists(),
+            "Dart Flutter contacts example is missing {file}"
+        );
+    }
+}
+
+#[test]
+fn dart_flutter_contacts_app_uses_generated_bindings() {
+    let main = read_doc("examples/dart/flutter-contacts/lib/main.dart");
+    assert!(
+        main.contains("import 'package:weaveffi/weaveffi.dart' as weaveffi;"),
+        "Flutter main.dart must import the generated package: {main}"
+    );
+    for token in [
+        "MaterialApp(",
+        "ListView.separated(",
+        "weaveffi.countContacts()",
+        "weaveffi.createContact(",
+        "weaveffi.listContacts()",
+        "weaveffi.ContactType.personal",
+        "contact.dispose()",
+        "finally",
+    ] {
+        assert!(
+            main.contains(token),
+            "Flutter main.dart must contain `{token}`: {main}"
+        );
+    }
+}
+
+#[test]
+fn dart_flutter_contacts_pubspec_is_flutter_app() {
+    let pubspec = read_doc("examples/dart/flutter-contacts/pubspec.yaml");
+    assert!(
+        pubspec.contains("sdk: '>=3.0.0 <4.0.0'"),
+        "pubspec must pin a modern Dart SDK range: {pubspec}"
+    );
+    assert!(
+        pubspec.contains("flutter:\n    sdk: flutter"),
+        "pubspec must declare a Flutter SDK dependency: {pubspec}"
+    );
+    assert!(
+        pubspec.contains("path: ../../../generated/dart"),
+        "pubspec must depend on the generated dart package via path: {pubspec}"
+    );
+    assert!(
+        pubspec.contains("flutter_test:\n    sdk: flutter"),
+        "pubspec must include flutter_test for widget tests: {pubspec}"
+    );
+}
+
+#[test]
+fn dart_flutter_contacts_widget_test_renders_contact_rows() {
+    let test = read_doc("examples/dart/flutter-contacts/test/widget_test.dart");
+    for token in [
+        "testWidgets(",
+        "ContactsApp(",
+        "ContactRow(",
+        "find.text('Alice Smith')",
+        "find.text('No email')",
+    ] {
+        assert!(
+            test.contains(token),
+            "widget_test.dart must contain `{token}`: {test}"
+        );
+    }
+}
+
+#[test]
+fn dart_flutter_contacts_ci_script_is_optional() {
+    let script = read_doc("examples/dart/flutter-contacts/tool/flutter_ci.sh");
+    for token in [
+        "command -v flutter",
+        "skipping optional Flutter contacts example",
+        "exit 0",
+        "cargo run -p weaveffi-cli -- generate samples/contacts/contacts.yml",
+        "flutter analyze",
+        "flutter test",
+        "flutter build bundle",
+    ] {
+        assert!(
+            script.contains(token),
+            "flutter_ci.sh must contain `{token}`: {script}"
+        );
+    }
+}
+
+#[test]
+fn dart_flutter_contacts_readme_documents_optional_build() {
+    let readme = read_doc("examples/dart/flutter-contacts/README.md");
+    for token in [
+        "cargo build -p contacts",
+        "cargo run -p weaveffi-cli -- generate samples/contacts/contacts.yml",
+        "flutter pub get",
+        "flutter run",
+        "DYLD_LIBRARY_PATH=../../../target/debug",
+        "LD_LIBRARY_PATH=../../../target/debug",
+        "Optional CI",
+        "tool/flutter_ci.sh",
+        "Flutter SDK is not",
+    ] {
+        assert!(
+            readme.contains(token),
+            "README must mention `{token}`: {readme}"
+        );
+    }
+}
+
+#[test]
 fn dart_sqlite_contacts_example_files_exist() {
     for file in [
         "examples/dart/sqlite-contacts/bin/main.dart",
