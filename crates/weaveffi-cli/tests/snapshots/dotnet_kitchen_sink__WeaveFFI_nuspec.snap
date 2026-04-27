@@ -1,0 +1,15 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>WeaveFFI</id>
+    <version>0.1.0</version>
+    <authors>WeaveFFI Contributors</authors>
+    <description>Auto-generated .NET bindings for a WeaveFFI native library.</description>
+    <license type="expression">MIT</license>
+    <projectUrl>https://github.com/AstroForge-Incorporated/weaveffi</projectUrl>
+    <tags>ffi interop native pinvoke</tags>
+  </metadata>
+</package>

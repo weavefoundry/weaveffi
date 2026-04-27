@@ -1,0 +1,69 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+# WeaveFFI WASM (experimental)
+
+This folder contains a minimal stub to help you load a `wasm32-unknown-unknown` build of your WeaveFFI library.
+
+Build (example):
+
+```bash
+cargo build --target wasm32-unknown-unknown --release
+```
+
+Then serve the `.wasm` and use `weaveffi_wasm.js` to load it.
+
+## Complex Type Handling
+
+WASM only supports numeric types natively (`i32`, `i64`, `f32`, `f64`). Complex types are encoded at the boundary as follows:
+
+### Structs
+
+Structs are passed as **opaque handles** (`i64` pointers into linear memory). The host cannot inspect struct fields directly; use the generated accessor functions (`weaveffi_{module}_{struct}_get_{field}`) to read/write fields.
+
+### Enums
+
+Enums are passed as **`i32` values** corresponding to the variant's integer discriminant.
+
+### Optionals
+
+Optional values use **`0` / `null`** to represent the absent case. For numeric optionals, a separate `_is_present` flag (`i32`: 0 or 1) is used. For handle-typed optionals, a null pointer (`0`) signals absence.
+
+### Lists
+
+Lists are passed as a **pointer + length** pair (`i32` pointer, `i32` length) referencing a contiguous region in linear memory. The caller is responsible for allocating and freeing the backing memory.
+
+### Error Handling
+
+The generated JS wrappers automatically handle errors by passing an error
+pointer as the last argument to each WASM function. Your WASM module must
+export the following functions:
+
+- `weaveffi_alloc(size: i32) -> i32` — allocate `size` bytes in linear memory
+- `weaveffi_error_clear(err_ptr: i32)` — clear and free error resources
+
+## API Reference
+
+### Module: `events`
+
+#### Functions
+
+##### `weaveffi_events_send_message`
+
+Send a message, triggering the OnMessage callback
+
+`weaveffi_events_send_message(text: i32, i32) -> void`
+
+| Param | API Type | WASM | Notes |
+|-------|----------|------|-------|
+| `text` | `string` | `i32, i32` | ptr + len in linear memory |
+
+##### `weaveffi_events_get_messages`
+
+Return an iterator over all sent messages
+
+`weaveffi_events_get_messages() -> i64`
+
+| Param | API Type | WASM | Notes |
+|-------|----------|------|-------|
+| _returns_ | `iter<string>` | `i64` | opaque iterator handle |

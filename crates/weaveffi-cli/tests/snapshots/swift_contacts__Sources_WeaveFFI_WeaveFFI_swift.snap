@@ -1,0 +1,128 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+import CWeaveFFI
+import Foundation
+
+public enum WeaveFFIError: Error, LocalizedError {
+    case error(code: Int32, message: String)
+    public var errorDescription: String? {
+        switch self {
+        case let .error(_, message): return message
+        }
+    }
+    public var errorCode: Int32 {
+        switch self {
+        case let .error(code, _): return code
+        }
+    }
+}
+
+@inline(__always)
+func check(_ err: inout weaveffi_error) throws {
+    if err.code != 0 {
+        let code = err.code
+        let message = err.message.flatMap { String(cString: $0) } ?? ""
+        weaveffi_error_clear(&err)
+        throw WeaveFFIError.error(code: code, message: message)
+    }
+}
+
+@inline(__always)
+func withOptionalPointer<T, R>(to value: T?, _ body: (UnsafePointer<T>?) throws -> R) rethrows -> R {
+    guard let value = value else { return try body(nil) }
+    return try withUnsafePointer(to: value) { try body($0) }
+}
+
+public enum ContactType: Int32 {
+    case personal = 0
+    case work = 1
+    case other = 2
+}
+
+public class Contact {
+    let ptr: OpaquePointer
+
+    init(ptr: OpaquePointer) {
+        self.ptr = ptr
+    }
+
+    deinit {
+        weaveffi_contacts_Contact_destroy(ptr)
+    }
+
+    public var id: Int64 {
+        return weaveffi_contacts_Contact_get_id(ptr)
+    }
+
+    public var first_name: String {
+        let raw = weaveffi_contacts_Contact_get_first_name(ptr)
+        guard let raw = raw else { return "" }
+        defer { weaveffi_free_string(raw) }
+        return String(cString: raw)
+    }
+
+    public var last_name: String {
+        let raw = weaveffi_contacts_Contact_get_last_name(ptr)
+        guard let raw = raw else { return "" }
+        defer { weaveffi_free_string(raw) }
+        return String(cString: raw)
+    }
+
+    public var email: String? {
+        let p = weaveffi_contacts_Contact_get_email(ptr)
+        guard let p = p else { return nil }
+        defer { weaveffi_free_string(p) }
+        return String(cString: p)
+    }
+
+    public var contact_type: ContactType {
+        return weaveffi_contacts_Contact_get_contact_type(ptr)
+    }
+}
+
+public enum Contacts {
+    public static func create_contact(_ first_name: String, _ last_name: String, _ email: String?, _ contact_type: ContactType) throws -> UInt64 {
+        var err = weaveffi_error(code: 0, message: nil)
+        let first_name_bytes = Array(first_name.utf8)
+        let last_name_bytes = Array(last_name.utf8)
+        let result: UInt64 = first_name_bytes.withUnsafeBufferPointer { first_name_buf in
+            let first_name_ptr = first_name_buf.baseAddress!
+            let first_name_len = first_name_buf.count
+            last_name_bytes.withUnsafeBufferPointer { last_name_buf in
+                let last_name_ptr = last_name_buf.baseAddress!
+                let last_name_len = last_name_buf.count
+                    return weaveffi_contacts_create_contact(first_name_ptr, first_name_len, last_name_ptr, last_name_len, email_ptr, email_len, weaveffi_contacts_ContactType(contact_type.rawValue), &err)
+            }
+        }
+        try check(&err)
+        return result
+    }
+    public static func get_contact(_ id: UInt64) throws -> Contact {
+        var err = weaveffi_error(code: 0, message: nil)
+        let rv = weaveffi_contacts_get_contact(id, &err)
+        try check(&err)
+        guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
+        return Contact(ptr: rv)
+    }
+    public static func list_contacts() throws -> [Contact] {
+        var err = weaveffi_error(code: 0, message: nil)
+        var outLen: Int = 0
+        let rv = weaveffi_contacts_list_contacts(&outLen, &err)
+        try check(&err)
+        guard let rv = rv else { return [] }
+        return (0..<outLen).map { Contact(ptr: rv[$0]!) }
+    }
+    public static func delete_contact(_ id: UInt64) throws -> Bool {
+        var err = weaveffi_error(code: 0, message: nil)
+        let rv = weaveffi_contacts_delete_contact(id, &err)
+        try check(&err)
+        return rv
+    }
+    public static func count_contacts() throws -> Int32 {
+        var err = weaveffi_error(code: 0, message: nil)
+        let rv = weaveffi_contacts_count_contacts(&err)
+        try check(&err)
+        return rv
+    }
+}

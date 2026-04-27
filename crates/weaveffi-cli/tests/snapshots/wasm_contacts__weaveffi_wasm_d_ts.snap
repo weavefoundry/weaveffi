@@ -1,0 +1,36 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+// Generated TypeScript declarations for WeaveFFI WASM bindings
+
+export interface Contact {
+  readonly id: number;
+  readonly first_name: string;
+  readonly last_name: string;
+  readonly email: string | null;
+  readonly contact_type: ContactType;
+}
+
+export declare const ContactType: Readonly<{
+  Personal: 0;
+  Work: 1;
+  Other: 2;
+}>;
+
+export interface WeaveffiWasmModule {
+  _raw: WebAssembly.Exports;
+  contacts: {
+    /** @throws {Error} if the native call fails */
+    create_contact(first_name: string, last_name: string, email: string | null, contact_type: ContactType): bigint;
+    /** @throws {Error} if the native call fails */
+    get_contact(id: bigint): Contact;
+    /** @throws {Error} if the native call fails */
+    list_contacts(): Contact[];
+    /** @throws {Error} if the native call fails */
+    delete_contact(id: bigint): boolean;
+    /** @throws {Error} if the native call fails */
+    count_contacts(): number;
+  };
+}
+
+export function loadWeaveffiWasm(url: string): Promise<WeaveffiWasmModule>;

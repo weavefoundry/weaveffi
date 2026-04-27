@@ -1,0 +1,473 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+#include <node_api.h>
+#include "weaveffi.h"
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    napi_env env;
+    napi_deferred deferred;
+} weaveffi_napi_async_ctx;
+
+static napi_value Napi_weaveffi_shared_ping(napi_env env, napi_callback_info info) {
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, NULL, NULL, NULL);
+  weaveffi_error err = {0};
+  const char* result = weaveffi_shared_ping(&err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_string_utf8(env, result, NAPI_AUTO_LENGTH, &ret);
+  weaveffi_free_string(result);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_kitchen_bool_id(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  bool x;
+  napi_get_value_bool(env, args[0], &x);
+  weaveffi_error err = {0};
+  bool result = weaveffi_kitchen_bool_id(x, &err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_get_boolean(env, result, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_kitchen_i32_id(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  int32_t x;
+  napi_get_value_int32(env, args[0], &x);
+  weaveffi_error err = {0};
+  int32_t result = weaveffi_kitchen_i32_id(x, &err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_int32(env, result, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_kitchen_u32_id(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  uint32_t x;
+  napi_get_value_uint32(env, args[0], &x);
+  weaveffi_error err = {0};
+  uint32_t result = weaveffi_kitchen_u32_id(x, &err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_uint32(env, result, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_kitchen_i64_id(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  int64_t x;
+  napi_get_value_int64(env, args[0], &x);
+  weaveffi_error err = {0};
+  int64_t result = weaveffi_kitchen_i64_id(x, &err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_int64(env, result, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_kitchen_f64_id(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  double x;
+  napi_get_value_double(env, args[0], &x);
+  weaveffi_error err = {0};
+  double result = weaveffi_kitchen_f64_id(x, &err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_double(env, result, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_kitchen_echo_string(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  size_t s_len;
+  napi_get_value_string_utf8(env, args[0], NULL, 0, &s_len);
+  char* s = (char*)malloc(s_len + 1);
+  napi_get_value_string_utf8(env, args[0], s, s_len + 1, &s_len);
+  weaveffi_error err = {0};
+  const char* result = weaveffi_kitchen_echo_string(s, &err);
+  free(s);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_string_utf8(env, result, NAPI_AUTO_LENGTH, &ret);
+  weaveffi_free_string(result);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_kitchen_echo_bytes(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  void* b_raw;
+  size_t b_len;
+  napi_get_buffer_info(env, args[0], &b_raw, &b_len);
+  weaveffi_error err = {0};
+  size_t out_len;
+  const uint8_t* result = weaveffi_kitchen_echo_bytes((const uint8_t*)b_raw, b_len, &out_len, &err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_buffer_copy(env, out_len, result, NULL, &ret);
+  weaveffi_free_bytes((uint8_t*)result, out_len);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_kitchen_echo_borrowed_str(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  size_t s_len;
+  napi_get_value_string_utf8(env, args[0], NULL, 0, &s_len);
+  char* s = (char*)malloc(s_len + 1);
+  napi_get_value_string_utf8(env, args[0], s, s_len + 1, &s_len);
+  weaveffi_error err = {0};
+  const char* result = weaveffi_kitchen_echo_borrowed_str(s, &err);
+  free(s);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_string_utf8(env, result, NAPI_AUTO_LENGTH, &ret);
+  weaveffi_free_string(result);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_kitchen_echo_borrowed_bytes(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  void* b_raw;
+  size_t b_len;
+  napi_get_buffer_info(env, args[0], &b_raw, &b_len);
+  weaveffi_error err = {0};
+  size_t out_len;
+  const uint8_t* result = weaveffi_kitchen_echo_borrowed_bytes((const uint8_t*)b_raw, b_len, &out_len, &err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_buffer_copy(env, out_len, result, NULL, &ret);
+  weaveffi_free_bytes((uint8_t*)result, out_len);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_kitchen_open_handle(napi_env env, napi_callback_info info) {
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, NULL, NULL, NULL);
+  weaveffi_error err = {0};
+  weaveffi_handle_t result = weaveffi_kitchen_open_handle(&err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_int64(env, (int64_t)result, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_kitchen_open_typed_handle(napi_env env, napi_callback_info info) {
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, NULL, NULL, NULL);
+  weaveffi_error err = {0};
+  weaveffi_handle_t result = weaveffi_kitchen_open_typed_handle(&err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_int64(env, (int64_t)result, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_kitchen_maybe_item(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  int64_t id;
+  napi_get_value_int64(env, args[0], &id);
+  weaveffi_error err = {0};
+  weaveffi_kitchen_Item* result = weaveffi_kitchen_maybe_item(id, &err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  if (result == NULL) {
+    napi_get_null(env, &ret);
+  } else {
+    napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
+  }
+  return ret;
+}
+
+static napi_value Napi_weaveffi_kitchen_list_items(napi_env env, napi_callback_info info) {
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, NULL, NULL, NULL);
+  weaveffi_error err = {0};
+  size_t out_len;
+  weaveffi_kitchen_Item** result = weaveffi_kitchen_list_items(&out_len, &err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_array_with_length(env, out_len, &ret);
+  for (size_t ret_i = 0; ret_i < out_len; ret_i++) {
+    napi_value elem;
+    napi_create_int64(env, (int64_t)(intptr_t)result[ret_i], &elem);
+    napi_set_element(env, ret, (uint32_t)ret_i, elem);
+  }
+  free(result);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_kitchen_get_attrs(napi_env env, napi_callback_info info) {
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, NULL, NULL, NULL);
+  weaveffi_error err = {0};
+  const char** out_keys = NULL;
+  int32_t* out_values = NULL;
+  size_t out_len = 0;
+  weaveffi_kitchen_get_attrs(out_keys, out_values, &out_len, &err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_object(env, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_kitchen_stream_items(napi_env env, napi_callback_info info) {
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, NULL, NULL, NULL);
+  weaveffi_error err = {0};
+  void* result = weaveffi_kitchen_stream_items(&err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_array(env, &ret);
+  uint32_t iter_idx = 0;
+  weaveffi_kitchen_Item* iter_item;
+  while (weaveffi_kitchen_StreamItemsIterator_next(result, &iter_item)) {
+    napi_value elem;
+    napi_create_int64(env, (int64_t)(intptr_t)iter_item, &elem);
+    napi_set_element(env, ret, iter_idx++, elem);
+  }
+  weaveffi_kitchen_StreamItemsIterator_destroy(result);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_kitchen_cross_module_token(napi_env env, napi_callback_info info) {
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, NULL, NULL, NULL);
+  weaveffi_error err = {0};
+  weaveffi_shared_Token* result = weaveffi_kitchen_cross_module_token(&err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
+  return ret;
+}
+
+static void weaveffi_kitchen_do_async_napi_cb(void* context, weaveffi_error* err, const char* result) {
+    weaveffi_napi_async_ctx* ctx = (weaveffi_napi_async_ctx*)context;
+    if (err != NULL && err->code != 0) {
+        napi_value err_msg;
+        napi_create_string_utf8(ctx->env, err->message, NAPI_AUTO_LENGTH, &err_msg);
+        napi_reject_deferred(ctx->env, ctx->deferred, err_msg);
+    } else {
+        napi_value val;
+        napi_create_string_utf8(ctx->env, result, NAPI_AUTO_LENGTH, &val);
+        napi_resolve_deferred(ctx->env, ctx->deferred, val);
+    }
+    free(ctx);
+}
+
+static napi_value Napi_weaveffi_kitchen_do_async(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  size_t input_len;
+  napi_get_value_string_utf8(env, args[0], NULL, 0, &input_len);
+  char* input = (char*)malloc(input_len + 1);
+  napi_get_value_string_utf8(env, args[0], input, input_len + 1, &input_len);
+  weaveffi_napi_async_ctx* ctx = (weaveffi_napi_async_ctx*)malloc(sizeof(weaveffi_napi_async_ctx));
+  ctx->env = env;
+  napi_value promise;
+  napi_create_promise(env, &ctx->deferred, &promise);
+  weaveffi_kitchen_do_async_async(input, weaveffi_kitchen_do_async_napi_cb, ctx);
+  free(input);
+  return promise;
+}
+
+static void weaveffi_kitchen_do_cancellable_napi_cb(void* context, weaveffi_error* err, const char* result) {
+    weaveffi_napi_async_ctx* ctx = (weaveffi_napi_async_ctx*)context;
+    if (err != NULL && err->code != 0) {
+        napi_value err_msg;
+        napi_create_string_utf8(ctx->env, err->message, NAPI_AUTO_LENGTH, &err_msg);
+        napi_reject_deferred(ctx->env, ctx->deferred, err_msg);
+    } else {
+        napi_value val;
+        napi_create_string_utf8(ctx->env, result, NAPI_AUTO_LENGTH, &val);
+        napi_resolve_deferred(ctx->env, ctx->deferred, val);
+    }
+    free(ctx);
+}
+
+static napi_value Napi_weaveffi_kitchen_do_cancellable(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  size_t input_len;
+  napi_get_value_string_utf8(env, args[0], NULL, 0, &input_len);
+  char* input = (char*)malloc(input_len + 1);
+  napi_get_value_string_utf8(env, args[0], input, input_len + 1, &input_len);
+  weaveffi_napi_async_ctx* ctx = (weaveffi_napi_async_ctx*)malloc(sizeof(weaveffi_napi_async_ctx));
+  ctx->env = env;
+  napi_value promise;
+  napi_create_promise(env, &ctx->deferred, &promise);
+  weaveffi_kitchen_do_cancellable_async(input, NULL, weaveffi_kitchen_do_cancellable_napi_cb, ctx);
+  free(input);
+  return promise;
+}
+
+static napi_value Napi_weaveffi_kitchen_legacy_op(napi_env env, napi_callback_info info) {
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, NULL, NULL, NULL);
+  weaveffi_error err = {0};
+  int32_t result = weaveffi_kitchen_legacy_op(&err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_int32(env, result, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_kitchen_new_op(napi_env env, napi_callback_info info) {
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, NULL, NULL, NULL);
+  weaveffi_error err = {0};
+  int32_t result = weaveffi_kitchen_new_op(&err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_int32(env, result, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_kitchen_nested_hello(napi_env env, napi_callback_info info) {
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, NULL, NULL, NULL);
+  weaveffi_error err = {0};
+  const char* result = weaveffi_kitchen_nested_hello(&err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_string_utf8(env, result, NAPI_AUTO_LENGTH, &ret);
+  weaveffi_free_string(result);
+  return ret;
+}
+
+static napi_value Init(napi_env env, napi_value exports) {
+  napi_property_descriptor props[] = {
+    { "ping", NULL, Napi_weaveffi_shared_ping, NULL, NULL, NULL, napi_default, NULL },
+    { "bool_id", NULL, Napi_weaveffi_kitchen_bool_id, NULL, NULL, NULL, napi_default, NULL },
+    { "i32_id", NULL, Napi_weaveffi_kitchen_i32_id, NULL, NULL, NULL, napi_default, NULL },
+    { "u32_id", NULL, Napi_weaveffi_kitchen_u32_id, NULL, NULL, NULL, napi_default, NULL },
+    { "i64_id", NULL, Napi_weaveffi_kitchen_i64_id, NULL, NULL, NULL, napi_default, NULL },
+    { "f64_id", NULL, Napi_weaveffi_kitchen_f64_id, NULL, NULL, NULL, napi_default, NULL },
+    { "echo_string", NULL, Napi_weaveffi_kitchen_echo_string, NULL, NULL, NULL, napi_default, NULL },
+    { "echo_bytes", NULL, Napi_weaveffi_kitchen_echo_bytes, NULL, NULL, NULL, napi_default, NULL },
+    { "echo_borrowed_str", NULL, Napi_weaveffi_kitchen_echo_borrowed_str, NULL, NULL, NULL, napi_default, NULL },
+    { "echo_borrowed_bytes", NULL, Napi_weaveffi_kitchen_echo_borrowed_bytes, NULL, NULL, NULL, napi_default, NULL },
+    { "open_handle", NULL, Napi_weaveffi_kitchen_open_handle, NULL, NULL, NULL, napi_default, NULL },
+    { "open_typed_handle", NULL, Napi_weaveffi_kitchen_open_typed_handle, NULL, NULL, NULL, napi_default, NULL },
+    { "maybe_item", NULL, Napi_weaveffi_kitchen_maybe_item, NULL, NULL, NULL, napi_default, NULL },
+    { "list_items", NULL, Napi_weaveffi_kitchen_list_items, NULL, NULL, NULL, napi_default, NULL },
+    { "get_attrs", NULL, Napi_weaveffi_kitchen_get_attrs, NULL, NULL, NULL, napi_default, NULL },
+    { "stream_items", NULL, Napi_weaveffi_kitchen_stream_items, NULL, NULL, NULL, napi_default, NULL },
+    { "cross_module_token", NULL, Napi_weaveffi_kitchen_cross_module_token, NULL, NULL, NULL, napi_default, NULL },
+    { "do_async", NULL, Napi_weaveffi_kitchen_do_async, NULL, NULL, NULL, napi_default, NULL },
+    { "do_cancellable", NULL, Napi_weaveffi_kitchen_do_cancellable, NULL, NULL, NULL, napi_default, NULL },
+    { "legacy_op", NULL, Napi_weaveffi_kitchen_legacy_op, NULL, NULL, NULL, napi_default, NULL },
+    { "new_op", NULL, Napi_weaveffi_kitchen_new_op, NULL, NULL, NULL, napi_default, NULL },
+    { "hello", NULL, Napi_weaveffi_kitchen_nested_hello, NULL, NULL, NULL, napi_default, NULL },
+  };
+  napi_define_properties(env, exports, 22, props);
+  return exports;
+}
+
+NAPI_MODULE(NODE_GYP_MODULE_NAME, Init)

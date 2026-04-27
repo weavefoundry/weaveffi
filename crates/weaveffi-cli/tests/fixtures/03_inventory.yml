@@ -1,0 +1,104 @@
+version: "0.3.0"
+modules:
+  - name: products
+    enums:
+      - name: Category
+        variants:
+          - name: Electronics
+            value: 0
+          - name: Clothing
+            value: 1
+          - name: Food
+            value: 2
+          - name: Books
+            value: 3
+    structs:
+      - name: Product
+        fields:
+          - name: id
+            type: i64
+          - name: name
+            type: string
+          - name: description
+            type: "string?"
+          - name: price
+            type: f64
+          - name: category
+            type: Category
+          - name: tags
+            type: "[string]"
+    functions:
+      - name: create_product
+        params:
+          - name: name
+            type: string
+          - name: price
+            type: f64
+          - name: category
+            type: Category
+        return: handle
+      - name: get_product
+        params:
+          - name: id
+            type: handle
+        return: Product
+      - name: search_products
+        params:
+          - name: category
+            type: Category
+        return: "[Product]"
+      - name: update_price
+        params:
+          - name: id
+            type: handle
+          - name: price
+            type: f64
+        return: bool
+      - name: delete_product
+        params:
+          - name: id
+            type: handle
+        return: bool
+  - name: orders
+    structs:
+      - name: OrderItem
+        fields:
+          - name: product_id
+            type: i64
+          - name: quantity
+            type: i32
+          - name: unit_price
+            type: f64
+      - name: Order
+        fields:
+          - name: id
+            type: i64
+          - name: items
+            type: "[OrderItem]"
+          - name: total
+            type: f64
+          - name: status
+            type: string
+    functions:
+      - name: create_order
+        params:
+          - name: items
+            type: "[OrderItem]"
+        return: handle
+      - name: get_order
+        params:
+          - name: id
+            type: handle
+        return: Order
+      - name: cancel_order
+        params:
+          - name: id
+            type: handle
+        return: bool
+      - name: add_product_to_order
+        params:
+          - name: order_id
+            type: handle
+          - name: product
+            type: Product
+        return: bool

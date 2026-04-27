@@ -1,0 +1,62 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+package com.weaveffi
+
+class WeaveFFI {
+    companion object {
+        init { System.loadLibrary("weaveffi") }
+
+        @JvmStatic private external fun create_contactJni(first_name: String, last_name: String, email: String?, contact_type: Int): Long
+        @JvmStatic fun create_contact(first_name: String, last_name: String, email: String?, contact_type: ContactType): Long = create_contactJni(first_name, last_name, email, contact_type.value)
+        @JvmStatic external fun get_contact(id: Long): Long
+        @JvmStatic external fun list_contacts(): LongArray
+        @JvmStatic external fun delete_contact(id: Long): Boolean
+        @JvmStatic external fun count_contacts(): Int
+    }
+}
+
+enum class ContactType(val value: Int) {
+    Personal(0),
+    Work(1),
+    Other(2);
+
+    companion object {
+        fun fromValue(value: Int): ContactType = entries.first { it.value == value }
+    }
+}
+
+class Contact internal constructor(private var handle: Long) : java.io.Closeable {
+    companion object {
+        init { System.loadLibrary("weaveffi") }
+
+        @JvmStatic external fun nativeCreate(id: Long, first_name: String, last_name: String, email: String?, contact_type: Int): Long
+        @JvmStatic external fun nativeDestroy(handle: Long)
+        @JvmStatic external fun nativeGetId(handle: Long): Long
+        @JvmStatic external fun nativeGetFirstName(handle: Long): String
+        @JvmStatic external fun nativeGetLastName(handle: Long): String
+        @JvmStatic external fun nativeGetEmail(handle: Long): String?
+        @JvmStatic external fun nativeGetContactType(handle: Long): Int
+
+        fun create(id: Long, first_name: String, last_name: String, email: String?, contact_type: Int): Contact = Contact(nativeCreate(id, first_name, last_name, email, contact_type))
+    }
+
+    val id: Long get() = nativeGetId(handle)
+    val first_name: String get() = nativeGetFirstName(handle)
+    val last_name: String get() = nativeGetLastName(handle)
+    val email: String? get() = nativeGetEmail(handle)
+    val contact_type: ContactType get() = nativeGetContactType(handle)
+
+    override fun close() {
+        if (handle != 0L) {
+            nativeDestroy(handle)
+            handle = 0L
+        }
+    }
+
+    protected fun finalize() {
+        close()
+    }
+}
+
+open class WeaveFFIException(val code: Int, message: String) : Exception(message)

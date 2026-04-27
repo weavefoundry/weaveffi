@@ -1,0 +1,132 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+#include <node_api.h>
+#include "weaveffi.h"
+#include <stdlib.h>
+#include <string.h>
+
+static napi_value Napi_weaveffi_contacts_create_contact(napi_env env, napi_callback_info info) {
+  size_t argc = 4;
+  napi_value args[4];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  size_t first_name_len;
+  napi_get_value_string_utf8(env, args[0], NULL, 0, &first_name_len);
+  char* first_name = (char*)malloc(first_name_len + 1);
+  napi_get_value_string_utf8(env, args[0], first_name, first_name_len + 1, &first_name_len);
+  size_t last_name_len;
+  napi_get_value_string_utf8(env, args[1], NULL, 0, &last_name_len);
+  char* last_name = (char*)malloc(last_name_len + 1);
+  napi_get_value_string_utf8(env, args[1], last_name, last_name_len + 1, &last_name_len);
+  napi_valuetype email_type;
+  napi_typeof(env, args[2], &email_type);
+  char* email = NULL;
+  if (email_type != napi_null && email_type != napi_undefined) {
+    size_t email_len;
+    napi_get_value_string_utf8(env, args[2], NULL, 0, &email_len);
+    email = (char*)malloc(email_len + 1);
+    napi_get_value_string_utf8(env, args[2], email, email_len + 1, &email_len);
+  }
+  int32_t contact_type;
+  napi_get_value_int32(env, args[3], &contact_type);
+  weaveffi_error err = {0};
+  weaveffi_handle_t result = weaveffi_contacts_create_contact(first_name, last_name, email, (weaveffi_contacts_ContactType)contact_type, &err);
+  free(first_name);
+  free(last_name);
+  free(email);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_int64(env, (int64_t)result, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_contacts_get_contact(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  int64_t id_raw;
+  napi_get_value_int64(env, args[0], &id_raw);
+  weaveffi_error err = {0};
+  weaveffi_contacts_Contact* result = weaveffi_contacts_get_contact((weaveffi_handle_t)id_raw, &err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_contacts_list_contacts(napi_env env, napi_callback_info info) {
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, NULL, NULL, NULL);
+  weaveffi_error err = {0};
+  size_t out_len;
+  weaveffi_contacts_Contact** result = weaveffi_contacts_list_contacts(&out_len, &err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_array_with_length(env, out_len, &ret);
+  for (size_t ret_i = 0; ret_i < out_len; ret_i++) {
+    napi_value elem;
+    napi_create_int64(env, (int64_t)(intptr_t)result[ret_i], &elem);
+    napi_set_element(env, ret, (uint32_t)ret_i, elem);
+  }
+  free(result);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_contacts_delete_contact(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  int64_t id_raw;
+  napi_get_value_int64(env, args[0], &id_raw);
+  weaveffi_error err = {0};
+  bool result = weaveffi_contacts_delete_contact((weaveffi_handle_t)id_raw, &err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_get_boolean(env, result, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_contacts_count_contacts(napi_env env, napi_callback_info info) {
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, NULL, NULL, NULL);
+  weaveffi_error err = {0};
+  int32_t result = weaveffi_contacts_count_contacts(&err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_int32(env, result, &ret);
+  return ret;
+}
+
+static napi_value Init(napi_env env, napi_value exports) {
+  napi_property_descriptor props[] = {
+    { "create_contact", NULL, Napi_weaveffi_contacts_create_contact, NULL, NULL, NULL, napi_default, NULL },
+    { "get_contact", NULL, Napi_weaveffi_contacts_get_contact, NULL, NULL, NULL, napi_default, NULL },
+    { "list_contacts", NULL, Napi_weaveffi_contacts_list_contacts, NULL, NULL, NULL, napi_default, NULL },
+    { "delete_contact", NULL, Napi_weaveffi_contacts_delete_contact, NULL, NULL, NULL, napi_default, NULL },
+    { "count_contacts", NULL, Napi_weaveffi_contacts_count_contacts, NULL, NULL, NULL, napi_default, NULL },
+  };
+  napi_define_properties(env, exports, 5, props);
+  return exports;
+}
+
+NAPI_MODULE(NODE_GYP_MODULE_NAME, Init)

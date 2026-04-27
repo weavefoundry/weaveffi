@@ -1,0 +1,130 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+package com.weaveffi
+
+class WeaveFFI {
+    companion object {
+        init { System.loadLibrary("weaveffi") }
+
+        @JvmStatic private external fun create_productJni(name: String, price: Double, category: Int): Long
+        @JvmStatic fun create_product(name: String, price: Double, category: Category): Long = create_productJni(name, price, category.value)
+        @JvmStatic external fun get_product(id: Long): Long
+        @JvmStatic private external fun search_productsJni(category: Int): LongArray
+        @JvmStatic fun search_products(category: Category): LongArray = search_productsJni(category.value)
+        @JvmStatic external fun update_price(id: Long, price: Double): Boolean
+        @JvmStatic external fun delete_product(id: Long): Boolean
+        @JvmStatic external fun create_order(items: LongArray): Long
+        @JvmStatic external fun get_order(id: Long): Long
+        @JvmStatic external fun cancel_order(id: Long): Boolean
+        @JvmStatic external fun add_product_to_order(order_id: Long, product: Long): Boolean
+    }
+}
+
+enum class Category(val value: Int) {
+    Electronics(0),
+    Clothing(1),
+    Food(2),
+    Books(3);
+
+    companion object {
+        fun fromValue(value: Int): Category = entries.first { it.value == value }
+    }
+}
+
+class Product internal constructor(private var handle: Long) : java.io.Closeable {
+    companion object {
+        init { System.loadLibrary("weaveffi") }
+
+        @JvmStatic external fun nativeCreate(id: Long, name: String, description: String?, price: Double, category: Int, tags: Array<String>): Long
+        @JvmStatic external fun nativeDestroy(handle: Long)
+        @JvmStatic external fun nativeGetId(handle: Long): Long
+        @JvmStatic external fun nativeGetName(handle: Long): String
+        @JvmStatic external fun nativeGetDescription(handle: Long): String?
+        @JvmStatic external fun nativeGetPrice(handle: Long): Double
+        @JvmStatic external fun nativeGetCategory(handle: Long): Int
+        @JvmStatic external fun nativeGetTags(handle: Long): Array<String>
+
+        fun create(id: Long, name: String, description: String?, price: Double, category: Int, tags: Array<String>): Product = Product(nativeCreate(id, name, description, price, category, tags))
+    }
+
+    val id: Long get() = nativeGetId(handle)
+    val name: String get() = nativeGetName(handle)
+    val description: String? get() = nativeGetDescription(handle)
+    val price: Double get() = nativeGetPrice(handle)
+    val category: Category get() = nativeGetCategory(handle)
+    val tags: Array<String> get() = nativeGetTags(handle)
+
+    override fun close() {
+        if (handle != 0L) {
+            nativeDestroy(handle)
+            handle = 0L
+        }
+    }
+
+    protected fun finalize() {
+        close()
+    }
+}
+
+class OrderItem internal constructor(private var handle: Long) : java.io.Closeable {
+    companion object {
+        init { System.loadLibrary("weaveffi") }
+
+        @JvmStatic external fun nativeCreate(product_id: Long, quantity: Int, unit_price: Double): Long
+        @JvmStatic external fun nativeDestroy(handle: Long)
+        @JvmStatic external fun nativeGetProductId(handle: Long): Long
+        @JvmStatic external fun nativeGetQuantity(handle: Long): Int
+        @JvmStatic external fun nativeGetUnitPrice(handle: Long): Double
+
+        fun create(product_id: Long, quantity: Int, unit_price: Double): OrderItem = OrderItem(nativeCreate(product_id, quantity, unit_price))
+    }
+
+    val product_id: Long get() = nativeGetProductId(handle)
+    val quantity: Int get() = nativeGetQuantity(handle)
+    val unit_price: Double get() = nativeGetUnitPrice(handle)
+
+    override fun close() {
+        if (handle != 0L) {
+            nativeDestroy(handle)
+            handle = 0L
+        }
+    }
+
+    protected fun finalize() {
+        close()
+    }
+}
+
+class Order internal constructor(private var handle: Long) : java.io.Closeable {
+    companion object {
+        init { System.loadLibrary("weaveffi") }
+
+        @JvmStatic external fun nativeCreate(id: Long, items: LongArray, total: Double, status: String): Long
+        @JvmStatic external fun nativeDestroy(handle: Long)
+        @JvmStatic external fun nativeGetId(handle: Long): Long
+        @JvmStatic external fun nativeGetItems(handle: Long): LongArray
+        @JvmStatic external fun nativeGetTotal(handle: Long): Double
+        @JvmStatic external fun nativeGetStatus(handle: Long): String
+
+        fun create(id: Long, items: LongArray, total: Double, status: String): Order = Order(nativeCreate(id, items, total, status))
+    }
+
+    val id: Long get() = nativeGetId(handle)
+    val items: LongArray get() = nativeGetItems(handle)
+    val total: Double get() = nativeGetTotal(handle)
+    val status: String get() = nativeGetStatus(handle)
+
+    override fun close() {
+        if (handle != 0L) {
+            nativeDestroy(handle)
+            handle = 0L
+        }
+    }
+
+    protected fun finalize() {
+        close()
+    }
+}
+
+open class WeaveFFIException(val code: Int, message: String) : Exception(message)

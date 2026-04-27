@@ -1,0 +1,29 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+# WeaveFFI Python Bindings
+
+Auto-generated Python bindings using ctypes.
+
+## Prerequisites
+
+- Python >= 3.8
+- The compiled shared library (`libweaveffi.so`, `libweaveffi.dylib`, or `weaveffi.dll`) available on your library search path.
+
+## Install
+
+```bash
+pip install .
+```
+
+## Development install
+
+```bash
+pip install -e .
+```
+
+## Usage
+
+```python
+from weaveffi import *
+```

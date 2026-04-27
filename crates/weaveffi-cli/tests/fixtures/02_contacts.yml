@@ -1,0 +1,53 @@
+version: "0.3.0"
+modules:
+  - name: contacts
+    enums:
+      - name: ContactType
+        variants:
+          - name: Personal
+            value: 0
+          - name: Work
+            value: 1
+          - name: Other
+            value: 2
+    structs:
+      - name: Contact
+        fields:
+          - name: id
+            type: i64
+          - name: first_name
+            type: string
+          - name: last_name
+            type: string
+          - name: email
+            type: "string?"
+          - name: contact_type
+            type: ContactType
+    functions:
+      - name: create_contact
+        params:
+          - name: first_name
+            type: string
+          - name: last_name
+            type: string
+          - name: email
+            type: "string?"
+          - name: contact_type
+            type: ContactType
+        return: handle
+      - name: get_contact
+        params:
+          - name: id
+            type: handle
+        return: Contact
+      - name: list_contacts
+        params: []
+        return: "[Contact]"
+      - name: delete_contact
+        params:
+          - name: id
+            type: handle
+        return: bool
+      - name: count_contacts
+        params: []
+        return: i32

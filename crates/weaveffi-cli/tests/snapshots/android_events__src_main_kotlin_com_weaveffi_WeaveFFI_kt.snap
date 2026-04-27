@@ -1,0 +1,15 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+package com.weaveffi
+
+class WeaveFFI {
+    companion object {
+        init { System.loadLibrary("weaveffi") }
+
+        @JvmStatic external fun send_message(text: String): Unit
+        @JvmStatic external fun get_messages(): Iterator<String>
+    }
+}
+
+open class WeaveFFIException(val code: Int, message: String) : Exception(message)

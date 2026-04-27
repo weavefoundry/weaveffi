@@ -1,0 +1,13 @@
+---
+source: crates/weaveffi-cli/tests/snapshots.rs
+---
+{
+  "targets": [
+    {
+      "target_name": "weaveffi",
+      "sources": ["weaveffi_addon.c"],
+      "include_dirs": ["../c"],
+      "libraries": ["-lweaveffi"]
+    }
+  ]
+}

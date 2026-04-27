@@ -1,0 +1,19 @@
+version: "0.3.0"
+modules:
+  - name: events
+    callbacks:
+      - name: OnMessage
+        params:
+          - { name: message, type: string }
+    listeners:
+      - name: message_listener
+        event_callback: OnMessage
+    functions:
+      - name: send_message
+        doc: Send a message, triggering the OnMessage callback
+        params:
+          - { name: text, type: string }
+      - name: get_messages
+        doc: Return an iterator over all sent messages
+        params: []
+        return: "iter<string>"

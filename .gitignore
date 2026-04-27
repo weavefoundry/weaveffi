@@ -44,3 +44,7 @@ node_modules/
 
 # WeaveFFI cache
 .weaveffi-cache
+
+# insta snapshot review artifacts (committed `.snap` files only)
+**/*.snap.new
+**/*.pending-snap
