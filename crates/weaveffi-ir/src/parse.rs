@@ -172,7 +172,7 @@ modules:
     fn parse_contacts_sample() {
         let yaml = std::fs::read_to_string("../../samples/contacts/contacts.yml").unwrap();
         let api = parse_api_str(&yaml, "yml").unwrap();
-        assert_eq!(api.version, "0.1.0");
+        assert_eq!(api.version, "0.3.0");
         assert_eq!(api.modules.len(), 1);
 
         let m = &api.modules[0];
@@ -829,7 +829,7 @@ modules:
     fn parse_inventory_sample() {
         let yaml = std::fs::read_to_string("../../samples/inventory/inventory.yml").unwrap();
         let api = parse_api_str(&yaml, "yml").unwrap();
-        assert_eq!(api.version, "0.1.0");
+        assert_eq!(api.version, "0.3.0");
         assert_eq!(api.modules.len(), 2);
 
         let products = &api.modules[0];
@@ -927,7 +927,7 @@ modules:
     fn parse_async_demo_sample() {
         let yaml = std::fs::read_to_string("../../samples/async-demo/async_demo.yml").unwrap();
         let api = parse_api_str(&yaml, "yml").unwrap();
-        assert_eq!(api.version, "0.2.0");
+        assert_eq!(api.version, "0.3.0");
         assert_eq!(api.modules.len(), 1);
 
         let m = &api.modules[0];

@@ -33,7 +33,7 @@ the work done inside the Rust library.
 Given this IDL definition:
 
 ```yaml
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: contacts
     enums:

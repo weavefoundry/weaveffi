@@ -42,7 +42,7 @@ omitted, errors still work but use the default code `-1`.
 ### YAML syntax
 
 ```yaml
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: contacts
     errors:

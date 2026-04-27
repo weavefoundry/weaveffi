@@ -17,7 +17,7 @@ The Android generator produces a Gradle `android-library` template with:
 Given this IDL definition:
 
 ```yaml
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: contacts
     enums:
