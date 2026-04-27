@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -12,7 +12,7 @@ pub struct Api {
     pub version: String,
     pub modules: Vec<Module>,
     #[serde(default)]
-    pub generators: Option<HashMap<String, toml::Value>>,
+    pub generators: Option<BTreeMap<String, toml::Value>>,
 }
 
 /// `Eq` is omitted because `StructField::default` contains `serde_yaml::Value`.

@@ -2109,6 +2109,7 @@ dependencies = [
  "tempfile",
  "tera",
  "thiserror",
+ "toml",
  "weaveffi-ir",
 ]
 
