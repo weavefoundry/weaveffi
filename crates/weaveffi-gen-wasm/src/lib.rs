@@ -203,8 +203,8 @@ fn render_wasm_readme(api: &Api, c_prefix: &str) -> String {
     out.push_str("For handle-typed optionals, a null pointer (`0`) signals absence.\n\n");
     out.push_str("### Strings\n\n");
     out.push_str("String parameters are passed as a **pointer + length** pair (`i32` pointer, `i32` length) ");
-    out.push_str("matching the C ABI signature `(const uint8_t* s_ptr, size_t s_len)`. ");
-    out.push_str("Strings are **not** NUL-terminated at the boundary; the explicit length is authoritative. ");
+    out.push_str("matching the C ABI signature `(const uint8_t* s_ptr, size_t s_len)`; ");
+    out.push_str("the explicit length is authoritative. ");
     out.push_str("The generated JS `_encodeString(wasm, str)` helper UTF-8 encodes the input, copies the bytes ");
     out.push_str(&format!(
         "into linear memory via `{c_prefix}_alloc`, and returns a `[ptr, len]` tuple that is spread ",
@@ -647,9 +647,7 @@ fn render_wasm_js_stub(api: &Api, module_name: &str, c_prefix: &str) -> String {
     out.push_str(
         "//   Optionals -> 0/null for absent; for numerics a separate _is_present i32 flag\n",
     );
-    out.push_str(
-        "//   Strings   -> (i32 ptr, i32 len) pair into linear memory; not NUL-terminated\n",
-    );
+    out.push_str("//   Strings   -> (i32 ptr, i32 len) pair into linear memory\n");
     out.push_str("//   Lists     -> (i32 pointer, i32 length) pair into linear memory\n");
     out.push('\n');
 
@@ -2637,8 +2635,8 @@ mod tests {
         );
 
         // Arity guard: the call site must have exactly 3 top-level args
-        // (ptr, len, err). Any regression that drops the `len` or reverts to
-        // a single NUL-terminated argument would trip this check.
+        // (ptr, len, err). Any regression that drops `len` or collapses
+        // the pair back into a single string argument would trip this check.
         let call_start = js
             .find("wasm.weaveffi_echo_shout(")
             .expect("wasm.weaveffi_echo_shout call site missing");
@@ -2674,17 +2672,17 @@ mod tests {
             "call site arity must match the new C signature (ptr, len, err) = 3 args / 2 commas; got args: {args:?}"
         );
 
-        // No legacy NUL-terminated convention may leak into the generated
-        // JS: those forms would mismatch the new (const uint8_t*, size_t) C
-        // prototype at the WASM boundary.
+        // The call site must not collapse the (ptr, len) pair into a single
+        // argument or drop the length, since that would mismatch the new
+        // (const uint8_t*, size_t) C prototype at the WASM boundary.
         assert!(
             !js.contains("wasm.weaveffi_echo_shout(msg, _err)")
                 && !js.contains("wasm.weaveffi_echo_shout(msg,_err)"),
-            "WASM call must NOT pass the Raw JS string as a single NUL-terminated argument: {js}"
+            "WASM call must NOT pass the raw JS string as a single argument: {js}"
         );
         assert!(
             !js.contains("wasm.weaveffi_echo_shout(msg_ptr, _err)"),
-            "WASM call must NOT drop the length and pass ptr as NUL-terminated: {js}"
+            "WASM call must NOT drop the length and pass ptr alone: {js}"
         );
 
         let readme = render_wasm_readme(&api, DEFAULT_C_PREFIX);
@@ -2697,12 +2695,16 @@ mod tests {
             "README must reference the new C signature for strings: {readme}"
         );
         assert!(
-            readme.contains("not** NUL-terminated"),
-            "README must clarify that the WASM string ABI is not NUL-terminated: {readme}"
+            readme.contains("the explicit length is authoritative"),
+            "README must clarify that the explicit length governs the WASM string ABI: {readme}"
         );
         assert!(
             readme.contains("`[ptr, len]` tuple"),
             "README must document that _encodeString returns a (ptr, len) tuple spread into the WASM call: {readme}"
+        );
+        assert!(
+            !readme.contains("NUL-terminated"),
+            "README must not reference NUL-terminated string params: {readme}"
         );
     }
 
