@@ -33,6 +33,8 @@ modules:
         cancellable: true
 ";
 
+// Re-enabled once Node, Go, and Ruby advertise the CancellableAsync (and AsyncFunctions) capability.
+#[ignore = "Node, Go, and Ruby do not advertise CancellableAsync/AsyncFunctions yet; reactivate when later phases add the capability back"]
 #[test]
 fn cancellable_async_emits_platform_primitive_in_all_targets() {
     let dir = tempfile::tempdir().expect("failed to create temp dir");

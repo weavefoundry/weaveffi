@@ -218,8 +218,6 @@ impl Generator for PythonGenerator {
 
     fn capabilities(&self) -> &'static [Capability] {
         &[
-            Capability::Callbacks,
-            Capability::Listeners,
             Capability::Iterators,
             Capability::Builders,
             Capability::AsyncFunctions,
@@ -5670,11 +5668,20 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_includes_callbacks_and_listeners() {
+    fn capabilities_excludes_callbacks_and_listeners() {
         let caps = PythonGenerator.capabilities();
-        assert!(caps.contains(&Capability::Callbacks));
-        assert!(caps.contains(&Capability::Listeners));
+        assert!(
+            !caps.contains(&Capability::Callbacks),
+            "Python generator must not advertise Callbacks until callback codegen is implemented"
+        );
+        assert!(
+            !caps.contains(&Capability::Listeners),
+            "Python generator must not advertise Listeners until listener codegen is implemented"
+        );
         for cap in Capability::ALL {
+            if matches!(cap, Capability::Callbacks | Capability::Listeners) {
+                continue;
+            }
             assert!(caps.contains(cap), "Python generator must support {cap:?}");
         }
     }

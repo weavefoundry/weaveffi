@@ -1,5 +1,7 @@
 use std::path::Path;
 
+// Re-enabled once Go and Ruby advertise the AsyncFunctions capability.
+#[ignore = "Go and Ruby do not advertise AsyncFunctions yet; reactivate when later phases add the capability back"]
 #[test]
 fn async_function_emitted_in_all_targets() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");

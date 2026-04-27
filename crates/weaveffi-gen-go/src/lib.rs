@@ -74,11 +74,6 @@ impl Generator for GoGenerator {
 
     fn capabilities(&self) -> &'static [Capability] {
         &[
-            Capability::Callbacks,
-            Capability::Listeners,
-            Capability::Iterators,
-            Capability::Builders,
-            Capability::AsyncFunctions,
             Capability::CancellableAsync,
             Capability::TypedHandles,
             Capability::BorrowedTypes,
@@ -4592,14 +4587,39 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_includes_callbacks_listeners_iterators_builders_async() {
+    fn capabilities_excludes_callbacks_listeners_iterators_builders_async() {
         let caps = GoGenerator.capabilities();
-        assert!(caps.contains(&Capability::Callbacks));
-        assert!(caps.contains(&Capability::Listeners));
-        assert!(caps.contains(&Capability::Iterators));
-        assert!(caps.contains(&Capability::Builders));
-        assert!(caps.contains(&Capability::AsyncFunctions));
+        assert!(
+            !caps.contains(&Capability::Callbacks),
+            "Go generator must not advertise Callbacks until callback codegen is implemented"
+        );
+        assert!(
+            !caps.contains(&Capability::Listeners),
+            "Go generator must not advertise Listeners until listener codegen is implemented"
+        );
+        assert!(
+            !caps.contains(&Capability::AsyncFunctions),
+            "Go generator must not advertise AsyncFunctions until async codegen is implemented"
+        );
+        assert!(
+            !caps.contains(&Capability::Iterators),
+            "Go generator must not advertise Iterators until iterator codegen is implemented"
+        );
+        assert!(
+            !caps.contains(&Capability::Builders),
+            "Go generator must not advertise Builders until builder codegen is implemented"
+        );
         for cap in Capability::ALL {
+            if matches!(
+                cap,
+                Capability::Callbacks
+                    | Capability::Listeners
+                    | Capability::AsyncFunctions
+                    | Capability::Iterators
+                    | Capability::Builders
+            ) {
+                continue;
+            }
             assert!(caps.contains(cap), "Go generator must support {cap:?}");
         }
     }
