@@ -5373,6 +5373,48 @@ mod tests {
             "JNI bridge must NOT pass msg_chars as a bare const char* or the raw jstring: {jni}"
         );
 
+        // User-facing Kotlin signature must take `msg: String` so the JNI
+        // bridge stays the sole conversion point between a Kotlin String
+        // and the `(const uint8_t*, size_t)` C ABI pair. A regression
+        // exposing `ByteArray` would silently reroute the ABI.
+        let kt =
+            std::fs::read_to_string(tmp.join("android/src/main/kotlin/com/weaveffi/WeaveFFI.kt"))
+                .unwrap();
+        assert!(
+            kt.contains("external fun shout(msg: String)"),
+            "Kotlin wrapper must expose msg as Kotlin String so the JNI bridge is the only String -> UTF-8 bytes transform: {kt}"
+        );
+
+        // Lifetime guard: acquire must run before the C call so
+        // msg_chars / msg_len are initialized, and release must run
+        // after so msg_chars stays live across the ABI boundary. A
+        // regression reordering these would surface as a UAF or an
+        // uninitialized-read on the C side.
+        let chars_idx = jni
+            .find("const char* msg_chars = (*env)->GetStringUTFChars(env, msg, NULL);")
+            .expect("GetStringUTFChars acquire must be present");
+        let length_idx = jni
+            .find("jsize msg_len = (*env)->GetStringUTFLength(env, msg);")
+            .expect("GetStringUTFLength acquire must be present");
+        let call_idx = jni
+            .find("weaveffi_echo_shout((const uint8_t*)msg_chars, (size_t)msg_len, &err);")
+            .expect("C call site must be present");
+        let release_idx = jni
+            .find("(*env)->ReleaseStringUTFChars(env, msg, msg_chars);")
+            .expect("ReleaseStringUTFChars must be present");
+        assert!(
+            chars_idx < call_idx,
+            "GetStringUTFChars must run before the C call so msg_chars is initialized: {jni}"
+        );
+        assert!(
+            length_idx < call_idx,
+            "GetStringUTFLength must run before the C call so msg_len is initialized: {jni}"
+        );
+        assert!(
+            call_idx < release_idx,
+            "ReleaseStringUTFChars must run after the C call so msg_chars stays live across the ABI boundary: {jni}"
+        );
+
         let cmake =
             std::fs::read_to_string(tmp.join("android/src/main/cpp/CMakeLists.txt")).unwrap();
         assert!(
