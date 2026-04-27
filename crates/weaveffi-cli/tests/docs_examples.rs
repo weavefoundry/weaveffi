@@ -954,6 +954,92 @@ fn dart_contacts_readme_documents_build_and_run() {
 }
 
 #[test]
+fn go_contacts_example_files_exist() {
+    for file in [
+        "examples/go/contacts/main.go",
+        "examples/go/contacts/go.mod",
+        "examples/go/contacts/README.md",
+    ] {
+        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        assert!(
+            workspace_root.join(file).exists(),
+            "Go contacts example is missing {file}"
+        );
+    }
+}
+
+#[test]
+fn go_contacts_main_exercises_generated_bindings() {
+    let main = read_doc("examples/go/contacts/main.go");
+    assert!(
+        main.contains("weaveffi \"github.com/example/weaveffi\""),
+        "main.go must import the generated Go module: {main}"
+    );
+    for call in [
+        "weaveffi.ContactsCreateContact(",
+        "weaveffi.ContactsCountContacts()",
+        "weaveffi.ContactsListContacts()",
+        "weaveffi.ContactsGetContact(",
+        "weaveffi.ContactsDeleteContact(",
+        "weaveffi.ContactTypePersonal",
+        "weaveffi.ContactTypeWork",
+    ] {
+        assert!(main.contains(call), "main.go must call `{call}`: {main}");
+    }
+    for close_call in ["contact.Close()", "fetched.Close()"] {
+        assert!(
+            main.contains(close_call),
+            "main.go must explicitly close generated structs with `{close_call}`: {main}"
+        );
+    }
+}
+
+#[test]
+fn go_contacts_go_mod_replaces_generated_module() {
+    let go_mod = read_doc("examples/go/contacts/go.mod");
+    assert!(
+        go_mod.contains("module github.com/example/weaveffi-go-contacts"),
+        "go.mod must declare the consumer example module: {go_mod}"
+    );
+    assert!(
+        go_mod.contains("require github.com/example/weaveffi v0.0.0"),
+        "go.mod must require the generated module path: {go_mod}"
+    );
+    assert!(
+        go_mod.contains("replace github.com/example/weaveffi => ../../generated/go"),
+        "go.mod must replace the generated module with ../../generated/go: {go_mod}"
+    );
+}
+
+#[test]
+fn go_contacts_readme_documents_cgo_build_and_run() {
+    let readme = read_doc("examples/go/contacts/README.md");
+    assert!(
+        readme.contains("cargo build -p contacts"),
+        "README must instruct building the contacts cdylib: {readme}"
+    );
+    for token in [
+        "cargo run -p weaveffi-cli -- generate samples/contacts/contacts.yml -o examples/generated --target c",
+        "cargo run -p weaveffi-cli -- generate samples/contacts/contacts.yml -o examples/generated --target go",
+        "replace github.com/example/weaveffi => ../../generated/go",
+        "CGO_CFLAGS=\"-I$ROOT/examples/generated/c\"",
+        "CGO_LDFLAGS=\"-L$ROOT/target/debug -lweaveffi\"",
+        "go run .",
+        "libweaveffi.dylib",
+        "libweaveffi.so",
+    ] {
+        assert!(
+            readme.contains(token),
+            "README must mention `{token}`: {readme}"
+        );
+    }
+}
+
+#[test]
 fn dart_flutter_contacts_example_files_exist() {
     for file in [
         "examples/dart/flutter-contacts/lib/main.dart",
