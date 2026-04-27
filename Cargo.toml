@@ -21,6 +21,7 @@ members = [
     "samples/inventory",
     "samples/async-demo",
     "samples/events",
+    "crates/weaveffi-fuzz",
 ]
 resolver = "2"
 

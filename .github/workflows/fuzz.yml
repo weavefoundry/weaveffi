@@ -1,0 +1,57 @@
+name: Fuzz
+
+on:
+  pull_request:
+  schedule:
+    # 08:00 UTC daily. The nightly run can be extended by bumping
+    # `-max_total_time` below.
+    - cron: '0 8 * * *'
+
+jobs:
+  fuzz:
+    name: cargo-fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_parse_yaml
+          - fuzz_parse_json
+          - fuzz_parse_toml
+          - fuzz_parse_type_ref
+          - fuzz_validate
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: true
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run ${{ matrix.target }} for 60s
+        # Each target is fuzzed for 60s in PRs (≈5 min total). The cron run
+        # uses the same budget today; bump `-max_total_time` to extend it.
+        # Any crash is written to fuzz/artifacts/ and fails the job.
+        run: |
+          cargo +nightly fuzz run \
+            --fuzz-dir crates/weaveffi-fuzz \
+            --features fuzzing \
+            ${{ matrix.target }} \
+            crates/weaveffi-fuzz/fuzz/seeds/${{ matrix.target }} \
+            -- -max_total_time=60 -seed=1
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: crates/weaveffi-fuzz/fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
