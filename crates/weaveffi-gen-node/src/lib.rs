@@ -99,6 +99,7 @@ impl Generator for NodeGenerator {
             Capability::Iterators,
             Capability::Builders,
             Capability::AsyncFunctions,
+            Capability::CancellableAsync,
             Capability::TypedHandles,
             Capability::BorrowedTypes,
             Capability::MapTypes,
@@ -3839,7 +3840,7 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_includes_listeners_excludes_cancellable_async() {
+    fn capabilities_includes_listeners_and_cancellable_async() {
         let caps = NodeGenerator.capabilities();
         assert!(
             caps.contains(&Capability::Callbacks),
@@ -3850,13 +3851,10 @@ mod tests {
             "Node generator must advertise Listeners now that listener codegen is implemented"
         );
         assert!(
-            !caps.contains(&Capability::CancellableAsync),
-            "Node generator must not advertise CancellableAsync while cancellation is broken"
+            caps.contains(&Capability::CancellableAsync),
+            "Node generator must advertise CancellableAsync now that AbortSignal is wired to the cancel token"
         );
         for cap in Capability::ALL {
-            if matches!(cap, Capability::CancellableAsync) {
-                continue;
-            }
             assert!(caps.contains(cap), "Node generator must support {cap:?}");
         }
     }
