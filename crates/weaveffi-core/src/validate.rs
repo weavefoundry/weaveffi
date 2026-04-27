@@ -1,3 +1,4 @@
+use miette::{Diagnostic, NamedSource, SourceSpan};
 use std::collections::{BTreeMap, BTreeSet};
 use weaveffi_ir::ir::{Api, ErrorDomain, Function, Module, Param, TypeRef, SUPPORTED_VERSIONS};
 
@@ -176,76 +177,232 @@ fn nesting_depth(ty: &TypeRef) -> usize {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, Diagnostic)]
 pub enum ValidationError {
     #[error("module has no name")]
+    #[diagnostic(help("every module must have a non-empty 'name' field"))]
     NoModuleName,
     #[error("duplicate module name: {0}")]
+    #[diagnostic(help(
+        "module names must be unique within an API definition; rename or merge the duplicate"
+    ))]
     DuplicateModuleName(String),
     #[error("invalid module name '{0}': {1}")]
+    #[diagnostic(help(
+        "choose a valid identifier (a-z, A-Z, 0-9, _) that is not a reserved word"
+    ))]
     InvalidModuleName(String, &'static str),
     #[error("duplicate function name in module '{module}': {function}")]
+    #[diagnostic(help("function names must be unique within a module; rename the duplicate"))]
     DuplicateFunctionName { module: String, function: String },
     #[error("duplicate param name in function '{function}' of module '{module}': {param}")]
+    #[diagnostic(help("parameter names must be unique within a function; rename the duplicate"))]
     DuplicateParamName {
         module: String,
         function: String,
         param: String,
     },
     #[error("reserved keyword used: {0}")]
+    #[diagnostic(help("choose a different name that is not a language reserved word"))]
     ReservedKeyword(String),
     #[error("invalid identifier '{0}': {1}")]
+    #[diagnostic(help("identifiers must start with a letter or underscore and contain only alphanumeric or underscore characters"))]
     InvalidIdentifier(String, &'static str),
     #[error("error domain missing name in module '{0}'")]
+    #[diagnostic(help("add a non-empty 'name' field to the error domain"))]
     ErrorDomainMissingName(String),
     #[error("duplicate error code name in module '{module}': {name}")]
+    #[diagnostic(help("error code names must be unique within a module; rename the duplicate"))]
     DuplicateErrorName { module: String, name: String },
     #[error("duplicate error numeric code in module '{module}': {code}")]
+    #[diagnostic(help(
+        "numeric error codes must be unique within a module; assign a different value"
+    ))]
     DuplicateErrorCode { module: String, code: i32 },
     #[error("invalid error code in module '{module}' for '{name}': must be non-zero")]
+    #[diagnostic(help("error codes must be non-zero; use a positive or negative integer"))]
     InvalidErrorCode { module: String, name: String },
     #[error("function name collides with error domain name in module '{module}': {name}")]
+    #[diagnostic(help(
+        "function and error domain names share a namespace; rename one to avoid the collision"
+    ))]
     NameCollisionWithErrorDomain { module: String, name: String },
     #[error("duplicate struct name in module '{module}': {name}")]
+    #[diagnostic(help("struct names must be unique within a module; rename the duplicate"))]
     DuplicateStructName { module: String, name: String },
     #[error("duplicate field name in struct '{struct_name}': {field}")]
+    #[diagnostic(help("field names must be unique within a struct; rename the duplicate"))]
     DuplicateStructField { struct_name: String, field: String },
     #[error("empty struct in module '{module}': {name}")]
+    #[diagnostic(help("structs must have at least one field; add a field or remove the struct"))]
     EmptyStruct { module: String, name: String },
     #[error("duplicate enum name in module '{module}': {name}")]
+    #[diagnostic(help("enum names must be unique within a module; rename the duplicate"))]
     DuplicateEnumName { module: String, name: String },
     #[error("empty enum in module '{module}': {name}")]
+    #[diagnostic(help("enums must have at least one variant; add a variant or remove the enum"))]
     EmptyEnum { module: String, name: String },
     #[error("duplicate enum variant in enum '{enum_name}': {variant}")]
+    #[diagnostic(help("variant names must be unique within an enum; rename the duplicate"))]
     DuplicateEnumVariant { enum_name: String, variant: String },
     #[error("duplicate enum value in enum '{enum_name}': {value}")]
+    #[diagnostic(help(
+        "variant numeric values must be unique within an enum; assign a different value"
+    ))]
     DuplicateEnumValue { enum_name: String, value: i32 },
     #[error("unknown type reference: {name}")]
+    #[diagnostic(help(
+        "define a struct or enum with this name in the same module, or check for typos"
+    ))]
     UnknownTypeRef { name: String },
     #[error("invalid map key type: {key_type}; only primitive types and strings are allowed as map keys")]
+    #[diagnostic(help("map keys must be primitive types (i32, u32, i64, f64, bool, string); structs, lists, and maps cannot be keys"))]
     InvalidMapKey { key_type: String },
     #[error(
         "borrowed type '{ty}' is not valid in {location}; only function parameters are allowed"
     )]
+    #[diagnostic(help("borrowed types (&str, &[u8]) can only be used as function parameters, not return types or struct fields"))]
     BorrowedTypeInInvalidPosition { ty: String, location: String },
     #[error("duplicate callback name in module '{module}': {name}")]
+    #[diagnostic(help("callback names must be unique within a module; rename the duplicate"))]
     DuplicateCallbackName { module: String, name: String },
     #[error(
         "listener '{listener}' in module '{module}' references undefined callback '{callback}'"
     )]
+    #[diagnostic(help(
+        "listener event_callback must reference a callback defined in the same module"
+    ))]
     ListenerCallbackNotFound {
         module: String,
         listener: String,
         callback: String,
     },
     #[error("duplicate listener name in module '{module}': {name}")]
+    #[diagnostic(help("listener names must be unique within a module; rename the duplicate"))]
     DuplicateListenerName { module: String, name: String },
     #[error("iterator type is only valid as a function return type, found in {location}")]
+    #[diagnostic(help("iterator types can only be used as function return types, not as parameters or struct fields"))]
     IteratorInInvalidPosition { location: String },
     #[error("builder struct '{name}' in module '{module}' must have at least one field")]
+    #[diagnostic(help(
+        "builder structs must have at least one field; add a field or set builder: false"
+    ))]
     BuilderStructEmpty { module: String, name: String },
     #[error("unsupported schema version '{version}'; supported versions: {supported}")]
+    #[diagnostic(help("run 'weaveffi upgrade <file>' to migrate to the current schema version"))]
     UnsupportedSchemaVersion { version: String, supported: String },
+}
+
+/// Diagnostic wrapper that attaches an optional source code snippet and a
+/// best-effort byte range to a [`ValidationError`] for fancy rendering via
+/// [`miette`]. The wrapper delegates `help()` and `code()` to the inner error
+/// while exposing its own `source_code` and `labels` so the renderer can
+/// underline the offending identifier in the input.
+#[derive(Debug)]
+pub struct ValidationDiagnostic {
+    pub error: ValidationError,
+    pub src: Option<NamedSource<String>>,
+    pub span: Option<SourceSpan>,
+}
+
+impl std::fmt::Display for ValidationDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl std::error::Error for ValidationDiagnostic {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
+}
+
+impl Diagnostic for ValidationDiagnostic {
+    fn code<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        self.error.code()
+    }
+
+    fn severity(&self) -> Option<miette::Severity> {
+        self.error.severity()
+    }
+
+    fn help<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        self.error.help()
+    }
+
+    fn url<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        self.error.url()
+    }
+
+    fn source_code(&self) -> Option<&dyn miette::SourceCode> {
+        self.src
+            .as_ref()
+            .map(|s| s as &dyn miette::SourceCode)
+            .or_else(|| self.error.source_code())
+    }
+
+    fn labels(&self) -> Option<Box<dyn Iterator<Item = miette::LabeledSpan> + '_>> {
+        if let Some(span) = self.span {
+            Some(Box::new(std::iter::once(
+                miette::LabeledSpan::new_with_span(Some("here".to_string()), span),
+            )))
+        } else {
+            self.error.labels()
+        }
+    }
+}
+
+impl ValidationDiagnostic {
+    /// Build a [`ValidationDiagnostic`] from a [`ValidationError`] and an
+    /// optional `(filename, contents)` source. When a source is provided the
+    /// constructor performs a best-effort search for the offending identifier
+    /// (e.g. a duplicate module name or unknown type reference) and attaches
+    /// a [`SourceSpan`] for fancy rendering. If no span can be computed the
+    /// label is omitted and miette still produces a nicer message + help
+    /// section than plain `Display`.
+    pub fn new(error: ValidationError, source: Option<(&str, &str)>) -> Self {
+        let (src, span) = match source {
+            Some((filename, contents)) => {
+                let span = find_offending_span(&error, contents);
+                (Some(NamedSource::new(filename, contents.to_string())), span)
+            }
+            None => (None, None),
+        };
+        Self { error, src, span }
+    }
+}
+
+fn find_offending_span(err: &ValidationError, src: &str) -> Option<SourceSpan> {
+    let needle: &str = match err {
+        ValidationError::DuplicateModuleName(n) => Some(n.as_str()),
+        ValidationError::InvalidModuleName(n, _) => Some(n.as_str()),
+        ValidationError::DuplicateFunctionName { function, .. } => Some(function.as_str()),
+        ValidationError::DuplicateParamName { param, .. } => Some(param.as_str()),
+        ValidationError::ReservedKeyword(n) => Some(n.as_str()),
+        ValidationError::InvalidIdentifier(n, _) => Some(n.as_str()),
+        ValidationError::DuplicateErrorName { name, .. } => Some(name.as_str()),
+        ValidationError::InvalidErrorCode { name, .. } => Some(name.as_str()),
+        ValidationError::NameCollisionWithErrorDomain { name, .. } => Some(name.as_str()),
+        ValidationError::DuplicateStructName { name, .. } => Some(name.as_str()),
+        ValidationError::DuplicateStructField { field, .. } => Some(field.as_str()),
+        ValidationError::EmptyStruct { name, .. } => Some(name.as_str()),
+        ValidationError::DuplicateEnumName { name, .. } => Some(name.as_str()),
+        ValidationError::EmptyEnum { name, .. } => Some(name.as_str()),
+        ValidationError::DuplicateEnumVariant { variant, .. } => Some(variant.as_str()),
+        ValidationError::UnknownTypeRef { name } => Some(name.as_str()),
+        ValidationError::DuplicateCallbackName { name, .. } => Some(name.as_str()),
+        ValidationError::ListenerCallbackNotFound { callback, .. } => Some(callback.as_str()),
+        ValidationError::DuplicateListenerName { name, .. } => Some(name.as_str()),
+        ValidationError::BuilderStructEmpty { name, .. } => Some(name.as_str()),
+        ValidationError::UnsupportedSchemaVersion { version, .. } => Some(version.as_str()),
+        _ => None,
+    }?;
+    let quoted = format!("\"{needle}\"");
+    if let Some(pos) = src.find(&quoted) {
+        return Some(SourceSpan::new(pos.into(), quoted.len()));
+    }
+    src.find(needle)
+        .map(|pos| SourceSpan::new(pos.into(), needle.len()))
 }
 
 const RESERVED: &[&str] = &[
@@ -275,7 +432,19 @@ fn check_identifier(name: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-pub fn validate_api(api: &mut Api) -> Result<(), ValidationError> {
+/// Validate an [`Api`]. The optional `source` is `(filename, contents)` of the
+/// IDL file and is used at the call site to attach a span to a returned error
+/// via [`ValidationDiagnostic::new`]. Pass `None` when the API is constructed
+/// in memory (tests, programmatic builds) and there is no on-disk source.
+#[allow(clippy::result_large_err)]
+pub fn validate_api(
+    api: &mut Api,
+    source: Option<(&str, &str)>,
+) -> Result<(), ValidationDiagnostic> {
+    validate_api_inner(api).map_err(|e| ValidationDiagnostic::new(e, source))
+}
+
+fn validate_api_inner(api: &mut Api) -> Result<(), ValidationError> {
     if !SUPPORTED_VERSIONS.contains(&api.version.as_str()) {
         return Err(ValidationError::UnsupportedSchemaVersion {
             version: api.version.clone(),
@@ -769,7 +938,7 @@ mod tests {
     #[test]
     fn valid_api_passes() {
         let mut api = simple_api();
-        assert!(validate_api(&mut api).is_ok());
+        assert!(validate_api(&mut api, None).is_ok());
     }
 
     #[test]
@@ -780,7 +949,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::DuplicateModuleName(n) if n == "dup"
         ));
     }
@@ -802,7 +971,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::DuplicateFunctionName { .. }
         ));
     }
@@ -825,7 +994,7 @@ mod tests {
                 generators: None,
             };
             assert!(
-                validate_api(&mut api).is_err(),
+                validate_api(&mut api, None).is_err(),
                 "Expected reserved keyword '{kw}' to be rejected"
             );
         }
@@ -849,7 +1018,7 @@ mod tests {
                 generators: None,
             };
             assert!(
-                validate_api(&mut api).is_err(),
+                validate_api(&mut api, None).is_err(),
                 "Expected invalid identifier '{bad}' to be rejected"
             );
         }
@@ -880,7 +1049,7 @@ mod tests {
             }],
             generators: None,
         };
-        assert!(validate_api(&mut api).is_ok());
+        assert!(validate_api(&mut api, None).is_ok());
     }
 
     #[test]
@@ -912,7 +1081,7 @@ mod tests {
             }],
             generators: None,
         };
-        assert!(validate_api(&mut api).is_ok());
+        assert!(validate_api(&mut api, None).is_ok());
     }
 
     #[test]
@@ -996,7 +1165,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::NoModuleName
         ));
     }
@@ -1072,7 +1241,7 @@ mod tests {
             }],
             generators: None,
         };
-        assert!(validate_api(&mut api).is_ok());
+        assert!(validate_api(&mut api, None).is_ok());
     }
 
     #[test]
@@ -1099,7 +1268,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::InvalidErrorCode { module, name }
                 if module == "mymod" && name == "success"
         ));
@@ -1129,7 +1298,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::NameCollisionWithErrorDomain { module, name }
                 if module == "mymod" && name == "do_stuff"
         ));
@@ -1166,7 +1335,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::DuplicateErrorName { module, name }
                 if module == "mymod" && name == "fail"
         ));
@@ -1203,7 +1372,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::DuplicateErrorCode { .. }
         ));
     }
@@ -1239,7 +1408,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::DuplicateStructName { module, name }
                 if module == "mymod" && name == "Point"
         ));
@@ -1267,7 +1436,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::EmptyStruct { module, name }
                 if module == "mymod" && name == "Empty"
         ));
@@ -1308,7 +1477,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::DuplicateStructField { struct_name, field }
                 if struct_name == "Point" && field == "x"
         ));
@@ -1350,7 +1519,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::DuplicateEnumName { module, name }
                 if module == "mymod" && name == "Color"
         ));
@@ -1377,7 +1546,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::EmptyEnum { module, name }
                 if module == "mymod" && name == "Empty"
         ));
@@ -1415,7 +1584,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::DuplicateEnumVariant { enum_name, variant }
                 if enum_name == "Color" && variant == "Red"
         ));
@@ -1453,7 +1622,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::DuplicateEnumValue { enum_name, value }
                 if enum_name == "Color" && value == 0
         ));
@@ -1489,7 +1658,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::UnknownTypeRef { name } if name == "Foo"
         ));
     }
@@ -1523,7 +1692,7 @@ mod tests {
             }],
             generators: None,
         };
-        assert!(validate_api(&mut api).is_ok());
+        assert!(validate_api(&mut api, None).is_ok());
     }
 
     #[test]
@@ -1556,7 +1725,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::UnknownTypeRef { name } if name == "Bar"
         ));
     }
@@ -1587,7 +1756,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::UnknownTypeRef { name } if name == "Baz"
         ));
     }
@@ -1619,7 +1788,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::UnknownTypeRef { name } if name == "Nonexistent"
         ));
     }
@@ -1663,7 +1832,7 @@ mod tests {
             }],
             generators: None,
         };
-        assert!(validate_api(&mut api).is_ok());
+        assert!(validate_api(&mut api, None).is_ok());
     }
 
     #[test]
@@ -1695,7 +1864,7 @@ mod tests {
             }],
             generators: None,
         };
-        assert!(validate_api(&mut api).is_ok());
+        assert!(validate_api(&mut api, None).is_ok());
     }
 
     #[test]
@@ -1735,7 +1904,7 @@ mod tests {
             }],
             generators: None,
         };
-        assert!(validate_api(&mut api).is_ok());
+        assert!(validate_api(&mut api, None).is_ok());
     }
 
     #[test]
@@ -1769,7 +1938,7 @@ mod tests {
             }],
             generators: None,
         };
-        assert!(validate_api(&mut api).is_ok());
+        assert!(validate_api(&mut api, None).is_ok());
     }
 
     #[test]
@@ -1797,7 +1966,7 @@ mod tests {
             }],
             generators: None,
         };
-        assert!(validate_api(&mut api).is_ok());
+        assert!(validate_api(&mut api, None).is_ok());
     }
 
     #[test]
@@ -1829,7 +1998,7 @@ mod tests {
             }],
             generators: None,
         };
-        validate_api(&mut api).unwrap();
+        validate_api(&mut api, None).unwrap();
         assert_eq!(
             api.modules[0].functions[0].params[0].ty,
             TypeRef::Enum("Color".to_string())
@@ -1865,7 +2034,7 @@ mod tests {
             }],
             generators: None,
         };
-        validate_api(&mut api).unwrap();
+        validate_api(&mut api, None).unwrap();
         assert_eq!(
             api.modules[0].functions[0].params[0].ty,
             TypeRef::Optional(Box::new(TypeRef::Enum("Color".to_string())))
@@ -1901,7 +2070,7 @@ mod tests {
             }],
             generators: None,
         };
-        validate_api(&mut api).unwrap();
+        validate_api(&mut api, None).unwrap();
         assert_eq!(
             api.modules[0].functions[0].params[0].ty,
             TypeRef::Struct("Contact".to_string())
@@ -1936,7 +2105,7 @@ mod tests {
             }],
             generators: None,
         };
-        assert!(validate_api(&mut api).is_ok());
+        assert!(validate_api(&mut api, None).is_ok());
     }
 
     #[test]
@@ -1968,7 +2137,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::InvalidMapKey { key_type } if key_type == "struct Point"
         ));
     }
@@ -2001,7 +2170,7 @@ mod tests {
             }],
             generators: None,
         };
-        assert!(validate_api(&mut api).is_ok());
+        assert!(validate_api(&mut api, None).is_ok());
     }
 
     #[test]
@@ -2355,7 +2524,7 @@ mod tests {
             }],
             generators: None,
         };
-        validate_api(&mut api).unwrap();
+        validate_api(&mut api, None).unwrap();
         assert_eq!(
             api.modules[0].structs[0].fields[0].ty,
             TypeRef::Enum("Color".to_string())
@@ -2391,7 +2560,7 @@ mod tests {
             }],
             generators: None,
         };
-        assert!(validate_api(&mut api).is_ok());
+        assert!(validate_api(&mut api, None).is_ok());
     }
 
     #[test]
@@ -2424,7 +2593,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::UnknownTypeRef { name } if name == "Nonexistent"
         ));
     }
@@ -2458,7 +2627,7 @@ mod tests {
             }],
             generators: None,
         };
-        assert!(validate_api(&mut api).is_ok());
+        assert!(validate_api(&mut api, None).is_ok());
     }
 
     #[test]
@@ -2490,7 +2659,7 @@ mod tests {
             }],
             generators: None,
         };
-        assert!(validate_api(&mut api).is_ok());
+        assert!(validate_api(&mut api, None).is_ok());
     }
 
     #[test]
@@ -2519,7 +2688,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::BorrowedTypeInInvalidPosition { ty, location }
                 if ty == "&str" && location.contains("return type")
         ));
@@ -2551,7 +2720,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::BorrowedTypeInInvalidPosition { ty, location }
                 if ty == "&[u8]" && location.contains("return type")
         ));
@@ -2584,7 +2753,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::BorrowedTypeInInvalidPosition { ty, location }
                 if ty == "&str" && location.contains("struct")
         ));
@@ -2617,7 +2786,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::BorrowedTypeInInvalidPosition { ty, location }
                 if ty == "&[u8]" && location.contains("struct")
         ));
@@ -2649,7 +2818,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::BorrowedTypeInInvalidPosition { ty, .. }
                 if ty == "&str"
         ));
@@ -2696,7 +2865,7 @@ mod tests {
             ],
             generators: None,
         };
-        validate_api(&mut api).unwrap();
+        validate_api(&mut api, None).unwrap();
         assert_eq!(
             api.modules[0].functions[0].params[0].ty,
             TypeRef::Struct("catalog.Product".to_string())
@@ -2740,7 +2909,7 @@ mod tests {
             ],
             generators: None,
         };
-        validate_api(&mut api).unwrap();
+        validate_api(&mut api, None).unwrap();
         assert_eq!(
             api.modules[0].functions[0].returns,
             Some(TypeRef::Enum("shared.Status".to_string()))
@@ -2789,7 +2958,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::UnknownTypeRef { name } if name == "Nonexistent"
         ));
     }
@@ -2869,7 +3038,7 @@ mod tests {
             }],
             generators: None,
         };
-        assert!(validate_api(&mut api).is_ok());
+        assert!(validate_api(&mut api, None).is_ok());
     }
 
     #[test]
@@ -2900,7 +3069,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::DuplicateCallbackName { module, name }
                 if module == "events" && name == "on_data"
         ));
@@ -2927,7 +3096,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::ListenerCallbackNotFound { module, listener, callback }
                 if module == "events" && listener == "watcher" && callback == "nonexistent"
         ));
@@ -2961,7 +3130,7 @@ mod tests {
             }],
             generators: None,
         };
-        assert!(validate_api(&mut api).is_ok());
+        assert!(validate_api(&mut api, None).is_ok());
     }
 
     #[test]
@@ -2996,7 +3165,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::DuplicateListenerName { module, name }
                 if module == "events" && name == "watcher"
         ));
@@ -3027,7 +3196,7 @@ mod tests {
             }],
             generators: None,
         };
-        assert!(validate_api(&mut api).is_ok());
+        assert!(validate_api(&mut api, None).is_ok());
     }
 
     #[test]
@@ -3060,7 +3229,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::IteratorInInvalidPosition { .. }
         ));
     }
@@ -3092,7 +3261,7 @@ mod tests {
             generators: None,
         };
         assert!(matches!(
-            validate_api(&mut api).unwrap_err(),
+            validate_api(&mut api, None).unwrap_err().error,
             ValidationError::IteratorInInvalidPosition { .. }
         ));
     }
@@ -3118,9 +3287,9 @@ mod tests {
             }],
             generators: None,
         };
-        let err = validate_api(&mut api).unwrap_err();
+        let err = validate_api(&mut api, None).unwrap_err();
         assert!(
-            matches!(err, ValidationError::BuilderStructEmpty { .. }),
+            matches!(err.error, ValidationError::BuilderStructEmpty { .. }),
             "expected BuilderStructEmpty, got: {err}"
         );
     }
