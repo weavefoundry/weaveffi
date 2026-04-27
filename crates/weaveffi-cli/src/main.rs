@@ -3,8 +3,7 @@ mod scaffold;
 
 use camino::Utf8Path;
 use clap::{CommandFactory, Parser, Subcommand};
-use color_eyre::eyre::{bail, eyre, Report, Result, WrapErr};
-use color_eyre::Section;
+use miette::{bail, miette, IntoDiagnostic, NamedSource, Report, Result, WrapErr};
 use serde::Deserialize;
 use similar::TextDiff;
 use std::collections::{BTreeSet, HashMap};
@@ -15,7 +14,7 @@ use tracing_subscriber::EnvFilter;
 use weaveffi_core::codegen::{Generator, Orchestrator};
 use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::templates::TemplateEngine;
-use weaveffi_core::validate::{collect_warnings, validate_api, ValidationError};
+use weaveffi_core::validate::{collect_warnings, validate_api};
 use weaveffi_gen_android::AndroidGenerator;
 use weaveffi_gen_c::CGenerator;
 use weaveffi_gen_cpp::CppGenerator;
@@ -28,7 +27,7 @@ use weaveffi_gen_ruby::RubyGenerator;
 use weaveffi_gen_swift::SwiftGenerator;
 use weaveffi_gen_wasm::WasmGenerator;
 use weaveffi_ir::ir::{CURRENT_SCHEMA_VERSION, SUPPORTED_VERSIONS};
-use weaveffi_ir::parse::{parse_api_str, ParseError};
+use weaveffi_ir::parse::parse_api_str;
 
 #[derive(Parser, Debug)]
 #[command(name = "weaveffi", version, about = "WeaveFFI CLI")]
@@ -121,7 +120,14 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    let _ = color_eyre::install();
+    let _ = miette::set_hook(Box::new(|_| {
+        Box::new(
+            miette::MietteHandlerOpts::new()
+                .terminal_links(true)
+                .context_lines(3)
+                .build(),
+        )
+    }));
 
     let cli = Cli::parse();
 
@@ -200,6 +206,7 @@ fn cmd_new(name: &str, quiet: bool) -> Result<()> {
         );
     }
     std::fs::create_dir_all(project_dir.as_std_path())
+        .into_diagnostic()
         .wrap_err_with(|| format!("failed to create project directory: {}", name))?;
 
     let module_name = sanitize_module_name(name);
@@ -237,10 +244,11 @@ fn cmd_new(name: &str, quiet: bool) -> Result<()> {
         module = module_name
     );
     std::fs::write(idl_path.as_std_path(), &idl_contents)
+        .into_diagnostic()
         .wrap_err_with(|| format!("failed to write {}", idl_path))?;
 
     let mut api = parse_api_str(&idl_contents, "yaml").wrap_err("failed to parse generated IDL")?;
-    validate_api(&mut api).wrap_err("generated IDL failed validation")?;
+    validate_api(&mut api, None).wrap_err("generated IDL failed validation")?;
 
     let cargo_toml_path = project_dir.join("Cargo.toml");
     let cargo_toml = format!(
@@ -263,14 +271,17 @@ fn cmd_new(name: &str, quiet: bool) -> Result<()> {
         name = name,
     );
     std::fs::write(cargo_toml_path.as_std_path(), &cargo_toml)
+        .into_diagnostic()
         .wrap_err_with(|| format!("failed to write {}", cargo_toml_path))?;
 
     let src_dir = project_dir.join("src");
     std::fs::create_dir_all(src_dir.as_std_path())
+        .into_diagnostic()
         .wrap_err_with(|| format!("failed to create {}", src_dir))?;
     let lib_rs_path = src_dir.join("lib.rs");
     let lib_contents = scaffold::render_scaffold(&api);
     std::fs::write(lib_rs_path.as_std_path(), &lib_contents)
+        .into_diagnostic()
         .wrap_err_with(|| format!("failed to write {}", lib_rs_path))?;
 
     let readme_path = project_dir.join("README.md");
@@ -297,6 +308,7 @@ fn cmd_new(name: &str, quiet: bool) -> Result<()> {
         name = name,
     );
     std::fs::write(readme_path.as_std_path(), &readme)
+        .into_diagnostic()
         .wrap_err_with(|| format!("failed to write {}", readme_path))?;
 
     if !quiet {
@@ -314,8 +326,10 @@ fn load_config(path: Option<&str>) -> Result<GeneratorConfig> {
     match path {
         Some(p) => {
             let contents = std::fs::read_to_string(p)
+                .into_diagnostic()
                 .wrap_err_with(|| format!("failed to read config file: {}", p))?;
             toml::from_str(&contents)
+                .into_diagnostic()
                 .wrap_err_with(|| format!("failed to parse config file: {}", p))
         }
         None => Ok(GeneratorConfig::default()),
@@ -492,9 +506,11 @@ fn cmd_generate(
         ),
     };
     let contents = std::fs::read_to_string(in_path.as_std_path())
+        .into_diagnostic()
         .wrap_err_with(|| format!("failed to read input file: {}", input))?;
-    let mut api = parse_api_str(&contents, format).map_err(|e| format_parse_error(input, e))?;
-    validate_api(&mut api).map_err(format_validation_error)?;
+    let mut api =
+        parse_api_str(&contents, format).map_err(|e| with_named_source(e, input, &contents))?;
+    validate_api(&mut api, Some((input, &contents))).map_err(Report::new)?;
 
     if let Some(ref generators) = api.generators {
         merge_inline_generators(&mut config, generators);
@@ -540,13 +556,14 @@ fn cmd_generate(
     }
 
     std::fs::create_dir_all(out_dir.as_std_path())
+        .into_diagnostic()
         .wrap_err_with(|| format!("failed to create output directory: {}", out))?;
 
     let engine = match templates_path {
         Some(dir) => {
             let mut te = TemplateEngine::new();
             te.load_dir(Utf8Path::new(dir))
-                .map_err(|e| eyre!("failed to load templates from {}: {:#}", dir, e))?;
+                .map_err(|e| miette!("failed to load templates from {}: {:#}", dir, e))?;
             Some(te)
         }
         None => None,
@@ -559,12 +576,13 @@ fn cmd_generate(
 
     orchestrator
         .run(&api, out_dir, &config, force, engine.as_ref())
-        .map_err(|e| eyre!("{:#}", e))?;
+        .map_err(|e| miette!("{:#}", e))?;
 
     if emit_scaffold {
         let scaffold_path = out_dir.join("scaffold.rs");
         let contents = scaffold::render_scaffold(&api);
         std::fs::write(scaffold_path.as_std_path(), contents)
+            .into_diagnostic()
             .wrap_err_with(|| format!("failed to write {}", scaffold_path))?;
         if !quiet {
             println!("Scaffold written to {}", scaffold_path);
@@ -593,10 +611,12 @@ fn cmd_validate(input: &str, warn: bool, quiet: bool) -> Result<()> {
         ),
     };
     let contents = std::fs::read_to_string(in_path.as_std_path())
+        .into_diagnostic()
         .wrap_err_with(|| format!("failed to read input file: {}", input))?;
-    let mut api = parse_api_str(&contents, format).map_err(|e| format_parse_error(input, e))?;
+    let mut api =
+        parse_api_str(&contents, format).map_err(|e| with_named_source(e, input, &contents))?;
 
-    match validate_api(&mut api) {
+    match validate_api(&mut api, Some((input, &contents))) {
         Ok(()) => {
             if warn {
                 for w in collect_warnings(&api) {
@@ -616,7 +636,7 @@ fn cmd_validate(input: &str, warn: bool, quiet: bool) -> Result<()> {
             }
             Ok(())
         }
-        Err(e) => Err(format_validation_error(e)),
+        Err(e) => Err(Report::new(e)),
     }
 }
 
@@ -637,9 +657,11 @@ fn cmd_lint(input: &str, quiet: bool) -> Result<bool> {
         ),
     };
     let contents = std::fs::read_to_string(in_path.as_std_path())
+        .into_diagnostic()
         .wrap_err_with(|| format!("failed to read input file: {}", input))?;
-    let mut api = parse_api_str(&contents, format).map_err(|e| format_parse_error(input, e))?;
-    validate_api(&mut api).map_err(format_validation_error)?;
+    let mut api =
+        parse_api_str(&contents, format).map_err(|e| with_named_source(e, input, &contents))?;
+    validate_api(&mut api, Some((input, &contents))).map_err(Report::new)?;
 
     let warnings = collect_warnings(&api);
     if warnings.is_empty() {
@@ -673,13 +695,17 @@ fn cmd_diff(input: &str, out: Option<&str>, quiet: bool) -> Result<()> {
         ),
     };
     let contents = std::fs::read_to_string(in_path.as_std_path())
+        .into_diagnostic()
         .wrap_err_with(|| format!("failed to read input file: {}", input))?;
-    let mut api = parse_api_str(&contents, format).map_err(|e| format_parse_error(input, e))?;
-    validate_api(&mut api).map_err(format_validation_error)?;
+    let mut api =
+        parse_api_str(&contents, format).map_err(|e| with_named_source(e, input, &contents))?;
+    validate_api(&mut api, Some((input, &contents))).map_err(Report::new)?;
 
-    let tmp = tempfile::tempdir().wrap_err("failed to create temp directory")?;
+    let tmp = tempfile::tempdir()
+        .into_diagnostic()
+        .wrap_err("failed to create temp directory")?;
     let tmp_path = Utf8Path::from_path(tmp.path())
-        .ok_or_else(|| eyre!("temp directory path is not valid UTF-8"))?;
+        .ok_or_else(|| miette!("temp directory path is not valid UTF-8"))?;
 
     let c = CGenerator;
     let cpp = CppGenerator;
@@ -703,7 +729,7 @@ fn cmd_diff(input: &str, out: Option<&str>, quiet: bool) -> Result<()> {
     }
     orchestrator
         .run(&api, tmp_path, &config, true, None)
-        .map_err(|e| eyre!("{:#}", e))?;
+        .map_err(|e| miette!("{:#}", e))?;
 
     let out_dir = Utf8Path::new(out);
 
@@ -731,8 +757,10 @@ fn cmd_diff(input: &str, out: Option<&str>, quiet: bool) -> Result<()> {
                 println!("{rel}: [would be removed]");
             }
             (true, true) => {
-                let gen_content = std::fs::read_to_string(gen_file.as_std_path())?;
-                let out_content = std::fs::read_to_string(out_file.as_std_path())?;
+                let gen_content =
+                    std::fs::read_to_string(gen_file.as_std_path()).into_diagnostic()?;
+                let out_content =
+                    std::fs::read_to_string(out_file.as_std_path()).into_diagnostic()?;
                 if gen_content != out_content {
                     has_diff = true;
                     print_unified_diff(rel, &out_content, &gen_content);
@@ -757,18 +785,20 @@ fn collect_relative_files(base: &Utf8Path) -> Result<BTreeSet<String>> {
 
 fn walk_dir(base: &Utf8Path, dir: &Utf8Path, out: &mut BTreeSet<String>) -> Result<()> {
     let entries = std::fs::read_dir(dir.as_std_path())
+        .into_diagnostic()
         .wrap_err_with(|| format!("failed to read directory: {}", dir))?;
     for entry in entries {
-        let entry = entry?;
+        let entry = entry.into_diagnostic()?;
         let path = entry.path();
         let utf8 = Utf8Path::from_path(&path)
-            .ok_or_else(|| eyre!("non-UTF-8 path: {:?}", path))?
+            .ok_or_else(|| miette!("non-UTF-8 path: {:?}", path))?
             .to_owned();
         if utf8.is_dir() {
             walk_dir(base, &utf8, out)?;
         } else {
             let rel = utf8
                 .strip_prefix(base)
+                .into_diagnostic()
                 .wrap_err("failed to strip prefix")?
                 .to_string();
             if rel != ".weaveffi-cache" {
@@ -788,139 +818,91 @@ fn print_unified_diff(path: &str, old: &str, new: &str) {
     }
 }
 
-fn format_parse_error(filename: &str, err: ParseError) -> Report {
-    let suggestion = match &err {
-        ParseError::Yaml { .. } => {
-            "check YAML syntax: ensure correct indentation, quoting, and key-value formatting"
-        }
-        ParseError::Json { .. } => {
-            "check JSON syntax: ensure all brackets, braces, and commas are correct"
-        }
-        ParseError::Toml { .. } => {
-            "check TOML syntax: ensure correct table headers, key-value pairs, and quoting"
-        }
-        ParseError::UnsupportedFormat(_) => "use a supported format: yml, yaml, json, or toml",
-    };
-
-    let location = match &err {
-        ParseError::Yaml { line, column, .. } | ParseError::Json { line, column, .. } => {
-            format!("{}:{}:{}", filename, line, column)
-        }
-        _ => filename.to_string(),
-    };
-
-    eyre!(err).note(location).suggestion(suggestion)
+/// Wrap a [`ParseError`] in a [`miette::Report`] and attach the input
+/// filename and contents as a [`NamedSource`] so the fancy renderer can
+/// display the offending line and caret.
+/// Wrap a [`miette::Diagnostic`] (e.g. a [`ParseError`]) in a [`Report`] while
+/// forcing its source code to be a [`NamedSource`] so the fancy renderer prints
+/// the filename in the snippet header. miette's built-in `with_source_code` is
+/// a no-op when the inner diagnostic already provides `#[source_code]`, so we
+/// use a small wrapper that overrides `source_code()` instead.
+fn with_named_source<E>(err: E, filename: &str, contents: &str) -> Report
+where
+    E: miette::Diagnostic + Send + Sync + 'static,
+{
+    Report::new(NamedDiagnostic {
+        inner: err,
+        src: NamedSource::new(filename, contents.to_string()),
+    })
 }
 
-fn format_validation_error(err: ValidationError) -> Report {
-    let suggestion = validation_suggestion(&err);
-    eyre!(err).suggestion(suggestion)
+#[derive(Debug)]
+struct NamedDiagnostic<E> {
+    inner: E,
+    src: NamedSource<String>,
 }
 
-fn validation_suggestion(err: &ValidationError) -> &'static str {
-    match err {
-        ValidationError::NoModuleName => "every module must have a non-empty 'name' field",
-        ValidationError::DuplicateModuleName(_) => {
-            "module names must be unique within an API definition; rename or merge the duplicate"
-        }
-        ValidationError::InvalidModuleName(_, _) => {
-            "choose a valid identifier (a-z, A-Z, 0-9, _) that is not a reserved word"
-        }
-        ValidationError::DuplicateFunctionName { .. } => {
-            "function names must be unique within a module; rename the duplicate"
-        }
-        ValidationError::DuplicateParamName { .. } => {
-            "parameter names must be unique within a function; rename the duplicate"
-        }
-        ValidationError::ReservedKeyword(_) => {
-            "choose a different name that is not a language reserved word"
-        }
-        ValidationError::InvalidIdentifier(_, _) => {
-            "identifiers must start with a letter or underscore and contain only alphanumeric or underscore characters"
-        }
-        ValidationError::ErrorDomainMissingName(_) => {
-            "add a non-empty 'name' field to the error domain"
-        }
-        ValidationError::DuplicateErrorName { .. } => {
-            "error code names must be unique within a module; rename the duplicate"
-        }
-        ValidationError::DuplicateErrorCode { .. } => {
-            "numeric error codes must be unique within a module; assign a different value"
-        }
-        ValidationError::InvalidErrorCode { .. } => {
-            "error codes must be non-zero; use a positive or negative integer"
-        }
-        ValidationError::NameCollisionWithErrorDomain { .. } => {
-            "function and error domain names share a namespace; rename one to avoid the collision"
-        }
-        ValidationError::DuplicateStructName { .. } => {
-            "struct names must be unique within a module; rename the duplicate"
-        }
-        ValidationError::DuplicateStructField { .. } => {
-            "field names must be unique within a struct; rename the duplicate"
-        }
-        ValidationError::EmptyStruct { .. } => {
-            "structs must have at least one field; add a field or remove the struct"
-        }
-        ValidationError::DuplicateEnumName { .. } => {
-            "enum names must be unique within a module; rename the duplicate"
-        }
-        ValidationError::EmptyEnum { .. } => {
-            "enums must have at least one variant; add a variant or remove the enum"
-        }
-        ValidationError::DuplicateEnumVariant { .. } => {
-            "variant names must be unique within an enum; rename the duplicate"
-        }
-        ValidationError::DuplicateEnumValue { .. } => {
-            "variant numeric values must be unique within an enum; assign a different value"
-        }
-        ValidationError::UnknownTypeRef { .. } => {
-            "define a struct or enum with this name in the same module, or check for typos"
-        }
-        ValidationError::InvalidMapKey { .. } => {
-            "map keys must be primitive types (i32, u32, i64, f64, bool, string); structs, lists, and maps cannot be keys"
-        }
-        ValidationError::BorrowedTypeInInvalidPosition { .. } => {
-            "borrowed types (&str, &[u8]) can only be used as function parameters, not return types or struct fields"
-        }
-        ValidationError::DuplicateCallbackName { .. } => {
-            "callback names must be unique within a module; rename the duplicate"
-        }
-        ValidationError::ListenerCallbackNotFound { .. } => {
-            "listener event_callback must reference a callback defined in the same module"
-        }
-        ValidationError::DuplicateListenerName { .. } => {
-            "listener names must be unique within a module; rename the duplicate"
-        }
-        ValidationError::IteratorInInvalidPosition { .. } => {
-            "iterator types can only be used as function return types, not as parameters or struct fields"
-        }
-        ValidationError::BuilderStructEmpty { .. } => {
-            "builder structs must have at least one field; add a field or set builder: false"
-        }
-        ValidationError::UnsupportedSchemaVersion { .. } => {
-            "run 'weaveffi upgrade <file>' to migrate to the current schema version"
-        }
+impl<E: std::fmt::Display> std::fmt::Display for NamedDiagnostic<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.inner, f)
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for NamedDiagnostic<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.inner.source()
+    }
+}
+
+impl<E: miette::Diagnostic + 'static> miette::Diagnostic for NamedDiagnostic<E> {
+    fn code<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        self.inner.code()
+    }
+    fn severity(&self) -> Option<miette::Severity> {
+        self.inner.severity()
+    }
+    fn help<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        self.inner.help()
+    }
+    fn url<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        self.inner.url()
+    }
+    fn labels(&self) -> Option<Box<dyn Iterator<Item = miette::LabeledSpan> + '_>> {
+        self.inner.labels()
+    }
+    fn related<'a>(&'a self) -> Option<Box<dyn Iterator<Item = &'a dyn miette::Diagnostic> + 'a>> {
+        self.inner.related()
+    }
+    fn diagnostic_source(&self) -> Option<&dyn miette::Diagnostic> {
+        self.inner.diagnostic_source()
+    }
+    fn source_code(&self) -> Option<&dyn miette::SourceCode> {
+        Some(&self.src)
     }
 }
 
 fn cmd_extract(input: &str, output: Option<&str>, format: &str, quiet: bool) -> Result<()> {
     let source = std::fs::read_to_string(input)
+        .into_diagnostic()
         .wrap_err_with(|| format!("failed to read source file: {}", input))?;
 
     let mut api = extract::extract_api_from_rust(&source)
-        .wrap_err("failed to extract API from Rust source")?;
+        .map_err(|e| miette!("failed to extract API from Rust source: {:#}", e))?;
 
-    if let Err(e) = validate_api(&mut api) {
+    if let Err(e) = validate_api(&mut api, None) {
         eprintln!("warning: {}", e);
     }
 
     let serialized = match format {
-        "yaml" | "yml" => {
-            serde_yaml::to_string(&api).wrap_err("failed to serialize API as YAML")?
-        }
-        "json" => serde_json::to_string_pretty(&api).wrap_err("failed to serialize API as JSON")?,
-        "toml" => toml::to_string_pretty(&api).wrap_err("failed to serialize API as TOML")?,
+        "yaml" | "yml" => serde_yaml::to_string(&api)
+            .into_diagnostic()
+            .wrap_err("failed to serialize API as YAML")?,
+        "json" => serde_json::to_string_pretty(&api)
+            .into_diagnostic()
+            .wrap_err("failed to serialize API as JSON")?,
+        "toml" => toml::to_string_pretty(&api)
+            .into_diagnostic()
+            .wrap_err("failed to serialize API as TOML")?,
         other => bail!(
             "unsupported output format: {} (expected yaml, json, or toml)",
             other
@@ -930,6 +912,7 @@ fn cmd_extract(input: &str, output: Option<&str>, format: &str, quiet: bool) -> 
     match output {
         Some(path) => {
             std::fs::write(path, &serialized)
+                .into_diagnostic()
                 .wrap_err_with(|| format!("failed to write output file: {}", path))?;
             if !quiet {
                 println!("Extracted API written to {}", path);
@@ -1046,6 +1029,7 @@ fn cmd_upgrade(input: &str, output: Option<&str>, check: bool, quiet: bool) -> R
         ),
     };
     let contents = std::fs::read_to_string(in_path.as_std_path())
+        .into_diagnostic()
         .wrap_err_with(|| format!("failed to read input file: {}", input))?;
 
     let outcome = match format {
@@ -1079,6 +1063,7 @@ fn cmd_upgrade(input: &str, output: Option<&str>, check: bool, quiet: bool) -> R
             }
             let dest = output.unwrap_or(input);
             std::fs::write(dest, &new)
+                .into_diagnostic()
                 .wrap_err_with(|| format!("failed to write output file: {}", dest))?;
             if !quiet {
                 println!("Upgraded {dest} from {from} to {CURRENT_SCHEMA_VERSION}");
@@ -1098,7 +1083,7 @@ where
     F: FnOnce() -> Option<String>,
 {
     get().ok_or_else(|| {
-        eyre!("missing or non-string 'version' field; cannot determine schema version to migrate from")
+        miette!("missing or non-string 'version' field; cannot determine schema version to migrate from")
     })
 }
 
@@ -1114,8 +1099,9 @@ fn ensure_supported(version: &str) -> Result<()> {
 }
 
 fn upgrade_yaml(input: &str, quiet: bool) -> Result<UpgradeOutcome> {
-    let mut value: serde_yaml::Value =
-        serde_yaml::from_str(input).wrap_err("failed to parse YAML")?;
+    let mut value: serde_yaml::Value = serde_yaml::from_str(input)
+        .into_diagnostic()
+        .wrap_err("failed to parse YAML")?;
     let version = read_version_str(|| {
         value
             .get("version")
@@ -1135,7 +1121,9 @@ fn upgrade_yaml(input: &str, quiet: bool) -> Result<UpgradeOutcome> {
             serde_yaml::Value::String(CURRENT_SCHEMA_VERSION.into()),
         );
     }
-    let new_contents = serde_yaml::to_string(&value).wrap_err("failed to serialize YAML")?;
+    let new_contents = serde_yaml::to_string(&value)
+        .into_diagnostic()
+        .wrap_err("failed to serialize YAML")?;
     Ok(UpgradeOutcome::Migrated {
         from: version,
         contents: new_contents,
@@ -1208,8 +1196,9 @@ fn yaml_strip_callback_params(
 }
 
 fn upgrade_json(input: &str, quiet: bool) -> Result<UpgradeOutcome> {
-    let mut value: serde_json::Value =
-        serde_json::from_str(input).wrap_err("failed to parse JSON")?;
+    let mut value: serde_json::Value = serde_json::from_str(input)
+        .into_diagnostic()
+        .wrap_err("failed to parse JSON")?;
     let version = read_version_str(|| {
         value
             .get("version")
@@ -1229,7 +1218,9 @@ fn upgrade_json(input: &str, quiet: bool) -> Result<UpgradeOutcome> {
             serde_json::Value::String(CURRENT_SCHEMA_VERSION.into()),
         );
     }
-    let new_contents = serde_json::to_string_pretty(&value).wrap_err("failed to serialize JSON")?;
+    let new_contents = serde_json::to_string_pretty(&value)
+        .into_diagnostic()
+        .wrap_err("failed to serialize JSON")?;
     Ok(UpgradeOutcome::Migrated {
         from: version,
         contents: new_contents,
@@ -1302,7 +1293,9 @@ fn json_strip_callback_params(
 }
 
 fn upgrade_toml(input: &str, quiet: bool) -> Result<UpgradeOutcome> {
-    let mut value: toml::Value = toml::from_str(input).wrap_err("failed to parse TOML")?;
+    let mut value: toml::Value = toml::from_str(input)
+        .into_diagnostic()
+        .wrap_err("failed to parse TOML")?;
     let version = read_version_str(|| {
         value
             .get("version")
@@ -1322,7 +1315,9 @@ fn upgrade_toml(input: &str, quiet: bool) -> Result<UpgradeOutcome> {
             toml::Value::String(CURRENT_SCHEMA_VERSION.into()),
         );
     }
-    let new_contents = toml::to_string_pretty(&value).wrap_err("failed to serialize TOML")?;
+    let new_contents = toml::to_string_pretty(&value)
+        .into_diagnostic()
+        .wrap_err("failed to serialize TOML")?;
     Ok(UpgradeOutcome::Migrated {
         from: version,
         contents: new_contents,
@@ -1477,165 +1472,6 @@ fn check_tool<S: AsRef<OsStr>>(cmd: &str, args: &[S], label: &str, hint: Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weaveffi_core::validate::ValidationError;
-    use weaveffi_ir::parse::ParseError;
-
-    #[test]
-    fn validation_suggestion_covers_all_variants() {
-        let cases: Vec<ValidationError> = vec![
-            ValidationError::NoModuleName,
-            ValidationError::DuplicateModuleName("m".into()),
-            ValidationError::InvalidModuleName("123".into(), "bad"),
-            ValidationError::DuplicateFunctionName {
-                module: "m".into(),
-                function: "f".into(),
-            },
-            ValidationError::DuplicateParamName {
-                module: "m".into(),
-                function: "f".into(),
-                param: "p".into(),
-            },
-            ValidationError::ReservedKeyword("type".into()),
-            ValidationError::InvalidIdentifier("123".into(), "bad"),
-            ValidationError::ErrorDomainMissingName("m".into()),
-            ValidationError::DuplicateErrorName {
-                module: "m".into(),
-                name: "e".into(),
-            },
-            ValidationError::DuplicateErrorCode {
-                module: "m".into(),
-                code: 1,
-            },
-            ValidationError::InvalidErrorCode {
-                module: "m".into(),
-                name: "e".into(),
-            },
-            ValidationError::NameCollisionWithErrorDomain {
-                module: "m".into(),
-                name: "e".into(),
-            },
-            ValidationError::DuplicateStructName {
-                module: "m".into(),
-                name: "S".into(),
-            },
-            ValidationError::DuplicateStructField {
-                struct_name: "S".into(),
-                field: "f".into(),
-            },
-            ValidationError::EmptyStruct {
-                module: "m".into(),
-                name: "S".into(),
-            },
-            ValidationError::DuplicateEnumName {
-                module: "m".into(),
-                name: "E".into(),
-            },
-            ValidationError::EmptyEnum {
-                module: "m".into(),
-                name: "E".into(),
-            },
-            ValidationError::DuplicateEnumVariant {
-                enum_name: "E".into(),
-                variant: "V".into(),
-            },
-            ValidationError::DuplicateEnumValue {
-                enum_name: "E".into(),
-                value: 0,
-            },
-            ValidationError::UnknownTypeRef { name: "Foo".into() },
-            ValidationError::InvalidMapKey {
-                key_type: "struct Foo".into(),
-            },
-            ValidationError::BorrowedTypeInInvalidPosition {
-                ty: "&str".into(),
-                location: "return type".into(),
-            },
-            ValidationError::DuplicateCallbackName {
-                module: "m".into(),
-                name: "cb".into(),
-            },
-            ValidationError::ListenerCallbackNotFound {
-                module: "m".into(),
-                listener: "l".into(),
-                callback: "cb".into(),
-            },
-            ValidationError::DuplicateListenerName {
-                module: "m".into(),
-                name: "l".into(),
-            },
-            ValidationError::UnsupportedSchemaVersion {
-                version: "9.9.9".into(),
-                supported: "0.1.0, 0.2.0, 0.3.0".into(),
-            },
-        ];
-
-        for err in &cases {
-            let suggestion = validation_suggestion(err);
-            assert!(!suggestion.is_empty(), "empty suggestion for {:?}", err);
-        }
-    }
-
-    #[test]
-    fn format_parse_error_preserves_yaml_error() {
-        let _ = color_eyre::install();
-        let err = ParseError::Yaml {
-            line: 5,
-            column: 3,
-            message: "test error".into(),
-        };
-        let report = format_parse_error("input.yml", err);
-        let msg = report.to_string();
-        assert!(
-            msg.contains("YAML parse error"),
-            "missing error type in: {msg}"
-        );
-        assert!(msg.contains("line 5"), "missing line number in: {msg}");
-        assert!(msg.contains("column 3"), "missing column number in: {msg}");
-    }
-
-    #[test]
-    fn format_parse_error_preserves_json_error() {
-        let _ = color_eyre::install();
-        let err = ParseError::Json {
-            line: 10,
-            column: 1,
-            message: "test error".into(),
-        };
-        let report = format_parse_error("data.json", err);
-        let msg = report.to_string();
-        assert!(
-            msg.contains("JSON parse error"),
-            "missing error type in: {msg}"
-        );
-        assert!(msg.contains("line 10"), "missing line in: {msg}");
-    }
-
-    #[test]
-    fn format_parse_error_preserves_toml_error() {
-        let _ = color_eyre::install();
-        let err = ParseError::Toml {
-            message: "test error".into(),
-        };
-        let report = format_parse_error("config.toml", err);
-        let msg = report.to_string();
-        assert!(
-            msg.contains("TOML parse error"),
-            "missing error type in: {msg}"
-        );
-    }
-
-    #[test]
-    fn format_validation_error_preserves_message() {
-        let _ = color_eyre::install();
-        let err = ValidationError::DuplicateModuleName("foo".into());
-        let report = format_validation_error(err);
-        let msg = report.to_string();
-        assert!(
-            msg.contains("duplicate module name"),
-            "missing error message in: {msg}"
-        );
-        assert!(msg.contains("foo"), "missing module name in: {msg}");
-    }
 
     #[test]
     fn config_file_parsed() {
@@ -1660,7 +1496,6 @@ mod tests {
 
     #[test]
     fn lint_clean_file_succeeds() {
-        let _ = color_eyre::install();
         let sample = format!(
             "{}/../../samples/calculator/calculator.yml",
             env!("CARGO_MANIFEST_DIR")
@@ -1895,7 +1730,6 @@ mod tests {
 
     #[test]
     fn dry_run_lists_files() {
-        let _ = color_eyre::install();
         let dir = tempfile::tempdir().unwrap();
         let yml = dir.path().join("api.yml");
         std::fs::write(
@@ -1928,7 +1762,7 @@ mod tests {
         let api = {
             let contents = std::fs::read_to_string(&yml).unwrap();
             let mut api = weaveffi_ir::parse::parse_api_str(&contents, "yaml").unwrap();
-            weaveffi_core::validate::validate_api(&mut api).unwrap();
+            weaveffi_core::validate::validate_api(&mut api, None).unwrap();
             api
         };
         let out_dir = Utf8Path::new(out_str);
@@ -2124,7 +1958,6 @@ mod tests {
 
     #[test]
     fn generate_cpp_target_filter() {
-        let _ = color_eyre::install();
         let dir = tempfile::tempdir().unwrap();
         let sample = format!(
             "{}/../../samples/calculator/calculator.yml",
@@ -2156,7 +1989,6 @@ mod tests {
 
     #[test]
     fn diff_shows_new_files() {
-        let _ = color_eyre::install();
         let dir = tempfile::tempdir().unwrap();
         let yml = dir.path().join("api.yml");
         std::fs::write(

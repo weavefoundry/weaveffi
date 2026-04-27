@@ -348,7 +348,7 @@ modules:
 fn readme_quickstart_yaml_parses_and_validates() {
     let mut api = weaveffi_ir::parse::parse_api_str(README_QUICKSTART_YAML, "yaml")
         .expect("README quickstart YAML should parse");
-    weaveffi_core::validate::validate_api(&mut api)
+    weaveffi_core::validate::validate_api(&mut api, None)
         .expect("README quickstart YAML should validate");
 
     assert_eq!(api.modules.len(), 1);
@@ -429,7 +429,8 @@ modules:
 fn getting_started_yaml_parses_and_validates() {
     let mut api = weaveffi_ir::parse::parse_api_str(GETTING_STARTED_YAML, "yaml")
         .expect("getting-started YAML should parse");
-    weaveffi_core::validate::validate_api(&mut api).expect("getting-started YAML should validate");
+    weaveffi_core::validate::validate_api(&mut api, None)
+        .expect("getting-started YAML should validate");
 
     assert_eq!(api.modules.len(), 1);
     assert_eq!(api.modules[0].name, "math");

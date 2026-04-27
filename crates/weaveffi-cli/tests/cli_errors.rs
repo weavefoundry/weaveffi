@@ -32,8 +32,8 @@ fn parse_error_yaml_shows_filename_and_location() {
         "expected YAML parse error message, got: {stderr}"
     );
     assert!(
-        stderr.contains("Suggestion"),
-        "expected Suggestion section, got: {stderr}"
+        stderr.contains("help:"),
+        "expected miette help section, got: {stderr}"
     );
 }
 
@@ -110,8 +110,8 @@ modules:
         "expected rule violation message, got: {stderr}"
     );
     assert!(
-        stderr.contains("Suggestion"),
-        "expected Suggestion section, got: {stderr}"
+        stderr.contains("help:"),
+        "expected miette help section, got: {stderr}"
     );
     assert!(
         stderr.contains("module names must be unique"),
@@ -200,8 +200,8 @@ fn generate_parse_error_shows_filename_and_suggestion() {
         "expected filename in generate error, got: {stderr}"
     );
     assert!(
-        stderr.contains("Suggestion"),
-        "expected Suggestion section in generate error, got: {stderr}"
+        stderr.contains("help:"),
+        "expected miette help section in generate error, got: {stderr}"
     );
 }
 
@@ -240,8 +240,8 @@ modules:
         "expected rule violation in generate, got: {stderr}"
     );
     assert!(
-        stderr.contains("Suggestion"),
-        "expected Suggestion section in generate, got: {stderr}"
+        stderr.contains("help:"),
+        "expected miette help section in generate, got: {stderr}"
     );
 }
 
