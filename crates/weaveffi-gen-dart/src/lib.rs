@@ -130,7 +130,11 @@ fn native_ffi_type(ty: &TypeRef) -> String {
                 n.to_upper_camel_case()
             )
         }
-        TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) => "Pointer<Void>".into(),
+        TypeRef::List(inner) | TypeRef::Iterator(inner) => match inner.as_ref() {
+            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => "Pointer<Pointer<Void>>".into(),
+            _ => "Pointer<Void>".into(),
+        },
+        TypeRef::Map(_, _) => "Pointer<Void>".into(),
     }
 }
 
@@ -153,17 +157,29 @@ fn dart_ffi_type(ty: &TypeRef) -> String {
                 n.to_upper_camel_case()
             )
         }
-        TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) => "Pointer<Void>".into(),
+        TypeRef::List(inner) | TypeRef::Iterator(inner) => match inner.as_ref() {
+            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => "Pointer<Pointer<Void>>".into(),
+            _ => "Pointer<Void>".into(),
+        },
+        TypeRef::Map(_, _) => "Pointer<Void>".into(),
     }
 }
 
 /// Native FFI type(s) for a parameter. `StringUtf8` and `Bytes`/`BorrowedBytes` expand to a
-/// (ptr, len) pair to match the C ABI `(const uint8_t* X_ptr, size_t X_len)`. `Callback`
-/// expands to a `(function_ptr, context_ptr)` pair.
+/// (ptr, len) pair to match the C ABI `(const uint8_t* X_ptr, size_t X_len)`, and
+/// `Optional<StringUtf8>` / `Optional<Bytes>` / `Optional<BorrowedBytes>` do the same with
+/// (nullptr, 0) encoding `None`. `Callback` expands to a `(function_ptr, context_ptr)` pair.
 fn native_ffi_param_types(ty: &TypeRef) -> Vec<String> {
     match ty {
-        TypeRef::StringUtf8 => vec!["Pointer<Uint8>".into(), "IntPtr".into()],
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+        TypeRef::StringUtf8 | TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            vec!["Pointer<Uint8>".into(), "IntPtr".into()]
+        }
+        TypeRef::Optional(inner)
+            if matches!(
+                inner.as_ref(),
+                TypeRef::StringUtf8 | TypeRef::Bytes | TypeRef::BorrowedBytes
+            ) =>
+        {
             vec!["Pointer<Uint8>".into(), "IntPtr".into()]
         }
         TypeRef::Callback(_) => vec![native_ffi_type(ty), "Pointer<Void>".into()],
@@ -172,11 +188,20 @@ fn native_ffi_param_types(ty: &TypeRef) -> Vec<String> {
 }
 
 /// Dart-side FFI type(s) for a parameter. `StringUtf8` and `Bytes`/`BorrowedBytes` expand to a
-/// (ptr, len) pair. `Callback` expands to a `(function_ptr, context_ptr)` pair.
+/// (ptr, len) pair, and `Optional<StringUtf8>` / `Optional<Bytes>` / `Optional<BorrowedBytes>`
+/// do the same with (nullptr, 0) encoding `None`. `Callback` expands to a
+/// `(function_ptr, context_ptr)` pair.
 fn dart_ffi_param_types(ty: &TypeRef) -> Vec<String> {
     match ty {
-        TypeRef::StringUtf8 => vec!["Pointer<Uint8>".into(), "int".into()],
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+        TypeRef::StringUtf8 | TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            vec!["Pointer<Uint8>".into(), "int".into()]
+        }
+        TypeRef::Optional(inner)
+            if matches!(
+                inner.as_ref(),
+                TypeRef::StringUtf8 | TypeRef::Bytes | TypeRef::BorrowedBytes
+            ) =>
+        {
             vec!["Pointer<Uint8>".into(), "int".into()]
         }
         TypeRef::Callback(_) => vec![dart_ffi_type(ty), "Pointer<Void>".into()],
@@ -211,7 +236,6 @@ fn render_pubspec(package_name: &str) -> String {
          version: 0.1.0\n\
          environment:\n\
          \x20 sdk: '>=3.0.0 <4.0.0'\n\
-         \x20 flutter: '>=3.10.0'\n\
          dependencies:\n\
          \x20 ffi: ^2.1.0\n\
          dev_dependencies:\n\
@@ -778,10 +802,7 @@ fn render_function(out: &mut String, module_path: &str, f: &Function, c_prefix: 
         .iter()
         .flat_map(|p| dart_ffi_param_types(&p.ty))
         .collect();
-    if matches!(
-        f.returns.as_ref(),
-        Some(TypeRef::Bytes | TypeRef::BorrowedBytes)
-    ) {
+    if returns_out_len(f) {
         native_params.push("Pointer<IntPtr>".into());
         dart_params.push("Pointer<IntPtr>".into());
     }
@@ -876,10 +897,60 @@ fn render_function(out: &mut String, module_path: &str, f: &Function, c_prefix: 
     }
 }
 
+/// Return `true` when the C ABI signature ends with an extra `size_t* out_len`
+/// parameter right before `weaveffi_error* out_err`. That happens for byte-buffer
+/// returns (`Bytes`/`BorrowedBytes`) and for list-of-handle returns
+/// (`[Struct]`/`[TypedHandle]`), both of which materialise into Dart as
+/// `(Pointer<IntPtr>, Pointer<_WeaveffiError>)` trailing params.
+fn returns_out_len(f: &Function) -> bool {
+    match f.returns.as_ref() {
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => true,
+        Some(TypeRef::List(inner) | TypeRef::Iterator(inner)) => {
+            matches!(inner.as_ref(), TypeRef::Struct(_) | TypeRef::TypedHandle(_))
+        }
+        _ => false,
+    }
+}
+
+/// Emit allocation for an `Optional<StringUtf8|Bytes|BorrowedBytes>` parameter as a
+/// `(Pointer<Uint8>, int)` pair, using `(nullptr, 0)` to encode `None` so the callee sees
+/// the same `const uint8_t* X_ptr, size_t X_len` shape as the non-optional variant.
+fn emit_optional_bytes_alloc(out: &mut String, pname: &str, inner: &TypeRef) {
+    let buf = format!("{pname}Buf");
+    let len = format!("{pname}Len");
+    out.push_str(&format!("  final Pointer<Uint8> {buf};\n"));
+    out.push_str(&format!("  final int {len};\n"));
+    out.push_str(&format!("  if ({pname} == null) {{\n"));
+    out.push_str(&format!("    {buf} = nullptr;\n"));
+    out.push_str(&format!("    {len} = 0;\n"));
+    out.push_str("  } else {\n");
+    match inner {
+        TypeRef::StringUtf8 => {
+            let bytes = format!("{pname}Bytes");
+            out.push_str(&format!("    final {bytes} = utf8.encode({pname});\n"));
+            out.push_str(&format!("    {buf} = calloc<Uint8>({bytes}.length);\n"));
+            out.push_str(&format!(
+                "    {buf}.asTypedList({bytes}.length).setAll(0, {bytes});\n"
+            ));
+            out.push_str(&format!("    {len} = {bytes}.length;\n"));
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            out.push_str(&format!("    {buf} = calloc<Uint8>({pname}.length);\n"));
+            out.push_str(&format!(
+                "    {buf}.asTypedList({pname}.length).setAll(0, {pname});\n"
+            ));
+            out.push_str(&format!("    {len} = {pname}.length;\n"));
+        }
+        _ => unreachable!("emit_optional_bytes_alloc called with unsupported inner"),
+    }
+    out.push_str("  }\n");
+}
+
 fn emit_function_body(out: &mut String, f: &Function, c_sym: &str, c_prefix: &str) {
     out.push_str("  final err = calloc<_WeaveffiError>();\n");
 
     let mut allocations: Vec<String> = Vec::new();
+    let mut optional_allocations: Vec<String> = Vec::new();
     for p in &f.params {
         let pname = p.name.to_lower_camel_case();
         match &p.ty {
@@ -906,6 +977,15 @@ fn emit_function_body(out: &mut String, f: &Function, c_sym: &str, c_prefix: &st
                 ));
                 allocations.push(buf);
             }
+            TypeRef::Optional(inner)
+                if matches!(
+                    inner.as_ref(),
+                    TypeRef::StringUtf8 | TypeRef::Bytes | TypeRef::BorrowedBytes
+                ) =>
+            {
+                emit_optional_bytes_alloc(out, &pname, inner);
+                optional_allocations.push(format!("{pname}Buf"));
+            }
             TypeRef::Callback(name) => {
                 let td = name.to_upper_camel_case();
                 out.push_str(&format!(
@@ -916,11 +996,8 @@ fn emit_function_body(out: &mut String, f: &Function, c_sym: &str, c_prefix: &st
         }
     }
 
-    let returns_bytes = matches!(
-        f.returns.as_ref(),
-        Some(TypeRef::Bytes | TypeRef::BorrowedBytes)
-    );
-    if returns_bytes {
+    let needs_out_len = returns_out_len(f);
+    if needs_out_len {
         out.push_str("  final outLen = calloc<IntPtr>();\n");
     }
 
@@ -939,6 +1016,15 @@ fn emit_function_body(out: &mut String, f: &Function, c_sym: &str, c_prefix: &st
                 call_args.push(format!("{pname}Buf"));
                 call_args.push(format!("{pname}.length"));
             }
+            TypeRef::Optional(inner)
+                if matches!(
+                    inner.as_ref(),
+                    TypeRef::StringUtf8 | TypeRef::Bytes | TypeRef::BorrowedBytes
+                ) =>
+            {
+                call_args.push(format!("{pname}Buf"));
+                call_args.push(format!("{pname}Len"));
+            }
             TypeRef::Bool => call_args.push(format!("{pname} ? 1 : 0")),
             TypeRef::Enum(_) => call_args.push(format!("{pname}.value")),
             TypeRef::TypedHandle(_) | TypeRef::Struct(_) => {
@@ -951,7 +1037,7 @@ fn emit_function_body(out: &mut String, f: &Function, c_sym: &str, c_prefix: &st
             _ => call_args.push(pname),
         }
     }
-    if returns_bytes {
+    if needs_out_len {
         call_args.push("outLen".into());
     }
     call_args.push("err".into());
@@ -973,7 +1059,12 @@ fn emit_function_body(out: &mut String, f: &Function, c_sym: &str, c_prefix: &st
     for alloc in &allocations {
         out.push_str(&format!("    calloc.free({alloc});\n"));
     }
-    if returns_bytes {
+    for alloc in &optional_allocations {
+        out.push_str(&format!(
+            "    if ({alloc} != nullptr) calloc.free({alloc});\n"
+        ));
+    }
+    if needs_out_len {
         out.push_str("    calloc.free(outLen);\n");
     }
     out.push_str("    calloc.free(err);\n");
@@ -1042,10 +1133,36 @@ fn emit_result_conversion(out: &mut String, ty: &TypeRef, indent: &str, c_prefix
                 out.push_str(&format!("{indent}return result;\n"));
             }
         },
+        TypeRef::List(inner) | TypeRef::Iterator(inner) => match inner.as_ref() {
+            TypeRef::Struct(name) => {
+                let n = local_type_name(name).to_upper_camel_case();
+                emit_list_of_handles_conversion(out, indent, &n);
+            }
+            TypeRef::TypedHandle(name) => {
+                let n = name.to_upper_camel_case();
+                emit_list_of_handles_conversion(out, indent, &n);
+            }
+            _ => {
+                out.push_str(&format!("{indent}return result;\n"));
+            }
+        },
         _ => {
             out.push_str(&format!("{indent}return result;\n"));
         }
     }
+}
+
+/// Emit the Dart loop that materialises a C `T**`/`size_t* out_len` pair returned from
+/// `weaveffi_{module}_{fn}` into a `List<{dart_class}>`, wrapping each handle in
+/// `{dart_class}._(ptr)` so the returned Dart objects participate in the same
+/// `dispose()`/`Finalizer` lifecycle as direct `{dart_class}` returns.
+fn emit_list_of_handles_conversion(out: &mut String, indent: &str, dart_class: &str) {
+    out.push_str(&format!("{indent}final len = outLen.value;\n"));
+    out.push_str(&format!("{indent}final list = <{dart_class}>[];\n"));
+    out.push_str(&format!("{indent}for (var i = 0; i < len; i++) {{\n"));
+    out.push_str(&format!("{indent}  list.add({dart_class}._(result[i]));\n"));
+    out.push_str(&format!("{indent}}}\n"));
+    out.push_str(&format!("{indent}return list;\n"));
 }
 
 #[cfg(test)]
@@ -1179,6 +1296,41 @@ mod tests {
         assert_eq!(
             native_ffi_type(&TypeRef::TypedHandle("S".into())),
             "Pointer<Void>"
+        );
+        assert_eq!(
+            native_ffi_type(&TypeRef::List(Box::new(TypeRef::Struct("X".into())))),
+            "Pointer<Pointer<Void>>",
+            "List<Struct> returns are a C `T**` array"
+        );
+        assert_eq!(
+            native_ffi_type(&TypeRef::List(Box::new(TypeRef::TypedHandle("S".into())))),
+            "Pointer<Pointer<Void>>",
+            "List<TypedHandle> returns are a C `T**` array"
+        );
+    }
+
+    #[test]
+    fn optional_string_param_expands_to_ptr_len_pair() {
+        assert_eq!(
+            native_ffi_param_types(&TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
+            vec!["Pointer<Uint8>".to_string(), "IntPtr".to_string()],
+            "Optional<StringUtf8> must marshal to `(const uint8_t*, size_t)` with (nullptr, 0) = None"
+        );
+        assert_eq!(
+            dart_ffi_param_types(&TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
+            vec!["Pointer<Uint8>".to_string(), "int".to_string()],
+        );
+    }
+
+    #[test]
+    fn optional_bytes_param_expands_to_ptr_len_pair() {
+        assert_eq!(
+            native_ffi_param_types(&TypeRef::Optional(Box::new(TypeRef::Bytes))),
+            vec!["Pointer<Uint8>".to_string(), "IntPtr".to_string()],
+        );
+        assert_eq!(
+            native_ffi_param_types(&TypeRef::Optional(Box::new(TypeRef::BorrowedBytes))),
+            vec!["Pointer<Uint8>".to_string(), "IntPtr".to_string()],
         );
     }
 
@@ -2291,6 +2443,42 @@ mod tests {
         assert!(
             dart.contains("int countContacts()"),
             "missing countContacts: {dart}"
+        );
+
+        // createContact accepts a nullable Dart `String?` but must marshal it to the
+        // C ABI's (const uint8_t*, size_t) pair with (nullptr, 0) representing `None`.
+        assert!(
+            dart.contains("String? email"),
+            "createContact must accept String? email: {dart}"
+        );
+        assert!(
+            dart.contains("if (email == null) {\n    emailBuf = nullptr;"),
+            "Optional<String> param must marshal null as nullptr: {dart}"
+        );
+        assert!(
+            dart.contains("emailBuf, emailLen, contactType.value, err"),
+            "createContact must pass (emailBuf, emailLen) pair: {dart}"
+        );
+        assert!(
+            dart.contains("if (emailBuf != nullptr) calloc.free(emailBuf);"),
+            "Optional<String> buf must only be freed when allocated: {dart}"
+        );
+
+        // listContacts must return a List<Contact> by iterating the T** / out_len
+        // pair returned by weaveffi_contacts_list_contacts.
+        assert!(
+            dart.contains(
+                "typedef _NativeWeaveffiContactsListContacts = Pointer<Pointer<Void>> Function(Pointer<IntPtr>, Pointer<_WeaveffiError>);"
+            ),
+            "listContacts native typedef must take (out_len, err) and return T**: {dart}"
+        );
+        assert!(
+            dart.contains("final outLen = calloc<IntPtr>();"),
+            "listContacts must allocate out_len: {dart}"
+        );
+        assert!(
+            dart.contains("list.add(Contact._(result[i]));"),
+            "listContacts must wrap each handle in Contact._: {dart}"
         );
     }
 
@@ -3454,8 +3642,9 @@ mod tests {
             "pubspec should pin a modern Dart SDK range: {pubspec}"
         );
         assert!(
-            pubspec.contains("flutter: '>=3.10.0'"),
-            "pubspec should declare an optional Flutter SDK floor: {pubspec}"
+            !pubspec.contains("flutter:"),
+            "pubspec should not require Flutter so pure-Dart consumers can \
+             `dart pub get`: {pubspec}"
         );
         assert!(
             pubspec.contains("ffi: ^2.1.0"),
