@@ -313,3 +313,109 @@ weaveffi generate api.yml -o generated --force
 The legacy single-file `.weaveffi-cache` written by older CLIs is
 ignored on first run and replaced with the new per-generator directory
 layout automatically.
+
+## Continuous integration
+
+Two CLI flags are designed for automated pipelines: `weaveffi diff
+--check` enforces that committed bindings stay in sync with the IDL,
+and `weaveffi validate|lint --format json` produces machine-readable
+output that scripts and quality dashboards can consume directly.
+
+### `weaveffi diff --check`
+
+Runs the generator into a temporary directory, compares against the
+committed `--out` directory, and exits non-zero if anything would
+change. Only a one-line summary is printed; per-file diffs are
+suppressed so the log stays small.
+
+Exit codes:
+
+| Code | Meaning |
+|------|---------|
+| `0` | The committed output matches the IDL exactly. |
+| `2` | One or more files would change in place. |
+| `3` | One or more files would be added or removed. |
+
+```bash
+weaveffi diff api.yml --out generated --check
+# Example output:
+# + 0 added, - 0 removed, ~ 3 modified
+```
+
+A typical "guard" job looks like:
+
+```yaml
+# .github/workflows/ci.yml
+- name: Verify generated bindings are up to date
+  run: weaveffi diff api.yml --out generated --check
+```
+
+If the command fails, the contributor must run `weaveffi generate
+api.yml -o generated` locally and commit the regenerated files.
+
+### `weaveffi validate --format json`
+
+Emits a single JSON object on stdout. On success:
+
+```json
+{ "ok": true, "modules": 2, "functions": 8, "structs": 3, "enums": 1 }
+```
+
+On failure, the object lists the structured error so a quality gate
+can surface the offending identifier without parsing the human-readable
+diagnostic:
+
+```json
+{
+  "ok": false,
+  "errors": [
+    {
+      "code": "DuplicateFunctionName",
+      "module": "math",
+      "function": "add",
+      "message": "duplicate function name in module 'math': add",
+      "suggestion": "function names must be unique within a module; rename the duplicate"
+    }
+  ]
+}
+```
+
+Pair `--format json` with the global `--quiet` flag to ensure no
+stray header lines end up on stdout or stderr — useful when piping
+the output straight into `jq` or a CI report parser:
+
+```bash
+weaveffi --quiet validate api.yml --format json | jq '.ok'
+```
+
+The exit code is `0` on success and non-zero on failure, so existing
+shell idioms (`set -e`, `if !`) keep working unchanged.
+
+### `weaveffi lint --format json`
+
+Returns the warning list as a stable JSON document. Every warning has
+the same three fields (`code`, `location`, `message`), regardless of
+the underlying lint:
+
+```json
+{
+  "ok": false,
+  "warnings": [
+    {
+      "code": "DeepNesting",
+      "location": "math::compute::matrix",
+      "message": "deep type nesting at math::compute::matrix (depth 4, max recommended 3)"
+    }
+  ]
+}
+```
+
+`ok` is `true` when the warnings array is empty and `false` otherwise,
+mirroring the process exit code (`0` clean, `1` warnings present). A
+common CI recipe is to fail on regressions but still surface the full
+warning list as build metadata:
+
+```bash
+weaveffi --quiet lint api.yml --format json > lint-report.json || \
+  (cat lint-report.json && exit 1)
+```
