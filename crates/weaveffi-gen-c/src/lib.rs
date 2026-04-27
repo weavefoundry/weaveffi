@@ -10,7 +10,7 @@ use camino::Utf8Path;
 use heck::ToUpperCamelCase;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
-use weaveffi_core::utils::c_abi_struct_name;
+use weaveffi_core::utils::{c_abi_struct_name, render_abi_prefix_aliases};
 use weaveffi_ir::ir::{Api, EnumDef, Module, Param, StructDef, TypeRef};
 
 pub struct CGenerator;
@@ -286,6 +286,7 @@ fn render_c_header(api: &Api, prefix: &str) -> String {
     out.push_str("#include <stdint.h>\n");
     out.push_str("#include <stddef.h>\n");
     out.push_str("#include <stdbool.h>\n\n");
+    out.push_str(&render_abi_prefix_aliases(prefix));
     out.push_str("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n");
     out.push_str(&format!("typedef uint64_t {prefix}_handle_t;\n\n"));
     out.push_str(&format!(
@@ -1453,8 +1454,16 @@ mod tests {
             "should use custom prefix for function names"
         );
         assert!(
-            !header.contains("weaveffi_"),
-            "should not contain default prefix"
+            !header.contains("weaveffi_calculator_add"),
+            "should not emit default prefix for user-defined symbols: {header}"
+        );
+        assert!(
+            header.contains("#define mylib_error weaveffi_error"),
+            "should alias runtime error type to weaveffi_error: {header}"
+        );
+        assert!(
+            header.contains("#define mylib_free_string weaveffi_free_string"),
+            "should alias runtime free_string to weaveffi_free_string: {header}"
         );
 
         let files = CGenerator.output_files_with_config(&api, out_dir, &config);

@@ -319,7 +319,7 @@ fn cmd_new(name: &str, quiet: bool) -> Result<()> {
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to create {}", src_dir))?;
     let lib_rs_path = src_dir.join("lib.rs");
-    let lib_contents = scaffold::render_scaffold(&api);
+    let lib_contents = scaffold::render_scaffold(&api, "weaveffi");
     std::fs::write(lib_rs_path.as_std_path(), &lib_contents)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to write {}", lib_rs_path))?;
@@ -620,7 +620,7 @@ fn cmd_generate(
 
     if emit_scaffold {
         let scaffold_path = out_dir.join("scaffold.rs");
-        let contents = scaffold::render_scaffold(&api);
+        let contents = scaffold::render_scaffold(&api, config.c_prefix());
         std::fs::write(scaffold_path.as_std_path(), contents)
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to write {}", scaffold_path))?;

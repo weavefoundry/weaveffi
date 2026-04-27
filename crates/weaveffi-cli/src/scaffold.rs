@@ -14,7 +14,7 @@ fn is_pointer_type(ty: &TypeRef) -> bool {
     )
 }
 
-fn rust_scalar_type(ty: &TypeRef, module: &str) -> String {
+fn rust_scalar_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
     match ty {
         TypeRef::I32 => "i32".into(),
         TypeRef::U32 => "u32".into(),
@@ -25,16 +25,16 @@ fn rust_scalar_type(ty: &TypeRef, module: &str) -> String {
         TypeRef::Bytes | TypeRef::BorrowedBytes => "u8".into(),
         TypeRef::Handle => "u64".into(),
         TypeRef::TypedHandle(name) => name.clone(),
-        TypeRef::Struct(s) => format!("weaveffi_{module}_{s}"),
+        TypeRef::Struct(s) => format!("{prefix}_{module}_{s}"),
         TypeRef::Enum(_) => "i32".into(),
         TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
-            rust_scalar_type(inner, module)
+            rust_scalar_type(inner, module, prefix)
         }
         TypeRef::Map(_, _) => "u8".into(),
     }
 }
 
-fn rust_param_fragments(name: &str, ty: &TypeRef, module: &str) -> Vec<String> {
+fn rust_param_fragments(name: &str, ty: &TypeRef, module: &str, prefix: &str) -> Vec<String> {
     match ty {
         TypeRef::I32 => vec![format!("{name}: i32")],
         TypeRef::U32 => vec![format!("{name}: u32")],
@@ -49,18 +49,18 @@ fn rust_param_fragments(name: &str, ty: &TypeRef, module: &str) -> Vec<String> {
         }
         TypeRef::Handle => vec![format!("{name}: u64")],
         TypeRef::TypedHandle(th) => vec![format!("{name}: *mut {th}")],
-        TypeRef::Struct(s) => vec![format!("{name}: *const weaveffi_{module}_{s}")],
+        TypeRef::Struct(s) => vec![format!("{name}: *const {prefix}_{module}_{s}")],
         TypeRef::Enum(_) => vec![format!("{name}: i32")],
         TypeRef::Optional(inner) => {
             if is_pointer_type(inner) {
-                rust_param_fragments(name, inner, module)
+                rust_param_fragments(name, inner, module, prefix)
             } else {
-                let scalar = rust_scalar_type(inner, module);
+                let scalar = rust_scalar_type(inner, module, prefix);
                 vec![format!("{name}: *const {scalar}")]
             }
         }
         TypeRef::List(inner) => {
-            let elem = rust_scalar_type(inner, module);
+            let elem = rust_scalar_type(inner, module, prefix);
             if is_pointer_type(inner) {
                 vec![
                     format!("{name}: *const *const {elem}"),
@@ -74,8 +74,8 @@ fn rust_param_fragments(name: &str, ty: &TypeRef, module: &str) -> Vec<String> {
             }
         }
         TypeRef::Map(key_ty, val_ty) => {
-            let k = rust_scalar_type(key_ty, module);
-            let v = rust_scalar_type(val_ty, module);
+            let k = rust_scalar_type(key_ty, module, prefix);
+            let v = rust_scalar_type(val_ty, module, prefix);
             let key_frag = if is_pointer_type(key_ty) {
                 format!("{name}_keys: *const *const {k}")
             } else {
@@ -92,7 +92,7 @@ fn rust_param_fragments(name: &str, ty: &TypeRef, module: &str) -> Vec<String> {
     }
 }
 
-fn rust_return_type(ty: &TypeRef, module: &str) -> (String, bool) {
+fn rust_return_type(ty: &TypeRef, module: &str, prefix: &str) -> (String, bool) {
     match ty {
         TypeRef::I32 => ("i32".into(), false),
         TypeRef::U32 => ("u32".into(), false),
@@ -103,18 +103,18 @@ fn rust_return_type(ty: &TypeRef, module: &str) -> (String, bool) {
         TypeRef::Bytes | TypeRef::BorrowedBytes => ("*mut u8".into(), true),
         TypeRef::Handle => ("u64".into(), false),
         TypeRef::TypedHandle(name) => (format!("*mut {name}"), false),
-        TypeRef::Struct(s) => (format!("*mut weaveffi_{module}_{s}"), false),
+        TypeRef::Struct(s) => (format!("*mut {prefix}_{module}_{s}"), false),
         TypeRef::Enum(_) => ("i32".into(), false),
         TypeRef::Optional(inner) => {
             if is_pointer_type(inner) {
-                rust_return_type(inner, module)
+                rust_return_type(inner, module, prefix)
             } else {
-                let scalar = rust_scalar_type(inner, module);
+                let scalar = rust_scalar_type(inner, module, prefix);
                 (format!("*mut {scalar}"), false)
             }
         }
         TypeRef::List(inner) => {
-            let elem = rust_scalar_type(inner, module);
+            let elem = rust_scalar_type(inner, module, prefix);
             if is_pointer_type(inner) {
                 (format!("*mut *mut {elem}"), true)
             } else {
@@ -126,7 +126,7 @@ fn rust_return_type(ty: &TypeRef, module: &str) -> (String, bool) {
     }
 }
 
-pub fn render_scaffold(api: &Api) -> String {
+pub fn render_scaffold(api: &Api, c_prefix: &str) -> String {
     let mut out = String::new();
     out.push_str("#![allow(unsafe_code)]\n");
     out.push_str("#![allow(clippy::not_unsafe_ptr_arg_deref)]\n\n");
@@ -134,7 +134,7 @@ pub fn render_scaffold(api: &Api) -> String {
     out.push_str("use weaveffi_abi::*;\n\n");
 
     for m in &api.modules {
-        render_module(&mut out, m);
+        render_module(&mut out, m, c_prefix);
     }
 
     out.push_str("#[no_mangle]\n");
@@ -155,24 +155,31 @@ pub fn render_scaffold(api: &Api) -> String {
     out
 }
 
-fn render_module(out: &mut String, module: &Module) {
+fn render_module(out: &mut String, module: &Module, prefix: &str) {
     let mod_name = &module.name;
 
     for s in &module.structs {
-        render_struct_scaffold(out, mod_name, s);
+        render_struct_scaffold(out, mod_name, s, prefix);
     }
 
     for f in &module.functions {
-        let fn_name = format!("weaveffi_{mod_name}_{}", f.name);
+        let fn_name = format!("{prefix}_{mod_name}_{}", f.name);
         let mut params = Vec::new();
         for p in &f.params {
-            params.extend(rust_param_fragments(&p.name, &p.ty, mod_name));
+            params.extend(rust_param_fragments(&p.name, &p.ty, mod_name, prefix));
         }
 
         if f.r#async {
-            render_async_function(out, &fn_name, &params, f.returns.as_ref(), mod_name);
+            render_async_function(out, &fn_name, &params, f.returns.as_ref(), mod_name, prefix);
         } else {
-            render_sync_function(out, &fn_name, &mut params, f.returns.as_ref(), mod_name);
+            render_sync_function(
+                out,
+                &fn_name,
+                &mut params,
+                f.returns.as_ref(),
+                mod_name,
+                prefix,
+            );
         }
     }
 }
@@ -183,11 +190,12 @@ fn render_sync_function(
     params: &mut Vec<String>,
     returns: Option<&TypeRef>,
     mod_name: &str,
+    prefix: &str,
 ) {
     let ret_sig = if let Some(ret) = returns {
         if let TypeRef::Map(key_ty, val_ty) = ret {
-            let k = rust_scalar_type(key_ty, mod_name);
-            let v = rust_scalar_type(val_ty, mod_name);
+            let k = rust_scalar_type(key_ty, mod_name, prefix);
+            let v = rust_scalar_type(val_ty, mod_name, prefix);
             if is_pointer_type(key_ty) {
                 params.push(format!("out_keys: *mut *mut {k}"));
             } else {
@@ -201,7 +209,7 @@ fn render_sync_function(
             params.push("out_map_len: *mut usize".into());
             String::new()
         } else {
-            let (ret_ty, needs_len) = rust_return_type(ret, mod_name);
+            let (ret_ty, needs_len) = rust_return_type(ret, mod_name, prefix);
             if needs_len {
                 params.push("out_len: *mut usize".into());
             }
@@ -227,12 +235,13 @@ fn render_async_function(
     params: &[String],
     returns: Option<&TypeRef>,
     mod_name: &str,
+    prefix: &str,
 ) {
     let mut cb_params = Vec::new();
     if let Some(ret) = returns {
         if let TypeRef::Map(key_ty, val_ty) = ret {
-            let k = rust_scalar_type(key_ty, mod_name);
-            let v = rust_scalar_type(val_ty, mod_name);
+            let k = rust_scalar_type(key_ty, mod_name, prefix);
+            let v = rust_scalar_type(val_ty, mod_name, prefix);
             cb_params.push(if is_pointer_type(key_ty) {
                 format!("*mut *mut {k}")
             } else {
@@ -245,7 +254,7 @@ fn render_async_function(
             });
             cb_params.push("usize".into());
         } else {
-            let (ret_ty, needs_len) = rust_return_type(ret, mod_name);
+            let (ret_ty, needs_len) = rust_return_type(ret, mod_name, prefix);
             cb_params.push(ret_ty);
             if needs_len {
                 cb_params.push("usize".into());
@@ -274,22 +283,22 @@ fn render_async_function(
     out.push_str("}\n\n");
 }
 
-fn render_struct_scaffold(out: &mut String, module: &str, s: &StructDef) {
-    let prefix = format!("weaveffi_{module}_{}", s.name);
+fn render_struct_scaffold(out: &mut String, module: &str, s: &StructDef, prefix: &str) {
+    let tag = format!("{prefix}_{module}_{}", s.name);
 
     out.push_str("#[repr(C)]\n");
-    out.push_str(&format!("pub struct {prefix} {{\n"));
+    out.push_str(&format!("pub struct {tag} {{\n"));
     out.push_str("    // TODO: add fields\n");
     out.push_str("}\n\n");
 
     let mut params = Vec::new();
     for f in &s.fields {
-        params.extend(rust_param_fragments(&f.name, &f.ty, module));
+        params.extend(rust_param_fragments(&f.name, &f.ty, module, prefix));
     }
     params.push("out_err: *mut weaveffi_error".into());
     out.push_str("#[no_mangle]\n");
     out.push_str(&format!(
-        "pub extern \"C\" fn {prefix}_create({}) -> *mut {prefix} {{\n",
+        "pub extern \"C\" fn {tag}_create({}) -> *mut {tag} {{\n",
         params.join(", ")
     ));
     out.push_str("    todo!()\n");
@@ -297,15 +306,15 @@ fn render_struct_scaffold(out: &mut String, module: &str, s: &StructDef) {
 
     out.push_str("#[no_mangle]\n");
     out.push_str(&format!(
-        "pub extern \"C\" fn {prefix}_destroy(ptr: *mut {prefix}) {{\n"
+        "pub extern \"C\" fn {tag}_destroy(ptr: *mut {tag}) {{\n"
     ));
     out.push_str("    todo!()\n");
     out.push_str("}\n\n");
 
     for field in &s.fields {
-        let (ret_ty, needs_len) = rust_return_type(&field.ty, module);
-        let getter = format!("{prefix}_get_{}", field.name);
-        let mut getter_params = vec![format!("ptr: *const {prefix}")];
+        let (ret_ty, needs_len) = rust_return_type(&field.ty, module, prefix);
+        let getter = format!("{tag}_get_{}", field.name);
+        let mut getter_params = vec![format!("ptr: *const {tag}")];
         if needs_len {
             getter_params.push("out_len: *mut usize".into());
         }
@@ -344,27 +353,88 @@ mod tests {
     #[test]
     fn scaffold_has_allow_unsafe() {
         let api = minimal_api(vec![], vec![]);
-        let out = render_scaffold(&api);
+        let out = render_scaffold(&api, "weaveffi");
         assert!(out.contains("#![allow(unsafe_code)]"));
     }
 
     #[test]
     fn scaffold_imports_abi() {
         let api = minimal_api(vec![], vec![]);
-        let out = render_scaffold(&api);
+        let out = render_scaffold(&api, "weaveffi");
         assert!(out.contains("use weaveffi_abi::*;"));
     }
 
     #[test]
     fn scaffold_includes_runtime_exports() {
         let api = minimal_api(vec![], vec![]);
-        let out = render_scaffold(&api);
+        let out = render_scaffold(&api, "weaveffi");
         assert!(out.contains("fn weaveffi_free_string("));
         assert!(out.contains("fn weaveffi_free_bytes("));
         assert!(out.contains("fn weaveffi_error_clear("));
         assert!(
             out.contains("free_string(ptr);"),
             "runtime exports should delegate to abi"
+        );
+    }
+
+    #[test]
+    fn scaffold_custom_prefix_renames_user_symbols() {
+        let api = minimal_api(
+            vec![Function {
+                name: "add".into(),
+                params: vec![Param {
+                    name: "a".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: None,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            vec![StructDef {
+                name: "Point".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "x".into(),
+                    ty: TypeRef::F64,
+                    doc: None,
+                    default: None,
+                }],
+                builder: false,
+            }],
+        );
+        let out = render_scaffold(&api, "myffi");
+        assert!(
+            out.contains("pub extern \"C\" fn myffi_calc_add("),
+            "user fn should adopt custom prefix: {out}"
+        );
+        assert!(
+            out.contains("pub struct myffi_calc_Point"),
+            "user struct should adopt custom prefix: {out}"
+        );
+        assert!(
+            out.contains("pub extern \"C\" fn myffi_calc_Point_create("),
+            "struct create stub should adopt custom prefix: {out}"
+        );
+        assert!(
+            !out.contains("weaveffi_calc_add"),
+            "user fn should not retain default prefix: {out}"
+        );
+        assert!(
+            !out.contains("weaveffi_calc_Point"),
+            "user struct should not retain default prefix: {out}"
+        );
+        assert!(
+            out.contains("pub extern \"C\" fn weaveffi_free_string("),
+            "runtime free_string export must keep weaveffi_ name: {out}"
+        );
+        assert!(
+            out.contains("pub extern \"C\" fn weaveffi_error_clear("),
+            "runtime error_clear export must keep weaveffi_ name: {out}"
         );
     }
 
@@ -396,7 +466,7 @@ mod tests {
             }],
             vec![],
         );
-        let out = render_scaffold(&api);
+        let out = render_scaffold(&api, "weaveffi");
         assert!(
             out.contains(
                 "pub extern \"C\" fn weaveffi_calc_add(a: i32, b: i32, out_err: *mut weaveffi_error) -> i32 {"
@@ -426,7 +496,7 @@ mod tests {
             }],
             vec![],
         );
-        let out = render_scaffold(&api);
+        let out = render_scaffold(&api, "weaveffi");
         assert!(
             out.contains(
                 "pub extern \"C\" fn weaveffi_calc_echo(s_ptr: *const u8, s_len: usize, out_err: *mut weaveffi_error) -> *const c_char {"
@@ -450,7 +520,7 @@ mod tests {
             }],
             vec![],
         );
-        let out = render_scaffold(&api);
+        let out = render_scaffold(&api, "weaveffi");
         assert!(
             out.contains("out_len: *mut usize"),
             "bytes return should add out_len param: {out}"
@@ -476,7 +546,7 @@ mod tests {
             }],
             vec![],
         );
-        let out = render_scaffold(&api);
+        let out = render_scaffold(&api, "weaveffi");
         assert!(
             out.contains("pub extern \"C\" fn weaveffi_calc_reset(out_err: *mut weaveffi_error) {"),
             "missing void function: {out}"
@@ -507,7 +577,7 @@ mod tests {
                 builder: false,
             }],
         );
-        let out = render_scaffold(&api);
+        let out = render_scaffold(&api, "weaveffi");
         assert!(out.contains("#[repr(C)]"), "struct should be repr(C)");
         assert!(
             out.contains("pub struct weaveffi_calc_Point"),
@@ -547,7 +617,7 @@ mod tests {
                 builder: false,
             }],
         );
-        let out = render_scaffold(&api);
+        let out = render_scaffold(&api, "weaveffi");
         assert!(
             out.contains("fn weaveffi_calc_Contact_get_name(ptr: *const weaveffi_calc_Contact) -> *const c_char"),
             "string getter should return *const c_char: {out}"
@@ -574,7 +644,7 @@ mod tests {
             }],
             vec![],
         );
-        let out = render_scaffold(&api);
+        let out = render_scaffold(&api, "weaveffi");
         assert!(
             out.contains("id: *const i32"),
             "optional i32 param should be pointer: {out}"
@@ -601,7 +671,7 @@ mod tests {
             }],
             vec![],
         );
-        let out = render_scaffold(&api);
+        let out = render_scaffold(&api, "weaveffi");
         assert!(
             out.contains("items: *const i32, items_len: usize"),
             "list param should be ptr+len: {out}"
@@ -628,7 +698,7 @@ mod tests {
             }],
             vec![],
         );
-        let out = render_scaffold(&api);
+        let out = render_scaffold(&api, "weaveffi");
         assert!(
             out.contains("color: i32"),
             "enum param should be i32: {out}"
@@ -651,7 +721,7 @@ mod tests {
             }],
             vec![],
         );
-        let out = render_scaffold(&api);
+        let out = render_scaffold(&api, "weaveffi");
         let no_mangle_count = out.matches("#[no_mangle]").count();
         let extern_count = out.matches("pub extern \"C\"").count();
         assert_eq!(
@@ -675,7 +745,7 @@ mod tests {
             }],
             vec![],
         );
-        let out = render_scaffold(&api);
+        let out = render_scaffold(&api, "weaveffi");
         assert!(out.contains("-> u64"), "handle return should be u64: {out}");
     }
 
@@ -702,7 +772,7 @@ mod tests {
             }],
             vec![],
         );
-        let out = render_scaffold(&api);
+        let out = render_scaffold(&api, "weaveffi");
         assert!(
             out.contains("grades_keys: *const *const c_char"),
             "map param should have keys array: {out}"
@@ -749,7 +819,7 @@ mod tests {
             }],
             vec![],
         );
-        let out = render_scaffold(&api);
+        let out = render_scaffold(&api, "weaveffi");
         assert!(
             out.contains("contact: *mut Contact"),
             "TypedHandle param should be *mut Contact: {out}"
@@ -780,7 +850,7 @@ mod tests {
             }],
             vec![],
         );
-        let out = render_scaffold(&api);
+        let out = render_scaffold(&api, "weaveffi");
         assert!(
             out.contains("pub type weaveffi_calc_fetch_callback = extern \"C\" fn("),
             "missing callback type alias: {out}"
@@ -822,7 +892,7 @@ mod tests {
             }],
             vec![],
         );
-        let out = render_scaffold(&api);
+        let out = render_scaffold(&api, "weaveffi");
         assert!(
             out.contains(
                 "pub type weaveffi_calc_sync_data_callback = extern \"C\" fn(*mut weaveffi_error, *mut std::ffi::c_void);"
@@ -881,7 +951,7 @@ mod tests {
             ],
             generators: None,
         };
-        let out = render_scaffold(&api);
+        let out = render_scaffold(&api, "weaveffi");
         assert!(out.contains("weaveffi_math_add"), "missing math module");
         assert!(out.contains("weaveffi_io_read"), "missing io module");
     }
