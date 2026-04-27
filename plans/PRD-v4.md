@@ -601,25 +601,25 @@ A real-world sample demonstrating non-trivial state and async I/O.
 
 - [x] Create `examples/dart/contacts/` with `bin/main.dart`, `pubspec.yaml`, `README.md`. The `main.dart` imports the generated `package:weaveffi/weaveffi.dart`, runs through the contacts CRUD demo, demonstrates `dispose()` (the Dart equivalent of RAII). The README shows how to run with `dart pub get && dart run`. Run `cargo test --workspace` to verify nothing is broken.
 
-- [ ] Create `examples/dart/sqlite-contacts/` showing async/await with the SQLite sample. Run `cargo test --workspace` to verify nothing is broken.
+- [x] Create `examples/dart/sqlite-contacts/` showing async/await with the SQLite sample. Run `cargo test --workspace` to verify nothing is broken.
 
-- [ ] (Optional) Create `examples/dart/flutter-contacts/` — a minimal Flutter app that uses the bindings to render a contacts list. Mark as optional in CI (only build if Flutter SDK available). Run `cargo test --workspace` to verify nothing is broken.
+- [x] (Optional) Create `examples/dart/flutter-contacts/` — a minimal Flutter app that uses the bindings to render a contacts list. Mark as optional in CI (only build if Flutter SDK available). Run `cargo test --workspace` to verify nothing is broken.
 
 ### Phase 49 — Examples for Go target
 
-- [ ] Create `examples/go/contacts/` with `main.go`, `go.mod`, `README.md`. The `main.go` imports the generated module (`replace` directive points at `../../generated/go`), runs the CRUD demo, demonstrates explicit `Close()` per struct. README shows how to set `CGO_LDFLAGS` to point at the cdylib build directory. Run `cargo test --workspace` to verify nothing is broken.
+- [x] Create `examples/go/contacts/` with `main.go`, `go.mod`, `README.md`. The `main.go` imports the generated module (`replace` directive points at `../../generated/go`), runs the CRUD demo, demonstrates explicit `Close()` per struct. README shows how to set `CGO_LDFLAGS` to point at the cdylib build directory. Run `cargo test --workspace` to verify nothing is broken.
 
-- [ ] Create `examples/go/sqlite-contacts/` showing channel-based async + iterator consumption (`for contact := range list_contacts() { ... }`). Run `cargo test --workspace` to verify nothing is broken.
+- [x] Create `examples/go/sqlite-contacts/` showing channel-based async + iterator consumption (`for contact := range list_contacts() { ... }`). Run `cargo test --workspace` to verify nothing is broken.
 
 ### Phase 50 — Examples for Ruby target
 
-- [ ] Create `examples/ruby/contacts/` with `Gemfile`, `bin/contacts.rb`, `README.md`. The script requires the generated gem, runs the CRUD demo, demonstrates Ruby's `FFI::AutoPointer` cleanup. README shows how to set `LD_LIBRARY_PATH` and run with `bundle exec`. Run `cargo test --workspace` to verify nothing is broken.
+- [x] Create `examples/ruby/contacts/` with `Gemfile`, `bin/contacts.rb`, `README.md`. The script requires the generated gem, runs the CRUD demo, demonstrates Ruby's `FFI::AutoPointer` cleanup. README shows how to set `LD_LIBRARY_PATH` and run with `bundle exec`. Run `cargo test --workspace` to verify nothing is broken.
 
-- [ ] Create `examples/ruby/sqlite-contacts/` showing block-based async (`fetch_async(url) { |result| ... }`) and Enumerator-based iterator consumption. Run `cargo test --workspace` to verify nothing is broken.
+- [x] Create `examples/ruby/sqlite-contacts/` showing block-based async (`fetch_async(url) { |result| ... }`) and Enumerator-based iterator consumption. Run `cargo test --workspace` to verify nothing is broken.
 
 ### Phase 51 — Complete WASM examples
 
-- [ ] Replace the partial `examples/wasm/` with a complete browser example. `examples/wasm/browser/` contains `index.html`, `app.js` (imports the generated `weaveffi_wasm.js`, instantiates with a worker), `serve.sh` (a `python3 -m http.server 8080` wrapper), and `README.md`. The HTML has a small UI calling the calculator's `add` and `echo`. Demonstrate error handling. Add a build script that compiles the calculator cdylib for `wasm32-unknown-unknown` first. Run `cargo test --workspace` to verify nothing is broken.
+- [x] Replace the partial `examples/wasm/` with a complete browser example. `examples/wasm/browser/` contains `index.html`, `app.js` (imports the generated `weaveffi_wasm.js`, instantiates with a worker), `serve.sh` (a `python3 -m http.server 8080` wrapper), and `README.md`. The HTML has a small UI calling the calculator's `add` and `echo`. Demonstrate error handling. Add a build script that compiles the calculator cdylib for `wasm32-unknown-unknown` first. Run `cargo test --workspace` to verify nothing is broken.
 
 - [ ] Add `examples/wasm/node/` showing how to load the WASM module from Node 22+ (which has WebAssembly support without flags) and call functions. Include `package.json`, `index.mjs`, `README.md`. Run `cargo test --workspace` to verify nothing is broken.
 
