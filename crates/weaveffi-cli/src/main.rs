@@ -1283,7 +1283,10 @@ fn watch_loop(
 
 fn is_watched_event(event: &notify::Event, canonical_input: &std::path::Path) -> bool {
     use notify::EventKind;
-    if !matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+    if !matches!(
+        event.kind,
+        EventKind::Any | EventKind::Modify(_) | EventKind::Create(_)
+    ) {
         return false;
     }
     event.paths.iter().any(|p| {
