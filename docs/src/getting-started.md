@@ -34,17 +34,16 @@ cd my-project
 
 This creates a `my-project/` directory containing:
 
-- `weaveffi.yml` — an example API definition with `add`, `mul`, and `echo`
-  functions
+- `weaveffi.yml` — an example IDL with `add`, `mul`, and `echo` functions
 - `README.md` — quick-start notes
 
-## 3) Define your API
+## 3) Define your IDL
 
-Open `weaveffi.yml` and replace its contents with an API that has a struct and
+Open `weaveffi.yml` and replace its contents with an IDL that has a struct and
 a function:
 
 ```yaml
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: math
     structs:
@@ -265,3 +264,42 @@ add(3, 4) = 7
   and features.
 - Explore the [Generators](generators/README.md) section for target-specific
   details.
+
+## Checking a single target
+
+`weaveffi doctor` runs every toolchain check it knows about. To narrow it
+down to a single target, pass `--target {name}`:
+
+```bash
+weaveffi doctor --target dart
+weaveffi doctor --target cpp
+weaveffi doctor --target go
+weaveffi doctor --target ruby
+weaveffi doctor --target dotnet
+weaveffi doctor --target python
+weaveffi doctor --target swift
+weaveffi doctor --target android
+weaveffi doctor --target node
+weaveffi doctor --target wasm
+```
+
+Only checks whose `applies_to` set contains the chosen target (plus the
+required Rust toolchain, which always runs) are executed. When `--target`
+is set the command exits with a non-zero status if any of those checks
+failed, making it scriptable in CI:
+
+```bash
+if ! weaveffi doctor --target dart; then
+  echo "Dart toolchain not ready" >&2
+  exit 1
+fi
+```
+
+For machine-readable output (handy for piping into `jq` or aggregating
+results across CI matrices), use `--format json`:
+
+```bash
+weaveffi doctor --target ruby --format json | jq '.[] | select(.ok == false)'
+```
+
+Each entry has `id`, `name`, `ok`, `version`, `hint`, and `applies_to` fields.

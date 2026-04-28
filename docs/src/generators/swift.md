@@ -1,22 +1,41 @@
 # Swift
 
-The Swift generator emits a SwiftPM System Library (`CWeaveFFI`) that
-references the generated C header via a `module.modulemap`, and a thin
-Swift module (`WeaveFFI`) that wraps the C API with Swift types and
-`throws`-based error handling.
+## Overview
 
-## Generated artifacts
+The Swift target emits a SwiftPM System Library (`CWeaveFFI`) that
+references the generated C header via a `module.modulemap`, plus a thin
+Swift module (`WeaveFFI`) that wraps the C ABI in idiomatic Swift with
+`throws`-based error handling and Swift-native types.
 
-- `generated/swift/Package.swift`
-- `generated/swift/Sources/CWeaveFFI/module.modulemap` — C module map pointing at the generated header
-- `generated/swift/Sources/WeaveFFI/WeaveFFI.swift` — thin Swift wrapper
+## What gets generated
 
-## Generated code examples
+| File | Purpose |
+|------|---------|
+| `generated/swift/Package.swift` | SwiftPM manifest declaring `CWeaveFFI` (system library) and `WeaveFFI` (Swift wrapper) |
+| `generated/swift/Sources/CWeaveFFI/module.modulemap` | C module map pointing at the generated header |
+| `generated/swift/Sources/WeaveFFI/WeaveFFI.swift` | Swift wrapper: enums, struct classes, namespaced module functions |
 
-Given this IDL definition:
+## Type mapping
+
+| IDL type     | Swift type                  | Notes                            |
+|--------------|-----------------------------|----------------------------------|
+| `i32`        | `Int32`                     | Direct value                     |
+| `u32`        | `UInt32`                    | Direct value                     |
+| `i64`        | `Int64`                     | Direct value                     |
+| `f64`        | `Double`                    | Direct value                     |
+| `bool`       | `Bool`                      | Mapped to `Int32` 0/1 at the ABI |
+| `string`     | `String`                    | UTF-8 buffers + length           |
+| `bytes`      | `Data` / `[UInt8]`          | Pointer + length                 |
+| `handle`     | `UInt64`                    | Direct value                     |
+| `StructName` | `StructName` (class)        | Wraps `OpaquePointer`            |
+| `EnumName`   | `EnumName` (`enum`)         | Backed by `Int32`                |
+| `T?`         | `T?`                        | Optional pointer / sentinel      |
+| `[T]`        | `[T]`                       | Pointer + length                 |
+
+## Example IDL → generated code
 
 ```yaml
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: contacts
     enums:
@@ -55,10 +74,7 @@ modules:
           - { name: contact_type, type: ContactType }
 ```
 
-### Enums
-
-Enums map to Swift enums backed by `Int32`. Variant names are converted to
-lowerCamelCase:
+Enums become Swift enums with lowerCamelCase cases backed by `Int32`:
 
 ```swift
 public enum ContactType: Int32 {
@@ -68,24 +84,14 @@ public enum ContactType: Int32 {
 }
 ```
 
-### Structs (opaque wrapper classes)
-
-Structs are wrapped as Swift classes holding an `OpaquePointer` to the
-Rust-allocated data. The `deinit` calls the C ABI destroy function to free
-memory. Field access is through computed properties that call the C ABI
-getters:
+Structs are wrapper classes around an `OpaquePointer`. The `deinit` calls
+the C destructor; computed properties call the C getters:
 
 ```swift
 public class Contact {
     let ptr: OpaquePointer
-
-    init(ptr: OpaquePointer) {
-        self.ptr = ptr
-    }
-
-    deinit {
-        weaveffi_contacts_Contact_destroy(ptr)
-    }
+    init(ptr: OpaquePointer) { self.ptr = ptr }
+    deinit { weaveffi_contacts_Contact_destroy(ptr) }
 
     public var name: String {
         let raw = weaveffi_contacts_Contact_get_name(ptr)
@@ -93,84 +99,16 @@ public class Contact {
         defer { weaveffi_free_string(raw) }
         return String(cString: raw)
     }
-
-    public var email: String {
-        let raw = weaveffi_contacts_Contact_get_email(ptr)
-        guard let raw = raw else { return "" }
-        defer { weaveffi_free_string(raw) }
-        return String(cString: raw)
-    }
-
-    public var age: Int32 {
-        return weaveffi_contacts_Contact_get_age(ptr)
-    }
 }
 ```
 
-### Optional handling
-
-Optional types map to Swift optionals (`T?`). For value returns, the
-generator dereferences via `pointee`. For string optionals, it guards
-against nil and frees the string. For struct optionals, it wraps the
-pointer:
-
-```swift
-// Optional value return: -> Int32?
-return rv?.pointee
-
-// Optional string return: -> String?
-guard let rv = rv else { return nil }
-defer { weaveffi_free_string(rv) }
-return String(cString: rv)
-
-// Optional struct return: -> Contact?
-return rv.map { Contact(ptr: $0) }
-```
-
-Optional value parameters use `withOptionalPointer` to pass a nullable
-pointer to the C ABI:
-
-```swift
-@inline(__always)
-func withOptionalPointer<T, R>(to value: T?, _ body: (UnsafePointer<T>?) throws -> R) rethrows -> R {
-    guard let value = value else { return try body(nil) }
-    return try withUnsafePointer(to: value) { try body($0) }
-}
-```
-
-### Array/List handling
-
-List types map to Swift arrays (`[T]`). Parameters are passed using
-`withUnsafeBufferPointer` to provide pointer+length to the C ABI. Return
-values are converted from a C pointer+length pair:
-
-```swift
-// List parameter: [Int32]
-ids.withUnsafeBufferPointer { ids_buf in
-    let ids_ptr = ids_buf.baseAddress
-    let ids_len = ids_buf.count
-    // ... call C function with ids_ptr, ids_len ...
-}
-
-// List return: -> [Int32]
-var outLen: Int = 0
-let rv = weaveffi_batch_get_ids(&outLen, &err)
-try check(&err)
-guard let rv = rv else { return [] }
-return Array(UnsafeBufferPointer(start: rv, count: outLen))
-```
-
-### Functions
-
-Module functions are generated as static methods on an enum namespace.
-Every function takes a trailing `weaveffi_error*` and the Swift wrapper
-calls `try check(&err)` to convert errors to Swift exceptions:
+Module functions live as static methods on a namespace enum and `try`
+into Swift errors:
 
 ```swift
 public enum Contacts {
     public static func create_contact(_ name: String, _ age: Int32) throws -> Contact {
         var err = weaveffi_error(code: 0, message: nil)
-        // ... buffer setup for string params ...
         let rv = weaveffi_contacts_create_contact(name_ptr, name_len, age, &err)
         try check(&err)
         guard let rv = rv else {
@@ -178,28 +116,30 @@ public enum Contacts {
         }
         return Contact(ptr: rv)
     }
-
-    public static func find_contact(_ id: Int32) throws -> Contact? {
-        var err = weaveffi_error(code: 0, message: nil)
-        let rv = weaveffi_contacts_find_contact(id, &err)
-        try check(&err)
-        return rv.map { Contact(ptr: $0) }
-    }
-
-    public static func list_contacts() throws -> [Contact] {
-        var err = weaveffi_error(code: 0, message: nil)
-        var outLen: Int = 0
-        let rv = weaveffi_contacts_list_contacts(&outLen, &err)
-        try check(&err)
-        guard let rv = rv else { return [] }
-        return (0..<outLen).map { Contact(ptr: rv[$0]!) }
-    }
 }
 ```
 
-## Try the example app
+Optionals and lists use `withOptionalPointer` and
+`withUnsafeBufferPointer` helpers:
 
-### macOS
+```swift
+@inline(__always)
+func withOptionalPointer<T, R>(to value: T?, _ body: (UnsafePointer<T>?) throws -> R) rethrows -> R {
+    guard let value = value else { return try body(nil) }
+    return try withUnsafePointer(to: value) { try body($0) }
+}
+
+ids.withUnsafeBufferPointer { buf in
+    let ids_ptr = buf.baseAddress
+    let ids_len = buf.count
+}
+```
+
+## Build instructions
+
+The runnable example uses the `calculator` sample.
+
+macOS:
 
 ```bash
 cargo build -p calculator
@@ -214,7 +154,7 @@ swiftc \
 DYLD_LIBRARY_PATH=../../target/debug .build/debug/App
 ```
 
-### Linux
+Linux:
 
 ```bash
 cargo build -p calculator
@@ -229,8 +169,63 @@ swiftc \
 LD_LIBRARY_PATH=../../target/debug .build/debug/App
 ```
 
-## Integration via SwiftPM
+In a real SwiftPM application, add the generated package as a path
+dependency, link `CWeaveFFI` and `WeaveFFI`, and ship the cdylib as part
+of an XCFramework or bundled `.dylib`/`.so`.
 
-In a real app, add the System Library as a dependency and link it with your
-target. The `CWeaveFFI` module map provides header linkage; import `WeaveFFI`
-in your Swift code for the ergonomic wrapper.
+## Memory and ownership
+
+- Struct classes own an `OpaquePointer`. The class `deinit` calls the
+  matching C destructor.
+- Returned strings are copied into Swift `String` and the raw pointer is
+  freed via `weaveffi_free_string` immediately.
+- `withUnsafeBufferPointer` and `withOptionalPointer` keep input buffers
+  alive only for the duration of the C call — there is no copy.
+- For `bytes` parameters, the wrapper uses `withUnsafeBytes` so Swift
+  retains ownership.
+
+## Async support
+
+Async IDL functions are exposed as `async throws` methods that bridge
+the C ABI callback into Swift's structured concurrency via
+`withCheckedThrowingContinuation`:
+
+```swift
+public static func fetch_contact(_ id: Int32) async throws -> Contact {
+    return try await withCheckedThrowingContinuation { cont in
+        weaveffi_contacts_fetch_contact_async(id, { ctx, err, result in
+            let cont = Unmanaged<ContWrapper>.fromOpaque(ctx!)
+                .takeRetainedValue().cont
+            if let err = err, err.pointee.code != 0 {
+                cont.resume(throwing: WeaveFFIError.from(err.pointee))
+            } else if let result = result {
+                cont.resume(returning: Contact(ptr: result))
+            } else {
+                cont.resume(throwing: WeaveFFIError.error(code: -1,
+                    message: "null result"))
+            }
+        }, Unmanaged.passRetained(ContWrapper(cont: cont)).toOpaque())
+    }
+}
+```
+
+When the IDL marks the function `cancel: true`, the generated wrapper
+exposes a Swift `Task` cancellation handler that forwards to the
+underlying `weaveffi_cancel_token`.
+
+## Troubleshooting
+
+- **`module 'CWeaveFFI' not found`** — Xcode/SwiftPM did not pick up
+  the generated `module.modulemap`. Make sure
+  `Sources/CWeaveFFI/module.modulemap` is on disk and the package
+  declares `systemLibrary(name: "CWeaveFFI")`.
+- **`Library not loaded: libweaveffi.dylib`** — set
+  `DYLD_LIBRARY_PATH` for development or embed the dylib in your
+  application bundle for distribution.
+- **Crashes after `deinit`** — never reuse an `OpaquePointer` after the
+  owning Swift wrapper goes out of scope. The C side has already freed
+  it.
+- **Optional struct ends up `nil` even when present** — the C function
+  is allowed to return a null pointer to indicate absence; double-check
+  the Rust implementation actually returns `Some(_)` for the case you
+  expect.

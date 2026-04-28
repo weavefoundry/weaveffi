@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
 use camino::Utf8Path;
@@ -51,8 +51,8 @@ impl TemplateEngine {
     }
 }
 
-pub fn type_ref_to_map(ty: &TypeRef) -> HashMap<String, tera::Value> {
-    let mut map: HashMap<String, tera::Value> = HashMap::new();
+pub fn type_ref_to_map(ty: &TypeRef) -> BTreeMap<String, tera::Value> {
+    let mut map: BTreeMap<String, tera::Value> = BTreeMap::new();
     match ty {
         TypeRef::I32 => {
             map.insert("kind".into(), "i32".into());
@@ -128,7 +128,6 @@ pub fn type_ref_to_map(ty: &TypeRef) -> HashMap<String, tera::Value> {
                 serde_json::to_value(type_ref_to_map(inner)).unwrap(),
             );
         }
-        TypeRef::Callback(_) => todo!("callback template type"),
     }
     map
 }
@@ -243,11 +242,13 @@ mod tests {
                             name: "a".into(),
                             ty: TypeRef::I32,
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "b".into(),
                             ty: TypeRef::I32,
                             mutable: false,
+                            doc: None,
                         },
                     ],
                     returns: Some(TypeRef::I32),

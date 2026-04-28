@@ -1,8 +1,16 @@
+//! Python (`ctypes`) binding generator for WeaveFFI.
+//!
+//! Emits a pip-installable package containing `ctypes`-based bindings and
+//! `.pyi` type stubs over the C ABI. Async functions surface as
+//! `async def` wrappers. Implements the [`Generator`] trait.
+
 use anyhow::Result;
 use camino::Utf8Path;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
-use weaveffi_core::utils::{c_symbol_name, local_type_name, wrapper_name};
+use weaveffi_core::utils::{
+    c_symbol_name, local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
+};
 use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, StructField, TypeRef};
 
 pub struct PythonGenerator;
@@ -14,28 +22,37 @@ impl PythonGenerator {
         out_dir: &Utf8Path,
         package_name: &str,
         strip_module_prefix: bool,
+        input_basename: &str,
     ) -> Result<()> {
         let dir = out_dir.join("python");
         let pkg_dir = dir.join(package_name);
         std::fs::create_dir_all(&pkg_dir)?;
+        let hash = CommentStyle::Hash;
         std::fs::write(
             pkg_dir.join("__init__.py"),
-            "from .weaveffi import *  # noqa: F401,F403\n",
+            format!(
+                "{}from .weaveffi import *  # noqa: F401,F403\n\n{}",
+                render_prelude(hash, input_basename),
+                render_trailer(hash, "__init__.py"),
+            ),
         )?;
         std::fs::write(
             pkg_dir.join("weaveffi.py"),
-            render_python_module(api, strip_module_prefix),
+            render_python_module(api, strip_module_prefix, input_basename),
         )?;
         std::fs::write(
             pkg_dir.join("weaveffi.pyi"),
-            render_pyi_module(api, strip_module_prefix),
+            render_pyi_module(api, strip_module_prefix, input_basename),
         )?;
         std::fs::write(
             dir.join("pyproject.toml"),
-            render_pyproject_toml(package_name),
+            render_pyproject_toml(package_name, input_basename),
         )?;
-        std::fs::write(dir.join("setup.py"), render_setup_py(package_name))?;
-        std::fs::write(dir.join("README.md"), render_readme())?;
+        std::fs::write(
+            dir.join("setup.py"),
+            render_setup_py(package_name, input_basename),
+        )?;
+        std::fs::write(dir.join("README.md"), render_readme(input_basename))?;
         Ok(())
     }
 }
@@ -46,7 +63,7 @@ impl Generator for PythonGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "weaveffi", true)
+        self.generate_impl(api, out_dir, "weaveffi", true, "weaveffi.yml")
     }
 
     fn generate_with_config(
@@ -60,12 +77,16 @@ impl Generator for PythonGenerator {
             out_dir,
             config.python_package_name(),
             config.strip_module_prefix,
+            config.input_basename(),
         )
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
         let pkg = "weaveffi";
-        vec![
+        let mut files = vec![
+            out_dir.join("python/README.md").to_string(),
+            out_dir.join("python/pyproject.toml").to_string(),
+            out_dir.join("python/setup.py").to_string(),
             out_dir
                 .join(format!("python/{pkg}/__init__.py"))
                 .to_string(),
@@ -75,10 +96,34 @@ impl Generator for PythonGenerator {
             out_dir
                 .join(format!("python/{pkg}/weaveffi.pyi"))
                 .to_string(),
+        ];
+        files.sort();
+        files
+    }
+
+    fn output_files_with_config(
+        &self,
+        _api: &Api,
+        out_dir: &Utf8Path,
+        config: &GeneratorConfig,
+    ) -> Vec<String> {
+        let pkg = config.python_package_name();
+        let mut files = vec![
+            out_dir.join("python/README.md").to_string(),
             out_dir.join("python/pyproject.toml").to_string(),
             out_dir.join("python/setup.py").to_string(),
-            out_dir.join("python/README.md").to_string(),
-        ]
+            out_dir
+                .join(format!("python/{pkg}/__init__.py"))
+                .to_string(),
+            out_dir
+                .join(format!("python/{pkg}/weaveffi.py"))
+                .to_string(),
+            out_dir
+                .join(format!("python/{pkg}/weaveffi.pyi"))
+                .to_string(),
+        ];
+        files.sort();
+        files
     }
 }
 
@@ -132,7 +177,6 @@ fn py_ctypes_scalar(ty: &TypeRef) -> &'static str {
         TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) | TypeRef::Iterator(_) => {
             "ctypes.c_void_p"
         }
-        TypeRef::Callback(_) => todo!("callback Python type"),
     }
 }
 
@@ -150,7 +194,6 @@ fn py_type_hint(ty: &TypeRef) -> String {
         TypeRef::List(inner) => format!("List[{}]", py_type_hint(inner)),
         TypeRef::Map(k, v) => format!("Dict[{}, {}]", py_type_hint(k), py_type_hint(v)),
         TypeRef::Iterator(inner) => format!("Iterator[{}]", py_type_hint(inner)),
-        TypeRef::Callback(_) => todo!("callback Python type"),
     }
 }
 
@@ -249,7 +292,6 @@ fn py_async_cb_trailing_fields(ret: &Option<TypeRef>) -> Vec<(String, String)> {
                 )]
             }
         }
-        Some(TypeRef::Callback(_)) => todo!("async Python callback return type"),
         Some(ty) => vec![("result".into(), py_ctypes_scalar(ty).to_string())],
     }
 }
@@ -406,7 +448,6 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
             }
         }
         Some(TypeRef::Iterator(_)) => todo!("async iterator return"),
-        Some(TypeRef::Callback(_)) => todo!("async Python callback return type"),
     }
 }
 
@@ -440,7 +481,7 @@ fn render_async_ffi_call_body(out: &mut String, module_name: &str, f: &Function)
         "{ind}            _state[\"err\"] = WeaveffiError(_code, _msg)\n"
     ));
     out.push_str(&format!("{ind}        else:\n"));
-    append_async_success_handler(out, &f.returns, "            ");
+    append_async_success_handler(out, &f.returns, "                ");
     out.push_str(&format!("{ind}    finally:\n"));
     out.push_str(&format!("{ind}        _ev.set()\n"));
 
@@ -496,8 +537,8 @@ fn render_async_ffi_call_body(out: &mut String, module_name: &str, f: &Function)
 
 // ── Rendering ──
 
-fn render_python_module(api: &Api, strip_module_prefix: bool) -> String {
-    let mut out = String::new();
+fn render_python_module(api: &Api, strip_module_prefix: bool, input_basename: &str) -> String {
+    let mut out = render_prelude(CommentStyle::Hash, input_basename);
     render_preamble(&mut out);
     let has_async = collect_all_modules(&api.modules)
         .iter()
@@ -509,6 +550,7 @@ fn render_python_module(api: &Api, strip_module_prefix: bool) -> String {
         render_python_module_content(&mut out, m, &m.name, strip_module_prefix);
     }
     out.push('\n');
+    out.push_str(&render_trailer(CommentStyle::Hash, "weaveffi.py"));
     out
 }
 
@@ -559,6 +601,131 @@ fn render_python_module_content(
         let sub_path = format!("{module_path}_{}", sub.name);
         render_python_module_content(out, sub, &sub_path, strip_module_prefix);
     }
+}
+
+/// Emits a Python `# ...` line comment at `indent`. Used above C ABI binding
+/// declarations (`attach_function`-style binds) where docstrings can't live.
+fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
+    let Some(doc) = doc else {
+        return;
+    };
+    let doc = doc.trim();
+    if doc.is_empty() {
+        return;
+    }
+    for line in doc.lines() {
+        out.push_str(indent);
+        if line.is_empty() {
+            out.push_str("#\n");
+        } else {
+            out.push_str("# ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+}
+
+/// Emits a Python triple-quoted `"""..."""` docstring as the first statement
+/// of a class or function body, at the given `indent`.
+fn emit_docstring(out: &mut String, doc: &Option<String>, indent: &str) {
+    let Some(doc) = doc else {
+        return;
+    };
+    let doc = doc.trim();
+    if doc.is_empty() {
+        return;
+    }
+    if doc.contains('\n') {
+        out.push_str(indent);
+        out.push_str("\"\"\"\n");
+        for line in doc.lines() {
+            if line.is_empty() {
+                out.push('\n');
+            } else {
+                out.push_str(indent);
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out.push_str(indent);
+        out.push_str("\"\"\"\n");
+    } else {
+        out.push_str(indent);
+        out.push_str("\"\"\"");
+        out.push_str(doc);
+        out.push_str("\"\"\"\n");
+    }
+}
+
+/// Emits a NumPy/Google-style docstring with a `Parameters` section listing
+/// each parameter that has a `doc:` value. Skips entirely when there is
+/// nothing to document.
+fn emit_fn_docstring(
+    out: &mut String,
+    doc: &Option<String>,
+    params: &[weaveffi_ir::ir::Param],
+    indent: &str,
+) {
+    let trimmed_doc = doc.as_ref().map(|d| d.trim()).filter(|d| !d.is_empty());
+    let documented_params: Vec<&weaveffi_ir::ir::Param> = params
+        .iter()
+        .filter(|p| {
+            p.doc
+                .as_ref()
+                .map(|d| !d.trim().is_empty())
+                .unwrap_or(false)
+        })
+        .collect();
+    if trimmed_doc.is_none() && documented_params.is_empty() {
+        return;
+    }
+    out.push_str(indent);
+    out.push_str("\"\"\"");
+    if let Some(d) = trimmed_doc {
+        if d.contains('\n') {
+            out.push('\n');
+            for line in d.lines() {
+                if line.is_empty() {
+                    out.push('\n');
+                } else {
+                    out.push_str(indent);
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        } else {
+            out.push_str(d);
+            out.push('\n');
+        }
+    } else {
+        out.push('\n');
+    }
+    if !documented_params.is_empty() {
+        out.push('\n');
+        out.push_str(indent);
+        out.push_str("Parameters\n");
+        out.push_str(indent);
+        out.push_str("----------\n");
+        for p in documented_params {
+            let pdoc = p.doc.as_ref().unwrap().trim();
+            let mut lines = pdoc.lines();
+            let first = lines.next().unwrap_or("");
+            out.push_str(indent);
+            out.push_str(&format!("{} : {}\n", p.name, first));
+            for line in lines {
+                out.push_str(indent);
+                if line.is_empty() {
+                    out.push('\n');
+                } else {
+                    out.push_str("    ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    out.push_str(indent);
+    out.push_str("\"\"\"\n");
 }
 
 fn render_preamble(out: &mut String) {
@@ -640,25 +807,28 @@ def _bytes_to_string(ptr) -> Optional[str]:
 }
 
 fn render_enum(out: &mut String, e: &EnumDef) {
-    out.push_str(&format!("\n\nclass {}(IntEnum):", e.name));
-    if let Some(doc) = &e.doc {
-        out.push_str(&format!("\n    \"\"\"{}\"\"\"", doc));
-    }
+    out.push_str(&format!("\n\nclass {}(IntEnum):\n", e.name));
+    emit_docstring(out, &e.doc, "    ");
     for v in &e.variants {
-        out.push_str(&format!("\n    {} = {}", v.name, v.value));
+        if let Some(d) = &v.doc {
+            let trimmed = d.trim();
+            if !trimmed.is_empty() {
+                for line in trimmed.lines() {
+                    out.push_str(&format!("    # {}\n", line));
+                }
+            }
+        }
+        out.push_str(&format!("    {} = {}\n", v.name, v.value));
     }
-    out.push('\n');
 }
 
 fn render_struct(out: &mut String, module_name: &str, s: &StructDef) {
     let prefix = format!("weaveffi_{}_{}", module_name, s.name);
 
-    out.push_str(&format!("\n\nclass {}:", s.name));
-    if let Some(doc) = &s.doc {
-        out.push_str(&format!("\n    \"\"\"{}\"\"\"", doc));
-    }
+    out.push_str(&format!("\n\nclass {}:\n", s.name));
+    emit_docstring(out, &s.doc, "    ");
 
-    out.push_str("\n\n    def __init__(self, _ptr: int) -> None:");
+    out.push_str("\n    def __init__(self, _ptr: int) -> None:");
     out.push_str("\n        self._ptr = _ptr");
 
     out.push_str("\n\n    def __del__(self) -> None:");
@@ -680,8 +850,9 @@ fn render_struct(out: &mut String, module_name: &str, s: &StructDef) {
 
 fn render_builder(out: &mut String, s: &StructDef) {
     let builder_name = format!("{}Builder", s.name);
-    out.push_str(&format!("\n\nclass {}:", builder_name));
-    out.push_str("\n    def __init__(self) -> None:");
+    out.push_str(&format!("\n\nclass {}:\n", builder_name));
+    emit_docstring(out, &s.doc, "    ");
+    out.push_str("    def __init__(self) -> None:");
     for field in &s.fields {
         let py_ty = py_type_hint(&field.ty);
         out.push_str(&format!(
@@ -695,6 +866,26 @@ fn render_builder(out: &mut String, s: &StructDef) {
             "\n\n    def with_{}(self, value: {}) -> \"{}\":",
             field.name, py_ty, builder_name
         ));
+        if let Some(d) = &field.doc {
+            let trimmed = d.trim();
+            if !trimmed.is_empty() {
+                if trimmed.contains('\n') {
+                    out.push_str("\n        \"\"\"\n");
+                    for line in trimmed.lines() {
+                        if line.is_empty() {
+                            out.push('\n');
+                        } else {
+                            out.push_str("        ");
+                            out.push_str(line);
+                            out.push('\n');
+                        }
+                    }
+                    out.push_str("        \"\"\"");
+                } else {
+                    out.push_str(&format!("\n        \"\"\"{}\"\"\"", trimmed));
+                }
+            }
+        }
         out.push_str(&format!("\n        self._{} = value", field.name));
         out.push_str("\n        return self");
     }
@@ -722,6 +913,7 @@ fn render_getter(out: &mut String, prefix: &str, field: &StructField) {
         "\n\n    @property\n    def {}(self) -> {}:\n",
         field.name, py_ty
     ));
+    emit_docstring(out, &field.doc, ind);
     out.push_str(&format!("{ind}_fn = _lib.{getter}\n"));
 
     let (restype, out_argtypes) = py_return_info(&field.ty);
@@ -785,6 +977,8 @@ fn render_function(out: &mut String, module_name: &str, f: &Function, strip_modu
     ));
 
     let ind = "    ";
+
+    emit_fn_docstring(out, &f.doc, &f.params, ind);
 
     if let Some(msg) = &f.deprecated {
         out.push_str(&format!(
@@ -881,6 +1075,7 @@ fn render_function(out: &mut String, module_name: &str, f: &Function, strip_modu
             "\n\nasync def {}({}) -> {}:\n",
             func_name, params_joined, ret_hint
         ));
+        emit_fn_docstring(out, &f.doc, &f.params, ind);
         out.push_str("    _loop = asyncio.get_event_loop()\n");
         let arg_names: Vec<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
         let executor_args = if arg_names.is_empty() {
@@ -1035,7 +1230,6 @@ fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
             format!("len(_{name}_keys)"),
         ],
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
-        TypeRef::Callback(_) => todo!("callback Python param call args"),
     }
 }
 
@@ -1093,7 +1287,6 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
         TypeRef::List(inner) => render_list_return(out, inner, ind),
         TypeRef::Map(k, v) => render_map_return(out, k, v, ind),
         TypeRef::Iterator(_) => unreachable!("iterator return handled in render_function"),
-        TypeRef::Callback(_) => todo!("callback Python return"),
     }
 }
 
@@ -1263,9 +1456,11 @@ fn render_iterator_return(
 
 // ── Packaging ──
 
-fn render_pyproject_toml(package_name: &str) -> String {
+fn render_pyproject_toml(package_name: &str, input_basename: &str) -> String {
+    let prelude = render_prelude(CommentStyle::Hash, input_basename);
+    let trailer = render_trailer(CommentStyle::Hash, "pyproject.toml");
     format!(
-        r#"[build-system]
+        r#"{prelude}[build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
@@ -1277,25 +1472,32 @@ requires-python = ">=3.8"
 
 [tool.setuptools]
 packages = ["{package_name}"]
-"#,
+
+{trailer}"#,
     )
 }
 
-fn render_setup_py(package_name: &str) -> String {
+fn render_setup_py(package_name: &str, input_basename: &str) -> String {
+    let prelude = render_prelude(CommentStyle::Hash, input_basename);
+    let trailer = render_trailer(CommentStyle::Hash, "setup.py");
     format!(
-        r#"from setuptools import setup
+        r#"{prelude}from setuptools import setup
 
 setup(
     name="{package_name}",
     version="0.1.0",
     packages=["{package_name}"],
 )
-"#,
+
+{trailer}"#,
     )
 }
 
-fn render_readme() -> &'static str {
-    r#"# WeaveFFI Python Bindings
+fn render_readme(input_basename: &str) -> String {
+    let prelude = render_prelude(CommentStyle::Xml, input_basename);
+    let trailer = render_trailer(CommentStyle::Xml, "README.md");
+    format!(
+        r#"{prelude}# WeaveFFI Python Bindings
 
 Auto-generated Python bindings using ctypes.
 
@@ -1321,15 +1523,16 @@ pip install -e .
 ```python
 from weaveffi import *
 ```
-"#
+
+{trailer}"#
+    )
 }
 
 // ── Type stub (.pyi) rendering ──
 
-fn render_pyi_module(api: &Api, strip_module_prefix: bool) -> String {
-    let mut out = String::from(
-        "from enum import IntEnum\nfrom typing import Dict, Iterator, List, Optional\n",
-    );
+fn render_pyi_module(api: &Api, strip_module_prefix: bool, input_basename: &str) -> String {
+    let mut out = render_prelude(CommentStyle::Hash, input_basename);
+    out.push_str("from enum import IntEnum\nfrom typing import Dict, Iterator, List, Optional\n");
     for (m, path) in collect_modules_with_path(&api.modules) {
         for e in &m.enums {
             render_pyi_enum(&mut out, e);
@@ -1341,20 +1544,28 @@ fn render_pyi_module(api: &Api, strip_module_prefix: bool) -> String {
             render_pyi_function(&mut out, &path, f, strip_module_prefix);
         }
     }
+    out.push('\n');
+    out.push_str(&render_trailer(CommentStyle::Hash, "weaveffi.pyi"));
     out
 }
 
 fn render_pyi_enum(out: &mut String, e: &EnumDef) {
-    out.push_str(&format!("\nclass {}(IntEnum):\n", e.name));
+    out.push('\n');
+    emit_doc(out, &e.doc, "");
+    out.push_str(&format!("class {}(IntEnum):\n", e.name));
     for v in &e.variants {
+        emit_doc(out, &v.doc, "    ");
         out.push_str(&format!("    {}: int\n", v.name));
     }
 }
 
 fn render_pyi_struct(out: &mut String, s: &StructDef) {
-    out.push_str(&format!("\nclass {}:\n", s.name));
+    out.push('\n');
+    emit_doc(out, &s.doc, "");
+    out.push_str(&format!("class {}:\n", s.name));
     for field in &s.fields {
         let py_ty = py_type_hint(&field.ty);
+        emit_doc(out, &field.doc, "    ");
         out.push_str(&format!(
             "    @property\n    def {}(self) -> {}: ...\n",
             field.name, py_ty
@@ -1380,8 +1591,10 @@ fn render_pyi_function(
         .map(py_type_hint)
         .unwrap_or_else(|| "None".into());
     let async_kw = if f.r#async { "async " } else { "" };
+    out.push('\n');
+    emit_doc(out, &f.doc, "");
     out.push_str(&format!(
-        "\n{async_kw}def {}({}) -> {}: ...\n",
+        "{async_kw}def {}({}) -> {}: ...\n",
         func_name,
         params.join(", "),
         ret
@@ -1432,11 +1645,13 @@ mod tests {
                     name: "a".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
                 Param {
                     name: "b".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
             ],
             returns: Some(TypeRef::I32),
@@ -1472,12 +1687,12 @@ mod tests {
         assert_eq!(
             files,
             vec![
+                out.join("python/README.md").to_string(),
+                out.join("python/pyproject.toml").to_string(),
+                out.join("python/setup.py").to_string(),
                 out.join("python/weaveffi/__init__.py").to_string(),
                 out.join("python/weaveffi/weaveffi.py").to_string(),
                 out.join("python/weaveffi/weaveffi.pyi").to_string(),
-                out.join("python/pyproject.toml").to_string(),
-                out.join("python/setup.py").to_string(),
-                out.join("python/README.md").to_string(),
             ]
         );
     }
@@ -1485,7 +1700,7 @@ mod tests {
     #[test]
     fn preamble_has_load_library() {
         let api = make_api(vec![]);
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
         assert!(py.contains("def _load_library()"), "missing _load_library");
         assert!(
             py.contains("libweaveffi.dylib"),
@@ -1499,7 +1714,7 @@ mod tests {
     #[test]
     fn preamble_has_error_handling() {
         let api = make_api(vec![]);
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
         assert!(
             py.contains("class WeaveffiError(Exception):"),
             "missing error class"
@@ -1524,11 +1739,13 @@ mod tests {
                     name: "a".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
                 Param {
                     name: "b".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
             ],
             returns: Some(TypeRef::I32),
@@ -1539,7 +1756,7 @@ mod tests {
             since: None,
         }])]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
         assert!(
             py.contains("def add(a: int, b: int) -> int:"),
             "missing function signature: {py}"
@@ -1573,6 +1790,7 @@ mod tests {
                     name: "msg".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::StringUtf8),
                 doc: None,
@@ -1589,7 +1807,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
         assert!(
             py.contains("def echo(msg: str) -> str:"),
             "missing signature: {py}"
@@ -1618,7 +1836,7 @@ mod tests {
             since: None,
         }])]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
         assert!(
             py.contains("def reset() -> None:"),
             "missing void signature: {py}"
@@ -1666,7 +1884,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
         assert!(
             py.contains("class Color(IntEnum):"),
             "missing IntEnum class: {py}"
@@ -1690,6 +1908,7 @@ mod tests {
                     name: "a".into(),
                     ty: TypeRef::Enum("Color".into()),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Enum("Color".into())),
                 doc: None,
@@ -1706,7 +1925,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
         assert!(py.contains("a: \"Color\""), "missing enum param hint: {py}");
         assert!(
             py.contains("-> \"Color\":"),
@@ -1750,7 +1969,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
         assert!(py.contains("class Contact:"), "missing class: {py}");
         assert!(
             py.contains("def __init__(self, _ptr: int)"),
@@ -1844,6 +2063,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::Handle,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -1860,7 +2080,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
         assert!(
             py.contains("-> \"Contact\":"),
             "missing struct return hint: {py}"
@@ -1883,6 +2103,7 @@ mod tests {
                 name: "flag".into(),
                 ty: TypeRef::Bool,
                 mutable: false,
+                doc: None,
             }],
             returns: Some(TypeRef::Bool),
             doc: None,
@@ -1892,7 +2113,7 @@ mod tests {
             since: None,
         }])]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
         assert!(py.contains("flag: bool"), "missing bool param: {py}");
         assert!(py.contains("-> bool:"), "missing bool return: {py}");
         assert!(
@@ -1922,7 +2143,7 @@ mod tests {
             since: None,
         }])]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
         assert!(
             py.contains("ctypes.c_uint64"),
             "missing c_uint64 for Handle: {py}"
@@ -1939,6 +2160,7 @@ mod tests {
                     name: "data".into(),
                     ty: TypeRef::Bytes,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Bytes),
                 doc: None,
@@ -1955,7 +2177,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
         assert!(py.contains("data: bytes"), "missing bytes param: {py}");
         assert!(py.contains("-> bytes:"), "missing bytes return: {py}");
         assert!(
@@ -1976,6 +2198,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::Optional(Box::new(TypeRef::I32)),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::I32))),
                 doc: None,
@@ -1992,7 +2215,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
         assert!(
             py.contains("id: Optional[int]"),
             "missing optional param: {py}"
@@ -2038,7 +2261,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
         assert!(
             py.contains("-> Optional[str]:"),
             "missing optional str return: {py}"
@@ -2060,6 +2283,7 @@ mod tests {
                         name: "ids".into(),
                         ty: TypeRef::List(Box::new(TypeRef::I32)),
                         mutable: false,
+                        doc: None,
                     }],
                     returns: None,
                     doc: None,
@@ -2087,7 +2311,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
         assert!(py.contains("ids: List[int]"), "missing list param: {py}");
         assert!(py.contains("-> List[int]:"), "missing list return: {py}");
         assert!(
@@ -2115,6 +2339,7 @@ mod tests {
                         name: "scores".into(),
                         ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
                         mutable: false,
+                        doc: None,
                     }],
                     returns: None,
                     doc: None,
@@ -2145,7 +2370,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
         assert!(
             py.contains("scores: Dict[str, int]"),
             "missing map param: {py}"
@@ -2185,7 +2410,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
         assert!(
             py.contains("def email(self) -> Optional[str]:"),
             "missing optional getter: {py}"
@@ -2219,7 +2444,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
         assert!(
             py.contains("def role(self) -> \"Role\":"),
             "missing enum getter: {py}"
@@ -2291,16 +2516,19 @@ mod tests {
                             name: "first_name".into(),
                             ty: TypeRef::StringUtf8,
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "email".into(),
                             ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "contact_type".into(),
                             ty: TypeRef::Enum("ContactType".into()),
                             mutable: false,
+                            doc: None,
                         },
                     ],
                     returns: Some(TypeRef::Handle),
@@ -2316,6 +2544,7 @@ mod tests {
                         name: "id".into(),
                         ty: TypeRef::Handle,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Struct("Contact".into())),
                     doc: None,
@@ -2450,7 +2679,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
         assert!(
             py.contains("-> List[\"Item\"]:"),
             "missing list struct return: {py}"
@@ -2484,7 +2713,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
         assert!(
             py.contains("def data(self) -> bytes:"),
             "missing bytes getter: {py}"
@@ -2566,11 +2795,13 @@ mod tests {
                             name: "name".into(),
                             ty: TypeRef::StringUtf8,
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "email".into(),
                             ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                             mutable: false,
+                            doc: None,
                         },
                     ],
                     returns: Some(TypeRef::Handle),
@@ -2586,6 +2817,7 @@ mod tests {
                         name: "id".into(),
                         ty: TypeRef::Handle,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Struct("Contact".into())),
                     doc: None,
@@ -2600,6 +2832,7 @@ mod tests {
                         name: "id".into(),
                         ty: TypeRef::Handle,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: None,
                     doc: None,
@@ -2691,11 +2924,13 @@ mod tests {
                     name: "a".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
                 Param {
                     name: "b".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
             ],
             returns: Some(TypeRef::I32),
@@ -2776,7 +3011,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
 
         assert!(py.contains("class Contact:"), "missing class decl");
         assert!(
@@ -2812,6 +3047,7 @@ mod tests {
                     name: "ct".into(),
                     ty: TypeRef::Enum("ContactType".into()),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Enum("ContactType".into())),
                 doc: None,
@@ -2848,7 +3084,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
 
         assert!(py.contains("class ContactType(IntEnum):"));
         assert!(py.contains("\"\"\"Type of contact\"\"\""));
@@ -2883,6 +3119,7 @@ mod tests {
                         name: "key".into(),
                         ty: TypeRef::Optional(Box::new(TypeRef::I32)),
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Optional(Box::new(TypeRef::I32))),
                     doc: None,
@@ -2897,6 +3134,7 @@ mod tests {
                         name: "prefix".into(),
                         ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
                     doc: None,
@@ -2936,7 +3174,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
 
         assert!(
             py.contains("key: Optional[int]"),
@@ -2998,6 +3236,7 @@ mod tests {
                         name: "ids".into(),
                         ty: TypeRef::List(Box::new(TypeRef::I32)),
                         mutable: false,
+                        doc: None,
                     }],
                     returns: None,
                     doc: None,
@@ -3035,7 +3274,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
 
         assert!(py.contains("ids: List[int]"), "missing List[int] param");
         assert!(
@@ -3078,6 +3317,7 @@ mod tests {
                         name: "settings".into(),
                         ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
                         mutable: false,
+                        doc: None,
                     }],
                     returns: None,
                     doc: None,
@@ -3108,7 +3348,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
 
         assert!(
             py.contains("settings: Dict[str, int]"),
@@ -3229,11 +3469,13 @@ mod tests {
                             name: "name".into(),
                             ty: TypeRef::StringUtf8,
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "email".into(),
                             ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                             mutable: false,
+                            doc: None,
                         },
                     ],
                     returns: Some(TypeRef::Handle),
@@ -3249,6 +3491,7 @@ mod tests {
                         name: "id".into(),
                         ty: TypeRef::Handle,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Struct("Contact".into())),
                     doc: None,
@@ -3273,6 +3516,7 @@ mod tests {
                         name: "id".into(),
                         ty: TypeRef::Handle,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: None,
                     doc: None,
@@ -3286,7 +3530,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let pyi = render_pyi_module(&api, true);
+        let pyi = render_pyi_module(&api, true, "weaveffi.yml");
 
         assert!(pyi.contains("from enum import IntEnum"));
         assert!(pyi.contains("from typing import Dict, Iterator, List, Optional"));
@@ -3381,21 +3625,25 @@ mod tests {
                             name: "first_name".into(),
                             ty: TypeRef::StringUtf8,
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "last_name".into(),
                             ty: TypeRef::StringUtf8,
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "email".into(),
                             ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "contact_type".into(),
                             ty: TypeRef::Enum("ContactType".into()),
                             mutable: false,
+                            doc: None,
                         },
                     ],
                     returns: Some(TypeRef::Handle),
@@ -3411,6 +3659,7 @@ mod tests {
                         name: "id".into(),
                         ty: TypeRef::Handle,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Struct("Contact".into())),
                     doc: None,
@@ -3435,6 +3684,7 @@ mod tests {
                         name: "id".into(),
                         ty: TypeRef::Handle,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Bool),
                     doc: None,
@@ -3535,11 +3785,13 @@ mod tests {
                     name: "a".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
                 Param {
                     name: "b".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
             ],
             returns: Some(TypeRef::I32),
@@ -3609,7 +3861,7 @@ mod tests {
     #[test]
     fn python_has_memory_helpers() {
         let api = make_api(vec![]);
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
         assert!(
             py.contains("import contextlib"),
             "missing contextlib import"
@@ -3641,11 +3893,13 @@ mod tests {
                     name: "a".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
                 Param {
                     name: "b".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
             ],
             returns: Some(TypeRef::I32),
@@ -3708,6 +3962,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -3796,6 +4051,7 @@ mod tests {
                         Box::new(TypeRef::Struct("Contact".into())),
                     ))))),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3821,7 +4077,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let pyi = render_pyi_module(&api, true);
+        let pyi = render_pyi_module(&api, true, "weaveffi.yml");
         assert!(
             pyi.contains("Optional[List[Optional["),
             "should contain deeply nested optional type: {pyi}"
@@ -3841,6 +4097,7 @@ mod tests {
                         Box::new(TypeRef::List(Box::new(TypeRef::I32))),
                     ),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3856,7 +4113,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let pyi = render_pyi_module(&api, true);
+        let pyi = render_pyi_module(&api, true, "weaveffi.yml");
         assert!(
             pyi.contains("Dict[str, List[int]]"),
             "should contain map of lists type: {pyi}"
@@ -3876,6 +4133,7 @@ mod tests {
                         Box::new(TypeRef::Struct("Contact".into())),
                     ),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3921,7 +4179,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let pyi = render_pyi_module(&api, true);
+        let pyi = render_pyi_module(&api, true, "weaveffi.yml");
         assert!(
             pyi.contains("Dict[\"Color\", \"Contact\"]"),
             "should contain enum-keyed map type: {pyi}"
@@ -3940,6 +4198,7 @@ mod tests {
                         name: "contact".into(),
                         ty: TypeRef::TypedHandle("Contact".into()),
                         mutable: false,
+                        doc: None,
                     }],
                     returns: None,
                     doc: None,
@@ -3967,7 +4226,7 @@ mod tests {
             }],
             generators: None,
         };
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
         assert!(
             py.contains("contact: \"Contact\""),
             "TypedHandle should use class type not int: {py}"
@@ -3992,6 +4251,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -4018,7 +4278,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
 
         assert!(
             py.contains("_string_to_bytes(name)"),
@@ -4085,6 +4345,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                     "Contact".into(),
@@ -4113,7 +4374,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
 
         assert!(
             py.contains("if _result is None:\n        return None"),
@@ -4139,6 +4400,7 @@ mod tests {
                 name: "id".into(),
                 ty: TypeRef::I32,
                 mutable: false,
+                doc: None,
             }],
             returns: Some(TypeRef::StringUtf8),
             doc: None,
@@ -4147,7 +4409,7 @@ mod tests {
             deprecated: None,
             since: None,
         }])]);
-        let code = render_python_module(&api, true);
+        let code = render_python_module(&api, true, "weaveffi.yml");
         assert!(
             code.contains("import asyncio"),
             "should import asyncio: {code}"
@@ -4170,14 +4432,20 @@ mod tests {
         );
     }
 
+    /// `ctypes.CFUNCTYPE` instances pin the C trampoline; `_cb` is held alive
+    /// in the local frame for the lifetime of the synchronous helper, which
+    /// blocks on `_ev.wait()` until the C callback fires. The `try/finally`
+    /// around `_state` mutation ensures `_ev.set()` always runs, releasing
+    /// the wait and letting `_cb` drop together with the helper frame.
     #[test]
-    fn python_pyi_async_function() {
+    fn python_async_pins_callback_for_lifetime() {
         let api = make_api(vec![simple_module(vec![Function {
             name: "fetch_data".into(),
             params: vec![Param {
                 name: "id".into(),
                 ty: TypeRef::I32,
                 mutable: false,
+                doc: None,
             }],
             returns: Some(TypeRef::StringUtf8),
             doc: None,
@@ -4186,7 +4454,42 @@ mod tests {
             deprecated: None,
             since: None,
         }])]);
-        let stubs = render_pyi_module(&api, true);
+        let code = render_python_module(&api, true, "weaveffi.yml");
+        let pin_count = code.matches("_cb = _cb_type(_cb_impl)").count();
+        let wait_count = code.matches("_ev.wait()").count();
+        let set_count = code.matches("_ev.set()").count();
+        assert_eq!(
+            pin_count, 1,
+            "expected one `_cb = _cb_type(_cb_impl)` per async fn, got {pin_count}: {code}"
+        );
+        assert_eq!(
+            wait_count, set_count,
+            "every `_ev.wait()` must be matched by an `_ev.set()` in finally: wait={wait_count} set={set_count}: {code}"
+        );
+        assert!(
+            code.contains("finally:\n            _ev.set()"),
+            "_ev.set() must be in a finally block: {code}"
+        );
+    }
+
+    #[test]
+    fn python_pyi_async_function() {
+        let api = make_api(vec![simple_module(vec![Function {
+            name: "fetch_data".into(),
+            params: vec![Param {
+                name: "id".into(),
+                ty: TypeRef::I32,
+                mutable: false,
+                doc: None,
+            }],
+            returns: Some(TypeRef::StringUtf8),
+            doc: None,
+            r#async: true,
+            cancellable: false,
+            deprecated: None,
+            since: None,
+        }])]);
+        let stubs = render_pyi_module(&api, true, "weaveffi.yml");
         assert!(
             stubs.contains("async def fetch_data(id: int) -> str: ..."),
             "pyi should declare async def: {stubs}"
@@ -4224,6 +4527,7 @@ mod tests {
                         name: "id".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Struct("types.Name".into())),
                     doc: None,
@@ -4241,8 +4545,8 @@ mod tests {
             },
         ]);
 
-        let code = render_python_module(&api, true);
-        let stubs = render_pyi_module(&api, true);
+        let code = render_python_module(&api, true, "weaveffi.yml");
+        let stubs = render_pyi_module(&api, true, "weaveffi.yml");
 
         assert!(
             code.contains("Name(_result)"),
@@ -4301,7 +4605,7 @@ mod tests {
                 modules: vec![],
             }],
         }]);
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
         assert!(
             py.contains("# === Module: parent ==="),
             "parent module section missing: {py}"
@@ -4318,7 +4622,7 @@ mod tests {
             py.contains("weaveffi_parent_child_inner_fn"),
             "nested child C function missing: {py}"
         );
-        let pyi = render_pyi_module(&api, true);
+        let pyi = render_pyi_module(&api, true, "weaveffi.yml");
         assert!(
             pyi.contains("def inner_fn"),
             "nested child function missing from pyi: {pyi}"
@@ -4360,7 +4664,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
         assert!(
             py.contains("ListItemsIterator"),
             "should reference iterator type name: {py}"
@@ -4384,11 +4688,13 @@ mod tests {
                     name: "a".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
                 Param {
                     name: "b".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
             ],
             returns: Some(TypeRef::I32),
@@ -4398,10 +4704,87 @@ mod tests {
             deprecated: Some("Use add_v2 instead".into()),
             since: Some("0.1.0".into()),
         }])]);
-        let py = render_python_module(&api, true);
+        let py = render_python_module(&api, true, "weaveffi.yml");
         assert!(
             py.contains("warnings.warn(\"Use add_v2 instead\", DeprecationWarning, stacklevel=2)"),
             "missing deprecation warning: {py}"
         );
+    }
+
+    fn doc_api() -> Api {
+        make_api(vec![Module {
+            name: "docs".into(),
+            functions: vec![Function {
+                name: "do_thing".into(),
+                params: vec![Param {
+                    name: "x".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: Some("the input value".into()),
+                }],
+                returns: Some(TypeRef::I32),
+                doc: Some("Performs a thing.".into()),
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![StructDef {
+                name: "Item".into(),
+                doc: Some("An item we track.".into()),
+                fields: vec![StructField {
+                    name: "id".into(),
+                    ty: TypeRef::I64,
+                    doc: Some("Stable id".into()),
+                    default: None,
+                }],
+                builder: false,
+            }],
+            enums: vec![EnumDef {
+                name: "Kind".into(),
+                doc: Some("Kind of item.".into()),
+                variants: vec![EnumVariant {
+                    name: "Small".into(),
+                    value: 0,
+                    doc: Some("A small one".into()),
+                }],
+            }],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }])
+    }
+
+    #[test]
+    fn python_emits_doc_on_function() {
+        let py = render_python_module(&doc_api(), true, "weaveffi.yml");
+        assert!(py.contains("\"\"\"Performs a thing."), "{py}");
+    }
+
+    #[test]
+    fn python_emits_doc_on_struct() {
+        let py = render_python_module(&doc_api(), true, "weaveffi.yml");
+        assert!(py.contains("\"\"\"An item we track.\"\"\""), "{py}");
+    }
+
+    #[test]
+    fn python_emits_doc_on_enum_variant() {
+        let py = render_python_module(&doc_api(), true, "weaveffi.yml");
+        assert!(py.contains("\"\"\"Kind of item.\"\"\""), "{py}");
+        assert!(py.contains("# A small one"), "{py}");
+    }
+
+    #[test]
+    fn python_emits_doc_on_field() {
+        let py = render_python_module(&doc_api(), true, "weaveffi.yml");
+        assert!(py.contains("\"\"\"Stable id\"\"\""), "{py}");
+    }
+
+    #[test]
+    fn python_emits_doc_on_param() {
+        let py = render_python_module(&doc_api(), true, "weaveffi.yml");
+        assert!(py.contains("Parameters"), "{py}");
+        assert!(py.contains("x : the input value"), "{py}");
     }
 }

@@ -319,7 +319,7 @@ fn summary_md_all_links_resolve() {
 }
 
 const README_QUICKSTART_YAML: &str = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: contacts
     structs:
@@ -348,7 +348,7 @@ modules:
 fn readme_quickstart_yaml_parses_and_validates() {
     let mut api = weaveffi_ir::parse::parse_api_str(README_QUICKSTART_YAML, "yaml")
         .expect("README quickstart YAML should parse");
-    weaveffi_core::validate::validate_api(&mut api)
+    weaveffi_core::validate::validate_api(&mut api, None)
         .expect("README quickstart YAML should validate");
 
     assert_eq!(api.modules.len(), 1);
@@ -429,7 +429,8 @@ modules:
 fn getting_started_yaml_parses_and_validates() {
     let mut api = weaveffi_ir::parse::parse_api_str(GETTING_STARTED_YAML, "yaml")
         .expect("getting-started YAML should parse");
-    weaveffi_core::validate::validate_api(&mut api).expect("getting-started YAML should validate");
+    weaveffi_core::validate::validate_api(&mut api, None)
+        .expect("getting-started YAML should validate");
 
     assert_eq!(api.modules.len(), 1);
     assert_eq!(api.modules[0].name, "math");
@@ -515,4 +516,359 @@ fn getting_started_yaml_validates_via_cli() {
         .assert()
         .success()
         .stdout(predicates::str::contains("Validation passed"));
+}
+
+fn workspace_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
+fn read_workspace_file(rel: &str) -> String {
+    let path = workspace_root().join(rel);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+}
+
+#[test]
+fn readme_states_value_proposition() {
+    let readme = read_workspace_file("README.md");
+    assert!(
+        readme.contains("WeaveFFI generates type-safe bindings for 11 languages from a single IDL"),
+        "README missing the canonical value proposition"
+    );
+    assert!(
+        readme.contains("no hand-written JNI"),
+        "README missing 'no hand-written JNI' phrase"
+    );
+}
+
+#[test]
+fn readme_uses_only_current_schema_version() {
+    let readme = read_workspace_file("README.md");
+    assert!(
+        readme.contains("\"0.3.0\""),
+        "README should reference schema version 0.3.0"
+    );
+    assert!(
+        !readme.contains("\"0.1.0\""),
+        "README should not reference older schema version 0.1.0"
+    );
+    assert!(
+        !readme.contains("\"0.2.0\""),
+        "README should not reference older schema version 0.2.0"
+    );
+}
+
+#[test]
+fn readme_lists_all_eleven_targets_in_table() {
+    let readme = read_workspace_file("README.md");
+    for target in [
+        "**C**",
+        "**C++**",
+        "**Swift**",
+        "**Android**",
+        "**Node.js**",
+        "**WASM**",
+        "**Python**",
+        "**.NET**",
+        "**Dart**",
+        "**Go**",
+        "**Ruby**",
+    ] {
+        assert!(
+            readme.contains(target),
+            "README supported-targets table missing {target}"
+        );
+    }
+}
+
+#[test]
+fn readme_cli_reference_lists_every_subcommand() {
+    let readme = read_workspace_file("README.md");
+    for cmd in [
+        "weaveffi new",
+        "weaveffi generate",
+        "weaveffi validate",
+        "weaveffi lint",
+        "weaveffi diff",
+        "weaveffi extract",
+        "weaveffi format",
+        "weaveffi watch",
+        "weaveffi upgrade",
+        "weaveffi schema ",
+        "weaveffi schema-version",
+        "weaveffi doctor",
+        "weaveffi completions",
+    ] {
+        assert!(
+            readme.contains(cmd),
+            "README CLI reference table missing `{cmd}`"
+        );
+    }
+}
+
+#[test]
+fn readme_has_required_top_level_sections() {
+    let readme = read_workspace_file("README.md");
+    for section in [
+        "## Quickstart",
+        "## Why WeaveFFI?",
+        "## How does it compare?",
+        "## Supported targets",
+        "## Install",
+        "## CLI reference",
+        "## Documentation",
+        "## Status",
+        "## Contributing",
+        "## License",
+    ] {
+        assert!(
+            readme.contains(section),
+            "README missing top-level section header `{section}`"
+        );
+    }
+}
+
+#[test]
+fn readme_status_marks_1_0_release_candidate() {
+    let readme = read_workspace_file("README.md");
+    assert!(
+        readme.contains("1.0.0 release candidate"),
+        "README status section should mark the workspace as a 1.0.0 release candidate"
+    );
+}
+
+#[test]
+fn readme_install_section_documents_cargo_and_releases() {
+    let readme = read_workspace_file("README.md");
+    assert!(
+        readme.contains("cargo install weaveffi-cli"),
+        "README install section missing cargo install command"
+    );
+    assert!(
+        readme.contains("github.com/weavefoundry/weaveffi/releases"),
+        "README install section missing pre-built binaries / releases link"
+    );
+}
+
+#[test]
+fn readme_comparison_link_points_to_docs() {
+    let readme = read_workspace_file("README.md");
+    assert!(
+        readme.contains("docs/src/comparison.md"),
+        "README should link to docs/src/comparison.md from the comparison section"
+    );
+}
+
+#[test]
+fn readme_quickstart_command_emits_all_advertised_targets() {
+    let out_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let out_path = out_dir.path();
+    let yml_path = out_path.join("contacts.yml");
+    std::fs::write(&yml_path, README_QUICKSTART_YAML).unwrap();
+
+    assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args([
+            "generate",
+            yml_path.to_str().unwrap(),
+            "-o",
+            out_path.join("generated").to_str().unwrap(),
+            "--target",
+            "c,swift,python,node,dart",
+        ])
+        .assert()
+        .success();
+
+    let gen = out_path.join("generated");
+    assert!(gen.join("c/weaveffi.h").exists(), "missing c/weaveffi.h");
+    assert!(
+        gen.join("swift/Sources/WeaveFFI/WeaveFFI.swift").exists(),
+        "missing swift/Sources/WeaveFFI/WeaveFFI.swift"
+    );
+    assert!(
+        gen.join("python/weaveffi/weaveffi.pyi").exists(),
+        "missing python/weaveffi/weaveffi.pyi"
+    );
+    assert!(
+        gen.join("node/types.d.ts").exists(),
+        "missing node/types.d.ts"
+    );
+    assert!(
+        gen.join("dart/lib/weaveffi.dart").exists(),
+        "missing dart/lib/weaveffi.dart"
+    );
+}
+
+#[test]
+fn readme_quickstart_snippets_match_actual_output() {
+    let readme = read_workspace_file("README.md");
+    let out_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let out_path = out_dir.path();
+    let yml_path = out_path.join("contacts.yml");
+    std::fs::write(&yml_path, README_QUICKSTART_YAML).unwrap();
+
+    assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args([
+            "generate",
+            yml_path.to_str().unwrap(),
+            "-o",
+            out_path.join("generated").to_str().unwrap(),
+            "--target",
+            "c,swift,python,node,dart",
+        ])
+        .assert()
+        .success();
+
+    let gen = out_path.join("generated");
+
+    // Each line below appears in BOTH the README snippet and the freshly
+    // generated output, proving the README is in sync with the CLI.
+    let c_header = std::fs::read_to_string(gen.join("c/weaveffi.h")).unwrap();
+    for needle in [
+        "typedef struct weaveffi_contacts_Contact weaveffi_contacts_Contact;",
+        "void weaveffi_contacts_Contact_destroy(weaveffi_contacts_Contact* ptr);",
+    ] {
+        assert!(
+            readme.contains(needle),
+            "README C snippet missing line: {needle}"
+        );
+        assert!(
+            c_header.contains(needle),
+            "Generated C header missing line: {needle}"
+        );
+    }
+
+    let swift = std::fs::read_to_string(gen.join("swift/Sources/WeaveFFI/WeaveFFI.swift")).unwrap();
+    for needle in [
+        "public class Contact {",
+        "    let ptr: OpaquePointer",
+        "        weaveffi_contacts_Contact_destroy(ptr)",
+    ] {
+        assert!(
+            readme.contains(needle),
+            "README Swift snippet missing line: {needle}"
+        );
+        assert!(
+            swift.contains(needle),
+            "Generated Swift file missing line: {needle}"
+        );
+    }
+
+    let pyi = std::fs::read_to_string(gen.join("python/weaveffi/weaveffi.pyi")).unwrap();
+    for needle in [
+        "class Contact:",
+        "def contacts_create_contact(name: str, email: Optional[str]) -> \"Contact\": ...",
+    ] {
+        assert!(
+            readme.contains(needle),
+            "README Python snippet missing line: {needle}"
+        );
+        assert!(
+            pyi.contains(needle),
+            "Generated Python .pyi missing line: {needle}"
+        );
+    }
+
+    let dts = std::fs::read_to_string(gen.join("node/types.d.ts")).unwrap();
+    for needle in ["export interface Contact {", "  email: string | null;"] {
+        assert!(
+            readme.contains(needle),
+            "README TypeScript snippet missing line: {needle}"
+        );
+        assert!(
+            dts.contains(needle),
+            "Generated types.d.ts missing line: {needle}"
+        );
+    }
+
+    let dart = std::fs::read_to_string(gen.join("dart/lib/weaveffi.dart")).unwrap();
+    for needle in ["class Contact {", "final Pointer<Void> _handle;"] {
+        assert!(
+            readme.contains(needle),
+            "README Dart snippet missing line: {needle}"
+        );
+        assert!(
+            dart.contains(needle),
+            "Generated Dart file missing line: {needle}"
+        );
+    }
+}
+
+#[test]
+fn comparison_doc_has_required_structure() {
+    let comparison = read_workspace_file("docs/src/comparison.md");
+
+    for competitor in ["UniFFI", "cbindgen", "diplomat", "SWIG", "autocxx"] {
+        assert!(
+            comparison.contains(competitor),
+            "comparison.md missing competitor reference: {competitor}"
+        );
+    }
+
+    assert!(
+        comparison.contains("## When to choose WeaveFFI"),
+        "comparison.md missing 'When to choose WeaveFFI' section"
+    );
+    assert!(
+        comparison.contains("## Where competitors are stronger"),
+        "comparison.md should be honest about competitor strengths"
+    );
+}
+
+#[test]
+fn faq_doc_has_top_ten_questions() {
+    let faq = read_workspace_file("docs/src/faq.md");
+    for question in [
+        "Why not UniFFI?",
+        "Can I use it with C++ codebases?",
+        "Does it support generics?",
+        "What's the runtime overhead?",
+        "How are errors propagated?",
+        "Can I customize the generated code?",
+        "Does it work with Flutter?",
+        "Is it Windows-friendly?",
+        "How do I distribute the cdylib?",
+        "What's the licensing?",
+    ] {
+        assert!(
+            faq.contains(question),
+            "faq.md missing question: {question}"
+        );
+    }
+}
+
+#[test]
+fn summary_md_includes_comparison_and_faq() {
+    let summary = read_workspace_file("docs/src/SUMMARY.md");
+    assert!(
+        summary.contains("(comparison.md)"),
+        "SUMMARY.md should link to comparison.md"
+    );
+    assert!(
+        summary.contains("(faq.md)"),
+        "SUMMARY.md should link to faq.md"
+    );
+}
+
+#[test]
+fn intro_doc_matches_new_value_proposition() {
+    let intro = read_workspace_file("docs/src/intro.md");
+    assert!(
+        intro.contains("WeaveFFI generates type-safe bindings for 11 languages from a single IDL"),
+        "intro.md should lead with the canonical value proposition"
+    );
+    assert!(
+        intro.contains("[Comparison](comparison.md)"),
+        "intro.md should link to the comparison page"
+    );
+    assert!(
+        intro.contains("[FAQ](faq.md)"),
+        "intro.md should link to the FAQ page"
+    );
 }

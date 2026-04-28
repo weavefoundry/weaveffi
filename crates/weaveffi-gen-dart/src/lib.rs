@@ -1,21 +1,41 @@
+//! Dart (`dart:ffi`) binding generator for WeaveFFI.
+//!
+//! Emits a Dart package (`pubspec.yaml` + library) with `dart:ffi`
+//! bindings over the C ABI for use in Flutter and Dart projects.
+//! Implements the [`Generator`] trait.
+
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
-use weaveffi_core::utils::{c_symbol_name, local_type_name};
+use weaveffi_core::utils::{
+    c_symbol_name, local_type_name, render_prelude, render_trailer, CommentStyle,
+};
 use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, TypeRef};
 
 pub struct DartGenerator;
 
 impl DartGenerator {
-    fn generate_impl(&self, api: &Api, out_dir: &Utf8Path, package_name: &str) -> Result<()> {
+    fn generate_impl(
+        &self,
+        api: &Api,
+        out_dir: &Utf8Path,
+        package_name: &str,
+        input_basename: &str,
+    ) -> Result<()> {
         let dart_dir = out_dir.join("dart");
         let lib_dir = dart_dir.join("lib");
         std::fs::create_dir_all(&lib_dir)?;
-        std::fs::write(lib_dir.join("weaveffi.dart"), render_dart_module(api))?;
-        std::fs::write(dart_dir.join("pubspec.yaml"), render_pubspec(package_name))?;
-        std::fs::write(dart_dir.join("README.md"), render_readme())?;
+        std::fs::write(
+            lib_dir.join("weaveffi.dart"),
+            render_dart_module(api, input_basename),
+        )?;
+        std::fs::write(
+            dart_dir.join("pubspec.yaml"),
+            render_pubspec(package_name, input_basename),
+        )?;
+        std::fs::write(dart_dir.join("README.md"), render_readme(input_basename))?;
         Ok(())
     }
 }
@@ -26,7 +46,7 @@ impl Generator for DartGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "weaveffi")
+        self.generate_impl(api, out_dir, "weaveffi", "weaveffi.yml")
     }
 
     fn generate_with_config(
@@ -35,15 +55,22 @@ impl Generator for DartGenerator {
         out_dir: &Utf8Path,
         config: &GeneratorConfig,
     ) -> Result<()> {
-        self.generate_impl(api, out_dir, config.dart_package_name())
+        self.generate_impl(
+            api,
+            out_dir,
+            config.dart_package_name(),
+            config.input_basename(),
+        )
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
-        vec![
+        let mut files = vec![
+            out_dir.join("dart/README.md").to_string(),
             out_dir.join("dart/lib/weaveffi.dart").to_string(),
             out_dir.join("dart/pubspec.yaml").to_string(),
-            out_dir.join("dart/README.md").to_string(),
-        ]
+        ];
+        files.sort();
+        files
     }
 }
 
@@ -60,7 +87,6 @@ fn dart_type(ty: &TypeRef) -> String {
         TypeRef::List(inner) => format!("List<{}>", dart_type(inner)),
         TypeRef::Iterator(inner) => format!("Iterable<{}>", dart_type(inner)),
         TypeRef::Map(k, v) => format!("Map<{}, {}>", dart_type(k), dart_type(v)),
-        TypeRef::Callback(_) => "Function".into(),
     }
 }
 
@@ -84,9 +110,7 @@ fn native_ffi_type(ty: &TypeRef) -> String {
         TypeRef::Bytes | TypeRef::BorrowedBytes => "Pointer<Uint8>".into(),
         TypeRef::TypedHandle(_) | TypeRef::Struct(_) => "Pointer<Void>".into(),
         TypeRef::Optional(inner) => native_ffi_type(inner),
-        TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) | TypeRef::Callback(_) => {
-            "Pointer<Void>".into()
-        }
+        TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) => "Pointer<Void>".into(),
     }
 }
 
@@ -103,9 +127,7 @@ fn dart_ffi_type(ty: &TypeRef) -> String {
         TypeRef::Bytes | TypeRef::BorrowedBytes => "Pointer<Uint8>".into(),
         TypeRef::TypedHandle(_) | TypeRef::Struct(_) => "Pointer<Void>".into(),
         TypeRef::Optional(inner) => dart_ffi_type(inner),
-        TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) | TypeRef::Callback(_) => {
-            "Pointer<Void>".into()
-        }
+        TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) => "Pointer<Void>".into(),
     }
 }
 
@@ -130,19 +152,25 @@ fn emit_typedef_and_lookup(
     ));
 }
 
-fn render_pubspec(package_name: &str) -> String {
+fn render_pubspec(package_name: &str, input_basename: &str) -> String {
+    let prelude = render_prelude(CommentStyle::Hash, input_basename);
+    let trailer = render_trailer(CommentStyle::Hash, "pubspec.yaml");
     format!(
-        "name: {package_name}\n\
+        "{prelude}name: {package_name}\n\
          version: 0.1.0\n\
          environment:\n\
          \x20 sdk: '>=3.0.0 <4.0.0'\n\
          dependencies:\n\
-         \x20 ffi: ^2.0.0\n"
+         \x20 ffi: ^2.0.0\n\n\
+         {trailer}"
     )
 }
 
-fn render_readme() -> String {
-    r#"# WeaveFFI Dart Bindings
+fn render_readme(input_basename: &str) -> String {
+    let prelude = render_prelude(CommentStyle::Xml, input_basename);
+    let trailer = render_trailer(CommentStyle::Xml, "README.md");
+    format!(
+        r#"{prelude}# WeaveFFI Dart Bindings
 
 Auto-generated Dart bindings using `dart:ffi`.
 
@@ -165,8 +193,9 @@ import 'package:weaveffi/weaveffi.dart';
 
 - Dart SDK >= 3.0.0
 - The `ffi` package (`^2.0.0`) for `Utf8` and `calloc` helpers.
-"#
-    .into()
+
+{trailer}"#
+    )
 }
 
 fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
@@ -193,18 +222,39 @@ fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Mo
     }
 }
 
-fn render_dart_module(api: &Api) -> String {
-    let mut out = String::new();
+/// Emits a Dart `///` doc comment at `indent`. Each input line is prefixed
+/// with `/// `; blank lines become `///`.
+fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
+    let Some(doc) = doc else {
+        return;
+    };
+    let doc = doc.trim();
+    if doc.is_empty() {
+        return;
+    }
+    for line in doc.lines() {
+        out.push_str(indent);
+        if line.is_empty() {
+            out.push_str("///\n");
+        } else {
+            out.push_str("/// ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+}
+
+fn render_dart_module(api: &Api, input_basename: &str) -> String {
+    let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
     let has_async = collect_all_modules(&api.modules)
         .iter()
         .any(|m| m.functions.iter().any(|f| f.r#async));
 
-    out.push_str("// Auto-generated by WeaveFFI. Do not edit.\n");
     out.push_str("// ignore_for_file: non_constant_identifier_names, camel_case_types\n\n");
     out.push_str("import 'dart:ffi';\n");
     out.push_str("import 'dart:io' show Platform;\n");
     if has_async {
-        out.push_str("import 'dart:isolate';\n");
+        out.push_str("import 'dart:async';\n");
     }
     out.push_str("import 'package:ffi/ffi.dart';\n\n");
 
@@ -264,22 +314,19 @@ fn render_dart_module(api: &Api) -> String {
         }
     }
 
+    out.push('\n');
+    out.push_str(&render_trailer(CommentStyle::DoubleSlash, "weaveffi.dart"));
     out
 }
 
 fn render_enum(out: &mut String, e: &EnumDef) {
     let name = e.name.to_upper_camel_case();
-    if let Some(doc) = &e.doc {
-        out.push_str(&format!("\n/// {doc}\n"));
-    } else {
-        out.push('\n');
-    }
+    out.push('\n');
+    emit_doc(out, &e.doc, "");
     out.push_str(&format!("enum {name} {{\n"));
     for v in &e.variants {
         let vname = v.name.to_lower_camel_case();
-        if let Some(doc) = &v.doc {
-            out.push_str(&format!("  /// {doc}\n"));
-        }
+        emit_doc(out, &v.doc, "  ");
         out.push_str(&format!("  {vname}({}),\n", v.value));
     }
     out.push_str("  ;\n");
@@ -319,11 +366,8 @@ fn render_struct(out: &mut String, module_path: &str, s: &StructDef) {
         );
     }
 
-    if let Some(doc) = &s.doc {
-        out.push_str(&format!("\n/// {doc}\n"));
-    } else {
-        out.push('\n');
-    }
+    out.push('\n');
+    emit_doc(out, &s.doc, "");
     out.push_str(&format!("class {class_name} {{\n"));
     out.push_str("  final Pointer<Void> _handle;\n");
     out.push_str(&format!("  {class_name}._(this._handle);\n\n"));
@@ -340,7 +384,9 @@ fn render_struct(out: &mut String, module_path: &str, s: &StructDef) {
         let dart_ret = dart_type(&field.ty);
         let fname = field.name.to_lower_camel_case();
 
-        out.push_str(&format!("\n  {dart_ret} get {fname} {{\n"));
+        out.push('\n');
+        emit_doc(out, &field.doc, "  ");
+        out.push_str(&format!("  {dart_ret} get {fname} {{\n"));
         out.push_str("    final err = calloc<_WeaveffiError>();\n");
         out.push_str("    try {\n");
         out.push_str(&format!(
@@ -362,7 +408,9 @@ fn render_dart_builder(out: &mut String, s: &StructDef) {
     let class_name = s.name.to_upper_camel_case();
     let builder_name = format!("{class_name}Builder");
 
-    out.push_str(&format!("\nclass {builder_name} {{\n"));
+    out.push('\n');
+    emit_doc(out, &s.doc, "");
+    out.push_str(&format!("class {builder_name} {{\n"));
     for field in &s.fields {
         let dt = dart_nullable_type_for_builder_field(&field.ty);
         let priv_name = field.name.to_lower_camel_case();
@@ -373,8 +421,10 @@ fn render_dart_builder(out: &mut String, s: &StructDef) {
         let pascal = field.name.to_upper_camel_case();
         let dt = dart_type(&field.ty);
         let priv_name = field.name.to_lower_camel_case();
+        out.push('\n');
+        emit_doc(out, &field.doc, "  ");
         out.push_str(&format!(
-            "\n  {builder_name} with{pascal}({dt} value) {{\n    _{priv_name} = value;\n    return this;\n  }}\n"
+            "  {builder_name} with{pascal}({dt} value) {{\n    _{priv_name} = value;\n    return this;\n  }}\n"
         ));
     }
 
@@ -397,6 +447,18 @@ fn render_dart_builder(out: &mut String, s: &StructDef) {
 
 fn render_function(out: &mut String, module_path: &str, f: &Function) {
     let c_sym = c_symbol_name(module_path, &f.name);
+    let wrapper_name = f.name.to_lower_camel_case();
+    let pub_ret = f.returns.as_ref().map_or("void".into(), dart_type);
+    let wrapper_params: Vec<String> = f
+        .params
+        .iter()
+        .map(|p| format!("{} {}", dart_type(&p.ty), p.name.to_lower_camel_case()))
+        .collect();
+
+    if f.r#async {
+        render_async_function(out, &c_sym, f, &wrapper_name, &pub_ret, &wrapper_params);
+        return;
+    }
 
     let mut native_params: Vec<String> = f.params.iter().map(|p| native_ffi_type(&p.ty)).collect();
     native_params.push("Pointer<_WeaveffiError>".into());
@@ -415,59 +477,278 @@ fn render_function(out: &mut String, module_path: &str, f: &Function) {
         &dart_ret,
     );
 
-    let wrapper_name = f.name.to_lower_camel_case();
-    let pub_ret = f.returns.as_ref().map_or("void".into(), dart_type);
-    let wrapper_params: Vec<String> = f
-        .params
-        .iter()
-        .map(|p| format!("{} {}", dart_type(&p.ty), p.name.to_lower_camel_case()))
+    out.push('\n');
+    emit_doc(out, &f.doc, "");
+    if let Some(msg) = &f.deprecated {
+        let escaped = msg.replace('\'', "\\'");
+        out.push_str(&format!("@Deprecated('{escaped}')\n"));
+    }
+    out.push_str(&format!(
+        "{pub_ret} {wrapper_name}({}) {{\n",
+        wrapper_params.join(", ")
+    ));
+    emit_function_body(out, f, &c_sym);
+    out.push_str("}\n");
+}
+
+/// Returns the (native, dart) FFI types of the trailing callback parameters
+/// (those after `(context, err)`) for an async function with the given return
+/// type. The empty vec means the callback signature is `(context, err)` with
+/// no extra payload.
+fn async_cb_extra_params(ret: Option<&TypeRef>) -> Vec<(&'static str, &'static str)> {
+    match ret {
+        None => vec![],
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
+            vec![("Pointer<Uint8>", "Pointer<Uint8>"), ("Size", "int")]
+        }
+        Some(TypeRef::List(_) | TypeRef::Iterator(_)) => {
+            vec![("Pointer<Void>", "Pointer<Void>"), ("Size", "int")]
+        }
+        Some(TypeRef::Map(_, _)) => vec![
+            ("Pointer<Void>", "Pointer<Void>"),
+            ("Pointer<Void>", "Pointer<Void>"),
+            ("Size", "int"),
+        ],
+        Some(t) => vec![{
+            let n: &'static str = match t {
+                TypeRef::I32 | TypeRef::U32 | TypeRef::Bool | TypeRef::Enum(_) => "Int32",
+                TypeRef::I64 | TypeRef::Handle | TypeRef::TypedHandle(_) => "Int64",
+                TypeRef::F64 => "Double",
+                TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Utf8>",
+                TypeRef::Struct(_) => "Pointer<Void>",
+                _ => "Pointer<Void>",
+            };
+            let d: &'static str = match t {
+                TypeRef::I32
+                | TypeRef::U32
+                | TypeRef::I64
+                | TypeRef::Bool
+                | TypeRef::Enum(_)
+                | TypeRef::Handle
+                | TypeRef::TypedHandle(_) => "int",
+                TypeRef::F64 => "double",
+                TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Utf8>",
+                TypeRef::Struct(_) => "Pointer<Void>",
+                _ => "Pointer<Void>",
+            };
+            (n, d)
+        }],
+    }
+}
+
+fn render_async_function(
+    out: &mut String,
+    c_sym: &str,
+    f: &Function,
+    wrapper_name: &str,
+    pub_ret: &str,
+    wrapper_params: &[String],
+) {
+    let cb_extras = async_cb_extra_params(f.returns.as_ref());
+    let cb_native_params: Vec<String> = std::iter::once("Pointer<Void>".to_string())
+        .chain(std::iter::once("Pointer<_WeaveffiError>".to_string()))
+        .chain(cb_extras.iter().map(|(n, _)| (*n).to_string()))
         .collect();
 
-    if f.r#async {
-        let sync_name = format!("_{wrapper_name}");
-        out.push('\n');
-        if let Some(msg) = &f.deprecated {
-            let escaped = msg.replace('\'', "\\'");
-            out.push_str(&format!("@Deprecated('{escaped}')\n"));
-        }
-        out.push_str(&format!(
-            "{pub_ret} {sync_name}({}) {{\n",
-            wrapper_params.join(", ")
-        ));
-        emit_function_body(out, f, &c_sym);
-        out.push_str("}\n");
+    let cb_typedef = format!("_NativeAsyncCb_{c_sym}");
+    out.push_str(&format!(
+        "\ntypedef {cb_typedef} = Void Function({});\n",
+        cb_native_params.join(", ")
+    ));
 
-        let call_args: Vec<String> = f
-            .params
-            .iter()
-            .map(|p| p.name.to_lower_camel_case())
-            .collect();
-        out.push('\n');
-        if let Some(msg) = &f.deprecated {
-            let escaped = msg.replace('\'', "\\'");
-            out.push_str(&format!("@Deprecated('{escaped}')\n"));
-        }
-        out.push_str(&format!(
-            "Future<{pub_ret}> {wrapper_name}({}) async {{\n",
-            wrapper_params.join(", ")
-        ));
-        out.push_str(&format!(
-            "  return await Isolate.run(() => {sync_name}({}));\n",
-            call_args.join(", ")
-        ));
-        out.push_str("}\n");
+    let async_sym = format!("{c_sym}_async");
+    let mut native_params: Vec<String> = f.params.iter().map(|p| native_ffi_type(&p.ty)).collect();
+    if f.cancellable {
+        native_params.push("Pointer<Void>".into());
+    }
+    native_params.push(format!("Pointer<NativeFunction<{cb_typedef}>>"));
+    native_params.push("Pointer<Void>".into());
+    let mut dart_params: Vec<String> = f.params.iter().map(|p| dart_ffi_type(&p.ty)).collect();
+    if f.cancellable {
+        dart_params.push("Pointer<Void>".into());
+    }
+    dart_params.push(format!("Pointer<NativeFunction<{cb_typedef}>>"));
+    dart_params.push("Pointer<Void>".into());
+
+    emit_typedef_and_lookup(
+        out,
+        &async_sym,
+        &native_params.join(", "),
+        &dart_params.join(", "),
+        "Void",
+        "void",
+    );
+
+    out.push('\n');
+    emit_doc(out, &f.doc, "");
+    if let Some(msg) = &f.deprecated {
+        let escaped = msg.replace('\'', "\\'");
+        out.push_str(&format!("@Deprecated('{escaped}')\n"));
+    }
+    out.push_str(&format!(
+        "Future<{pub_ret}> {wrapper_name}({}) {{\n",
+        wrapper_params.join(", ")
+    ));
+
+    let completer_type = if f.returns.is_some() {
+        pub_ret.to_string()
     } else {
-        out.push('\n');
-        if let Some(msg) = &f.deprecated {
-            let escaped = msg.replace('\'', "\\'");
-            out.push_str(&format!("@Deprecated('{escaped}')\n"));
+        "void".to_string()
+    };
+    out.push_str(&format!(
+        "  final completer = Completer<{completer_type}>();\n"
+    ));
+
+    let mut native_strings = Vec::new();
+    for p in &f.params {
+        if matches!(p.ty, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
+            let pname = p.name.to_lower_camel_case();
+            let ptr = format!("{pname}Ptr");
+            out.push_str(&format!("  final {ptr} = {pname}.toNativeUtf8();\n"));
+            native_strings.push(ptr);
         }
-        out.push_str(&format!(
-            "{pub_ret} {wrapper_name}({}) {{\n",
-            wrapper_params.join(", ")
-        ));
-        emit_function_body(out, f, &c_sym);
-        out.push_str("}\n");
+    }
+
+    let cb_dart_params: Vec<String> = std::iter::once("Pointer<Void>".to_string())
+        .chain(std::iter::once("Pointer<_WeaveffiError>".to_string()))
+        .chain(cb_extras.iter().map(|(_, d)| (*d).to_string()))
+        .collect();
+    let cb_arg_names: Vec<String> = (0..cb_dart_params.len())
+        .map(|i| match i {
+            0 => "context".to_string(),
+            1 => "err".to_string(),
+            2 => "result".to_string(),
+            3 => "resultLen".to_string(),
+            4 => "resultLenExtra".to_string(),
+            _ => format!("arg{i}"),
+        })
+        .collect();
+    let cb_param_decls: Vec<String> = cb_dart_params
+        .iter()
+        .zip(cb_arg_names.iter())
+        .map(|(t, n)| format!("{t} {n}"))
+        .collect();
+
+    out.push_str(&format!("  late NativeCallable<{cb_typedef}> callable;\n"));
+    out.push_str(&format!(
+        "  callable = NativeCallable<{cb_typedef}>.listener(({}) {{\n",
+        cb_param_decls.join(", ")
+    ));
+    out.push_str("    try {\n");
+    out.push_str("      if (err.address != 0 && err.ref.code != 0) {\n");
+    out.push_str("        final code = err.ref.code;\n");
+    out.push_str("        final msg = err.ref.message.toDartString();\n");
+    out.push_str("        _weaveffiErrorClear(err);\n");
+    out.push_str("        completer.completeError(WeaveffiException(code, msg));\n");
+    out.push_str("        return;\n");
+    out.push_str("      }\n");
+    emit_async_complete(out, f.returns.as_ref(), "      ");
+    out.push_str("    } catch (e) {\n");
+    out.push_str("      completer.completeError(e);\n");
+    out.push_str("    } finally {\n");
+    out.push_str("      callable.close();\n");
+    out.push_str("    }\n");
+    out.push_str("  });\n");
+
+    let mut call_args: Vec<String> = Vec::new();
+    for p in &f.params {
+        let pname = p.name.to_lower_camel_case();
+        call_args.push(match &p.ty {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("{pname}Ptr"),
+            TypeRef::Bool => format!("{pname} ? 1 : 0"),
+            TypeRef::Enum(_) => format!("{pname}.value"),
+            TypeRef::TypedHandle(_) | TypeRef::Struct(_) => format!("{pname}._handle"),
+            _ => pname,
+        });
+    }
+    if f.cancellable {
+        call_args.push("nullptr".into());
+    }
+    call_args.push("callable.nativeFunction".into());
+    call_args.push("nullptr".into());
+
+    let var = async_sym.to_lower_camel_case();
+    out.push_str("  try {\n");
+    out.push_str(&format!("    _{var}({});\n", call_args.join(", ")));
+    out.push_str("  } catch (e) {\n");
+    out.push_str("    callable.close();\n");
+    for ns in &native_strings {
+        out.push_str(&format!("    calloc.free({ns});\n"));
+    }
+    out.push_str("    rethrow;\n");
+    out.push_str("  }\n");
+    if native_strings.is_empty() {
+        out.push_str("  return completer.future;\n");
+    } else {
+        out.push_str("  return completer.future.whenComplete(() {\n");
+        for ns in &native_strings {
+            out.push_str(&format!("    calloc.free({ns});\n"));
+        }
+        out.push_str("  });\n");
+    }
+    out.push_str("}\n");
+}
+
+fn emit_async_complete(out: &mut String, ty: Option<&TypeRef>, indent: &str) {
+    match ty {
+        None => {
+            out.push_str(&format!("{indent}completer.complete();\n"));
+        }
+        Some(TypeRef::Bool) => {
+            out.push_str(&format!("{indent}completer.complete(result != 0);\n"));
+        }
+        Some(TypeRef::Enum(name)) => {
+            let n = name.to_upper_camel_case();
+            out.push_str(&format!(
+                "{indent}completer.complete({n}.fromValue(result));\n"
+            ));
+        }
+        Some(TypeRef::Struct(name)) => {
+            let n = local_type_name(name).to_upper_camel_case();
+            out.push_str(&format!("{indent}completer.complete({n}._(result));\n"));
+        }
+        Some(TypeRef::TypedHandle(name)) => {
+            let n = name.to_upper_camel_case();
+            out.push_str(&format!("{indent}completer.complete({n}._(result));\n"));
+        }
+        Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
+            out.push_str(&format!(
+                "{indent}completer.complete(result.toDartString());\n"
+            ));
+        }
+        Some(TypeRef::Optional(inner)) => match inner.as_ref() {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                out.push_str(&format!("{indent}if (result == nullptr) {{\n"));
+                out.push_str(&format!("{indent}  completer.complete(null);\n"));
+                out.push_str(&format!("{indent}}} else {{\n"));
+                out.push_str(&format!(
+                    "{indent}  completer.complete(result.toDartString());\n"
+                ));
+                out.push_str(&format!("{indent}}}\n"));
+            }
+            TypeRef::Struct(name) => {
+                let n = local_type_name(name).to_upper_camel_case();
+                out.push_str(&format!("{indent}if (result == nullptr) {{\n"));
+                out.push_str(&format!("{indent}  completer.complete(null);\n"));
+                out.push_str(&format!("{indent}}} else {{\n"));
+                out.push_str(&format!("{indent}  completer.complete({n}._(result));\n"));
+                out.push_str(&format!("{indent}}}\n"));
+            }
+            TypeRef::TypedHandle(name) => {
+                let n = name.to_upper_camel_case();
+                out.push_str(&format!("{indent}if (result == nullptr) {{\n"));
+                out.push_str(&format!("{indent}  completer.complete(null);\n"));
+                out.push_str(&format!("{indent}}} else {{\n"));
+                out.push_str(&format!("{indent}  completer.complete({n}._(result));\n"));
+                out.push_str(&format!("{indent}}}\n"));
+            }
+            _ => {
+                out.push_str(&format!("{indent}completer.complete(result);\n"));
+            }
+        },
+        Some(_) => {
+            out.push_str(&format!("{indent}completer.complete(result);\n"));
+        }
     }
 }
 
@@ -611,9 +892,9 @@ mod tests {
         assert_eq!(
             files,
             vec![
+                out.join("dart/README.md").to_string(),
                 out.join("dart/lib/weaveffi.dart").to_string(),
                 out.join("dart/pubspec.yaml").to_string(),
-                out.join("dart/README.md").to_string(),
             ]
         );
     }
@@ -679,11 +960,13 @@ mod tests {
                     name: "a".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
                 Param {
                     name: "b".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
             ],
             returns: Some(TypeRef::I32),
@@ -820,7 +1103,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let dart = render_dart_module(&api);
+        let dart = render_dart_module(&api, "weaveffi.yml");
 
         assert!(dart.contains("class Contact {"), "missing class: {dart}");
         assert!(
@@ -886,7 +1169,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let dart = render_dart_module(&api);
+        let dart = render_dart_module(&api, "weaveffi.yml");
         assert!(
             dart.contains("class PointBuilder {"),
             "builder class: {dart}"
@@ -911,6 +1194,7 @@ mod tests {
                     name: "color".into(),
                     ty: TypeRef::Enum("Color".into()),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Enum("Color".into())),
                 doc: None,
@@ -947,7 +1231,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let dart = render_dart_module(&api);
+        let dart = render_dart_module(&api, "weaveffi.yml");
 
         assert!(dart.contains("enum Color {"), "missing enum: {dart}");
         assert!(dart.contains("red(0)"), "missing red: {dart}");
@@ -992,7 +1276,7 @@ mod tests {
             since: None,
         }])]);
 
-        let dart = render_dart_module(&api);
+        let dart = render_dart_module(&api, "weaveffi.yml");
         assert!(
             dart.contains("void reset()"),
             "missing void function: {dart}"
@@ -1013,6 +1297,7 @@ mod tests {
                     name: "msg".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::StringUtf8),
                 doc: None,
@@ -1029,7 +1314,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let dart = render_dart_module(&api);
+        let dart = render_dart_module(&api, "weaveffi.yml");
         assert!(
             dart.contains("String echo(String msg)"),
             "missing signature: {dart}"
@@ -1056,6 +1341,7 @@ mod tests {
                 name: "flag".into(),
                 ty: TypeRef::Bool,
                 mutable: false,
+                doc: None,
             }],
             returns: Some(TypeRef::Bool),
             doc: None,
@@ -1065,7 +1351,7 @@ mod tests {
             since: None,
         }])]);
 
-        let dart = render_dart_module(&api);
+        let dart = render_dart_module(&api, "weaveffi.yml");
         assert!(
             dart.contains("bool isValid(bool flag)"),
             "missing signature: {dart}"
@@ -1082,6 +1368,7 @@ mod tests {
                 name: "id".into(),
                 ty: TypeRef::I32,
                 mutable: false,
+                doc: None,
             }],
             returns: Some(TypeRef::StringUtf8),
             doc: None,
@@ -1091,20 +1378,58 @@ mod tests {
             since: None,
         }])]);
 
-        let dart = render_dart_module(&api);
+        let dart = render_dart_module(&api, "weaveffi.yml");
         assert!(
-            dart.contains("import 'dart:isolate'"),
-            "missing isolate import: {dart}"
+            dart.contains("import 'dart:async'"),
+            "missing dart:async import: {dart}"
         );
         assert!(
-            dart.contains("String _fetchData(int id)"),
-            "missing sync helper: {dart}"
-        );
-        assert!(
-            dart.contains("Future<String> fetchData(int id) async"),
+            dart.contains("Future<String> fetchData(int id)"),
             "missing async wrapper: {dart}"
         );
-        assert!(dart.contains("Isolate.run"), "missing Isolate.run: {dart}");
+        assert!(
+            dart.contains("NativeCallable<_NativeAsyncCb_weaveffi_math_fetch_data>.listener"),
+            "missing NativeCallable.listener: {dart}"
+        );
+        assert!(
+            dart.contains("weaveffi_math_fetch_data_async"),
+            "must call the _async C symbol: {dart}"
+        );
+    }
+
+    /// `NativeCallable.listener` allocates a native trampoline that pins the
+    /// Dart closure across the C boundary. It must be matched by exactly one
+    /// `callable.close()` on every exit path so the trampoline is freed when
+    /// the future resolves.
+    #[test]
+    fn dart_async_pins_callback_for_lifetime() {
+        let api = make_api(vec![simple_module(vec![Function {
+            name: "fetch_data".into(),
+            params: vec![Param {
+                name: "id".into(),
+                ty: TypeRef::I32,
+                mutable: false,
+                doc: None,
+            }],
+            returns: Some(TypeRef::StringUtf8),
+            doc: None,
+            r#async: true,
+            cancellable: false,
+            deprecated: None,
+            since: None,
+        }])]);
+        let dart = render_dart_module(&api, "weaveffi.yml");
+        let pin_count = dart.matches(".listener(").count();
+        let unpin_count = dart.matches("callable.close()").count();
+        assert_eq!(
+            pin_count, 1,
+            "expected one NativeCallable.listener per async fn, got {pin_count}: {dart}"
+        );
+        // Two close sites per fn: callback finally, and try/catch around _ffiCall.
+        assert_eq!(
+            unpin_count, 2,
+            "expected callable.close() in callback finally and synchronous catch (2 total), got {unpin_count}: {dart}"
+        );
     }
 
     #[test]
@@ -1117,6 +1442,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::Handle,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -1133,7 +1459,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let dart = render_dart_module(&api);
+        let dart = render_dart_module(&api, "weaveffi.yml");
         assert!(
             dart.contains("Contact getContact(int id)"),
             "missing signature: {dart}"
@@ -1157,7 +1483,7 @@ mod tests {
             since: None,
         }])]);
 
-        let dart = render_dart_module(&api);
+        let dart = render_dart_module(&api, "weaveffi.yml");
         assert!(
             dart.contains("Int64 Function("),
             "missing Int64 for Handle: {dart}"
@@ -1215,6 +1541,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::I64,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
                 doc: None,
@@ -1231,7 +1558,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let dart = render_dart_module(&api);
+        let dart = render_dart_module(&api, "weaveffi.yml");
         assert!(
             dart.contains("String? findUser(int id)"),
             "missing optional return type: {dart}"
@@ -1256,6 +1583,7 @@ mod tests {
                     name: "items".into(),
                     ty: TypeRef::List(Box::new(TypeRef::I32)),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
                 doc: None,
@@ -1272,7 +1600,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let dart = render_dart_module(&api);
+        let dart = render_dart_module(&api, "weaveffi.yml");
         assert!(
             dart.contains("List<String> getScores(List<int> items)"),
             "missing list signature: {dart}"
@@ -1308,7 +1636,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let dart = render_dart_module(&api);
+        let dart = render_dart_module(&api, "weaveffi.yml");
         assert!(
             dart.contains("Map<String, int> getEntries()"),
             "missing map return type: {dart}"
@@ -1326,6 +1654,7 @@ mod tests {
                         name: "name".into(),
                         ty: TypeRef::StringUtf8,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::TypedHandle("Session".into())),
                     doc: None,
@@ -1340,6 +1669,7 @@ mod tests {
                         name: "session".into(),
                         ty: TypeRef::TypedHandle("Session".into()),
                         mutable: false,
+                        doc: None,
                     }],
                     returns: None,
                     doc: None,
@@ -1357,7 +1687,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let dart = render_dart_module(&api);
+        let dart = render_dart_module(&api, "weaveffi.yml");
         assert!(
             dart.contains("Session createSession(String name)"),
             "missing typed handle return: {dart}"
@@ -1388,21 +1718,25 @@ mod tests {
                             name: "first_name".into(),
                             ty: TypeRef::StringUtf8,
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "last_name".into(),
                             ty: TypeRef::StringUtf8,
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "email".into(),
                             ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "contact_type".into(),
                             ty: TypeRef::Enum("ContactType".into()),
                             mutable: false,
+                            doc: None,
                         },
                     ],
                     returns: Some(TypeRef::Handle),
@@ -1418,6 +1752,7 @@ mod tests {
                         name: "id".into(),
                         ty: TypeRef::Handle,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Struct("Contact".into())),
                     doc: None,
@@ -1442,6 +1777,7 @@ mod tests {
                         name: "id".into(),
                         ty: TypeRef::Handle,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Bool),
                     doc: None,
@@ -1525,7 +1861,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let dart = render_dart_module(&api);
+        let dart = render_dart_module(&api, "weaveffi.yml");
 
         assert!(
             dart.contains("enum ContactType {"),
@@ -1639,6 +1975,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -1651,7 +1988,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let dart = render_dart_module(&api);
+        let dart = render_dart_module(&api, "weaveffi.yml");
 
         assert!(
             !dart.contains("weaveffi_free_string(namePtr"),
@@ -1690,6 +2027,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                     "Contact".into(),
@@ -1708,7 +2046,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let dart = render_dart_module(&api);
+        let dart = render_dart_module(&api, "weaveffi.yml");
 
         let fn_start = dart
             .find("Contact? findContact(")
@@ -1725,5 +2063,75 @@ mod tests {
             null_check < contact_wrap,
             "optional struct return should check null before wrapping: {dart}"
         );
+    }
+
+    fn doc_api() -> Api {
+        make_api(vec![Module {
+            name: "docs".into(),
+            functions: vec![Function {
+                name: "do_thing".into(),
+                params: vec![Param {
+                    name: "x".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: None,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: Some("Performs a thing.".into()),
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![StructDef {
+                name: "Item".into(),
+                doc: Some("An item we track.".into()),
+                fields: vec![StructField {
+                    name: "id".into(),
+                    ty: TypeRef::I64,
+                    doc: Some("Stable id".into()),
+                    default: None,
+                }],
+                builder: false,
+            }],
+            enums: vec![EnumDef {
+                name: "Kind".into(),
+                doc: Some("Kind of item.".into()),
+                variants: vec![EnumVariant {
+                    name: "Small".into(),
+                    value: 0,
+                    doc: Some("A small one".into()),
+                }],
+            }],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }])
+    }
+
+    #[test]
+    fn dart_emits_doc_on_function() {
+        let dart = render_dart_module(&doc_api(), "weaveffi.yml");
+        assert!(dart.contains("/// Performs a thing."), "{dart}");
+    }
+
+    #[test]
+    fn dart_emits_doc_on_struct() {
+        let dart = render_dart_module(&doc_api(), "weaveffi.yml");
+        assert!(dart.contains("/// An item we track."), "{dart}");
+    }
+
+    #[test]
+    fn dart_emits_doc_on_enum_variant() {
+        let dart = render_dart_module(&doc_api(), "weaveffi.yml");
+        assert!(dart.contains("/// Kind of item."), "{dart}");
+        assert!(dart.contains("/// A small one"), "{dart}");
+    }
+
+    #[test]
+    fn dart_emits_doc_on_field() {
+        let dart = render_dart_module(&doc_api(), "weaveffi.yml");
+        assert!(dart.contains("/// Stable id"), "{dart}");
     }
 }

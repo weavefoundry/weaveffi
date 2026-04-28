@@ -21,6 +21,8 @@ members = [
     "samples/inventory",
     "samples/async-demo",
     "samples/events",
+    "samples/kvstore",
+    "crates/weaveffi-fuzz",
 ]
 resolver = "2"
 
@@ -55,6 +57,11 @@ similar = "2.0"
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 tera = "1.20"
+miette = { version = "7", features = ["fancy"] }
+insta = { version = "1", features = ["yaml", "json"] }
+notify = "6"
+schemars = { version = "0.8", features = ["preserve_order"] }
+rayon = "1.10"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

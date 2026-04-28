@@ -1,0 +1,69 @@
+# cargo-deny configuration for WeaveFFI
+# https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# RustSec is the canonical advisory database for Rust crates; it mirrors
+# Rust-relevant advisories from the GitHub Advisory Database into the format
+# cargo-deny understands. cargo-deny v2 advisories format treats
+# vulnerabilities as errors and unmaintained/yanked as warnings, which matches
+# the CI policy ("allow advisories warnings to land but fail on errors").
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "warn"
+ignore = []
+
+[licenses]
+# Only permissive licenses we have actually vetted. Anything outside this list
+# must be reviewed and explicitly allowlisted.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    # SPDX identifier used by unicode-ident >= 1.0.13 in place of the
+    # historical Unicode-DFS-2016 expression; same permissive intent.
+    "Unicode-3.0",
+    "MPL-2.0",
+    "Zlib",
+    "CC0-1.0",
+]
+confidence-threshold = 0.93
+
+[licenses.private]
+# Skip license checks for unpublished workspace crates (samples and addons in
+# samples/* are all `publish = false`).
+ignore = true
+
+[[licenses.exceptions]]
+# libfuzzer-sys vendors LLVM's libFuzzer, whose runtime is NCSA-licensed.
+# It's OSI-approved and FSF Free, but only relevant inside the fuzz crate,
+# so allow it narrowly here instead of globally widening `allow`.
+name = "libfuzzer-sys"
+allow = ["NCSA"]
+
+[bans]
+# We tolerate at most a handful of duplicate versions of the same crate; any
+# more than that is a sign of dependency churn we should clean up. cargo-deny
+# does not support a numeric threshold here, so we report duplicates as
+# warnings (which CI treats as informational) and rely on review to catch
+# regressions above ~3 copies.
+multiple-versions = "warn"
+wildcards = "deny"
+# Path-only deps (`{ path = "..." }`) get a synthetic `*` version requirement;
+# allow that so workspace-internal deps don't trip the wildcard check.
+allow-wildcard-paths = true
+deny = [
+    # We never want to pull in OpenSSL transitively. Anything needing TLS
+    # should depend on rustls.
+    { crate = "openssl-sys", reason = "WeaveFFI must not pull in OpenSSL; use rustls instead" },
+]
+
+[sources]
+# Only crates.io is allowed as a source. No git deps, no alternative
+# registries.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -1,23 +1,18 @@
 # Ruby
 
-The Ruby generator produces pure-Ruby FFI bindings using the
-[ffi](https://github.com/ffi/ffi) gem to call the C ABI directly. No
-compilation step, no native extensions — just `require 'ffi'` and go.
+## Overview
 
-## Why the FFI gem?
+The Ruby target produces pure-Ruby FFI bindings using the
+[ffi](https://github.com/ffi/ffi) gem to call the C ABI directly. There
+is no native extension to compile — `gem install ffi` is the only
+prerequisite. The generator emits a single `.rb` file plus a `gemspec`
+ready for `gem build` and `gem install`.
 
-- **Minimal dependency.** The `ffi` gem is the standard Ruby library for
-  calling native code. It is battle-tested in projects like GRPC, Sass, and
-  libsodium bindings.
-- **No C compiler required.** The generated `.rb` files are plain Ruby — no
-  Makefile, no `extconf.rb`, no build step beyond `gem install ffi`.
-- **Transparent.** Developers can read and debug the generated code directly.
+The trade-off is that FFI gem calls are slower than a hand-written C
+extension. For typical FFI workloads the overhead is negligible compared
+to the work done inside the Rust library.
 
-The trade-off is that FFI gem calls are slower than hand-written C extensions.
-For most FFI workloads the overhead is negligible compared to the work done
-inside the Rust library.
-
-## Generated artifacts
+## What gets generated
 
 | File | Purpose |
 |------|---------|
@@ -25,40 +20,31 @@ inside the Rust library.
 | `ruby/weaveffi.gemspec` | Gem specification with `ffi ~> 1.15` dependency |
 | `ruby/README.md` | Prerequisites and usage instructions |
 
-## The FFI gem approach
+## Type mapping
 
-The generated module extends `FFI::Library` and uses `attach_function` to bind
-each C ABI symbol. Platform detection selects the correct shared library name
-at load time:
+| IDL type     | Ruby type          | FFI type                       |
+|--------------|--------------------|--------------------------------|
+| `i32`        | `Integer`          | `:int32`                       |
+| `u32`        | `Integer`          | `:uint32`                      |
+| `i64`        | `Integer`          | `:int64`                       |
+| `f64`        | `Float`            | `:double`                      |
+| `bool`       | `true`/`false`     | `:int32` (0/1 conversion)      |
+| `string`     | `String`           | `:string` (param) / `:pointer` (return) |
+| `bytes`      | `String` (binary)  | `:pointer` + `:size_t`         |
+| `handle`     | `Integer`          | `:uint64`                      |
+| `Struct`     | `StructName`       | `:pointer`                     |
+| `Enum`       | `Integer`          | `:int32`                       |
+| `T?`         | `T` or `nil`       | `:pointer` for scalars; same pointer for strings/structs |
+| `[T]`        | `Array`            | `:pointer` + `:size_t`         |
+| `{K: V}`     | `Hash`             | key/value pointer arrays + `:size_t` |
 
-```ruby
-require 'ffi'
+Booleans cross as `:int32` (`0`/`1`); the wrapper converts both
+directions.
 
-module WeaveFFI
-  extend FFI::Library
-
-  case FFI::Platform::OS
-  when /darwin/
-    ffi_lib 'libweaveffi.dylib'
-  when /mswin|mingw/
-    ffi_lib 'weaveffi.dll'
-  else
-    ffi_lib 'libweaveffi.so'
-  end
-end
-```
-
-Every C ABI function is declared with `attach_function`, mapping parameter
-types and return types to FFI type symbols (`:int32`, `:pointer`, etc.).
-A thin Ruby method then wraps each raw call with argument conversion, error
-checking, and return-value marshalling.
-
-## Generated code examples
-
-Given this IDL definition:
+## Example IDL → generated code
 
 ```yaml
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: contacts
     enums:
@@ -74,7 +60,6 @@ modules:
         fields:
           - { name: id, type: i64 }
           - { name: first_name, type: string }
-          - { name: last_name, type: string }
           - { name: email, type: "string?" }
           - { name: contact_type, type: ContactType }
 
@@ -82,7 +67,6 @@ modules:
       - name: create_contact
         params:
           - { name: first_name, type: string }
-          - { name: last_name, type: string }
           - { name: email, type: "string?" }
           - { name: contact_type, type: ContactType }
         return: handle
@@ -95,15 +79,26 @@ modules:
       - name: list_contacts
         params: []
         return: "[Contact]"
-
-      - name: count_contacts
-        params: []
-        return: i32
 ```
 
-### Enums
+The generated module extends `FFI::Library` and selects the right
+shared library at load time:
 
-Enums map to Ruby modules with `SHOUTY_SNAKE_CASE` constants:
+```ruby
+require 'ffi'
+
+module WeaveFFI
+  extend FFI::Library
+
+  case FFI::Platform::OS
+  when /darwin/  then ffi_lib 'libweaveffi.dylib'
+  when /mswin|mingw/ then ffi_lib 'weaveffi.dll'
+  else ffi_lib 'libweaveffi.so'
+  end
+end
+```
+
+Enums become Ruby modules with constants:
 
 ```ruby
 module ContactType
@@ -113,13 +108,8 @@ module ContactType
 end
 ```
 
-Enum values are plain integers and are passed directly to the C ABI.
-
-### Structs (AutoPointer wrapper classes)
-
-Structs become Ruby classes with an `FFI::AutoPointer` handle. The
-`AutoPointer` ensures the C ABI `_destroy` function is called when the
-object is garbage collected, preventing memory leaks:
+Structs become classes wrapping an `FFI::AutoPointer` so the C
+destructor is called when Ruby garbage-collects the wrapper:
 
 ```ruby
 class ContactPtr < FFI::AutoPointer
@@ -133,21 +123,6 @@ class Contact
 
   def initialize(handle)
     @handle = ContactPtr.new(handle)
-  end
-
-  def self.create(handle)
-    new(handle)
-  end
-
-  def destroy
-    return if @handle.nil?
-    @handle.free
-    @handle = nil
-  end
-
-  def id
-    result = WeaveFFI.weaveffi_contacts_Contact_get_id(@handle)
-    result
   end
 
   def first_name
@@ -165,25 +140,16 @@ class Contact
     WeaveFFI.weaveffi_free_string(result)
     str
   end
-
-  def contact_type
-    result = WeaveFFI.weaveffi_contacts_Contact_get_contact_type(@handle)
-    result
-  end
 end
 ```
 
-### Functions
-
-Each IDL function becomes a class method on the module. The wrapper creates
-an `ErrorStruct`, calls the C symbol, checks for errors, and converts the
-return value:
+Functions are class methods on the module and raise on failure:
 
 ```ruby
-def self.create_contact(first_name, last_name, email, contact_type)
+def self.create_contact(first_name, email, contact_type)
   err = ErrorStruct.new
   result = weaveffi_contacts_create_contact(
-    first_name, last_name, email, contact_type, err)
+    first_name, email, contact_type, err)
   check_error!(err)
   result
 end
@@ -195,35 +161,13 @@ def self.get_contact(id)
   raise Error.new(-1, 'null pointer') if result.null?
   Contact.new(result)
 end
-
-def self.list_contacts
-  err = ErrorStruct.new
-  out_len = FFI::MemoryPointer.new(:size_t)
-  result = weaveffi_contacts_list_contacts(out_len, err)
-  check_error!(err)
-  return [] if result.null?
-  len = out_len.read(:size_t)
-  result.read_array_of_pointer(len).map { |p| Contact.new(p) }
-end
-
-def self.count_contacts
-  err = ErrorStruct.new
-  result = weaveffi_contacts_count_contacts(err)
-  check_error!(err)
-  result
-end
 ```
 
-### Error handling
-
-The generated module defines an `ErrorStruct` (mirroring the C
-`weaveffi_error`) and an `Error` exception class. Every function call
-follows this pattern:
+The shared error machinery:
 
 ```ruby
 class ErrorStruct < FFI::Struct
-  layout :code, :int32,
-         :message, :pointer
+  layout :code, :int32, :message, :pointer
 end
 
 class Error < StandardError
@@ -245,152 +189,48 @@ def self.check_error!(err)
 end
 ```
 
-Callers use standard Ruby `begin`/`rescue`:
+Catch errors with standard `begin`/`rescue`:
 
 ```ruby
 require 'weaveffi'
 
 begin
-  handle = WeaveFFI.create_contact("Alice", "Smith", nil, ContactType::WORK)
+  handle = WeaveFFI.create_contact("Alice", nil, WeaveFFI::ContactType::WORK)
 rescue WeaveFFI::Error => e
   puts "Error #{e.code}: #{e.message}"
 end
 ```
 
-## Type mapping reference
+## Build instructions
 
-| IDL type     | Ruby type          | FFI type                       |
-|--------------|--------------------|--------------------------------|
-| `i32`        | `Integer`          | `:int32`                       |
-| `u32`        | `Integer`          | `:uint32`                      |
-| `i64`        | `Integer`          | `:int64`                       |
-| `f64`        | `Float`            | `:double`                      |
-| `bool`       | `true`/`false`     | `:int32` (0/1 conversion)      |
-| `string`     | `String`           | `:string` (param) / `:pointer` (return) |
-| `bytes`      | `String` (binary)  | `:pointer` + `:size_t`         |
-| `handle`     | `Integer`          | `:uint64`                      |
-| `Struct`     | `StructName`       | `:pointer`                     |
-| `Enum`       | `Integer`          | `:int32`                       |
-| `T?`         | `T` or `nil`       | `:pointer` for scalars; same pointer for strings/structs |
-| `[T]`        | `Array`            | `:pointer` + `:size_t`         |
-| `{K: V}`     | `Hash`             | key/value pointer arrays + `:size_t` |
+1. Generate the bindings:
 
-Booleans are transmitted as `:int32` (`0`/`1`). The wrapper converts
-`true`/`false` to integers on input and back to booleans on output.
+   ```bash
+   weaveffi generate --input api.yaml --output generated/ --target ruby
+   ```
 
-## Gem packaging
+2. Build the Rust shared library:
 
-### 1. Generate bindings
+   ```bash
+   cargo build --release -p your_library
+   ```
 
-```bash
-weaveffi generate --input api.yaml --output generated/ --target ruby
-```
+3. Build and install the gem:
 
-### 2. Build the Rust shared library
+   ```bash
+   cd generated/ruby
+   gem build weaveffi.gemspec
+   gem install weaveffi-0.1.0.gem
+   ```
 
-```bash
-cargo build --release -p your_library
-```
+4. Make the cdylib findable at runtime:
 
-This produces `libweaveffi.dylib` (macOS), `libweaveffi.so` (Linux), or
-`weaveffi.dll` (Windows) in `target/release/`.
+   - macOS: `DYLD_LIBRARY_PATH=$PWD/../../target/release ruby your_script.rb`
+   - Linux: `LD_LIBRARY_PATH=$PWD/../../target/release ruby your_script.rb`
+   - Windows: place `weaveffi.dll` next to the script or add its
+     directory to `PATH`.
 
-### 3. Build and install the gem
-
-```bash
-cd generated/ruby
-gem build weaveffi.gemspec
-gem install weaveffi-0.1.0.gem
-```
-
-The generated gemspec declares `ffi ~> 1.15` as its only runtime dependency.
-
-### 4. Make the shared library findable
-
-The shared library must be on the system library search path at runtime:
-
-**macOS:**
-```bash
-DYLD_LIBRARY_PATH=../../target/release ruby your_script.rb
-```
-
-**Linux:**
-```bash
-LD_LIBRARY_PATH=../../target/release ruby your_script.rb
-```
-
-**Windows:**
-Place `weaveffi.dll` in the same directory as your script, or add its
-directory to `PATH`.
-
-### 5. Use the bindings
-
-```ruby
-require 'weaveffi'
-
-handle = WeaveFFI.create_contact("Alice", "Smith", "alice@example.com",
-                                  WeaveFFI::ContactType::WORK)
-contact = WeaveFFI.get_contact(handle)
-puts "#{contact.first_name} #{contact.last_name}"
-puts "Email: #{contact.email || '(none)'}"
-puts "Total: #{WeaveFFI.count_contacts}"
-```
-
-## Memory management
-
-The generated Ruby wrappers handle memory ownership automatically via
-`FFI::AutoPointer` and explicit free calls.
-
-### Strings
-
-- **Passing strings in:** Ruby strings are passed as `:string` parameters.
-  FFI handles the encoding to null-terminated C strings automatically.
-- **Receiving strings back:** Returned `:pointer` values are read with
-  `read_string`, then the Rust-allocated pointer is freed via
-  `weaveffi_free_string`. The wrapper copies the data into a Ruby string
-  before freeing.
-
-### Bytes
-
-- **Passing bytes in:** A `FFI::MemoryPointer` is allocated, the byte data
-  is copied in via `put_bytes`, and the pointer is passed with a length
-  parameter.
-- **Receiving bytes back:** The C function writes to an `out_len` parameter.
-  The wrapper reads the data via `read_string(len)`, then the Rust side is
-  responsible for the original buffer.
-
-### Structs (AutoPointer release callbacks)
-
-Each struct class uses `FFI::AutoPointer` to ensure automatic cleanup.
-`AutoPointer` calls the `release` class method when the Ruby object is
-garbage collected, which invokes the C ABI `_destroy` function:
-
-```ruby
-class ContactPtr < FFI::AutoPointer
-  def self.release(ptr)
-    WeaveFFI.weaveffi_contacts_Contact_destroy(ptr)
-  end
-end
-```
-
-For explicit lifetime control, call `destroy` to free immediately:
-
-```ruby
-contact = WeaveFFI.get_contact(handle)
-puts contact.first_name
-contact.destroy
-```
-
-### Maps
-
-Maps are passed across the FFI boundary as parallel arrays of keys and
-values plus a length. The wrapper builds `FFI::MemoryPointer` buffers for
-keys and values, and reconstructs a Ruby `Hash` from the returned arrays
-using `each_with_object`.
-
-## Configuration
-
-The Ruby module name and gem name can be customized via generator
+The Ruby module name and gem name can be customised via generator
 configuration:
 
 ```toml
@@ -398,5 +238,59 @@ ruby_module_name = "MyBindings"
 ruby_gem_name = "my_bindings"
 ```
 
-This changes the generated `module MyBindings` declaration and the
-gemspec `s.name` field.
+## Memory and ownership
+
+- **Strings in:** Ruby strings are passed as `:string` parameters and
+  the FFI gem encodes them to null-terminated C strings.
+- **Strings out:** the wrapper reads the returned `:pointer` with
+  `read_string`, then calls `weaveffi_free_string` to release the
+  Rust-owned buffer.
+- **Bytes:** an `FFI::MemoryPointer` is allocated for inputs; outputs
+  are read with `read_string(len)` and the Rust side is responsible
+  for the buffer it returned.
+- **Structs:** wrappers hold an `FFI::AutoPointer` whose `release`
+  callback invokes the C `_destroy` function on GC. Use the explicit
+  `destroy` method for deterministic cleanup.
+- **Maps:** keys and values are marshalled into parallel
+  `FFI::MemoryPointer` buffers; the wrapper rebuilds a Ruby `Hash`
+  from the returned arrays.
+
+## Async support
+
+Async IDL functions are exposed as Ruby methods that return a
+`Concurrent::Promises::Future` (when `concurrent-ruby` is present) or
+a hand-rolled callback wrapper otherwise. The Ruby thread that calls
+the function blocks on a `Queue` to receive the result from the C ABI
+callback:
+
+```ruby
+def self.fetch_contact(id)
+  q = Queue.new
+  context = FFI::Function.new(:void, [:pointer, :pointer]) do |err, result|
+    q << [err, result]
+  end
+  weaveffi_contacts_fetch_contact_async(id, context, nil)
+  err, result = q.pop
+  check_error!(ErrorStruct.new(err))
+  Contact.new(result)
+end
+```
+
+When the IDL marks the function `cancel: true`, the wrapper accepts a
+cancellation token and forwards it to the underlying
+`weaveffi_cancel_token`.
+
+## Troubleshooting
+
+- **`LoadError: Could not open library 'libweaveffi.dylib'`** — the
+  cdylib is not on the loader path. Set `DYLD_LIBRARY_PATH` /
+  `LD_LIBRARY_PATH` or copy the library next to your script.
+- **`FFI::NotFoundError: Function 'weaveffi_*' not found`** — the
+  cdylib does not export the symbol. Rebuild the Rust crate after
+  regenerating the IDL.
+- **Segmentation faults on Ruby exit** — keep references to FFI
+  callbacks alive for the lifetime of the call. Letting them be
+  garbage-collected mid-call corrupts the C side.
+- **Strings come back as binary garbage** — UTF-8 strings should round
+  trip through `read_string`; for binary data use
+  `read_bytes(length)` with the `out_len` returned by the C ABI.

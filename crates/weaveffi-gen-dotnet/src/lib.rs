@@ -1,9 +1,17 @@
+//! .NET (P/Invoke) binding generator for WeaveFFI.
+//!
+//! Emits a C# project (`.csproj` + `.nuspec`) with P/Invoke declarations
+//! and idiomatic wrappers over the C ABI. Async functions surface as
+//! `Task<T>`-returning methods. Implements the [`Generator`] trait.
+
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
-use weaveffi_core::utils::{c_symbol_name, local_type_name, wrapper_name};
+use weaveffi_core::utils::{
+    c_symbol_name, local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
+};
 use weaveffi_ir::ir::{Api, EnumDef, Function, Module, Param, StructDef, StructField, TypeRef};
 
 pub struct DotnetGenerator;
@@ -15,22 +23,32 @@ impl DotnetGenerator {
         out_dir: &Utf8Path,
         namespace: &str,
         strip_module_prefix: bool,
+        input_basename: &str,
     ) -> Result<()> {
         let dir = out_dir.join("dotnet");
         std::fs::create_dir_all(&dir)?;
+        let cs_filename = format!("{namespace}.cs");
+        let csproj_filename = format!("{namespace}.csproj");
+        let nuspec_filename = format!("{namespace}.nuspec");
         std::fs::write(
-            dir.join(format!("{namespace}.cs")),
-            render_csharp(api, namespace, strip_module_prefix),
+            dir.join(&cs_filename),
+            render_csharp(
+                api,
+                namespace,
+                strip_module_prefix,
+                input_basename,
+                &cs_filename,
+            ),
         )?;
         std::fs::write(
-            dir.join(format!("{namespace}.csproj")),
-            render_csproj(namespace),
+            dir.join(&csproj_filename),
+            render_csproj(namespace, input_basename, &csproj_filename),
         )?;
         std::fs::write(
-            dir.join(format!("{namespace}.nuspec")),
-            render_nuspec(namespace),
+            dir.join(&nuspec_filename),
+            render_nuspec(namespace, input_basename, &nuspec_filename),
         )?;
-        std::fs::write(dir.join("README.md"), render_readme())?;
+        std::fs::write(dir.join("README.md"), render_readme(input_basename))?;
         Ok(())
     }
 }
@@ -41,7 +59,7 @@ impl Generator for DotnetGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "WeaveFFI", true)
+        self.generate_impl(api, out_dir, "WeaveFFI", true, "weaveffi.yml")
     }
 
     fn generate_with_config(
@@ -55,16 +73,36 @@ impl Generator for DotnetGenerator {
             out_dir,
             config.dotnet_namespace(),
             config.strip_module_prefix,
+            config.input_basename(),
         )
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
-        vec![
+        let mut files = vec![
+            out_dir.join("dotnet/README.md").to_string(),
             out_dir.join("dotnet/WeaveFFI.cs").to_string(),
             out_dir.join("dotnet/WeaveFFI.csproj").to_string(),
             out_dir.join("dotnet/WeaveFFI.nuspec").to_string(),
+        ];
+        files.sort();
+        files
+    }
+
+    fn output_files_with_config(
+        &self,
+        _api: &Api,
+        out_dir: &Utf8Path,
+        config: &GeneratorConfig,
+    ) -> Vec<String> {
+        let ns = config.dotnet_namespace();
+        let mut files = vec![
             out_dir.join("dotnet/README.md").to_string(),
-        ]
+            out_dir.join(format!("dotnet/{ns}.cs")).to_string(),
+            out_dir.join(format!("dotnet/{ns}.csproj")).to_string(),
+            out_dir.join(format!("dotnet/{ns}.nuspec")).to_string(),
+        ];
+        files.sort();
+        files
     }
 }
 
@@ -97,7 +135,6 @@ fn cs_type(ty: &TypeRef) -> String {
         TypeRef::List(inner) => format!("{}[]", cs_type(inner)),
         TypeRef::Iterator(inner) => format!("IEnumerable<{}>", cs_type(inner)),
         TypeRef::Map(k, v) => format!("Dictionary<{}, {}>", cs_type(k), cs_type(v)),
-        TypeRef::Callback(_) => todo!("callback .NET type"),
     }
 }
 
@@ -120,7 +157,6 @@ fn pinvoke_type(ty: &TypeRef) -> String {
         TypeRef::Handle => "ulong".into(),
         TypeRef::TypedHandle(_) => "IntPtr".into(),
         TypeRef::Enum(_) => "int".into(),
-        TypeRef::Callback(_) => todo!("callback .NET type"),
     }
 }
 
@@ -176,9 +212,11 @@ fn pinvoke_return_info(ty: &TypeRef) -> (String, Vec<String>) {
     }
 }
 
-fn render_csproj(namespace: &str) -> String {
+fn render_csproj(namespace: &str, input_basename: &str, filename: &str) -> String {
+    let prelude = render_prelude(CommentStyle::Xml, input_basename);
+    let trailer = render_trailer(CommentStyle::Xml, filename);
     format!(
-        r#"<Project Sdk="Microsoft.NET.Sdk">
+        r#"{prelude}<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
@@ -188,14 +226,17 @@ fn render_csproj(namespace: &str) -> String {
   </PropertyGroup>
 
 </Project>
-"#,
+
+{trailer}"#,
     )
 }
 
-fn render_nuspec(namespace: &str) -> String {
+fn render_nuspec(namespace: &str, input_basename: &str, filename: &str) -> String {
+    let prelude = render_prelude(CommentStyle::Xml, input_basename);
+    let trailer = render_trailer(CommentStyle::Xml, filename);
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
-<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+{prelude}<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
   <metadata>
     <id>{namespace}</id>
     <version>0.1.0</version>
@@ -206,12 +247,16 @@ fn render_nuspec(namespace: &str) -> String {
     <tags>ffi interop native pinvoke</tags>
   </metadata>
 </package>
-"#,
+
+{trailer}"#,
     )
 }
 
-fn render_readme() -> String {
-    r#"# WeaveFFI .NET Bindings
+fn render_readme(input_basename: &str) -> String {
+    let prelude = render_prelude(CommentStyle::Xml, input_basename);
+    let trailer = render_trailer(CommentStyle::Xml, "README.md");
+    format!(
+        r#"{prelude}# WeaveFFI .NET Bindings
 
 Auto-generated P/Invoke bindings for the WeaveFFI native library.
 
@@ -228,8 +273,9 @@ dotnet pack
 ```
 
 The resulting `.nupkg` will be in `bin/Debug/` (or `bin/Release/` with `-c Release`).
-"#
-    .into()
+
+{trailer}"#,
+    )
 }
 
 fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
@@ -241,9 +287,105 @@ fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
     all
 }
 
-fn render_csharp(api: &Api, namespace: &str, strip_module_prefix: bool) -> String {
-    let mut out = String::new();
-    out.push_str("// Auto-generated by WeaveFFI — do not edit.\n");
+/// Emits a C# XML doc comment at `indent`. Single-line docs collapse to
+/// `/// <summary>text</summary>`; multi-line docs expand to a `<summary>`
+/// block with each input line wrapped in its own line.
+fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
+    let Some(doc) = doc else {
+        return;
+    };
+    let doc = doc.trim();
+    if doc.is_empty() {
+        return;
+    }
+    if doc.contains('\n') {
+        out.push_str(indent);
+        out.push_str("/// <summary>\n");
+        for line in doc.lines() {
+            out.push_str(indent);
+            out.push_str("/// ");
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push_str(indent);
+        out.push_str("/// </summary>\n");
+    } else {
+        out.push_str(indent);
+        out.push_str("/// <summary>");
+        out.push_str(doc);
+        out.push_str("</summary>\n");
+    }
+}
+
+/// Emits a full XML doc block: function `<summary>` plus a `<param>` element
+/// per documented parameter. Skips entirely when there is nothing to emit.
+fn emit_fn_doc(
+    out: &mut String,
+    doc: &Option<String>,
+    params: &[weaveffi_ir::ir::Param],
+    indent: &str,
+) {
+    let trimmed_doc = doc.as_ref().map(|d| d.trim()).filter(|d| !d.is_empty());
+    let documented_params: Vec<&weaveffi_ir::ir::Param> = params
+        .iter()
+        .filter(|p| {
+            p.doc
+                .as_ref()
+                .map(|d| !d.trim().is_empty())
+                .unwrap_or(false)
+        })
+        .collect();
+    if trimmed_doc.is_none() && documented_params.is_empty() {
+        return;
+    }
+    if let Some(d) = trimmed_doc {
+        if d.contains('\n') {
+            out.push_str(indent);
+            out.push_str("/// <summary>\n");
+            for line in d.lines() {
+                out.push_str(indent);
+                out.push_str("/// ");
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.push_str(indent);
+            out.push_str("/// </summary>\n");
+        } else {
+            out.push_str(indent);
+            out.push_str("/// <summary>");
+            out.push_str(d);
+            out.push_str("</summary>\n");
+        }
+    }
+    for p in documented_params {
+        let pdoc = p.doc.as_ref().unwrap().trim();
+        let name = safe_cs_name(&p.name);
+        if pdoc.contains('\n') {
+            out.push_str(indent);
+            out.push_str(&format!("/// <param name=\"{}\">\n", name));
+            for line in pdoc.lines() {
+                out.push_str(indent);
+                out.push_str("/// ");
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.push_str(indent);
+            out.push_str("/// </param>\n");
+        } else {
+            out.push_str(indent);
+            out.push_str(&format!("/// <param name=\"{}\">{}</param>\n", name, pdoc));
+        }
+    }
+}
+
+fn render_csharp(
+    api: &Api,
+    namespace: &str,
+    strip_module_prefix: bool,
+    input_basename: &str,
+    filename: &str,
+) -> String {
+    let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
     out.push_str(
         "using System;\nusing System.Collections.Generic;\nusing System.Runtime.InteropServices;\n",
     );
@@ -277,7 +419,8 @@ fn render_csharp(api: &Api, namespace: &str, strip_module_prefix: bool) -> Strin
         render_wrapper_class(&mut out, m, &m.name, "    ", strip_module_prefix);
     }
 
-    out.push_str("}\n");
+    out.push_str("}\n\n");
+    out.push_str(&render_trailer(CommentStyle::DoubleSlash, filename));
     out
 }
 
@@ -339,11 +482,10 @@ fn render_helpers_class(out: &mut String) {
 }
 
 fn render_enum(out: &mut String, e: &EnumDef) {
-    if let Some(doc) = &e.doc {
-        out.push_str(&format!("    /// <summary>{doc}</summary>\n"));
-    }
+    emit_doc(out, &e.doc, "    ");
     out.push_str(&format!("    public enum {}\n    {{\n", e.name));
     for v in &e.variants {
+        emit_doc(out, &v.doc, "        ");
         out.push_str(&format!("        {} = {},\n", v.name, v.value));
     }
     out.push_str("    }\n\n");
@@ -352,9 +494,7 @@ fn render_enum(out: &mut String, e: &EnumDef) {
 fn render_struct_class(out: &mut String, module_name: &str, s: &StructDef) {
     let prefix = format!("weaveffi_{}_{}", module_name, s.name);
 
-    if let Some(doc) = &s.doc {
-        out.push_str(&format!("    /// <summary>{doc}</summary>\n"));
-    }
+    emit_doc(out, &s.doc, "    ");
     out.push_str(&format!(
         "    public class {} : IDisposable\n    {{\n",
         s.name
@@ -402,6 +542,7 @@ fn render_builder_class(out: &mut String, module_name: &str, s: &StructDef) {
         return;
     }
     let builder_name = format!("{}Builder", s.name);
+    emit_doc(out, &s.doc, "    ");
     out.push_str(&format!("    public class {builder_name}\n    {{\n"));
     for field in &s.fields {
         let storage = cs_type_builder_storage(&field.ty);
@@ -413,6 +554,7 @@ fn render_builder_class(out: &mut String, module_name: &str, s: &StructDef) {
         let pascal = field.name.to_upper_camel_case();
         let param_ty = cs_type(&field.ty);
         let fname = safe_cs_name(&field.name);
+        emit_doc(out, &field.doc, "        ");
         out.push_str(&format!(
             "        public {builder_name} With{pascal}({param_ty} value)\n        {{\n            _{fname} = value;\n            return this;\n        }}\n\n"
         ));
@@ -438,6 +580,7 @@ fn render_struct_getter(out: &mut String, prefix: &str, field: &StructField) {
     let getter_sym = format!("{}_get_{}", prefix, field.name);
     let cs = cs_type(&field.ty);
 
+    emit_doc(out, &field.doc, "        ");
     out.push_str(&format!(
         "        public {cs} {prop_name}\n        {{\n            get\n            {{\n"
     ));
@@ -582,7 +725,6 @@ fn render_struct_getter(out: &mut String, prefix: &str, field: &StructField) {
             out.push_str("                }\n");
             out.push_str("                return dict;\n");
         }
-        TypeRef::Callback(_) => todo!("callback struct getter"),
         TypeRef::Iterator(_) => unreachable!("iterator not valid as struct field"),
     }
 
@@ -676,6 +818,7 @@ fn render_struct_pinvoke(out: &mut String, module_name: &str, s: &StructDef) {
                 name: f.name.clone(),
                 ty: f.ty.clone(),
                 mutable: false,
+                doc: f.doc.clone(),
             };
             pinvoke_param_list(&p)
         })
@@ -878,6 +1021,7 @@ fn render_wrapper_method(
         .map(|p| format!("{} {}", cs_type(&p.ty), safe_cs_name(&p.name)))
         .collect();
 
+    emit_fn_doc(out, &f.doc, &f.params, "        ");
     if let Some(msg) = &f.deprecated {
         out.push_str(&format!(
             "        [Obsolete(\"{}\")]\n",
@@ -940,6 +1084,7 @@ fn render_async_wrapper_method(
         .map(|p| format!("{} {}", cs_type(&p.ty), safe_cs_name(&p.name)))
         .collect();
 
+    emit_fn_doc(out, &f.doc, &f.params, "        ");
     if let Some(msg) = &f.deprecated {
         out.push_str(&format!(
             "        [Obsolete(\"{}\")]\n",
@@ -961,23 +1106,35 @@ fn render_async_wrapper_method(
         "            {delegate_name} callback = {cb_lambda_params} =>\n            {{\n"
     ));
 
-    out.push_str("                if (err != IntPtr.Zero)\n                {\n");
-    out.push_str("                    var wErr = Marshal.PtrToStructure<WeaveffiError>(err);\n");
-    out.push_str("                    if (wErr.Code != 0)\n                    {\n");
+    out.push_str("                try\n                {\n");
+    out.push_str("                    if (err != IntPtr.Zero)\n                    {\n");
     out.push_str(
-        "                        var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? \"\";\n",
+        "                        var wErr = Marshal.PtrToStructure<WeaveffiError>(err);\n",
+    );
+    out.push_str("                        if (wErr.Code != 0)\n                        {\n");
+    out.push_str(
+        "                            var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? \"\";\n",
     );
     out.push_str(
-        "                        tcs.SetException(new WeaveffiException(wErr.Code, msg));\n",
+        "                            tcs.SetException(new WeaveffiException(wErr.Code, msg));\n",
     );
-    out.push_str("                        return;\n");
+    out.push_str("                            return;\n");
+    out.push_str("                        }\n");
+    out.push_str("                    }\n");
+
+    render_async_set_result(out, &f.returns, "                    ");
+
+    out.push_str("                }\n");
+    out.push_str("                finally\n                {\n");
+    out.push_str("                    if (context != IntPtr.Zero)\n");
+    out.push_str("                    {\n");
+    out.push_str("                        GCHandle.FromIntPtr(context).Free();\n");
     out.push_str("                    }\n");
     out.push_str("                }\n");
 
-    render_async_set_result(out, &f.returns, "                ");
-
     out.push_str("            };\n");
-    out.push_str("            var gcHandle = GCHandle.Alloc(callback);\n");
+    out.push_str("            var gcHandle = GCHandle.Alloc(callback, GCHandleType.Normal);\n");
+    out.push_str("            var ctx = GCHandle.ToIntPtr(gcHandle);\n");
 
     let needs_try = f.params.iter().any(|p| param_needs_marshal(&p.ty));
     let call_args = build_call_args(&f.params);
@@ -993,18 +1150,30 @@ fn render_async_wrapper_method(
             render_marshal_setup(out, p, "            ");
         }
         out.push_str("            try\n            {\n");
+        out.push_str("                try\n                {\n");
         out.push_str(&format!(
-            "                NativeMethods.{c_sym}_async({args_part}{cancel_arg}callback, IntPtr.Zero);\n"
+            "                    NativeMethods.{c_sym}_async({args_part}{cancel_arg}callback, ctx);\n"
         ));
+        out.push_str("                }\n");
+        out.push_str("                catch\n                {\n");
+        out.push_str("                    if (gcHandle.IsAllocated) gcHandle.Free();\n");
+        out.push_str("                    throw;\n");
+        out.push_str("                }\n");
         out.push_str("            }\n            finally\n            {\n");
         for p in &f.params {
             render_marshal_cleanup(out, p, "                ");
         }
         out.push_str("            }\n");
     } else {
+        out.push_str("            try\n            {\n");
         out.push_str(&format!(
-            "            NativeMethods.{c_sym}_async({args_part}{cancel_arg}callback, IntPtr.Zero);\n"
+            "                NativeMethods.{c_sym}_async({args_part}{cancel_arg}callback, ctx);\n"
         ));
+        out.push_str("            }\n");
+        out.push_str("            catch\n            {\n");
+        out.push_str("                if (gcHandle.IsAllocated) gcHandle.Free();\n");
+        out.push_str("                throw;\n");
+        out.push_str("            }\n");
     }
 
     if f.returns.is_some() {
@@ -1555,10 +1724,10 @@ mod tests {
         assert_eq!(
             files,
             vec![
+                out.join("dotnet/README.md").to_string(),
                 out.join("dotnet/WeaveFFI.cs").to_string(),
                 out.join("dotnet/WeaveFFI.csproj").to_string(),
                 out.join("dotnet/WeaveFFI.nuspec").to_string(),
-                out.join("dotnet/README.md").to_string(),
             ]
         );
     }
@@ -1572,11 +1741,13 @@ mod tests {
                     name: "a".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
                 Param {
                     name: "b".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
             ],
             returns: Some(TypeRef::I32),
@@ -1765,11 +1936,13 @@ mod tests {
                     name: "a".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
                 Param {
                     name: "b".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
             ],
             returns: Some(TypeRef::I32),
@@ -1780,7 +1953,7 @@ mod tests {
             since: None,
         }])]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(cs.contains("namespace WeaveFFI"), "missing namespace: {cs}");
         assert!(cs.contains("DllImport"), "missing DllImport: {cs}");
         assert!(cs.contains("weaveffi_math_add"), "missing C symbol: {cs}");
@@ -1811,7 +1984,7 @@ mod tests {
             since: None,
         }])]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(
             cs.contains("public static void Reset()"),
             "missing void wrapper: {cs}"
@@ -1830,6 +2003,7 @@ mod tests {
                 name: "flag".into(),
                 ty: TypeRef::Bool,
                 mutable: false,
+                doc: None,
             }],
             returns: Some(TypeRef::Bool),
             doc: None,
@@ -1839,7 +2013,7 @@ mod tests {
             since: None,
         }])]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(
             cs.contains("flag ? 1 : 0"),
             "missing bool-to-int conversion: {cs}"
@@ -1860,6 +2034,7 @@ mod tests {
                     name: "a".into(),
                     ty: TypeRef::Enum("Color".into()),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Enum("Color".into())),
                 doc: None,
@@ -1896,7 +2071,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(cs.contains("public enum Color"), "missing enum: {cs}");
         assert!(cs.contains("Red = 0"), "missing Red: {cs}");
         assert!(cs.contains("Green = 1"), "missing Green: {cs}");
@@ -1943,7 +2118,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(
             cs.contains("public class Contact : IDisposable"),
             "missing IDisposable: {cs}"
@@ -2005,7 +2180,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(
             cs.contains("public string FirstName"),
             "missing FirstName: {cs}"
@@ -2062,7 +2237,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(
             cs.contains("public void Dispose()"),
             "missing Dispose: {cs}"
@@ -2109,7 +2284,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(
             cs.contains("weaveffi_contacts_Contact_create("),
             "missing create P/Invoke: {cs}"
@@ -2142,6 +2317,7 @@ mod tests {
                     name: "msg".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::StringUtf8),
                 doc: None,
@@ -2158,7 +2334,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(
             cs.contains("Marshal.PtrToStringUTF8(result)"),
             "missing PtrToStringUTF8: {cs}"
@@ -2199,7 +2375,7 @@ mod tests {
             since: None,
         }])]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(
             cs.contains("internal static class NativeMethods"),
             "missing NativeMethods: {cs}"
@@ -2223,11 +2399,13 @@ mod tests {
                     name: "a".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
                 Param {
                     name: "b".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
             ],
             returns: Some(TypeRef::I32),
@@ -2238,7 +2416,7 @@ mod tests {
             since: None,
         }])]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(
             cs.contains("ref WeaveffiError err"),
             "missing error param in P/Invoke: {cs}"
@@ -2248,7 +2426,7 @@ mod tests {
     #[test]
     fn header_has_using_statements() {
         let api = make_api(vec![]);
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(cs.contains("using System;"), "missing System: {cs}");
         assert!(
             cs.contains("using System.Runtime.InteropServices;"),
@@ -2291,6 +2469,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::Handle,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -2307,7 +2486,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(
             cs.contains("new Contact(result)"),
             "missing struct wrapping: {cs}"
@@ -2340,7 +2519,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(
             cs.contains("public static int[] GetIds()"),
             "missing list return method: {cs}"
@@ -2374,7 +2553,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(
             cs.contains("public static Dictionary<int, double> GetScores()"),
             "missing map return: {cs}"
@@ -2410,7 +2589,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(
             cs.contains("public string? Email"),
             "missing optional string getter: {cs}"
@@ -2436,11 +2615,13 @@ mod tests {
                         name: "name".into(),
                         ty: TypeRef::StringUtf8,
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "email".into(),
                         ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::Handle),
@@ -2458,7 +2639,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(
             cs.contains("StringToCoTaskMemUTF8(name)"),
             "missing name marshal: {cs}"
@@ -2538,16 +2719,19 @@ mod tests {
                             name: "first_name".into(),
                             ty: TypeRef::StringUtf8,
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "email".into(),
                             ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "contact_type".into(),
                             ty: TypeRef::Enum("ContactType".into()),
                             mutable: false,
+                            doc: None,
                         },
                     ],
                     returns: Some(TypeRef::Handle),
@@ -2563,6 +2747,7 @@ mod tests {
                         name: "id".into(),
                         ty: TypeRef::Handle,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Struct("Contact".into())),
                     doc: None,
@@ -2637,11 +2822,13 @@ mod tests {
                     name: "a".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
                 Param {
                     name: "b".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
             ],
             returns: Some(TypeRef::I32),
@@ -2733,7 +2920,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
 
         assert!(
             cs.contains("public class Person : IDisposable"),
@@ -2850,7 +3037,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
 
         assert!(
             cs.contains("<summary>Task priority levels</summary>"),
@@ -2889,11 +3076,13 @@ mod tests {
                         name: "label".into(),
                         ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "count".into(),
                         ty: TypeRef::Optional(Box::new(TypeRef::I32)),
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::I64))),
@@ -2941,7 +3130,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
 
         assert!(
             cs.contains("public static long? Update(string? label, int? count)"),
@@ -3037,7 +3226,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
 
         assert!(
             cs.contains("public static int[] GetIds()"),
@@ -3160,21 +3349,25 @@ mod tests {
                             name: "first_name".into(),
                             ty: TypeRef::StringUtf8,
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "last_name".into(),
                             ty: TypeRef::StringUtf8,
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "email".into(),
                             ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "contact_type".into(),
                             ty: TypeRef::Enum("ContactType".into()),
                             mutable: false,
+                            doc: None,
                         },
                     ],
                     returns: Some(TypeRef::Handle),
@@ -3190,6 +3383,7 @@ mod tests {
                         name: "id".into(),
                         ty: TypeRef::Handle,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Struct("Contact".into())),
                     doc: None,
@@ -3204,6 +3398,7 @@ mod tests {
                         name: "contact_type".into(),
                         ty: TypeRef::Optional(Box::new(TypeRef::Enum("ContactType".into()))),
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
                     doc: None,
@@ -3218,6 +3413,7 @@ mod tests {
                         name: "id".into(),
                         ty: TypeRef::Handle,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: None,
                     doc: None,
@@ -3376,7 +3572,7 @@ mod tests {
     #[test]
     fn dotnet_has_memory_helpers() {
         let api = make_api(vec![simple_module(vec![])]);
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(
             cs.contains("internal static class WeaveFFIHelpers"),
             "missing WeaveFFIHelpers class: {cs}"
@@ -3412,11 +3608,13 @@ mod tests {
                     name: "a".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
                 Param {
                     name: "b".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
             ],
             returns: Some(TypeRef::I32),
@@ -3481,6 +3679,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -3557,6 +3756,7 @@ mod tests {
                         Box::new(TypeRef::Struct("Contact".into())),
                     ))))),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3582,7 +3782,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(
             cs.contains("Contact?[]?"),
             "should contain deeply nested optional type: {cs}"
@@ -3602,6 +3802,7 @@ mod tests {
                         Box::new(TypeRef::List(Box::new(TypeRef::I32))),
                     ),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3617,7 +3818,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(
             cs.contains("Dictionary<string, int[]>"),
             "should contain map of lists type: {cs}"
@@ -3637,6 +3838,7 @@ mod tests {
                         Box::new(TypeRef::Struct("Contact".into())),
                     ),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3682,7 +3884,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(
             cs.contains("Dictionary<Color, Contact>"),
             "should contain enum-keyed map type: {cs}"
@@ -3701,6 +3903,7 @@ mod tests {
                         name: "contact".into(),
                         ty: TypeRef::TypedHandle("Contact".into()),
                         mutable: false,
+                        doc: None,
                     }],
                     returns: None,
                     doc: None,
@@ -3728,7 +3931,7 @@ mod tests {
             }],
             generators: None,
         };
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(
             cs.contains("Contact contact"),
             "TypedHandle should use class type not ulong: {cs}"
@@ -3745,6 +3948,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -3770,7 +3974,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(
             cs.contains("StringToCoTaskMemUTF8"),
             "string param should be marshalled to unmanaged memory: {cs}"
@@ -3815,6 +4019,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                     "Contact".into(),
@@ -3842,7 +4047,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(
             cs.contains("result == IntPtr.Zero ? null : new Contact(result)"),
             "optional struct return should null-check before wrap: {cs}"
@@ -3859,6 +4064,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -3874,7 +4080,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(
             cs.contains("async Task<"),
             "missing async Task< in signature: {cs}"
@@ -3891,6 +4097,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -3906,10 +4113,56 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(
             cs.contains("TaskCompletionSource"),
             "missing TaskCompletionSource: {cs}"
+        );
+    }
+
+    /// `GCHandle.Alloc(callback, GCHandleType.Normal)` (the .NET equivalent
+    /// of pinning the delegate so the GC won't reclaim it while the C side
+    /// owns a function pointer to it) must be balanced by exactly one
+    /// `GCHandle.FromIntPtr(context).Free()` in the C callback after the
+    /// `TaskCompletionSource` is resolved.
+    #[test]
+    fn dotnet_async_pins_callback_for_lifetime() {
+        let api = make_api(vec![Module {
+            name: "tasks".into(),
+            functions: vec![Function {
+                name: "run".into(),
+                params: vec![Param {
+                    name: "id".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: None,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: true,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        assert!(
+            cs.contains("GCHandle.Alloc(callback, GCHandleType.Normal)"),
+            "missing GCHandle.Alloc(..., Normal): {cs}"
+        );
+        assert!(
+            cs.contains("GCHandle.ToIntPtr(gcHandle)"),
+            "GCHandle must be passed as the C context: {cs}"
+        );
+        assert!(
+            cs.contains("GCHandle.FromIntPtr(context).Free()"),
+            "missing GCHandle.Free in callback: {cs}"
         );
     }
 
@@ -3952,7 +4205,7 @@ mod tests {
                 modules: vec![],
             }],
         }]);
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(
             cs.contains("public static class Parent"),
             "top-level wrapper class missing: {cs}"
@@ -3980,11 +4233,13 @@ mod tests {
                     name: "a".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
                 Param {
                     name: "b".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 },
             ],
             returns: Some(TypeRef::I32),
@@ -3994,10 +4249,95 @@ mod tests {
             deprecated: Some("Use AddV2 instead".into()),
             since: Some("0.1.0".into()),
         }])]);
-        let cs = render_csharp(&api, "WeaveFFI", true);
+        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
         assert!(
             cs.contains("[Obsolete(\"Use AddV2 instead\")]"),
             "missing Obsolete attribute: {cs}"
+        );
+    }
+
+    fn doc_api() -> Api {
+        make_api(vec![Module {
+            name: "docs".into(),
+            functions: vec![Function {
+                name: "do_thing".into(),
+                params: vec![Param {
+                    name: "x".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: Some("the input value".into()),
+                }],
+                returns: Some(TypeRef::I32),
+                doc: Some("Performs a thing.".into()),
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![StructDef {
+                name: "Item".into(),
+                doc: Some("An item we track.".into()),
+                fields: vec![StructField {
+                    name: "id".into(),
+                    ty: TypeRef::I64,
+                    doc: Some("Stable id".into()),
+                    default: None,
+                }],
+                builder: false,
+            }],
+            enums: vec![EnumDef {
+                name: "Kind".into(),
+                doc: Some("Kind of item.".into()),
+                variants: vec![EnumVariant {
+                    name: "Small".into(),
+                    value: 0,
+                    doc: Some("A small one".into()),
+                }],
+            }],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }])
+    }
+
+    #[test]
+    fn dotnet_emits_doc_on_function() {
+        let cs = render_csharp(&doc_api(), "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        assert!(
+            cs.contains("/// <summary>Performs a thing.</summary>"),
+            "{cs}"
+        );
+    }
+
+    #[test]
+    fn dotnet_emits_doc_on_struct() {
+        let cs = render_csharp(&doc_api(), "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        assert!(
+            cs.contains("/// <summary>An item we track.</summary>"),
+            "{cs}"
+        );
+    }
+
+    #[test]
+    fn dotnet_emits_doc_on_enum_variant() {
+        let cs = render_csharp(&doc_api(), "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        assert!(cs.contains("/// <summary>Kind of item.</summary>"), "{cs}");
+        assert!(cs.contains("/// <summary>A small one</summary>"), "{cs}");
+    }
+
+    #[test]
+    fn dotnet_emits_doc_on_field() {
+        let cs = render_csharp(&doc_api(), "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        assert!(cs.contains("/// <summary>Stable id</summary>"), "{cs}");
+    }
+
+    #[test]
+    fn dotnet_emits_doc_on_param() {
+        let cs = render_csharp(&doc_api(), "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        assert!(
+            cs.contains("/// <param name=\"x\">the input value</param>"),
+            "{cs}"
         );
     }
 }

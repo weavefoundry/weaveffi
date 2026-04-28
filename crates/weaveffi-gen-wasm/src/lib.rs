@@ -1,9 +1,15 @@
+//! WebAssembly binding generator for WeaveFFI.
+//!
+//! Emits a JavaScript loader stub and TypeScript declarations targeting a
+//! `wasm32-unknown-unknown` cdylib build of the same Rust source.
+//! Implements the [`Generator`] trait.
+
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
-use weaveffi_core::utils::local_type_name;
+use weaveffi_core::utils::{local_type_name, render_prelude, render_trailer, CommentStyle};
 use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, TypeRef};
 
 pub struct WasmGenerator;
@@ -11,17 +17,28 @@ pub struct WasmGenerator;
 const DEFAULT_MODULE_NAME: &str = "weaveffi_wasm";
 
 impl WasmGenerator {
-    fn generate_impl(&self, api: &Api, out_dir: &Utf8Path, module_name: &str) -> Result<()> {
+    fn generate_impl(
+        &self,
+        api: &Api,
+        out_dir: &Utf8Path,
+        module_name: &str,
+        input_basename: &str,
+    ) -> Result<()> {
         let wasm_dir = out_dir.join("wasm");
         std::fs::create_dir_all(&wasm_dir)?;
-        std::fs::write(wasm_dir.join("README.md"), render_wasm_readme(api))?;
         std::fs::write(
-            wasm_dir.join(format!("{module_name}.js")),
-            render_wasm_js_stub(api, module_name),
+            wasm_dir.join("README.md"),
+            render_wasm_readme(api, input_basename),
+        )?;
+        let js_filename = format!("{module_name}.js");
+        let dts_filename = format!("{module_name}.d.ts");
+        std::fs::write(
+            wasm_dir.join(&js_filename),
+            render_wasm_js_stub(api, module_name, input_basename, &js_filename),
         )?;
         std::fs::write(
-            wasm_dir.join(format!("{module_name}.d.ts")),
-            render_wasm_dts(api, module_name),
+            wasm_dir.join(&dts_filename),
+            render_wasm_dts(api, module_name, input_basename, &dts_filename),
         )?;
         Ok(())
     }
@@ -33,7 +50,7 @@ impl Generator for WasmGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, DEFAULT_MODULE_NAME)
+        self.generate_impl(api, out_dir, DEFAULT_MODULE_NAME, "weaveffi.yml")
     }
 
     fn generate_with_config(
@@ -42,7 +59,12 @@ impl Generator for WasmGenerator {
         out_dir: &Utf8Path,
         config: &GeneratorConfig,
     ) -> Result<()> {
-        self.generate_impl(api, out_dir, config.wasm_module_name())
+        self.generate_impl(
+            api,
+            out_dir,
+            config.wasm_module_name(),
+            config.input_basename(),
+        )
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
@@ -60,11 +82,13 @@ impl Generator for WasmGenerator {
 }
 
 fn output_file_list(out_dir: &Utf8Path, module_name: &str) -> Vec<String> {
-    vec![
+    let mut files = vec![
         out_dir.join("wasm/README.md").to_string(),
-        out_dir.join(format!("wasm/{module_name}.js")).to_string(),
         out_dir.join(format!("wasm/{module_name}.d.ts")).to_string(),
-    ]
+        out_dir.join(format!("wasm/{module_name}.js")).to_string(),
+    ];
+    files.sort();
+    files
 }
 
 fn wasm_type(ty: &TypeRef) -> &'static str {
@@ -90,7 +114,6 @@ fn wasm_type(ty: &TypeRef) -> &'static str {
             | TypeRef::Map(_, _) => "i64",
             _ => "i32, i32",
         },
-        TypeRef::Callback(_) => todo!("callback WASM type"),
     }
 }
 
@@ -118,7 +141,6 @@ fn wasm_type_note(ty: &TypeRef) -> &'static str {
             | TypeRef::Map(_, _) => "opaque handle, 0 = absent",
             _ => "is_present flag + value",
         },
-        TypeRef::Callback(_) => todo!("callback WASM type"),
     }
 }
 
@@ -138,12 +160,11 @@ fn type_display(ty: &TypeRef) -> String {
         TypeRef::List(inner) => format!("[{}]", type_display(inner)),
         TypeRef::Iterator(inner) => format!("iter<{}>", type_display(inner)),
         TypeRef::Map(k, v) => format!("{{{}:{}}}", type_display(k), type_display(v)),
-        TypeRef::Callback(_) => todo!("callback WASM type"),
     }
 }
 
-fn render_wasm_readme(api: &Api) -> String {
-    let mut out = String::new();
+fn render_wasm_readme(api: &Api, input_basename: &str) -> String {
+    let mut out = render_prelude(CommentStyle::Xml, input_basename);
     out.push_str("# WeaveFFI WASM (experimental)\n\n");
     out.push_str("This folder contains a minimal stub to help you load a `wasm32-unknown-unknown` build of your WeaveFFI library.\n\n");
     out.push_str("Build (example):\n\n");
@@ -181,6 +202,8 @@ fn render_wasm_readme(api: &Api) -> String {
         render_api_reference(&mut out, api);
     }
 
+    out.push('\n');
+    out.push_str(&render_trailer(CommentStyle::Xml, "README.md"));
     out
 }
 
@@ -362,7 +385,6 @@ fn ts_type_for(ty: &TypeRef) -> String {
             format!("{t}[]")
         }
         TypeRef::Map(k, v) => format!("Record<{}, {}>", ts_type_for(k), ts_type_for(v)),
-        TypeRef::Callback(_) => todo!("callback WASM type"),
     }
 }
 
@@ -390,17 +412,113 @@ fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Mo
     }
 }
 
-fn render_wasm_dts(api: &Api, module_name: &str) -> String {
+/// Emits a JSDoc comment at `indent`. Single-line docs collapse to
+/// `/** text */`; multi-line docs expand to a block with ` * ` prefixed lines.
+fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
+    let Some(doc) = doc else {
+        return;
+    };
+    let doc = doc.trim();
+    if doc.is_empty() {
+        return;
+    }
+    if doc.contains('\n') {
+        out.push_str(indent);
+        out.push_str("/**\n");
+        for line in doc.lines() {
+            out.push_str(indent);
+            if line.is_empty() {
+                out.push_str(" *\n");
+            } else {
+                out.push_str(" * ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out.push_str(indent);
+        out.push_str(" */\n");
+    } else {
+        out.push_str(indent);
+        out.push_str("/** ");
+        out.push_str(doc);
+        out.push_str(" */\n");
+    }
+}
+
+/// Emits a JSDoc block for a function: function doc, `@param name desc` for
+/// each documented parameter, and an optional trailing tag list.
+fn emit_fn_doc(
+    out: &mut String,
+    doc: &Option<String>,
+    params: &[weaveffi_ir::ir::Param],
+    indent: &str,
+    extra_tags: &[String],
+) {
+    let has_param_docs = params.iter().any(|p| p.doc.is_some());
+    let trimmed_doc = doc.as_ref().map(|d| d.trim()).filter(|d| !d.is_empty());
+    if trimmed_doc.is_none() && !has_param_docs && extra_tags.is_empty() {
+        return;
+    }
+    out.push_str(indent);
+    out.push_str("/**\n");
+    if let Some(d) = trimmed_doc {
+        for line in d.lines() {
+            out.push_str(indent);
+            if line.is_empty() {
+                out.push_str(" *\n");
+            } else {
+                out.push_str(" * ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    for p in params {
+        if let Some(pdoc) = &p.doc {
+            let pdoc = pdoc.trim();
+            if pdoc.is_empty() {
+                continue;
+            }
+            let mut lines = pdoc.lines();
+            if let Some(first) = lines.next() {
+                out.push_str(indent);
+                out.push_str(&format!(" * @param {} {}\n", p.name, first));
+            }
+            for line in lines {
+                out.push_str(indent);
+                if line.is_empty() {
+                    out.push_str(" *\n");
+                } else {
+                    out.push_str(" *   ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    for tag in extra_tags {
+        out.push_str(indent);
+        out.push_str(" * ");
+        out.push_str(tag);
+        out.push('\n');
+    }
+    out.push_str(indent);
+    out.push_str(" */\n");
+}
+
+fn render_wasm_dts(api: &Api, module_name: &str, input_basename: &str, filename: &str) -> String {
     let pascal_name = module_name.to_upper_camel_case();
     let interface_name = format!("{pascal_name}Module");
     let load_fn = format!("load{pascal_name}");
-    let mut out =
-        String::from("// Generated TypeScript declarations for WeaveFFI WASM bindings\n\n");
+    let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
+    out.push_str("// Generated TypeScript declarations for WeaveFFI WASM bindings\n\n");
 
     for (m, _path) in collect_modules_with_path(&api.modules) {
         for s in &m.structs {
+            emit_doc(&mut out, &s.doc, "");
             out.push_str(&format!("export interface {} {{\n", s.name));
             for field in &s.fields {
+                emit_doc(&mut out, &field.doc, "  ");
                 out.push_str(&format!(
                     "  readonly {}: {};\n",
                     field.name,
@@ -411,8 +529,10 @@ fn render_wasm_dts(api: &Api, module_name: &str) -> String {
         }
 
         for e in &m.enums {
+            emit_doc(&mut out, &e.doc, "");
             out.push_str(&format!("export declare const {}: Readonly<{{\n", e.name));
             for v in &e.variants {
+                emit_doc(&mut out, &v.doc, "  ");
                 out.push_str(&format!("  {}: {};\n", v.name, v.value));
             }
             out.push_str("}>;\n\n");
@@ -430,8 +550,9 @@ fn render_wasm_dts(api: &Api, module_name: &str) -> String {
     out.push_str("}\n\n");
 
     out.push_str(&format!(
-        "export function {load_fn}(url: string): Promise<{interface_name}>;\n"
+        "export function {load_fn}(url: string): Promise<{interface_name}>;\n\n"
     ));
+    out.push_str(&render_trailer(CommentStyle::DoubleSlash, filename));
     out
 }
 
@@ -460,12 +581,11 @@ fn render_dts_module_interface(out: &mut String, m: &Module, module_path: &str, 
         } else {
             base_ret
         };
+        let mut tags = vec!["@throws {Error} if the native call fails".to_string()];
         if let Some(msg) = &func.deprecated {
-            out.push_str(&format!("{inner}/** @deprecated {msg} */\n"));
+            tags.insert(0, format!("@deprecated {msg}"));
         }
-        out.push_str(&format!(
-            "{inner}/** @throws {{Error}} if the native call fails */\n"
-        ));
+        emit_fn_doc(out, &func.doc, &func.params, &inner, &tags);
         out.push_str(&format!(
             "{inner}{}({}): {};\n",
             func.name,
@@ -480,10 +600,15 @@ fn render_dts_module_interface(out: &mut String, m: &Module, module_path: &str, 
     out.push_str(&format!("{indent}}};\n"));
 }
 
-fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
+fn render_wasm_js_stub(
+    api: &Api,
+    module_name: &str,
+    input_basename: &str,
+    filename: &str,
+) -> String {
     let pascal_name = module_name.to_upper_camel_case();
     let load_fn = format!("load{pascal_name}");
-    let mut out = String::new();
+    let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
     let needs_strings = api_needs_string_helpers(api);
 
     out.push_str("// WeaveFFI WASM bindings (auto-generated)\n");
@@ -693,7 +818,8 @@ fn render_wasm_js_stub(api: &Api, module_name: &str) -> String {
         out.push_str("  };\n");
     }
 
-    out.push_str("}\n");
+    out.push_str("}\n\n");
+    out.push_str(&render_trailer(CommentStyle::DoubleSlash, filename));
     out
 }
 
@@ -887,7 +1013,6 @@ fn async_cb_wasm_params(returns: Option<&TypeRef>) -> Vec<&'static str> {
                 params.push("i32");
             }
         },
-        Some(TypeRef::Callback(_)) => todo!("callback WASM type"),
     }
     params
 }
@@ -1033,11 +1158,13 @@ mod tests {
                         name: "a".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "b".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::I32),
@@ -1096,7 +1223,7 @@ mod tests {
 
     #[test]
     fn readme_documents_structs() {
-        let readme = render_wasm_readme(&empty_api());
+        let readme = render_wasm_readme(&empty_api(), "weaveffi.yml");
         assert!(readme.contains("### Structs"));
         assert!(readme.contains("opaque handles"));
         assert!(readme.contains("`i64` pointers"));
@@ -1104,7 +1231,7 @@ mod tests {
 
     #[test]
     fn readme_documents_enums() {
-        let readme = render_wasm_readme(&empty_api());
+        let readme = render_wasm_readme(&empty_api(), "weaveffi.yml");
         assert!(readme.contains("### Enums"));
         assert!(readme.contains("`i32` values"));
         assert!(readme.contains("discriminant"));
@@ -1112,7 +1239,7 @@ mod tests {
 
     #[test]
     fn readme_documents_optionals() {
-        let readme = render_wasm_readme(&empty_api());
+        let readme = render_wasm_readme(&empty_api(), "weaveffi.yml");
         assert!(readme.contains("### Optionals"));
         assert!(readme.contains("`0` / `null`"));
         assert!(readme.contains("_is_present"));
@@ -1120,7 +1247,7 @@ mod tests {
 
     #[test]
     fn readme_documents_lists() {
-        let readme = render_wasm_readme(&empty_api());
+        let readme = render_wasm_readme(&empty_api(), "weaveffi.yml");
         assert!(readme.contains("### Lists"));
         assert!(readme.contains("pointer + length"));
         assert!(readme.contains("`i32` pointer, `i32` length"));
@@ -1128,7 +1255,12 @@ mod tests {
 
     #[test]
     fn js_stub_has_jsdoc() {
-        let js = render_wasm_js_stub(&empty_api(), DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(
+            &empty_api(),
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.js",
+        );
         assert!(js.contains("@param {string} url"));
         assert!(js.contains("@returns {Promise<WebAssembly.Exports>}"));
         assert!(js.contains("@example"));
@@ -1136,7 +1268,12 @@ mod tests {
 
     #[test]
     fn js_stub_documents_complex_types() {
-        let js = render_wasm_js_stub(&empty_api(), DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(
+            &empty_api(),
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.js",
+        );
         assert!(js.contains("Struct handle: () -> i64 (opaque pointer)"));
         assert!(js.contains("Enum: (i32 discriminant) -> void"));
         assert!(js.contains("Optional: (i32 is_present, i32 value) -> void"));
@@ -1145,7 +1282,12 @@ mod tests {
 
     #[test]
     fn js_stub_has_type_convention_header() {
-        let js = render_wasm_js_stub(&empty_api(), DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(
+            &empty_api(),
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.js",
+        );
         assert!(js.contains("Structs   -> i64 opaque handle"));
         assert!(js.contains("Enums     -> i32 discriminant value"));
         assert!(js.contains("Optionals -> 0/null for absent"));
@@ -1172,32 +1314,32 @@ mod tests {
 
     #[test]
     fn empty_api_has_no_api_reference() {
-        let readme = render_wasm_readme(&empty_api());
+        let readme = render_wasm_readme(&empty_api(), "weaveffi.yml");
         assert!(!readme.contains("## API Reference"));
     }
 
     #[test]
     fn api_reference_lists_module() {
-        let readme = render_wasm_readme(&sample_api());
+        let readme = render_wasm_readme(&sample_api(), "weaveffi.yml");
         assert!(readme.contains("## API Reference"));
         assert!(readme.contains("### Module: `math`"));
     }
 
     #[test]
     fn api_reference_function_abi_name() {
-        let readme = render_wasm_readme(&sample_api());
+        let readme = render_wasm_readme(&sample_api(), "weaveffi.yml");
         assert!(readme.contains("##### `weaveffi_math_add`"));
     }
 
     #[test]
     fn api_reference_function_signature() {
-        let readme = render_wasm_readme(&sample_api());
+        let readme = render_wasm_readme(&sample_api(), "weaveffi.yml");
         assert!(readme.contains("`weaveffi_math_add(a: i32, b: i32) -> i32`"));
     }
 
     #[test]
     fn api_reference_function_param_table() {
-        let readme = render_wasm_readme(&sample_api());
+        let readme = render_wasm_readme(&sample_api(), "weaveffi.yml");
         assert!(readme.contains("| `a` | `i32` | `i32` | native WASM i32 |"));
         assert!(readme.contains("| `b` | `i32` | `i32` | native WASM i32 |"));
         assert!(readme.contains("| _returns_ | `i32` | `i32` | native WASM i32 |"));
@@ -1205,13 +1347,13 @@ mod tests {
 
     #[test]
     fn api_reference_function_doc() {
-        let readme = render_wasm_readme(&sample_api());
+        let readme = render_wasm_readme(&sample_api(), "weaveffi.yml");
         assert!(readme.contains("Add two numbers"));
     }
 
     #[test]
     fn api_reference_struct_accessors() {
-        let readme = render_wasm_readme(&sample_api());
+        let readme = render_wasm_readme(&sample_api(), "weaveffi.yml");
         assert!(readme.contains("##### `Point`"));
         assert!(readme.contains("opaque handle (`i64`)"));
         assert!(readme.contains("| `weaveffi_math_Point_get_x` | `f64` |"));
@@ -1220,7 +1362,7 @@ mod tests {
 
     #[test]
     fn api_reference_enum_discriminants() {
-        let readme = render_wasm_readme(&sample_api());
+        let readme = render_wasm_readme(&sample_api(), "weaveffi.yml");
         assert!(readme.contains("##### `Color`"));
         assert!(readme.contains("`i32` discriminant"));
         assert!(readme.contains("| `Red` | `0` |"));
@@ -1320,6 +1462,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                     "Contact".into(),
@@ -1355,7 +1498,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let readme = render_wasm_readme(&api);
+        let readme = render_wasm_readme(&api, "weaveffi.yml");
         assert!(readme.contains("| `name` | `string` | `i32, i32` | ptr + len in linear memory |"));
         assert!(readme.contains("| _returns_ | `Contact?` | `i64` | opaque handle, 0 = absent |"));
         assert!(readme.contains("| `weaveffi_contacts_Contact_get_id` | `i32` |"));
@@ -1372,6 +1515,7 @@ mod tests {
                     name: "msg".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -1387,7 +1531,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let readme = render_wasm_readme(&api);
+        let readme = render_wasm_readme(&api, "weaveffi.yml");
         assert!(readme.contains("-> void`"));
         assert!(!readme.contains("_returns_"));
     }
@@ -1416,7 +1560,7 @@ mod tests {
                 modules: vec![],
             },
         ]);
-        let readme = render_wasm_readme(&api);
+        let readme = render_wasm_readme(&api, "weaveffi.yml");
         assert!(readme.contains("### Module: `math`"));
         assert!(readme.contains("### Module: `io`"));
     }
@@ -1441,7 +1585,12 @@ mod tests {
     #[test]
     fn wasm_js_has_api_functions() {
         let api = sample_api();
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(
+            &api,
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.js",
+        );
         assert!(js.contains("add(a, b)"));
         assert!(js.contains("wasm.weaveffi_math_add(a, b, _err)"));
         assert!(js.contains("class Point"));
@@ -1489,6 +1638,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::StringUtf8),
                 doc: None,
@@ -1504,7 +1654,12 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(
+            &api,
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.js",
+        );
         assert!(js.contains("function _encodeString(wasm, str)"));
         assert!(js.contains("function _decodeString(wasm, ptr, len)"));
         assert!(js.contains("TextEncoder"));
@@ -1518,7 +1673,12 @@ mod tests {
     #[test]
     fn wasm_js_has_error_helpers() {
         let api = sample_api();
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(
+            &api,
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.js",
+        );
         assert!(js.contains("function _allocError(wasm)"));
         assert!(js.contains("function _checkError(wasm, errPtr)"));
     }
@@ -1526,7 +1686,12 @@ mod tests {
     #[test]
     fn wasm_js_function_passes_err() {
         let api = sample_api();
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(
+            &api,
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.js",
+        );
         assert!(js.contains("const _err = _allocError(wasm)"));
         assert!(js.contains("_checkError(wasm, _err)"));
     }
@@ -1534,12 +1699,17 @@ mod tests {
     #[test]
     fn wasm_dts_has_throws_doc() {
         let api = sample_api();
-        let dts = render_wasm_dts(&api, DEFAULT_MODULE_NAME);
+        let dts = render_wasm_dts(
+            &api,
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.d.ts",
+        );
         assert!(
             dts.contains("@throws"),
             "Expected .d.ts to contain @throws JSDoc comment"
         );
-        assert!(dts.contains("/** @throws {Error} if the native call fails */"));
+        assert!(dts.contains("@throws {Error} if the native call fails"));
     }
 
     #[test]
@@ -1583,6 +1753,7 @@ mod tests {
                     name: "contact".into(),
                     ty: TypeRef::TypedHandle("Contact".into()),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -1608,12 +1779,22 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let dts = render_wasm_dts(&api, DEFAULT_MODULE_NAME);
+        let dts = render_wasm_dts(
+            &api,
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.d.ts",
+        );
         assert!(
             dts.contains("contact: Contact"),
             "TypedHandle should use class type not bigint: {dts}"
         );
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(
+            &api,
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.js",
+        );
         assert!(
             js.contains("contact._handle"),
             "TypedHandle should extract ._handle: {js}"
@@ -1632,6 +1813,7 @@ mod tests {
                         Box::new(TypeRef::Struct("Contact".into())),
                     ))))),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -1657,7 +1839,12 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let dts = render_wasm_dts(&api, DEFAULT_MODULE_NAME);
+        let dts = render_wasm_dts(
+            &api,
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.d.ts",
+        );
         assert!(
             dts.contains("(Contact | null)[] | null"),
             "should contain deeply nested optional type: {dts}"
@@ -1677,6 +1864,7 @@ mod tests {
                         Box::new(TypeRef::List(Box::new(TypeRef::I32))),
                     ),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -1692,7 +1880,12 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let dts = render_wasm_dts(&api, DEFAULT_MODULE_NAME);
+        let dts = render_wasm_dts(
+            &api,
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.d.ts",
+        );
         assert!(
             dts.contains("Record<string, number[]>"),
             "should contain map of lists type: {dts}"
@@ -1712,6 +1905,7 @@ mod tests {
                         Box::new(TypeRef::Struct("Contact".into())),
                     ),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -1757,7 +1951,12 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let dts = render_wasm_dts(&api, DEFAULT_MODULE_NAME);
+        let dts = render_wasm_dts(
+            &api,
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.d.ts",
+        );
         assert!(
             dts.contains("Record<Color, Contact>"),
             "should contain enum-keyed map type: {dts}"
@@ -1774,6 +1973,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -1799,7 +1999,12 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(
+            &api,
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.js",
+        );
         assert!(
             js.contains("_encodeString(wasm, name)"),
             "string param should be copied to WASM memory via _encodeString"
@@ -1834,6 +2039,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                     "Contact".into(),
@@ -1861,7 +2067,12 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(
+            &api,
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.js",
+        );
         assert!(
             js.contains("result === 0n ? null : new Contact(wasm, result)"),
             "optional struct return should null-check before wrapping"
@@ -1878,6 +2089,7 @@ mod tests {
                     name: "x".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -1893,7 +2105,12 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(
+            &api,
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.js",
+        );
         assert!(
             js.contains("new Promise"),
             "async function should return a Promise: {js}"
@@ -1924,6 +2141,62 @@ mod tests {
         );
     }
 
+    /// The WASM bindings register one trampoline per async-callback
+    /// signature on the indirect function table for the lifetime of the API
+    /// instance and route per-call resolve/reject through the
+    /// `_asyncContexts` map. Each entry is `set(ctxId, ...)` once and
+    /// `delete(ctxId)` once on the callback path so the resolver closures do
+    /// not leak.
+    #[test]
+    fn wasm_async_pins_callback_for_lifetime() {
+        let api = make_api(vec![Module {
+            name: "math".into(),
+            functions: vec![Function {
+                name: "compute".into(),
+                params: vec![Param {
+                    name: "x".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: None,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: true,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let js = render_wasm_js_stub(
+            &api,
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.js",
+        );
+        let trampoline_count = js.matches("_registerTrampoline").count();
+        let set_count = js.matches("_asyncContexts.set(ctxId").count();
+        let delete_count = js.matches("_asyncContexts.delete(ctxId)").count();
+        // Trampoline is defined once and registered once per signature.
+        assert_eq!(
+            trampoline_count, 2,
+            "expected one definition and one registration of the trampoline, got {trampoline_count}: {js}"
+        );
+        assert_eq!(
+            set_count, delete_count,
+            "every _asyncContexts.set must be matched by a delete: set={set_count} delete={delete_count}: {js}"
+        );
+        assert!(
+            set_count >= 1,
+            "expected at least one _asyncContexts.set per async fn: {js}"
+        );
+    }
+
     #[test]
     fn wasm_dts_async_function() {
         let api = make_api(vec![Module {
@@ -1935,6 +2208,7 @@ mod tests {
                         name: "x".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::I32),
                     doc: None,
@@ -1950,11 +2224,13 @@ mod tests {
                             name: "a".into(),
                             ty: TypeRef::I32,
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "b".into(),
                             ty: TypeRef::I32,
                             mutable: false,
+                            doc: None,
                         },
                     ],
                     returns: Some(TypeRef::I32),
@@ -1972,7 +2248,12 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let dts = render_wasm_dts(&api, DEFAULT_MODULE_NAME);
+        let dts = render_wasm_dts(
+            &api,
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.d.ts",
+        );
         assert!(
             dts.contains("compute(x: number): Promise<number>"),
             "async function should return Promise<T> in .d.ts: {dts}"
@@ -2026,7 +2307,12 @@ mod tests {
                 modules: vec![],
             }],
         }]);
-        let dts = render_wasm_dts(&api, DEFAULT_MODULE_NAME);
+        let dts = render_wasm_dts(
+            &api,
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.d.ts",
+        );
         assert!(
             dts.contains("parent:"),
             "parent module in DTS interface missing: {dts}"
@@ -2043,7 +2329,12 @@ mod tests {
             dts.contains("inner_fn(): number"),
             "nested child function in DTS missing: {dts}"
         );
-        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let js = render_wasm_js_stub(
+            &api,
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.js",
+        );
         assert!(
             js.contains("weaveffi_parent_outer_fn"),
             "parent C ABI call in JS missing: {js}"
@@ -2052,5 +2343,106 @@ mod tests {
             js.contains("weaveffi_parent_child_inner_fn"),
             "nested child C ABI call in JS missing: {js}"
         );
+    }
+
+    fn doc_module() -> Module {
+        Module {
+            name: "docs".into(),
+            functions: vec![Function {
+                name: "do_thing".into(),
+                params: vec![Param {
+                    name: "x".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: Some("the input value".into()),
+                }],
+                returns: Some(TypeRef::I32),
+                doc: Some("Performs a thing.".into()),
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![StructDef {
+                name: "Item".into(),
+                doc: Some("An item we track.".into()),
+                fields: vec![StructField {
+                    name: "id".into(),
+                    ty: TypeRef::I64,
+                    doc: Some("Stable id".into()),
+                    default: None,
+                }],
+                builder: false,
+            }],
+            enums: vec![EnumDef {
+                name: "Kind".into(),
+                doc: Some("Kind of item.".into()),
+                variants: vec![EnumVariant {
+                    name: "Small".into(),
+                    value: 0,
+                    doc: Some("A small one".into()),
+                }],
+            }],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }
+    }
+
+    #[test]
+    fn wasm_emits_doc_on_function() {
+        let dts = render_wasm_dts(
+            &make_api(vec![doc_module()]),
+            "weaveffi",
+            "weaveffi.yml",
+            "weaveffi.d.ts",
+        );
+        assert!(dts.contains("Performs a thing."), "{dts}");
+    }
+
+    #[test]
+    fn wasm_emits_doc_on_struct() {
+        let dts = render_wasm_dts(
+            &make_api(vec![doc_module()]),
+            "weaveffi",
+            "weaveffi.yml",
+            "weaveffi.d.ts",
+        );
+        assert!(dts.contains("/** An item we track. */"), "{dts}");
+    }
+
+    #[test]
+    fn wasm_emits_doc_on_enum_variant() {
+        let dts = render_wasm_dts(
+            &make_api(vec![doc_module()]),
+            "weaveffi",
+            "weaveffi.yml",
+            "weaveffi.d.ts",
+        );
+        assert!(dts.contains("/** Kind of item. */"), "{dts}");
+        assert!(dts.contains("/** A small one */"), "{dts}");
+    }
+
+    #[test]
+    fn wasm_emits_doc_on_field() {
+        let dts = render_wasm_dts(
+            &make_api(vec![doc_module()]),
+            "weaveffi",
+            "weaveffi.yml",
+            "weaveffi.d.ts",
+        );
+        assert!(dts.contains("/** Stable id */"), "{dts}");
+    }
+
+    #[test]
+    fn wasm_emits_doc_on_param() {
+        let dts = render_wasm_dts(
+            &make_api(vec![doc_module()]),
+            "weaveffi",
+            "weaveffi.yml",
+            "weaveffi.d.ts",
+        );
+        assert!(dts.contains("@param x the input value"), "{dts}");
     }
 }

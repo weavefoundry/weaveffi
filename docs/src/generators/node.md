@@ -1,21 +1,43 @@
-# Node
+# Node.js
 
-The Node generator produces a CommonJS loader and `.d.ts` type definitions
-for your functions. The generated addon uses the [N-API](https://nodejs.org/api/n-api.html)
-(Node-API) interface to load the C ABI symbols and expose JS-friendly functions.
+## Overview
 
-## Generated artifacts
+The Node.js target produces a CommonJS loader plus TypeScript type
+definitions. The actual native bridging happens in an N-API addon
+(`samples/node-addon` for the in-tree examples) which the loader picks
+up as `index.node`. The generator focuses on the consumer-facing surface
+so that downstream projects can ship the same `.node` file with typed JS
+bindings.
 
-- `generated/node/index.js` — CommonJS loader that requires `./index.node`
-- `generated/node/types.d.ts` — function signatures inferred from your IR
-- `generated/node/package.json`
+## What gets generated
 
-## Generated code examples
+| File | Purpose |
+|------|---------|
+| `generated/node/index.js` | CommonJS loader that requires `./index.node` |
+| `generated/node/types.d.ts` | TypeScript declarations for the public surface |
+| `generated/node/package.json` | npm package metadata (`main`, `types`) |
 
-Given this IDL definition:
+## Type mapping
+
+| IDL type      | TypeScript type      |
+|---------------|----------------------|
+| `i32`         | `number`             |
+| `u32`         | `number`             |
+| `i64`         | `number`             |
+| `f64`         | `number`             |
+| `bool`        | `boolean`            |
+| `string`      | `string`             |
+| `bytes`       | `Buffer`             |
+| `handle`      | `bigint`             |
+| `StructName`  | `StructName`         |
+| `EnumName`    | `EnumName`           |
+| `T?`          | `T \| null`          |
+| `[T]`         | `T[]`                |
+
+## Example IDL → generated code
 
 ```yaml
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: contacts
     enums:
@@ -53,9 +75,8 @@ modules:
         return: "[string]"
 ```
 
-### TypeScript interfaces
-
-Structs map to TypeScript interfaces with typed fields:
+Structs become TypeScript interfaces and enums become explicit numeric
+TypeScript enums:
 
 ```typescript
 export interface Contact {
@@ -63,13 +84,7 @@ export interface Contact {
   email: string | null;
   tags: string[];
 }
-```
 
-### Enums
-
-Enums map to TypeScript enums with explicit integer values:
-
-```typescript
 export enum Color {
   Red = 0,
   Green = 1,
@@ -77,77 +92,20 @@ export enum Color {
 }
 ```
 
-### Nullable types
-
-Optional types are expressed as union types with `null`:
+Optional return and parameter types use `| null`; arrays use `T[]`:
 
 ```typescript
-// Optional parameter
-color: Color | null
-
-// Optional return
-export function get_contact(id: number): Contact | null
-```
-
-### Array types
-
-List types map to TypeScript arrays. Lists of optionals use parenthesized
-union types:
-
-```typescript
-// Simple array
-export function get_tags(contact_id: number): string[]
-
-// Array return of structs
-export function list_contacts(): Contact[]
-
-// Array of optionals (if defined)
-(number | null)[]
-```
-
-### Complete generated `types.d.ts`
-
-For the IDL above, the full generated file looks like:
-
-```typescript
-// Generated types for WeaveFFI functions
-export interface Contact {
-  name: string;
-  email: string | null;
-  tags: string[];
-}
-export enum Color {
-  Red = 0,
-  Green = 1,
-  Blue = 2,
-}
-// module contacts
 export function get_contact(id: number): Contact | null
 export function list_contacts(): Contact[]
 export function set_favorite_color(contact_id: number, color: Color | null): void
 export function get_tags(contact_id: number): string[]
 ```
 
-### Type mapping reference
+## Build instructions
 
-| IDL type      | TypeScript type      |
-|---------------|----------------------|
-| `i32`         | `number`             |
-| `u32`         | `number`             |
-| `i64`         | `number`             |
-| `f64`         | `number`             |
-| `bool`        | `boolean`            |
-| `string`      | `string`             |
-| `bytes`       | `Buffer`             |
-| `handle`      | `bigint`             |
-| `StructName`  | `StructName`         |
-| `EnumName`    | `EnumName`           |
-| `T?`          | `T \| null`          |
-| `[T]`         | `T[]`                |
+The runnable example uses the `calculator` sample.
 
-## Running the example
-
-### macOS
+macOS:
 
 ```bash
 cargo build -p calculator
@@ -157,7 +115,7 @@ cd examples/node
 DYLD_LIBRARY_PATH=../../target/debug npm start
 ```
 
-### Linux
+Linux:
 
 ```bash
 cargo build -p calculator
@@ -167,7 +125,49 @@ cd examples/node
 LD_LIBRARY_PATH=../../target/debug npm start
 ```
 
-## Notes
+Windows: copy `target\debug\index.dll` to `generated\node\index.node`
+and run `npm start` from `examples\node`.
 
-- The loader expects the compiled N-API addon next to it as `index.node`.
-- The N-API addon crate is in `samples/node-addon`.
+For your own project, build an N-API addon (see `samples/node-addon`),
+copy the resulting platform-specific binary in as `index.node`, and
+publish the generated directory as a private npm package or ship it
+inside your app.
+
+## Memory and ownership
+
+- The N-API addon is responsible for all conversions between JS values
+  and C ABI types. Strings and byte buffers are copied into JS-managed
+  storage, so consumers never need to think about freeing memory.
+- Struct handles surface as opaque numeric IDs (`bigint`). The addon
+  exposes `_destroy` helpers that tear down the underlying Rust state;
+  use them in `try`/`finally` blocks for deterministic cleanup.
+- Errors from the C ABI are converted into JavaScript `Error` instances
+  by the addon before bubbling up to the caller.
+
+## Async support
+
+Async IDL functions are exposed as JS functions that return a Promise.
+The N-API addon implements them with `napi_create_async_work` so that
+the JS event loop stays responsive while the Rust function runs:
+
+```typescript
+export function fetch_contact(id: number): Promise<Contact>;
+```
+
+When the IDL marks the function `cancel: true`, the addon also accepts
+an `AbortSignal` parameter and forwards aborts to the underlying
+`weaveffi_cancel_token`.
+
+## Troubleshooting
+
+- **`Error: Cannot find module 'index.node'`** — the addon binary is
+  missing. Build the N-API addon for your platform and copy it into
+  `generated/node/` as `index.node`.
+- **`dlopen: ... image not found`** — the addon links against the
+  Rust cdylib at runtime; set `DYLD_LIBRARY_PATH` /
+  `LD_LIBRARY_PATH` or copy the cdylib next to `index.node`.
+- **`BigInt` errors with `handle`** — handles are 64-bit; pass them as
+  `bigint`, not `number`.
+- **TypeScript complains about missing types** — point `tsconfig`'s
+  `paths` at `generated/node/types.d.ts` or include the generated
+  package in `compilerOptions.types`.

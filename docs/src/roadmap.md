@@ -1,146 +1,191 @@
-# WeaveFFI Roadmap
+# Roadmap
 
-This roadmap tracks high-level goals for WeaveFFI. The project generates
-multi-language bindings from an API definition (YAML, JSON, or TOML), producing
-a stable C ABI contract consumed by language-specific wrappers.
-
-## Crate structure
-
-| Crate | Purpose |
-|---|---|
-| `weaveffi-ir` | IR model + YAML/JSON/TOML parsing via `serde` |
-| `weaveffi-abi` | C ABI runtime helpers (error struct, handles, memory free functions) |
-| `weaveffi-core` | `Generator` trait, `Orchestrator`, validation, shared utilities, template engine |
-| `weaveffi-gen-c` | C header generator |
-| `weaveffi-gen-cpp` | C++ header + RAII wrapper + CMake scaffold generator |
-| `weaveffi-gen-swift` | SwiftPM System Library + Swift wrapper generator |
-| `weaveffi-gen-android` | Kotlin/JNI wrapper + Gradle skeleton generator |
-| `weaveffi-gen-node` | N-API addon loader + TypeScript types generator |
-| `weaveffi-gen-wasm` | WASM loader + JS/TS wrapper generator |
-| `weaveffi-gen-python` | Python ctypes binding + `.pyi` stubs generator |
-| `weaveffi-gen-dotnet` | .NET P/Invoke binding generator |
-| `weaveffi-gen-dart` | Dart `dart:ffi` binding + `pubspec.yaml` generator |
-| `weaveffi-gen-go` | Go CGo binding + `go.mod` generator |
-| `weaveffi-gen-ruby` | Ruby FFI binding + gemspec generator |
-| `weaveffi-cli` | CLI binary (installed as `weaveffi`) |
-| `samples/calculator` | End-to-end sample Rust library |
-| `samples/contacts` | Contacts sample with structs, enums, and optionals |
-| `samples/inventory` | Multi-module sample with cross-type features |
-| `samples/node-addon` | N-API addon for the calculator sample |
-| `samples/async-demo` | Async demo with callback-based C ABI convention |
-| `samples/events` | Events sample with callbacks, listeners, and iterators |
-
-## What works today
-
-- **CLI** with commands: `generate`, `new`, `validate`, `extract`, `lint`, `diff`, `doctor`, `completions`, `schema-version`
-- **IR parsing** from YAML, JSON, and TOML with validation (name collisions, reserved keywords, unsupported shapes)
-- **Code generators** for C, C++, Swift, Android, Node.js, WASM, Python, .NET, Dart, Go, and Ruby targets
-- **Rich type system**: primitives, strings, bytes, handles, typed handles, structs, enums, optionals, lists, maps, iterators, callbacks
-- **Annotated Rust extraction** — derive/proc-macro input as an alternative to hand-written YAML
-- **Incremental codegen** with content-hash caching to skip unchanged files
-- **Generator configuration** via TOML config file with per-target options
-- **Inline generator config** via `[generators.<target>]` sections in IDL files
-- **Template engine** — Tera-based user-overridable code templates loaded from a `templates/` directory
-- **Pre/post hooks** — run arbitrary scripts before and after code generation
-- **Scaffolding** — `--scaffold` emits Rust `extern "C"` stubs for the API (sync and async)
-- **Inline helpers** — error types and memory management utilities generated into each package
-- **Samples** demonstrating end-to-end usage (calculator, contacts, inventory, async-demo, events)
-- **C ABI layer** with error struct, string/bytes free functions, error domains, typed handles, and callback convention
-- **Validation warnings** — `--warn` and `lint` command for non-fatal diagnostics
-- **Diff mode** — compare generated output against existing files
-- **Shell completions** — `weaveffi completions <shell>` for bash, zsh, fish, PowerShell
-- **Schema versioning** — IR version field with `schema-version` for querying
-- **Async IR model** — async functions with completion callback convention and cancellation support
-- **Advanced IR features** — sub-modules, builder pattern, deprecated/since annotations, mutable params, default field values, borrowed types
+This page tracks where WeaveFFI is, where it's going next, and what lives
+beyond 1.0. The shape and stability of each surface is documented in the
+[stability page](stability.md); this page is the feature timeline.
 
 ## Completed
 
-- [x] Usable CLI that reads a YAML IR, validates it, and generates bindings for all five original targets (C, Swift, Android, Node, WASM)
-- [x] Calculator sample and mdBook documentation site
-- [x] C ABI layer with error struct, string/bytes free functions, and handle convention
-- [x] Extended IR: structs, enums, optional types, arrays/slices, and maps
-- [x] Richer string and byte-buffer handling
-- [x] Packaging improvements (SwiftPM, Gradle, npm scaffolds)
-- [x] Annotated Rust crate extraction (`weaveffi extract`) as an alternative to hand-written YAML
-- [x] Improved diagnostics, validation warnings, and `weaveffi lint` command
-- [x] Incremental codegen with content-hash caching
-- [x] Generator configuration via TOML config file
-- [x] DX polish: `--dry-run`, `--quiet`, `--verbose`, `diff` command, improved `doctor`
-- [x] Python target (ctypes + `.pyi` type stubs + pip-installable package)
-- [x] .NET target (P/Invoke + `.csproj` + `.nuspec`)
-- [x] Inline generated helpers per target (error types, memory wrappers)
-- [x] WASM generator rewritten to be API-driven (JS wrappers + `.d.ts`)
-- [x] Inventory sample demonstrating multi-module and cross-type features
-- [x] Publishing to crates.io with automated semantic-release pipeline
-- [x] C++ target (RAII wrappers, `std::string`/`std::vector`/`std::optional`/`std::unordered_map`, CMakeLists.txt, exception-based errors, configurable namespace/header/standard)
-- [x] Dart target (`dart:ffi` bindings, enum generation, `pubspec.yaml`, null-safe code, configurable package name)
-- [x] Go target (CGo bindings, Go `error` pattern, `go.mod`, idiomatic naming, configurable module path)
-- [x] Ruby target (FFI gem bindings, struct class wrappers, gemspec, enum modules, configurable module/gem namespace)
-- [x] Template engine (Tera) with user-overridable templates and template directory discovery
-- [x] Pre-generation and post-generation hook commands
-- [x] Inline `[generators.<target>]` sections in IDL files for per-target configuration
-- [x] IR schema version field
-- [x] Shell auto-completions (`weaveffi completions <shell>` for bash, zsh, fish, PowerShell)
-- [x] Improved `weaveffi new` with full project scaffold (Cargo.toml, lib.rs, IDL, README)
-- [x] Typed handles (`handle<Name>`) replacing raw `u64` for type-safe handle usage
-- [x] Benchmarking infrastructure (criterion) for codegen throughput
-- [x] Async IR model and C ABI async convention (completion callbacks with context pointers)
-- [x] Callback and listener patterns in the IR (register/unregister function pairs)
-- [x] Iterator type in the IR for streaming/sequence patterns
-- [x] Nested sub-module support in the IR
-- [x] Builder pattern support for struct construction
-- [x] Versioned API evolution: deprecated/since annotations, default field values
-- [x] Borrowed types (`&str`, `&[u8]`) for zero-copy parameter passing
-- [x] Mutable parameter annotations for safer codegen
-- [x] Async-demo and events samples demonstrating callbacks, listeners, and iterators
-- [x] Cross-module type references (struct in one module used as param in another)
-- [x] WASM generator aligned with the C ABI error model (`out_err` parameter handling in generated JS)
-- [x] Node N-API addon stub bodies completed with functional glue
-- [x] End-to-end integration tests for JSON and TOML input formats
-- [x] Generator edge-case coverage (deeply nested optionals, maps of lists, enum-keyed maps)
-- [x] Zero-copy string and byte-buffer passing (borrowed slices across the ABI boundary)
-- [x] Arena/pool allocation patterns for batch handle creation and destruction
-- [x] IR parsing and validation profiling and optimization
-- [x] Generated code memory safety audit (double-free, use-after-free, null pointer paths)
-- [x] Swift `async/await` mapping for async functions
-- [x] Kotlin coroutine (`suspend fun`) mapping for async functions
-- [x] Node.js `Promise` mapping for async functions
-- [x] Python `asyncio` mapping for async functions
-- [x] .NET `Task<T>` / `async` mapping for async functions
-- [x] Cancellation token support for long-running async operations
-- [x] Full cross-platform CI (Windows added to the test matrix)
-- [x] Security audit of all generated code patterns (memory safety, input validation)
+Everything shipped in the `0.x` line. The CLI is feature-complete for
+eleven targets and ~900 tests pass on Linux, macOS, and Windows.
 
-## Future releases
+### Core CLI and IR
 
-### Dart Flutter integration
+- Subcommands: `generate`, `new`, `validate`, `extract`, `lint`, `diff`,
+  `doctor`, `completions`, `schema-version`, `upgrade`, `watch`, `format`,
+  `schema`.
+- IDL parsing from YAML, JSON, and TOML with span-aware
+  `miette`-rendered diagnostics.
+- Validation rejecting name collisions, reserved keywords, and
+  unsupported shapes; non-fatal diagnostics behind `--warn` and the
+  dedicated `lint` command.
+- Inline `[generators.<target>]` configuration in IDL files plus
+  external TOML configs; every `GeneratorConfig` field is reachable from
+  both.
+- IR schema versioning with `CURRENT_SCHEMA_VERSION = "0.3.0"` and a
+  `weaveffi upgrade` migrator that handles every supported source
+  version.
+- JSON Schema export (`weaveffi schema --format json-schema`) and a
+  checked-in `weaveffi.schema.json` for editor autocomplete.
+- File-watch regeneration (`weaveffi watch`) with debounced events.
+- Canonical IDL formatter (`weaveffi format` / `--check`).
+- Determinism: every generator's output is byte-identical across runs
+  on the same WeaveFFI version, enforced by tests.
+- Snapshot tests via `cargo-insta` for every generator across an
+  eight-fixture corpus including a kitchen-sink IDL.
+- Fuzzing harnesses (`cargo-fuzz`) for the YAML/JSON/TOML parsers, the
+  validator, and `parse_type_ref`, with a 5-minute CI smoke run on every
+  PR.
+- Parallel orchestrator with per-generator cache invalidation.
 
-- [ ] Flutter plugin scaffold with platform channel integration
+### Type system
 
-### Documentation and benchmarks
+- Primitives, `string`, `bytes`, `&str`, `&[u8]` borrowed views.
+- Structs (with `builder: true`, default field values, doc strings).
+- Enums with explicit discriminants and per-variant docs.
+- Optionals (`T?`), lists (`[T]`), maps (`{K:V}`).
+- Typed handles (`handle<T>`) and the legacy untyped `handle` alias.
+- Iterators (`iter<T>`) for streaming sequences.
+- Module-level `callbacks:` and `listeners:` for event patterns.
+- `async: true` and `cancellable: true` functions.
+- Cross-module type references and nested sub-modules.
+- `deprecated:`, `since:`, and `mutable:` annotations.
 
-- [ ] Benchmark results published on documentation site
-- [ ] Per-target tutorials for C, C++, Dart, Go, Ruby, WASM, and .NET
-- [ ] Cookbook recipes for common integration patterns
+### Generators (eleven targets)
 
-## Design principle: standalone generated packages
+- **C** — header with error struct, free helpers, typed handles,
+  configurable `c_prefix` propagated through every emitted symbol.
+- **C++** — RAII header (`std::optional`, `std::vector`,
+  `std::unordered_map`, `std::future`), exception-based errors,
+  `CMakeLists.txt`, configurable namespace and standard.
+- **Swift** — SwiftPM System Library + Swift wrapper with
+  `async/await` and `throws`.
+- **Android (Kotlin/JNI)** — Kotlin wrapper, JNI shim, Gradle
+  scaffold, `suspend fun` for async.
+- **Node.js** — N-API addon loader and `.d.ts` types with `Promise`
+  for async.
+- **WASM** — JS loader and `.d.ts` types aligned with the C ABI error
+  model.
+- **Python** — `ctypes` binding, `.pyi` stubs, `asyncio` for async.
+- **.NET** — P/Invoke binding, `.csproj`/`.nuspec`, `Task<T>` for
+  async.
+- **Dart** — `dart:ffi` binding, `pubspec.yaml`, `Future<T>` for async.
+- **Go** — CGo binding, `go.mod`, idiomatic `error` returns.
+- **Ruby** — `ffi` gem binding, gemspec, struct class wrappers.
 
-Generated packages should be fully self-contained and publishable to their
-native ecosystem (npm, CocoaPods, Maven Central, PyPI, NuGet, pub.dev, etc.)
-without requiring consumers to install WeaveFFI tooling, runtimes, or support
-packages. WeaveFFI is a build-time tool for library authors — end users should
-never need to know it exists. Any helper code (error types, memory management
-utilities) is generated inline into each package rather than pulled from a
-shared runtime dependency.
+### Quality and infrastructure
 
-## Non-goals (for now)
+- `cargo deny`, `cargo audit`, `cargo machete`, rustdoc lints, and
+  coverage in CI on every PR.
+- Cross-platform CI matrix (Linux, macOS, Windows) including an
+  `android-ndk` job, a `swift-spm` job, and a `windows-e2e-extended`
+  job.
+- End-to-end consumer programs in `examples/` for every target,
+  exercised in CI against the calculator and contacts cdylibs via
+  `examples/run_all.sh`.
+- Async stress tests (1000 concurrent calls per target) verifying no
+  callback/handle leaks.
+- Doc strings flow through to native doc-comment syntax in every
+  target.
+- Standard prelude header (`// Generated by WeaveFFI X.Y.Z … DO NOT
+  EDIT`) on every generated file.
+- Templates engine (Tera) with user-overridable templates.
+- Pre/post generation hooks.
+- Benchmarking infrastructure (`criterion`).
+- Automated publishing to crates.io via semantic-release.
+- Governance: `CONTRIBUTING.md` at the repo root and the canonical
+  internal [architecture](architecture.md) reference under
+  `docs/src/`.
 
-- **Full RPC / IPC framework**: WeaveFFI generates in-process FFI bindings, not
-  network protocols. gRPC, Cap'n Proto, or similar tools are better suited for
-  cross-process communication.
-- **Automatic Rust implementation**: WeaveFFI generates the *consumer* side
-  (bindings). The library author still writes the Rust (or C) implementation
-  behind the ABI.
-- **GUI framework bindings**: Complex GUI toolkits with deep object hierarchies
-  and inheritance are out of scope. WeaveFFI targets function-oriented APIs with
-  flat or moderately nested data types.
+### Samples
+
+- `calculator`, `contacts`, `inventory`, `async-demo`, `events`,
+  `node-addon`, plus the production-quality `kvstore` reference that
+  exercises every IDL feature in one place.
+
+## v1.0 candidate
+
+Every PRD-v4 phase is complete. The workspace has graduated from
+"feature-complete prototype" to "1.0 release candidate" pending the
+format-canonicalization polish noted in the README "Status" section.
+
+- [x] Phase 1 — Eliminate `TypeRef::Callback` dead code across the
+  workspace.
+- [x] Phase 2 — Implement `weaveffi upgrade` and bump schema to
+  `0.3.0`.
+- [x] Phase 3 — Wire every `GeneratorConfig` option through inline
+  IDL configs.
+- [x] Phase 4 — Source-span-aware diagnostics with `miette`.
+- [x] Phase 5 — Snapshot testing every generator with `insta`.
+- [x] Phase 6 — Deterministic generator output (sort all map
+  iteration).
+- [x] Phase 7 — `weaveffi watch`, `weaveffi format`, JSON Schema
+  export.
+- [x] Phase 8 — Real-world end-to-end consumer tests in CI for every
+  target.
+- [x] Phase 9 — Quality infrastructure: deny, audit, machete, doc
+  lints, coverage.
+- [x] Phase 10 — Fuzzing harness for parser, validator, and
+  `parse_type_ref`.
+- [x] Phase 11 — Doc strings everywhere: `doc:` → native doc comments.
+- [x] Phase 12 — `c_prefix` audit: full propagation through C, C++,
+  scaffold.
+- [x] Phase 13 — Build a non-trivial real-world sample: `kvstore`.
+- [x] Phase 14 — Parallel codegen with rayon and per-generator
+  caching.
+- [x] Phase 15 — Cross-platform CI hardening: Windows path/hook fixes,
+  NDK glue, Swift/iOS smoke.
+- [x] Phase 16 — `doctor --json`, target-specific checks, richer
+  hints.
+- [x] Phase 17 — `--check` and `--format json` for CI integration.
+- [x] Phase 18 — Add CONTRIBUTING / SECURITY / CODE_OF_CONDUCT /
+  ARCHITECTURE.
+- [x] Phase 19 — Async robustness: GC pinning, cancellation, leak
+  tests.
+- [x] Phase 20 — Generator output polish: deterministic order,
+  named-after-fields, prelude.
+- [x] Phase 21 — Beautiful README, comparison page, marketing polish.
+- [x] Phase 22 — Versioning policy, stability docs, roadmap to 1.0.
+- [x] Phase 23 — Performance: run benchmarks, profile, optimize hot
+  paths, set targets.
+- [x] Phase 24 — Honesty pass on docs and full SUMMARY audit.
+- [x] Phase 25 — Add `weaveffi extract` enhancements and round-trip
+  integrity.
+- [x] Phase 26 — Final quality pass and release-readiness checklist.
+
+## Post-1.0
+
+Stretch goals that are out of scope for 1.0 but on our radar for the
+1.x line:
+
+- **LSP server for IDL files.** Schema-driven completion, hover docs,
+  go-to-definition for cross-module type references, and validation
+  diagnostics inside any LSP-aware editor.
+- **Official VS Code extension.** Bundles the LSP server, adds syntax
+  highlighting for `.weaveffi.yml` files, runs `weaveffi watch`
+  integrated with the editor's task system, and surfaces `weaveffi
+  doctor` results in the status bar.
+- **Bazel and Buck rules.** First-class build-system integration so
+  `weaveffi_library(name = ..., idl = ...)` produces all eleven target
+  outputs as cacheable, reproducible Bazel/Buck targets.
+- **Plugin SDK for third-party generators.** A stable `Generator`
+  trait surface plus a `weaveffi-plugin-sdk` crate so generators for
+  additional targets (e.g. Lua, Erlang, OCaml, R) can ship as
+  independent crates and be loaded dynamically by the CLI.
+- **`weaveffi publish` automation.** A subcommand that drives the
+  per-target package publishers — `npm publish`, `pod trunk push`,
+  `mvn deploy`, `gem push`, `dotnet nuget push`, `pub publish`, `go
+  mod proxy` warmup, `pip upload` — from a single config file, with
+  dry-run support and a CI-friendly `--check` mode.
+
+If any of these would unblock your use case sooner, please open an issue
+describing the workflow you want — community demand drives the order.
+
+## See also
+
+- [Stability and Versioning](stability.md) — what's covered by SemVer
+  and how the deprecation policy works.
+- [Comparison](comparison.md) — how WeaveFFI stacks up against UniFFI,
+  cbindgen, diplomat, SWIG, and autocxx.
+- [Architecture](architecture.md) — the canonical "how WeaveFFI works
+  internally" reference for contributors.

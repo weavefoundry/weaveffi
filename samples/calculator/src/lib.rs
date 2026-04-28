@@ -1,3 +1,6 @@
+//! Calculator sample cdylib used as a fixture for the WeaveFFI generators
+//! and the end-to-end consumer examples.
+
 #![allow(unsafe_code)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 

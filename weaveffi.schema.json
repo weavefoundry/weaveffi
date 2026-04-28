@@ -1,0 +1,380 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Api",
+  "description": "Top-level WeaveFFI API definition.",
+  "type": "object",
+  "required": [
+    "modules",
+    "version"
+  ],
+  "properties": {
+    "version": {
+      "type": "string"
+    },
+    "modules": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Module"
+      }
+    },
+    "generators": {
+      "default": null,
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": true
+    }
+  },
+  "definitions": {
+    "Module": {
+      "description": "A WeaveFFI module: a named group of functions, types, callbacks, listeners, and errors.",
+      "type": "object",
+      "required": [
+        "functions",
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "functions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Function"
+          }
+        },
+        "structs": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/StructDef"
+          }
+        },
+        "enums": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/EnumDef"
+          }
+        },
+        "callbacks": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CallbackDef"
+          }
+        },
+        "listeners": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ListenerDef"
+          }
+        },
+        "errors": {
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ErrorDomain"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "modules": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Module"
+          }
+        }
+      }
+    },
+    "Function": {
+      "type": "object",
+      "required": [
+        "name",
+        "params"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Param"
+          }
+        },
+        "return": {
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TypeRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "doc": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "async": {
+          "default": false,
+          "type": "boolean"
+        },
+        "cancellable": {
+          "default": false,
+          "type": "boolean"
+        },
+        "deprecated": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "since": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "Param": {
+      "type": "object",
+      "required": [
+        "name",
+        "type"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/definitions/TypeRef"
+        },
+        "mutable": {
+          "default": false,
+          "type": "boolean"
+        },
+        "doc": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "TypeRef": {
+      "title": "TypeRef",
+      "description": "Reference to a type. Encoded as a string with custom syntax: primitives (`i32`, `u32`, `i64`, `f64`, `bool`, `string`, `bytes`, `handle`), borrowed types (`&str`, `&[u8]`), typed handles (`handle<{name}>`), iterators (`iter<{T}>`), lists (`[{T}]`), maps (`{{K:V}}`), optionals (`{T}?`), or any user-defined struct/enum name.",
+      "type": "string"
+    },
+    "StructDef": {
+      "description": "A struct (record) type with named fields.",
+      "type": "object",
+      "required": [
+        "fields",
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "doc": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fields": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/StructField"
+          }
+        },
+        "builder": {
+          "default": false,
+          "type": "boolean"
+        }
+      }
+    },
+    "StructField": {
+      "type": "object",
+      "required": [
+        "name",
+        "type"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/definitions/TypeRef"
+        },
+        "doc": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "default": {
+          "default": null
+        }
+      }
+    },
+    "EnumDef": {
+      "type": "object",
+      "required": [
+        "name",
+        "variants"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "doc": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "variants": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/EnumVariant"
+          }
+        }
+      }
+    },
+    "EnumVariant": {
+      "type": "object",
+      "required": [
+        "name",
+        "value"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "doc": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "CallbackDef": {
+      "type": "object",
+      "required": [
+        "name",
+        "params"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Param"
+          }
+        },
+        "doc": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "ListenerDef": {
+      "type": "object",
+      "required": [
+        "event_callback",
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "event_callback": {
+          "type": "string"
+        },
+        "doc": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "ErrorDomain": {
+      "type": "object",
+      "required": [
+        "codes",
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "codes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ErrorCode"
+          }
+        }
+      }
+    },
+    "ErrorCode": {
+      "type": "object",
+      "required": [
+        "code",
+        "message",
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "code": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "message": {
+          "type": "string"
+        },
+        "doc": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

@@ -38,6 +38,117 @@ cargo test -p weaveffi-core
 cargo test -p weaveffi-ir
 ```
 
+## Adding a new generator
+
+Each target language is implemented as its own crate (`weaveffi-gen-<lang>`)
+that implements the `Generator` trait from `weaveffi_core::codegen`. Before
+starting, read the [architecture overview](docs/src/architecture.md) for the
+crate dependency graph, the IDL → IR → Validate → Resolve → Generate → Output
+data flow, and the snapshot-test layout new generators must hook into.
+
+The short version:
+
+1. Create `crates/weaveffi-gen-<lang>/` following the layout of an existing
+   generator (e.g. `weaveffi-gen-c`). Add it to the workspace `members` list
+   in the root `Cargo.toml` and depend on `weaveffi-core` and `weaveffi-ir`.
+2. Implement `Generator` (`name`, `generate`, and the optional
+   `generate_with_config` / `generate_with_templates` /
+   `output_files` / `output_files_with_config` overrides).
+3. Wire the generator into `crates/weaveffi-cli/src/main.rs` so the
+   `--targets` flag accepts it.
+4. Add snapshot fixtures under
+   `crates/weaveffi-cli/tests/snapshots.rs` covering at minimum the
+   `calculator`, `contacts`, `inventory`, `async_demo`, and `events` sample
+   IDLs.
+5. Document the generator under `docs/src/generators/<lang>.md` and link it
+   from `docs/src/SUMMARY.md`.
+
+## Snapshot tests
+
+Snapshot tests are the primary defense against generator regressions. They
+live in `crates/weaveffi-cli/tests/snapshots.rs` and write
+one-file-per-snapshot artifacts under `crates/weaveffi-cli/tests/snapshots/`
+using [`cargo-insta`](https://insta.rs/).
+
+Workflow when output changes intentionally:
+
+```bash
+cargo install cargo-insta --locked
+cargo test -p weaveffi-cli --test snapshots
+cargo insta review
+```
+
+`cargo insta review` opens an interactive TUI showing the `.snap.new` diff
+for each pending snapshot. Inspect every diff carefully:
+
+- Press `a` (or run `cargo insta accept`) to promote `.snap.new` files into
+  their final `.snap` form when the change is correct.
+- Press `r` (or run `cargo insta reject`) to delete the `.snap.new` files
+  when the diff exposes a bug — fix the generator before re-running.
+- Press `s` to skip a snapshot and decide later.
+
+After accepting, **commit the resulting `.snap` files in the same commit as
+the code change that produced them** so reviewers can see the generator diff
+alongside the implementation diff. Never commit `.snap.new` files; CI rejects
+them.
+
+## Fuzzing
+
+Parser and validator fuzz harnesses live in `crates/weaveffi-fuzz` and are
+driven by [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) +
+`libFuzzer`. They require nightly Rust because the libFuzzer sanitizer flags
+are unstable.
+
+Install once:
+
+```bash
+rustup toolchain install nightly
+cargo install cargo-fuzz --locked
+```
+
+Run a target for 60 seconds (swap the target name for any of `fuzz_parse_yaml`,
+`fuzz_parse_json`, `fuzz_parse_toml`, `fuzz_parse_type_ref`, `fuzz_validate`):
+
+```bash
+cargo +nightly fuzz run \
+    --fuzz-dir crates/weaveffi-fuzz \
+    --features fuzzing \
+    fuzz_parse_yaml \
+    crates/weaveffi-fuzz/fuzz/seeds/fuzz_parse_yaml \
+    -- -max_total_time=60
+```
+
+Drop `-max_total_time=60` to fuzz indefinitely.
+
+### Triaging a crash
+
+When libFuzzer finds an input that panics or aborts it writes the bytes to
+`crates/weaveffi-fuzz/fuzz/artifacts/<target>/crash-<hash>`. To triage:
+
+1. Pretty-print the input as the target sees it:
+
+   ```bash
+   cargo +nightly fuzz fmt \
+       --fuzz-dir crates/weaveffi-fuzz \
+       --features fuzzing \
+       <target> \
+       crates/weaveffi-fuzz/fuzz/artifacts/<target>/crash-<hash>
+   ```
+
+2. Minimize the reproducer:
+
+   ```bash
+   cargo +nightly fuzz tmin \
+       --fuzz-dir crates/weaveffi-fuzz \
+       --features fuzzing \
+       <target> \
+       crates/weaveffi-fuzz/fuzz/artifacts/<target>/crash-<hash>
+   ```
+
+3. Convert the minimized input into a regression test in the affected crate
+   (`weaveffi-ir` for parser crashes, `weaveffi-core` for validator crashes)
+   **before** fixing the bug, so the failure is locked in and cannot regress.
+
 ## Commit conventions
 
 This repo uses Conventional Commits for all commits. Keep it simple: we do not use scopes.

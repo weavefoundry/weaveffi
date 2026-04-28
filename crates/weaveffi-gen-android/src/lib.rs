@@ -1,9 +1,17 @@
+//! Android (Kotlin/JNI) binding generator for WeaveFFI.
+//!
+//! Generates a Gradle project skeleton with a Kotlin wrapper plus a JNI
+//! bridge layer that calls into the C ABI. `suspend fun` shims are emitted
+//! for async functions. Implements the [`Generator`] trait.
+
 use anyhow::Result;
 use camino::Utf8Path;
 use std::fmt::Write as _;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
-use weaveffi_core::utils::{c_symbol_name, local_type_name, wrapper_name};
+use weaveffi_core::utils::{
+    c_symbol_name, local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
+};
 use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, TypeRef};
 
 pub struct AndroidGenerator;
@@ -15,26 +23,42 @@ impl AndroidGenerator {
         out_dir: &Utf8Path,
         package: &str,
         strip_module_prefix: bool,
+        input_basename: &str,
     ) -> Result<()> {
         let dir = out_dir.join("android");
         std::fs::create_dir_all(&dir)?;
 
+        let dbl = CommentStyle::DoubleSlash;
         std::fs::write(
             dir.join("settings.gradle"),
-            "rootProject.name = 'weaveffi'\n",
+            format!(
+                "{}rootProject.name = 'weaveffi'\n\n{}",
+                render_prelude(dbl, input_basename),
+                render_trailer(dbl, "settings.gradle"),
+            ),
         )?;
-        std::fs::write(dir.join("build.gradle"), build_gradle(package))?;
+        std::fs::write(
+            dir.join("build.gradle"),
+            build_gradle(package, input_basename),
+        )?;
 
         let pkg_path = package.replace('.', "/");
         let src_dir = dir.join(format!("src/main/kotlin/{pkg_path}"));
         std::fs::create_dir_all(&src_dir)?;
-        let kotlin = render_kotlin(api, package, strip_module_prefix);
+        let kotlin = render_kotlin(api, package, strip_module_prefix, input_basename);
         std::fs::write(src_dir.join("WeaveFFI.kt"), kotlin)?;
 
         let jni_dir = dir.join("src/main/cpp");
         std::fs::create_dir_all(&jni_dir)?;
-        std::fs::write(jni_dir.join("CMakeLists.txt"), CMAKE)?;
-        let jni_c = render_jni_c(api, package, strip_module_prefix);
+        std::fs::write(
+            jni_dir.join("CMakeLists.txt"),
+            format!(
+                "{}{CMAKE}\n{}",
+                render_prelude(CommentStyle::Hash, input_basename),
+                render_trailer(CommentStyle::Hash, "CMakeLists.txt"),
+            ),
+        )?;
+        let jni_c = render_jni_c(api, package, strip_module_prefix, input_basename);
         std::fs::write(jni_dir.join("weaveffi_jni.c"), jni_c)?;
 
         Ok(())
@@ -47,7 +71,7 @@ impl Generator for AndroidGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "com.weaveffi", true)
+        self.generate_impl(api, out_dir, "com.weaveffi", true, "weaveffi.yml")
     }
 
     fn generate_with_config(
@@ -61,29 +85,146 @@ impl Generator for AndroidGenerator {
             out_dir,
             config.android_package(),
             config.strip_module_prefix,
+            config.input_basename(),
         )
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
-        vec![
-            out_dir.join("android/settings.gradle").to_string(),
+        let mut files = vec![
             out_dir.join("android/build.gradle").to_string(),
-            out_dir
-                .join("android/src/main/kotlin/com/weaveffi/WeaveFFI.kt")
-                .to_string(),
+            out_dir.join("android/settings.gradle").to_string(),
             out_dir
                 .join("android/src/main/cpp/CMakeLists.txt")
                 .to_string(),
             out_dir
                 .join("android/src/main/cpp/weaveffi_jni.c")
                 .to_string(),
-        ]
+            out_dir
+                .join("android/src/main/kotlin/com/weaveffi/WeaveFFI.kt")
+                .to_string(),
+        ];
+        files.sort();
+        files
+    }
+
+    fn output_files_with_config(
+        &self,
+        _api: &Api,
+        out_dir: &Utf8Path,
+        config: &GeneratorConfig,
+    ) -> Vec<String> {
+        let pkg_path = config.android_package().replace('.', "/");
+        let mut files = vec![
+            out_dir.join("android/build.gradle").to_string(),
+            out_dir.join("android/settings.gradle").to_string(),
+            out_dir
+                .join("android/src/main/cpp/CMakeLists.txt")
+                .to_string(),
+            out_dir
+                .join("android/src/main/cpp/weaveffi_jni.c")
+                .to_string(),
+            out_dir
+                .join(format!("android/src/main/kotlin/{pkg_path}/WeaveFFI.kt"))
+                .to_string(),
+        ];
+        files.sort();
+        files
     }
 }
 
-fn build_gradle(namespace: &str) -> String {
+/// Emits a Kotlin KDoc comment at `indent`. Single-line docs collapse to
+/// `/** text */`; multi-line docs expand to a block with ` * ` prefixed lines.
+fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
+    let Some(doc) = doc else {
+        return;
+    };
+    let doc = doc.trim();
+    if doc.is_empty() {
+        return;
+    }
+    if doc.contains('\n') {
+        out.push_str(indent);
+        out.push_str("/**\n");
+        for line in doc.lines() {
+            out.push_str(indent);
+            if line.is_empty() {
+                out.push_str(" *\n");
+            } else {
+                out.push_str(" * ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out.push_str(indent);
+        out.push_str(" */\n");
+    } else {
+        out.push_str(indent);
+        out.push_str("/** ");
+        out.push_str(doc);
+        out.push_str(" */\n");
+    }
+}
+
+/// Emits a KDoc block for a function: function doc plus `@param name desc`
+/// lines for each documented parameter. Skips entirely when there is nothing
+/// to document.
+fn emit_fn_doc(
+    out: &mut String,
+    doc: &Option<String>,
+    params: &[weaveffi_ir::ir::Param],
+    indent: &str,
+) {
+    let has_param_docs = params.iter().any(|p| p.doc.is_some());
+    let trimmed_doc = doc.as_ref().map(|d| d.trim()).filter(|d| !d.is_empty());
+    if trimmed_doc.is_none() && !has_param_docs {
+        return;
+    }
+    out.push_str(indent);
+    out.push_str("/**\n");
+    if let Some(d) = trimmed_doc {
+        for line in d.lines() {
+            out.push_str(indent);
+            if line.is_empty() {
+                out.push_str(" *\n");
+            } else {
+                out.push_str(" * ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    for p in params {
+        if let Some(pdoc) = &p.doc {
+            let pdoc = pdoc.trim();
+            if pdoc.is_empty() {
+                continue;
+            }
+            let mut lines = pdoc.lines();
+            if let Some(first) = lines.next() {
+                out.push_str(indent);
+                out.push_str(&format!(" * @param {} {}\n", p.name, first));
+            }
+            for line in lines {
+                out.push_str(indent);
+                if line.is_empty() {
+                    out.push_str(" *\n");
+                } else {
+                    out.push_str(" *   ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    out.push_str(indent);
+    out.push_str(" */\n");
+}
+
+fn build_gradle(namespace: &str, input_basename: &str) -> String {
+    let prelude = render_prelude(CommentStyle::DoubleSlash, input_basename);
+    let trailer = render_trailer(CommentStyle::DoubleSlash, "build.gradle");
     format!(
-        r#"plugins {{
+        r#"{prelude}plugins {{
     id 'com.android.library'
     id 'org.jetbrains.kotlin.android' version '1.9.22' apply false
 }}
@@ -105,7 +246,8 @@ android {{
         }}
     }}
 }}
-"#
+
+{trailer}"#
     )
 }
 
@@ -132,14 +274,12 @@ fn kotlin_type(t: &TypeRef) -> String {
         TypeRef::List(inner) => kotlin_list_type(inner),
         TypeRef::Iterator(inner) => format!("Iterator<{}>", kotlin_type(inner)),
         TypeRef::Map(k, v) => format!("Map<{}, {}>", kotlin_type(k), kotlin_type(v)),
-        TypeRef::Callback(_) => todo!("callback Android type"),
     }
 }
 
 fn kotlin_jni_type(t: &TypeRef) -> String {
     match t {
         TypeRef::TypedHandle(_) => "Long".to_string(),
-        TypeRef::Callback(_) => todo!("callback Android type"),
         other => kotlin_type(other),
     }
 }
@@ -159,7 +299,6 @@ fn kotlin_list_type(inner: &TypeRef) -> String {
         TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) => {
             "LongArray".to_string()
         }
-        TypeRef::Callback(_) => todo!("callback Android type"),
     }
 }
 
@@ -182,7 +321,6 @@ fn jni_param_type(t: &TypeRef) -> String {
         },
         TypeRef::List(inner) | TypeRef::Iterator(inner) => jni_array_type(inner),
         TypeRef::Map(_, _) => "jobject".to_string(),
-        TypeRef::Callback(_) => todo!("callback Android type"),
     }
 }
 
@@ -222,7 +360,6 @@ fn c_type_for_return(t: &TypeRef) -> &'static str {
         | TypeRef::List(_)
         | TypeRef::Iterator(_)
         | TypeRef::Map(_, _) => "void*",
-        TypeRef::Callback(_) => todo!("callback Android type"),
     }
 }
 
@@ -241,7 +378,6 @@ fn jni_default_return(t: Option<&TypeRef>) -> &'static str {
         Some(
             TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _),
         ) => "return NULL;",
-        Some(TypeRef::Callback(_)) => todo!("callback Android type"),
     }
 }
 
@@ -258,7 +394,6 @@ fn jni_cast_for(t: &TypeRef) -> &'static str {
 fn kotlin_public_type(t: &TypeRef) -> String {
     match t {
         TypeRef::Enum(name) => name.clone(),
-        TypeRef::Callback(_) => todo!("callback Android type"),
         other => kotlin_type(other),
     }
 }
@@ -294,12 +429,18 @@ fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Mo
     }
 }
 
-fn render_kotlin(api: &Api, package: &str, strip_module_prefix: bool) -> String {
+fn render_kotlin(
+    api: &Api,
+    package: &str,
+    strip_module_prefix: bool,
+    input_basename: &str,
+) -> String {
     let all_mods = collect_all_modules(&api.modules);
     let has_async = all_mods
         .iter()
         .any(|m| m.functions.iter().any(|f| f.r#async));
-    let mut kotlin = format!("package {package}\n\n");
+    let mut kotlin = render_prelude(CommentStyle::DoubleSlash, input_basename);
+    kotlin.push_str(&format!("package {package}\n\n"));
     if has_async {
         kotlin.push_str("import kotlinx.coroutines.suspendCancellableCoroutine\n");
         kotlin.push_str("import kotlin.coroutines.resume\n");
@@ -309,6 +450,7 @@ fn render_kotlin(api: &Api, package: &str, strip_module_prefix: bool) -> String 
     for (m, path) in collect_modules_with_path(&api.modules) {
         for f in &m.functions {
             let func_name = wrapper_name(&path, &f.name, strip_module_prefix);
+            emit_fn_doc(&mut kotlin, &f.doc, &f.params, "        ");
             if let Some(msg) = &f.deprecated {
                 let _ = writeln!(
                     kotlin,
@@ -431,6 +573,8 @@ fn render_kotlin(api: &Api, package: &str, strip_module_prefix: bool) -> String 
         kotlin.push_str("    fun onError(message: String) { cont.resumeWithException(RuntimeException(message)) }\n");
         kotlin.push_str("}\n");
     }
+    kotlin.push('\n');
+    kotlin.push_str(&render_trailer(CommentStyle::DoubleSlash, "WeaveFFI.kt"));
     kotlin
 }
 
@@ -489,8 +633,10 @@ fn render_kotlin_async_fun(out: &mut String, f: &Function, func_name: &str) {
 
 fn render_kotlin_enum(out: &mut String, e: &EnumDef) {
     let _ = writeln!(out);
+    emit_doc(out, &e.doc, "");
     let _ = writeln!(out, "enum class {}(val value: Int) {{", e.name);
     for (i, v) in e.variants.iter().enumerate() {
+        emit_doc(out, &v.doc, "    ");
         let comma = if i < e.variants.len() - 1 { "," } else { ";" };
         let _ = writeln!(out, "    {}({}){}", v.name, v.value, comma);
     }
@@ -524,6 +670,7 @@ fn render_kotlin_error_types(out: &mut String, api: &Api) {
             "sealed class WeaveFFIException(val code: Int, message: String) : Exception(message) {{"
         );
         for ec in &error_codes {
+            emit_doc(out, &ec.doc, "    ");
             let _ = writeln!(
                 out,
                 "    class {}(message: String = \"{}\") : WeaveFFIException({}, message)",
@@ -534,10 +681,16 @@ fn render_kotlin_error_types(out: &mut String, api: &Api) {
     }
 }
 
-fn render_jni_c(api: &Api, package: &str, strip_module_prefix: bool) -> String {
+fn render_jni_c(
+    api: &Api,
+    package: &str,
+    strip_module_prefix: bool,
+    input_basename: &str,
+) -> String {
     let jni_prefix = package.replace('.', "_");
     let jni_pkg_path = package.replace('.', "/");
-    let mut jni_c = String::from("#include <jni.h>\n#include <stdbool.h>\n#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n#include \"weaveffi.h\"\n\n");
+    let mut jni_c = render_prelude(CommentStyle::DoubleSlash, input_basename);
+    jni_c.push_str("#include <jni.h>\n#include <stdbool.h>\n#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n#include \"weaveffi.h\"\n\n");
 
     let all_mods = collect_all_modules(&api.modules);
     let error_codes: Vec<_> = all_mods
@@ -656,6 +809,8 @@ fn render_jni_c(api: &Api, package: &str, strip_module_prefix: bool) -> String {
             render_jni_struct(&mut jni_c, &path, s, &jni_prefix);
         }
     }
+    jni_c.push('\n');
+    jni_c.push_str(&render_trailer(CommentStyle::DoubleSlash, "weaveffi_jni.c"));
     jni_c
 }
 
@@ -952,7 +1107,6 @@ fn write_optional_acquire(out: &mut String, name: &str, inner: &TypeRef) {
             let _ = writeln!(out, "    }}");
         }
         TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) => {}
-        TypeRef::Callback(_) => todo!(),
     }
 }
 
@@ -1331,7 +1485,6 @@ fn build_c_call_args(args: &mut Vec<String>, name: &str, ty: &TypeRef, module: &
             args.push(format!("{}{n}_c_vals", map_elem_c_call_cast(v), n = name));
             args.push(format!("(size_t){n}_len", n = name));
         }
-        TypeRef::Callback(_) => todo!(),
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
     }
 }
@@ -1397,7 +1550,6 @@ fn write_return_handling(
         TypeRef::Map(k, v) => {
             write_map_return(jni_c, k, v, c_sym, &args_str, returns, params);
         }
-        TypeRef::Callback(_) => todo!(),
         ret_type => {
             let c_ty = c_type_for_return(ret_type);
             let jcast = jni_cast_for(ret_type);
@@ -1857,13 +2009,13 @@ fn kotlin_getter_type(t: &TypeRef) -> String {
     match t {
         TypeRef::Struct(name) => local_type_name(name).to_string(),
         TypeRef::Enum(name) => name.clone(),
-        TypeRef::Callback(_) => todo!("callback Android type"),
         other => kotlin_type(other),
     }
 }
 
 fn render_kotlin_struct(out: &mut String, s: &StructDef) {
     let _ = writeln!(out);
+    emit_doc(out, &s.doc, "");
     let _ = writeln!(
         out,
         "class {} internal constructor(private var handle: Long) : java.io.Closeable {{",
@@ -1913,6 +2065,7 @@ fn render_kotlin_struct(out: &mut String, s: &StructDef) {
     for f in &s.fields {
         let pascal = to_pascal_case(&f.name);
         let kt_type = kotlin_getter_type(&f.ty);
+        emit_doc(out, &f.doc, "    ");
         match &f.ty {
             TypeRef::Struct(name) => {
                 let local = local_type_name(name);
@@ -1951,6 +2104,7 @@ fn render_kotlin_builder(out: &mut String, s: &StructDef) {
         return;
     }
     let _ = writeln!(out);
+    emit_doc(out, &s.doc, "");
     let _ = writeln!(out, "class {}Builder {{", s.name);
     for f in &s.fields {
         let kt_getter = kotlin_getter_type(&f.ty);
@@ -1959,6 +2113,7 @@ fn render_kotlin_builder(out: &mut String, s: &StructDef) {
     for f in &s.fields {
         let pascal = to_pascal_case(&f.name);
         let kt_getter = kotlin_getter_type(&f.ty);
+        emit_doc(out, &f.doc, "    ");
         let _ = writeln!(
             out,
             "    fun with{}({}: {}): {}Builder {{",
@@ -2125,7 +2280,6 @@ fn render_jni_struct(out: &mut String, module_name: &str, s: &StructDef, jni_pre
             TypeRef::List(inner) => {
                 write_struct_list_getter(out, inner, &getter_c, &prefix);
             }
-            TypeRef::Callback(_) => todo!(),
             other => {
                 let c_ty = c_type_for_return(other);
                 let jcast = jni_cast_for(other);
@@ -2405,7 +2559,7 @@ mod tests {
     #[test]
     fn kotlin_struct_class_declaration() {
         let api = make_struct_api();
-        let kt = render_kotlin(&api, "com.weaveffi", true);
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             kt.contains("class Contact internal constructor(private var handle: Long) : java.io.Closeable {"),
             "missing struct class declaration: {kt}"
@@ -2415,7 +2569,7 @@ mod tests {
     #[test]
     fn kotlin_struct_companion_native_create() {
         let api = make_struct_api();
-        let kt = render_kotlin(&api, "com.weaveffi", true);
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             kt.contains("@JvmStatic external fun nativeCreate(name: String, age: Int): Long"),
             "missing nativeCreate: {kt}"
@@ -2425,7 +2579,7 @@ mod tests {
     #[test]
     fn kotlin_struct_companion_native_destroy() {
         let api = make_struct_api();
-        let kt = render_kotlin(&api, "com.weaveffi", true);
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             kt.contains("@JvmStatic external fun nativeDestroy(handle: Long)"),
             "missing nativeDestroy: {kt}"
@@ -2435,7 +2589,7 @@ mod tests {
     #[test]
     fn kotlin_struct_companion_native_getters() {
         let api = make_struct_api();
-        let kt = render_kotlin(&api, "com.weaveffi", true);
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             kt.contains("@JvmStatic external fun nativeGetName(handle: Long): String"),
             "missing nativeGetName: {kt}"
@@ -2449,7 +2603,7 @@ mod tests {
     #[test]
     fn kotlin_struct_factory_method() {
         let api = make_struct_api();
-        let kt = render_kotlin(&api, "com.weaveffi", true);
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             kt.contains(
                 "fun create(name: String, age: Int): Contact = Contact(nativeCreate(name, age))"
@@ -2461,7 +2615,7 @@ mod tests {
     #[test]
     fn kotlin_struct_property_getters() {
         let api = make_struct_api();
-        let kt = render_kotlin(&api, "com.weaveffi", true);
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             kt.contains("val name: String get() = nativeGetName(handle)"),
             "missing name property: {kt}"
@@ -2475,7 +2629,7 @@ mod tests {
     #[test]
     fn kotlin_struct_closeable() {
         let api = make_struct_api();
-        let kt = render_kotlin(&api, "com.weaveffi", true);
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             kt.contains("override fun close()"),
             "missing close method: {kt}"
@@ -2490,7 +2644,7 @@ mod tests {
     #[test]
     fn kotlin_struct_finalize() {
         let api = make_struct_api();
-        let kt = render_kotlin(&api, "com.weaveffi", true);
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             kt.contains("protected fun finalize()"),
             "missing finalize: {kt}"
@@ -2500,7 +2654,7 @@ mod tests {
     #[test]
     fn kotlin_struct_loads_library() {
         let api = make_struct_api();
-        let kt = render_kotlin(&api, "com.weaveffi", true);
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         let struct_section = kt.split("class Contact").nth(1).unwrap();
         assert!(
             struct_section.contains("System.loadLibrary(\"weaveffi\")"),
@@ -2563,7 +2717,7 @@ mod tests {
     #[test]
     fn jni_struct_native_create() {
         let api = make_struct_api();
-        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             jni.contains("Java_com_weaveffi_Contact_nativeCreate"),
             "missing JNI nativeCreate: {jni}"
@@ -2577,7 +2731,7 @@ mod tests {
     #[test]
     fn jni_struct_native_destroy() {
         let api = make_struct_api();
-        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             jni.contains("Java_com_weaveffi_Contact_nativeDestroy"),
             "missing JNI nativeDestroy: {jni}"
@@ -2591,7 +2745,7 @@ mod tests {
     #[test]
     fn jni_struct_native_getters() {
         let api = make_struct_api();
-        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             jni.contains("Java_com_weaveffi_Contact_nativeGetName"),
             "missing JNI nativeGetName: {jni}"
@@ -2613,7 +2767,7 @@ mod tests {
     #[test]
     fn jni_struct_string_getter_frees() {
         let api = make_struct_api();
-        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             jni.contains("weaveffi_free_string(rv)"),
             "missing free_string in getter: {jni}"
@@ -2623,7 +2777,7 @@ mod tests {
     #[test]
     fn jni_struct_create_handles_string_param() {
         let api = make_struct_api();
-        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             jni.contains("GetStringUTFChars(env, name, NULL)"),
             "missing string acquisition in create: {jni}"
@@ -2637,7 +2791,7 @@ mod tests {
     #[test]
     fn jni_struct_create_error_check() {
         let api = make_struct_api();
-        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
         let create_section: &str = jni
             .split("Java_com_weaveffi_Contact_nativeCreate")
             .nth(1)
@@ -2671,13 +2825,13 @@ mod tests {
             modules: vec![],
         }]);
 
-        let kt = render_kotlin(&api, "com.weaveffi", true);
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             kt.contains("val data: ByteArray get() = nativeGetData(handle)"),
             "missing bytes property: {kt}"
         );
 
-        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             jni.contains("weaveffi_storage_Blob_get_data("),
             "missing bytes getter C call: {jni}"
@@ -2711,13 +2865,13 @@ mod tests {
             modules: vec![],
         }]);
 
-        let kt = render_kotlin(&api, "com.weaveffi", true);
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             kt.contains("val start: Point get() = Point(nativeGetStart(handle))"),
             "missing nested struct property: {kt}"
         );
 
-        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             jni.contains("weaveffi_geo_Line_get_start("),
             "missing nested struct getter C call: {jni}"
@@ -2754,6 +2908,7 @@ mod tests {
                     name: "contact".to_string(),
                     ty: TypeRef::Struct("Contact".into()),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -2770,13 +2925,13 @@ mod tests {
             modules: vec![],
         }]);
 
-        let kt = render_kotlin(&api, "com.weaveffi", true);
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             kt.contains("contact: Long"),
             "missing struct param as Long: {kt}"
         );
 
-        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             jni.contains("(const weaveffi_contacts_Contact*)(intptr_t)contact"),
             "missing struct param cast: {jni}"
@@ -2793,6 +2948,7 @@ mod tests {
                     name: "age".to_string(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -2809,7 +2965,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             jni.contains("weaveffi_contacts_Contact* rv"),
             "missing struct return type: {jni}"
@@ -2855,7 +3011,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let kt = render_kotlin(&api, "com.weaveffi", true);
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             kt.contains("enum class Color(val value: Int) {"),
             "missing enum class: {kt}"
@@ -2896,6 +3052,7 @@ mod tests {
                     name: "color".to_string(),
                     ty: TypeRef::Enum("Color".into()),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -2912,7 +3069,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let kt = render_kotlin(&api, "com.weaveffi", true);
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             kt.contains("color: Color"),
             "public wrapper should use enum class name: {kt}"
@@ -2938,11 +3095,13 @@ mod tests {
                         name: "name".to_string(),
                         ty: TypeRef::StringUtf8,
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "contact_type".to_string(),
                         ty: TypeRef::Enum("ContactType".into()),
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::Enum("ContactType".into())),
@@ -2960,7 +3119,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let kt = render_kotlin(&api, "com.weaveffi", true);
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             kt.contains("contact_type: ContactType"),
             "public signature should use enum class name, not Int: {kt}"
@@ -2997,6 +3156,7 @@ mod tests {
                     name: "color".to_string(),
                     ty: TypeRef::Enum("Color".into()),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3013,7 +3173,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             jni.contains("jint color"),
             "missing jint param in JNI: {jni}"
@@ -3050,7 +3210,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             jni.contains("JNIEXPORT jint JNICALL"),
             "missing jint return in JNI: {jni}"
@@ -3090,6 +3250,7 @@ mod tests {
                     name: "id".to_string(),
                     ty: TypeRef::Optional(Box::new(TypeRef::I32)),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3106,7 +3267,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let kt = render_kotlin(&api, "com.weaveffi", true);
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(kt.contains("id: Int?"), "missing optional Int? param: {kt}");
     }
 
@@ -3120,6 +3281,7 @@ mod tests {
                     name: "id".to_string(),
                     ty: TypeRef::Optional(Box::new(TypeRef::I32)),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3136,7 +3298,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(jni.contains("jobject id"), "missing jobject param: {jni}");
         assert!(
             jni.contains("java/lang/Integer"),
@@ -3159,6 +3321,7 @@ mod tests {
                     name: "query".to_string(),
                     ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3175,7 +3338,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             jni.contains("jstring query"),
             "missing jstring param: {jni}"
@@ -3208,7 +3371,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             jni.contains("JNIEXPORT jobject JNICALL"),
             "missing jobject return: {jni}"
@@ -3249,7 +3412,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             jni.contains("JNIEXPORT jstring JNICALL"),
             "missing jstring return: {jni}"
@@ -3297,6 +3460,7 @@ mod tests {
                     name: "ids".to_string(),
                     ty: TypeRef::List(Box::new(TypeRef::I32)),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3313,7 +3477,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let kt = render_kotlin(&api, "com.weaveffi", true);
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(kt.contains("ids: IntArray"), "missing IntArray param: {kt}");
     }
 
@@ -3327,6 +3491,7 @@ mod tests {
                     name: "ids".to_string(),
                     ty: TypeRef::List(Box::new(TypeRef::I32)),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3343,7 +3508,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             jni.contains("jintArray ids"),
             "missing jintArray param: {jni}"
@@ -3380,7 +3545,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             jni.contains("JNIEXPORT jintArray JNICALL"),
             "missing jintArray return: {jni}"
@@ -3440,6 +3605,7 @@ mod tests {
                     name: "id".to_string(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -3619,6 +3785,7 @@ mod tests {
                     name: "scores".to_string(),
                     ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3635,7 +3802,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let kt = render_kotlin(&api, "com.weaveffi", true);
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             kt.contains("scores: Map<String, Int>"),
             "missing Map<String, Int> param: {kt}"
@@ -3652,6 +3819,7 @@ mod tests {
                     name: "scores".to_string(),
                     ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -3668,7 +3836,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             jni.contains("jobject scores"),
             "missing jobject param: {jni}"
@@ -3757,7 +3925,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             jni.contains("JNIEXPORT jobject JNICALL"),
             "missing jobject return: {jni}"
@@ -3780,11 +3948,13 @@ mod tests {
                         name: "a".to_string(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "b".to_string(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::I32),
@@ -3857,6 +4027,7 @@ mod tests {
                     name: "id".to_string(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -3876,18 +4047,20 @@ mod tests {
                         name: "ContactNotFound".to_string(),
                         code: 1001,
                         message: "Contact not found".to_string(),
+                        doc: None,
                     },
                     ErrorCode {
                         name: "InvalidInput".to_string(),
                         code: 1002,
                         message: "Invalid input provided".to_string(),
+                        doc: None,
                     },
                 ],
             }),
             modules: vec![],
         }]);
 
-        let kt = render_kotlin(&api, "com.weaveffi", true);
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             kt.contains("sealed class WeaveFFIException(val code: Int, message: String) : Exception(message)"),
             "missing sealed class declaration: {kt}"
@@ -3901,7 +4074,7 @@ mod tests {
             "missing InvalidInput subclass: {kt}"
         );
 
-        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             jni.contains("throw_weaveffi_error(env, &err)"),
             "missing throw_weaveffi_error call: {jni}"
@@ -3934,6 +4107,7 @@ mod tests {
                     name: "name".to_string(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -4019,6 +4193,7 @@ mod tests {
                         Box::new(TypeRef::Struct("Contact".into())),
                     ))))),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -4044,7 +4219,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let kotlin = render_kotlin(&api, "com.weaveffi", true);
+        let kotlin = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             kotlin.contains("LongArray?"),
             "should contain deeply nested optional type: {kotlin}"
@@ -4064,6 +4239,7 @@ mod tests {
                         Box::new(TypeRef::List(Box::new(TypeRef::I32))),
                     ),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -4079,7 +4255,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let kotlin = render_kotlin(&api, "com.weaveffi", true);
+        let kotlin = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             kotlin.contains("Map<String, IntArray>"),
             "should contain map of lists type: {kotlin}"
@@ -4099,6 +4275,7 @@ mod tests {
                         Box::new(TypeRef::Struct("Contact".into())),
                     ),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -4144,7 +4321,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let kotlin = render_kotlin(&api, "com.weaveffi", true);
+        let kotlin = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             kotlin.contains("Map<Int, Long>"),
             "should contain enum-keyed map type: {kotlin}"
@@ -4161,6 +4338,7 @@ mod tests {
                     name: "contact".into(),
                     ty: TypeRef::TypedHandle("Contact".into()),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -4186,7 +4364,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let kt = render_kotlin(&api, "com.weaveffi", true);
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             kt.contains("contact: Contact"),
             "TypedHandle should use class type not Long: {kt}"
@@ -4203,6 +4381,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -4229,7 +4408,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             jni.contains("GetStringUTFChars"),
             "input StringUtf8 should use GetStringUTFChars: {jni}"
@@ -4264,7 +4443,7 @@ mod tests {
             "error path should throw: {jni}"
         );
 
-        let kt = render_kotlin(&api, "com.weaveffi", true);
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(kt.contains("class Contact"), "struct class Contact: {kt}");
     }
 
@@ -4278,6 +4457,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                     "Contact".into(),
@@ -4306,7 +4486,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true);
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             jni.contains("if (rv == NULL)"),
             "optional struct return needs null check: {jni}"
@@ -4327,6 +4507,7 @@ mod tests {
                     name: "id".to_string(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -4343,7 +4524,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let kt = render_kotlin(&api, "com.weaveffi", true);
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             kt.contains("suspend fun"),
             "async function should generate suspend fun: {kt}"
@@ -4364,6 +4545,7 @@ mod tests {
                     name: "id".to_string(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -4380,7 +4562,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let kt = render_kotlin(&api, "com.weaveffi", true);
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
             kt.contains("suspendCancellableCoroutine"),
             "async function should use suspendCancellableCoroutine: {kt}"
@@ -4393,5 +4575,138 @@ mod tests {
             kt.contains("import kotlinx.coroutines.suspendCancellableCoroutine"),
             "should import suspendCancellableCoroutine: {kt}"
         );
+    }
+
+    /// JNI requires `NewGlobalRef` on the Kotlin continuation so it survives
+    /// across the C-side thread spawn, balanced by `DeleteGlobalRef` in the
+    /// JNI callback after the suspend point is resumed. The `malloc` of the
+    /// callback context must also be balanced by `free(ctx)`.
+    #[test]
+    fn android_async_pins_callback_for_lifetime() {
+        let api = make_api(vec![Module {
+            name: "tasks".into(),
+            functions: vec![Function {
+                name: "run".into(),
+                params: vec![Param {
+                    name: "id".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: None,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: true,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let c = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
+        let pin_count = c.matches("NewGlobalRef(env, callback)").count();
+        let unpin_count = c.matches("DeleteGlobalRef(env, ctx->callback)").count();
+        let malloc_count = c.matches("malloc(sizeof(weaveffi_jni_async_ctx))").count();
+        let free_count = c.matches("free(ctx);").count();
+        assert_eq!(
+            pin_count, 1,
+            "expected one NewGlobalRef per async fn, got {pin_count}: {c}"
+        );
+        assert_eq!(
+            unpin_count, 1,
+            "expected one DeleteGlobalRef per async fn, got {unpin_count}: {c}"
+        );
+        assert_eq!(
+            malloc_count, free_count,
+            "ctx malloc / free must balance: malloc={malloc_count} free={free_count}: {c}"
+        );
+    }
+
+    fn doc_api() -> Api {
+        make_api(vec![Module {
+            name: "docs".into(),
+            functions: vec![Function {
+                name: "do_thing".into(),
+                params: vec![Param {
+                    name: "x".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: Some("the input value".into()),
+                }],
+                returns: Some(TypeRef::I32),
+                doc: Some("Performs a thing.".into()),
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![StructDef {
+                name: "Item".into(),
+                doc: Some("An item we track.".into()),
+                fields: vec![StructField {
+                    name: "id".into(),
+                    ty: TypeRef::I64,
+                    doc: Some("Stable id".into()),
+                    default: None,
+                }],
+                builder: false,
+            }],
+            enums: vec![EnumDef {
+                name: "Kind".into(),
+                doc: Some("Kind of item.".into()),
+                variants: vec![EnumVariant {
+                    name: "Small".into(),
+                    value: 0,
+                    doc: Some("A small one".into()),
+                }],
+            }],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: Some(ErrorDomain {
+                name: "DocsErrors".into(),
+                codes: vec![ErrorCode {
+                    name: "not_found".into(),
+                    code: 1,
+                    message: "Not found".into(),
+                    doc: Some("Raised when missing".into()),
+                }],
+            }),
+            modules: vec![],
+        }])
+    }
+
+    #[test]
+    fn android_emits_doc_on_function() {
+        let kt = render_kotlin(&doc_api(), "com.weaveffi", true, "weaveffi.yml");
+        assert!(kt.contains("Performs a thing."), "{kt}");
+    }
+
+    #[test]
+    fn android_emits_doc_on_struct() {
+        let kt = render_kotlin(&doc_api(), "com.weaveffi", true, "weaveffi.yml");
+        assert!(kt.contains("/** An item we track. */"), "{kt}");
+    }
+
+    #[test]
+    fn android_emits_doc_on_enum_variant() {
+        let kt = render_kotlin(&doc_api(), "com.weaveffi", true, "weaveffi.yml");
+        assert!(kt.contains("/** Kind of item. */"), "{kt}");
+        assert!(kt.contains("/** A small one */"), "{kt}");
+    }
+
+    #[test]
+    fn android_emits_doc_on_field() {
+        let kt = render_kotlin(&doc_api(), "com.weaveffi", true, "weaveffi.yml");
+        assert!(kt.contains("/** Stable id */"), "{kt}");
+    }
+
+    #[test]
+    fn android_emits_doc_on_param() {
+        let kt = render_kotlin(&doc_api(), "com.weaveffi", true, "weaveffi.yml");
+        assert!(kt.contains("@param x the input value"), "{kt}");
     }
 }

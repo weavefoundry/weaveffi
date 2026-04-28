@@ -1,15 +1,72 @@
 use color_eyre::eyre::{bail, eyre, Result};
 use weaveffi_ir::ir::{
-    Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
+    Api, CallbackDef, EnumDef, EnumVariant, Function, ListenerDef, Module, Param, StructDef,
+    StructField, TypeRef,
 };
 
 fn has_attr(attrs: &[syn::Attribute], name: &str) -> bool {
     attrs.iter().any(|a| a.path().is_ident(name))
 }
 
+fn find_attr<'a>(attrs: &'a [syn::Attribute], name: &str) -> Option<&'a syn::Attribute> {
+    attrs.iter().find(|a| a.path().is_ident(name))
+}
+
 fn has_repr_i32(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|a| {
         a.path().is_ident("repr") && a.parse_args::<syn::Ident>().is_ok_and(|id| id == "i32")
+    })
+}
+
+/// Parse `#[deprecated(since = "...", note = "...")]` into `(since, note)`.
+/// Bare `#[deprecated]` returns `(None, Some("deprecated"))` so callers know
+/// the function is flagged even when no message is provided.
+fn parse_deprecated(attrs: &[syn::Attribute]) -> (Option<String>, Option<String>) {
+    let Some(attr) = find_attr(attrs, "deprecated") else {
+        return (None, None);
+    };
+    let mut since = None;
+    let mut note = None;
+    if matches!(attr.meta, syn::Meta::Path(_)) {
+        return (None, Some("deprecated".to_string()));
+    }
+    let _ = attr.parse_nested_meta(|meta| {
+        let Some(ident) = meta.path.get_ident() else {
+            return Ok(());
+        };
+        let value = meta.value()?;
+        let lit: syn::LitStr = value.parse()?;
+        match ident.to_string().as_str() {
+            "since" => since = Some(lit.value()),
+            "note" => note = Some(lit.value()),
+            _ => {}
+        }
+        Ok(())
+    });
+    if note.is_none() && since.is_none() {
+        note = Some("deprecated".to_string());
+    }
+    (since, note)
+}
+
+/// Parse `#[weaveffi_listener(event_callback = "OnReady")]` and return the
+/// referenced callback name.
+fn parse_listener_callback(attr: &syn::Attribute) -> Result<String> {
+    if matches!(attr.meta, syn::Meta::Path(_)) {
+        bail!("#[weaveffi_listener] requires `event_callback = \"<callback name>\"`");
+    }
+    let mut callback = None;
+    attr.parse_nested_meta(|meta| {
+        if meta.path.is_ident("event_callback") {
+            let value = meta.value()?;
+            let lit: syn::LitStr = value.parse()?;
+            callback = Some(lit.value());
+        }
+        Ok(())
+    })
+    .map_err(|e| eyre!("failed to parse #[weaveffi_listener] attribute: {e}"))?;
+    callback.ok_or_else(|| {
+        eyre!("#[weaveffi_listener] requires `event_callback = \"<callback name>\"`")
     })
 }
 
@@ -77,40 +134,75 @@ fn two_generic_args(seg: &syn::PathSegment) -> Result<(&syn::Type, &syn::Type)> 
     Ok((k, v))
 }
 
+/// Returns the bare ident name (last path segment) for a `Type::Path`, or
+/// `None` if the type isn't a simple path. Used to emit
+/// [`TypeRef::TypedHandle`] for `*mut Foo` patterns.
+fn type_path_ident(ty: &syn::Type) -> Option<String> {
+    let syn::Type::Path(p) = ty else { return None };
+    p.path.segments.last().map(|s| s.ident.to_string())
+}
+
 fn map_type(ty: &syn::Type) -> Result<TypeRef> {
-    let syn::Type::Path(type_path) = ty else {
-        bail!("unsupported type syntax");
-    };
-    let seg = type_path
-        .path
-        .segments
-        .last()
-        .ok_or_else(|| eyre!("empty type path"))?;
-    let ident = seg.ident.to_string();
-    match ident.as_str() {
-        "i32" => Ok(TypeRef::I32),
-        "u32" => Ok(TypeRef::U32),
-        "i64" => Ok(TypeRef::I64),
-        "f64" => Ok(TypeRef::F64),
-        "bool" => Ok(TypeRef::Bool),
-        "String" => Ok(TypeRef::StringUtf8),
-        "u64" => Ok(TypeRef::Handle),
-        "Vec" => {
-            let inner = single_generic_arg(seg)?;
-            if is_ident(inner, "u8") {
-                return Ok(TypeRef::Bytes);
+    match ty {
+        syn::Type::Reference(r) => {
+            // `&str`, `&[u8]`, `&mut T`, `&T` — `&str` and `&[u8]` map to
+            // borrowed IR variants; everything else delegates to the inner
+            // type so `&mut Foo` becomes `Struct(Foo)` (the `mutable` flag is
+            // captured separately by the caller).
+            if let syn::Type::Path(p) = r.elem.as_ref() {
+                if p.path.is_ident("str") {
+                    return Ok(TypeRef::BorrowedStr);
+                }
             }
-            Ok(TypeRef::List(Box::new(map_type(inner)?)))
+            if let syn::Type::Slice(slice) = r.elem.as_ref() {
+                if is_ident(&slice.elem, "u8") {
+                    return Ok(TypeRef::BorrowedBytes);
+                }
+            }
+            map_type(&r.elem)
         }
-        "Option" => {
-            let inner = single_generic_arg(seg)?;
-            Ok(TypeRef::Optional(Box::new(map_type(inner)?)))
+        syn::Type::Ptr(p) => {
+            // `*mut Foo` and `*const Foo` are treated as opaque typed handles
+            // (`handle<Foo>`). The mutability of the pointer itself is not
+            // expressible in the IR.
+            let name = type_path_ident(&p.elem)
+                .ok_or_else(|| eyre!("unsupported pointer target; expected a named type"))?;
+            Ok(TypeRef::TypedHandle(name))
         }
-        "HashMap" | "BTreeMap" => {
-            let (k, v) = two_generic_args(seg)?;
-            Ok(TypeRef::Map(Box::new(map_type(k)?), Box::new(map_type(v)?)))
+        syn::Type::Path(type_path) => {
+            let seg = type_path
+                .path
+                .segments
+                .last()
+                .ok_or_else(|| eyre!("empty type path"))?;
+            let ident = seg.ident.to_string();
+            match ident.as_str() {
+                "i32" => Ok(TypeRef::I32),
+                "u32" => Ok(TypeRef::U32),
+                "i64" => Ok(TypeRef::I64),
+                "f64" => Ok(TypeRef::F64),
+                "bool" => Ok(TypeRef::Bool),
+                "String" => Ok(TypeRef::StringUtf8),
+                "u64" => Ok(TypeRef::Handle),
+                "Vec" => {
+                    let inner = single_generic_arg(seg)?;
+                    if is_ident(inner, "u8") {
+                        return Ok(TypeRef::Bytes);
+                    }
+                    Ok(TypeRef::List(Box::new(map_type(inner)?)))
+                }
+                "Option" => {
+                    let inner = single_generic_arg(seg)?;
+                    Ok(TypeRef::Optional(Box::new(map_type(inner)?)))
+                }
+                "HashMap" | "BTreeMap" => {
+                    let (k, v) = two_generic_args(seg)?;
+                    Ok(TypeRef::Map(Box::new(map_type(k)?), Box::new(map_type(v)?)))
+                }
+                other => Ok(TypeRef::Struct(other.to_string())),
+            }
         }
-        other => Ok(TypeRef::Struct(other.to_string())),
+        _ => bail!("unsupported type syntax"),
     }
 }
 
@@ -129,11 +221,10 @@ fn parse_discriminant(expr: &syn::Expr) -> Result<i32> {
     }
 }
 
-fn extract_function(item: &syn::ItemFn) -> Result<Function> {
-    let name = item.sig.ident.to_string();
-    let params = item
-        .sig
-        .inputs
+fn extract_params(
+    inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::Token![,]>,
+) -> Result<Vec<Param>> {
+    inputs
         .iter()
         .filter_map(|arg| match arg {
             syn::FnArg::Typed(pt) => Some(pt),
@@ -144,28 +235,58 @@ fn extract_function(item: &syn::ItemFn) -> Result<Function> {
                 syn::Pat::Ident(id) => id.ident.to_string(),
                 _ => bail!("unsupported parameter pattern"),
             };
+            // `&mut T` (excluding `&mut str` / `&mut [u8]`, which become the
+            // borrowed IR variants) is the syntax for a mutable parameter.
+            let mutable =
+                matches!(pt.ty.as_ref(), syn::Type::Reference(r) if r.mutability.is_some());
             Ok(Param {
                 name: param_name,
                 ty: map_type(&pt.ty)?,
-                mutable: false,
+                mutable,
+                doc: extract_doc(&pt.attrs),
             })
         })
-        .collect::<Result<_>>()?;
+        .collect()
+}
+
+fn extract_function(item: &syn::ItemFn) -> Result<Function> {
+    let name = item.sig.ident.to_string();
+    let params = extract_params(&item.sig.inputs)?;
 
     let returns = match &item.sig.output {
         syn::ReturnType::Default => None,
         syn::ReturnType::Type(_, ty) => Some(map_type(ty)?),
     };
 
+    let (since, deprecated) = parse_deprecated(&item.attrs);
+
     Ok(Function {
         name,
         params,
         returns,
         doc: extract_doc(&item.attrs),
-        r#async: false,
-        cancellable: false,
-        deprecated: None,
-        since: None,
+        r#async: item.sig.asyncness.is_some() || has_attr(&item.attrs, "weaveffi_async"),
+        cancellable: has_attr(&item.attrs, "weaveffi_cancellable"),
+        deprecated,
+        since,
+    })
+}
+
+fn extract_callback(item: &syn::ItemFn) -> Result<CallbackDef> {
+    Ok(CallbackDef {
+        name: item.sig.ident.to_string(),
+        params: extract_params(&item.sig.inputs)?,
+        doc: extract_doc(&item.attrs),
+    })
+}
+
+fn extract_listener(item: &syn::ItemFn) -> Result<ListenerDef> {
+    let attr = find_attr(&item.attrs, "weaveffi_listener")
+        .ok_or_else(|| eyre!("missing #[weaveffi_listener] attribute"))?;
+    Ok(ListenerDef {
+        name: item.sig.ident.to_string(),
+        event_callback: parse_listener_callback(attr)?,
+        doc: extract_doc(&item.attrs),
     })
 }
 
@@ -196,7 +317,7 @@ fn extract_struct(item: &syn::ItemStruct) -> Result<StructDef> {
         name,
         doc: extract_doc(&item.attrs),
         fields,
-        builder: false,
+        builder: has_attr(&item.attrs, "weaveffi_builder"),
     })
 }
 
@@ -238,10 +359,19 @@ fn extract_module(item_mod: &syn::ItemMod) -> Result<Module> {
     let mut functions = Vec::new();
     let mut structs = Vec::new();
     let mut enums = Vec::new();
+    let mut callbacks = Vec::new();
+    let mut listeners = Vec::new();
+    let mut modules = Vec::new();
 
     if let Some((_, items)) = &item_mod.content {
         for item in items {
             match item {
+                syn::Item::Fn(f) if has_attr(&f.attrs, "weaveffi_listener") => {
+                    listeners.push(extract_listener(f)?);
+                }
+                syn::Item::Fn(f) if has_attr(&f.attrs, "weaveffi_callback") => {
+                    callbacks.push(extract_callback(f)?);
+                }
                 syn::Item::Fn(f) if has_attr(&f.attrs, "weaveffi_export") => {
                     functions.push(extract_function(f)?);
                 }
@@ -250,6 +380,9 @@ fn extract_module(item_mod: &syn::ItemMod) -> Result<Module> {
                 }
                 syn::Item::Enum(e) if has_attr(&e.attrs, "weaveffi_enum") => {
                     enums.push(extract_enum(e)?);
+                }
+                syn::Item::Mod(m) if m.content.is_some() => {
+                    modules.push(extract_module(m)?);
                 }
                 _ => {}
             }
@@ -261,10 +394,10 @@ fn extract_module(item_mod: &syn::ItemMod) -> Result<Module> {
         functions,
         structs,
         enums,
-        callbacks: vec![],
-        listeners: vec![],
+        callbacks,
+        listeners,
         errors: None,
-        modules: vec![],
+        modules,
     })
 }
 
@@ -801,5 +934,311 @@ mod tests {
         let api = extract_api_from_rust(src).unwrap();
         let f = &api.modules[0].functions[0];
         assert_eq!(f.doc.as_deref(), Some("Adds two numbers."));
+    }
+
+    #[test]
+    fn extract_borrowed_str_param() {
+        let src = r#"
+            mod m {
+                #[weaveffi_export]
+                fn echo(s: &str) -> String { String::new() }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert_eq!(f.params[0].ty, TypeRef::BorrowedStr);
+        assert_eq!(f.returns, Some(TypeRef::StringUtf8));
+    }
+
+    #[test]
+    fn extract_borrowed_bytes_param() {
+        let src = r#"
+            mod m {
+                #[weaveffi_export]
+                fn hash(b: &[u8]) -> u32 { 0 }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert_eq!(f.params[0].ty, TypeRef::BorrowedBytes);
+    }
+
+    #[test]
+    fn extract_typed_handle_via_pointer() {
+        let src = r#"
+            mod m {
+                #[weaveffi_export]
+                fn open() -> *mut Token { std::ptr::null_mut() }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert_eq!(f.returns, Some(TypeRef::TypedHandle("Token".into())));
+    }
+
+    #[test]
+    fn extract_typed_handle_param_via_pointer() {
+        let src = r#"
+            mod m {
+                #[weaveffi_export]
+                fn close(token: *mut Token) {}
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert_eq!(f.params[0].ty, TypeRef::TypedHandle("Token".into()));
+        assert!(!f.params[0].mutable);
+    }
+
+    #[test]
+    fn extract_const_pointer_is_typed_handle() {
+        let src = r#"
+            mod m {
+                #[weaveffi_export]
+                fn peek(token: *const Token) -> i32 { 0 }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert_eq!(f.params[0].ty, TypeRef::TypedHandle("Token".into()));
+    }
+
+    #[test]
+    fn extract_mutable_reference_param() {
+        let src = r#"
+            mod m {
+                #[weaveffi_export]
+                fn fill(buf: &mut Buffer) {}
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let p = &api.modules[0].functions[0].params[0];
+        assert!(p.mutable);
+        assert_eq!(p.ty, TypeRef::Struct("Buffer".into()));
+    }
+
+    #[test]
+    fn extract_immutable_reference_param() {
+        let src = r#"
+            mod m {
+                #[weaveffi_export]
+                fn read(buf: &Buffer) -> i32 { 0 }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let p = &api.modules[0].functions[0].params[0];
+        assert!(!p.mutable);
+        assert_eq!(p.ty, TypeRef::Struct("Buffer".into()));
+    }
+
+    #[test]
+    fn extract_async_marker_attribute() {
+        let src = r#"
+            mod m {
+                #[weaveffi_export]
+                #[weaveffi_async]
+                fn fetch(url: String) -> String { String::new() }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert!(f.r#async);
+    }
+
+    #[test]
+    fn extract_async_keyword() {
+        let src = r#"
+            mod m {
+                #[weaveffi_export]
+                async fn fetch(url: String) -> String { String::new() }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert!(f.r#async);
+    }
+
+    #[test]
+    fn extract_cancellable_marker() {
+        let src = r#"
+            mod m {
+                #[weaveffi_export]
+                #[weaveffi_async]
+                #[weaveffi_cancellable]
+                fn fetch(url: String) -> String { String::new() }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert!(f.r#async);
+        assert!(f.cancellable);
+    }
+
+    #[test]
+    fn extract_deprecated_with_since_and_note() {
+        let src = r#"
+            mod m {
+                #[weaveffi_export]
+                #[deprecated(since = "0.1.0", note = "Use new_op instead")]
+                fn legacy() -> i32 { 0 }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert_eq!(f.since.as_deref(), Some("0.1.0"));
+        assert_eq!(f.deprecated.as_deref(), Some("Use new_op instead"));
+    }
+
+    #[test]
+    fn extract_deprecated_bare_attribute() {
+        let src = r#"
+            mod m {
+                #[weaveffi_export]
+                #[deprecated]
+                fn legacy() -> i32 { 0 }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert!(f.since.is_none());
+        assert_eq!(f.deprecated.as_deref(), Some("deprecated"));
+    }
+
+    #[test]
+    fn extract_no_deprecated_means_none() {
+        let src = r#"
+            mod m {
+                #[weaveffi_export]
+                fn ok() -> i32 { 0 }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert!(f.since.is_none());
+        assert!(f.deprecated.is_none());
+    }
+
+    #[test]
+    fn extract_builder_struct() {
+        let src = r#"
+            mod m {
+                #[weaveffi_struct]
+                #[weaveffi_builder]
+                struct Item {
+                    name: String,
+                    count: i32,
+                }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let s = &api.modules[0].structs[0];
+        assert!(s.builder);
+    }
+
+    #[test]
+    fn extract_callback_definition() {
+        let src = r#"
+            mod m {
+                /// Fires when an item is ready.
+                #[weaveffi_callback]
+                fn OnReady(code: i32, msg: String) {}
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        assert_eq!(api.modules[0].callbacks.len(), 1);
+        let cb = &api.modules[0].callbacks[0];
+        assert_eq!(cb.name, "OnReady");
+        assert_eq!(cb.params.len(), 2);
+        assert_eq!(cb.params[0].name, "code");
+        assert_eq!(cb.params[0].ty, TypeRef::I32);
+        assert_eq!(cb.params[1].name, "msg");
+        assert_eq!(cb.params[1].ty, TypeRef::StringUtf8);
+        assert_eq!(cb.doc.as_deref(), Some("Fires when an item is ready."));
+    }
+
+    #[test]
+    fn extract_listener_definition() {
+        let src = r#"
+            mod m {
+                /// Subscribe to OnReady events.
+                #[weaveffi_listener(event_callback = "OnReady")]
+                fn ready_listener() {}
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        assert_eq!(api.modules[0].listeners.len(), 1);
+        let l = &api.modules[0].listeners[0];
+        assert_eq!(l.name, "ready_listener");
+        assert_eq!(l.event_callback, "OnReady");
+        assert_eq!(l.doc.as_deref(), Some("Subscribe to OnReady events."));
+    }
+
+    #[test]
+    fn extract_listener_without_event_callback_is_error() {
+        let src = r#"
+            mod m {
+                #[weaveffi_listener]
+                fn bad() {}
+            }
+        "#;
+        let err = extract_api_from_rust(src).unwrap_err();
+        assert!(
+            format!("{err}").contains("event_callback"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn extract_nested_modules_recursive() {
+        let src = r#"
+            mod outer {
+                #[weaveffi_export]
+                fn top() -> i32 { 0 }
+
+                mod inner {
+                    #[weaveffi_export]
+                    fn deep(x: bool) -> bool { x }
+
+                    mod deeper {
+                        #[weaveffi_export]
+                        fn very() {}
+                    }
+                }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let outer = &api.modules[0];
+        assert_eq!(outer.name, "outer");
+        assert_eq!(outer.functions.len(), 1);
+        assert_eq!(outer.modules.len(), 1);
+        let inner = &outer.modules[0];
+        assert_eq!(inner.name, "inner");
+        assert_eq!(inner.functions.len(), 1);
+        assert_eq!(inner.functions[0].name, "deep");
+        assert_eq!(inner.modules.len(), 1);
+        let deeper = &inner.modules[0];
+        assert_eq!(deeper.name, "deeper");
+        assert_eq!(deeper.functions.len(), 1);
+        assert_eq!(deeper.functions[0].name, "very");
+    }
+
+    #[test]
+    fn extract_preserves_param_doc() {
+        // Doc comments on parameters round-trip when present (rare in
+        // practice, since rustfmt rejects them in many configurations).
+        let src = r#"
+            mod m {
+                #[weaveffi_export]
+                fn add(
+                    /// First addend.
+                    a: i32,
+                    b: i32,
+                ) -> i32 { a + b }
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let f = &api.modules[0].functions[0];
+        assert_eq!(f.params[0].doc.as_deref(), Some("First addend."));
+        assert!(f.params[1].doc.is_none());
     }
 }

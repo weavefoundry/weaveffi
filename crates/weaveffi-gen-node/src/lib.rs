@@ -1,9 +1,18 @@
+//! Node.js (N-API) binding generator for WeaveFFI.
+//!
+//! Emits a JavaScript loader plus TypeScript type definitions for the
+//! companion N-API addon. Async functions surface as `Promise`-returning
+//! methods. Implements the [`Generator`] trait.
+
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
-use weaveffi_core::utils::{c_abi_struct_name, local_type_name, wrapper_name};
+use weaveffi_core::utils::{
+    c_abi_struct_name, local_type_name, render_json_prelude, render_prelude, render_trailer,
+    wrapper_name, CommentStyle,
+};
 use weaveffi_ir::ir::{Api, Function, Module, StructDef, TypeRef};
 
 pub struct NodeGenerator;
@@ -15,22 +24,31 @@ impl NodeGenerator {
         out_dir: &Utf8Path,
         package_name: &str,
         strip_module_prefix: bool,
+        input_basename: &str,
     ) -> Result<()> {
         let dir = out_dir.join("node");
         std::fs::create_dir_all(&dir)?;
+        let dbl = CommentStyle::DoubleSlash;
         std::fs::write(
             dir.join("index.js"),
-            "module.exports = require('./index.node')\n",
+            format!(
+                "{}module.exports = require('./index.node')\n\n{}",
+                render_prelude(dbl, input_basename),
+                render_trailer(dbl, "index.js"),
+            ),
         )?;
         std::fs::write(
             dir.join("types.d.ts"),
-            render_node_dts(api, strip_module_prefix),
+            render_node_dts(api, strip_module_prefix, input_basename),
         )?;
-        std::fs::write(dir.join("package.json"), render_package_json(package_name))?;
-        std::fs::write(dir.join("binding.gyp"), render_binding_gyp())?;
+        std::fs::write(
+            dir.join("package.json"),
+            render_package_json(package_name, input_basename),
+        )?;
+        std::fs::write(dir.join("binding.gyp"), render_binding_gyp(input_basename))?;
         std::fs::write(
             dir.join("weaveffi_addon.c"),
-            render_addon_c(api, strip_module_prefix),
+            render_addon_c(api, strip_module_prefix, input_basename),
         )?;
         Ok(())
     }
@@ -42,7 +60,7 @@ impl Generator for NodeGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "weaveffi", true)
+        self.generate_impl(api, out_dir, "weaveffi", true, "weaveffi.yml")
     }
 
     fn generate_with_config(
@@ -56,49 +74,36 @@ impl Generator for NodeGenerator {
             out_dir,
             config.node_package_name(),
             config.strip_module_prefix,
+            config.input_basename(),
         )
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
-        vec![
-            out_dir.join("node/index.js").to_string(),
-            out_dir.join("node/types.d.ts").to_string(),
-            out_dir.join("node/package.json").to_string(),
+        let mut files = vec![
             out_dir.join("node/binding.gyp").to_string(),
+            out_dir.join("node/index.js").to_string(),
+            out_dir.join("node/package.json").to_string(),
+            out_dir.join("node/types.d.ts").to_string(),
             out_dir.join("node/weaveffi_addon.c").to_string(),
-        ]
+        ];
+        files.sort();
+        files
     }
 }
 
-fn render_package_json(name: &str) -> String {
+fn render_package_json(name: &str, input_basename: &str) -> String {
+    let prelude = render_json_prelude(input_basename);
     format!(
-        r#"{{
-  "name": "{name}",
-  "version": "0.1.0",
-  "main": "index.js",
-  "types": "types.d.ts",
-  "gypfile": true,
-  "scripts": {{
-    "install": "node-gyp rebuild"
-  }}
-}}
-"#
+        "{{\n{prelude}  \"name\": \"{name}\",\n  \"version\": \"0.1.0\",\n  \"main\": \"index.js\",\n  \"types\": \"types.d.ts\",\n  \"gypfile\": true,\n  \"scripts\": {{\n    \"install\": \"node-gyp rebuild\"\n  }}\n}}\n"
     )
 }
 
-fn render_binding_gyp() -> String {
-    r#"{
-  "targets": [
-    {
-      "target_name": "weaveffi",
-      "sources": ["weaveffi_addon.c"],
-      "include_dirs": ["../c"],
-      "libraries": ["-lweaveffi"]
-    }
-  ]
-}
-"#
-    .to_string()
+fn render_binding_gyp(input_basename: &str) -> String {
+    let prelude = render_prelude(CommentStyle::Hash, input_basename);
+    let trailer = render_trailer(CommentStyle::Hash, "binding.gyp");
+    format!(
+        "{prelude}{{\n  \"targets\": [\n    {{\n      \"target_name\": \"weaveffi\",\n      \"sources\": [\"weaveffi_addon.c\"],\n      \"include_dirs\": [\"../c\"],\n      \"libraries\": [\"-lweaveffi\"]\n    }}\n  ]\n}}\n\n{trailer}"
+    )
 }
 
 fn is_c_ptr_type(ty: &TypeRef) -> bool {
@@ -129,7 +134,6 @@ fn c_elem_type(ty: &TypeRef, module: &str) -> String {
             c_elem_type(inner, module)
         }
         TypeRef::Map(_, _) => "void*".into(),
-        TypeRef::Callback(_) => todo!("callback Node type"),
     }
 }
 
@@ -155,7 +159,6 @@ fn c_ret_type_str(ty: &TypeRef, module: &str) -> String {
         TypeRef::List(inner) => format!("{}*", c_elem_type(inner, module)),
         TypeRef::Map(_, _) => "void".into(),
         TypeRef::Iterator(_) => "void*".into(),
-        TypeRef::Callback(_) => todo!("callback Node type"),
     }
 }
 
@@ -196,8 +199,9 @@ fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Mo
     }
 }
 
-fn render_addon_c(api: &Api, strip_module_prefix: bool) -> String {
-    let mut out = String::from(
+fn render_addon_c(api: &Api, strip_module_prefix: bool, input_basename: &str) -> String {
+    let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
+    out.push_str(
         "#include <node_api.h>\n#include \"weaveffi.h\"\n#include <stdlib.h>\n#include <string.h>\n\n",
     );
 
@@ -252,7 +256,11 @@ fn render_addon_c(api: &Api, strip_module_prefix: bool) -> String {
     }
     out.push_str("  return exports;\n");
     out.push_str("}\n\n");
-    out.push_str("NAPI_MODULE(NODE_GYP_MODULE_NAME, Init)\n");
+    out.push_str("NAPI_MODULE(NODE_GYP_MODULE_NAME, Init)\n\n");
+    out.push_str(&render_trailer(
+        CommentStyle::DoubleSlash,
+        "weaveffi_addon.c",
+    ));
     out
 }
 
@@ -498,7 +506,6 @@ fn emit_param(
             emit_map_param(out, c_args, cleanups, k, v, name, idx, module);
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
-        TypeRef::Callback(_) => todo!("callback Node param"),
     }
 }
 
@@ -921,7 +928,6 @@ fn emit_ret_to_napi(out: &mut String, ty: &TypeRef, module: &str, fn_name: &str)
             out.push_str("  }\n");
             out.push_str(&format!("  {iter_type}_destroy(result);\n"));
         }
-        TypeRef::Callback(_) => todo!("callback Node return"),
     }
     out.push_str("  return ret;\n");
 }
@@ -1039,28 +1045,126 @@ fn ts_type_for(ty: &TypeRef) -> String {
             let t = ts_type_for(inner);
             format!("{t}[]")
         }
-        TypeRef::Callback(_) => todo!("callback Node type"),
     }
+}
+
+/// Emits a JSDoc comment at `indent`. Single-line docs collapse to
+/// `/** text */`; multi-line docs expand to a block with ` * ` prefixed lines.
+fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
+    let Some(doc) = doc else {
+        return;
+    };
+    let doc = doc.trim();
+    if doc.is_empty() {
+        return;
+    }
+    if doc.contains('\n') {
+        out.push_str(indent);
+        out.push_str("/**\n");
+        for line in doc.lines() {
+            out.push_str(indent);
+            if line.is_empty() {
+                out.push_str(" *\n");
+            } else {
+                out.push_str(" * ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out.push_str(indent);
+        out.push_str(" */\n");
+    } else {
+        out.push_str(indent);
+        out.push_str("/** ");
+        out.push_str(doc);
+        out.push_str(" */\n");
+    }
+}
+
+/// Emits a JSDoc block for a function: function doc, `@param name desc` for
+/// each documented parameter, and an optional trailing tag list.
+fn emit_fn_doc(
+    out: &mut String,
+    doc: &Option<String>,
+    params: &[weaveffi_ir::ir::Param],
+    indent: &str,
+    extra_tags: &[String],
+) {
+    let has_param_docs = params.iter().any(|p| p.doc.is_some());
+    let trimmed_doc = doc.as_ref().map(|d| d.trim()).filter(|d| !d.is_empty());
+    if trimmed_doc.is_none() && !has_param_docs && extra_tags.is_empty() {
+        return;
+    }
+    out.push_str(indent);
+    out.push_str("/**\n");
+    if let Some(d) = trimmed_doc {
+        for line in d.lines() {
+            out.push_str(indent);
+            if line.is_empty() {
+                out.push_str(" *\n");
+            } else {
+                out.push_str(" * ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    for p in params {
+        if let Some(pdoc) = &p.doc {
+            let pdoc = pdoc.trim();
+            if pdoc.is_empty() {
+                continue;
+            }
+            let mut lines = pdoc.lines();
+            if let Some(first) = lines.next() {
+                out.push_str(indent);
+                out.push_str(&format!(" * @param {} {}\n", p.name, first));
+            }
+            for line in lines {
+                out.push_str(indent);
+                if line.is_empty() {
+                    out.push_str(" *\n");
+                } else {
+                    out.push_str(" *   ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    for tag in extra_tags {
+        out.push_str(indent);
+        out.push_str(" * ");
+        out.push_str(tag);
+        out.push('\n');
+    }
+    out.push_str(indent);
+    out.push_str(" */\n");
 }
 
 fn render_struct_builder_dts(out: &mut String, s: &StructDef) {
     let name = &s.name;
+    emit_doc(out, &s.doc, "");
     out.push_str(&format!("export interface {}Builder {{\n", s.name));
     for field in &s.fields {
         let method = format!("with{}", field.name.to_upper_camel_case());
         let ts = ts_type_for(&field.ty);
+        emit_doc(out, &field.doc, "  ");
         out.push_str(&format!("  {method}(value: {ts}): {name}Builder;\n"));
     }
     out.push_str(&format!("  build(): {name};\n"));
     out.push_str("}\n");
 }
 
-fn render_node_dts(api: &Api, strip_module_prefix: bool) -> String {
-    let mut out = String::from("// Generated types for WeaveFFI functions\n");
+fn render_node_dts(api: &Api, strip_module_prefix: bool, input_basename: &str) -> String {
+    let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
+    out.push_str("// Generated types for WeaveFFI functions\n");
     for (m, path) in collect_modules_with_path(&api.modules) {
         for s in &m.structs {
+            emit_doc(&mut out, &s.doc, "");
             out.push_str(&format!("export interface {} {{\n", s.name));
             for field in &s.fields {
+                emit_doc(&mut out, &field.doc, "  ");
                 out.push_str(&format!("  {}: {};\n", field.name, ts_type_for(&field.ty)));
             }
             out.push_str("}\n");
@@ -1069,8 +1173,10 @@ fn render_node_dts(api: &Api, strip_module_prefix: bool) -> String {
             }
         }
         for e in &m.enums {
+            emit_doc(&mut out, &e.doc, "");
             out.push_str(&format!("export enum {} {{\n", e.name));
             for v in &e.variants {
+                emit_doc(&mut out, &v.doc, "  ");
                 out.push_str(&format!("  {} = {},\n", v.name, v.value));
             }
             out.push_str("}\n");
@@ -1092,13 +1198,11 @@ fn render_node_dts(api: &Api, strip_module_prefix: bool) -> String {
                 base_ret
             };
             let ts_name = wrapper_name(&path, &f.name, strip_module_prefix);
-            out.push_str(&format!(
-                "/** Maps to C function: weaveffi_{}_{} */\n",
-                path, f.name
-            ));
+            let mut tags = vec![format!("Maps to C function: weaveffi_{}_{}", path, f.name)];
             if let Some(msg) = &f.deprecated {
-                out.push_str(&format!("/** @deprecated {} */\n", msg));
+                tags.push(format!("@deprecated {}", msg));
             }
+            emit_fn_doc(&mut out, &f.doc, &f.params, "", &tags);
             out.push_str(&format!(
                 "export function {}({}): {}\n",
                 ts_name,
@@ -1107,6 +1211,8 @@ fn render_node_dts(api: &Api, strip_module_prefix: bool) -> String {
             ));
         }
     }
+    out.push('\n');
+    out.push_str(&render_trailer(CommentStyle::DoubleSlash, "types.d.ts"));
     out
 }
 
@@ -1237,6 +1343,7 @@ mod tests {
                 name: "id".into(),
                 ty: TypeRef::I32,
                 mutable: false,
+                doc: None,
             }],
             returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                 "Contact".into(),
@@ -1258,7 +1365,7 @@ mod tests {
             since: None,
         });
 
-        let dts = render_node_dts(&make_api(vec![m]), true);
+        let dts = render_node_dts(&make_api(vec![m]), true, "weaveffi.yml");
 
         assert!(dts.contains("export interface Contact {"));
         assert!(dts.contains("  name: string;"));
@@ -1292,11 +1399,13 @@ mod tests {
                         name: "a".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "b".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::I32),
@@ -1361,6 +1470,7 @@ mod tests {
                         name: "id".to_string(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                         "Contact".into(),
@@ -1388,11 +1498,13 @@ mod tests {
                             name: "contact_id".to_string(),
                             ty: TypeRef::I32,
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "color".to_string(),
                             ty: TypeRef::Optional(Box::new(TypeRef::Enum("Color".into()))),
                             mutable: false,
+                            doc: None,
                         },
                     ],
                     returns: None,
@@ -1408,6 +1520,7 @@ mod tests {
                         name: "contact_id".to_string(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
                     doc: None,
@@ -1572,11 +1685,13 @@ mod tests {
                         name: "a".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "b".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::I32),
@@ -1593,11 +1708,13 @@ mod tests {
                         name: "a".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "b".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::I32),
@@ -1610,16 +1727,14 @@ mod tests {
             m
         }]);
 
-        let dts = render_node_dts(&api, true);
+        let dts = render_node_dts(&api, true, "weaveffi.yml");
 
         assert!(
-            dts.contains("/** Maps to C function: weaveffi_math_add */\nexport function add("),
+            dts.contains("Maps to C function: weaveffi_math_add"),
             "missing JSDoc for add: {dts}"
         );
         assert!(
-            dts.contains(
-                "/** Maps to C function: weaveffi_math_subtract */\nexport function subtract("
-            ),
+            dts.contains("Maps to C function: weaveffi_math_subtract"),
             "missing JSDoc for subtract: {dts}"
         );
     }
@@ -1635,11 +1750,13 @@ mod tests {
                         name: "a".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "b".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::I32),
@@ -1651,7 +1768,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi.yml");
         assert!(
             !addon.contains("// TODO: implement"),
             "generated addon.c should not contain TODO comments: {addon}"
@@ -1669,11 +1786,13 @@ mod tests {
                         name: "a".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "b".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::I32),
@@ -1685,7 +1804,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi.yml");
         assert!(
             addon.contains("napi_get_cb_info"),
             "generated addon.c should call napi_get_cb_info: {addon}"
@@ -1702,6 +1821,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::StringUtf8),
                 doc: None,
@@ -1712,7 +1832,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi.yml");
         assert!(
             addon.contains("weaveffi_free_string(result)"),
             "generated addon should free returned strings: {addon}"
@@ -1742,11 +1862,13 @@ mod tests {
                         name: "a".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                     Param {
                         name: "b".into(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     },
                 ],
                 returns: Some(TypeRef::I32),
@@ -1758,7 +1880,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi.yml");
         assert!(
             addon.contains("err.code"),
             "generated addon.c should check err.code: {addon}"
@@ -1775,6 +1897,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -1861,6 +1984,7 @@ mod tests {
                     name: "contact".into(),
                     ty: TypeRef::TypedHandle("Contact".into()),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -1871,7 +1995,7 @@ mod tests {
             });
             m
         }]);
-        let dts = render_node_dts(&api, true);
+        let dts = render_node_dts(&api, true, "weaveffi.yml");
         assert!(
             dts.contains("contact: Contact"),
             "TypedHandle should use class type not bigint: {dts}"
@@ -1890,6 +2014,7 @@ mod tests {
                         Box::new(TypeRef::Struct("Contact".into())),
                     ))))),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -1915,7 +2040,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let dts = render_node_dts(&api, true);
+        let dts = render_node_dts(&api, true, "weaveffi.yml");
         assert!(
             dts.contains("(Contact | null)[] | null"),
             "should contain deeply nested optional type: {dts}"
@@ -1935,6 +2060,7 @@ mod tests {
                         Box::new(TypeRef::List(Box::new(TypeRef::I32))),
                     ),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -1950,7 +2076,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let dts = render_node_dts(&api, true);
+        let dts = render_node_dts(&api, true, "weaveffi.yml");
         assert!(
             dts.contains("Record<string, number[]>"),
             "should contain map of lists type: {dts}"
@@ -1970,6 +2096,7 @@ mod tests {
                         Box::new(TypeRef::Struct("Contact".into())),
                     ),
                     mutable: false,
+                    doc: None,
                 }],
                 returns: None,
                 doc: None,
@@ -2015,7 +2142,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let dts = render_node_dts(&api, true);
+        let dts = render_node_dts(&api, true, "weaveffi.yml");
         assert!(
             dts.contains("Record<Color, Contact>"),
             "should contain enum-keyed map type: {dts}"
@@ -2043,6 +2170,7 @@ mod tests {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
@@ -2053,7 +2181,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi.yml");
         assert!(
             addon.contains("free(name)"),
             "malloc'd JS string copy should be freed after the C call: {addon}"
@@ -2107,6 +2235,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                     "Contact".into(),
@@ -2119,7 +2248,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi.yml");
         assert!(
             addon.contains("if (result == NULL)"),
             "optional struct return should null-check before wrapping: {addon}"
@@ -2140,6 +2269,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::StringUtf8),
                 doc: None,
@@ -2160,7 +2290,7 @@ mod tests {
             });
             m
         }]);
-        let dts = render_node_dts(&api, true);
+        let dts = render_node_dts(&api, true, "weaveffi.yml");
         assert!(
             dts.contains("Promise<"),
             "async function should return Promise in .d.ts: {dts}"
@@ -2185,6 +2315,7 @@ mod tests {
                     name: "id".into(),
                     ty: TypeRef::I32,
                     mutable: false,
+                    doc: None,
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
@@ -2195,7 +2326,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi.yml");
         assert!(
             addon.contains("napi_create_promise"),
             "async addon should call napi_create_promise: {addon}"
@@ -2220,5 +2351,133 @@ mod tests {
             addon.contains("weaveffi_tasks_run_napi_cb"),
             "async addon should define the callback: {addon}"
         );
+    }
+
+    /// The N-API deferred is created with `napi_create_promise` and consumed
+    /// (and freed) by exactly one of `napi_resolve_deferred` /
+    /// `napi_reject_deferred`. The async context struct that carries the
+    /// deferred across the C callback boundary must be `malloc`-ed once and
+    /// `free`-d exactly once on the callback path.
+    #[test]
+    fn node_async_pins_callback_for_lifetime() {
+        let api = make_api(vec![{
+            let mut m = make_module("tasks");
+            m.functions.push(Function {
+                name: "run".into(),
+                params: vec![Param {
+                    name: "id".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: None,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: true,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            });
+            m
+        }]);
+        let addon = render_addon_c(&api, true, "weaveffi.yml");
+        let create_count = addon.matches("napi_create_promise").count();
+        let resolve_count = addon.matches("napi_resolve_deferred").count();
+        let reject_count = addon.matches("napi_reject_deferred").count();
+        let malloc_count = addon
+            .matches("malloc(sizeof(weaveffi_napi_async_ctx))")
+            .count();
+        let free_count = addon.matches("free(ctx);").count();
+        assert_eq!(
+            create_count, 1,
+            "expected one napi_create_promise per async fn, got {create_count}: {addon}"
+        );
+        assert_eq!(
+            resolve_count, 1,
+            "expected one napi_resolve_deferred per async fn, got {resolve_count}: {addon}"
+        );
+        assert_eq!(
+            reject_count, 1,
+            "expected one napi_reject_deferred per async fn, got {reject_count}: {addon}"
+        );
+        assert_eq!(
+            malloc_count, free_count,
+            "ctx malloc / free must balance per async fn: malloc={malloc_count} free={free_count}: {addon}"
+        );
+    }
+
+    fn doc_module() -> Module {
+        Module {
+            name: "docs".into(),
+            functions: vec![Function {
+                name: "do_thing".into(),
+                params: vec![Param {
+                    name: "x".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: Some("the input value".into()),
+                }],
+                returns: Some(TypeRef::I32),
+                doc: Some("Performs a thing.".into()),
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![StructDef {
+                name: "Item".into(),
+                doc: Some("An item we track.".into()),
+                fields: vec![StructField {
+                    name: "id".into(),
+                    ty: TypeRef::I64,
+                    doc: Some("Stable id".into()),
+                    default: None,
+                }],
+                builder: false,
+            }],
+            enums: vec![EnumDef {
+                name: "Kind".into(),
+                doc: Some("Kind of item.".into()),
+                variants: vec![EnumVariant {
+                    name: "Small".into(),
+                    value: 0,
+                    doc: Some("A small one".into()),
+                }],
+            }],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }
+    }
+
+    #[test]
+    fn node_emits_doc_on_function() {
+        let dts = render_node_dts(&make_api(vec![doc_module()]), true, "weaveffi.yml");
+        assert!(dts.contains("Performs a thing."), "{dts}");
+    }
+
+    #[test]
+    fn node_emits_doc_on_struct() {
+        let dts = render_node_dts(&make_api(vec![doc_module()]), true, "weaveffi.yml");
+        assert!(dts.contains("/** An item we track. */"), "{dts}");
+    }
+
+    #[test]
+    fn node_emits_doc_on_enum_variant() {
+        let dts = render_node_dts(&make_api(vec![doc_module()]), true, "weaveffi.yml");
+        assert!(dts.contains("/** Kind of item. */"), "{dts}");
+        assert!(dts.contains("/** A small one */"), "{dts}");
+    }
+
+    #[test]
+    fn node_emits_doc_on_field() {
+        let dts = render_node_dts(&make_api(vec![doc_module()]), true, "weaveffi.yml");
+        assert!(dts.contains("/** Stable id */"), "{dts}");
+    }
+
+    #[test]
+    fn node_emits_doc_on_param() {
+        let dts = render_node_dts(&make_api(vec![doc_module()]), true, "weaveffi.yml");
+        assert!(dts.contains("@param x the input value"), "{dts}");
     }
 }

@@ -1,8 +1,13 @@
 # Summary
 
 - [Introduction](intro.md)
-- [Roadmap](roadmap.md)
 - [Getting Started](getting-started.md)
+- [Architecture](architecture.md)
+- [Comparison](comparison.md)
+- [FAQ](faq.md)
+- [Stability and Versioning](stability.md)
+- [Performance](performance.md)
+- [Roadmap](roadmap.md)
 - [Samples](samples.md)
 - [Reference](reference/README.md)
   - [IDL Schema](reference/idl.md)

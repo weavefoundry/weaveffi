@@ -1,26 +1,30 @@
-# Tutorial: Swift iOS App
+# Swift iOS App
 
-This tutorial walks through building a Rust library, generating Swift
-bindings with WeaveFFI, and integrating everything into an Xcode iOS
-project.
+## Goal
+
+Build a small Rust greeter library, generate Swift bindings with
+WeaveFFI, and call them from a SwiftUI iOS app running in the
+simulator.
 
 ## Prerequisites
 
-- [Rust toolchain](https://rustup.rs/) (stable channel)
-- Xcode 15+ with iOS SDK
-- WeaveFFI CLI installed (`cargo install weaveffi-cli`)
+- [Rust toolchain](https://rustup.rs/) (stable channel).
+- Xcode 15 or later with the iOS SDK installed.
+- WeaveFFI CLI (`cargo install weaveffi-cli`).
 - iOS Rust targets:
 
-```bash
-rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
-```
+  ```bash
+  rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+  ```
 
-## 1) Define your API
+## Step-by-step
 
-Create a file called `greeter.yml`:
+### 1. Author the IDL
+
+Save as `greeter.yml`:
 
 ```yaml
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: greeter
     structs:
@@ -40,13 +44,13 @@ modules:
         return: Greeting
 ```
 
-## 2) Generate bindings
+### 2. Generate bindings
 
 ```bash
 weaveffi generate greeter.yml -o generated --scaffold
 ```
 
-This produces:
+You should see, among other targets:
 
 ```text
 generated/
@@ -62,15 +66,13 @@ generated/
 └── scaffold.rs
 ```
 
-## 3) Create the Rust library
-
-Create a new Cargo project for the native library:
+### 3. Implement the Rust library
 
 ```bash
 cargo init --lib mygreeter
 ```
 
-**mygreeter/Cargo.toml:**
+`mygreeter/Cargo.toml`:
 
 ```toml
 [package]
@@ -85,10 +87,7 @@ crate-type = ["staticlib", "cdylib"]
 weaveffi-abi = { version = "0.1" }
 ```
 
-Use `staticlib` for iOS — Xcode links static libraries into the app
-bundle. `cdylib` is included for desktop testing.
-
-**mygreeter/src/lib.rs:**
+`mygreeter/src/lib.rs`:
 
 ```rust
 #![allow(unsafe_code)]
@@ -111,55 +110,36 @@ pub extern "C" fn weaveffi_greeter_hello(
 }
 
 #[no_mangle]
-pub extern "C" fn weaveffi_free_string(ptr: *const c_char) {
-    abi::free_string(ptr);
-}
+pub extern "C" fn weaveffi_free_string(ptr: *const c_char) { abi::free_string(ptr); }
 
 #[no_mangle]
-pub extern "C" fn weaveffi_free_bytes(ptr: *mut u8, len: usize) {
-    abi::free_bytes(ptr, len);
-}
+pub extern "C" fn weaveffi_free_bytes(ptr: *mut u8, len: usize) { abi::free_bytes(ptr, len); }
 
 #[no_mangle]
-pub extern "C" fn weaveffi_error_clear(err: *mut weaveffi_error) {
-    abi::error_clear(err);
-}
+pub extern "C" fn weaveffi_error_clear(err: *mut weaveffi_error) { abi::error_clear(err); }
 ```
 
-Fill in the remaining functions (`weaveffi_greeter_greeting`,
-`weaveffi_greeter_Greeting_destroy`, getters, etc.) using the generated
-`scaffold.rs` as a guide.
+Use `scaffold.rs` as the template for the rest of the API
+(`weaveffi_greeter_greeting`, the `Greeting` lifecycle, getters, ...).
 
-## 4) Build for iOS
-
-Build the static library for each iOS target:
+### 4. Build for iOS targets
 
 ```bash
-# Physical devices (arm64)
 cargo build -p mygreeter --target aarch64-apple-ios --release
-
-# Simulator (arm64 Apple Silicon)
 cargo build -p mygreeter --target aarch64-apple-ios-sim --release
-
-# Simulator (x86_64 Intel Mac)
 cargo build -p mygreeter --target x86_64-apple-ios --release
 ```
 
-Create a universal simulator library with `lipo`:
+Combine the simulator architectures with `lipo` and bundle everything
+in an `XCFramework` so Xcode can pick the right slice automatically:
 
 ```bash
 mkdir -p target/universal-ios-sim/release
-
 lipo -create \
   target/aarch64-apple-ios-sim/release/libmygreeter.a \
   target/x86_64-apple-ios/release/libmygreeter.a \
   -output target/universal-ios-sim/release/libmygreeter.a
-```
 
-Optionally, create an XCFramework that bundles both device and simulator
-slices:
-
-```bash
 xcodebuild -create-xcframework \
   -library target/aarch64-apple-ios/release/libmygreeter.a \
   -headers generated/c/ \
@@ -168,34 +148,26 @@ xcodebuild -create-xcframework \
   -output MyGreeter.xcframework
 ```
 
-## 5) Set up the Xcode project
+### 5. Wire it into Xcode
 
-1. **Create a new iOS App** in Xcode (SwiftUI or UIKit).
+1. Create a new iOS App in Xcode (SwiftUI or UIKit).
+2. Drag `MyGreeter.xcframework` into the project navigator. Confirm it
+   appears under **Build Phases > Link Binary With Libraries**.
+3. **File > Add Package Dependencies > Add Local…** and pick
+   `generated/swift/`. The package contributes the `CWeaveFFI` and
+   `WeaveFFI` targets.
+4. **Build Settings > Header Search Paths**: add the path to
+   `generated/c/` (e.g. `$(SRCROOT)/../generated/c`).
+5. **Build Settings > Library Search Paths**: add the path to the
+   matching Rust static library
+   (`$(SRCROOT)/../target/aarch64-apple-ios/release` for device
+   builds).
+6. **Build Phases > Dependencies**: ensure `WeaveFFI` is listed.
 
-2. **Add the static library.** Drag `MyGreeter.xcframework` (or the
-   `.a` file for a single architecture) into your project navigator.
-   Ensure it appears under **Build Phases > Link Binary With Libraries**.
-
-3. **Add the generated Swift package.** In Xcode, go to
-   **File > Add Package Dependencies > Add Local…** and select
-   `generated/swift/`. This adds the `CWeaveFFI` (C module map) and
-   `WeaveFFI` (Swift wrapper) targets.
-
-4. **Set the Header Search Path.** Under **Build Settings > Header
-   Search Paths**, add the path to `generated/c/` (e.g.
-   `$(SRCROOT)/../generated/c`). This lets the module map find
-   `weaveffi.h`.
-
-5. **Set the Library Search Path.** Under **Build Settings > Library
-   Search Paths**, add the path to the Rust static library (e.g.
-   `$(SRCROOT)/../target/aarch64-apple-ios/release` for device builds).
-
-6. **Add a bridging dependency.** In your app target's
-   **Build Phases > Dependencies**, ensure `WeaveFFI` is listed.
-
-## 6) Call from Swift
+### 6. Call from Swift
 
 ```swift
+import SwiftUI
 import WeaveFFI
 
 struct ContentView: View {
@@ -219,34 +191,44 @@ struct ContentView: View {
 
 The generated `WeaveFFI` module exposes:
 
-- `Greeter.hello(_:)` — returns a `String`
-- `Greeter.greeting(_:_:)` — returns a `Greeting` object with `.message`
-  and `.lang` properties
-- `Greeting` — a class wrapping the opaque Rust pointer, with automatic
-  cleanup on `deinit`
+- `Greeter.hello(_:)` — returns `String`.
+- `Greeter.greeting(_:_:)` — returns a `Greeting` instance with
+  `.message` and `.lang` properties; `deinit` calls the Rust
+  destructor automatically.
+- `Greeting` — the wrapper class around the opaque Rust pointer.
 
-## 7) Build and run
+## Verification
 
-Select an iOS Simulator target in Xcode and press **Cmd+R**. The app
-should display "Hello, Swift!" when you tap the button.
+- Select an iOS Simulator target and press **Cmd+R**.
+- Tap **Greet** in the running app; the label changes to
+  `Hello, Swift!`.
+- Re-run on a physical device after building for `aarch64-apple-ios`
+  to confirm the device path also works.
+- Common error mappings:
 
-For a physical device, ensure you built for `aarch64-apple-ios` and that
-the correct library search path is set.
+  | Symptom                                           | Likely cause                                                                 |
+  |---------------------------------------------------|------------------------------------------------------------------------------|
+  | `Undefined symbols for architecture arm64`        | Static library not linked or the search path is wrong.                       |
+  | `Module 'CWeaveFFI' not found`                    | Header search path does not point at `generated/c/`.                         |
+  | `No such module 'WeaveFFI'`                       | Local Swift package not added under **Add Package Dependencies > Add Local…**.|
+  | Crash when running on Intel simulator              | Build for `x86_64-apple-ios` and combine with `lipo`.                        |
 
-## Troubleshooting
+## Cleanup
 
-| Problem | Solution |
-|---------|----------|
-| `Undefined symbols for architecture arm64` | Check that the static library is linked and the library search path is correct. |
-| `Module 'CWeaveFFI' not found` | Ensure the header search path points to `generated/c/`. |
-| `No such module 'WeaveFFI'` | Add the `generated/swift/` local package to your Xcode project. |
-| Simulator crash on Intel Mac | Build with `x86_64-apple-ios` and create a universal binary with `lipo`. |
+```bash
+rm -rf generated/ MyGreeter.xcframework
+cargo clean -p mygreeter
+```
+
+Remove the `MyGreeter.xcframework` reference from the Xcode project
+and undo the **Header Search Paths** / **Library Search Paths**
+edits.
 
 ## Next steps
 
-- See the [Swift generator reference](../generators/swift.md) for type
-  mapping details.
+- See the [Swift generator reference](../generators/swift.md) for the
+  full type mapping.
 - Read the [Memory Ownership](../guides/memory.md) guide to understand
-  struct lifecycle management.
-- Explore the [Calculator tutorial](calculator.md) for a simpler
-  end-to-end walkthrough.
+  struct lifecycle and `deinit` rules.
+- Try the [Calculator tutorial](calculator.md) for a simpler
+  end-to-end walkthrough or [Android](android.md) for a JVM target.

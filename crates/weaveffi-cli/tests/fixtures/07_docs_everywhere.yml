@@ -1,0 +1,62 @@
+version: "0.3.0"
+modules:
+  - name: docs
+    enums:
+      - name: Status
+        doc: |
+          Lifecycle status of a document.
+
+          Used to drive UI badges and filters.
+        variants:
+          - { name: Draft, value: 0, doc: Document is being edited }
+          - { name: Published, value: 1, doc: Document is publicly visible }
+          - { name: Archived, value: 2, doc: Document is hidden from listings }
+    structs:
+      - name: Document
+        doc: |
+          Represents a single document tracked by the system.
+
+          Documents are persisted to disk and exposed via the public API.
+        builder: true
+        fields:
+          - { name: id, type: i64, doc: Stable opaque identifier }
+          - { name: title, type: string, doc: Human-readable title shown in lists }
+          - { name: status, type: Status, doc: Current lifecycle status }
+          - { name: tags, type: "[string]", doc: Free-form tags for grouping }
+    callbacks:
+      - name: OnSaved
+        doc: Fires after a document has been persisted successfully
+        params:
+          - { name: doc_id, type: i64, doc: Identifier of the saved document }
+          - { name: revision, type: i32, doc: Monotonically increasing revision }
+    listeners:
+      - name: saved_listener
+        event_callback: OnSaved
+        doc: Subscribe to document-saved notifications
+    errors:
+      name: DocsErrors
+      codes:
+        - { name: not_found, code: 1, message: "Document not found", doc: Returned when no document matches the requested id }
+        - { name: invalid_status, code: 2, message: "Invalid status transition", doc: Raised when attempting to move into a forbidden state }
+    functions:
+      - name: create_document
+        doc: |
+          Create a brand new document.
+
+          The document starts in `Draft` status; callers must publish
+          it explicitly to make it visible.
+        params:
+          - { name: title, type: string, doc: Human-readable title for the new document }
+          - { name: tags, type: "[string]", doc: Initial set of tags (may be empty) }
+        return: Document
+      - name: get_document
+        doc: Look up a document by identifier
+        params:
+          - { name: id, type: i64, doc: Identifier returned from create_document }
+        return: "Document?"
+      - name: publish_async
+        doc: Publish a document in the background
+        params:
+          - { name: id, type: i64, doc: Identifier of the document to publish }
+        return: bool
+        async: true

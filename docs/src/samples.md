@@ -1,8 +1,51 @@
 # Samples
 
 This repo includes sample projects under `samples/` that showcase end-to-end
-usage of the C ABI layer. Each sample contains a YAML API definition and a Rust
-crate that implements the corresponding `weaveffi_*` C ABI functions.
+usage of the C ABI layer. Each sample contains a YAML IDL and a Rust crate
+that implements the corresponding `weaveffi_*` C ABI functions.
+
+## Kvstore (kitchen-sink reference)
+
+Path: `samples/kvstore`
+
+A production-quality, in-memory key/value store that exercises **every IDL
+feature WeaveFFI supports** in a single sample. Use this as the canonical
+reference when learning the IDL surface or when you need to copy/paste a
+real-world pattern for a new generator.
+
+**What it demonstrates:**
+
+- Typed handles (`handle<Store>`) for opaque resource lifecycle
+- A struct (`Entry`) with every primitive — `i64`, `string`, `bytes`, optional
+  field (`expires_at: i64?`), list field (`tags: [string]`), and map field
+  (`metadata: {string:string}`) — plus per-field doc strings and `builder: true`
+- A documented enum (`EntryKind` with `Volatile`, `Persistent`, `Encrypted`)
+- A documented error domain (`KvError` with `KEY_NOT_FOUND`, `EXPIRED`,
+  `STORE_FULL`, `IO_ERROR`)
+- A module-level callback (`OnEvict`) and listener (`eviction_listener`)
+- A streaming iterator return (`list_keys -> iter<string>`) with prefix filter
+- A cancellable async function (`compact_async`, `async: true, cancellable: true`)
+  that respects a `weaveffi_cancel_token` while reclaiming bytes on a worker
+  thread
+- A deprecated function (`legacy_put`) and `since: "0.3.0"` on every other
+  function
+- A nested sub-module (`kv.stats`) with its own struct (`Stats`) and a function
+  that takes a cross-module `handle<Store>`
+- Inline `generators:` overrides for `swift.module_name`, `cpp.namespace`,
+  `dotnet.namespace`, `dart.package_name`, `go.module_path`, and
+  `ruby.module_name`
+
+**Build, generate bindings, and run the C ABI tests:**
+
+```bash
+cargo build -p kvstore
+cargo test -p kvstore
+weaveffi generate samples/kvstore/kvstore.yml -o generated
+```
+
+Every consumer language under `examples/` ships with a kvstore smoke test
+(`open -> put -> get -> delete -> close`) that runs against the generated
+bindings and the produced `libkvstore` cdylib; see `examples/run_all.sh`.
 
 ## Calculator
 
@@ -64,7 +107,7 @@ exercises cross-module struct references and nested list types.
 
 **What it demonstrates:**
 
-- Multiple modules in a single API definition
+- Multiple modules in a single IDL
 - Enums (`Category` with `Electronics`, `Clothing`, `Food`, `Books`)
 - Structs with optional fields, list fields (`[string]` tags), and float types
 - List-returning search functions (`search_products` filtered by category)
@@ -103,9 +146,10 @@ cargo build -p async-demo
 cargo test -p async-demo
 ```
 
-> **Note:** The validator currently rejects `async: true` in API definitions.
-> This sample exists to exercise the planned async ABI pattern ahead of full
-> validator support.
+> **Note:** Async functions are fully supported by the validator. This
+> sample focuses on the C ABI callback pattern; see the
+> [Async Functions guide](guides/async.md) for the per-target async/await
+> story.
 
 ## Events
 
@@ -149,3 +193,25 @@ exports. Used by the Node.js example in `examples/`.
 cargo build -p calculator
 cargo build -p weaveffi-node-addon
 ```
+
+## End-to-end testing
+
+Every consumer language under `examples/` ships with an executable
+test that loads the calculator and contacts cdylibs at runtime and
+asserts a representative slice of the C ABI (basic add, contact
+create/list/cleanup). The `examples/run_all.sh` orchestrator builds
+and runs each one in turn:
+
+```bash
+cargo build -p calculator -p contacts
+
+WEAVEFFI_LIB=target/debug/libcalculator.dylib \
+  bash examples/run_all.sh
+```
+
+It prints `[OK] {target}` for each example that succeeds and exits
+non-zero on the first failure. Use `ONLY=python,ruby` to run a
+subset, or `SKIP=android,go` to omit individual targets. CI runs the
+full matrix on Linux, most targets on macOS, and the Python path on
+Windows. See the comment block at the top of `examples/run_all.sh`
+for the full list of env vars and per-target prerequisites.

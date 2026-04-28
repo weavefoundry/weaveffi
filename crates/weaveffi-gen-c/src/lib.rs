@@ -1,24 +1,67 @@
+//! C header and source-file generator for WeaveFFI.
+//!
+//! Emits a single `weaveffi.h` (plus optional helper sources) describing the
+//! stable C ABI surface defined by an [`weaveffi_ir::ir::Api`]. The generator
+//! is invoked through the [`Generator`] trait and is normally driven by
+//! [`weaveffi_core::codegen::Orchestrator`].
+
+use std::fmt::Write;
+
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
-use weaveffi_core::utils::c_abi_struct_name;
+use weaveffi_core::utils::{
+    c_abi_struct_name, render_abi_prefix_aliases, render_prelude, render_trailer, CommentStyle,
+};
 use weaveffi_ir::ir::{Api, EnumDef, Module, Param, StructDef, TypeRef};
+
+/// Number of API surface elements (functions + structs + enums + callbacks +
+/// listeners) used to pre-allocate the output buffer. Each element produces
+/// roughly 200-500 bytes of header text; budget 512 to cover most cases
+/// without re-allocating mid-render.
+const ESTIMATED_BYTES_PER_ELEMENT: usize = 512;
+const HEADER_BASE_BYTES: usize = 2048;
+
+fn estimate_header_capacity(api: &Api) -> usize {
+    fn count(modules: &[Module]) -> usize {
+        modules
+            .iter()
+            .map(|m| {
+                m.functions.len()
+                    + m.structs.len() * 2
+                    + m.enums.len()
+                    + m.callbacks.len()
+                    + m.listeners.len() * 2
+                    + count(&m.modules)
+            })
+            .sum()
+    }
+    HEADER_BASE_BYTES + count(&api.modules) * ESTIMATED_BYTES_PER_ELEMENT
+}
 
 pub struct CGenerator;
 
 impl CGenerator {
-    fn generate_impl(&self, api: &Api, out_dir: &Utf8Path, prefix: &str) -> Result<()> {
+    fn generate_impl(
+        &self,
+        api: &Api,
+        out_dir: &Utf8Path,
+        prefix: &str,
+        input_basename: &str,
+    ) -> Result<()> {
         let dir = out_dir.join("c");
         std::fs::create_dir_all(&dir)?;
+        let header_name = format!("{prefix}.h");
+        let source_name = format!("{prefix}.c");
         std::fs::write(
-            dir.join(format!("{prefix}.h")),
-            render_c_header(api, prefix),
+            dir.join(&header_name),
+            render_c_header(api, prefix, input_basename, &header_name),
         )?;
         std::fs::write(
-            dir.join(format!("{prefix}.c")),
-            render_c_convenience_c(prefix),
+            dir.join(&source_name),
+            render_c_convenience_c(prefix, input_basename, &source_name),
         )?;
         Ok(())
     }
@@ -30,7 +73,7 @@ impl Generator for CGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "weaveffi")
+        self.generate_impl(api, out_dir, "weaveffi", "weaveffi.yml")
     }
 
     fn generate_with_config(
@@ -39,14 +82,16 @@ impl Generator for CGenerator {
         out_dir: &Utf8Path,
         config: &GeneratorConfig,
     ) -> Result<()> {
-        self.generate_impl(api, out_dir, config.c_prefix())
+        self.generate_impl(api, out_dir, config.c_prefix(), config.input_basename())
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
-        vec![
-            out_dir.join("c/weaveffi.h").to_string(),
+        let mut files = vec![
             out_dir.join("c/weaveffi.c").to_string(),
-        ]
+            out_dir.join("c/weaveffi.h").to_string(),
+        ];
+        files.sort();
+        files
     }
 
     fn output_files_with_config(
@@ -56,10 +101,45 @@ impl Generator for CGenerator {
         config: &GeneratorConfig,
     ) -> Vec<String> {
         let prefix = config.c_prefix();
-        vec![
-            out_dir.join(format!("c/{prefix}.h")).to_string(),
+        let mut files = vec![
             out_dir.join(format!("c/{prefix}.c")).to_string(),
-        ]
+            out_dir.join(format!("c/{prefix}.h")).to_string(),
+        ];
+        files.sort();
+        files
+    }
+}
+
+/// Emits a `/** ... */` doc comment at `indent`. Single-line docs collapse to
+/// `/** text */`; multi-line docs expand to a block with ` * ` prefixed lines.
+fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
+    let Some(doc) = doc else {
+        return;
+    };
+    let doc = doc.trim();
+    if doc.is_empty() {
+        return;
+    }
+    if doc.contains('\n') {
+        out.push_str(indent);
+        out.push_str("/**\n");
+        for line in doc.lines() {
+            out.push_str(indent);
+            if line.is_empty() {
+                out.push_str(" *\n");
+            } else {
+                out.push_str(" * ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out.push_str(indent);
+        out.push_str(" */\n");
+    } else {
+        out.push_str(indent);
+        out.push_str("/** ");
+        out.push_str(doc);
+        out.push_str(" */\n");
     }
 }
 
@@ -95,7 +175,6 @@ fn c_element_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
             c_element_type(inner, module, prefix)
         }
         TypeRef::Map(_, _) => "void*".to_string(),
-        TypeRef::Callback(_) => todo!("callback C type"),
     }
 }
 
@@ -160,7 +239,6 @@ fn c_type_for_param(ty: &TypeRef, name: &str, module: &str, prefix: &str, mutabl
             }
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
-        TypeRef::Callback(_) => todo!("callback C type"),
     }
 }
 
@@ -205,7 +283,6 @@ fn c_ret_type(ty: &TypeRef, module: &str, prefix: &str) -> (String, Vec<String>)
             )
         }
         TypeRef::Iterator(_) => unreachable!("iterator return handled specially"),
-        TypeRef::Callback(_) => todo!("callback C return type"),
     }
 }
 
@@ -214,6 +291,18 @@ fn c_params_sig(params: &[Param], module: &str, prefix: &str) -> Vec<String> {
         .iter()
         .map(|p| c_type_for_param(&p.ty, &p.name, module, prefix, p.mutable))
         .collect()
+}
+
+/// Write a comma-separated parameter signature directly into `out`, optionally
+/// prefixed with extra entries (used to fold callbacks/cancel tokens/out_err
+/// into the same signature without an intermediate `Vec<String>`).
+fn write_params_into(out: &mut String, parts: &[&str]) {
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(part);
+    }
 }
 
 fn c_callback_result_params(ty: &TypeRef, module: &str, prefix: &str) -> Vec<String> {
@@ -241,41 +330,29 @@ fn c_callback_result_params(ty: &TypeRef, module: &str, prefix: &str) -> Vec<Str
     }
 }
 
-fn render_c_header(api: &Api, prefix: &str) -> String {
+fn render_c_header(api: &Api, prefix: &str, input_basename: &str, filename: &str) -> String {
     let guard = format!("{}_H", prefix.to_uppercase());
-    let mut out = String::new();
-    out.push_str(&format!("#ifndef {guard}\n"));
-    out.push_str(&format!("#define {guard}\n\n"));
+    let mut out = String::with_capacity(estimate_header_capacity(api));
+    out.push_str(&render_prelude(CommentStyle::DoubleSlash, input_basename));
+    let _ = write!(out, "#ifndef {guard}\n#define {guard}\n\n");
     out.push_str("#include <stdint.h>\n");
     out.push_str("#include <stddef.h>\n");
     out.push_str("#include <stdbool.h>\n\n");
+    out.push_str(&render_abi_prefix_aliases(prefix));
     out.push_str("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n");
-    out.push_str(&format!("typedef uint64_t {prefix}_handle_t;\n\n"));
-    out.push_str(&format!(
-        "typedef struct {prefix}_error {{ int32_t code; const char* message; }} {prefix}_error;\n\n",
-    ));
-    out.push_str(&format!(
-        "void {prefix}_error_clear({prefix}_error* err);\n"
-    ));
-    out.push_str(&format!("void {prefix}_free_string(const char* ptr);\n"));
-    out.push_str(&format!(
-        "void {prefix}_free_bytes(uint8_t* ptr, size_t len);\n\n"
-    ));
-    out.push_str(&format!(
-        "typedef struct {prefix}_cancel_token {prefix}_cancel_token;\n"
-    ));
-    out.push_str(&format!(
-        "{prefix}_cancel_token* {prefix}_cancel_token_create(void);\n"
-    ));
-    out.push_str(&format!(
-        "void {prefix}_cancel_token_cancel({prefix}_cancel_token* token);\n"
-    ));
-    out.push_str(&format!(
-        "bool {prefix}_cancel_token_is_cancelled(const {prefix}_cancel_token* token);\n"
-    ));
-    out.push_str(&format!(
-        "void {prefix}_cancel_token_destroy({prefix}_cancel_token* token);\n\n"
-    ));
+    let _ = write!(
+        out,
+        "typedef uint64_t {prefix}_handle_t;\n\n\
+         typedef struct {prefix}_error {{ int32_t code; const char* message; }} {prefix}_error;\n\n\
+         void {prefix}_error_clear({prefix}_error* err);\n\
+         void {prefix}_free_string(const char* ptr);\n\
+         void {prefix}_free_bytes(uint8_t* ptr, size_t len);\n\n\
+         typedef struct {prefix}_cancel_token {prefix}_cancel_token;\n\
+         {prefix}_cancel_token* {prefix}_cancel_token_create(void);\n\
+         void {prefix}_cancel_token_cancel({prefix}_cancel_token* token);\n\
+         bool {prefix}_cancel_token_is_cancelled(const {prefix}_cancel_token* token);\n\
+         void {prefix}_cancel_token_destroy({prefix}_cancel_token* token);\n\n",
+    );
     out.push_str("/*\n");
     out.push_str(" * Map convention: Maps are passed as parallel arrays of keys and values.\n");
     out.push_str(" * A map parameter {K:V} named \"m\" expands to:\n");
@@ -289,13 +366,15 @@ fn render_c_header(api: &Api, prefix: &str) -> String {
     }
 
     out.push_str("\n#ifdef __cplusplus\n}\n#endif\n\n");
-    out.push_str(&format!("#endif // {guard}\n"));
+    let _ = write!(out, "#endif // {guard}\n\n");
+    out.push_str(&render_trailer(CommentStyle::DoubleSlash, filename));
     out
 }
 
 fn render_struct_header(out: &mut String, module_name: &str, s: &StructDef, prefix: &str) {
     let tag = format!("{prefix}_{module_name}_{}", s.name);
 
+    emit_doc(out, &s.doc, "");
     out.push_str(&format!("typedef struct {tag} {tag};\n"));
 
     let mut params: Vec<String> = s
@@ -311,6 +390,7 @@ fn render_struct_header(out: &mut String, module_name: &str, s: &StructDef, pref
     for field in &s.fields {
         let (ret_ty, out_params) = c_ret_type(&field.ty, module_name, prefix);
         let getter = format!("{tag}_get_{}", field.name);
+        emit_doc(out, &field.doc, "");
         if out_params.is_empty() {
             out.push_str(&format!("{ret_ty} {getter}(const {tag}* ptr);\n"));
         } else {
@@ -328,6 +408,7 @@ fn render_builder_header(out: &mut String, module_name: &str, s: &StructDef, pre
     out.push_str(&format!("{builder_ty}* {tag}_Builder_new(void);\n"));
     for field in &s.fields {
         let param = c_type_for_param(&field.ty, "value", module_name, prefix, false);
+        emit_doc(out, &field.doc, "");
         out.push_str(&format!(
             "void {tag}_Builder_set_{}({builder_ty}* builder, {});\n",
             field.name, param
@@ -344,19 +425,31 @@ fn render_builder_header(out: &mut String, module_name: &str, s: &StructDef, pre
 
 fn render_enum_header(out: &mut String, module_name: &str, e: &EnumDef, prefix: &str) {
     let tag = format!("{prefix}_{module_name}_{}", e.name);
-    let variants: Vec<String> = e
-        .variants
-        .iter()
-        .map(|v| format!("{tag}_{} = {}", v.name, v.value))
-        .collect();
-    out.push_str(&format!(
-        "typedef enum {{ {} }} {tag};\n",
-        variants.join(", ")
-    ));
+    let any_variant_doc = e.variants.iter().any(|v| v.doc.is_some());
+    emit_doc(out, &e.doc, "");
+    if any_variant_doc {
+        out.push_str("typedef enum {\n");
+        for (i, v) in e.variants.iter().enumerate() {
+            emit_doc(out, &v.doc, "    ");
+            let comma = if i + 1 == e.variants.len() { "" } else { "," };
+            out.push_str(&format!("    {tag}_{} = {}{comma}\n", v.name, v.value));
+        }
+        out.push_str(&format!("}} {tag};\n"));
+    } else {
+        let variants: Vec<String> = e
+            .variants
+            .iter()
+            .map(|v| format!("{tag}_{} = {}", v.name, v.value))
+            .collect();
+        out.push_str(&format!(
+            "typedef enum {{ {} }} {tag};\n",
+            variants.join(", ")
+        ));
+    }
 }
 
 fn render_module_header(out: &mut String, module: &Module, prefix: &str, module_path: &str) {
-    out.push_str(&format!("// Module: {module_path}\n"));
+    let _ = writeln!(out, "// Module: {module_path}");
     for e in &module.enums {
         render_enum_header(out, module_path, e, prefix);
     }
@@ -367,78 +460,82 @@ fn render_module_header(out: &mut String, module: &Module, prefix: &str, module_
         }
     }
     for cb in &module.callbacks {
-        let cb_type = format!("{prefix}_{module_path}_{}_fn", cb.name);
         let mut params: Vec<String> = cb
             .params
             .iter()
             .map(|p| c_type_for_param(&p.ty, &p.name, module_path, prefix, p.mutable))
             .collect();
         params.push("void* context".to_string());
-        out.push_str(&format!(
-            "typedef void (*{cb_type})({});\n",
-            params.join(", ")
-        ));
+        emit_doc(out, &cb.doc, "");
+        let _ = write!(
+            out,
+            "typedef void (*{prefix}_{module_path}_{}_fn)(",
+            cb.name
+        );
+        let parts: Vec<&str> = params.iter().map(|s| s.as_str()).collect();
+        write_params_into(out, &parts);
+        out.push_str(");\n");
     }
     for l in &module.listeners {
-        let cb_type = format!("{prefix}_{module_path}_{}_fn", l.event_callback);
-        let reg_fn = format!("{prefix}_{module_path}_register_{}", l.name);
-        let unreg_fn = format!("{prefix}_{module_path}_unregister_{}", l.name);
-        out.push_str(&format!(
-            "uint64_t {reg_fn}({cb_type} callback, void* context);\n"
-        ));
-        out.push_str(&format!("void {unreg_fn}(uint64_t id);\n"));
+        emit_doc(out, &l.doc, "");
+        let _ = writeln!(
+            out,
+            "uint64_t {prefix}_{module_path}_register_{}({prefix}_{module_path}_{}_fn callback, void* context);",
+            l.name, l.event_callback
+        );
+        emit_doc(out, &l.doc, "");
+        let _ = writeln!(
+            out,
+            "void {prefix}_{module_path}_unregister_{}(uint64_t id);",
+            l.name
+        );
     }
     for f in &module.functions {
+        emit_doc(out, &f.doc, "");
         if let Some(msg) = &f.deprecated {
-            out.push_str(&format!(
-                "__attribute__((deprecated(\"{}\")))\n",
+            let _ = writeln!(
+                out,
+                "__attribute__((deprecated(\"{}\")))",
                 msg.replace('"', "\\\"")
-            ));
+            );
         }
         if let Some(TypeRef::Iterator(inner)) = &f.returns {
             let iter_tag = iter_type_name(&f.name, module_path, prefix);
-            out.push_str(&format!("typedef struct {iter_tag} {iter_tag};\n"));
+            let _ = writeln!(out, "typedef struct {iter_tag} {iter_tag};");
 
             let mut params_sig = c_params_sig(&f.params, module_path, prefix);
             params_sig.push(format!("{prefix}_error* out_err"));
-            out.push_str(&format!(
-                "{iter_tag}* {prefix}_{module_path}_{}({});\n",
-                f.name,
-                params_sig.join(", ")
-            ));
+            let _ = write!(out, "{iter_tag}* {prefix}_{module_path}_{}(", f.name);
+            let parts: Vec<&str> = params_sig.iter().map(|s| s.as_str()).collect();
+            write_params_into(out, &parts);
+            out.push_str(");\n");
 
             let (item_ty, item_out_params) = c_ret_type(inner, module_path, prefix);
-            let mut next_params = vec![format!("{iter_tag}* iter")];
-            if item_out_params.is_empty() {
-                next_params.push(format!("{item_ty}* out_item"));
-            } else {
-                next_params.push(format!("{item_ty}* out_item"));
-                next_params.extend(item_out_params);
-            }
+            let mut next_params = vec![format!("{iter_tag}* iter"), format!("{item_ty}* out_item")];
+            next_params.extend(item_out_params);
             next_params.push(format!("{prefix}_error* out_err"));
-            out.push_str(&format!(
-                "int32_t {iter_tag}_next({});\n",
-                next_params.join(", ")
-            ));
+            let _ = write!(out, "int32_t {iter_tag}_next(");
+            let parts: Vec<&str> = next_params.iter().map(|s| s.as_str()).collect();
+            write_params_into(out, &parts);
+            out.push_str(");\n");
 
-            out.push_str(&format!("void {iter_tag}_destroy({iter_tag}* iter);\n"));
+            let _ = writeln!(out, "void {iter_tag}_destroy({iter_tag}* iter);");
             continue;
         }
         if f.r#async {
             let fn_base = format!("{prefix}_{module_path}_{}", f.name);
-            let cb_name = format!("{fn_base}_callback");
 
             let mut cb_params = vec!["void* context".to_string(), format!("{prefix}_error* err")];
             if let Some(ret) = &f.returns {
                 cb_params.extend(c_callback_result_params(ret, module_path, prefix));
             }
-            out.push_str(&format!(
-                "typedef void (*{cb_name})({});\n",
-                cb_params.join(", ")
-            ));
+            let _ = write!(out, "typedef void (*{fn_base}_callback)(");
+            let parts: Vec<&str> = cb_params.iter().map(|s| s.as_str()).collect();
+            write_params_into(out, &parts);
+            out.push_str(");\n");
 
-            out.push_str("/*\n");
-            out.push_str(&format!(" * Async: {fn_base}\n"));
+            let _ = writeln!(out, "/*");
+            let _ = writeln!(out, " * Async: {fn_base}");
             out.push_str(" * The callback is called exactly once, on any thread.\n");
             out.push_str(" * On success, err is NULL and result (if any) is valid.\n");
             out.push_str(" * On failure, err is non-NULL with a non-zero code.\n");
@@ -448,12 +545,12 @@ fn render_module_header(out: &mut String, module: &Module, prefix: &str, module_
             if f.cancellable {
                 params_sig.push(format!("{prefix}_cancel_token* cancel_token"));
             }
-            params_sig.push(format!("{cb_name} callback"));
+            params_sig.push(format!("{fn_base}_callback callback"));
             params_sig.push("void* context".to_string());
-            out.push_str(&format!(
-                "void {fn_base}_async({});\n",
-                params_sig.join(", ")
-            ));
+            let _ = write!(out, "void {fn_base}_async(");
+            let parts: Vec<&str> = params_sig.iter().map(|s| s.as_str()).collect();
+            write_params_into(out, &parts);
+            out.push_str(");\n");
         } else {
             let mut params_sig = c_params_sig(&f.params, module_path, prefix);
             let ret_sig = if let Some(ret) = &f.returns {
@@ -464,13 +561,10 @@ fn render_module_header(out: &mut String, module: &Module, prefix: &str, module_
                 "void".to_string()
             };
             params_sig.push(format!("{prefix}_error* out_err"));
-            let fn_name = format!("{prefix}_{module_path}_{}", f.name);
-            out.push_str(&format!(
-                "{} {}({});\n",
-                ret_sig,
-                fn_name,
-                params_sig.join(", ")
-            ));
+            let _ = write!(out, "{ret_sig} {prefix}_{module_path}_{}(", f.name);
+            let parts: Vec<&str> = params_sig.iter().map(|s| s.as_str()).collect();
+            write_params_into(out, &parts);
+            out.push_str(");\n");
         }
     }
     for sub in &module.modules {
@@ -480,8 +574,13 @@ fn render_module_header(out: &mut String, module: &Module, prefix: &str, module_
     out.push('\n');
 }
 
-fn render_c_convenience_c(prefix: &str) -> String {
-    format!("#include \"{prefix}.h\"\n\n// Optional convenience wrappers can be added here in future versions.\n")
+fn render_c_convenience_c(prefix: &str, input_basename: &str, filename: &str) -> String {
+    let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
+    out.push_str(&format!(
+        "#include \"{prefix}.h\"\n\n// Optional convenience wrappers can be added here in future versions.\n\n"
+    ));
+    out.push_str(&render_trailer(CommentStyle::DoubleSlash, filename));
+    out
 }
 
 #[cfg(test)]
@@ -509,11 +608,13 @@ mod tests {
                                 name: "a".to_string(),
                                 ty: TypeRef::I32,
                                 mutable: false,
+                                doc: None,
                             },
                             Param {
                                 name: "b".to_string(),
                                 ty: TypeRef::I32,
                                 mutable: false,
+                                doc: None,
                             },
                         ],
                         returns: Some(TypeRef::I32),
@@ -529,6 +630,7 @@ mod tests {
                             name: "msg".to_string(),
                             ty: TypeRef::StringUtf8,
                             mutable: false,
+                            doc: None,
                         }],
                         returns: Some(TypeRef::StringUtf8),
                         doc: None,
@@ -609,7 +711,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
 
         assert!(
             header.contains("typedef struct weaveffi_contacts_Contact weaveffi_contacts_Contact;"),
@@ -689,7 +791,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(header.contains("typedef enum {"), "missing typedef enum");
         assert!(
             header.contains("weaveffi_contacts_Color_Red = 0"),
@@ -743,7 +845,7 @@ mod tests {
             }],
             generators: None,
         };
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         let enum_pos = header.find("typedef enum").unwrap();
         let struct_pos = header.find("typedef struct weaveffi_contacts_").unwrap();
         assert!(enum_pos < struct_pos, "enums must appear before structs");
@@ -892,6 +994,7 @@ mod tests {
                             name: "id".to_string(),
                             ty: TypeRef::Optional(Box::new(TypeRef::I32)),
                             mutable: false,
+                            doc: None,
                         }],
                         returns: Some(TypeRef::Optional(Box::new(TypeRef::I32))),
                         doc: None,
@@ -906,6 +1009,7 @@ mod tests {
                             name: "tags".to_string(),
                             ty: TypeRef::List(Box::new(TypeRef::I32)),
                             mutable: false,
+                            doc: None,
                         }],
                         returns: Some(TypeRef::List(Box::new(TypeRef::I32))),
                         doc: None,
@@ -925,7 +1029,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains(
                 "int32_t* weaveffi_store_find(const int32_t* id, weaveffi_error* out_err);"
@@ -1012,21 +1116,25 @@ mod tests {
                                 name: "first_name".to_string(),
                                 ty: TypeRef::StringUtf8,
                                 mutable: false,
+                                doc: None,
                             },
                             Param {
                                 name: "last_name".to_string(),
                                 ty: TypeRef::StringUtf8,
                                 mutable: false,
+                                doc: None,
                             },
                             Param {
                                 name: "email".to_string(),
                                 ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                                 mutable: false,
+                                doc: None,
                             },
                             Param {
                                 name: "contact_type".to_string(),
                                 ty: TypeRef::Enum("ContactType".to_string()),
                                 mutable: false,
+                                doc: None,
                             },
                         ],
                         returns: Some(TypeRef::Handle),
@@ -1042,6 +1150,7 @@ mod tests {
                             name: "id".to_string(),
                             ty: TypeRef::Handle,
                             mutable: false,
+                            doc: None,
                         }],
                         returns: Some(TypeRef::Struct("Contact".to_string())),
                         doc: None,
@@ -1068,6 +1177,7 @@ mod tests {
                             name: "id".to_string(),
                             ty: TypeRef::Handle,
                             mutable: false,
+                            doc: None,
                         }],
                         returns: Some(TypeRef::Bool),
                         doc: None,
@@ -1202,6 +1312,7 @@ mod tests {
                         name: "a".to_string(),
                         ty: TypeRef::Enum("Color".into()),
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Enum("Color".into())),
                     doc: None,
@@ -1235,7 +1346,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("typedef enum { weaveffi_paint_Color_Red = 0, weaveffi_paint_Color_Green = 1 } weaveffi_paint_Color;"),
             "missing enum typedef: {header}"
@@ -1291,6 +1402,7 @@ mod tests {
                         name: "scores".to_string(),
                         ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
                         mutable: false,
+                        doc: None,
                     }],
                     returns: None,
                     doc: None,
@@ -1309,7 +1421,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains(
                 "const char* const* scores_keys, const int32_t* scores_values, size_t scores_len"
@@ -1335,11 +1447,13 @@ mod tests {
                             name: "a".to_string(),
                             ty: TypeRef::I32,
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "b".to_string(),
                             ty: TypeRef::I32,
                             mutable: false,
+                            doc: None,
                         },
                     ],
                     returns: Some(TypeRef::I32),
@@ -1382,8 +1496,16 @@ mod tests {
             "should use custom prefix for function names"
         );
         assert!(
-            !header.contains("weaveffi_"),
-            "should not contain default prefix"
+            !header.contains("weaveffi_calculator_add"),
+            "should not emit default prefix for user-defined symbols: {header}"
+        );
+        assert!(
+            header.contains("#define mylib_error weaveffi_error"),
+            "should alias runtime error type to weaveffi_error: {header}"
+        );
+        assert!(
+            header.contains("#define mylib_free_string weaveffi_free_string"),
+            "should alias runtime free_string to weaveffi_free_string: {header}"
         );
 
         let files = CGenerator.output_files_with_config(&api, out_dir, &config);
@@ -1413,6 +1535,7 @@ mod tests {
                             TypeRef::Optional(Box::new(TypeRef::Struct("Contact".into()))),
                         )))),
                         mutable: false,
+                        doc: None,
                     }],
                     returns: None,
                     doc: None,
@@ -1440,7 +1563,7 @@ mod tests {
             }],
             generators: None,
         };
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("weaveffi_edge_process"),
             "should contain function name: {header}"
@@ -1470,6 +1593,7 @@ mod tests {
                             Box::new(TypeRef::List(Box::new(TypeRef::I32))),
                         ),
                         mutable: false,
+                        doc: None,
                     }],
                     returns: None,
                     doc: None,
@@ -1487,7 +1611,7 @@ mod tests {
             }],
             generators: None,
         };
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("scores_keys"),
             "map param should have keys: {header}"
@@ -1514,6 +1638,7 @@ mod tests {
                         name: "contact".into(),
                         ty: TypeRef::TypedHandle("Contact".into()),
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::TypedHandle("Contact".into())),
                     doc: None,
@@ -1541,7 +1666,7 @@ mod tests {
             }],
             generators: None,
         };
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("weaveffi_contacts_Contact* contact"),
             "TypedHandle param should use opaque struct pointer: {header}"
@@ -1577,11 +1702,13 @@ mod tests {
                             name: "msg".to_string(),
                             ty: TypeRef::BorrowedStr,
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "raw".to_string(),
                             ty: TypeRef::BorrowedBytes,
                             mutable: false,
+                            doc: None,
                         },
                     ],
                     returns: None,
@@ -1601,7 +1728,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("const char* msg"),
             "BorrowedStr param should map to const char*: {header}"
@@ -1631,6 +1758,7 @@ mod tests {
                             Box::new(TypeRef::Struct("Contact".into())),
                         ),
                         mutable: false,
+                        doc: None,
                     }],
                     returns: None,
                     doc: None,
@@ -1678,7 +1806,7 @@ mod tests {
             }],
             generators: None,
         };
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("contacts_keys"),
             "map param should have keys: {header}"
@@ -1705,6 +1833,7 @@ mod tests {
                         name: "name".to_string(),
                         ty: TypeRef::StringUtf8,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Struct("Contact".to_string())),
                     doc: None,
@@ -1733,7 +1862,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
 
         assert!(
             header.contains("const char* name"),
@@ -1770,6 +1899,7 @@ mod tests {
                             name: "id".to_string(),
                             ty: TypeRef::I32,
                             mutable: false,
+                            doc: None,
                         }],
                         returns: Some(TypeRef::I32),
                         doc: None,
@@ -1799,7 +1929,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("typedef void (*weaveffi_tasks_run_callback)(void* context, weaveffi_error* err, int32_t result);"),
             "missing callback typedef with result param: {header}"
@@ -1824,6 +1954,7 @@ mod tests {
                         name: "id".to_string(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::I32),
                     doc: None,
@@ -1842,7 +1973,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("void weaveffi_tasks_run_async(int32_t id, weaveffi_tasks_run_callback callback, void* context);"),
             "missing async function signature: {header}"
@@ -1869,6 +2000,7 @@ mod tests {
                         name: "id".to_string(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                         "Contact".to_string(),
@@ -1889,7 +2021,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
 
         assert!(
             header.contains("weaveffi_contacts_Contact* weaveffi_contacts_find_contact(int32_t id, weaveffi_error* out_err);"),
@@ -1918,6 +2050,7 @@ mod tests {
                             name: "id".to_string(),
                             ty: TypeRef::I32,
                             mutable: false,
+                            doc: None,
                         }],
                         returns: Some(TypeRef::I32),
                         doc: None,
@@ -1947,7 +2080,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
 
         assert!(
             header.contains("weaveffi_cancel_token* cancel_token"),
@@ -2010,6 +2143,7 @@ mod tests {
                             name: "id".to_string(),
                             ty: TypeRef::I32,
                             mutable: false,
+                            doc: None,
                         }],
                         returns: Some(TypeRef::Struct("types.Name".to_string())),
                         doc: None,
@@ -2029,7 +2163,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
 
         assert!(
             header.contains("typedef struct weaveffi_types_Name weaveffi_types_Name;"),
@@ -2057,6 +2191,7 @@ mod tests {
                         name: "x".to_string(),
                         ty: TypeRef::I32,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::I32),
                     doc: None,
@@ -2078,6 +2213,7 @@ mod tests {
                             name: "y".to_string(),
                             ty: TypeRef::I32,
                             mutable: false,
+                            doc: None,
                         }],
                         returns: Some(TypeRef::I32),
                         doc: None,
@@ -2097,7 +2233,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("weaveffi_parent_top_fn"),
             "parent function should use weaveffi_parent_top_fn: {header}"
@@ -2132,11 +2268,13 @@ mod tests {
                             name: "payload".to_string(),
                             ty: TypeRef::StringUtf8,
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "len".to_string(),
                             ty: TypeRef::I32,
                             mutable: false,
+                            doc: None,
                         },
                     ],
                     doc: None,
@@ -2147,7 +2285,7 @@ mod tests {
             }],
             generators: None,
         };
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("typedef void (*weaveffi_events_on_data_fn)(const char* payload, int32_t len, void* context);"),
             "missing callback typedef: {header}"
@@ -2169,6 +2307,7 @@ mod tests {
                         name: "payload".to_string(),
                         ty: TypeRef::StringUtf8,
                         mutable: false,
+                        doc: None,
                     }],
                     doc: None,
                 }],
@@ -2182,7 +2321,7 @@ mod tests {
             }],
             generators: None,
         };
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("uint64_t weaveffi_events_register_data_stream(weaveffi_events_on_data_fn callback, void* context);"),
             "missing register function: {header}"
@@ -2213,7 +2352,7 @@ mod tests {
             }],
             generators: None,
         };
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("typedef void (*weaveffi_lifecycle_on_ready_fn)(void* context);"),
             "callback with no params should only have context: {header}"
@@ -2246,7 +2385,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains(
                 "typedef struct weaveffi_data_ListItemsIterator weaveffi_data_ListItemsIterator;"
@@ -2279,6 +2418,7 @@ mod tests {
                         name: "filter".to_string(),
                         ty: TypeRef::StringUtf8,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: Some(TypeRef::Iterator(Box::new(TypeRef::Struct(
                         "Contact".to_string(),
@@ -2309,7 +2449,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("typedef struct weaveffi_contacts_ListContactsIterator weaveffi_contacts_ListContactsIterator;"),
             "missing iterator typedef: {header}"
@@ -2496,6 +2636,7 @@ mod tests {
                         name: "buf".to_string(),
                         ty: TypeRef::Bytes,
                         mutable: true,
+                        doc: None,
                     }],
                     returns: None,
                     doc: None,
@@ -2514,7 +2655,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("uint8_t* buf_ptr"),
             "mutable bytes should omit const: {header}"
@@ -2537,6 +2678,7 @@ mod tests {
                         name: "buf".to_string(),
                         ty: TypeRef::Bytes,
                         mutable: false,
+                        doc: None,
                     }],
                     returns: None,
                     doc: None,
@@ -2555,7 +2697,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("const uint8_t* buf_ptr"),
             "immutable bytes should have const: {header}"
@@ -2575,11 +2717,13 @@ mod tests {
                             name: "input".to_string(),
                             ty: TypeRef::StringUtf8,
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "output".to_string(),
                             ty: TypeRef::Struct("Buffer".into()),
                             mutable: true,
+                            doc: None,
                         },
                     ],
                     returns: None,
@@ -2609,7 +2753,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("const char* input"),
             "immutable string should have const: {header}"
@@ -2637,11 +2781,13 @@ mod tests {
                             name: "a".to_string(),
                             ty: TypeRef::I32,
                             mutable: false,
+                            doc: None,
                         },
                         Param {
                             name: "b".to_string(),
                             ty: TypeRef::I32,
                             mutable: false,
+                            doc: None,
                         },
                     ],
                     returns: Some(TypeRef::I32),
@@ -2660,7 +2806,7 @@ mod tests {
             }],
             generators: None,
         };
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("__attribute__((deprecated(\"Use add_v2 instead\")))"),
             "missing deprecated attribute: {header}"
@@ -2669,5 +2815,94 @@ mod tests {
             header.contains("weaveffi_math_add_old"),
             "missing function declaration: {header}"
         );
+    }
+
+    fn doc_api() -> Api {
+        Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "docs".into(),
+                functions: vec![Function {
+                    name: "do_thing".into(),
+                    params: vec![Param {
+                        name: "x".into(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                        doc: Some("the input value".into()),
+                    }],
+                    returns: Some(TypeRef::I32),
+                    doc: Some("Performs a thing.".into()),
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![StructDef {
+                    name: "Item".into(),
+                    doc: Some("An item we track.".into()),
+                    fields: vec![StructField {
+                        name: "id".into(),
+                        ty: TypeRef::I64,
+                        doc: Some("Stable id".into()),
+                        default: None,
+                    }],
+                    builder: false,
+                }],
+                enums: vec![EnumDef {
+                    name: "Kind".into(),
+                    doc: Some("Kind of item.".into()),
+                    variants: vec![EnumVariant {
+                        name: "Small".into(),
+                        value: 0,
+                        doc: Some("A small one".into()),
+                    }],
+                }],
+                callbacks: vec![CallbackDef {
+                    name: "OnReady".into(),
+                    doc: Some("Fires when ready".into()),
+                    params: vec![],
+                }],
+                listeners: vec![ListenerDef {
+                    name: "ready_listener".into(),
+                    event_callback: "OnReady".into(),
+                    doc: Some("Subscribe to ready".into()),
+                }],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        }
+    }
+
+    #[test]
+    fn c_emits_doc_on_function() {
+        let header = render_c_header(&doc_api(), "weaveffi", "weaveffi.yml", "weaveffi.h");
+        assert!(header.contains("/** Performs a thing. */"), "{header}");
+    }
+
+    #[test]
+    fn c_emits_doc_on_struct() {
+        let header = render_c_header(&doc_api(), "weaveffi", "weaveffi.yml", "weaveffi.h");
+        assert!(header.contains("/** An item we track. */"), "{header}");
+    }
+
+    #[test]
+    fn c_emits_doc_on_enum_variant() {
+        let header = render_c_header(&doc_api(), "weaveffi", "weaveffi.yml", "weaveffi.h");
+        assert!(header.contains("/** Kind of item. */"), "{header}");
+        assert!(header.contains("/** A small one */"), "{header}");
+    }
+
+    #[test]
+    fn c_emits_doc_on_field() {
+        let header = render_c_header(&doc_api(), "weaveffi", "weaveffi.yml", "weaveffi.h");
+        assert!(header.contains("/** Stable id */"), "{header}");
+    }
+
+    #[test]
+    fn c_emits_doc_on_callback_and_listener() {
+        let header = render_c_header(&doc_api(), "weaveffi", "weaveffi.yml", "weaveffi.h");
+        assert!(header.contains("/** Fires when ready */"), "{header}");
+        assert!(header.contains("/** Subscribe to ready */"), "{header}");
     }
 }

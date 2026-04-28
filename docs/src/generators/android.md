@@ -1,23 +1,45 @@
 # Android
 
-The Android generator produces a Gradle `android-library` template with:
-- Kotlin wrapper `WeaveFFI` that declares `external fun`s
-- JNI C shims that call into the generated C ABI
-- `CMakeLists.txt` for building the shared library
+## Overview
 
-## Generated artifacts
+The Android target produces a Gradle `android-library` template that
+combines a Kotlin wrapper, JNI C shims, and a CMake build for the JNI
+shared library. The wrapper exposes idiomatic Kotlin types while the JNI
+layer bridges them to the C ABI.
 
-- `generated/android/settings.gradle`
-- `generated/android/build.gradle`
-- `generated/android/src/main/kotlin/com/weaveffi/WeaveFFI.kt`
-- `generated/android/src/main/cpp/{weaveffi_jni.c,CMakeLists.txt}`
+## What gets generated
 
-## Generated code examples
+| File | Purpose |
+|------|---------|
+| `generated/android/settings.gradle` | Gradle settings for the library module |
+| `generated/android/build.gradle` | `android-library` plugin, NDK config |
+| `generated/android/src/main/kotlin/com/weaveffi/WeaveFFI.kt` | Kotlin wrapper (enums, struct classes, namespaced functions) |
+| `generated/android/src/main/cpp/weaveffi_jni.c` | JNI shims that call the C ABI and throw Java exceptions |
+| `generated/android/src/main/cpp/CMakeLists.txt` | NDK CMake build for the JNI shared library |
 
-Given this IDL definition:
+## Type mapping
+
+| IDL type       | Kotlin type (external) | Kotlin type (wrapper) | JNI C type     |
+|----------------|------------------------|-----------------------|----------------|
+| `i32`          | `Int`                  | `Int`                 | `jint`         |
+| `u32`          | `Long`                 | `Long`                | `jlong`        |
+| `i64`          | `Long`                 | `Long`                | `jlong`        |
+| `f64`          | `Double`               | `Double`              | `jdouble`      |
+| `bool`         | `Boolean`              | `Boolean`             | `jboolean`     |
+| `string`       | `String`               | `String`              | `jstring`      |
+| `bytes`        | `ByteArray`            | `ByteArray`           | `jbyteArray`   |
+| `handle`       | `Long`                 | `Long`                | `jlong`        |
+| `StructName`   | `Long`                 | `StructName`          | `jlong`        |
+| `EnumName`     | `Int`                  | `EnumName`            | `jint`         |
+| `T?`           | `T?`                   | `T?`                  | `jobject`      |
+| `[i32]`        | `IntArray`             | `IntArray`            | `jintArray`    |
+| `[i64]`        | `LongArray`            | `LongArray`           | `jlongArray`   |
+| `[string]`     | `Array<String>`        | `Array<String>`       | `jobjectArray` |
+
+## Example IDL → generated code
 
 ```yaml
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: contacts
     enums:
@@ -45,10 +67,8 @@ modules:
         return: "[Contact]"
 ```
 
-### Kotlin wrapper class
-
-Functions are declared as `@JvmStatic external fun` inside a companion
-object. The native library is loaded in the `init` block:
+The Kotlin wrapper declares `external fun` entries inside a companion
+object and loads the JNI library on first use:
 
 ```kotlin
 package com.weaveffi
@@ -56,20 +76,13 @@ package com.weaveffi
 class WeaveFFI {
     companion object {
         init { System.loadLibrary("weaveffi") }
-
         @JvmStatic external fun get_contact(id: Int): Long
         @JvmStatic external fun find_by_type(contact_type: Int): LongArray
     }
 }
 ```
 
-Struct parameters and returns use `Long` (opaque handle). Enum parameters
-use `Int`.
-
-### Kotlin enum classes
-
-Enums generate a Kotlin `enum class` with an integer value and a
-`fromValue` factory:
+Enums become Kotlin `enum class` with a `fromValue` factory:
 
 ```kotlin
 enum class ContactType(val value: Int) {
@@ -83,22 +96,16 @@ enum class ContactType(val value: Int) {
 }
 ```
 
-### Kotlin struct wrapper classes
-
-Structs generate a Kotlin class that wraps a native handle (`Long`). The
-class implements `Closeable` for deterministic cleanup and provides
-property getters backed by JNI native methods:
+Structs are wrapped in a Kotlin class implementing `Closeable`:
 
 ```kotlin
 class Contact internal constructor(private var handle: Long) : java.io.Closeable {
     companion object {
         init { System.loadLibrary("weaveffi") }
-
         @JvmStatic external fun nativeCreate(name: String, age: Int): Long
         @JvmStatic external fun nativeDestroy(handle: Long)
         @JvmStatic external fun nativeGetName(handle: Long): String
         @JvmStatic external fun nativeGetAge(handle: Long): Int
-
         fun create(name: String, age: Int): Contact = Contact(nativeCreate(name, age))
     }
 
@@ -111,35 +118,13 @@ class Contact internal constructor(private var handle: Long) : java.io.Closeable
             handle = 0L
         }
     }
-
-    protected fun finalize() {
-        close()
-    }
 }
 ```
 
-Usage:
-
-```kotlin
-Contact.create("Alice", 30).use { contact ->
-    println("${contact.name}, age ${contact.age}")
-}
-```
-
-### JNI C shims
-
-The JNI layer (`weaveffi_jni.c`) bridges Kotlin external declarations to
-the C ABI functions. Each JNI function acquires parameters from the JVM,
-calls the C ABI, checks for errors (throwing `RuntimeException` on
-failure), and releases JNI resources:
+The JNI shims (`weaveffi_jni.c`) bridge each Kotlin `external fun` into
+the C ABI, throwing `RuntimeException` on error:
 
 ```c
-#include <jni.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stddef.h>
-#include "weaveffi.h"
-
 JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_get_1contact(
     JNIEnv* env, jclass clazz, jint id) {
     weaveffi_error err = {0, NULL};
@@ -156,13 +141,7 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_get_1contact(
 }
 ```
 
-String parameters are converted via `GetStringUTFChars`/`ReleaseStringUTFChars`.
-Optional value types are unboxed from Java wrapper classes (`Integer`,
-`Long`, `Double`, `Boolean`).
-
-### CMake configuration
-
-The CMake file links the JNI shim against the C header:
+The CMake file links the JNI shim against the generated C header:
 
 ```cmake
 cmake_minimum_required(VERSION 3.22)
@@ -171,51 +150,78 @@ add_library(weaveffi SHARED weaveffi_jni.c)
 target_include_directories(weaveffi PRIVATE ../../../../c)
 ```
 
-The `target_include_directories` path points at `generated/c/` where
-`weaveffi.h` lives.
+## Build instructions
 
-### Type mapping reference
+1. Install Android Studio (Giraffe or newer) plus the NDK.
+2. Cross-compile the Rust cdylib for every Android ABI you support:
 
-| IDL type       | Kotlin type (external) | Kotlin type (wrapper) | JNI C type     |
-|----------------|------------------------|-----------------------|----------------|
-| `i32`          | `Int`                  | `Int`                 | `jint`         |
-| `u32`          | `Long`                 | `Long`                | `jlong`        |
-| `i64`          | `Long`                 | `Long`                | `jlong`        |
-| `f64`          | `Double`               | `Double`              | `jdouble`      |
-| `bool`         | `Boolean`              | `Boolean`             | `jboolean`     |
-| `string`       | `String`               | `String`              | `jstring`      |
-| `bytes`        | `ByteArray`            | `ByteArray`           | `jbyteArray`   |
-| `handle`       | `Long`                 | `Long`                | `jlong`        |
-| `StructName`   | `Long`                 | `StructName`          | `jlong`        |
-| `EnumName`     | `Int`                  | `EnumName`            | `jint`         |
-| `T?`           | `T?`                   | `T?`                  | `jobject`      |
-| `[i32]`        | `IntArray`             | `IntArray`            | `jintArray`    |
-| `[i64]`        | `LongArray`            | `LongArray`           | `jlongArray`   |
-| `[string]`     | `Array<String>`        | `Array<String>`       | `jobjectArray` |
+   ```bash
+   rustup target add aarch64-linux-android armv7-linux-androideabi \
+                     x86_64-linux-android i686-linux-android
+   export ANDROID_NDK_HOME=/path/to/ndk
+   cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -t x86 \
+       build --release -p your_library
+   ```
 
-## Build steps
+3. Open `generated/android` in Android Studio, sync Gradle, and build
+   the AAR (`./gradlew :weaveffi:assemble`).
+4. Add the resulting AAR as a dependency in your app module and ensure
+   your `jniLibs/` directory contains the Rust-built cdylib for each
+   supported ABI.
 
-1. Ensure Android SDK and NDK are installed (Android Studio recommended).
-2. Cross-compile the Rust library for your target architecture:
+## Memory and ownership
 
-### macOS (host) targeting Android
+- Struct wrappers implement `Closeable`; either call `.close()`
+  explicitly or use `use { ... }`. The `finalize()` safety net runs
+  during GC but is not a substitute for deterministic cleanup.
+- Strings returned from JNI are fresh Java strings; the JNI shim frees
+  the underlying Rust pointer with `weaveffi_free_string` before
+  returning.
+- Byte arrays returned from JNI are copied with `SetByteArrayRegion`
+  before the Rust buffer is freed.
+- Optional values are passed as boxed wrappers (`Integer`, `Long`,
+  `Double`, `Boolean`); the JNI shim unboxes and forwards them to the C
+  ABI.
 
-```bash
-rustup target add aarch64-linux-android armv7-linux-androideabi
-cargo build --target aarch64-linux-android --release
+## Async support
+
+Async IDL functions are exposed as Kotlin `suspend fun` declarations
+that bridge the C ABI callback into a `CompletableDeferred` and
+`await()` the result. The JNI shim retains the deferred via a global
+reference, invokes it from the C callback, and releases the reference:
+
+```kotlin
+companion object {
+    @JvmStatic external fun fetchContactAsync(id: Int, deferred: Long): Unit
+}
+
+suspend fun fetchContact(id: Int): Contact {
+    val deferred = CompletableDeferred<Contact>()
+    val ref = JNIDeferred.retain(deferred)
+    try {
+        WeaveFFI.fetchContactAsync(id, ref)
+        return deferred.await()
+    } finally {
+        JNIDeferred.release(ref)
+    }
+}
 ```
 
-### Linux (host) targeting Android
+When the IDL marks the function `cancel: true`, the generated wrapper
+hooks into Kotlin `CoroutineContext` cancellation and invokes the
+underlying `weaveffi_cancel_token`.
 
-```bash
-rustup target add aarch64-linux-android armv7-linux-androideabi
-export ANDROID_NDK_HOME=/path/to/ndk
-cargo build --target aarch64-linux-android --release
-```
+## Troubleshooting
 
-3. Open `generated/android` in Android Studio.
-4. Sync Gradle and build the `:weaveffi` AAR.
-5. Integrate the AAR into your app module. Ensure your app loads the Rust-produced
-   native library (e.g., `libcalculator`) at runtime on device/emulator.
-
-The JNI shims convert strings/bytes and propagate errors by throwing `RuntimeException`.
+- **`UnsatisfiedLinkError: Couldn't find libweaveffi.so`** — the
+  Rust-built cdylib was not packaged inside the AAR. Place it under
+  `src/main/jniLibs/<abi>/` and rebuild.
+- **`UnsatisfiedLinkError` for the JNI symbol itself** — Kotlin
+  external function names must match the JNI signature, including the
+  `_1` escape for underscores. Re-run `weaveffi generate` if you
+  hand-edited either side.
+- **Crashes when releasing strings** — the JNI shim is responsible for
+  calling `ReleaseStringUTFChars` on every `GetStringUTFChars`. If you
+  edit the shim, keep the pairing intact.
+- **R8/ProGuard removes `WeaveFFI` symbols** — keep the wrapper class
+  with `-keep class com.weaveffi.** { *; }` in your ProGuard rules.

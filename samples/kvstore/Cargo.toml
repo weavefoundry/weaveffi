@@ -1,0 +1,15 @@
+[package]
+name = "kvstore"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+weaveffi-abi = { path = "../../crates/weaveffi-abi" }
+parking_lot = "0.12"
+
+[lints]
+workspace = true
