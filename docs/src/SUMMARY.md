@@ -2,6 +2,8 @@
 
 - [Introduction](intro.md)
 - [Getting Started](getting-started.md)
+- [Comparison](comparison.md)
+- [FAQ](faq.md)
 - [Samples](samples.md)
 - [Reference](reference/README.md)
   - [IDL Schema](reference/idl.md)
