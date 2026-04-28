@@ -634,11 +634,11 @@ fn readme_has_required_top_level_sections() {
 }
 
 #[test]
-fn readme_status_marks_pre_1_0() {
+fn readme_status_marks_1_0_release_candidate() {
     let readme = read_workspace_file("README.md");
     assert!(
-        readme.contains("pre-1.0") && readme.contains("1.0.0"),
-        "README status section should warn about pre-1.0 breaking changes until 1.0.0"
+        readme.contains("1.0.0 release candidate"),
+        "README status section should mark the workspace as a 1.0.0 release candidate"
     );
 }
 

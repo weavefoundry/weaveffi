@@ -105,33 +105,53 @@ eleven targets and ~900 tests pass on Linux, macOS, and Windows.
 
 ## v1.0 candidate
 
-The remaining PRD-v4 items required before tagging a `1.0.0-rc`:
+Every PRD-v4 phase is complete. The workspace has graduated from
+"feature-complete prototype" to "1.0 release candidate" pending the
+format-canonicalization polish noted in the README "Status" section.
 
-- **Performance baseline.** Run the criterion benches end-to-end,
-  publish baseline numbers and explicit targets in
-  `docs/src/performance.md`, profile with `cargo flamegraph`, and
-  optimize the top three hot paths. Wire a `bench.yml` workflow that
-  uploads results on pushes to `main`.
-- **Documentation honesty pass.** Audit every `docs/src/**/*.md`
-  page: every code block must validate against the current CLI, every
-  link must resolve, every generator page follows the same structure
-  (Overview, What gets generated, Type mapping, Example, Build, Memory,
-  Async, Troubleshooting), every guide and tutorial follows its
-  template. Add `mdbook-linkcheck` to CI.
-- **`weaveffi extract` round-trip integrity.** Extend the syn-based
-  Rust extractor to recognize typed handles, listeners, builder
-  structs, `since`/`deprecated`, `mutable`, and async functions, and
-  prove a `kitchen-sink` IDL → scaffold → annotate → extract round-trip
-  is lossless.
-- **Final quality gate and release-readiness checklist.** A clean run
-  of `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`,
-  `cargo doc -D warnings`, `cargo deny check`, `cargo audit`, `cargo
-  machete`, `cargo insta test --check`, and a one-time audit of every
-  published crate's `Cargo.toml` metadata and `cargo package --list`
-  contents.
-
-When all four land, the workspace promotes from "feature-complete
-prototype" to "1.0 release candidate."
+- [x] Phase 1 — Eliminate `TypeRef::Callback` dead code across the
+  workspace.
+- [x] Phase 2 — Implement `weaveffi upgrade` and bump schema to
+  `0.3.0`.
+- [x] Phase 3 — Wire every `GeneratorConfig` option through inline
+  IDL configs.
+- [x] Phase 4 — Source-span-aware diagnostics with `miette`.
+- [x] Phase 5 — Snapshot testing every generator with `insta`.
+- [x] Phase 6 — Deterministic generator output (sort all map
+  iteration).
+- [x] Phase 7 — `weaveffi watch`, `weaveffi format`, JSON Schema
+  export.
+- [x] Phase 8 — Real-world end-to-end consumer tests in CI for every
+  target.
+- [x] Phase 9 — Quality infrastructure: deny, audit, machete, doc
+  lints, coverage.
+- [x] Phase 10 — Fuzzing harness for parser, validator, and
+  `parse_type_ref`.
+- [x] Phase 11 — Doc strings everywhere: `doc:` → native doc comments.
+- [x] Phase 12 — `c_prefix` audit: full propagation through C, C++,
+  scaffold.
+- [x] Phase 13 — Build a non-trivial real-world sample: `kvstore`.
+- [x] Phase 14 — Parallel codegen with rayon and per-generator
+  caching.
+- [x] Phase 15 — Cross-platform CI hardening: Windows path/hook fixes,
+  NDK glue, Swift/iOS smoke.
+- [x] Phase 16 — `doctor --json`, target-specific checks, richer
+  hints.
+- [x] Phase 17 — `--check` and `--format json` for CI integration.
+- [x] Phase 18 — Add CONTRIBUTING / SECURITY / CODE_OF_CONDUCT /
+  ARCHITECTURE.
+- [x] Phase 19 — Async robustness: GC pinning, cancellation, leak
+  tests.
+- [x] Phase 20 — Generator output polish: deterministic order,
+  named-after-fields, prelude.
+- [x] Phase 21 — Beautiful README, comparison page, marketing polish.
+- [x] Phase 22 — Versioning policy, stability docs, roadmap to 1.0.
+- [x] Phase 23 — Performance: run benchmarks, profile, optimize hot
+  paths, set targets.
+- [x] Phase 24 — Honesty pass on docs and full SUMMARY audit.
+- [x] Phase 25 — Add `weaveffi extract` enhancements and round-trip
+  integrity.
+- [x] Phase 26 — Final quality pass and release-readiness checklist.
 
 ## Post-1.0
 
