@@ -4,6 +4,8 @@
 //! including module map, `Package.swift`, and Swift `async/await` shims for
 //! functions marked `async: true`. Implements the [`Generator`] trait.
 
+use std::fmt::Write;
+
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
@@ -13,6 +15,37 @@ use weaveffi_core::utils::{
     c_symbol_name, local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
 };
 use weaveffi_ir::ir::{Api, EnumDef, Function, Module, Param, StructDef, StructField, TypeRef};
+
+/// Each module contributes ~2KB of Swift wrapper text on average (struct
+/// shims, getters, async wrappers); pre-allocating from this estimate
+/// reduces `String` re-allocations as the wrapper grows past 64 KB.
+const SWIFT_BASE_BYTES: usize = 4096;
+const SWIFT_BYTES_PER_MODULE: usize = 2048;
+const SWIFT_BYTES_PER_FUNCTION: usize = 512;
+const SWIFT_BYTES_PER_STRUCT: usize = 512;
+
+fn estimate_swift_capacity(modules: &[Module]) -> usize {
+    fn count(modules: &[Module]) -> (usize, usize, usize) {
+        let mut m = 0;
+        let mut f = 0;
+        let mut s = 0;
+        for module in modules {
+            m += 1;
+            f += module.functions.len();
+            s += module.structs.len();
+            let (sm, sf, ss) = count(&module.modules);
+            m += sm;
+            f += sf;
+            s += ss;
+        }
+        (m, f, s)
+    }
+    let (mods, funcs, structs) = count(modules);
+    SWIFT_BASE_BYTES
+        + mods * SWIFT_BYTES_PER_MODULE
+        + funcs * SWIFT_BYTES_PER_FUNCTION
+        + structs * SWIFT_BYTES_PER_STRUCT
+}
 
 pub struct SwiftGenerator;
 
@@ -259,7 +292,7 @@ fn render_swift_wrapper(
     input_basename: &str,
     filename: &str,
 ) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(estimate_swift_capacity(&api.modules));
     out.push_str(&render_prelude(CommentStyle::DoubleSlash, input_basename));
     out.push_str("import CWeaveFFI\nimport Foundation\n\n");
 
@@ -621,28 +654,21 @@ fn render_swift_function(
 ) {
     emit_fn_doc(out, &f.doc, &f.params, "    ");
     if let Some(msg) = &f.deprecated {
-        out.push_str(&format!(
-            "    @available(*, deprecated, message: \"{}\")\n",
+        let _ = writeln!(
+            out,
+            "    @available(*, deprecated, message: \"{}\")",
             msg.replace('"', "\\\"")
-        ));
+        );
     }
     let func_name = wrapper_name(module_name, &f.name, strip_module_prefix);
-    let params_sig: Vec<String> = f
-        .params
-        .iter()
-        .map(|p| format!("_ {}: {}", p.name, swift_type_for(&p.ty)))
-        .collect();
     let ret_swift = f
         .returns
         .as_ref()
         .map(swift_type_for)
         .unwrap_or_else(|| "Void".to_string());
-    out.push_str(&format!(
-        "    public static func {}({}) throws -> {} {{\n",
-        func_name,
-        params_sig.join(", "),
-        ret_swift
-    ));
+    let _ = write!(out, "    public static func {}(", func_name);
+    write_swift_params_sig(out, &f.params);
+    let _ = writeln!(out, ") throws -> {} {{", ret_swift);
     out.push_str("        var err = weaveffi_error(code: 0, message: nil)\n");
 
     let c_sym = c_symbol_name(module_name, &f.name);
@@ -662,6 +688,19 @@ fn render_swift_function(
     out.push_str("    }\n");
 }
 
+/// Write `_ name: SwiftType, _ name: SwiftType, ...` directly into `out`,
+/// avoiding the per-call `format!` and intermediate `Vec<String>` allocations
+/// that `params.iter().map(format!).collect::<Vec<_>>().join(", ")` would
+/// require.
+fn write_swift_params_sig(out: &mut String, params: &[Param]) {
+    for (i, p) in params.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let _ = write!(out, "_ {}: {}", p.name, swift_type_for(&p.ty));
+    }
+}
+
 fn render_swift_async_function(
     out: &mut String,
     module_name: &str,
@@ -670,33 +709,27 @@ fn render_swift_async_function(
 ) {
     emit_fn_doc(out, &f.doc, &f.params, "    ");
     if let Some(msg) = &f.deprecated {
-        out.push_str(&format!(
-            "    @available(*, deprecated, message: \"{}\")\n",
+        let _ = writeln!(
+            out,
+            "    @available(*, deprecated, message: \"{}\")",
             msg.replace('"', "\\\"")
-        ));
+        );
     }
     let func_name = wrapper_name(module_name, &f.name, strip_module_prefix);
-    let params_sig: Vec<String> = f
-        .params
-        .iter()
-        .map(|p| format!("_ {}: {}", p.name, swift_type_for(&p.ty)))
-        .collect();
     let ret_swift = f
         .returns
         .as_ref()
         .map(swift_type_for)
         .unwrap_or_else(|| "Void".to_string());
 
-    out.push_str(&format!(
-        "    public static func {}({}) async throws -> {} {{\n",
-        func_name,
-        params_sig.join(", "),
+    let _ = write!(out, "    public static func {}(", func_name);
+    write_swift_params_sig(out, &f.params);
+    let _ = writeln!(out, ") async throws -> {} {{", ret_swift);
+    let _ = writeln!(
+        out,
+        "        try await withCheckedThrowingContinuation {{ (continuation: CheckedContinuation<{}, Error>) in",
         ret_swift
-    ));
-    out.push_str(&format!(
-        "        try await withCheckedThrowingContinuation {{ (continuation: CheckedContinuation<{}, Error>) in\n",
-        ret_swift
-    ));
+    );
     out.push_str(
         "            let ctx = Unmanaged.passRetained(ContinuationRef(continuation)).toOpaque()\n",
     );
