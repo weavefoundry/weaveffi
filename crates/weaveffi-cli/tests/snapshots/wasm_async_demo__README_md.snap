@@ -75,6 +75,23 @@ export the following functions:
 | `id` | `i64` | `i64` | native WASM i64 |
 | _returns_ | `bool` | `i32` | 0 = false, 1 = true |
 
+##### `weaveffi_tasks_run_n_tasks`
+
+`weaveffi_tasks_run_n_tasks(n: i32) -> i32`
+
+| Param | API Type | WASM | Notes |
+|-------|----------|------|-------|
+| `n` | `i32` | `i32` | native WASM i32 |
+| _returns_ | `i32` | `i32` | native WASM i32 |
+
+##### `weaveffi_tasks_active_callbacks`
+
+`weaveffi_tasks_active_callbacks() -> i64`
+
+| Param | API Type | WASM | Notes |
+|-------|----------|------|-------|
+| _returns_ | `i64` | `i64` | native WASM i64 |
+
 #### Structs
 
 ##### `TaskResult`

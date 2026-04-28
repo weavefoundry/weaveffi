@@ -6,7 +6,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 import 'dart:ffi';
 import 'dart:io' show Platform;
-import 'dart:isolate';
+import 'dart:async';
 import 'package:ffi/ffi.dart';
 
 DynamicLibrary _openLibrary() {
@@ -445,25 +445,40 @@ void clear(Store store) {
   }
 }
 
-typedef _NativeWeaveffiKvCompactAsync = Int64 Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKvCompactAsync = int Function(Pointer<Void>, Pointer<_WeaveffiError>);
-final _weaveffiKvCompactAsync = _lib.lookupFunction<
-    _NativeWeaveffiKvCompactAsync, _DartWeaveffiKvCompactAsync>('weaveffi_kv_compact_async');
+typedef _NativeAsyncCb_weaveffi_kv_compact_async = Void Function(Pointer<Void>, Pointer<_WeaveffiError>, Int64);
 
-int _compactAsync(Store store) {
-  final err = calloc<_WeaveffiError>();
-  try {
-    final result = _weaveffiKvCompactAsync(store._handle, err);
-    _checkError(err);
-    return result;
-  } finally {
-    calloc.free(err);
-  }
-}
+typedef _NativeWeaveffiKvCompactAsyncAsync = Void Function(Pointer<Void>, Pointer<Void>, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_kv_compact_async>>, Pointer<Void>);
+typedef _DartWeaveffiKvCompactAsyncAsync = void Function(Pointer<Void>, Pointer<Void>, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_kv_compact_async>>, Pointer<Void>);
+final _weaveffiKvCompactAsyncAsync = _lib.lookupFunction<
+    _NativeWeaveffiKvCompactAsyncAsync, _DartWeaveffiKvCompactAsyncAsync>('weaveffi_kv_compact_async_async');
 
 /// Reclaim space asynchronously; returns the number of bytes reclaimed
-Future<int> compactAsync(Store store) async {
-  return await Isolate.run(() => _compactAsync(store));
+Future<int> compactAsync(Store store) {
+  final completer = Completer<int>();
+  late NativeCallable<_NativeAsyncCb_weaveffi_kv_compact_async> callable;
+  callable = NativeCallable<_NativeAsyncCb_weaveffi_kv_compact_async>.listener((Pointer<Void> context, Pointer<_WeaveffiError> err, int result) {
+    try {
+      if (err.address != 0 && err.ref.code != 0) {
+        final code = err.ref.code;
+        final msg = err.ref.message.toDartString();
+        _weaveffiErrorClear(err);
+        completer.completeError(WeaveffiException(code, msg));
+        return;
+      }
+      completer.complete(result);
+    } catch (e) {
+      completer.completeError(e);
+    } finally {
+      callable.close();
+    }
+  });
+  try {
+    _weaveffiKvCompactAsyncAsync(store._handle, nullptr, callable.nativeFunction, nullptr);
+  } catch (e) {
+    callable.close();
+    rethrow;
+  }
+  return completer.future;
 }
 
 typedef _NativeWeaveffiKvLegacyPut = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>, Pointer<_WeaveffiError>);

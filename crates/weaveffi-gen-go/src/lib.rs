@@ -1076,6 +1076,63 @@ mod tests {
         assert!(go.contains("import \"C\""), "missing import C: {go}");
     }
 
+    /// Go's CGo bindings deliberately skip async-marked functions: a CGo
+    /// callback's lifetime is tied to a Go channel that would have to
+    /// outlive the C-side worker thread, which leaks if the channel is
+    /// closed early. This test pins the contract so a future change that
+    /// re-enables async generation has to handle the channel lifetime first.
+    #[test]
+    fn go_async_pins_callback_for_lifetime() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "io".into(),
+                functions: vec![
+                    Function {
+                        name: "read".into(),
+                        params: vec![],
+                        returns: Some(TypeRef::StringUtf8),
+                        doc: None,
+                        r#async: true,
+                        cancellable: false,
+                        deprecated: None,
+                        since: None,
+                    },
+                    Function {
+                        name: "write".into(),
+                        params: vec![],
+                        returns: None,
+                        doc: None,
+                        r#async: false,
+                        cancellable: false,
+                        deprecated: None,
+                        since: None,
+                    },
+                ],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let go = render_go(&api);
+        assert!(
+            !go.contains("//export readCallback"),
+            "async export callbacks must not be emitted: {go}"
+        );
+        assert!(
+            !go.contains("weaveffi_io_read_async"),
+            "async C function must not be referenced: {go}"
+        );
+        assert!(
+            go.contains("weaveffi_io_write"),
+            "sync function should still be emitted: {go}"
+        );
+    }
+
     #[test]
     fn imports_fmt_and_unsafe() {
         let go = render_go(&calculator_api());

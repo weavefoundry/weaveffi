@@ -52,6 +52,7 @@ module WeaveFFI
   attach_function :weaveffi_tasks_TaskResult_get_value, [:pointer], :pointer
   attach_function :weaveffi_tasks_TaskResult_get_success, [:pointer], :int32
   attach_function :weaveffi_tasks_cancel_task, [:int64, :pointer], :int32
+  attach_function :weaveffi_tasks_active_callbacks, [:pointer], :int64
 
   class TaskResultPtr < FFI::AutoPointer
     def self.release(ptr)
@@ -100,5 +101,12 @@ module WeaveFFI
     result = weaveffi_tasks_cancel_task(id, err)
     check_error!(err)
     result != 0
+  end
+
+  def self.active_callbacks()
+    err = ErrorStruct.new
+    result = weaveffi_tasks_active_callbacks(err)
+    check_error!(err)
+    result
   end
 end

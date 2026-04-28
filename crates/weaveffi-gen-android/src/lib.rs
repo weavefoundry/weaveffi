@@ -4513,6 +4513,55 @@ mod tests {
         );
     }
 
+    /// JNI requires `NewGlobalRef` on the Kotlin continuation so it survives
+    /// across the C-side thread spawn, balanced by `DeleteGlobalRef` in the
+    /// JNI callback after the suspend point is resumed. The `malloc` of the
+    /// callback context must also be balanced by `free(ctx)`.
+    #[test]
+    fn android_async_pins_callback_for_lifetime() {
+        let api = make_api(vec![Module {
+            name: "tasks".into(),
+            functions: vec![Function {
+                name: "run".into(),
+                params: vec![Param {
+                    name: "id".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: None,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: true,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let c = render_jni_c(&api, "com.weaveffi", true);
+        let pin_count = c.matches("NewGlobalRef(env, callback)").count();
+        let unpin_count = c.matches("DeleteGlobalRef(env, ctx->callback)").count();
+        let malloc_count = c.matches("malloc(sizeof(weaveffi_jni_async_ctx))").count();
+        let free_count = c.matches("free(ctx);").count();
+        assert_eq!(
+            pin_count, 1,
+            "expected one NewGlobalRef per async fn, got {pin_count}: {c}"
+        );
+        assert_eq!(
+            unpin_count, 1,
+            "expected one DeleteGlobalRef per async fn, got {unpin_count}: {c}"
+        );
+        assert_eq!(
+            malloc_count, free_count,
+            "ctx malloc / free must balance: malloc={malloc_count} free={free_count}: {c}"
+        );
+    }
+
     fn doc_api() -> Api {
         make_api(vec![Module {
             name: "docs".into(),

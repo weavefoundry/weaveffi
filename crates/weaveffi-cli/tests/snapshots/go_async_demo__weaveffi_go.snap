@@ -58,3 +58,14 @@ func TasksCancelTask(id int64) (bool, error) {
 	}
 	return cToBool(result), nil
 }
+
+func TasksActiveCallbacks() (int64, error) {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_tasks_active_callbacks(&cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return 0, goErr
+	}
+	return int64(result), nil
+}

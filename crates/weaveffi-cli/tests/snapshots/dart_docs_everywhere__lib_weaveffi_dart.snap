@@ -6,7 +6,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 import 'dart:ffi';
 import 'dart:io' show Platform;
-import 'dart:isolate';
+import 'dart:async';
 import 'package:ffi/ffi.dart';
 
 DynamicLibrary _openLibrary() {
@@ -238,23 +238,38 @@ Document? getDocument(int id) {
   }
 }
 
-typedef _NativeWeaveffiDocsPublishAsync = Int32 Function(Int64, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiDocsPublishAsync = int Function(int, Pointer<_WeaveffiError>);
-final _weaveffiDocsPublishAsync = _lib.lookupFunction<
-    _NativeWeaveffiDocsPublishAsync, _DartWeaveffiDocsPublishAsync>('weaveffi_docs_publish_async');
+typedef _NativeAsyncCb_weaveffi_docs_publish_async = Void Function(Pointer<Void>, Pointer<_WeaveffiError>, Int32);
 
-bool _publishAsync(int id) {
-  final err = calloc<_WeaveffiError>();
-  try {
-    final result = _weaveffiDocsPublishAsync(id, err);
-    _checkError(err);
-    return result != 0;
-  } finally {
-    calloc.free(err);
-  }
-}
+typedef _NativeWeaveffiDocsPublishAsyncAsync = Void Function(Int64, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_docs_publish_async>>, Pointer<Void>);
+typedef _DartWeaveffiDocsPublishAsyncAsync = void Function(int, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_docs_publish_async>>, Pointer<Void>);
+final _weaveffiDocsPublishAsyncAsync = _lib.lookupFunction<
+    _NativeWeaveffiDocsPublishAsyncAsync, _DartWeaveffiDocsPublishAsyncAsync>('weaveffi_docs_publish_async_async');
 
 /// Publish a document in the background
-Future<bool> publishAsync(int id) async {
-  return await Isolate.run(() => _publishAsync(id));
+Future<bool> publishAsync(int id) {
+  final completer = Completer<bool>();
+  late NativeCallable<_NativeAsyncCb_weaveffi_docs_publish_async> callable;
+  callable = NativeCallable<_NativeAsyncCb_weaveffi_docs_publish_async>.listener((Pointer<Void> context, Pointer<_WeaveffiError> err, int result) {
+    try {
+      if (err.address != 0 && err.ref.code != 0) {
+        final code = err.ref.code;
+        final msg = err.ref.message.toDartString();
+        _weaveffiErrorClear(err);
+        completer.completeError(WeaveffiException(code, msg));
+        return;
+      }
+      completer.complete(result != 0);
+    } catch (e) {
+      completer.completeError(e);
+    } finally {
+      callable.close();
+    }
+  });
+  try {
+    _weaveffiDocsPublishAsyncAsync(id, callable.nativeFunction, nullptr);
+  } catch (e) {
+    callable.close();
+    rethrow;
+  }
+  return completer.future;
 }

@@ -442,7 +442,7 @@ def _compact_async_sync(store: "Store") -> int:
                 _lib.weaveffi_error_clear(ctypes.byref(err.contents))
                 _state["err"] = WeaveffiError(_code, _msg)
             else:
-            _state["val"] = result
+                _state["val"] = result
         finally:
             _ev.set()
     _cb_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(_WeaveffiErrorStruct), ctypes.c_int64)

@@ -442,7 +442,7 @@ fn render_async_ffi_call_body(out: &mut String, module_name: &str, f: &Function)
         "{ind}            _state[\"err\"] = WeaveffiError(_code, _msg)\n"
     ));
     out.push_str(&format!("{ind}        else:\n"));
-    append_async_success_handler(out, &f.returns, "            ");
+    append_async_success_handler(out, &f.returns, "                ");
     out.push_str(&format!("{ind}    finally:\n"));
     out.push_str(&format!("{ind}        _ev.set()\n"));
 
@@ -4377,6 +4377,46 @@ mod tests {
         assert!(
             code.contains("run_in_executor(None, _fetch_data_sync, id)"),
             "should use run_in_executor with sync fn and args: {code}"
+        );
+    }
+
+    /// `ctypes.CFUNCTYPE` instances pin the C trampoline; `_cb` is held alive
+    /// in the local frame for the lifetime of the synchronous helper, which
+    /// blocks on `_ev.wait()` until the C callback fires. The `try/finally`
+    /// around `_state` mutation ensures `_ev.set()` always runs, releasing
+    /// the wait and letting `_cb` drop together with the helper frame.
+    #[test]
+    fn python_async_pins_callback_for_lifetime() {
+        let api = make_api(vec![simple_module(vec![Function {
+            name: "fetch_data".into(),
+            params: vec![Param {
+                name: "id".into(),
+                ty: TypeRef::I32,
+                mutable: false,
+                doc: None,
+            }],
+            returns: Some(TypeRef::StringUtf8),
+            doc: None,
+            r#async: true,
+            cancellable: false,
+            deprecated: None,
+            since: None,
+        }])]);
+        let code = render_python_module(&api, true);
+        let pin_count = code.matches("_cb = _cb_type(_cb_impl)").count();
+        let wait_count = code.matches("_ev.wait()").count();
+        let set_count = code.matches("_ev.set()").count();
+        assert_eq!(
+            pin_count, 1,
+            "expected one `_cb = _cb_type(_cb_impl)` per async fn, got {pin_count}: {code}"
+        );
+        assert_eq!(
+            wait_count, set_count,
+            "every `_ev.wait()` must be matched by an `_ev.set()` in finally: wait={wait_count} set={set_count}: {code}"
+        );
+        assert!(
+            code.contains("finally:\n            _ev.set()"),
+            "_ev.set() must be in a finally block: {code}"
         );
     }
 

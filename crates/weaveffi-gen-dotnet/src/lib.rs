@@ -1058,23 +1058,35 @@ fn render_async_wrapper_method(
         "            {delegate_name} callback = {cb_lambda_params} =>\n            {{\n"
     ));
 
-    out.push_str("                if (err != IntPtr.Zero)\n                {\n");
-    out.push_str("                    var wErr = Marshal.PtrToStructure<WeaveffiError>(err);\n");
-    out.push_str("                    if (wErr.Code != 0)\n                    {\n");
+    out.push_str("                try\n                {\n");
+    out.push_str("                    if (err != IntPtr.Zero)\n                    {\n");
     out.push_str(
-        "                        var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? \"\";\n",
+        "                        var wErr = Marshal.PtrToStructure<WeaveffiError>(err);\n",
+    );
+    out.push_str("                        if (wErr.Code != 0)\n                        {\n");
+    out.push_str(
+        "                            var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? \"\";\n",
     );
     out.push_str(
-        "                        tcs.SetException(new WeaveffiException(wErr.Code, msg));\n",
+        "                            tcs.SetException(new WeaveffiException(wErr.Code, msg));\n",
     );
-    out.push_str("                        return;\n");
+    out.push_str("                            return;\n");
+    out.push_str("                        }\n");
+    out.push_str("                    }\n");
+
+    render_async_set_result(out, &f.returns, "                    ");
+
+    out.push_str("                }\n");
+    out.push_str("                finally\n                {\n");
+    out.push_str("                    if (context != IntPtr.Zero)\n");
+    out.push_str("                    {\n");
+    out.push_str("                        GCHandle.FromIntPtr(context).Free();\n");
     out.push_str("                    }\n");
     out.push_str("                }\n");
 
-    render_async_set_result(out, &f.returns, "                ");
-
     out.push_str("            };\n");
-    out.push_str("            var gcHandle = GCHandle.Alloc(callback);\n");
+    out.push_str("            var gcHandle = GCHandle.Alloc(callback, GCHandleType.Normal);\n");
+    out.push_str("            var ctx = GCHandle.ToIntPtr(gcHandle);\n");
 
     let needs_try = f.params.iter().any(|p| param_needs_marshal(&p.ty));
     let call_args = build_call_args(&f.params);
@@ -1090,18 +1102,30 @@ fn render_async_wrapper_method(
             render_marshal_setup(out, p, "            ");
         }
         out.push_str("            try\n            {\n");
+        out.push_str("                try\n                {\n");
         out.push_str(&format!(
-            "                NativeMethods.{c_sym}_async({args_part}{cancel_arg}callback, IntPtr.Zero);\n"
+            "                    NativeMethods.{c_sym}_async({args_part}{cancel_arg}callback, ctx);\n"
         ));
+        out.push_str("                }\n");
+        out.push_str("                catch\n                {\n");
+        out.push_str("                    if (gcHandle.IsAllocated) gcHandle.Free();\n");
+        out.push_str("                    throw;\n");
+        out.push_str("                }\n");
         out.push_str("            }\n            finally\n            {\n");
         for p in &f.params {
             render_marshal_cleanup(out, p, "                ");
         }
         out.push_str("            }\n");
     } else {
+        out.push_str("            try\n            {\n");
         out.push_str(&format!(
-            "            NativeMethods.{c_sym}_async({args_part}{cancel_arg}callback, IntPtr.Zero);\n"
+            "                NativeMethods.{c_sym}_async({args_part}{cancel_arg}callback, ctx);\n"
         ));
+        out.push_str("            }\n");
+        out.push_str("            catch\n            {\n");
+        out.push_str("                if (gcHandle.IsAllocated) gcHandle.Free();\n");
+        out.push_str("                throw;\n");
+        out.push_str("            }\n");
     }
 
     if f.returns.is_some() {
@@ -4045,6 +4069,52 @@ mod tests {
         assert!(
             cs.contains("TaskCompletionSource"),
             "missing TaskCompletionSource: {cs}"
+        );
+    }
+
+    /// `GCHandle.Alloc(callback, GCHandleType.Normal)` (the .NET equivalent
+    /// of pinning the delegate so the GC won't reclaim it while the C side
+    /// owns a function pointer to it) must be balanced by exactly one
+    /// `GCHandle.FromIntPtr(context).Free()` in the C callback after the
+    /// `TaskCompletionSource` is resolved.
+    #[test]
+    fn dotnet_async_pins_callback_for_lifetime() {
+        let api = make_api(vec![Module {
+            name: "tasks".into(),
+            functions: vec![Function {
+                name: "run".into(),
+                params: vec![Param {
+                    name: "id".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: None,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: true,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let cs = render_csharp(&api, "WeaveFFI", true);
+        assert!(
+            cs.contains("GCHandle.Alloc(callback, GCHandleType.Normal)"),
+            "missing GCHandle.Alloc(..., Normal): {cs}"
+        );
+        assert!(
+            cs.contains("GCHandle.ToIntPtr(gcHandle)"),
+            "GCHandle must be passed as the C context: {cs}"
+        );
+        assert!(
+            cs.contains("GCHandle.FromIntPtr(context).Free()"),
+            "missing GCHandle.Free in callback: {cs}"
         );
     }
 

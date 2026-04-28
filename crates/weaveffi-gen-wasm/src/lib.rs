@@ -2034,6 +2034,57 @@ mod tests {
         );
     }
 
+    /// The WASM bindings register one trampoline per async-callback
+    /// signature on the indirect function table for the lifetime of the API
+    /// instance and route per-call resolve/reject through the
+    /// `_asyncContexts` map. Each entry is `set(ctxId, ...)` once and
+    /// `delete(ctxId)` once on the callback path so the resolver closures do
+    /// not leak.
+    #[test]
+    fn wasm_async_pins_callback_for_lifetime() {
+        let api = make_api(vec![Module {
+            name: "math".into(),
+            functions: vec![Function {
+                name: "compute".into(),
+                params: vec![Param {
+                    name: "x".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: None,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: true,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let js = render_wasm_js_stub(&api, DEFAULT_MODULE_NAME);
+        let trampoline_count = js.matches("_registerTrampoline").count();
+        let set_count = js.matches("_asyncContexts.set(ctxId").count();
+        let delete_count = js.matches("_asyncContexts.delete(ctxId)").count();
+        // Trampoline is defined once and registered once per signature.
+        assert_eq!(
+            trampoline_count, 2,
+            "expected one definition and one registration of the trampoline, got {trampoline_count}: {js}"
+        );
+        assert_eq!(
+            set_count, delete_count,
+            "every _asyncContexts.set must be matched by a delete: set={set_count} delete={delete_count}: {js}"
+        );
+        assert!(
+            set_count >= 1,
+            "expected at least one _asyncContexts.set per async fn: {js}"
+        );
+    }
+
     #[test]
     fn wasm_dts_async_function() {
         let api = make_api(vec![Module {

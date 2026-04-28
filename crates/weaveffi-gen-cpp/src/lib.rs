@@ -3247,6 +3247,53 @@ mod tests {
         );
     }
 
+    /// The C++ async wrapper heap-allocates `std::promise<T>` once and
+    /// passes it through the C context. The lambda callback must take
+    /// ownership and `delete` it exactly once on every exit path
+    /// (success and exception).
+    #[test]
+    fn cpp_async_pins_callback_for_lifetime() {
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "tasks".into(),
+                functions: vec![Function {
+                    name: "run".into(),
+                    params: vec![Param {
+                        name: "id".into(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                        doc: None,
+                    }],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: true,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let h = render_cpp_header(&api, "weaveffi", "weaveffi");
+        let alloc_count = h.matches("new std::promise<int32_t>()").count();
+        let free_count = h.matches("delete p;").count();
+        assert_eq!(
+            alloc_count, 1,
+            "expected one heap promise per async fn, got {alloc_count}: {h}"
+        );
+        assert_eq!(
+            free_count, 1,
+            "expected exactly one `delete p;` per async fn, got {free_count}: {h}"
+        );
+    }
+
     #[test]
     fn cpp_no_double_free_on_error() {
         let api = Api {

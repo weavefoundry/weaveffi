@@ -42,6 +42,9 @@ void weaveffi_tasks_run_task_async(const char* name, weaveffi_tasks_run_task_cal
 typedef void (*weaveffi_tasks_run_batch_callback)(void* context, weaveffi_error* err, weaveffi_tasks_TaskResult** result, size_t result_len);
 void weaveffi_tasks_run_batch_async(const char* const* names, size_t names_len, weaveffi_tasks_run_batch_callback callback, void* context);
 bool weaveffi_tasks_cancel_task(int64_t id, weaveffi_error* out_err);
+typedef void (*weaveffi_tasks_run_n_tasks_callback)(void* context, weaveffi_error* err, int32_t result);
+void weaveffi_tasks_run_n_tasks_async(int32_t n, weaveffi_tasks_run_n_tasks_callback callback, void* context);
+int64_t weaveffi_tasks_active_callbacks(weaveffi_error* out_err);
 
 } // extern "C"
 
@@ -141,6 +144,34 @@ inline std::future<std::vector<TaskResult>> tasks_run_batch(const std::vector<st
 inline bool tasks_cancel_task(int64_t id) {
     weaveffi_error err{};
     auto result = weaveffi_tasks_cancel_task(id, &err);
+    if (err.code != 0) {
+        std::string msg(err.message ? err.message : "unknown error");
+        int32_t code = err.code;
+        weaveffi_error_clear(&err);
+        throw WeaveFFIError(code, msg);
+    }
+    return result;
+}
+
+inline std::future<int32_t> tasks_run_n_tasks(int32_t n) {
+    auto* promise_ptr = new std::promise<int32_t>();
+    auto future = promise_ptr->get_future();
+    weaveffi_tasks_run_n_tasks_async(n, [](void* context, weaveffi_error* err, int32_t result) {
+        auto* p = static_cast<std::promise<int32_t>*>(context);
+        if (err && err->code != 0) {
+            std::string msg(err->message ? err->message : "unknown error");
+            p->set_exception(std::make_exception_ptr(WeaveFFIError(err->code, msg)));
+        } else {
+            p->set_value(result);
+        }
+        delete p;
+    }, static_cast<void*>(promise_ptr));
+    return future;
+}
+
+inline int64_t tasks_active_callbacks() {
+    weaveffi_error err{};
+    auto result = weaveffi_tasks_active_callbacks(&err);
     if (err.code != 0) {
         std::string msg(err.message ? err.message : "unknown error");
         int32_t code = err.code;
