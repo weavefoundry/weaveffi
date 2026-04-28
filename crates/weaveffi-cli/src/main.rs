@@ -819,10 +819,13 @@ fn cmd_diff(input: &str, out: Option<&str>, check: bool, quiet: bool) -> Result<
         &c, &cpp, &swift, &android, &node, &wasm, &python, &dotnet, &dart, &go, &ruby,
     ];
 
-    let config = GeneratorConfig {
+    let mut config = GeneratorConfig {
         input_basename: in_path.file_name().map(str::to_string),
         ..GeneratorConfig::default()
     };
+    if let Some(ref generators) = api.generators {
+        merge_inline_generators(&mut config, generators);
+    }
     let mut orchestrator = Orchestrator::new();
     for &gen in &all {
         orchestrator = orchestrator.with_generator(gen);
