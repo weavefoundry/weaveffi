@@ -24,6 +24,14 @@ export interface WeaveffiWasmModule {
      * @throws {Error} if the native call fails
      */
     cancel_task(id: number): boolean;
+    /**
+     * @throws {Error} if the native call fails
+     */
+    run_n_tasks(n: number): Promise<number>;
+    /**
+     * @throws {Error} if the native call fails
+     */
+    active_callbacks(): number;
   };
 }
 

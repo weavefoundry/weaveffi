@@ -22,3 +22,11 @@ modules:
         params:
           - { name: id, type: i64 }
         return: bool
+      - name: run_n_tasks
+        params:
+          - { name: n, type: i32 }
+        return: i32
+        async: true
+      - name: active_callbacks
+        params: []
+        return: i64

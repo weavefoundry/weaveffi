@@ -4066,6 +4066,50 @@ mod tests {
         );
     }
 
+    /// `Unmanaged.passRetained(...)` (the +1 retain that pins the
+    /// continuation across the C boundary) must be matched by exactly one
+    /// `Unmanaged.fromOpaque(...).takeRetainedValue()` in the C callback so
+    /// the continuation is released when the future resolves.
+    #[test]
+    fn swift_async_pins_callback_for_lifetime() {
+        let api = make_api(vec![Module {
+            name: "tasks".to_string(),
+            functions: vec![Function {
+                name: "run".to_string(),
+                params: vec![Param {
+                    name: "id".to_string(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: None,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: true,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let out = render_swift_wrapper(&api, true);
+        let pin_count = out.matches("Unmanaged.passRetained").count();
+        let unpin_count = out.matches("takeRetainedValue()").count();
+        assert_eq!(
+            pin_count, 1,
+            "expected exactly one Unmanaged.passRetained, found {pin_count}: {out}"
+        );
+        assert_eq!(
+            unpin_count, 1,
+            "expected exactly one takeRetainedValue, found {unpin_count}: {out}"
+        );
+    }
+
     #[test]
     fn swift_cross_module_struct() {
         let api = make_api(vec![

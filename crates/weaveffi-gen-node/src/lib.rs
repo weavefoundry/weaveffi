@@ -2346,6 +2346,58 @@ mod tests {
         );
     }
 
+    /// The N-API deferred is created with `napi_create_promise` and consumed
+    /// (and freed) by exactly one of `napi_resolve_deferred` /
+    /// `napi_reject_deferred`. The async context struct that carries the
+    /// deferred across the C callback boundary must be `malloc`-ed once and
+    /// `free`-d exactly once on the callback path.
+    #[test]
+    fn node_async_pins_callback_for_lifetime() {
+        let api = make_api(vec![{
+            let mut m = make_module("tasks");
+            m.functions.push(Function {
+                name: "run".into(),
+                params: vec![Param {
+                    name: "id".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: None,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                r#async: true,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            });
+            m
+        }]);
+        let addon = render_addon_c(&api, true);
+        let create_count = addon.matches("napi_create_promise").count();
+        let resolve_count = addon.matches("napi_resolve_deferred").count();
+        let reject_count = addon.matches("napi_reject_deferred").count();
+        let malloc_count = addon
+            .matches("malloc(sizeof(weaveffi_napi_async_ctx))")
+            .count();
+        let free_count = addon.matches("free(ctx);").count();
+        assert_eq!(
+            create_count, 1,
+            "expected one napi_create_promise per async fn, got {create_count}: {addon}"
+        );
+        assert_eq!(
+            resolve_count, 1,
+            "expected one napi_resolve_deferred per async fn, got {resolve_count}: {addon}"
+        );
+        assert_eq!(
+            reject_count, 1,
+            "expected one napi_reject_deferred per async fn, got {reject_count}: {addon}"
+        );
+        assert_eq!(
+            malloc_count, free_count,
+            "ctx malloc / free must balance per async fn: malloc={malloc_count} free={free_count}: {addon}"
+        );
+    }
+
     fn doc_module() -> Module {
         Module {
             name: "docs".into(),

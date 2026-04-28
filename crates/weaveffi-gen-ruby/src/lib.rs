@@ -1458,6 +1458,53 @@ mod tests {
         );
     }
 
+    /// Ruby's FFI bindings deliberately skip async-marked functions because
+    /// no idiomatic concurrency primitive exists; there is therefore no
+    /// callback to pin and nothing to free. This test fixes that contract so
+    /// a future change that re-enables async generation has to provide
+    /// matching pin/unpin sites first.
+    #[test]
+    fn ruby_async_pins_callback_for_lifetime() {
+        let api = make_api(vec![simple_module(
+            "io",
+            vec![
+                Function {
+                    name: "read".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::StringUtf8),
+                    doc: None,
+                    r#async: true,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "write".into(),
+                    params: vec![],
+                    returns: None,
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+            ],
+        )]);
+        let code = render_ruby_module(&api, "WeaveFFI");
+        assert!(
+            !code.contains("rb_global_variable"),
+            "async is unsupported, no global ref pinning expected: {code}"
+        );
+        assert!(
+            !code.contains("weaveffi_io_read"),
+            "async function should be omitted, sync function still emitted: {code}"
+        );
+        assert!(
+            code.contains("weaveffi_io_write"),
+            "sync function should still be emitted: {code}"
+        );
+    }
+
     #[test]
     fn preamble_has_platform_detection() {
         let code = render_ruby_module(&make_api(vec![]), "WeaveFFI");

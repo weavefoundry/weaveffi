@@ -188,6 +188,69 @@ responsible for managing threading and callback lifetime.
 - `cancellable: true` is only meaningful when `async: true`. Setting
   `cancellable` on a synchronous function has no effect.
 
+## Memory and lifetime
+
+The asynchronous C ABI hands the foreign side two pointers — a function
+pointer for the callback and a `void* context` opaque pointer — that the
+Rust worker keeps until it dispatches the result. Every binding has to
+keep those two pointers alive across the suspend point, hand ownership
+across one (and only one) thread boundary, and release the underlying
+language-side resources exactly once on the callback path. Getting this
+wrong silently corrupts memory: a callback that gets garbage-collected
+before the worker fires leaves the worker calling into freed memory; a
+context pointer freed twice yields a double-free.
+
+The matrix below is the contract every generator implements. Each row
+is verified by a `{generator}_async_pins_callback_for_lifetime` unit test
+and exercised under load by the per-target stress tests in
+`examples/{target}/async_stress.{ext}` (1000 concurrent calls each,
+wired into `examples/run_all.sh`).
+
+| Target  | Pin (allocate / retain)                                | Unpin (free / release) on callback             | Notes |
+|---------|---------------------------------------------------------|------------------------------------------------|-------|
+| Swift   | `Unmanaged.passRetained(ContinuationRef(...))`          | `Unmanaged.fromOpaque(ctx).takeRetainedValue()` | The retained `+1` is dropped exactly once when the continuation resumes. |
+| .NET    | `GCHandle.Alloc(callback, GCHandleType.Normal)`         | `GCHandle.FromIntPtr(context).Free()`           | `GCHandle.ToIntPtr(handle)` is passed as the `context`; the C catch path also frees the handle on synchronous failure. |
+| Kotlin  | JNI `(*env)->NewGlobalRef(env, callback)`               | `(*env)->DeleteGlobalRef(env, ctx->callback)`   | The JNI shim also `malloc`s and `free`s the per-call `weaveffi_jni_async_ctx` exactly once. |
+| Node.js | `napi_create_promise(env, &deferred, &promise)`         | `napi_resolve_deferred` or `napi_reject_deferred` (whichever runs first frees the deferred) | The N-API runtime owns the deferred; the per-call `weaveffi_napi_async_ctx` is `malloc`-ed and `free`-d exactly once. |
+| Python  | `_cb = ctypes.CFUNCTYPE(...)(impl)` (held in the local synchronous helper) | `_ev.set()` in the callback's `finally` releases the helper's `_ev.wait()` | `ctypes` auto-acquires the GIL on the C callback thread; the helper blocks on the event so `_cb` (and the trampoline it wraps) stay alive until the callback fires. |
+| C++     | `new std::promise<T>()` plus the lambda capture          | `delete p;` once at the end of the lambda       | The lambda owns the heap promise on every exit branch (set value, set exception). |
+| Dart    | `NativeCallable<...>.listener(...)` (assigned via `late`) | `callable.close()` in the listener's `finally` and on the synchronous catch path | Pointer-typed parameters are kept alive in `whenComplete` so the C side can read them across the suspension. |
+| WASM    | One `_registerTrampoline` per callback signature (lives for the API instance) plus `_asyncContexts.set(ctxId, ...)` per call | `_asyncContexts.delete(ctxId)` in the trampoline | The trampoline never has to be removed; per-call resolver closures are removed from the map after resolve/reject. |
+| Go      | _Not async-capable._ The Go generator skips `async: true` functions because a CGo callback's lifetime cannot exceed the channel it would resume. | n/a | Re-enabling Go async requires solving the channel-vs-callback lifetime problem first. |
+| Ruby    | _Not async-capable._ The Ruby generator skips `async: true` functions; the Ruby `ffi` gem has no idiomatic async primitive to bind to. | n/a | A future Ruby async implementation must `rb_global_variable` the callback and unregister it on completion. |
+
+### Audit invariants
+
+For every async-capable target:
+
+1. The user-supplied `void* context` has exactly one owning entity at any
+   moment. Ownership is handed off to the C worker on the call and
+   handed back to (and freed by) the callback. There is no path on which
+   both the caller and the callback free the same context.
+2. The callback closure is pinned in language-managed memory by an
+   explicit "+1" allocation (`GCHandle.Alloc`,
+   `Unmanaged.passRetained`, `NewGlobalRef`, `NativeCallable.listener`,
+   …) before the C worker can see it, and released by the matching "-1"
+   exactly once on the callback path.
+3. Synchronous failure of the C call (the callback never fires) is
+   handled in a `catch` / `try` that frees the pin so it does not leak.
+4. The stress test under `examples/{target}/async_stress.{ext}` spawns
+   1000 concurrent calls to `weaveffi_tasks_run_n_tasks_async`, awaits
+   them, asserts each returned the expected `n`, and checks that
+   `weaveffi_tasks_active_callbacks()` returns to zero — a simple FFI
+   counter exposed by `samples/async-demo` that tracks in-flight worker
+   threads. A leaked callback would manifest as a hang (the worker
+   calling into freed memory) or a non-zero counter at the end.
+
+### Cancellation
+
+For `cancellable: true` functions, the C ABI also takes a
+`weaveffi_cancel_token*` argument. Cancellation is observed by the Rust
+worker but the callback is **always** invoked exactly once — either with
+the result or with a `Cancelled` error. This means the pin/unpin pair
+above runs on the cancellation path identically to the success path; no
+extra cleanup is required by the generator.
+
 ## Best practices
 
 1. **Prefer async for I/O-bound operations.** Network requests, file I/O,

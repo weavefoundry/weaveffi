@@ -1082,7 +1082,7 @@ modules:
         assert_eq!(s.fields[2].name, "success");
         assert_eq!(s.fields[2].ty, TypeRef::Bool);
 
-        assert_eq!(m.functions.len(), 3);
+        assert_eq!(m.functions.len(), 5);
 
         let run_task = &m.functions[0];
         assert_eq!(run_task.name, "run_task");
@@ -1106,6 +1106,16 @@ modules:
         assert_eq!(cancel_task.name, "cancel_task");
         assert!(!cancel_task.r#async);
         assert_eq!(cancel_task.returns, Some(TypeRef::Bool));
+
+        let run_n_tasks = &m.functions[3];
+        assert_eq!(run_n_tasks.name, "run_n_tasks");
+        assert!(run_n_tasks.r#async);
+        assert_eq!(run_n_tasks.returns, Some(TypeRef::I32));
+
+        let active_callbacks = &m.functions[4];
+        assert_eq!(active_callbacks.name, "active_callbacks");
+        assert!(!active_callbacks.r#async);
+        assert_eq!(active_callbacks.returns, Some(TypeRef::I64));
     }
 
     #[test]

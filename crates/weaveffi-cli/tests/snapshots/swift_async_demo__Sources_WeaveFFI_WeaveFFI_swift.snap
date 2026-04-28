@@ -121,4 +121,25 @@ public enum Tasks {
         try check(&err)
         return rv
     }
+    public static func run_n_tasks(_ n: Int32) async throws -> Int32 {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Int32, Error>) in
+            let ctx = Unmanaged.passRetained(ContinuationRef(continuation)).toOpaque()
+            weaveffi_tasks_run_n_tasks_async(n, { context, err, result in
+                let contRef = Unmanaged<ContinuationRef<Int32>>.fromOpaque(context!).takeRetainedValue()
+                if let err = err, err.pointee.code != 0 {
+                    let code = err.pointee.code
+                    let msg = err.pointee.message.flatMap { String(cString: $0) } ?? ""
+                    contRef.value.resume(throwing: WeaveFFIError.error(code: code, message: msg))
+                } else {
+                    contRef.value.resume(returning: result)
+                }
+            }, ctx)
+        }
+    }
+    public static func active_callbacks() throws -> Int64 {
+        var err = weaveffi_error(code: 0, message: nil)
+        let rv = weaveffi_tasks_active_callbacks(&err)
+        try check(&err)
+        return rv
+    }
 }

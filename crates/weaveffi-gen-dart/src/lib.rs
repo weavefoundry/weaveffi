@@ -227,7 +227,7 @@ fn render_dart_module(api: &Api) -> String {
     out.push_str("import 'dart:ffi';\n");
     out.push_str("import 'dart:io' show Platform;\n");
     if has_async {
-        out.push_str("import 'dart:isolate';\n");
+        out.push_str("import 'dart:async';\n");
     }
     out.push_str("import 'package:ffi/ffi.dart';\n\n");
 
@@ -418,6 +418,18 @@ fn render_dart_builder(out: &mut String, s: &StructDef) {
 
 fn render_function(out: &mut String, module_path: &str, f: &Function) {
     let c_sym = c_symbol_name(module_path, &f.name);
+    let wrapper_name = f.name.to_lower_camel_case();
+    let pub_ret = f.returns.as_ref().map_or("void".into(), dart_type);
+    let wrapper_params: Vec<String> = f
+        .params
+        .iter()
+        .map(|p| format!("{} {}", dart_type(&p.ty), p.name.to_lower_camel_case()))
+        .collect();
+
+    if f.r#async {
+        render_async_function(out, &c_sym, f, &wrapper_name, &pub_ret, &wrapper_params);
+        return;
+    }
 
     let mut native_params: Vec<String> = f.params.iter().map(|p| native_ffi_type(&p.ty)).collect();
     native_params.push("Pointer<_WeaveffiError>".into());
@@ -436,61 +448,278 @@ fn render_function(out: &mut String, module_path: &str, f: &Function) {
         &dart_ret,
     );
 
-    let wrapper_name = f.name.to_lower_camel_case();
-    let pub_ret = f.returns.as_ref().map_or("void".into(), dart_type);
-    let wrapper_params: Vec<String> = f
-        .params
-        .iter()
-        .map(|p| format!("{} {}", dart_type(&p.ty), p.name.to_lower_camel_case()))
+    out.push('\n');
+    emit_doc(out, &f.doc, "");
+    if let Some(msg) = &f.deprecated {
+        let escaped = msg.replace('\'', "\\'");
+        out.push_str(&format!("@Deprecated('{escaped}')\n"));
+    }
+    out.push_str(&format!(
+        "{pub_ret} {wrapper_name}({}) {{\n",
+        wrapper_params.join(", ")
+    ));
+    emit_function_body(out, f, &c_sym);
+    out.push_str("}\n");
+}
+
+/// Returns the (native, dart) FFI types of the trailing callback parameters
+/// (those after `(context, err)`) for an async function with the given return
+/// type. The empty vec means the callback signature is `(context, err)` with
+/// no extra payload.
+fn async_cb_extra_params(ret: Option<&TypeRef>) -> Vec<(&'static str, &'static str)> {
+    match ret {
+        None => vec![],
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
+            vec![("Pointer<Uint8>", "Pointer<Uint8>"), ("Size", "int")]
+        }
+        Some(TypeRef::List(_) | TypeRef::Iterator(_)) => {
+            vec![("Pointer<Void>", "Pointer<Void>"), ("Size", "int")]
+        }
+        Some(TypeRef::Map(_, _)) => vec![
+            ("Pointer<Void>", "Pointer<Void>"),
+            ("Pointer<Void>", "Pointer<Void>"),
+            ("Size", "int"),
+        ],
+        Some(t) => vec![{
+            let n: &'static str = match t {
+                TypeRef::I32 | TypeRef::U32 | TypeRef::Bool | TypeRef::Enum(_) => "Int32",
+                TypeRef::I64 | TypeRef::Handle | TypeRef::TypedHandle(_) => "Int64",
+                TypeRef::F64 => "Double",
+                TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Utf8>",
+                TypeRef::Struct(_) => "Pointer<Void>",
+                _ => "Pointer<Void>",
+            };
+            let d: &'static str = match t {
+                TypeRef::I32
+                | TypeRef::U32
+                | TypeRef::I64
+                | TypeRef::Bool
+                | TypeRef::Enum(_)
+                | TypeRef::Handle
+                | TypeRef::TypedHandle(_) => "int",
+                TypeRef::F64 => "double",
+                TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Utf8>",
+                TypeRef::Struct(_) => "Pointer<Void>",
+                _ => "Pointer<Void>",
+            };
+            (n, d)
+        }],
+    }
+}
+
+fn render_async_function(
+    out: &mut String,
+    c_sym: &str,
+    f: &Function,
+    wrapper_name: &str,
+    pub_ret: &str,
+    wrapper_params: &[String],
+) {
+    let cb_extras = async_cb_extra_params(f.returns.as_ref());
+    let cb_native_params: Vec<String> = std::iter::once("Pointer<Void>".to_string())
+        .chain(std::iter::once("Pointer<_WeaveffiError>".to_string()))
+        .chain(cb_extras.iter().map(|(n, _)| (*n).to_string()))
         .collect();
 
-    if f.r#async {
-        let sync_name = format!("_{wrapper_name}");
-        out.push('\n');
-        if let Some(msg) = &f.deprecated {
-            let escaped = msg.replace('\'', "\\'");
-            out.push_str(&format!("@Deprecated('{escaped}')\n"));
-        }
-        out.push_str(&format!(
-            "{pub_ret} {sync_name}({}) {{\n",
-            wrapper_params.join(", ")
-        ));
-        emit_function_body(out, f, &c_sym);
-        out.push_str("}\n");
+    let cb_typedef = format!("_NativeAsyncCb_{c_sym}");
+    out.push_str(&format!(
+        "\ntypedef {cb_typedef} = Void Function({});\n",
+        cb_native_params.join(", ")
+    ));
 
-        let call_args: Vec<String> = f
-            .params
-            .iter()
-            .map(|p| p.name.to_lower_camel_case())
-            .collect();
-        out.push('\n');
-        emit_doc(out, &f.doc, "");
-        if let Some(msg) = &f.deprecated {
-            let escaped = msg.replace('\'', "\\'");
-            out.push_str(&format!("@Deprecated('{escaped}')\n"));
-        }
-        out.push_str(&format!(
-            "Future<{pub_ret}> {wrapper_name}({}) async {{\n",
-            wrapper_params.join(", ")
-        ));
-        out.push_str(&format!(
-            "  return await Isolate.run(() => {sync_name}({}));\n",
-            call_args.join(", ")
-        ));
-        out.push_str("}\n");
+    let async_sym = format!("{c_sym}_async");
+    let mut native_params: Vec<String> = f.params.iter().map(|p| native_ffi_type(&p.ty)).collect();
+    if f.cancellable {
+        native_params.push("Pointer<Void>".into());
+    }
+    native_params.push(format!("Pointer<NativeFunction<{cb_typedef}>>"));
+    native_params.push("Pointer<Void>".into());
+    let mut dart_params: Vec<String> = f.params.iter().map(|p| dart_ffi_type(&p.ty)).collect();
+    if f.cancellable {
+        dart_params.push("Pointer<Void>".into());
+    }
+    dart_params.push(format!("Pointer<NativeFunction<{cb_typedef}>>"));
+    dart_params.push("Pointer<Void>".into());
+
+    emit_typedef_and_lookup(
+        out,
+        &async_sym,
+        &native_params.join(", "),
+        &dart_params.join(", "),
+        "Void",
+        "void",
+    );
+
+    out.push('\n');
+    emit_doc(out, &f.doc, "");
+    if let Some(msg) = &f.deprecated {
+        let escaped = msg.replace('\'', "\\'");
+        out.push_str(&format!("@Deprecated('{escaped}')\n"));
+    }
+    out.push_str(&format!(
+        "Future<{pub_ret}> {wrapper_name}({}) {{\n",
+        wrapper_params.join(", ")
+    ));
+
+    let completer_type = if f.returns.is_some() {
+        pub_ret.to_string()
     } else {
-        out.push('\n');
-        emit_doc(out, &f.doc, "");
-        if let Some(msg) = &f.deprecated {
-            let escaped = msg.replace('\'', "\\'");
-            out.push_str(&format!("@Deprecated('{escaped}')\n"));
+        "void".to_string()
+    };
+    out.push_str(&format!(
+        "  final completer = Completer<{completer_type}>();\n"
+    ));
+
+    let mut native_strings = Vec::new();
+    for p in &f.params {
+        if matches!(p.ty, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
+            let pname = p.name.to_lower_camel_case();
+            let ptr = format!("{pname}Ptr");
+            out.push_str(&format!("  final {ptr} = {pname}.toNativeUtf8();\n"));
+            native_strings.push(ptr);
         }
-        out.push_str(&format!(
-            "{pub_ret} {wrapper_name}({}) {{\n",
-            wrapper_params.join(", ")
-        ));
-        emit_function_body(out, f, &c_sym);
-        out.push_str("}\n");
+    }
+
+    let cb_dart_params: Vec<String> = std::iter::once("Pointer<Void>".to_string())
+        .chain(std::iter::once("Pointer<_WeaveffiError>".to_string()))
+        .chain(cb_extras.iter().map(|(_, d)| (*d).to_string()))
+        .collect();
+    let cb_arg_names: Vec<String> = (0..cb_dart_params.len())
+        .map(|i| match i {
+            0 => "context".to_string(),
+            1 => "err".to_string(),
+            2 => "result".to_string(),
+            3 => "resultLen".to_string(),
+            4 => "resultLenExtra".to_string(),
+            _ => format!("arg{i}"),
+        })
+        .collect();
+    let cb_param_decls: Vec<String> = cb_dart_params
+        .iter()
+        .zip(cb_arg_names.iter())
+        .map(|(t, n)| format!("{t} {n}"))
+        .collect();
+
+    out.push_str(&format!("  late NativeCallable<{cb_typedef}> callable;\n"));
+    out.push_str(&format!(
+        "  callable = NativeCallable<{cb_typedef}>.listener(({}) {{\n",
+        cb_param_decls.join(", ")
+    ));
+    out.push_str("    try {\n");
+    out.push_str("      if (err.address != 0 && err.ref.code != 0) {\n");
+    out.push_str("        final code = err.ref.code;\n");
+    out.push_str("        final msg = err.ref.message.toDartString();\n");
+    out.push_str("        _weaveffiErrorClear(err);\n");
+    out.push_str("        completer.completeError(WeaveffiException(code, msg));\n");
+    out.push_str("        return;\n");
+    out.push_str("      }\n");
+    emit_async_complete(out, f.returns.as_ref(), "      ");
+    out.push_str("    } catch (e) {\n");
+    out.push_str("      completer.completeError(e);\n");
+    out.push_str("    } finally {\n");
+    out.push_str("      callable.close();\n");
+    out.push_str("    }\n");
+    out.push_str("  });\n");
+
+    let mut call_args: Vec<String> = Vec::new();
+    for p in &f.params {
+        let pname = p.name.to_lower_camel_case();
+        call_args.push(match &p.ty {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("{pname}Ptr"),
+            TypeRef::Bool => format!("{pname} ? 1 : 0"),
+            TypeRef::Enum(_) => format!("{pname}.value"),
+            TypeRef::TypedHandle(_) | TypeRef::Struct(_) => format!("{pname}._handle"),
+            _ => pname,
+        });
+    }
+    if f.cancellable {
+        call_args.push("nullptr".into());
+    }
+    call_args.push("callable.nativeFunction".into());
+    call_args.push("nullptr".into());
+
+    let var = async_sym.to_lower_camel_case();
+    out.push_str("  try {\n");
+    out.push_str(&format!("    _{var}({});\n", call_args.join(", ")));
+    out.push_str("  } catch (e) {\n");
+    out.push_str("    callable.close();\n");
+    for ns in &native_strings {
+        out.push_str(&format!("    calloc.free({ns});\n"));
+    }
+    out.push_str("    rethrow;\n");
+    out.push_str("  }\n");
+    if native_strings.is_empty() {
+        out.push_str("  return completer.future;\n");
+    } else {
+        out.push_str("  return completer.future.whenComplete(() {\n");
+        for ns in &native_strings {
+            out.push_str(&format!("    calloc.free({ns});\n"));
+        }
+        out.push_str("  });\n");
+    }
+    out.push_str("}\n");
+}
+
+fn emit_async_complete(out: &mut String, ty: Option<&TypeRef>, indent: &str) {
+    match ty {
+        None => {
+            out.push_str(&format!("{indent}completer.complete();\n"));
+        }
+        Some(TypeRef::Bool) => {
+            out.push_str(&format!("{indent}completer.complete(result != 0);\n"));
+        }
+        Some(TypeRef::Enum(name)) => {
+            let n = name.to_upper_camel_case();
+            out.push_str(&format!(
+                "{indent}completer.complete({n}.fromValue(result));\n"
+            ));
+        }
+        Some(TypeRef::Struct(name)) => {
+            let n = local_type_name(name).to_upper_camel_case();
+            out.push_str(&format!("{indent}completer.complete({n}._(result));\n"));
+        }
+        Some(TypeRef::TypedHandle(name)) => {
+            let n = name.to_upper_camel_case();
+            out.push_str(&format!("{indent}completer.complete({n}._(result));\n"));
+        }
+        Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
+            out.push_str(&format!(
+                "{indent}completer.complete(result.toDartString());\n"
+            ));
+        }
+        Some(TypeRef::Optional(inner)) => match inner.as_ref() {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                out.push_str(&format!("{indent}if (result == nullptr) {{\n"));
+                out.push_str(&format!("{indent}  completer.complete(null);\n"));
+                out.push_str(&format!("{indent}}} else {{\n"));
+                out.push_str(&format!(
+                    "{indent}  completer.complete(result.toDartString());\n"
+                ));
+                out.push_str(&format!("{indent}}}\n"));
+            }
+            TypeRef::Struct(name) => {
+                let n = local_type_name(name).to_upper_camel_case();
+                out.push_str(&format!("{indent}if (result == nullptr) {{\n"));
+                out.push_str(&format!("{indent}  completer.complete(null);\n"));
+                out.push_str(&format!("{indent}}} else {{\n"));
+                out.push_str(&format!("{indent}  completer.complete({n}._(result));\n"));
+                out.push_str(&format!("{indent}}}\n"));
+            }
+            TypeRef::TypedHandle(name) => {
+                let n = name.to_upper_camel_case();
+                out.push_str(&format!("{indent}if (result == nullptr) {{\n"));
+                out.push_str(&format!("{indent}  completer.complete(null);\n"));
+                out.push_str(&format!("{indent}}} else {{\n"));
+                out.push_str(&format!("{indent}  completer.complete({n}._(result));\n"));
+                out.push_str(&format!("{indent}}}\n"));
+            }
+            _ => {
+                out.push_str(&format!("{indent}completer.complete(result);\n"));
+            }
+        },
+        Some(_) => {
+            out.push_str(&format!("{indent}completer.complete(result);\n"));
+        }
     }
 }
 
@@ -1122,18 +1351,56 @@ mod tests {
 
         let dart = render_dart_module(&api);
         assert!(
-            dart.contains("import 'dart:isolate'"),
-            "missing isolate import: {dart}"
+            dart.contains("import 'dart:async'"),
+            "missing dart:async import: {dart}"
         );
         assert!(
-            dart.contains("String _fetchData(int id)"),
-            "missing sync helper: {dart}"
-        );
-        assert!(
-            dart.contains("Future<String> fetchData(int id) async"),
+            dart.contains("Future<String> fetchData(int id)"),
             "missing async wrapper: {dart}"
         );
-        assert!(dart.contains("Isolate.run"), "missing Isolate.run: {dart}");
+        assert!(
+            dart.contains("NativeCallable<_NativeAsyncCb_weaveffi_math_fetch_data>.listener"),
+            "missing NativeCallable.listener: {dart}"
+        );
+        assert!(
+            dart.contains("weaveffi_math_fetch_data_async"),
+            "must call the _async C symbol: {dart}"
+        );
+    }
+
+    /// `NativeCallable.listener` allocates a native trampoline that pins the
+    /// Dart closure across the C boundary. It must be matched by exactly one
+    /// `callable.close()` on every exit path so the trampoline is freed when
+    /// the future resolves.
+    #[test]
+    fn dart_async_pins_callback_for_lifetime() {
+        let api = make_api(vec![simple_module(vec![Function {
+            name: "fetch_data".into(),
+            params: vec![Param {
+                name: "id".into(),
+                ty: TypeRef::I32,
+                mutable: false,
+                doc: None,
+            }],
+            returns: Some(TypeRef::StringUtf8),
+            doc: None,
+            r#async: true,
+            cancellable: false,
+            deprecated: None,
+            since: None,
+        }])]);
+        let dart = render_dart_module(&api);
+        let pin_count = dart.matches(".listener(").count();
+        let unpin_count = dart.matches("callable.close()").count();
+        assert_eq!(
+            pin_count, 1,
+            "expected one NativeCallable.listener per async fn, got {pin_count}: {dart}"
+        );
+        // Two close sites per fn: callback finally, and try/catch around _ffiCall.
+        assert_eq!(
+            unpin_count, 2,
+            "expected callable.close() in callback finally and synchronous catch (2 total), got {unpin_count}: {dart}"
+        );
     }
 
     #[test]

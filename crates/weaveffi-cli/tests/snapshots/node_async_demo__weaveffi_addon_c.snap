@@ -100,13 +100,58 @@ static napi_value Napi_weaveffi_tasks_cancel_task(napi_env env, napi_callback_in
   return ret;
 }
 
+static void weaveffi_tasks_run_n_tasks_napi_cb(void* context, weaveffi_error* err, int32_t result) {
+    weaveffi_napi_async_ctx* ctx = (weaveffi_napi_async_ctx*)context;
+    if (err != NULL && err->code != 0) {
+        napi_value err_msg;
+        napi_create_string_utf8(ctx->env, err->message, NAPI_AUTO_LENGTH, &err_msg);
+        napi_reject_deferred(ctx->env, ctx->deferred, err_msg);
+    } else {
+        napi_value val;
+        napi_create_int32(ctx->env, result, &val);
+        napi_resolve_deferred(ctx->env, ctx->deferred, val);
+    }
+    free(ctx);
+}
+
+static napi_value Napi_weaveffi_tasks_run_n_tasks(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  int32_t n;
+  napi_get_value_int32(env, args[0], &n);
+  weaveffi_napi_async_ctx* ctx = (weaveffi_napi_async_ctx*)malloc(sizeof(weaveffi_napi_async_ctx));
+  ctx->env = env;
+  napi_value promise;
+  napi_create_promise(env, &ctx->deferred, &promise);
+  weaveffi_tasks_run_n_tasks_async(n, weaveffi_tasks_run_n_tasks_napi_cb, ctx);
+  return promise;
+}
+
+static napi_value Napi_weaveffi_tasks_active_callbacks(napi_env env, napi_callback_info info) {
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, NULL, NULL, NULL);
+  weaveffi_error err = {0};
+  int64_t result = weaveffi_tasks_active_callbacks(&err);
+  if (err.code != 0) {
+    napi_throw_error(env, NULL, err.message);
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_int64(env, result, &ret);
+  return ret;
+}
+
 static napi_value Init(napi_env env, napi_value exports) {
   napi_property_descriptor props[] = {
     { "run_task", NULL, Napi_weaveffi_tasks_run_task, NULL, NULL, NULL, napi_default, NULL },
     { "run_batch", NULL, Napi_weaveffi_tasks_run_batch, NULL, NULL, NULL, napi_default, NULL },
     { "cancel_task", NULL, Napi_weaveffi_tasks_cancel_task, NULL, NULL, NULL, napi_default, NULL },
+    { "run_n_tasks", NULL, Napi_weaveffi_tasks_run_n_tasks, NULL, NULL, NULL, napi_default, NULL },
+    { "active_callbacks", NULL, Napi_weaveffi_tasks_active_callbacks, NULL, NULL, NULL, napi_default, NULL },
   };
-  napi_define_properties(env, exports, 3, props);
+  napi_define_properties(env, exports, 5, props);
   return exports;
 }
 

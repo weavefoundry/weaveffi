@@ -20,3 +20,11 @@ export function run_batch(names: string[]): Promise<TaskResult[]>
  * Maps to C function: weaveffi_tasks_cancel_task
  */
 export function cancel_task(id: number): boolean
+/**
+ * Maps to C function: weaveffi_tasks_run_n_tasks
+ */
+export function run_n_tasks(n: number): Promise<number>
+/**
+ * Maps to C function: weaveffi_tasks_active_callbacks
+ */
+export function active_callbacks(): number

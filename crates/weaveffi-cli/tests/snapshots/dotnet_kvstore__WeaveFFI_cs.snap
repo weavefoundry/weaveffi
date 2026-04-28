@@ -571,20 +571,39 @@ namespace WeaveFFI
             var tcs = new TaskCompletionSource<long>(TaskCreationOptions.RunContinuationsAsynchronously);
             NativeMethods.AsyncCb_weaveffi_kv_compact_async callback = (context, err, result) =>
             {
-                if (err != IntPtr.Zero)
+                try
                 {
-                    var wErr = Marshal.PtrToStructure<WeaveffiError>(err);
-                    if (wErr.Code != 0)
+                    if (err != IntPtr.Zero)
                     {
-                        var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? "";
-                        tcs.SetException(new WeaveffiException(wErr.Code, msg));
-                        return;
+                        var wErr = Marshal.PtrToStructure<WeaveffiError>(err);
+                        if (wErr.Code != 0)
+                        {
+                            var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? "";
+                            tcs.SetException(new WeaveffiException(wErr.Code, msg));
+                            return;
+                        }
+                    }
+                    tcs.SetResult(result);
+                }
+                finally
+                {
+                    if (context != IntPtr.Zero)
+                    {
+                        GCHandle.FromIntPtr(context).Free();
                     }
                 }
-                tcs.SetResult(result);
             };
-            var gcHandle = GCHandle.Alloc(callback);
-            NativeMethods.weaveffi_kv_compact_async_async(store.Handle, IntPtr.Zero, callback, IntPtr.Zero);
+            var gcHandle = GCHandle.Alloc(callback, GCHandleType.Normal);
+            var ctx = GCHandle.ToIntPtr(gcHandle);
+            try
+            {
+                NativeMethods.weaveffi_kv_compact_async_async(store.Handle, IntPtr.Zero, callback, ctx);
+            }
+            catch
+            {
+                if (gcHandle.IsAllocated) gcHandle.Free();
+                throw;
+            }
             return await tcs.Task;
         }
 
