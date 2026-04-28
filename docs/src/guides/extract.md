@@ -1,102 +1,39 @@
 # Annotated Rust Extraction
 
-Instead of hand-writing a YAML, JSON, or TOML API definition, you can annotate
-your Rust source code with WeaveFFI attributes and extract an equivalent IDL
-file automatically. This keeps your API definition co-located with your
-implementation and eliminates drift between the two.
+## Overview
 
-## Attributes
+Instead of hand-writing an IDL, you can annotate your Rust source with
+WeaveFFI marker attributes and let `weaveffi extract` produce the IDL
+for you. The result keeps the IDL co-located with the implementation
+and eliminates drift between the two — change the Rust signatures and
+re-run extract.
 
-WeaveFFI recognises three marker attributes. They are checked by name only — no
-proc-macro crate is required. You can define them as no-op attribute macros, or
-simply allow unknown attributes in the annotated module.
+## When to use
 
-### `#[weaveffi_export]`
+Reach for `weaveffi extract` when:
 
-Marks a free function for export. The function signature (name, parameters,
-return type) is extracted into the `functions` list of the enclosing module.
+- The Rust implementation already exists and you want a starting IDL.
+- The IDL changes whenever signatures change, and you want a single
+  source of truth.
+- You are scaffolding a new module and would rather decorate Rust than
+  write YAML by hand.
 
-```rust
-mod math {
-    #[weaveffi_export]
-    fn add(a: i32, b: i32) -> i32 {
-        a + b
-    }
-}
-```
+Skip extraction when:
 
-- `self` / `&self` receivers are ignored (only typed parameters are extracted).
-- The function body is irrelevant to extraction; only the signature matters.
-- Doc comments (`///`) on the function become the `doc` field in the IR.
+- You want to design the API before any Rust exists — author the IDL
+  directly.
+- The function uses references, generics, async, or other patterns
+  that the extractor cannot infer from syntax alone (see Pitfalls).
+- You need control over `async: true`, `cancellable: true`, or
+  `deprecated:` flags that the extractor never emits.
 
-### `#[weaveffi_struct]`
+## Step-by-step
 
-Marks a struct for export. Only structs with named fields are supported.
+### 1. Annotate the Rust source
 
-```rust
-mod shapes {
-    /// A 2D point.
-    #[weaveffi_struct]
-    struct Point {
-        x: f64,
-        /// The vertical coordinate.
-        y: f64,
-    }
-}
-```
-
-- Tuple structs and unit structs are not supported.
-- Doc comments on the struct and individual fields are preserved.
-
-### `#[weaveffi_enum]`
-
-Marks an enum for export. The enum **must** have `#[repr(i32)]` and every
-variant **must** have an explicit integer discriminant.
-
-```rust
-mod status {
-    /// Traffic-light colors.
-    #[weaveffi_enum]
-    #[repr(i32)]
-    enum Color {
-        Red = 0,
-        Green = 1,
-        Blue = 2,
-    }
-}
-```
-
-- Negative discriminants are supported (e.g. `Neg = -1`).
-- Variants without explicit values cause an extraction error.
-- Enums without `#[repr(i32)]` cause an extraction error.
-
-## Type mapping rules
-
-The extractor maps Rust types to WeaveFFI `TypeRef` values according to these
-rules:
-
-| Rust type                  | WeaveFFI TypeRef         | IDL string       |
-|----------------------------|--------------------------|-------------------|
-| `i32`                      | `I32`                    | `i32`             |
-| `u32`                      | `U32`                    | `u32`             |
-| `i64`                      | `I64`                    | `i64`             |
-| `f64`                      | `F64`                    | `f64`             |
-| `bool`                     | `Bool`                   | `bool`            |
-| `String`                   | `StringUtf8`             | `string`          |
-| `Vec<u8>`                  | `Bytes`                  | `bytes`           |
-| `u64`                      | `Handle`                 | `handle`          |
-| `Vec<T>`                   | `List(T)`                | `[T]`             |
-| `Option<T>`                | `Optional(T)`            | `T?`              |
-| `HashMap<K, V>`            | `Map(K, V)`              | `{K:V}`           |
-| `BTreeMap<K, V>`           | `Map(K, V)`              | `{K:V}`           |
-| Any other identifier       | `Struct(name)`           | `name`            |
-
-Types compose recursively — `Option<Vec<i32>>` becomes `[i32]?` and
-`Vec<Option<String>>` becomes `[string?]`.
-
-## Complete example
-
-Given the following annotated Rust module:
+WeaveFFI recognises three marker attributes by name only — there is no
+proc-macro crate. Define them as no-op attribute macros, or add
+`#![allow(unknown_lints)]` and ignore the warning.
 
 ```rust
 mod inventory {
@@ -132,7 +69,27 @@ mod inventory {
 }
 ```
 
-Running `weaveffi extract lib.rs` produces:
+- `#[weaveffi_export]` — exports a free function. `self` / `&self`
+  receivers are ignored; only typed parameters are extracted.
+- `#[weaveffi_struct]` — exports a struct with named fields.
+- `#[weaveffi_enum]` — exports an enum that has `#[repr(i32)]` and
+  explicit discriminants on every variant.
+
+Doc comments (`///`) on items and fields become the `doc` field in
+the IR.
+
+### 2. Run `weaveffi extract`
+
+```sh
+weaveffi extract src/api.rs                   # YAML to stdout
+weaveffi extract src/api.rs -o api.yml         # YAML to file
+weaveffi extract src/api.rs -f json -o api.json  # JSON to file
+weaveffi extract src/api.rs | weaveffi generate -o generated
+```
+
+### 3. Review the generated IDL
+
+For the example above, extraction produces:
 
 ```yaml
 version: '0.1.0'
@@ -179,9 +136,20 @@ modules:
       value: 2
 ```
 
-This YAML can then be fed directly to `weaveffi generate` to produce bindings.
+The extractor always sets `async: false`. To expose async functions,
+edit the YAML to flip `async: true` (and `cancellable: true` when
+appropriate) before running `weaveffi generate`.
 
-## CLI command
+### 4. Validate and generate
+
+```sh
+weaveffi validate api.yml
+weaveffi generate api.yml -o generated/
+```
+
+## Reference
+
+### CLI command
 
 ```
 weaveffi extract <INPUT> [--output <PATH>] [--format <FORMAT>]
@@ -193,54 +161,51 @@ weaveffi extract <INPUT> [--output <PATH>] [--format <FORMAT>]
 | `-o`, `--output` | stdout   | Write to a file instead of stdout             |
 | `-f`, `--format` | `yaml`   | Output format: `yaml`, `json`, or `toml`      |
 
-### Examples
+The extracted IDL is validated automatically. Warnings are printed to
+stderr but do not prevent output.
 
-```sh
-# Print YAML to stdout
-weaveffi extract src/api.rs
+### Type mapping
 
-# Write JSON to a file
-weaveffi extract src/api.rs --format json --output api.json
+| Rust type                  | WeaveFFI TypeRef         | IDL string       |
+|----------------------------|--------------------------|------------------|
+| `i32`                      | `I32`                    | `i32`            |
+| `u32`                      | `U32`                    | `u32`            |
+| `i64`                      | `I64`                    | `i64`            |
+| `f64`                      | `F64`                    | `f64`            |
+| `bool`                     | `Bool`                   | `bool`           |
+| `String`                   | `StringUtf8`             | `string`         |
+| `Vec<u8>`                  | `Bytes`                  | `bytes`          |
+| `u64`                      | `Handle`                 | `handle`         |
+| `Vec<T>`                   | `List(T)`                | `[T]`            |
+| `Option<T>`                | `Optional(T)`            | `T?`             |
+| `HashMap<K, V>`            | `Map(K, V)`              | `{K:V}`          |
+| `BTreeMap<K, V>`           | `Map(K, V)`              | `{K:V}`          |
+| Any other identifier       | `Struct(name)`           | `name`           |
 
-# Pipe into generate
-weaveffi extract src/api.rs -o api.yml && weaveffi generate api.yml -o generated
-```
+Compositions work recursively — `Option<Vec<i32>>` becomes `[i32]?`
+and `Vec<Option<String>>` becomes `[string?]`.
 
-The extracted API is validated after extraction. Validation warnings are printed
-to stderr but do not prevent output.
+## Pitfalls
 
-## Limitations and unsupported patterns
-
-The extractor uses `syn` to parse Rust source at the syntax level. It does not
-perform type resolution, trait solving, or macro expansion. The following
-patterns are **not** supported:
-
-- **Trait implementations.** Methods inside `impl Trait for Struct` blocks are
-  not scanned. Only free functions annotated with `#[weaveffi_export]` are
-  extracted.
-
-- **Generic functions.** Functions with type parameters (`fn foo<T>(...)`) are
-  not supported. All parameter and return types must be concrete.
-
-- **Lifetime annotations.** References (`&str`, `&[u8]`) and lifetime
-  parameters (`'a`) are not supported. Use owned types (`String`, `Vec<u8>`).
-
-- **`self` receivers.** `fn method(&self, ...)` parameters are silently
-  skipped. Only typed parameters are extracted.
-
-- **External modules.** `mod foo;` declarations (without an inline body) are
-  skipped. The extractor only processes modules with inline content
-  (`mod foo { ... }`).
-
-- **Tuple and unit structs.** Only structs with named fields are supported by
-  `#[weaveffi_struct]`.
-
-- **Enums without `#[repr(i32)]`.** The extractor requires `#[repr(i32)]` and
-  explicit discriminants on every variant. Rust-style enums with data payloads
-  are not supported.
-
-- **Macro-generated items.** Items produced by procedural or declarative macros
-  are invisible to the extractor since it operates on unexpanded source.
-
-- **Async functions.** The `async` field is always set to `false`. The WeaveFFI
-  validator rejects `async: true`.
+- **`syn` parses syntax, not semantics.** The extractor never resolves
+  types, runs trait solving, or expands macros. Items produced by
+  proc-macros and declarative macros are invisible.
+- **Trait `impl` blocks are skipped.** Only free functions tagged
+  with `#[weaveffi_export]` are extracted; `impl Foo` methods are
+  ignored.
+- **Generics are not supported.** Functions with `<T>` parameters
+  cannot be extracted. Use concrete types.
+- **References and lifetimes are not supported.** Use owned types
+  (`String`, `Vec<u8>`); `&str` and `&[u8]` cannot be extracted.
+- **External `mod foo;` declarations are skipped.** Only inline
+  modules (`mod foo { ... }`) are processed.
+- **Tuple and unit structs are not supported.** Only structs with
+  named fields work with `#[weaveffi_struct]`.
+- **Enums must use `#[repr(i32)]` with explicit discriminants.**
+  Rust-style enums with payloads cannot be extracted.
+- **Async cannot be inferred.** The extractor always emits
+  `async: false`. Async functions are fully supported — flip the
+  field manually after extraction. See the
+  [Async Functions guide](async.md).
+- **`deprecated:` and other metadata are not inferred.** Add them by
+  hand if you need them.

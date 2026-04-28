@@ -30,7 +30,7 @@ Generated packages are fully self-contained and publishable to their
 native ecosystem (npm, CocoaPods, Maven Central, PyPI, NuGet, pub.dev,
 RubyGems, etc.) without requiring consumers to install WeaveFFI tooling
 or runtime dependencies. WeaveFFI is a build-time tool for library
-authors — end users should never need to know it exists. Helper code
+authors — consumers should never need to know it exists. Helper code
 (error types, memory management utilities) is generated inline into each
 package rather than pulled from a shared runtime dependency.
 

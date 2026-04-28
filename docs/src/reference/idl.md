@@ -1,8 +1,8 @@
 # IDL Type Reference
 
-WeaveFFI consumes a declarative API definition (IDL) that describes modules,
-types, and functions. YAML, JSON, and TOML are all supported; this reference
-uses YAML throughout.
+WeaveFFI consumes a declarative IDL (Interface Definition Language) that
+describes modules, types, and functions. YAML, JSON, and TOML are all
+supported; this reference uses YAML throughout.
 
 ## Editor autocomplete (JSON Schema)
 
@@ -21,7 +21,10 @@ in the repository root.
 
 ## Top-level structure
 
-```yaml
+The shape of an IDL document, with placeholder ellipses for nested arrays
+and objects:
+
+```text
 # yaml-language-server: $schema=./weaveffi.schema.json
 version: "0.3.0"
 modules:
@@ -37,6 +40,9 @@ generators:
   swift:
     module_name: MyApp
 ```
+
+A complete, validating example lives at the bottom of this page in the
+[Complete example](#complete-example) section.
 
 | Field        | Type                        | Required | Description                              |
 |--------------|-----------------------------|----------|------------------------------------------|
@@ -103,67 +109,74 @@ parameters and return types.
 ### Primitive examples
 
 ```yaml
-functions:
-  - name: add
-    params:
-      - { name: a, type: i32 }
-      - { name: b, type: i32 }
-    return: i32
+version: "0.3.0"
+modules:
+  - name: primitives
+    structs:
+      - name: Session
+        fields:
+          - { name: id, type: i64 }
+    functions:
+      - name: add
+        params:
+          - { name: a, type: i32 }
+          - { name: b, type: i32 }
+        return: i32
 
-  - name: scale
-    params:
-      - { name: value, type: f64 }
-      - { name: factor, type: f64 }
-    return: f64
+      - name: scale
+        params:
+          - { name: value, type: f64 }
+          - { name: factor, type: f64 }
+        return: f64
 
-  - name: count
-    params:
-      - { name: limit, type: u32 }
-    return: u32
+      - name: count
+        params:
+          - { name: limit, type: u32 }
+        return: u32
 
-  - name: timestamp
-    params: []
-    return: i64
+      - name: timestamp
+        params: []
+        return: i64
 
-  - name: is_valid
-    params:
-      - { name: token, type: string }
-    return: bool
+      - name: is_valid
+        params:
+          - { name: token, type: string }
+        return: bool
 
-  - name: echo
-    params:
-      - { name: message, type: string }
-    return: string
+      - name: echo
+        params:
+          - { name: message, type: string }
+        return: string
 
-  - name: compress
-    params:
-      - { name: data, type: bytes }
-    return: bytes
+      - name: compress
+        params:
+          - { name: data, type: bytes }
+        return: bytes
 
-  - name: open_resource
-    params:
-      - { name: path, type: string }
-    return: handle
+      - name: open_resource
+        params:
+          - { name: path, type: string }
+        return: handle
 
-  - name: close_resource
-    params:
-      - { name: id, type: handle }
+      - name: close_resource
+        params:
+          - { name: id, type: handle }
 
-  - name: open_session
-    params:
-      - { name: config, type: string }
-    return: "handle<Session>"
-    doc: "Returns a typed handle scoped to Session"
+      - name: open_session
+        params:
+          - { name: config, type: string }
+        return: "handle<Session>"
+        doc: "Returns a typed handle scoped to Session"
 
-  - name: write_fast
-    params:
-      - { name: data, type: "&str" }
-    doc: "Borrowed string — no copy at the FFI boundary"
+      - name: write_fast
+        params:
+          - { name: data, type: "&str" }
+        doc: "Borrowed string — no copy at the FFI boundary"
 
-  - name: send_raw
-    params:
-      - { name: payload, type: "&[u8]" }
-    doc: "Borrowed byte slice — no copy at the FFI boundary"
+      - name: send_raw
+        params:
+          - { name: payload, type: "&[u8]" }
+        doc: "Borrowed byte slice — no copy at the FFI boundary"
 ```
 
 ### Typed handles
@@ -171,16 +184,26 @@ functions:
 `handle<T>` is a typed variant of `handle` that associates the opaque
 identifier with a named type `T`. This gives generators type-safety
 information — for example, generating a distinct wrapper class per handle
-type. At the C ABI level, `handle<T>` is still a `uint64_t`.
+type. `T` must be a struct defined in the same module so the generator
+knows how to spell the handle's type. At the C ABI level, `handle<T>` is
+still a `uint64_t`.
 
 ```yaml
-functions:
-  - name: create_session
-    return: "handle<Session>"
+version: "0.3.0"
+modules:
+  - name: sessions
+    structs:
+      - name: Session
+        fields:
+          - { name: id, type: i64 }
+    functions:
+      - name: create_session
+        params: []
+        return: "handle<Session>"
 
-  - name: close_session
-    params:
-      - { name: session, type: "handle<Session>" }
+      - name: close_session
+        params:
+          - { name: session, type: "handle<Session>" }
 ```
 
 ### Borrowed types
@@ -226,6 +249,7 @@ Each field:
 ### Struct example
 
 ```yaml
+version: "0.3.0"
 modules:
   - name: geometry
     structs:
@@ -302,6 +326,7 @@ Each variant:
 ### Enum example
 
 ```yaml
+version: "0.3.0"
 modules:
   - name: contacts
     enums:
@@ -344,29 +369,27 @@ the default is null.
 ### Optional example
 
 ```yaml
-structs:
-  - name: Contact
-    fields:
-      - name: id
-        type: i64
-      - name: name
-        type: string
-      - name: email
-        type: "string?"
-      - name: nickname
-        type: "string?"
+version: "0.3.0"
+modules:
+  - name: contacts
+    structs:
+      - name: Contact
+        fields:
+          - { name: id, type: i64 }
+          - { name: name, type: string }
+          - { name: email, type: "string?" }
+          - { name: nickname, type: "string?" }
+    functions:
+      - name: find_contact
+        params:
+          - { name: id, type: i64 }
+        return: "Contact?"
+        doc: "Returns null if no contact exists with the given id"
 
-functions:
-  - name: find_contact
-    params:
-      - { name: id, type: i64 }
-    return: "Contact?"
-    doc: "Returns null if no contact exists with the given id"
-
-  - name: update_email
-    params:
-      - { name: id, type: i64 }
-      - { name: email, type: "string?" }
+      - name: update_email
+        params:
+          - { name: id, type: i64 }
+          - { name: email, type: "string?" }
 ```
 
 > **YAML note:** Quote optional types like `"string?"` and `"Contact?"` to
@@ -388,20 +411,27 @@ Wrap a type in `[T]` brackets to declare a list (variable-length sequence).
 ### List example
 
 ```yaml
-functions:
-  - name: sum
-    params:
-      - { name: values, type: "[i32]" }
-    return: i32
+version: "0.3.0"
+modules:
+  - name: lists
+    structs:
+      - name: Contact
+        fields:
+          - { name: id, type: i64 }
+    functions:
+      - name: sum
+        params:
+          - { name: values, type: "[i32]" }
+        return: i32
 
-  - name: list_contacts
-    params: []
-    return: "[Contact]"
+      - name: list_contacts
+        params: []
+        return: "[Contact]"
 
-  - name: batch_delete
-    params:
-      - { name: ids, type: "[i64]" }
-    return: i32
+      - name: batch_delete
+        params:
+          - { name: ids, type: "[i64]" }
+        return: i32
 ```
 
 > **YAML note:** Quote list types like `"[i32]"` and `"[Contact]"` because
@@ -425,30 +455,32 @@ and maps are not valid key types. Values may be any valid `TypeRef`.
 ### Map example
 
 ```yaml
-structs:
-  - name: Contact
-    fields:
-      - { name: id, type: i64 }
-      - { name: name, type: string }
-      - { name: email, type: "string?" }
+version: "0.3.0"
+modules:
+  - name: maps
+    structs:
+      - name: Contact
+        fields:
+          - { name: id, type: i64 }
+          - { name: name, type: string }
+          - { name: email, type: "string?" }
+    functions:
+      - name: update_scores
+        params:
+          - { name: scores, type: "{string:i32}" }
+        return: bool
+        doc: "Update player scores by name"
 
-functions:
-  - name: update_scores
-    params:
-      - { name: scores, type: "{string:i32}" }
-    return: bool
-    doc: "Update player scores by name"
+      - name: get_contacts
+        params: []
+        return: "{string:Contact}"
+        doc: "Returns a map of name to Contact"
 
-  - name: get_contacts
-    params: []
-    return: "{string:Contact}"
-    doc: "Returns a map of name to Contact"
-
-  - name: merge_tags
-    params:
-      - { name: current, type: "{string:string}" }
-      - { name: additions, type: "{string:string}" }
-    return: "{string:string}"
+      - name: merge_tags
+        params:
+          - { name: current, type: "{string:string}" }
+          - { name: additions, type: "{string:string}" }
+        return: "{string:string}"
 ```
 
 > **YAML note:** Quote map types like `"{string:i32}"` because YAML
@@ -504,23 +536,30 @@ Optional and list modifiers compose freely:
 ### Nested type example
 
 ```yaml
-functions:
-  - name: search
-    params:
-      - { name: query, type: string }
-    return: "[Contact?]"
-    doc: "Returns a list where some entries may be null (redacted)"
+version: "0.3.0"
+modules:
+  - name: nested
+    structs:
+      - name: Contact
+        fields:
+          - { name: id, type: i64 }
+    functions:
+      - name: search
+        params:
+          - { name: query, type: string }
+        return: "[Contact?]"
+        doc: "Returns a list where some entries may be null (redacted)"
 
-  - name: get_scores
-    params:
-      - { name: user_id, type: i64 }
-    return: "[i32]?"
-    doc: "Returns null if user has no scores, otherwise a list"
+      - name: get_scores
+        params:
+          - { name: user_id, type: i64 }
+        return: "[i32]?"
+        doc: "Returns null if user has no scores, otherwise a list"
 
-  - name: bulk_update
-    params:
-      - { name: emails, type: "[string?]" }
-    return: i32
+      - name: bulk_update
+        params:
+          - { name: emails, type: "[string?]" }
+        return: i32
 ```
 
 The parser evaluates type syntax outside-in: `[Contact?]` is parsed as
@@ -544,12 +583,19 @@ one at a time and are suitable for large or streaming result sets.
 ### Iterator example
 
 ```yaml
-functions:
-  - name: scan_entries
-    params:
-      - { name: prefix, type: string }
-    return: "iter<Contact>"
-    doc: "Lazily iterates over matching contacts"
+version: "0.3.0"
+modules:
+  - name: streaming
+    structs:
+      - name: Contact
+        fields:
+          - { name: id, type: i64 }
+    functions:
+      - name: scan_entries
+        params:
+          - { name: prefix, type: string }
+        return: "iter<Contact>"
+        doc: "Lazily iterates over matching contacts"
 ```
 
 Iterators are only valid as **return types**. The validator rejects
@@ -574,8 +620,10 @@ invokes a caller-provided function.
 ### Callback example
 
 ```yaml
+version: "0.3.0"
 modules:
   - name: events
+    functions: []
     callbacks:
       - name: on_data
         params:
@@ -612,8 +660,10 @@ with subscribe/unsubscribe lifecycle management.
 ### Listener example
 
 ```yaml
+version: "0.3.0"
 modules:
   - name: events
+    functions: []
     callbacks:
       - name: on_data
         params:
@@ -647,6 +697,10 @@ modules:
 
     modules:
       - name: auth
+        structs:
+          - name: Session
+            fields:
+              - { name: id, type: i64 }
         functions:
           - name: login
             params:
@@ -689,19 +743,22 @@ Functions can be marked as asynchronous. See the
 behaviour.
 
 ```yaml
-functions:
-  - name: fetch_data
-    params:
-      - { name: url, type: string }
-    return: string
-    async: true
+version: "0.3.0"
+modules:
+  - name: net
+    functions:
+      - name: fetch_data
+        params:
+          - { name: url, type: string }
+        return: string
+        async: true
 
-  - name: upload_file
-    params:
-      - { name: path, type: string }
-    return: bool
-    async: true
-    cancellable: true
+      - name: upload_file
+        params:
+          - { name: path, type: string }
+        return: bool
+        async: true
+        cancellable: true
 ```
 
 Async void functions (no return type) emit a validator **warning** since
@@ -712,14 +769,17 @@ they are unusual.
 Mark a function as deprecated with a migration message:
 
 ```yaml
-functions:
-  - name: add_old
-    params:
-      - { name: a, type: i32 }
-      - { name: b, type: i32 }
-    return: i32
-    deprecated: "Use add_v2 instead"
-    since: "0.1.0"
+version: "0.3.0"
+modules:
+  - name: legacy
+    functions:
+      - name: add_old
+        params:
+          - { name: a, type: i32 }
+          - { name: b, type: i32 }
+        return: i32
+        deprecated: "Use add_v2 instead"
+        since: "0.1.0"
 ```
 
 Generators propagate the deprecation message to the target language
@@ -731,10 +791,13 @@ Generators propagate the deprecation message to the target language
 Mark a parameter as mutable when the callee may modify it in-place:
 
 ```yaml
-functions:
-  - name: fill_buffer
-    params:
-      - { name: buf, type: bytes, mutable: true }
+version: "0.3.0"
+modules:
+  - name: buffers
+    functions:
+      - name: fill_buffer
+        params:
+          - { name: buf, type: bytes, mutable: true }
 ```
 
 This affects the C ABI signature (non-const pointer) and may influence
@@ -809,7 +872,7 @@ All types are valid in both parameter and return positions unless noted.
 
 ## Complete example
 
-A full API definition combining structs, enums, optionals, lists, and nested
+A full IDL combining structs, enums, optionals, lists, and nested
 types:
 
 ```yaml
@@ -897,11 +960,19 @@ You can declare an optional error domain on a module to reserve symbolic names
 and numeric codes:
 
 ```yaml
-errors:
-  name: ContactErrors
-  codes:
-    - { name: not_found, code: 1, message: "Contact not found" }
-    - { name: duplicate, code: 2, message: "Contact already exists" }
+version: "0.3.0"
+modules:
+  - name: contacts
+    errors:
+      name: ContactErrors
+      codes:
+        - { name: not_found, code: 1, message: "Contact not found" }
+        - { name: duplicate, code: 2, message: "Contact already exists" }
+    functions:
+      - name: get_contact
+        params:
+          - { name: id, type: handle }
+        return: handle
 ```
 
 Error codes must be non-zero and unique. Error domain names must not collide
@@ -941,6 +1012,7 @@ Per-target syntax:
 Example IDL:
 
 ```yaml
+version: "0.3.0"
 modules:
   - name: docs
     structs:

@@ -1,23 +1,27 @@
-# Tutorial: Android App
+# Android App
 
-This tutorial walks through building a Rust library, generating Kotlin
-bindings with WeaveFFI, and integrating everything into an Android Studio
-project.
+## Goal
+
+Build a small Rust greeter library, generate Kotlin/JNI bindings with
+WeaveFFI, and call them from an Android Studio app running on an
+emulator or a physical device.
 
 ## Prerequisites
 
-- [Rust toolchain](https://rustup.rs/) (stable channel)
-- Android Studio with NDK installed (via SDK Manager)
-- WeaveFFI CLI installed (`cargo install weaveffi-cli`)
+- [Rust toolchain](https://rustup.rs/) (stable channel).
+- Android Studio with the NDK installed (via SDK Manager).
+- WeaveFFI CLI (`cargo install weaveffi-cli`).
 - Android Rust targets:
 
-```bash
-rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
-```
+  ```bash
+  rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+  ```
 
-## 1) Define your API
+## Step-by-step
 
-Create a file called `greeter.yml`:
+### 1. Author the IDL
+
+Save as `greeter.yml`:
 
 ```yaml
 version: "0.3.0"
@@ -40,13 +44,13 @@ modules:
         return: Greeting
 ```
 
-## 2) Generate bindings
+### 2. Generate bindings
 
 ```bash
 weaveffi generate greeter.yml -o generated --scaffold
 ```
 
-This produces (among other targets):
+You should see, among other targets:
 
 ```text
 generated/
@@ -63,13 +67,13 @@ generated/
 └── scaffold.rs
 ```
 
-## 3) Create the Rust library
+### 3. Implement the Rust library
 
 ```bash
 cargo init --lib mygreeter
 ```
 
-**mygreeter/Cargo.toml:**
+`mygreeter/Cargo.toml`:
 
 ```toml
 [package]
@@ -84,7 +88,7 @@ crate-type = ["cdylib"]
 weaveffi-abi = { version = "0.1" }
 ```
 
-**mygreeter/src/lib.rs:**
+`mygreeter/src/lib.rs`:
 
 ```rust
 #![allow(unsafe_code)]
@@ -107,34 +111,27 @@ pub extern "C" fn weaveffi_greeter_hello(
 }
 
 #[no_mangle]
-pub extern "C" fn weaveffi_free_string(ptr: *const c_char) {
-    abi::free_string(ptr);
-}
+pub extern "C" fn weaveffi_free_string(ptr: *const c_char) { abi::free_string(ptr); }
 
 #[no_mangle]
-pub extern "C" fn weaveffi_free_bytes(ptr: *mut u8, len: usize) {
-    abi::free_bytes(ptr, len);
-}
+pub extern "C" fn weaveffi_free_bytes(ptr: *mut u8, len: usize) { abi::free_bytes(ptr, len); }
 
 #[no_mangle]
-pub extern "C" fn weaveffi_error_clear(err: *mut weaveffi_error) {
-    abi::error_clear(err);
-}
+pub extern "C" fn weaveffi_error_clear(err: *mut weaveffi_error) { abi::error_clear(err); }
 ```
 
-Fill in the remaining functions using `scaffold.rs` as a guide.
+Use `scaffold.rs` for the rest of the API (`weaveffi_greeter_greeting`,
+the `Greeting` lifecycle, getters, ...).
 
-## 4) Configure the Android NDK toolchain
-
-Set the `ANDROID_NDK_HOME` environment variable to the NDK path. On
-macOS with Android Studio's default install location:
+### 4. Configure the NDK toolchain
 
 ```bash
 export ANDROID_NDK_HOME="$HOME/Library/Android/sdk/ndk/$(ls $HOME/Library/Android/sdk/ndk | sort -V | tail -1)"
+export PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin:$PATH"
 ```
 
-Create a `.cargo/config.toml` in your project to point Cargo at the NDK
-linkers:
+Replace `darwin-x86_64` with `linux-x86_64` on Linux. Add the matching
+`linker = ...` entries in `.cargo/config.toml`:
 
 ```toml
 [target.aarch64-linux-android]
@@ -147,15 +144,7 @@ linker = "armv7a-linux-androideabi21-clang"
 linker = "x86_64-linux-android21-clang"
 ```
 
-Add the NDK toolchain to your `PATH`:
-
-```bash
-export PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin:$PATH"
-```
-
-Replace `darwin-x86_64` with `linux-x86_64` on Linux.
-
-## 5) Cross-compile for Android
+### 5. Cross-compile for every ABI
 
 ```bash
 cargo build -p mygreeter --target aarch64-linux-android --release
@@ -163,7 +152,7 @@ cargo build -p mygreeter --target armv7-linux-androideabi --release
 cargo build -p mygreeter --target x86_64-linux-android --release
 ```
 
-This produces shared libraries:
+You should now have:
 
 ```text
 target/aarch64-linux-android/release/libmygreeter.so
@@ -171,21 +160,17 @@ target/armv7-linux-androideabi/release/libmygreeter.so
 target/x86_64-linux-android/release/libmygreeter.so
 ```
 
-## 6) Set up the Android Studio project
+### 6. Wire it into Android Studio
 
-1. **Create a new Android project** in Android Studio (Empty Activity,
-   Kotlin, minimum SDK 21+).
-
-2. **Copy the generated android module.** Copy the `generated/android/`
-   directory into your project as a Gradle module. In your root
-   `settings.gradle`, add:
+1. Create a new Android project (Empty Activity, Kotlin, `minSdk` 21+).
+2. Include the generated module in the root `settings.gradle`:
 
    ```groovy
    include ':weaveffi'
    project(':weaveffi').projectDir = new File('generated/android')
    ```
 
-3. **Add the module dependency.** In your app's `build.gradle`:
+3. Add it as a dependency in your app's `build.gradle`:
 
    ```groovy
    dependencies {
@@ -193,82 +178,85 @@ target/x86_64-linux-android/release/libmygreeter.so
    }
    ```
 
-4. **Place the Rust shared libraries.** Copy each `.so` into the
-   matching `jniLibs` directory:
+4. Copy the cdylib into `jniLibs` per ABI:
 
    ```bash
-   mkdir -p app/src/main/jniLibs/arm64-v8a
-   mkdir -p app/src/main/jniLibs/armeabi-v7a
-   mkdir -p app/src/main/jniLibs/x86_64
-
+   mkdir -p app/src/main/jniLibs/{arm64-v8a,armeabi-v7a,x86_64}
    cp target/aarch64-linux-android/release/libmygreeter.so \
      app/src/main/jniLibs/arm64-v8a/libmygreeter.so
-
    cp target/armv7-linux-androideabi/release/libmygreeter.so \
      app/src/main/jniLibs/armeabi-v7a/libmygreeter.so
-
    cp target/x86_64-linux-android/release/libmygreeter.so \
      app/src/main/jniLibs/x86_64/libmygreeter.so
    ```
 
-5. **Copy the C header.** The JNI shims need `weaveffi.h`. Ensure the
-   `CMakeLists.txt` in `generated/android/src/main/cpp/` has the
-   correct `target_include_directories` pointing to `generated/c/`.
+5. Confirm the JNI `CMakeLists.txt` in
+   `generated/android/src/main/cpp/` includes
+   `target_include_directories(... PRIVATE ../../../../c)` so it can
+   find `weaveffi.h`.
 
-## 7) Call from Kotlin
+### 7. Call from Kotlin
 
 ```kotlin
 import com.weaveffi.WeaveFFI
+import com.weaveffi.Greeting
 
 class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        val message = WeaveFFI.hello("Android")
-        findViewById<TextView>(R.id.textView).text = message
+        findViewById<TextView>(R.id.textView).text = WeaveFFI.hello("Android")
+
+        Greeting.create("Hi", "en").use { g ->
+            println("${g.message} (${g.lang})")
+        }
     }
 }
 ```
 
-The generated `WeaveFFI` companion object loads the native library
-automatically and exposes:
+The generated `WeaveFFI` companion object loads the cdylib lazily and
+exposes:
 
 - `WeaveFFI.hello(name: String): String`
-- `WeaveFFI.greeting(name: String, lang: String): Long` — returns an
-  opaque handle to a `Greeting` struct
+- `WeaveFFI.greeting(name: String, lang: String): Long` — opaque
+  handle that the `Greeting` wrapper consumes.
 
-Struct wrappers (like `Greeting`) implement `Closeable` for
-deterministic cleanup:
+`Greeting` implements `Closeable`; either call `.close()` or use
+`use { ... }` for deterministic cleanup.
 
-```kotlin
-import com.weaveffi.Greeting
+## Verification
 
-Greeting.create("Hi", "en").use { g ->
-    println("${g.message} (${g.lang})")
-}
+- Sync Gradle in Android Studio.
+- Pick an emulator or a connected device and press **Run** (Shift+F10).
+- The text view should display `Hello, Android!` and Logcat should
+  show `Hi (en)` from the `Greeting` block.
+- Common error mappings:
+
+  | Symptom                                            | Likely cause                                                                |
+  |----------------------------------------------------|-----------------------------------------------------------------------------|
+  | `UnsatisfiedLinkError: dlopen failed`              | The cdylib is missing from `jniLibs/` or built for the wrong ABI.            |
+  | `RuntimeException` from JNI                        | A WeaveFFI error was raised; inspect the message.                             |
+  | Linker errors during `cargo build`                 | `ANDROID_NDK_HOME` is not set or the NDK toolchain is missing from `PATH`.    |
+  | `No implementation found for native method`         | JNI symbol names do not match the Kotlin package; re-run `weaveffi generate`. |
+
+## Cleanup
+
+```bash
+rm -rf generated/ app/src/main/jniLibs
+cargo clean -p mygreeter
 ```
 
-## 8) Build and run
-
-1. Sync Gradle in Android Studio.
-2. Select an emulator or connected device.
-3. Press **Run** (Shift+F10). The app should display "Hello, Android!".
-
-## Troubleshooting
-
-| Problem | Solution |
-|---------|----------|
-| `UnsatisfiedLinkError: dlopen failed` | The `.so` is missing from `jniLibs/` or was built for the wrong ABI. |
-| `java.lang.RuntimeException` from JNI | A WeaveFFI error was raised. Check the exception message for details. |
-| Linker errors during `cargo build` | Ensure `ANDROID_NDK_HOME` is set and the NDK toolchain is on `PATH`. |
-| `No implementation found for native method` | The JNI function names must match the Kotlin package path exactly. |
+Drop the `include ':weaveffi'` line from `settings.gradle` and remove
+the dependency from your app module if you do not want to keep the
+generated bindings around.
 
 ## Next steps
 
 - See the [Android generator reference](../generators/android.md) for
-  type mapping and JNI details.
-- Read the [Error Handling](../guides/errors.md) guide — JNI shims
-  convert C errors to `RuntimeException` automatically.
-- Explore the [Calculator tutorial](calculator.md) for a simpler
-  end-to-end walkthrough.
+  the full type mapping and JNI conventions.
+- Read [Error Handling](../guides/errors.md) — JNI shims convert C
+  errors to `RuntimeException` automatically.
+- Try the [Calculator tutorial](calculator.md) for a simpler
+  end-to-end walkthrough or [Swift iOS](swift.md) for a sibling
+  mobile target.

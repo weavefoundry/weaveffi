@@ -34,13 +34,12 @@ cd my-project
 
 This creates a `my-project/` directory containing:
 
-- `weaveffi.yml` — an example API definition with `add`, `mul`, and `echo`
-  functions
+- `weaveffi.yml` — an example IDL with `add`, `mul`, and `echo` functions
 - `README.md` — quick-start notes
 
-## 3) Define your API
+## 3) Define your IDL
 
-Open `weaveffi.yml` and replace its contents with an API that has a struct and
+Open `weaveffi.yml` and replace its contents with an IDL that has a struct and
 a function:
 
 ```yaml
@@ -269,7 +268,7 @@ add(3, 4) = 7
 ## Checking a single target
 
 `weaveffi doctor` runs every toolchain check it knows about. To narrow it
-down to a single language target, pass `--target {name}`:
+down to a single target, pass `--target {name}`:
 
 ```bash
 weaveffi doctor --target dart
