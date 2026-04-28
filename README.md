@@ -276,12 +276,26 @@ Full documentation lives at <https://docs.weaveffi.com/> (sources under
 
 ## Status
 
-WeaveFFI is in **pre-1.0**; expect breaking changes until **1.0.0**. The C ABI
-naming convention (`{c_prefix}_{module}_{function}`), the `weaveffi-abi`
-runtime symbols (`weaveffi_free_string`, `weaveffi_free_bytes`,
-`weaveffi_error_clear`), and the IDL schema may all evolve in minor releases.
-We follow the rule that any breaking change is gated behind a `weaveffi
-upgrade` migration step so you can move IDLs forward mechanically.
+WeaveFFI is a **1.0.0 release candidate**. Every PRD-v4 phase is complete and
+the full quality gate (`cargo fmt`, `cargo clippy -D warnings`, `cargo test`,
+`cargo doc -D warnings`, `cargo deny`, `cargo audit`, `cargo machete`,
+`cargo insta test --check`, `cargo bench --no-run`, `weaveffi diff --check`
+on every sample) passes. The C ABI naming convention
+(`{c_prefix}_{module}_{function}`), the `weaveffi-abi` runtime symbols
+(`weaveffi_free_string`, `weaveffi_free_bytes`, `weaveffi_error_clear`),
+and the IDL schema are now considered stable; any breaking change is gated
+behind a `weaveffi upgrade` migration step so you can move IDLs forward
+mechanically.
+
+**Remaining blockers before tagging `1.0.0`:**
+
+- `weaveffi format --check` currently re-emits every IR field (including
+  `null`, `false`, and `[]` defaults) when canonicalising an IDL, which
+  makes the canonical form 2–3× longer than the hand-written sample IDLs
+  in `samples/*/`. Either the formatter must learn to omit
+  `serde(default)` values or every committed sample must be reformatted
+  to the verbose canonical form. Tracked as a follow-up; does not block
+  any CI gate today.
 
 Releases are fully automated by [semantic-release](https://semantic-release.gitbook.io/)
 on merge to `main`.
