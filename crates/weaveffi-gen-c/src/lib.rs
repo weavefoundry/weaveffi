@@ -10,22 +10,32 @@ use camino::Utf8Path;
 use heck::ToUpperCamelCase;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
-use weaveffi_core::utils::{c_abi_struct_name, render_abi_prefix_aliases};
+use weaveffi_core::utils::{
+    c_abi_struct_name, render_abi_prefix_aliases, render_prelude, render_trailer, CommentStyle,
+};
 use weaveffi_ir::ir::{Api, EnumDef, Module, Param, StructDef, TypeRef};
 
 pub struct CGenerator;
 
 impl CGenerator {
-    fn generate_impl(&self, api: &Api, out_dir: &Utf8Path, prefix: &str) -> Result<()> {
+    fn generate_impl(
+        &self,
+        api: &Api,
+        out_dir: &Utf8Path,
+        prefix: &str,
+        input_basename: &str,
+    ) -> Result<()> {
         let dir = out_dir.join("c");
         std::fs::create_dir_all(&dir)?;
+        let header_name = format!("{prefix}.h");
+        let source_name = format!("{prefix}.c");
         std::fs::write(
-            dir.join(format!("{prefix}.h")),
-            render_c_header(api, prefix),
+            dir.join(&header_name),
+            render_c_header(api, prefix, input_basename, &header_name),
         )?;
         std::fs::write(
-            dir.join(format!("{prefix}.c")),
-            render_c_convenience_c(prefix),
+            dir.join(&source_name),
+            render_c_convenience_c(prefix, input_basename, &source_name),
         )?;
         Ok(())
     }
@@ -37,7 +47,7 @@ impl Generator for CGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "weaveffi")
+        self.generate_impl(api, out_dir, "weaveffi", "weaveffi.yml")
     }
 
     fn generate_with_config(
@@ -46,14 +56,16 @@ impl Generator for CGenerator {
         out_dir: &Utf8Path,
         config: &GeneratorConfig,
     ) -> Result<()> {
-        self.generate_impl(api, out_dir, config.c_prefix())
+        self.generate_impl(api, out_dir, config.c_prefix(), config.input_basename())
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
-        vec![
-            out_dir.join("c/weaveffi.h").to_string(),
+        let mut files = vec![
             out_dir.join("c/weaveffi.c").to_string(),
-        ]
+            out_dir.join("c/weaveffi.h").to_string(),
+        ];
+        files.sort();
+        files
     }
 
     fn output_files_with_config(
@@ -63,10 +75,12 @@ impl Generator for CGenerator {
         config: &GeneratorConfig,
     ) -> Vec<String> {
         let prefix = config.c_prefix();
-        vec![
-            out_dir.join(format!("c/{prefix}.h")).to_string(),
+        let mut files = vec![
             out_dir.join(format!("c/{prefix}.c")).to_string(),
-        ]
+            out_dir.join(format!("c/{prefix}.h")).to_string(),
+        ];
+        files.sort();
+        files
     }
 }
 
@@ -278,9 +292,10 @@ fn c_callback_result_params(ty: &TypeRef, module: &str, prefix: &str) -> Vec<Str
     }
 }
 
-fn render_c_header(api: &Api, prefix: &str) -> String {
+fn render_c_header(api: &Api, prefix: &str, input_basename: &str, filename: &str) -> String {
     let guard = format!("{}_H", prefix.to_uppercase());
     let mut out = String::new();
+    out.push_str(&render_prelude(CommentStyle::DoubleSlash, input_basename));
     out.push_str(&format!("#ifndef {guard}\n"));
     out.push_str(&format!("#define {guard}\n\n"));
     out.push_str("#include <stdint.h>\n");
@@ -327,7 +342,8 @@ fn render_c_header(api: &Api, prefix: &str) -> String {
     }
 
     out.push_str("\n#ifdef __cplusplus\n}\n#endif\n\n");
-    out.push_str(&format!("#endif // {guard}\n"));
+    out.push_str(&format!("#endif // {guard}\n\n"));
+    out.push_str(&render_trailer(CommentStyle::DoubleSlash, filename));
     out
 }
 
@@ -537,8 +553,13 @@ fn render_module_header(out: &mut String, module: &Module, prefix: &str, module_
     out.push('\n');
 }
 
-fn render_c_convenience_c(prefix: &str) -> String {
-    format!("#include \"{prefix}.h\"\n\n// Optional convenience wrappers can be added here in future versions.\n")
+fn render_c_convenience_c(prefix: &str, input_basename: &str, filename: &str) -> String {
+    let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
+    out.push_str(&format!(
+        "#include \"{prefix}.h\"\n\n// Optional convenience wrappers can be added here in future versions.\n\n"
+    ));
+    out.push_str(&render_trailer(CommentStyle::DoubleSlash, filename));
+    out
 }
 
 #[cfg(test)]
@@ -669,7 +690,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
 
         assert!(
             header.contains("typedef struct weaveffi_contacts_Contact weaveffi_contacts_Contact;"),
@@ -749,7 +770,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(header.contains("typedef enum {"), "missing typedef enum");
         assert!(
             header.contains("weaveffi_contacts_Color_Red = 0"),
@@ -803,7 +824,7 @@ mod tests {
             }],
             generators: None,
         };
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         let enum_pos = header.find("typedef enum").unwrap();
         let struct_pos = header.find("typedef struct weaveffi_contacts_").unwrap();
         assert!(enum_pos < struct_pos, "enums must appear before structs");
@@ -987,7 +1008,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains(
                 "int32_t* weaveffi_store_find(const int32_t* id, weaveffi_error* out_err);"
@@ -1304,7 +1325,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("typedef enum { weaveffi_paint_Color_Red = 0, weaveffi_paint_Color_Green = 1 } weaveffi_paint_Color;"),
             "missing enum typedef: {header}"
@@ -1379,7 +1400,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains(
                 "const char* const* scores_keys, const int32_t* scores_values, size_t scores_len"
@@ -1521,7 +1542,7 @@ mod tests {
             }],
             generators: None,
         };
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("weaveffi_edge_process"),
             "should contain function name: {header}"
@@ -1569,7 +1590,7 @@ mod tests {
             }],
             generators: None,
         };
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("scores_keys"),
             "map param should have keys: {header}"
@@ -1624,7 +1645,7 @@ mod tests {
             }],
             generators: None,
         };
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("weaveffi_contacts_Contact* contact"),
             "TypedHandle param should use opaque struct pointer: {header}"
@@ -1686,7 +1707,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("const char* msg"),
             "BorrowedStr param should map to const char*: {header}"
@@ -1764,7 +1785,7 @@ mod tests {
             }],
             generators: None,
         };
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("contacts_keys"),
             "map param should have keys: {header}"
@@ -1820,7 +1841,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
 
         assert!(
             header.contains("const char* name"),
@@ -1887,7 +1908,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("typedef void (*weaveffi_tasks_run_callback)(void* context, weaveffi_error* err, int32_t result);"),
             "missing callback typedef with result param: {header}"
@@ -1931,7 +1952,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("void weaveffi_tasks_run_async(int32_t id, weaveffi_tasks_run_callback callback, void* context);"),
             "missing async function signature: {header}"
@@ -1979,7 +2000,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
 
         assert!(
             header.contains("weaveffi_contacts_Contact* weaveffi_contacts_find_contact(int32_t id, weaveffi_error* out_err);"),
@@ -2038,7 +2059,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
 
         assert!(
             header.contains("weaveffi_cancel_token* cancel_token"),
@@ -2121,7 +2142,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
 
         assert!(
             header.contains("typedef struct weaveffi_types_Name weaveffi_types_Name;"),
@@ -2191,7 +2212,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("weaveffi_parent_top_fn"),
             "parent function should use weaveffi_parent_top_fn: {header}"
@@ -2243,7 +2264,7 @@ mod tests {
             }],
             generators: None,
         };
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("typedef void (*weaveffi_events_on_data_fn)(const char* payload, int32_t len, void* context);"),
             "missing callback typedef: {header}"
@@ -2279,7 +2300,7 @@ mod tests {
             }],
             generators: None,
         };
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("uint64_t weaveffi_events_register_data_stream(weaveffi_events_on_data_fn callback, void* context);"),
             "missing register function: {header}"
@@ -2310,7 +2331,7 @@ mod tests {
             }],
             generators: None,
         };
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("typedef void (*weaveffi_lifecycle_on_ready_fn)(void* context);"),
             "callback with no params should only have context: {header}"
@@ -2343,7 +2364,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains(
                 "typedef struct weaveffi_data_ListItemsIterator weaveffi_data_ListItemsIterator;"
@@ -2407,7 +2428,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("typedef struct weaveffi_contacts_ListContactsIterator weaveffi_contacts_ListContactsIterator;"),
             "missing iterator typedef: {header}"
@@ -2613,7 +2634,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("uint8_t* buf_ptr"),
             "mutable bytes should omit const: {header}"
@@ -2655,7 +2676,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("const uint8_t* buf_ptr"),
             "immutable bytes should have const: {header}"
@@ -2711,7 +2732,7 @@ mod tests {
             generators: None,
         };
 
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("const char* input"),
             "immutable string should have const: {header}"
@@ -2764,7 +2785,7 @@ mod tests {
             }],
             generators: None,
         };
-        let header = render_c_header(&api, "weaveffi");
+        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(
             header.contains("__attribute__((deprecated(\"Use add_v2 instead\")))"),
             "missing deprecated attribute: {header}"
@@ -2834,32 +2855,32 @@ mod tests {
 
     #[test]
     fn c_emits_doc_on_function() {
-        let header = render_c_header(&doc_api(), "weaveffi");
+        let header = render_c_header(&doc_api(), "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(header.contains("/** Performs a thing. */"), "{header}");
     }
 
     #[test]
     fn c_emits_doc_on_struct() {
-        let header = render_c_header(&doc_api(), "weaveffi");
+        let header = render_c_header(&doc_api(), "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(header.contains("/** An item we track. */"), "{header}");
     }
 
     #[test]
     fn c_emits_doc_on_enum_variant() {
-        let header = render_c_header(&doc_api(), "weaveffi");
+        let header = render_c_header(&doc_api(), "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(header.contains("/** Kind of item. */"), "{header}");
         assert!(header.contains("/** A small one */"), "{header}");
     }
 
     #[test]
     fn c_emits_doc_on_field() {
-        let header = render_c_header(&doc_api(), "weaveffi");
+        let header = render_c_header(&doc_api(), "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(header.contains("/** Stable id */"), "{header}");
     }
 
     #[test]
     fn c_emits_doc_on_callback_and_listener() {
-        let header = render_c_header(&doc_api(), "weaveffi");
+        let header = render_c_header(&doc_api(), "weaveffi", "weaveffi.yml", "weaveffi.h");
         assert!(header.contains("/** Fires when ready */"), "{header}");
         assert!(header.contains("/** Subscribe to ready */"), "{header}");
     }

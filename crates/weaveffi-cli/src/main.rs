@@ -566,6 +566,7 @@ fn cmd_generate(
             other
         ),
     };
+    config.input_basename = in_path.file_name().map(str::to_string);
     let contents = std::fs::read_to_string(in_path.as_std_path())
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to read input file: {}", input))?;
@@ -818,7 +819,10 @@ fn cmd_diff(input: &str, out: Option<&str>, check: bool, quiet: bool) -> Result<
         &c, &cpp, &swift, &android, &node, &wasm, &python, &dotnet, &dart, &go, &ruby,
     ];
 
-    let config = GeneratorConfig::default();
+    let config = GeneratorConfig {
+        input_basename: in_path.file_name().map(str::to_string),
+        ..GeneratorConfig::default()
+    };
     let mut orchestrator = Orchestrator::new();
     for &gen in &all {
         orchestrator = orchestrator.with_generator(gen);

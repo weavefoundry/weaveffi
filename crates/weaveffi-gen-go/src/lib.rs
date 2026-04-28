@@ -9,18 +9,29 @@ use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
-use weaveffi_core::utils::{c_symbol_name, local_type_name};
+use weaveffi_core::utils::{
+    c_symbol_name, local_type_name, render_prelude, render_trailer, CommentStyle,
+};
 use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, StructField, TypeRef};
 
 pub struct GoGenerator;
 
 impl GoGenerator {
-    fn generate_impl(&self, api: &Api, out_dir: &Utf8Path, module_path: &str) -> Result<()> {
+    fn generate_impl(
+        &self,
+        api: &Api,
+        out_dir: &Utf8Path,
+        module_path: &str,
+        input_basename: &str,
+    ) -> Result<()> {
         let dir = out_dir.join("go");
         std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join("weaveffi.go"), render_go(api))?;
-        std::fs::write(dir.join("go.mod"), render_go_mod(module_path))?;
-        std::fs::write(dir.join("README.md"), render_readme())?;
+        std::fs::write(dir.join("weaveffi.go"), render_go(api, input_basename))?;
+        std::fs::write(
+            dir.join("go.mod"),
+            render_go_mod(module_path, input_basename),
+        )?;
+        std::fs::write(dir.join("README.md"), render_readme(input_basename))?;
         Ok(())
     }
 }
@@ -31,7 +42,7 @@ impl Generator for GoGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "weaveffi")
+        self.generate_impl(api, out_dir, "weaveffi", "weaveffi.yml")
     }
 
     fn generate_with_config(
@@ -40,15 +51,22 @@ impl Generator for GoGenerator {
         out_dir: &Utf8Path,
         config: &GeneratorConfig,
     ) -> Result<()> {
-        self.generate_impl(api, out_dir, config.go_module_path())
+        self.generate_impl(
+            api,
+            out_dir,
+            config.go_module_path(),
+            config.input_basename(),
+        )
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
-        vec![
-            out_dir.join("go/weaveffi.go").to_string(),
-            out_dir.join("go/go.mod").to_string(),
+        let mut files = vec![
             out_dir.join("go/README.md").to_string(),
-        ]
+            out_dir.join("go/go.mod").to_string(),
+            out_dir.join("go/weaveffi.go").to_string(),
+        ];
+        files.sort();
+        files
     }
 }
 
@@ -213,12 +231,17 @@ fn scan_imports(api: &Api) -> (bool, bool, bool) {
 
 // ── Packaging scaffold ──
 
-fn render_go_mod(module_path: &str) -> String {
-    format!("module {module_path}\n\ngo 1.21\n")
+fn render_go_mod(module_path: &str, input_basename: &str) -> String {
+    let prelude = render_prelude(CommentStyle::DoubleSlash, input_basename);
+    let trailer = render_trailer(CommentStyle::DoubleSlash, "go.mod");
+    format!("{prelude}module {module_path}\n\ngo 1.21\n\n{trailer}")
 }
 
-fn render_readme() -> String {
-    r#"# WeaveFFI Go Bindings
+fn render_readme(input_basename: &str) -> String {
+    let prelude = render_prelude(CommentStyle::Xml, input_basename);
+    let trailer = render_trailer(CommentStyle::Xml, "README.md");
+    format!(
+        r#"{prelude}# WeaveFFI Go Bindings
 
 Auto-generated Go bindings using CGo.
 
@@ -253,8 +276,9 @@ The generated `weaveffi.go` file uses a CGo preamble to `#include "weaveffi.h"`
 and link against `-lweaveffi`. Each API function is exposed as an idiomatic Go
 function that marshals arguments to C types, calls the C ABI function, and
 converts the result back to Go types. Errors are returned as Go `error` values.
-"#
-    .into()
+
+{trailer}"#
+    )
 }
 
 // ── Top-level rendering ──
@@ -358,9 +382,9 @@ fn emit_fn_doc(
     }
 }
 
-fn render_go(api: &Api) -> String {
+fn render_go(api: &Api, input_basename: &str) -> String {
     let (needs_fmt, needs_unsafe, needs_bool) = scan_imports(api);
-    let mut out = String::new();
+    let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
 
     out.push_str("package weaveffi\n\n");
 
@@ -412,6 +436,8 @@ fn render_go(api: &Api) -> String {
         }
     }
 
+    out.push('\n');
+    out.push_str(&render_trailer(CommentStyle::DoubleSlash, "weaveffi.go"));
     out
 }
 
@@ -1054,17 +1080,17 @@ mod tests {
         assert_eq!(
             files,
             vec![
-                out.join("go/weaveffi.go").to_string(),
-                out.join("go/go.mod").to_string(),
                 out.join("go/README.md").to_string(),
+                out.join("go/go.mod").to_string(),
+                out.join("go/weaveffi.go").to_string(),
             ]
         );
     }
 
     #[test]
     fn package_and_cgo_preamble() {
-        let go = render_go(&calculator_api());
-        assert!(go.starts_with("package weaveffi\n"), "missing package");
+        let go = render_go(&calculator_api(), "weaveffi.yml");
+        assert!(go.contains("package weaveffi\n"), "missing package");
         assert!(
             go.contains("#cgo LDFLAGS: -lweaveffi"),
             "missing LDFLAGS: {go}"
@@ -1118,7 +1144,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi.yml");
         assert!(
             !go.contains("//export readCallback"),
             "async export callbacks must not be emitted: {go}"
@@ -1135,14 +1161,14 @@ mod tests {
 
     #[test]
     fn imports_fmt_and_unsafe() {
-        let go = render_go(&calculator_api());
+        let go = render_go(&calculator_api(), "weaveffi.yml");
         assert!(go.contains("\"fmt\""), "missing fmt import: {go}");
         assert!(go.contains("\"unsafe\""), "missing unsafe import: {go}");
     }
 
     #[test]
     fn simple_i32_function() {
-        let go = render_go(&calculator_api());
+        let go = render_go(&calculator_api(), "weaveffi.yml");
         assert!(
             go.contains("func CalculatorAdd(a int32, b int32) (int32, error)"),
             "missing function sig: {go}"
@@ -1160,7 +1186,7 @@ mod tests {
 
     #[test]
     fn string_function() {
-        let go = render_go(&calculator_api());
+        let go = render_go(&calculator_api(), "weaveffi.yml");
         assert!(
             go.contains("func CalculatorEcho(msg string) (string, error)"),
             "missing echo sig: {go}"
@@ -1179,7 +1205,7 @@ mod tests {
 
     #[test]
     fn error_handling() {
-        let go = render_go(&calculator_api());
+        let go = render_go(&calculator_api(), "weaveffi.yml");
         assert!(
             go.contains("var cErr C.weaveffi_error"),
             "missing error var: {go}"
@@ -1231,7 +1257,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi.yml");
         assert!(
             go.contains("type Color int32"),
             "missing enum typedef: {go}"
@@ -1284,7 +1310,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi.yml");
         assert!(go.contains("type Contact struct {"), "missing struct: {go}");
         assert!(
             go.contains("ptr *C.weaveffi_contacts_Contact"),
@@ -1338,7 +1364,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi.yml");
         assert!(
             go.contains("type PointBuilder struct {"),
             "builder type: {go}"
@@ -1383,7 +1409,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi.yml");
         assert!(
             go.contains("func SystemReset() error"),
             "missing void function sig: {go}"
@@ -1424,7 +1450,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi.yml");
         assert!(
             go.contains("(int64, error)"),
             "handle return should be int64: {go}"
@@ -1465,7 +1491,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi.yml");
         assert!(go.contains("func boolToC("), "missing boolToC: {go}");
         assert!(go.contains("func cToBool("), "missing cToBool: {go}");
         assert!(
@@ -1516,7 +1542,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi.yml");
         assert!(
             go.contains("func PaintMix(a Color) (Color, error)"),
             "missing enum function sig: {go}"
@@ -1571,7 +1597,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi.yml");
         assert!(
             go.contains("(*Contact, error)"),
             "missing struct return type: {go}"
@@ -1612,7 +1638,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi.yml");
         assert!(
             go.contains("query *string"),
             "optional string param should be *string: {go}"
@@ -1659,7 +1685,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi.yml");
         assert!(
             go.contains("(*Contact, error)"),
             "optional struct return: {go}"
@@ -1692,7 +1718,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi.yml");
         assert!(
             go.contains("([]int32, error)"),
             "missing list return type: {go}"
@@ -1739,7 +1765,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi.yml");
         assert!(
             go.contains("([]*Contact, error)"),
             "missing struct list return: {go}"
@@ -1775,7 +1801,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi.yml");
         assert!(
             !go.contains("func TasksRun("),
             "async functions should be skipped: {go}"
@@ -1867,7 +1893,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi.yml");
         assert!(
             go.contains("id *int32"),
             "optional i32 param should be *int32: {go}"
@@ -1904,7 +1930,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi.yml");
         assert!(
             go.contains("func (s *Contact) Email() *string"),
             "optional string getter should return *string: {go}"
@@ -1953,7 +1979,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi.yml");
         assert!(
             !go.contains("boolToC"),
             "should not include bool helpers: {go}"
@@ -1994,7 +2020,7 @@ mod tests {
             }],
             generators: None,
         };
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi.yml");
         assert!(
             go.contains("func (s *Contact) ContactType() ContactType"),
             "missing enum field getter: {go}"
@@ -2595,7 +2621,7 @@ mod tests {
             generators: None,
         };
 
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi.yml");
 
         let fn_start = go
             .find("func ContactsFindContact(")
@@ -2660,7 +2686,7 @@ mod tests {
             generators: None,
         };
 
-        let go = render_go(&api);
+        let go = render_go(&api, "weaveffi.yml");
 
         let fn_start = go
             .find("func ContactsFindContact(")
@@ -2732,32 +2758,32 @@ mod tests {
 
     #[test]
     fn go_emits_doc_on_function() {
-        let go = render_go(&doc_api());
+        let go = render_go(&doc_api(), "weaveffi.yml");
         assert!(go.contains("// DocsDoThing: Performs a thing."), "{go}");
     }
 
     #[test]
     fn go_emits_doc_on_struct() {
-        let go = render_go(&doc_api());
+        let go = render_go(&doc_api(), "weaveffi.yml");
         assert!(go.contains("// Item: An item we track."), "{go}");
     }
 
     #[test]
     fn go_emits_doc_on_enum_variant() {
-        let go = render_go(&doc_api());
+        let go = render_go(&doc_api(), "weaveffi.yml");
         assert!(go.contains("// Kind: Kind of item."), "{go}");
         assert!(go.contains("// KindSmall: A small one"), "{go}");
     }
 
     #[test]
     fn go_emits_doc_on_field() {
-        let go = render_go(&doc_api());
+        let go = render_go(&doc_api(), "weaveffi.yml");
         assert!(go.contains("// Id: Stable id"), "{go}");
     }
 
     #[test]
     fn go_emits_doc_on_param() {
-        let go = render_go(&doc_api());
+        let go = render_go(&doc_api(), "weaveffi.yml");
         assert!(go.contains("// Parameters:"), "{go}");
         assert!(go.contains("//   - x: the input value"), "{go}");
     }
