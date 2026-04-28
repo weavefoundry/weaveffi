@@ -20,6 +20,11 @@ class WeaveFFI {
             run_batchAsync(names, WeaveContinuation(cont))
         }
         @JvmStatic external fun cancel_task(id: Long): Boolean
+        @JvmStatic private external fun run_n_tasksAsync(n: Int, callback: Any)
+        @JvmStatic suspend fun run_n_tasks(n: Int): Int = suspendCancellableCoroutine { cont ->
+            run_n_tasksAsync(n, WeaveContinuation(cont))
+        }
+        @JvmStatic external fun active_callbacks(): Long
     }
 }
 

@@ -6,7 +6,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 import 'dart:ffi';
 import 'dart:io' show Platform;
-import 'dart:isolate';
+import 'dart:async';
 import 'package:ffi/ffi.dart';
 
 DynamicLibrary _openLibrary() {
@@ -728,50 +728,84 @@ Token crossModuleToken() {
   }
 }
 
-typedef _NativeWeaveffiKitchenDoAsync = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKitchenDoAsync = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<_WeaveffiError>);
-final _weaveffiKitchenDoAsync = _lib.lookupFunction<
-    _NativeWeaveffiKitchenDoAsync, _DartWeaveffiKitchenDoAsync>('weaveffi_kitchen_do_async');
+typedef _NativeAsyncCb_weaveffi_kitchen_do_async = Void Function(Pointer<Void>, Pointer<_WeaveffiError>, Pointer<Utf8>);
 
-String _doAsync(String input) {
-  final err = calloc<_WeaveffiError>();
-  final inputPtr = input.toNativeUtf8();
-  try {
-    final result = _weaveffiKitchenDoAsync(inputPtr, err);
-    _checkError(err);
-    return result.toDartString();
-  } finally {
-    calloc.free(inputPtr);
-    calloc.free(err);
-  }
-}
+typedef _NativeWeaveffiKitchenDoAsyncAsync = Void Function(Pointer<Utf8>, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_kitchen_do_async>>, Pointer<Void>);
+typedef _DartWeaveffiKitchenDoAsyncAsync = void Function(Pointer<Utf8>, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_kitchen_do_async>>, Pointer<Void>);
+final _weaveffiKitchenDoAsyncAsync = _lib.lookupFunction<
+    _NativeWeaveffiKitchenDoAsyncAsync, _DartWeaveffiKitchenDoAsyncAsync>('weaveffi_kitchen_do_async_async');
 
 /// Async operation
-Future<String> doAsync(String input) async {
-  return await Isolate.run(() => _doAsync(input));
-}
-
-typedef _NativeWeaveffiKitchenDoCancellable = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKitchenDoCancellable = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<_WeaveffiError>);
-final _weaveffiKitchenDoCancellable = _lib.lookupFunction<
-    _NativeWeaveffiKitchenDoCancellable, _DartWeaveffiKitchenDoCancellable>('weaveffi_kitchen_do_cancellable');
-
-String _doCancellable(String input) {
-  final err = calloc<_WeaveffiError>();
+Future<String> doAsync(String input) {
+  final completer = Completer<String>();
   final inputPtr = input.toNativeUtf8();
+  late NativeCallable<_NativeAsyncCb_weaveffi_kitchen_do_async> callable;
+  callable = NativeCallable<_NativeAsyncCb_weaveffi_kitchen_do_async>.listener((Pointer<Void> context, Pointer<_WeaveffiError> err, Pointer<Utf8> result) {
+    try {
+      if (err.address != 0 && err.ref.code != 0) {
+        final code = err.ref.code;
+        final msg = err.ref.message.toDartString();
+        _weaveffiErrorClear(err);
+        completer.completeError(WeaveffiException(code, msg));
+        return;
+      }
+      completer.complete(result.toDartString());
+    } catch (e) {
+      completer.completeError(e);
+    } finally {
+      callable.close();
+    }
+  });
   try {
-    final result = _weaveffiKitchenDoCancellable(inputPtr, err);
-    _checkError(err);
-    return result.toDartString();
-  } finally {
+    _weaveffiKitchenDoAsyncAsync(inputPtr, callable.nativeFunction, nullptr);
+  } catch (e) {
+    callable.close();
     calloc.free(inputPtr);
-    calloc.free(err);
+    rethrow;
   }
+  return completer.future.whenComplete(() {
+    calloc.free(inputPtr);
+  });
 }
+
+typedef _NativeAsyncCb_weaveffi_kitchen_do_cancellable = Void Function(Pointer<Void>, Pointer<_WeaveffiError>, Pointer<Utf8>);
+
+typedef _NativeWeaveffiKitchenDoCancellableAsync = Void Function(Pointer<Utf8>, Pointer<Void>, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_kitchen_do_cancellable>>, Pointer<Void>);
+typedef _DartWeaveffiKitchenDoCancellableAsync = void Function(Pointer<Utf8>, Pointer<Void>, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_kitchen_do_cancellable>>, Pointer<Void>);
+final _weaveffiKitchenDoCancellableAsync = _lib.lookupFunction<
+    _NativeWeaveffiKitchenDoCancellableAsync, _DartWeaveffiKitchenDoCancellableAsync>('weaveffi_kitchen_do_cancellable_async');
 
 /// Cancellable async operation
-Future<String> doCancellable(String input) async {
-  return await Isolate.run(() => _doCancellable(input));
+Future<String> doCancellable(String input) {
+  final completer = Completer<String>();
+  final inputPtr = input.toNativeUtf8();
+  late NativeCallable<_NativeAsyncCb_weaveffi_kitchen_do_cancellable> callable;
+  callable = NativeCallable<_NativeAsyncCb_weaveffi_kitchen_do_cancellable>.listener((Pointer<Void> context, Pointer<_WeaveffiError> err, Pointer<Utf8> result) {
+    try {
+      if (err.address != 0 && err.ref.code != 0) {
+        final code = err.ref.code;
+        final msg = err.ref.message.toDartString();
+        _weaveffiErrorClear(err);
+        completer.completeError(WeaveffiException(code, msg));
+        return;
+      }
+      completer.complete(result.toDartString());
+    } catch (e) {
+      completer.completeError(e);
+    } finally {
+      callable.close();
+    }
+  });
+  try {
+    _weaveffiKitchenDoCancellableAsync(inputPtr, nullptr, callable.nativeFunction, nullptr);
+  } catch (e) {
+    callable.close();
+    calloc.free(inputPtr);
+    rethrow;
+  }
+  return completer.future.whenComplete(() {
+    calloc.free(inputPtr);
+  });
 }
 
 typedef _NativeWeaveffiKitchenLegacyOp = Int32 Function(Pointer<_WeaveffiError>);

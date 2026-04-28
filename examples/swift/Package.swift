@@ -5,6 +5,7 @@ let package = Package(
     name: "WeaveFFIExample",
     platforms: [ .macOS(.v12) ],
     targets: [
-        .executableTarget(name: "App", path: "Sources/App")
+        .executableTarget(name: "App", path: "Sources/App"),
+        .executableTarget(name: "AsyncStress", path: "Sources/AsyncStress"),
     ]
 )

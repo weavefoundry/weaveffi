@@ -90,6 +90,45 @@ JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_cancel_task(JNIEnv* env, j
     return rv ? JNI_TRUE : JNI_FALSE;
 }
 
+static void weaveffi_tasks_run_n_tasks_jni_cb(void* context, weaveffi_error* err, int32_t result) {
+    weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)context;
+    JNIEnv* env;
+    (*ctx->jvm)->AttachCurrentThread(ctx->jvm, (void**)&env, NULL);
+    if (err != NULL && err->code != 0) {
+        const char* msg = err->message ? err->message : "WeaveFFI error";
+        jstring jmsg = (*env)->NewStringUTF(env, msg);
+        jclass cls = (*env)->GetObjectClass(env, ctx->callback);
+        jmethodID mid = (*env)->GetMethodID(env, cls, "onError", "(Ljava/lang/String;)V");
+        (*env)->CallVoidMethod(env, ctx->callback, mid, jmsg);
+    } else {
+        jclass boxCls = (*env)->FindClass(env, "java/lang/Integer");
+        jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, "valueOf", "(I)Ljava/lang/Integer;");
+        jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jint)result);
+        jclass cls = (*env)->GetObjectClass(env, ctx->callback);
+        jmethodID mid = (*env)->GetMethodID(env, cls, "onSuccess", "(Ljava/lang/Object;)V");
+        (*env)->CallVoidMethod(env, ctx->callback, mid, boxed);
+    }
+    (*env)->DeleteGlobalRef(env, ctx->callback);
+    free(ctx);
+}
+
+JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_run_n_tasksAsync(JNIEnv* env, jclass clazz, jint n, jobject callback) {
+    weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)malloc(sizeof(weaveffi_jni_async_ctx));
+    (*env)->GetJavaVM(env, &ctx->jvm);
+    ctx->callback = (*env)->NewGlobalRef(env, callback);
+    weaveffi_tasks_run_n_tasks_async((int32_t)n, weaveffi_tasks_run_n_tasks_jni_cb, ctx);
+}
+
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_active_callbacks(JNIEnv* env, jclass clazz) {
+    weaveffi_error err = {0, NULL};
+    int64_t rv = weaveffi_tasks_active_callbacks(, &err);
+    if (err.code != 0) {
+        throw_weaveffi_error(env, &err);
+        return 0;
+    }
+    return (jlong) rv;
+}
+
 JNIEXPORT jlong JNICALL Java_com_weaveffi_TaskResult_nativeCreate(JNIEnv* env, jclass clazz, jlong id, jstring value, jboolean success) {
     weaveffi_error err = {0, NULL};
     const char* value_chars = (*env)->GetStringUTFChars(env, value, NULL);

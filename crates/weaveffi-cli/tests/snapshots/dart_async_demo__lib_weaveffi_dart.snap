@@ -6,7 +6,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 import 'dart:ffi';
 import 'dart:io' show Platform;
-import 'dart:isolate';
+import 'dart:async';
 import 'package:ffi/ffi.dart';
 
 DynamicLibrary _openLibrary() {
@@ -107,46 +107,78 @@ class TaskResult {
   }
 }
 
-typedef _NativeWeaveffiTasksRunTask = Pointer<Void> Function(Pointer<Utf8>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiTasksRunTask = Pointer<Void> Function(Pointer<Utf8>, Pointer<_WeaveffiError>);
-final _weaveffiTasksRunTask = _lib.lookupFunction<
-    _NativeWeaveffiTasksRunTask, _DartWeaveffiTasksRunTask>('weaveffi_tasks_run_task');
+typedef _NativeAsyncCb_weaveffi_tasks_run_task = Void Function(Pointer<Void>, Pointer<_WeaveffiError>, Pointer<Void>);
 
-TaskResult _runTask(String name) {
-  final err = calloc<_WeaveffiError>();
+typedef _NativeWeaveffiTasksRunTaskAsync = Void Function(Pointer<Utf8>, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_tasks_run_task>>, Pointer<Void>);
+typedef _DartWeaveffiTasksRunTaskAsync = void Function(Pointer<Utf8>, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_tasks_run_task>>, Pointer<Void>);
+final _weaveffiTasksRunTaskAsync = _lib.lookupFunction<
+    _NativeWeaveffiTasksRunTaskAsync, _DartWeaveffiTasksRunTaskAsync>('weaveffi_tasks_run_task_async');
+
+Future<TaskResult> runTask(String name) {
+  final completer = Completer<TaskResult>();
   final namePtr = name.toNativeUtf8();
+  late NativeCallable<_NativeAsyncCb_weaveffi_tasks_run_task> callable;
+  callable = NativeCallable<_NativeAsyncCb_weaveffi_tasks_run_task>.listener((Pointer<Void> context, Pointer<_WeaveffiError> err, Pointer<Void> result) {
+    try {
+      if (err.address != 0 && err.ref.code != 0) {
+        final code = err.ref.code;
+        final msg = err.ref.message.toDartString();
+        _weaveffiErrorClear(err);
+        completer.completeError(WeaveffiException(code, msg));
+        return;
+      }
+      completer.complete(TaskResult._(result));
+    } catch (e) {
+      completer.completeError(e);
+    } finally {
+      callable.close();
+    }
+  });
   try {
-    final result = _weaveffiTasksRunTask(namePtr, err);
-    _checkError(err);
-    return TaskResult._(result);
-  } finally {
+    _weaveffiTasksRunTaskAsync(namePtr, callable.nativeFunction, nullptr);
+  } catch (e) {
+    callable.close();
     calloc.free(namePtr);
-    calloc.free(err);
+    rethrow;
   }
+  return completer.future.whenComplete(() {
+    calloc.free(namePtr);
+  });
 }
 
-Future<TaskResult> runTask(String name) async {
-  return await Isolate.run(() => _runTask(name));
-}
+typedef _NativeAsyncCb_weaveffi_tasks_run_batch = Void Function(Pointer<Void>, Pointer<_WeaveffiError>, Pointer<Void>, Size);
 
-typedef _NativeWeaveffiTasksRunBatch = Pointer<Void> Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiTasksRunBatch = Pointer<Void> Function(Pointer<Void>, Pointer<_WeaveffiError>);
-final _weaveffiTasksRunBatch = _lib.lookupFunction<
-    _NativeWeaveffiTasksRunBatch, _DartWeaveffiTasksRunBatch>('weaveffi_tasks_run_batch');
+typedef _NativeWeaveffiTasksRunBatchAsync = Void Function(Pointer<Void>, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_tasks_run_batch>>, Pointer<Void>);
+typedef _DartWeaveffiTasksRunBatchAsync = void Function(Pointer<Void>, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_tasks_run_batch>>, Pointer<Void>);
+final _weaveffiTasksRunBatchAsync = _lib.lookupFunction<
+    _NativeWeaveffiTasksRunBatchAsync, _DartWeaveffiTasksRunBatchAsync>('weaveffi_tasks_run_batch_async');
 
-List<TaskResult> _runBatch(List<String> names) {
-  final err = calloc<_WeaveffiError>();
+Future<List<TaskResult>> runBatch(List<String> names) {
+  final completer = Completer<List<TaskResult>>();
+  late NativeCallable<_NativeAsyncCb_weaveffi_tasks_run_batch> callable;
+  callable = NativeCallable<_NativeAsyncCb_weaveffi_tasks_run_batch>.listener((Pointer<Void> context, Pointer<_WeaveffiError> err, Pointer<Void> result, int resultLen) {
+    try {
+      if (err.address != 0 && err.ref.code != 0) {
+        final code = err.ref.code;
+        final msg = err.ref.message.toDartString();
+        _weaveffiErrorClear(err);
+        completer.completeError(WeaveffiException(code, msg));
+        return;
+      }
+      completer.complete(result);
+    } catch (e) {
+      completer.completeError(e);
+    } finally {
+      callable.close();
+    }
+  });
   try {
-    final result = _weaveffiTasksRunBatch(names, err);
-    _checkError(err);
-    return result;
-  } finally {
-    calloc.free(err);
+    _weaveffiTasksRunBatchAsync(names, callable.nativeFunction, nullptr);
+  } catch (e) {
+    callable.close();
+    rethrow;
   }
-}
-
-Future<List<TaskResult>> runBatch(List<String> names) async {
-  return await Isolate.run(() => _runBatch(names));
+  return completer.future;
 }
 
 typedef _NativeWeaveffiTasksCancelTask = Int32 Function(Int64, Pointer<_WeaveffiError>);
@@ -160,6 +192,57 @@ bool cancelTask(int id) {
     final result = _weaveffiTasksCancelTask(id, err);
     _checkError(err);
     return result != 0;
+  } finally {
+    calloc.free(err);
+  }
+}
+
+typedef _NativeAsyncCb_weaveffi_tasks_run_n_tasks = Void Function(Pointer<Void>, Pointer<_WeaveffiError>, Int32);
+
+typedef _NativeWeaveffiTasksRunNTasksAsync = Void Function(Int32, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_tasks_run_n_tasks>>, Pointer<Void>);
+typedef _DartWeaveffiTasksRunNTasksAsync = void Function(int, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_tasks_run_n_tasks>>, Pointer<Void>);
+final _weaveffiTasksRunNTasksAsync = _lib.lookupFunction<
+    _NativeWeaveffiTasksRunNTasksAsync, _DartWeaveffiTasksRunNTasksAsync>('weaveffi_tasks_run_n_tasks_async');
+
+Future<int> runNTasks(int n) {
+  final completer = Completer<int>();
+  late NativeCallable<_NativeAsyncCb_weaveffi_tasks_run_n_tasks> callable;
+  callable = NativeCallable<_NativeAsyncCb_weaveffi_tasks_run_n_tasks>.listener((Pointer<Void> context, Pointer<_WeaveffiError> err, int result) {
+    try {
+      if (err.address != 0 && err.ref.code != 0) {
+        final code = err.ref.code;
+        final msg = err.ref.message.toDartString();
+        _weaveffiErrorClear(err);
+        completer.completeError(WeaveffiException(code, msg));
+        return;
+      }
+      completer.complete(result);
+    } catch (e) {
+      completer.completeError(e);
+    } finally {
+      callable.close();
+    }
+  });
+  try {
+    _weaveffiTasksRunNTasksAsync(n, callable.nativeFunction, nullptr);
+  } catch (e) {
+    callable.close();
+    rethrow;
+  }
+  return completer.future;
+}
+
+typedef _NativeWeaveffiTasksActiveCallbacks = Int64 Function(Pointer<_WeaveffiError>);
+typedef _DartWeaveffiTasksActiveCallbacks = int Function(Pointer<_WeaveffiError>);
+final _weaveffiTasksActiveCallbacks = _lib.lookupFunction<
+    _NativeWeaveffiTasksActiveCallbacks, _DartWeaveffiTasksActiveCallbacks>('weaveffi_tasks_active_callbacks');
+
+int activeCallbacks() {
+  final err = calloc<_WeaveffiError>();
+  try {
+    final result = _weaveffiTasksActiveCallbacks(err);
+    _checkError(err);
+    return result;
   } finally {
     calloc.free(err);
   }

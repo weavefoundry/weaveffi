@@ -122,6 +122,7 @@ export async function loadWeaveffiWasm(url) {
 
   const _cbPtr_i32_i32_i64 = _registerTrampoline(_table, ['i32', 'i32', 'i64'], _asyncHandler);
   const _cbPtr_i32_i32_i32_i32 = _registerTrampoline(_table, ['i32', 'i32', 'i32', 'i32'], _asyncHandler);
+  const _cbPtr_i32_i32_i32 = _registerTrampoline(_table, ['i32', 'i32', 'i32'], _asyncHandler);
 
   return {
     _raw: wasm,
@@ -146,6 +147,19 @@ export async function loadWeaveffiWasm(url) {
         const _result = wasm.weaveffi_tasks_cancel_task(id, _err);
         _checkError(wasm, _err);
         return _result !== 0;
+      },
+      run_n_tasks(n) {
+        return new Promise((resolve, reject) => {
+          const ctxId = _nextCtxId++;
+          _asyncContexts.set(ctxId, { resolve, reject });
+          wasm.weaveffi_tasks_run_n_tasks_async(n, _cbPtr_i32_i32_i32, ctxId);
+        }));
+      },
+      active_callbacks() {
+        const _err = _allocError(wasm);
+        const _result = wasm.weaveffi_tasks_active_callbacks(_err);
+        _checkError(wasm, _err);
+        return _result;
       },
     },
   };

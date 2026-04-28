@@ -59,6 +59,15 @@ typedef void (*weaveffi_tasks_run_batch_callback)(void* context, weaveffi_error*
  */
 void weaveffi_tasks_run_batch_async(const char* const* names, size_t names_len, weaveffi_tasks_run_batch_callback callback, void* context);
 bool weaveffi_tasks_cancel_task(int64_t id, weaveffi_error* out_err);
+typedef void (*weaveffi_tasks_run_n_tasks_callback)(void* context, weaveffi_error* err, int32_t result);
+/*
+ * Async: weaveffi_tasks_run_n_tasks
+ * The callback is called exactly once, on any thread.
+ * On success, err is NULL and result (if any) is valid.
+ * On failure, err is non-NULL with a non-zero code.
+ */
+void weaveffi_tasks_run_n_tasks_async(int32_t n, weaveffi_tasks_run_n_tasks_callback callback, void* context);
+int64_t weaveffi_tasks_active_callbacks(weaveffi_error* out_err);
 
 
 #ifdef __cplusplus

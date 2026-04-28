@@ -154,6 +154,18 @@ namespace WeaveFFI
         [DllImport(LibName, EntryPoint = "weaveffi_tasks_cancel_task", CallingConvention = CallingConvention.Cdecl)]
         internal static extern int weaveffi_tasks_cancel_task(long id, ref WeaveffiError err);
 
+        [DllImport(LibName, EntryPoint = "weaveffi_tasks_run_n_tasks", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int weaveffi_tasks_run_n_tasks(int n, ref WeaveffiError err);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        internal delegate void AsyncCb_weaveffi_tasks_run_n_tasks(IntPtr context, IntPtr err, int result);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_tasks_run_n_tasks_async", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_tasks_run_n_tasks_async(int n, AsyncCb_weaveffi_tasks_run_n_tasks callback, IntPtr context);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_tasks_active_callbacks", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern long weaveffi_tasks_active_callbacks(ref WeaveffiError err);
+
     }
 
     public static class Tasks
@@ -163,23 +175,42 @@ namespace WeaveFFI
             var tcs = new TaskCompletionSource<TaskResult>(TaskCreationOptions.RunContinuationsAsynchronously);
             NativeMethods.AsyncCb_weaveffi_tasks_run_task callback = (context, err, result) =>
             {
-                if (err != IntPtr.Zero)
+                try
                 {
-                    var wErr = Marshal.PtrToStructure<WeaveffiError>(err);
-                    if (wErr.Code != 0)
+                    if (err != IntPtr.Zero)
                     {
-                        var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? "";
-                        tcs.SetException(new WeaveffiException(wErr.Code, msg));
-                        return;
+                        var wErr = Marshal.PtrToStructure<WeaveffiError>(err);
+                        if (wErr.Code != 0)
+                        {
+                            var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? "";
+                            tcs.SetException(new WeaveffiException(wErr.Code, msg));
+                            return;
+                        }
+                    }
+                    tcs.SetResult(new TaskResult(result));
+                }
+                finally
+                {
+                    if (context != IntPtr.Zero)
+                    {
+                        GCHandle.FromIntPtr(context).Free();
                     }
                 }
-                tcs.SetResult(new TaskResult(result));
             };
-            var gcHandle = GCHandle.Alloc(callback);
+            var gcHandle = GCHandle.Alloc(callback, GCHandleType.Normal);
+            var ctx = GCHandle.ToIntPtr(gcHandle);
             var namePtr = Marshal.StringToCoTaskMemUTF8(name);
             try
             {
-                NativeMethods.weaveffi_tasks_run_task_async(namePtr, callback, IntPtr.Zero);
+                try
+                {
+                    NativeMethods.weaveffi_tasks_run_task_async(namePtr, callback, ctx);
+                }
+                catch
+                {
+                    if (gcHandle.IsAllocated) gcHandle.Free();
+                    throw;
+                }
             }
             finally
             {
@@ -193,20 +224,39 @@ namespace WeaveFFI
             var tcs = new TaskCompletionSource<TaskResult[]>(TaskCreationOptions.RunContinuationsAsynchronously);
             NativeMethods.AsyncCb_weaveffi_tasks_run_batch callback = (context, err, result, resultLen) =>
             {
-                if (err != IntPtr.Zero)
+                try
                 {
-                    var wErr = Marshal.PtrToStructure<WeaveffiError>(err);
-                    if (wErr.Code != 0)
+                    if (err != IntPtr.Zero)
                     {
-                        var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? "";
-                        tcs.SetException(new WeaveffiException(wErr.Code, msg));
-                        return;
+                        var wErr = Marshal.PtrToStructure<WeaveffiError>(err);
+                        if (wErr.Code != 0)
+                        {
+                            var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? "";
+                            tcs.SetException(new WeaveffiException(wErr.Code, msg));
+                            return;
+                        }
+                    }
+                    tcs.SetResult(result);
+                }
+                finally
+                {
+                    if (context != IntPtr.Zero)
+                    {
+                        GCHandle.FromIntPtr(context).Free();
                     }
                 }
-                tcs.SetResult(result);
             };
-            var gcHandle = GCHandle.Alloc(callback);
-            NativeMethods.weaveffi_tasks_run_batch_async(names, callback, IntPtr.Zero);
+            var gcHandle = GCHandle.Alloc(callback, GCHandleType.Normal);
+            var ctx = GCHandle.ToIntPtr(gcHandle);
+            try
+            {
+                NativeMethods.weaveffi_tasks_run_batch_async(names, callback, ctx);
+            }
+            catch
+            {
+                if (gcHandle.IsAllocated) gcHandle.Free();
+                throw;
+            }
             return await tcs.Task;
         }
 
@@ -216,6 +266,55 @@ namespace WeaveFFI
             var result = NativeMethods.weaveffi_tasks_cancel_task(id, ref err);
             WeaveffiError.Check(err);
             return result != 0;
+        }
+
+        public static async Task<int> RunNTasks(int n)
+        {
+            var tcs = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+            NativeMethods.AsyncCb_weaveffi_tasks_run_n_tasks callback = (context, err, result) =>
+            {
+                try
+                {
+                    if (err != IntPtr.Zero)
+                    {
+                        var wErr = Marshal.PtrToStructure<WeaveffiError>(err);
+                        if (wErr.Code != 0)
+                        {
+                            var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? "";
+                            tcs.SetException(new WeaveffiException(wErr.Code, msg));
+                            return;
+                        }
+                    }
+                    tcs.SetResult(result);
+                }
+                finally
+                {
+                    if (context != IntPtr.Zero)
+                    {
+                        GCHandle.FromIntPtr(context).Free();
+                    }
+                }
+            };
+            var gcHandle = GCHandle.Alloc(callback, GCHandleType.Normal);
+            var ctx = GCHandle.ToIntPtr(gcHandle);
+            try
+            {
+                NativeMethods.weaveffi_tasks_run_n_tasks_async(n, callback, ctx);
+            }
+            catch
+            {
+                if (gcHandle.IsAllocated) gcHandle.Free();
+                throw;
+            }
+            return await tcs.Task;
+        }
+
+        public static long ActiveCallbacks()
+        {
+            var err = new WeaveffiError();
+            var result = NativeMethods.weaveffi_tasks_active_callbacks(ref err);
+            WeaveffiError.Check(err);
+            return result;
         }
 
     }

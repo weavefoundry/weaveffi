@@ -132,10 +132,10 @@ def _run_task_sync(name: str) -> "TaskResult":
                 _lib.weaveffi_error_clear(ctypes.byref(err.contents))
                 _state["err"] = WeaveffiError(_code, _msg)
             else:
-            if result is None:
-                _state["err"] = WeaveffiError(-1, "null pointer")
-            else:
-                _state["val"] = TaskResult(result)
+                if result is None:
+                    _state["err"] = WeaveffiError(-1, "null pointer")
+                else:
+                    _state["val"] = TaskResult(result)
         finally:
             _ev.set()
     _cb_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(_WeaveffiErrorStruct), ctypes.c_void_p)
@@ -166,11 +166,11 @@ def _run_batch_sync(names: List[str]) -> List["TaskResult"]:
                 _lib.weaveffi_error_clear(ctypes.byref(err.contents))
                 _state["err"] = WeaveffiError(_code, _msg)
             else:
-            if not result:
-                _state["val"] = []
-            else:
-                _rl = int(result_len)
-                _state["val"] = [TaskResult(result[_i]) for _i in range(_rl)]
+                if not result:
+                    _state["val"] = []
+                else:
+                    _rl = int(result_len)
+                    _state["val"] = [TaskResult(result[_i]) for _i in range(_rl)]
         finally:
             _ev.set()
     _cb_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(_WeaveffiErrorStruct), ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t)
@@ -198,3 +198,44 @@ def cancel_task(id: int) -> bool:
     _result = _fn(id, ctypes.byref(_err))
     _check_error(_err)
     return bool(_result)
+
+
+def _run_n_tasks_sync(n: int) -> int:
+    _fn = _lib.weaveffi_tasks_run_n_tasks_async
+    _ev = threading.Event()
+    _state = {"err": None, "val": None}
+    def _cb_impl(context, err, result):
+        try:
+            if err and err.contents.code != 0:
+                _code = err.contents.code
+                _msg = err.contents.message.decode("utf-8") if err.contents.message else ""
+                _lib.weaveffi_error_clear(ctypes.byref(err.contents))
+                _state["err"] = WeaveffiError(_code, _msg)
+            else:
+                _state["val"] = result
+        finally:
+            _ev.set()
+    _cb_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(_WeaveffiErrorStruct), ctypes.c_int32)
+    _cb = _cb_type(_cb_impl)
+    _fn.argtypes = [ctypes.c_int32, _cb_type, ctypes.c_void_p]
+    _fn.restype = None
+    _fn(n, _cb, None)
+    _ev.wait()
+    if _state["err"] is not None:
+        raise _state["err"]
+    return _state["val"]
+
+
+async def run_n_tasks(n: int) -> int:
+    _loop = asyncio.get_event_loop()
+    return await _loop.run_in_executor(None, _run_n_tasks_sync, n)
+
+
+def active_callbacks() -> int:
+    _fn = _lib.weaveffi_tasks_active_callbacks
+    _fn.argtypes = [ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.restype = ctypes.c_int64
+    _err = _WeaveffiErrorStruct()
+    _result = _fn(ctypes.byref(_err))
+    _check_error(_err)
+    return _result
