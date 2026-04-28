@@ -166,6 +166,13 @@
         "mutable": {
           "default": false,
           "type": "boolean"
+        },
+        "doc": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
@@ -359,6 +366,13 @@
         },
         "message": {
           "type": "string"
+        },
+        "doc": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     }
