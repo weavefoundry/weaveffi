@@ -3,6 +3,18 @@ use std::collections::BTreeMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// The current IR schema version that the parser, validator, and every
+/// generator expect.
+///
+/// Schema bumps are tied to this crate's minor version: each minor release
+/// of `weaveffi-ir` may introduce at most one new schema version, and
+/// [`SUPPORTED_VERSIONS`] always lists every version the upgrader can
+/// read. The CLI's `weaveffi upgrade` subcommand guarantees an N-1 → N
+/// migration path between consecutive versions.
+///
+/// See [`docs/src/stability.md`](https://github.com/weavefoundry/weaveffi/blob/main/docs/src/stability.md)
+/// for the full schema-migration policy and the surfaces covered by
+/// SemVer.
 pub const CURRENT_SCHEMA_VERSION: &str = "0.3.0";
 
 pub const SUPPORTED_VERSIONS: &[&str] = &["0.1.0", "0.2.0", "0.3.0"];
