@@ -5,9 +5,19 @@ language = "en"
 
 [build]
 create-missing = true
+extra-watch-dirs = []
 
 [output.html]
 default-theme = "ayu"
 preferred-dark-theme = "ayu"
 git-repository-url = "https://github.com/weavefoundry/weaveffi"
 site-url = "https://docs.weaveffi.com/"
+
+[output.linkcheck]
+follow-web-links = false
+warning-policy = "error"
+exclude = [
+    'docs\.weaveffi\.com',
+    'github\.com/weavefoundry/weaveffi',
+    'crates\.io',
+]

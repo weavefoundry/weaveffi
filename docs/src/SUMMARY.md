@@ -2,6 +2,7 @@
 
 - [Introduction](intro.md)
 - [Getting Started](getting-started.md)
+- [Architecture](architecture.md)
 - [Comparison](comparison.md)
 - [FAQ](faq.md)
 - [Stability and Versioning](stability.md)

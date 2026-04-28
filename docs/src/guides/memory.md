@@ -1,20 +1,41 @@
-# Memory Ownership Guide
+# Memory Ownership
 
-WeaveFFI exposes Rust functionality through a stable C ABI. Because Rust and C
-(and Swift, Kotlin, etc.) have fundamentally different memory models, every
-allocation that crosses the FFI boundary follows strict ownership rules.
+## Overview
 
-**Golden rule:** whoever allocates the memory owns it, and ownership must be
-explicitly transferred back for deallocation. Rust allocates; the caller frees
-through the designated `weaveffi_free_*` functions.
+WeaveFFI exposes Rust functionality through a stable C ABI. Because
+Rust and the consumer languages (C, Swift, Kotlin, Python, ...) have
+different memory models, every allocation that crosses the boundary
+follows strict ownership rules.
 
-## String ownership
+**Golden rule:** whoever allocates owns it, and ownership must be
+explicitly transferred back for deallocation. Rust allocates; the
+consumer frees through the designated `weaveffi_free_*` functions or
+the matching `_destroy` symbol.
 
-Rust-returned strings are NUL-terminated, UTF-8, heap-allocated C strings
-created via `CString::into_raw`. The caller **must** free them with
-`weaveffi_free_string` after use.
+## When to use
 
-### C
+Read this guide when:
+
+- You are writing a consumer in C/C++ where the compiler will not free
+  anything for you.
+- You are debugging a leak, double-free, or use-after-free in a
+  generated binding.
+- You are extending a generator and need to verify the ownership
+  contract for a new type.
+- You are reviewing PRs that add new IDL types that involve
+  heap-allocated data.
+
+For higher-level languages (Swift, Kotlin, Python, .NET, Dart, Ruby,
+Go) the generated wrappers handle most of this automatically; the rules
+below explain what those wrappers are doing under the hood.
+
+## Step-by-step
+
+### Strings
+
+Rust returns NUL-terminated, UTF-8, heap-allocated C strings created
+via `CString::into_raw`. The consumer must free them with
+`weaveffi_free_string`.
 
 ```c
 weaveffi_error err = {0, NULL};
@@ -27,25 +48,10 @@ if (err.code) {
 }
 
 printf("result: %s\n", echoed);
-weaveffi_free_string(echoed);   // REQUIRED — Rust allocated this
+weaveffi_free_string(echoed);
 ```
 
-### Swift
-
-```swift
-var err = weaveffi_error(code: 0, message: nil)
-let raw = weaveffi_calculator_echo(
-    Array("hello".utf8), 5, &err)
-// ... check err ...
-
-if let raw = raw {
-    let result = String(cString: raw)
-    weaveffi_free_string(raw)   // REQUIRED — Rust allocated this
-    print(result)
-}
-```
-
-The generated Swift wrapper handles this automatically with `defer`:
+Generated wrappers do the same with `defer`:
 
 ```swift
 let raw = weaveffi_calculator_echo(...)
@@ -53,32 +59,11 @@ defer { weaveffi_free_string(raw) }
 return String(cString: raw!)
 ```
 
-### Common mistakes
+### Byte buffers
 
-```c
-// BUG: use-after-free — reading string after freeing it
-const char* name = weaveffi_contacts_Contact_get_name(contact);
-weaveffi_free_string(name);
-printf("name: %s\n", name);    // UNDEFINED BEHAVIOR
-
-// BUG: double-free — freeing the same pointer twice
-const char* s = weaveffi_calculator_echo((const uint8_t*)"hi", 2, &err);
-weaveffi_free_string(s);
-weaveffi_free_string(s);       // UNDEFINED BEHAVIOR
-
-// BUG: memory leak — forgetting to free
-const char* s = weaveffi_calculator_echo((const uint8_t*)"hi", 2, &err);
-printf("%s\n", s);
-// missing weaveffi_free_string(s) — memory leaked
-```
-
-## Byte buffer ownership
-
-Byte buffers (`bytes` type) are returned as a `const uint8_t*` with a
-separate `size_t* out_len` output parameter. The caller **must** free them
-with `weaveffi_free_bytes(ptr, len)`.
-
-### C
+Byte buffers are returned as `const uint8_t*` plus an `out_len`. Free
+them with `weaveffi_free_bytes(ptr, len)` — the length must match what
+the C ABI returned.
 
 ```c
 size_t out_len = 0;
@@ -88,51 +73,23 @@ if (err.code) {
     return 1;
 }
 
-// Copy what you need before freeing
 process_data(buf, out_len);
-weaveffi_free_bytes((uint8_t*)buf, out_len);  // REQUIRED
+weaveffi_free_bytes((uint8_t*)buf, out_len);
 ```
 
-### Swift
+### Struct lifecycle
 
-```swift
-var outLen: Int = 0
-let raw = weaveffi_module_get_data(&outLen, &err)
-guard let raw = raw else { return Data() }
-defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: raw), outLen) }
-let data = Data(bytes: raw, count: outLen)
-```
+Structs are opaque on the consumer side. The lifecycle is:
 
-### Common mistakes
-
-```c
-// BUG: wrong length — passing incorrect length to free_bytes
-size_t len = 0;
-const uint8_t* buf = weaveffi_module_get_data(&len, &err);
-weaveffi_free_bytes((uint8_t*)buf, 0);    // WRONG length — undefined behavior
-
-// BUG: forgetting to free
-size_t len = 0;
-const uint8_t* buf = weaveffi_module_get_data(&len, &err);
-// missing weaveffi_free_bytes — memory leaked
-```
-
-## Struct lifecycle
-
-Structs are opaque on the C side. Their lifecycle follows a strict pattern:
-
-1. **`_create`** allocates and returns a pointer. Caller owns it.
-2. **`_destroy`** frees the struct. Must be called exactly once.
-3. **`_get_*`** getters read fields. Primitive getters (i32, f64, bool) return
-   values directly — no memory management needed. String and bytes getters
-   return **new owned copies** that the caller must free separately.
-
-### C
+1. `*_create` allocates and returns a pointer; the consumer owns it.
+2. `*_destroy` frees the struct. Call exactly once.
+3. `*_get_<field>` getters read fields. Primitive getters (`i32`,
+   `f64`, `bool`) return values directly. String/bytes getters return
+   **new owned copies** that must be freed.
 
 ```c
 weaveffi_error err = {0, NULL};
 
-// 1. Create — caller now owns the struct
 weaveffi_contacts_Contact* contact = weaveffi_contacts_Contact_create(
     (const uint8_t*)"Alice", 5,
     (const uint8_t*)"alice@example.com", 17,
@@ -143,30 +100,20 @@ if (err.code) {
     return 1;
 }
 
-// 2. Read fields — primitive getter, no free needed
 int32_t age = weaveffi_contacts_Contact_get_age(contact);
-printf("age: %d\n", age);
-
-// 3. Read fields — string getter returns owned copy, must free
 const char* name = weaveffi_contacts_Contact_get_name(contact);
-printf("name: %s\n", name);
-weaveffi_free_string(name);   // free the getter's returned string
+weaveffi_free_string(name);
 
-// 4. Destroy — frees the struct itself
 weaveffi_contacts_Contact_destroy(contact);
 ```
 
-### Swift
-
-The generated Swift wrapper wraps the opaque pointer in a class whose `deinit`
-calls `_destroy` automatically:
+The generated Swift wrapper invokes `_destroy` from `deinit` and frees
+returned strings with `defer`:
 
 ```swift
 public class Contact {
     let ptr: OpaquePointer
-
     init(ptr: OpaquePointer) { self.ptr = ptr }
-
     deinit { weaveffi_contacts_Contact_destroy(ptr) }
 
     public var name: String {
@@ -175,113 +122,46 @@ public class Contact {
         defer { weaveffi_free_string(raw) }
         return String(cString: raw)
     }
-
-    public var age: Int32 {
-        return weaveffi_contacts_Contact_get_age(ptr)
-    }
 }
 ```
 
-Swift's ARC ensures `deinit` runs when the last reference is dropped. String
-getters use `defer { weaveffi_free_string(...) }` to free after copying into a
-Swift `String`.
+### Error struct lifecycle
 
-### Common mistakes
-
-```c
-// BUG: use-after-free — accessing struct after destroying it
-weaveffi_contacts_Contact_destroy(contact);
-int32_t age = weaveffi_contacts_Contact_get_age(contact);  // UNDEFINED BEHAVIOR
-
-// BUG: double-free — destroying twice
-weaveffi_contacts_Contact_destroy(contact);
-weaveffi_contacts_Contact_destroy(contact);  // UNDEFINED BEHAVIOR
-
-// BUG: leaking getter string — getter returns owned copy
-const char* name = weaveffi_contacts_Contact_get_name(contact);
-// missing weaveffi_free_string(name) — leaked
-
-// BUG: memory leak — forgetting to destroy
-weaveffi_contacts_Contact* c = weaveffi_contacts_Contact_create(...);
-// missing weaveffi_contacts_Contact_destroy(c) — struct leaked
-```
-
-## Error struct lifecycle
-
-Every FFI function takes a trailing `weaveffi_error* out_err`. On failure,
-Rust writes into `out_err->code` (non-zero) and `out_err->message` (a
-Rust-allocated C string). Clearing the error frees the message.
-
-### C
+Every C ABI function takes a trailing `weaveffi_error* out_err`. On
+failure Rust writes a non-zero `code` and a Rust-allocated `message`.
+Clearing the error frees the message:
 
 ```c
-weaveffi_error err = {0, NULL};  // stack-allocated, zero-initialized
+weaveffi_error err = {0, NULL};
 
 int32_t result = weaveffi_calculator_div(10, 0, &err);
 if (err.code) {
     fprintf(stderr, "error %d: %s\n", err.code, err.message);
-    weaveffi_error_clear(&err);  // frees err.message, zeroes fields
+    weaveffi_error_clear(&err);
 }
 
-// err is now safe to reuse for the next call
 result = weaveffi_calculator_add(1, 2, &err);
 ```
 
-### Swift
+Generated wrappers convert non-zero codes into language-native
+exceptions (`throw`, `raise`, `Result::Err`).
 
-The generated Swift wrapper provides a `check` helper that copies the error
-message, clears the C error, and throws a Swift error:
+### Thread safety
 
-```swift
-var err = weaveffi_error(code: 0, message: nil)
-let result = weaveffi_calculator_div(10, 0, &err)
-try check(&err)  // throws WeaveFFIError, calls weaveffi_error_clear internally
-```
-
-### Common mistakes
-
-```c
-// BUG: leaking error message — forgetting to clear
-weaveffi_error err = {0, NULL};
-weaveffi_calculator_div(1, 0, &err);
-if (err.code) {
-    fprintf(stderr, "error: %s\n", err.message);
-    // missing weaveffi_error_clear(&err) — err.message leaked
-}
-
-// BUG: use-after-free — reading message after clearing
-weaveffi_error err = {0, NULL};
-weaveffi_calculator_div(1, 0, &err);
-if (err.code) {
-    weaveffi_error_clear(&err);
-    printf("%s\n", err.message);  // UNDEFINED BEHAVIOR — message was freed
-}
-```
-
-## Thread safety
-
-All WeaveFFI-generated FFI functions are expected to be called from a
-**single thread** unless the module documentation explicitly states otherwise.
-
-Concurrent calls from multiple threads into the same module may cause data
-races and undefined behavior. If you need multi-threaded access, synchronize
-externally (e.g., with a mutex or serial dispatch queue) on the calling side.
-
-```c
-// CORRECT — all calls on the main thread
-int32_t a = weaveffi_calculator_add(1, 2, &err);
-int32_t b = weaveffi_calculator_mul(3, 4, &err);
-```
+Generated FFI functions are expected to be called from a **single
+thread** unless the module's documentation says otherwise. Concurrent
+calls from multiple threads can cause data races and undefined
+behaviour. Synchronise externally — for example with a mutex or a
+serial dispatch queue:
 
 ```swift
-// CORRECT — serialize access through a serial queue
 let queue = DispatchQueue(label: "com.app.weaveffi")
 queue.sync {
     let result = try? Calculator.add(a: 1, b: 2)
 }
 ```
 
-## Summary
+## Reference
 
 | Resource           | Allocator | Free function              | Notes                                |
 |--------------------|-----------|----------------------------|--------------------------------------|
@@ -290,3 +170,23 @@ queue.sync {
 | Struct instance    | Rust      | `*_destroy`                | Call exactly once                    |
 | String from getter | Rust      | `weaveffi_free_string`     | Getter returns an owned copy         |
 | Error message      | Rust      | `weaveffi_error_clear`     | Clears code and frees message        |
+
+## Pitfalls
+
+- **Use-after-free** — reading a string after freeing it, or accessing
+  a struct after `_destroy`. Once the consumer frees something, the
+  pointer is invalid.
+- **Double-free** — freeing the same pointer twice (e.g. calling
+  `weaveffi_free_string` twice or invoking `_destroy` after the wrapper
+  has already done so).
+- **Wrong length to `weaveffi_free_bytes`** — always free with the
+  exact length the C ABI returned in `out_len`.
+- **Forgetting to clear error structs** — `err.message` is
+  Rust-allocated; failing to call `weaveffi_error_clear` after a
+  non-zero code leaks that string.
+- **Calling FFI from multiple threads without synchronisation** — the
+  default contract is single-threaded; synchronise externally if you
+  need parallelism.
+- **Manually freeing pointers passed in as borrowed parameters** —
+  borrowed inputs (`&str`, `&[u8]`, `const T*`) are owned by the
+  caller and must not be passed to `weaveffi_free_*`.

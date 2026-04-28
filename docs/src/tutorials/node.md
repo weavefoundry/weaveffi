@@ -1,17 +1,25 @@
-# Tutorial: Node.js npm Package
+# Node.js npm Package
 
-This tutorial walks through building a Rust library, generating Node.js
-N-API bindings with WeaveFFI, and publishing as an npm package.
+## Goal
+
+Build a small Rust greeter library, generate Node.js bindings with
+WeaveFFI, build the N-API addon, and call the bindings from a
+JavaScript script. By the end you will have an `npm`-installable
+package shape ready to publish.
 
 ## Prerequisites
 
-- [Rust toolchain](https://rustup.rs/) (stable channel)
-- Node.js 16+ and npm
-- WeaveFFI CLI installed (`cargo install weaveffi-cli`)
+- [Rust toolchain](https://rustup.rs/) (stable channel).
+- Node.js 16 or later and `npm`.
+- WeaveFFI CLI (`cargo install weaveffi-cli`).
+- A C compiler in the `PATH` (Xcode CLT on macOS, `build-essential` on
+  Linux, MSVC build tools on Windows) for the N-API addon build.
 
-## 1) Define your API
+## Step-by-step
 
-Create a file called `greeter.yml`:
+### 1. Author the IDL
+
+Save as `greeter.yml`:
 
 ```yaml
 version: "0.3.0"
@@ -34,13 +42,13 @@ modules:
         return: Greeting
 ```
 
-## 2) Generate bindings
+### 2. Generate bindings
 
 ```bash
 weaveffi generate greeter.yml -o generated --scaffold
 ```
 
-This produces (among other targets):
+Among other targets you should see:
 
 ```text
 generated/
@@ -53,13 +61,13 @@ generated/
 └── scaffold.rs
 ```
 
-## 3) Create the Rust library
+### 3. Implement the Rust library
 
 ```bash
 cargo init --lib mygreeter
 ```
 
-**mygreeter/Cargo.toml:**
+`mygreeter/Cargo.toml`:
 
 ```toml
 [package]
@@ -74,7 +82,7 @@ crate-type = ["cdylib"]
 weaveffi-abi = { version = "0.1" }
 ```
 
-**mygreeter/src/lib.rs:**
+`mygreeter/src/lib.rs`:
 
 ```rust
 #![allow(unsafe_code)]
@@ -97,103 +105,87 @@ pub extern "C" fn weaveffi_greeter_hello(
 }
 
 #[no_mangle]
-pub extern "C" fn weaveffi_free_string(ptr: *const c_char) {
-    abi::free_string(ptr);
-}
+pub extern "C" fn weaveffi_free_string(ptr: *const c_char) { abi::free_string(ptr); }
 
 #[no_mangle]
-pub extern "C" fn weaveffi_free_bytes(ptr: *mut u8, len: usize) {
-    abi::free_bytes(ptr, len);
-}
+pub extern "C" fn weaveffi_free_bytes(ptr: *mut u8, len: usize) { abi::free_bytes(ptr, len); }
 
 #[no_mangle]
-pub extern "C" fn weaveffi_error_clear(err: *mut weaveffi_error) {
-    abi::error_clear(err);
-}
+pub extern "C" fn weaveffi_error_clear(err: *mut weaveffi_error) { abi::error_clear(err); }
 ```
 
-Fill in the remaining functions using `scaffold.rs` as a guide.
+Use `scaffold.rs` for the rest of the API. You also need an N-API
+addon crate that bridges Node's runtime to the C ABI — see
+`samples/node-addon` in the WeaveFFI repository for a working example
+to copy.
 
-You also need an N-API addon crate that bridges Node's JavaScript
-runtime to the C ABI. See `samples/node-addon` in the WeaveFFI
-repository for a working example.
-
-## 4) Build the N-API addon
-
-Build the Rust library:
+### 4. Build the cdylib and the N-API addon
 
 ```bash
 cargo build -p mygreeter --release
-```
-
-Build the N-API addon (which links against your library and the C ABI):
-
-```bash
 cargo build -p node-addon --release
 ```
 
-Copy the compiled addon into the generated node package:
+Copy the addon into the generated package as `index.node`:
 
-**macOS:**
+macOS:
 
 ```bash
 cp target/release/libindex.dylib generated/node/index.node
 ```
 
-**Linux:**
+Linux:
 
 ```bash
 cp target/release/libindex.so generated/node/index.node
 ```
 
-The file must be named `index.node` — the generated `index.js` loader
-requires it at that path.
+Windows:
 
-## 5) Test locally
+```powershell
+copy target\release\index.dll generated\node\index.node
+```
 
-Create a test script `demo.js` in the `generated/node/` directory:
+### 5. Run the bindings locally
+
+Save as `generated/node/demo.js`:
 
 ```javascript
 const weaveffi = require("./index");
 
 const msg = weaveffi.hello("Node");
-console.log(msg); // "Hello, Node!"
+console.log(msg);
 ```
 
-Run it:
+Run it (the cdylib must be on the loader path):
 
-**macOS:**
+macOS:
 
 ```bash
 cd generated/node
 DYLD_LIBRARY_PATH=../../target/release node demo.js
 ```
 
-**Linux:**
+Linux:
 
 ```bash
 cd generated/node
 LD_LIBRARY_PATH=../../target/release node demo.js
 ```
 
-### TypeScript support
-
-The generated `types.d.ts` provides full type definitions. In a
-TypeScript project:
+For TypeScript consumers, the generated `types.d.ts` is enough:
 
 ```typescript
 import * as weaveffi from "./index";
 
 const msg: string = weaveffi.hello("TypeScript");
-console.log(msg);
-
 const g: weaveffi.Greeting = weaveffi.greeting("TS", "en");
 console.log(`${g.message} (${g.lang})`);
 ```
 
-## 6) Prepare for npm publish
+### 6. Prepare for publishing
 
-Edit `generated/node/package.json` to set your package metadata:
+Edit `generated/node/package.json`:
 
 ```json
 {
@@ -211,26 +203,20 @@ Edit `generated/node/package.json` to set your package metadata:
 }
 ```
 
-Key points:
+`files` must include `index.node`. For multi-platform packages,
+publish per-platform optional dependencies (e.g.
+`@myorg/greeter-darwin-arm64`) and use an install script to pick the
+right binary.
 
-- **`files`** must include `index.node` (the compiled N-API addon).
-- **`os`** and **`cpu`** fields document supported platforms.
-- For cross-platform packages, consider publishing platform-specific
-  optional dependencies (e.g.
-  `@myorg/greeter-darwin-arm64`) and using an install script to select
-  the right binary.
-
-## 7) Publish
+### 7. Publish
 
 ```bash
 cd generated/node
-npm pack    # creates a .tgz for inspection
-npm publish # publishes to the npm registry
+npm pack
+npm publish
 ```
 
-For scoped packages, use `npm publish --access public`.
-
-### Consuming the published package
+For scoped packages, append `--access public`. Consumers then run:
 
 ```bash
 npm install @myorg/greeter
@@ -238,23 +224,42 @@ npm install @myorg/greeter
 
 ```javascript
 const { hello } = require("@myorg/greeter");
-console.log(hello("npm")); // "Hello, npm!"
+console.log(hello("npm"));
 ```
 
-## Troubleshooting
+## Verification
 
-| Problem | Solution |
-|---------|----------|
-| `Error: Cannot find module './index.node'` | The compiled addon is missing. Copy the built `.dylib`/`.so` as `index.node`. |
-| `Error: dlopen ... not found` | The Rust shared library is not on the library path. Set `DYLD_LIBRARY_PATH` or `LD_LIBRARY_PATH`. |
-| `TypeError: weaveffi.hello is not a function` | The N-API addon did not export the expected symbols. Check that the addon registers all functions. |
-| Crashes on `require()` | The addon was built for a different Node.js version or architecture. Rebuild with the correct target. |
+- `node demo.js` prints `Hello, Node!` and exits with code `0`.
+- `npm pack` produces a `.tgz` containing `index.node`,
+  `types.d.ts`, and `index.js`.
+- TypeScript consumers see the `Greeting` interface and `hello`
+  signature without manual type declarations.
+- Common error mappings:
+
+  | Symptom                                                  | Likely cause                                                                  |
+  |----------------------------------------------------------|-------------------------------------------------------------------------------|
+  | `Error: Cannot find module './index.node'`               | The compiled addon is missing; copy the platform-specific binary in.           |
+  | `Error: dlopen ... not found`                            | Cdylib not on the loader path; set `DYLD_LIBRARY_PATH` / `LD_LIBRARY_PATH`.    |
+  | `TypeError: weaveffi.hello is not a function`            | The N-API addon did not export the expected symbols; rebuild after IDL edits.  |
+  | Crashes on `require()`                                   | Addon built for the wrong Node.js version or architecture; rebuild.            |
+
+## Cleanup
+
+```bash
+rm -rf generated/
+cargo clean -p mygreeter
+cargo clean -p node-addon
+```
+
+If you published a test version, mark it as deprecated with
+`npm deprecate @myorg/greeter@0.1.0 "test publish"`.
 
 ## Next steps
 
-- See the [Node generator reference](../generators/node.md) for type
-  mapping details and the full `types.d.ts` format.
-- Read the [Memory Ownership](../guides/memory.md) guide for struct
-  lifecycle semantics.
-- Explore the [Calculator tutorial](calculator.md) for a simpler
-  end-to-end walkthrough.
+- See the [Node generator reference](../generators/node.md) for the
+  full type mapping and `types.d.ts` layout.
+- Read [Memory Ownership](../guides/memory.md) for struct lifecycle
+  semantics.
+- Try the [Calculator tutorial](calculator.md) for a simpler
+  end-to-end walkthrough or [Python](python.md) for a sibling
+  scripting target.

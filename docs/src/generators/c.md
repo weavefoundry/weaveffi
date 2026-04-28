@@ -1,17 +1,52 @@
 # C
 
-The C generator emits a single header `weaveffi.h` containing function prototypes,
-error types, and memory helpers; it also includes an optional `weaveffi.c` placeholder
-for future convenience wrappers.
+## Overview
 
-## Generated artifacts
+The C target emits the canonical C header and a thin reference C file
+that every other WeaveFFI target ultimately speaks to. All cross-language
+bindings sit on top of these symbols, so the C output is also the easiest
+way to inspect what the IDL compiles to.
 
-- `generated/c/weaveffi.h`
-- `generated/c/weaveffi.c`
+## What gets generated
 
-## Generated code examples
+| File | Purpose |
+|------|---------|
+| `generated/c/weaveffi.h` | Public header: opaque types, enums, function prototypes, error/memory helpers |
+| `generated/c/weaveffi.c` | Empty placeholder for future convenience wrappers (kept so projects can link a single TU if desired) |
 
-Given this IDL definition:
+## Type mapping
+
+| IDL type     | C parameter type                        | C return type                      |
+|--------------|-----------------------------------------|------------------------------------|
+| `i32`        | `int32_t`                               | `int32_t`                          |
+| `u32`        | `uint32_t`                              | `uint32_t`                         |
+| `i64`        | `int64_t`                               | `int64_t`                          |
+| `f64`        | `double`                                | `double`                           |
+| `bool`       | `bool`                                  | `bool`                             |
+| `string`     | `const uint8_t* ptr, size_t len`        | `const char*`                      |
+| `bytes`      | `const uint8_t* ptr, size_t len`        | `const uint8_t*` + `size_t* out_len`|
+| `handle`     | `weaveffi_handle_t`                     | `weaveffi_handle_t`                |
+| `Struct`     | `const weaveffi_m_S*`                   | `weaveffi_m_S*`                    |
+| `Enum`       | `weaveffi_m_E`                          | `weaveffi_m_E`                     |
+| `T?` (value) | `const T*` (NULL = absent)              | `T*` (NULL = absent)               |
+| `[T]`        | `const T* items, size_t items_len`      | `T*` + `size_t* out_len`           |
+
+C ABI symbol naming follows a strict convention:
+
+| Kind              | Pattern                                           | Example                                       |
+|-------------------|---------------------------------------------------|-----------------------------------------------|
+| Function          | `weaveffi_{module}_{function}`                    | `weaveffi_contacts_create_contact`            |
+| Struct type       | `weaveffi_{module}_{Struct}`                      | `weaveffi_contacts_Contact`                   |
+| Struct create     | `weaveffi_{module}_{Struct}_create`               | `weaveffi_contacts_Contact_create`            |
+| Struct destroy    | `weaveffi_{module}_{Struct}_destroy`              | `weaveffi_contacts_Contact_destroy`           |
+| Struct getter     | `weaveffi_{module}_{Struct}_get_{field}`          | `weaveffi_contacts_Contact_get_name`          |
+| Enum type         | `weaveffi_{module}_{Enum}`                        | `weaveffi_contacts_ContactType`               |
+| Enum variant      | `weaveffi_{module}_{Enum}_{Variant}`              | `weaveffi_contacts_ContactType_Personal`      |
+
+When the IDL sets `c_prefix`, every symbol — including the runtime
+helpers — is rewritten with the new prefix.
+
+## Example IDL → generated code
 
 ```yaml
 version: "0.3.0"
@@ -52,10 +87,8 @@ modules:
         return: i32
 ```
 
-### Header format
-
-The generated header includes an include guard, standard C headers, a
-`#ifdef __cplusplus` guard, and the common error/memory types:
+The header opens with an include guard, standard headers, an
+`extern "C"` block, and the shared error/memory helpers:
 
 ```c
 #ifndef WEAVEFFI_H
@@ -79,21 +112,10 @@ typedef struct weaveffi_error {
 void weaveffi_error_clear(weaveffi_error* err);
 void weaveffi_free_string(const char* ptr);
 void weaveffi_free_bytes(uint8_t* ptr, size_t len);
-
-// ... module declarations ...
-
-#ifdef __cplusplus
-}
-#endif
-
-#endif // WEAVEFFI_H
 ```
 
-### Opaque struct pattern
-
-Structs use a forward-declared opaque typedef. Callers interact with structs
-exclusively through create/destroy/getter functions — they cannot inspect
-fields directly:
+Structs become forward-declared opaque typedefs reached via
+create/destroy/getter functions:
 
 ```c
 typedef struct weaveffi_contacts_Contact weaveffi_contacts_Contact;
@@ -108,29 +130,9 @@ void weaveffi_contacts_Contact_destroy(weaveffi_contacts_Contact* ptr);
 
 const char* weaveffi_contacts_Contact_get_name(
     const weaveffi_contacts_Contact* ptr);
-const char* weaveffi_contacts_Contact_get_email(
-    const weaveffi_contacts_Contact* ptr);
-int32_t weaveffi_contacts_Contact_get_age(
-    const weaveffi_contacts_Contact* ptr);
 ```
 
-### Naming conventions
-
-All C ABI symbols follow a strict naming convention:
-
-| Kind              | Pattern                                           | Example                                       |
-|-------------------|---------------------------------------------------|-----------------------------------------------|
-| Function          | `weaveffi_{module}_{function}`                    | `weaveffi_contacts_create_contact`            |
-| Struct type       | `weaveffi_{module}_{Struct}`                      | `weaveffi_contacts_Contact`                   |
-| Struct create     | `weaveffi_{module}_{Struct}_create`               | `weaveffi_contacts_Contact_create`            |
-| Struct destroy    | `weaveffi_{module}_{Struct}_destroy`              | `weaveffi_contacts_Contact_destroy`           |
-| Struct getter     | `weaveffi_{module}_{Struct}_get_{field}`          | `weaveffi_contacts_Contact_get_name`          |
-| Enum type         | `weaveffi_{module}_{Enum}`                        | `weaveffi_contacts_ContactType`               |
-| Enum variant      | `weaveffi_{module}_{Enum}_{Variant}`              | `weaveffi_contacts_ContactType_Personal`      |
-
-### Enum typedefs
-
-Enums generate a C `typedef enum` with prefixed variant names:
+Enums turn into typed `enum` declarations with prefixed variants:
 
 ```c
 typedef enum {
@@ -140,72 +142,23 @@ typedef enum {
 } weaveffi_contacts_ContactType;
 ```
 
-### Optional parameters and returns
-
-Optional value types are passed as const pointers; `NULL` means absent.
-Optional pointer types (string, struct) reuse the same pointer — `NULL`
-signals absence:
+Optionals and lists use pointer-with-sentinel and pointer+length pairs:
 
 ```c
-// Optional i32 parameter: const int32_t* (NULL = absent)
 int32_t* weaveffi_store_find(const int32_t* id, weaveffi_error* out_err);
 
-// Optional string return: const char* (NULL = absent)
-const char* weaveffi_store_get_name(weaveffi_error* out_err);
-
-// Optional struct return: pointer (NULL = absent)
-weaveffi_contacts_Contact* weaveffi_contacts_find_contact(
-    const int32_t* id, weaveffi_error* out_err);
-```
-
-### List parameters and returns
-
-Lists are passed as pointer + length. Return lists include an `out_len`
-output parameter:
-
-```c
-// List parameter: pointer + length
-void weaveffi_batch_process(
-    const int32_t* items, size_t items_len,
-    weaveffi_error* out_err);
-
-// List return: pointer + out_len
-int32_t* weaveffi_batch_get_ids(
-    size_t* out_len,
-    weaveffi_error* out_err);
-
-// List of structs return
 weaveffi_contacts_Contact** weaveffi_contacts_list_contacts(
     size_t* out_len,
     weaveffi_error* out_err);
 ```
 
-### Type mapping reference
-
-| IDL type     | C parameter type                        | C return type                      |
-|--------------|-----------------------------------------|------------------------------------|
-| `i32`        | `int32_t`                               | `int32_t`                          |
-| `u32`        | `uint32_t`                              | `uint32_t`                         |
-| `i64`        | `int64_t`                               | `int64_t`                          |
-| `f64`        | `double`                                | `double`                           |
-| `bool`       | `bool`                                  | `bool`                             |
-| `string`     | `const uint8_t* ptr, size_t len`        | `const char*`                      |
-| `bytes`      | `const uint8_t* ptr, size_t len`        | `const uint8_t*` + `size_t* out_len`|
-| `handle`     | `weaveffi_handle_t`                     | `weaveffi_handle_t`                |
-| `Struct`     | `const weaveffi_m_S*`                   | `weaveffi_m_S*`                    |
-| `Enum`       | `weaveffi_m_E`                          | `weaveffi_m_E`                     |
-| `T?` (value) | `const T*` (NULL = absent)              | `T*` (NULL = absent)               |
-| `[T]`        | `const T* items, size_t items_len`      | `T*` + `size_t* out_len`           |
-
-### Error handling
-
-Every generated function takes a trailing `weaveffi_error* out_err`. On
-failure, `out_err->code` is set to a non-zero value and `out_err->message`
-points to a Rust-allocated string. Always check and clear:
+Every function takes a trailing `weaveffi_error* out_err`. On failure
+`out_err->code` is non-zero and `out_err->message` points at a
+Rust-allocated string the consumer must clear:
 
 ```c
 weaveffi_error err = {0, NULL};
-int32_t result = weaveffi_contacts_count_contacts(&err);
+int32_t total = weaveffi_contacts_count_contacts(&err);
 if (err.code != 0) {
     fprintf(stderr, "Error %d: %s\n", err.code, err.message);
     weaveffi_error_clear(&err);
@@ -213,24 +166,11 @@ if (err.code != 0) {
 }
 ```
 
-### Memory management
+## Build instructions
 
-Rust-allocated strings and byte buffers must be freed by the caller:
+The runnable example uses the `calculator` sample crate.
 
-```c
-const char* name = weaveffi_contacts_Contact_get_name(contact);
-printf("Name: %s\n", name);
-weaveffi_free_string(name);
-
-size_t len;
-const uint8_t* data = weaveffi_storage_get_data(&len, &err);
-// ... use data ...
-weaveffi_free_bytes((uint8_t*)data, len);
-```
-
-## Build and run (calculator sample)
-
-### macOS
+macOS:
 
 ```bash
 cargo build -p calculator
@@ -240,7 +180,7 @@ cc -I ../../generated/c main.c -L ../../target/debug -lcalculator -o c_example
 DYLD_LIBRARY_PATH=../../target/debug ./c_example
 ```
 
-### Linux
+Linux:
 
 ```bash
 cargo build -p calculator
@@ -250,4 +190,69 @@ cc -I ../../generated/c main.c -L ../../target/debug -lcalculator -o c_example
 LD_LIBRARY_PATH=../../target/debug ./c_example
 ```
 
-See `examples/c/main.c` for usage of errors and returned strings.
+Windows:
+
+```powershell
+cargo build -p calculator
+cd examples\c
+cl /I ..\..\generated\c main.c /link calculator.lib
+.\main.exe
+```
+
+See `examples/c/main.c` for end-to-end usage.
+
+## Memory and ownership
+
+Rust always owns memory it allocates. Strings and byte buffers returned
+across the boundary must be freed by the consumer with the matching
+helper:
+
+```c
+const char* name = weaveffi_contacts_Contact_get_name(contact);
+printf("Name: %s\n", name);
+weaveffi_free_string(name);
+
+size_t len;
+const uint8_t* data = weaveffi_storage_get_data(&len, &err);
+weaveffi_free_bytes((uint8_t*)data, len);
+```
+
+For struct handles, call the matching `_destroy` symbol when the
+consumer is done. Borrowed parameters (`const T*`, `string`/`bytes`
+inputs) remain owned by the caller for the duration of the call only.
+
+## Async support
+
+Async functions (`async: true`) generate a callback-based variant with
+the suffix `_async`. The wrapper accepts a function pointer whose
+signature mirrors the synchronous return and an opaque `void* context`.
+WeaveFFI invokes the callback once with either a result or an error.
+
+```c
+typedef void (*weaveffi_demo_fetch_cb)(
+    void* context,
+    weaveffi_error* err,
+    const char* result);
+
+void weaveffi_demo_fetch_async(
+    int32_t id,
+    weaveffi_demo_fetch_cb callback,
+    void* context);
+```
+
+Cancellable functions also accept a `weaveffi_cancel_token*`. See
+[Async functions](../guides/async.md) for the full pattern.
+
+## Troubleshooting
+
+- **`undefined reference to weaveffi_*`** — make sure the linker sees
+  the cdylib (`-L target/debug -l<your-crate>`). The header alone is
+  not enough.
+- **Crashes inside `weaveffi_free_string`** — the pointer was not
+  Rust-allocated. Only free pointers returned from a generated getter
+  or function.
+- **`error: unknown type weaveffi_handle_t`** — the consumer included
+  the header without `<stdint.h>`. Include order matters; the generated
+  header pulls in the standard integer typedefs explicitly.
+- **`weaveffi.c` is empty** — that file is intentionally a placeholder.
+  All declarations live in `weaveffi.h`.

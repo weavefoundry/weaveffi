@@ -93,8 +93,9 @@ eleven targets and ~900 tests pass on Linux, macOS, and Windows.
 - Pre/post generation hooks.
 - Benchmarking infrastructure (`criterion`).
 - Automated publishing to crates.io via semantic-release.
-- Governance: `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`,
-  `ARCHITECTURE.md`, issue templates, PR template, CODEOWNERS.
+- Governance: `CONTRIBUTING.md` at the repo root and the canonical
+  internal [architecture](architecture.md) reference under
+  `docs/src/`.
 
 ### Samples
 
@@ -166,5 +167,5 @@ describing the workflow you want — community demand drives the order.
   and how the deprecation policy works.
 - [Comparison](comparison.md) — how WeaveFFI stacks up against UniFFI,
   cbindgen, diplomat, SWIG, and autocxx.
-- [Architecture](reference/README.md) — internal design docs (see
-  `ARCHITECTURE.md` at the repo root for the canonical version).
+- [Architecture](architecture.md) — the canonical "how WeaveFFI works
+  internally" reference for contributors.
