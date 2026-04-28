@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/weavefoundry/weaveffi/security/policy
+    about: Please report vulnerabilities privately according to SECURITY.md.
+  - name: Documentation
+    url: https://weavefoundry.github.io/weaveffi/
+    about: Check the user guide and API reference before opening a question.
