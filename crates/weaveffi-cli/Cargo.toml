@@ -8,6 +8,10 @@ repository.workspace = true
 description = "Command-line tool for generating multi-language FFI bindings from API definitions"
 keywords = ["ffi", "codegen", "bindings", "cli", "code-generation"]
 categories = ["development-tools::ffi", "command-line-utilities"]
+exclude = [
+    "tests/fixtures/**",
+    "tests/snapshots/**",
+]
 
 [[bin]]
 name = "weaveffi"
