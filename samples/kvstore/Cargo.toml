@@ -10,7 +10,6 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 weaveffi-abi = { path = "../../crates/weaveffi-abi" }
 parking_lot = "0.12"
-serde_json = { workspace = true }
 
 [lints]
 workspace = true
