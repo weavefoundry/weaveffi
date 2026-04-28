@@ -241,6 +241,242 @@ mod math {{
 }
 
 #[test]
+fn extract_async_function() {
+    let dir = tempfile::tempdir().expect("failed to create temp dir");
+    let src_path = dir.path().join("lib.rs");
+
+    {
+        let mut f = std::fs::File::create(&src_path).unwrap();
+        write!(
+            f,
+            r#"
+mod async_demo {{
+    /// Fetch data asynchronously.
+    #[weaveffi_export]
+    #[weaveffi_async]
+    fn fetch(url: String) -> String {{
+        todo!()
+    }}
+}}
+"#
+        )
+        .unwrap();
+    }
+
+    let output = assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args(["extract", src_path.to_str().unwrap()])
+        .output()
+        .expect("failed to run extract");
+
+    assert!(output.status.success(), "extract command failed");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let api: serde_yaml::Value =
+        serde_yaml::from_str(&stdout).expect("output should be valid YAML");
+    let func = &api["modules"].as_sequence().unwrap()[0]["functions"]
+        .as_sequence()
+        .unwrap()[0];
+    assert_eq!(func["name"].as_str().unwrap(), "fetch");
+    assert_eq!(
+        func["async"].as_bool(),
+        Some(true),
+        "async flag should be set"
+    );
+}
+
+#[test]
+fn extract_typed_handle_param() {
+    let dir = tempfile::tempdir().expect("failed to create temp dir");
+    let src_path = dir.path().join("lib.rs");
+
+    {
+        let mut f = std::fs::File::create(&src_path).unwrap();
+        write!(
+            f,
+            r#"
+mod sessions {{
+    #[weaveffi_export]
+    fn close(session: *mut Session) {{
+        todo!()
+    }}
+}}
+"#
+        )
+        .unwrap();
+    }
+
+    let output = assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args(["extract", src_path.to_str().unwrap()])
+        .output()
+        .expect("failed to run extract");
+
+    assert!(output.status.success(), "extract command failed");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let api: serde_yaml::Value =
+        serde_yaml::from_str(&stdout).expect("output should be valid YAML");
+    let param = &api["modules"].as_sequence().unwrap()[0]["functions"]
+        .as_sequence()
+        .unwrap()[0]["params"]
+        .as_sequence()
+        .unwrap()[0];
+    assert_eq!(param["name"].as_str().unwrap(), "session");
+    assert_eq!(param["type"].as_str().unwrap(), "handle<Session>");
+}
+
+#[test]
+fn extract_listener_definition() {
+    let dir = tempfile::tempdir().expect("failed to create temp dir");
+    let src_path = dir.path().join("lib.rs");
+
+    {
+        let mut f = std::fs::File::create(&src_path).unwrap();
+        write!(
+            f,
+            r#"
+mod events {{
+    /// Fired when data arrives.
+    #[weaveffi_callback]
+    fn OnData(payload: String) {{}}
+
+    /// Subscribe to OnData events.
+    #[weaveffi_listener(event_callback = "OnData")]
+    fn data_listener() {{}}
+}}
+"#
+        )
+        .unwrap();
+    }
+
+    let output = assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args(["extract", src_path.to_str().unwrap()])
+        .output()
+        .expect("failed to run extract");
+
+    assert!(output.status.success(), "extract command failed");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let api: serde_yaml::Value =
+        serde_yaml::from_str(&stdout).expect("output should be valid YAML");
+    let module = &api["modules"].as_sequence().unwrap()[0];
+
+    let callbacks = module["callbacks"].as_sequence().unwrap();
+    assert_eq!(callbacks.len(), 1);
+    assert_eq!(callbacks[0]["name"].as_str().unwrap(), "OnData");
+    assert_eq!(
+        callbacks[0]["doc"].as_str(),
+        Some("Fired when data arrives.")
+    );
+
+    let listeners = module["listeners"].as_sequence().unwrap();
+    assert_eq!(listeners.len(), 1);
+    assert_eq!(listeners[0]["name"].as_str().unwrap(), "data_listener");
+    assert_eq!(
+        listeners[0]["event_callback"].as_str().unwrap(),
+        "OnData",
+        "listener should reference its callback by name"
+    );
+    assert_eq!(
+        listeners[0]["doc"].as_str(),
+        Some("Subscribe to OnData events.")
+    );
+}
+
+#[test]
+fn extract_deprecated_attribute_to_since() {
+    let dir = tempfile::tempdir().expect("failed to create temp dir");
+    let src_path = dir.path().join("lib.rs");
+
+    {
+        let mut f = std::fs::File::create(&src_path).unwrap();
+        write!(
+            f,
+            r#"
+mod legacy {{
+    /// Legacy add.
+    #[weaveffi_export]
+    #[deprecated(since = "0.2.0", note = "Use add_v2 instead")]
+    fn add_old(a: i32, b: i32) -> i32 {{
+        a + b
+    }}
+}}
+"#
+        )
+        .unwrap();
+    }
+
+    let output = assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args(["extract", src_path.to_str().unwrap()])
+        .output()
+        .expect("failed to run extract");
+
+    assert!(output.status.success(), "extract command failed");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let api: serde_yaml::Value =
+        serde_yaml::from_str(&stdout).expect("output should be valid YAML");
+    let func = &api["modules"].as_sequence().unwrap()[0]["functions"]
+        .as_sequence()
+        .unwrap()[0];
+    assert_eq!(func["name"].as_str().unwrap(), "add_old");
+    assert_eq!(func["since"].as_str().unwrap(), "0.2.0");
+    assert_eq!(func["deprecated"].as_str().unwrap(), "Use add_v2 instead");
+}
+
+#[test]
+fn extract_mutable_reference_to_mutable_flag() {
+    let dir = tempfile::tempdir().expect("failed to create temp dir");
+    let src_path = dir.path().join("lib.rs");
+
+    {
+        let mut f = std::fs::File::create(&src_path).unwrap();
+        write!(
+            f,
+            r#"
+mod buffers {{
+    #[weaveffi_struct]
+    struct Buffer {{
+        capacity: i32,
+    }}
+
+    #[weaveffi_export]
+    fn fill(buf: &mut Buffer, value: i32) {{
+        todo!()
+    }}
+}}
+"#
+        )
+        .unwrap();
+    }
+
+    let output = assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args(["extract", src_path.to_str().unwrap()])
+        .output()
+        .expect("failed to run extract");
+
+    assert!(output.status.success(), "extract command failed");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let api: serde_yaml::Value =
+        serde_yaml::from_str(&stdout).expect("output should be valid YAML");
+    let params = &api["modules"].as_sequence().unwrap()[0]["functions"]
+        .as_sequence()
+        .unwrap()[0]["params"]
+        .as_sequence()
+        .unwrap();
+    assert_eq!(params[0]["name"].as_str().unwrap(), "buf");
+    assert_eq!(params[0]["mutable"].as_bool(), Some(true));
+    assert_eq!(params[1]["name"].as_str().unwrap(), "value");
+    // value is not &mut, so mutable is false (omitted from YAML by serde
+    // default skip).
+    assert!(
+        params[1].get("mutable").is_none() || params[1]["mutable"].as_bool() == Some(false),
+        "non-mut param should not have mutable=true: {:?}",
+        params[1]
+    );
+}
+
+#[test]
 fn extract_to_toml_format() {
     let dir = tempfile::tempdir().expect("failed to create temp dir");
     let src_path = dir.path().join("lib.rs");
