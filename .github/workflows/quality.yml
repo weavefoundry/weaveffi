@@ -123,3 +123,24 @@ jobs:
         with:
           files: lcov.info
           fail_ci_if_error: false
+
+  docs-linkcheck:
+    name: docs link check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install mdbook + mdbook-linkcheck
+        run: |
+          cargo install mdbook --locked
+          cargo install mdbook-linkcheck --locked
+
+      - name: Validate docs links
+        run: scripts/check-links.sh

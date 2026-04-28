@@ -1,243 +1,48 @@
 # Generator Configuration
 
-WeaveFFI reads an optional TOML configuration file that lets you customise
-names, packages, and prefixes used by each code generator. When no configuration
-file is provided, every option falls back to a sensible default.
+## Overview
 
-## Passing the configuration file
+WeaveFFI ships with sensible defaults so `weaveffi generate api.yml`
+just works. When you need to override package names, namespaces, or
+the C ABI prefix, you have two options that compose with each other:
 
-Use the `--config` flag on the `generate` command:
+- A TOML file (`weaveffi.toml`) passed via `--config`. Per-environment
+  values that vary by machine or CI runner.
+- An inline `generators:` block inside the IDL. Project-wide values
+  every contributor inherits without remembering a flag.
+
+When the same option appears in both, the inline IDL value wins.
+
+## When to use
+
+- Use the **TOML config** when one developer or one pipeline needs to
+  swap a value without changing the IDL.
+- Use the **inline `generators:` block** when the value is part of the
+  project contract (Swift module name, Go module path, custom
+  C ABI prefix). Checking it into the IDL guarantees consistency.
+- Use **both** when there is a project-wide default that an environment
+  occasionally needs to override.
+
+## Step-by-step
+
+### 1. Pass a TOML config file
 
 ```bash
 weaveffi generate api.yml -o generated --config weaveffi.toml
 ```
 
-When `--config` is omitted, all options use their default values.
-
-## File format
-
-The configuration file is plain TOML. All keys are top-level — there are no
-nested tables. Every key is optional; omit a key to keep its default.
-
-### Minimal example
-
-An empty file (or no file at all) is valid — defaults apply to everything:
-
 ```toml
-# weaveffi.toml — all defaults
-```
-
-### Full example
-
-```toml
-# weaveffi.toml
-
-# Swift module name used in Package.swift and the Sources/ directory.
 swift_module_name = "MyApp"
-
-# Java/Kotlin package name for the Android JNI wrapper.
 android_package = "com.example.myapp"
-
-# npm package name emitted in the Node.js loader.
 node_package_name = "@myorg/myapp"
-
-# WASM module name used in the JavaScript loader.
 wasm_module_name = "myapp_wasm"
-
-# Prefix for C ABI symbol names (e.g. myapp_math_add instead of weaveffi_math_add).
 c_prefix = "myapp"
-
-# When true, strip the module name from generated identifiers where applicable.
 strip_module_prefix = true
 ```
 
-## Configuration options
+Every key is optional; omit anything you want defaulted.
 
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `swift_module_name` | string | `"WeaveFFI"` | Name of the Swift module in `Package.swift` and the `Sources/` directory. |
-| `android_package` | string | `"com.weaveffi"` | Java/Kotlin package declaration in the generated JNI wrapper. |
-| `node_package_name` | string | `"weaveffi"` | Package name in the generated Node.js N-API loader. |
-| `wasm_module_name` | string | `"weaveffi_wasm"` | Module name in the generated WASM JavaScript loader. |
-| `c_prefix` | string | `"weaveffi"` | Prefix prepended to every C ABI symbol (`{prefix}_{module}_{function}`). |
-| `strip_module_prefix` | bool | `false` | Strip the module name from generated identifiers where applicable. |
-
-### `swift_module_name`
-
-Controls the Swift package and module name. The generated `Package.swift`
-references this name, and the source directory is created as
-`Sources/{swift_module_name}/`.
-
-```toml
-swift_module_name = "CoolLib"
-```
-
-Produces `Sources/CoolLib/CoolLib.swift` and a matching `Package.swift`:
-
-```swift
-// Package.swift
-let package = Package(
-    name: "CoolLib",
-    ...
-    targets: [
-        .target(name: "CoolLib", path: "Sources/CoolLib"),
-    ]
-)
-```
-
-### `android_package`
-
-Sets the Java/Kotlin package for the generated JNI bridge. The package
-determines the directory structure and the `package` declaration at the top of
-the generated `.kt` file.
-
-```toml
-android_package = "com.example.myapp"
-```
-
-Produces:
-
-```kotlin
-package com.example.myapp
-```
-
-### `node_package_name`
-
-Sets the package name used in the generated Node.js loader. This is the name
-consumers use in `require()` or `import` statements.
-
-```toml
-node_package_name = "@myorg/cool-lib"
-```
-
-### `wasm_module_name`
-
-Sets the module name used in the generated WASM JavaScript loader and
-TypeScript declarations.
-
-```toml
-wasm_module_name = "coolapp_wasm"
-```
-
-### `c_prefix`
-
-Replaces the default `weaveffi` prefix on all C ABI symbol names. This affects
-every generated header and every language binding that references C symbols.
-
-```toml
-c_prefix = "myapp"
-```
-
-With an API module named `math` containing a function `add`, the exported C
-symbol becomes `myapp_math_add` instead of the default `weaveffi_math_add`.
-
-### `strip_module_prefix`
-
-When set to `true`, generated identifiers omit the module name where the
-target language supports namespacing natively.
-
-```toml
-strip_module_prefix = true
-```
-
-## Common recipes
-
-### iOS/macOS project
-
-```toml
-swift_module_name = "MyAppFFI"
-c_prefix = "myapp"
-```
-
-```bash
-weaveffi generate api.yml -o generated -t swift,c --config weaveffi.toml
-```
-
-### Android project
-
-```toml
-android_package = "com.example.myapp.ffi"
-c_prefix = "myapp"
-```
-
-```bash
-weaveffi generate api.yml -o generated -t android --config weaveffi.toml
-```
-
-### Node.js package
-
-```toml
-node_package_name = "@myorg/myapp-native"
-```
-
-```bash
-weaveffi generate api.yml -o generated -t node --config weaveffi.toml
-```
-
-### All targets with custom prefix
-
-```toml
-swift_module_name = "MyAppFFI"
-android_package = "com.example.myapp"
-node_package_name = "@example/myapp"
-wasm_module_name = "myapp_wasm"
-c_prefix = "myapp"
-```
-
-```bash
-weaveffi generate api.yml -o generated --config weaveffi.toml
-```
-
-## Inline generator configuration
-
-Every key from the TOML config file can also live directly inside the IDL
-under a top-level `generators:` map. Each subtable is a *target name* (or
-the special `weaveffi` / `global` section); inside each target, the keys
-omit the `{target}_` prefix from the TOML form.
-
-When the same option appears in both places, the inline IDL value wins.
-The IDL is checked into the repository alongside the API definition and
-is therefore the more specific, project-local source of truth, while a
-`--config` TOML file is typically per-environment (CI, developer machine,
-release pipeline). Putting an option in the IDL guarantees every
-consumer sees the same generator settings without remembering to pass
-`--config`.
-
-### Per-target keys
-
-Each entry below shows the inline form on the left and the equivalent
-TOML field on the right.
-
-| Inline (IDL) | TOML field | Type |
-|--------------|------------|------|
-| `swift.module_name` | `swift_module_name` | string |
-| `android.package` | `android_package` | string |
-| `node.package_name` | `node_package_name` | string |
-| `wasm.module_name` | `wasm_module_name` | string |
-| `c.prefix` | `c_prefix` | string |
-| `python.package_name` | `python_package_name` | string |
-| `dotnet.namespace` | `dotnet_namespace` | string |
-| `cpp.namespace` | `cpp_namespace` | string |
-| `cpp.header_name` | `cpp_header_name` | string |
-| `cpp.standard` | `cpp_standard` | string |
-| `dart.package_name` | `dart_package_name` | string |
-| `go.module_path` | `go_module_path` | string |
-| `ruby.module_name` | `ruby_module_name` | string |
-| `ruby.gem_name` | `ruby_gem_name` | string |
-
-### Global section
-
-Options that are not specific to one target live under a `weaveffi`
-section (the alias `global` is also accepted):
-
-| Inline (IDL) | TOML field | Type |
-|--------------|------------|------|
-| `weaveffi.strip_module_prefix` | `strip_module_prefix` | bool |
-| `weaveffi.template_dir` | `template_dir` | string |
-| `weaveffi.pre_generate` | `pre_generate` | string |
-| `weaveffi.post_generate` | `post_generate` | string |
-
-### YAML example
+### 2. Embed `generators:` in the IDL
 
 ```yaml
 version: "0.3.0"
@@ -272,77 +77,39 @@ generators:
     pre_generate: "cargo build --release"
 ```
 
-Unknown target names (for example a future language target) and
-unknown keys inside a known target are silently ignored, so an older
-`weaveffi` CLI can still read an IDL written for a newer one.
+Unknown target keys are silently ignored, so an older `weaveffi` CLI
+can still read an IDL written for a newer one.
 
-## Performance
-
-`weaveffi generate` is fast enough that you generally don't need to think
-about it, but two design choices keep large multi-generator runs snappy:
-
-### Parallel generator dispatch
-
-The orchestrator dispatches every selected generator in parallel using
-[rayon](https://docs.rs/rayon). The pre-generate hook still runs before
-any generator starts and the post-generate hook still runs after every
-generator finishes — only the codegen step itself is parallelised.
-
-You don't need to opt in or configure anything. Selecting all 11 targets
-on a multi-core machine is roughly as fast as running the slowest single
-generator alone.
-
-### Per-generator incremental cache
-
-WeaveFFI persists one hash per generator under
-`{out_dir}/.weaveffi-cache/{target}.hash`. On every run, each generator's
-hash is recomputed (the IR plus the generator's name) and compared
-against the persisted value. Only generators whose hashes have changed
-are re-executed; the rest are skipped.
-
-This means tweaking a single field that only affects, say, the C header
-will only re-run the C generator on the next `weaveffi generate` —
-the other 10 generators stay cached.
-
-To clear every cached entry and force a full rebuild, pass `--force`:
+### 3. Verify the result
 
 ```bash
-weaveffi generate api.yml -o generated --force
+weaveffi generate api.yml -o generated --config weaveffi.toml
+ls generated/
 ```
 
-The legacy single-file `.weaveffi-cache` written by older CLIs is
-ignored on first run and replaced with the new per-generator directory
-layout automatically.
+For day-to-day project recipes:
 
-## Continuous integration
-
-Two CLI flags are designed for automated pipelines: `weaveffi diff
---check` enforces that committed bindings stay in sync with the IDL,
-and `weaveffi validate|lint --format json` produces machine-readable
-output that scripts and quality dashboards can consume directly.
-
-### `weaveffi diff --check`
-
-Runs the generator into a temporary directory, compares against the
-committed `--out` directory, and exits non-zero if anything would
-change. Only a one-line summary is printed; per-file diffs are
-suppressed so the log stays small.
-
-Exit codes:
-
-| Code | Meaning |
-|------|---------|
-| `0` | The committed output matches the IDL exactly. |
-| `2` | One or more files would change in place. |
-| `3` | One or more files would be added or removed. |
-
-```bash
-weaveffi diff api.yml --out generated --check
-# Example output:
-# + 0 added, - 0 removed, ~ 3 modified
+```toml
+# iOS / macOS
+swift_module_name = "MyAppFFI"
+c_prefix = "myapp"
 ```
 
-A typical "guard" job looks like:
+```toml
+# Android
+android_package = "com.example.myapp.ffi"
+c_prefix = "myapp"
+```
+
+```toml
+# Node
+node_package_name = "@myorg/myapp-native"
+```
+
+### 4. Wire it into CI
+
+`weaveffi diff --check` enforces that the committed bindings still
+match the IDL. A typical guard job:
 
 ```yaml
 # .github/workflows/ci.yml
@@ -350,72 +117,137 @@ A typical "guard" job looks like:
   run: weaveffi diff api.yml --out generated --check
 ```
 
-If the command fails, the contributor must run `weaveffi generate
-api.yml -o generated` locally and commit the regenerated files.
-
-### `weaveffi validate --format json`
-
-Emits a single JSON object on stdout. On success:
-
-```json
-{ "ok": true, "modules": 2, "functions": 8, "structs": 3, "enums": 1 }
-```
-
-On failure, the object lists the structured error so a quality gate
-can surface the offending identifier without parsing the human-readable
-diagnostic:
-
-```json
-{
-  "ok": false,
-  "errors": [
-    {
-      "code": "DuplicateFunctionName",
-      "module": "math",
-      "function": "add",
-      "message": "duplicate function name in module 'math': add",
-      "suggestion": "function names must be unique within a module; rename the duplicate"
-    }
-  ]
-}
-```
-
-Pair `--format json` with the global `--quiet` flag to ensure no
-stray header lines end up on stdout or stderr — useful when piping
-the output straight into `jq` or a CI report parser:
+`weaveffi validate --format json` and `weaveffi lint --format json`
+are designed to be parsed by quality dashboards:
 
 ```bash
 weaveffi --quiet validate api.yml --format json | jq '.ok'
-```
-
-The exit code is `0` on success and non-zero on failure, so existing
-shell idioms (`set -e`, `if !`) keep working unchanged.
-
-### `weaveffi lint --format json`
-
-Returns the warning list as a stable JSON document. Every warning has
-the same three fields (`code`, `location`, `message`), regardless of
-the underlying lint:
-
-```json
-{
-  "ok": false,
-  "warnings": [
-    {
-      "code": "DeepNesting",
-      "location": "math::compute::matrix",
-      "message": "deep type nesting at math::compute::matrix (depth 4, max recommended 3)"
-    }
-  ]
-}
-```
-
-`ok` is `true` when the warnings array is empty and `false` otherwise,
-mirroring the process exit code (`0` clean, `1` warnings present). A
-common CI recipe is to fail on regressions but still surface the full
-warning list as build metadata:
-
-```bash
 weaveffi --quiet lint api.yml --format json > lint-report.json || \
   (cat lint-report.json && exit 1)
 ```
+
+## Reference
+
+### TOML keys
+
+| Key                    | Type   | Default            | Description                                                                 |
+|------------------------|--------|--------------------|-----------------------------------------------------------------------------|
+| `swift_module_name`    | string | `"WeaveFFI"`       | Swift module name in `Package.swift` and the `Sources/` directory           |
+| `android_package`      | string | `"com.weaveffi"`   | Java/Kotlin package declaration in the JNI wrapper                          |
+| `node_package_name`    | string | `"weaveffi"`       | npm package name in the Node.js loader                                      |
+| `wasm_module_name`     | string | `"weaveffi_wasm"`  | Module name in the WASM JS loader                                           |
+| `c_prefix`             | string | `"weaveffi"`       | Prefix prepended to every C ABI symbol (`{prefix}_{module}_{function}`)     |
+| `strip_module_prefix`  | bool   | `false`            | Strip the module name from generated identifiers when supported             |
+| `python_package_name`  | string | `"weaveffi"`       | Python package name                                                         |
+| `dotnet_namespace`     | string | `"WeaveFFI"`       | .NET namespace                                                              |
+| `cpp_namespace`        | string | `"weaveffi"`       | C++ namespace for the wrapper                                               |
+| `cpp_header_name`      | string | `"weaveffi.hpp"`   | Header file name for the C++ output                                         |
+| `cpp_standard`         | string | `"17"`             | C++ standard for the generated `CMakeLists.txt`                             |
+| `dart_package_name`    | string | `"weaveffi"`       | Dart package name in `pubspec.yaml`                                         |
+| `go_module_path`       | string | `"weaveffi"`       | Go module path in `go.mod`                                                  |
+| `ruby_module_name`     | string | `"WeaveFFI"`       | Ruby module that wraps the bindings                                         |
+| `ruby_gem_name`        | string | `"weaveffi"`       | Ruby gem name                                                               |
+| `template_dir`         | string | _none_             | Directory of `.tera` overrides loaded by every generator                    |
+| `pre_generate`         | string | _none_             | Shell command run before any generator starts                               |
+| `post_generate`        | string | _none_             | Shell command run after every generator finishes                            |
+
+### Inline `generators:` keys
+
+Inline keys drop the `{target}_` prefix and live under their target's
+subtable.
+
+| Inline (IDL)                    | TOML field             | Type   |
+|---------------------------------|------------------------|--------|
+| `swift.module_name`             | `swift_module_name`    | string |
+| `android.package`               | `android_package`      | string |
+| `node.package_name`             | `node_package_name`    | string |
+| `wasm.module_name`              | `wasm_module_name`     | string |
+| `c.prefix`                      | `c_prefix`             | string |
+| `python.package_name`           | `python_package_name`  | string |
+| `dotnet.namespace`              | `dotnet_namespace`     | string |
+| `cpp.namespace`                 | `cpp_namespace`        | string |
+| `cpp.header_name`               | `cpp_header_name`      | string |
+| `cpp.standard`                  | `cpp_standard`         | string |
+| `dart.package_name`             | `dart_package_name`    | string |
+| `go.module_path`                | `go_module_path`       | string |
+| `ruby.module_name`              | `ruby_module_name`     | string |
+| `ruby.gem_name`                 | `ruby_gem_name`        | string |
+| `weaveffi.strip_module_prefix`  | `strip_module_prefix`  | bool   |
+| `weaveffi.template_dir`         | `template_dir`         | string |
+| `weaveffi.pre_generate`         | `pre_generate`         | string |
+| `weaveffi.post_generate`        | `post_generate`        | string |
+
+The alias `global` is accepted for the `weaveffi` section.
+
+### Performance and CI flags
+
+- The orchestrator dispatches every selected generator in parallel
+  using [rayon](https://docs.rs/rayon). The pre- and post-generate
+  hooks still run serially around the whole batch.
+- Each generator persists a hash under
+  `{out_dir}/.weaveffi-cache/{target}.hash`. Only generators whose
+  hash changed are re-run; pass `--force` to invalidate every entry.
+- `weaveffi diff --check` exit codes:
+
+  | Code | Meaning |
+  |------|---------|
+  | `0`  | The committed output matches the IDL exactly. |
+  | `2`  | One or more files would change in place. |
+  | `3`  | One or more files would be added or removed. |
+
+- `weaveffi validate --format json` emits structured success/failure:
+
+  ```json
+  { "ok": true, "modules": 2, "functions": 8, "structs": 3, "enums": 1 }
+  ```
+
+  ```json
+  {
+    "ok": false,
+    "errors": [
+      {
+        "code": "DuplicateFunctionName",
+        "module": "math",
+        "function": "add",
+        "message": "duplicate function name in module 'math': add",
+        "suggestion": "function names must be unique within a module; rename the duplicate"
+      }
+    ]
+  }
+  ```
+
+- `weaveffi lint --format json` returns the warning list with stable
+  `code` / `location` / `message` fields:
+
+  ```json
+  {
+    "ok": false,
+    "warnings": [
+      {
+        "code": "DeepNesting",
+        "location": "math::compute::matrix",
+        "message": "deep type nesting at math::compute::matrix (depth 4, max recommended 3)"
+      }
+    ]
+  }
+  ```
+
+## Pitfalls
+
+- **Inline value overrides TOML silently** — there is no warning when
+  both are set. If a TOML override "doesn't take", check for an inline
+  block in the IDL.
+- **`c_prefix` rewrites every generator** — picking a custom prefix
+  also rewrites the runtime symbols (`{prefix}_free_string`, ...). The
+  Rust cdylib must be built with the same prefix.
+- **`strip_module_prefix = true` flattens names** — collisions across
+  modules become possible. Pick one or the other consistently.
+- **Hooks run shell commands as-is** — `pre_generate` and
+  `post_generate` are passed straight to `sh -c`. Quote them
+  carefully and never include untrusted input.
+- **Cache only tracks IR + generator name** — if you change a template
+  override outside the IR (e.g. via `template_dir`) and want all
+  generators to re-run, pass `--force`.
+- **Older CLIs ignore unknown keys** — adding a new generator key
+  with a project-wide implication does not error out on older
+  toolchains. Pin the CLI version in CI when you need that guarantee.

@@ -1,8 +1,8 @@
 # Samples
 
 This repo includes sample projects under `samples/` that showcase end-to-end
-usage of the C ABI layer. Each sample contains a YAML API definition and a Rust
-crate that implements the corresponding `weaveffi_*` C ABI functions.
+usage of the C ABI layer. Each sample contains a YAML IDL and a Rust crate
+that implements the corresponding `weaveffi_*` C ABI functions.
 
 ## Kvstore (kitchen-sink reference)
 
@@ -107,7 +107,7 @@ exercises cross-module struct references and nested list types.
 
 **What it demonstrates:**
 
-- Multiple modules in a single API definition
+- Multiple modules in a single IDL
 - Enums (`Category` with `Electronics`, `Clothing`, `Food`, `Books`)
 - Structs with optional fields, list fields (`[string]` tags), and float types
 - List-returning search functions (`search_products` filtered by category)
@@ -146,9 +146,10 @@ cargo build -p async-demo
 cargo test -p async-demo
 ```
 
-> **Note:** The validator currently rejects `async: true` in API definitions.
-> This sample exists to exercise the planned async ABI pattern ahead of full
-> validator support.
+> **Note:** Async functions are fully supported by the validator. This
+> sample focuses on the C ABI callback pattern; see the
+> [Async Functions guide](guides/async.md) for the per-target async/await
+> story.
 
 ## Events
 
