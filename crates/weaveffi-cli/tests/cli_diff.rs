@@ -67,3 +67,43 @@ fn diff_no_changes() {
         .success()
         .stdout(predicate::str::contains("No differences found."));
 }
+
+/// Regression: `weaveffi diff` must apply the in-IDL `generators:` block
+/// the same way `weaveffi generate` does, otherwise an IDL with custom
+/// per-language naming (cpp namespace, dart package, dotnet assembly,
+/// etc.) reports spurious diffs against its own freshly generated output.
+#[test]
+fn diff_check_honors_inline_generators() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
+    let input = repo_root.join("samples/kvstore/kvstore.yml");
+
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let out_path = tmp.path().join("generated");
+
+    assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args([
+            "generate",
+            input.to_str().unwrap(),
+            "-o",
+            out_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args([
+            "diff",
+            input.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+            "--check",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "0 added, - 0 removed, ~ 0 modified",
+        ));
+}
