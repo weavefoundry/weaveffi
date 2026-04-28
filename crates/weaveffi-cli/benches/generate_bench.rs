@@ -211,6 +211,70 @@ fn load_kitchen_sink_api() -> Api {
     api
 }
 
+/// Parse and validate the calculator sample IDL.
+fn load_calculator_api() -> Api {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../samples/calculator/calculator.yml");
+    let contents = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read sample {}: {e}", path.display()));
+    let mut api = parse_api_str(&contents, "yaml")
+        .unwrap_or_else(|e| panic!("parse sample {}: {e}", path.display()));
+    validate_api(&mut api, None)
+        .unwrap_or_else(|e| panic!("validate sample {}: {e}", path.display()));
+    api
+}
+
+fn run_all_generators(api: &Api) {
+    let config = GeneratorConfig::default();
+
+    let c_gen = CGenerator;
+    let cpp = CppGenerator;
+    let swift = SwiftGenerator;
+    let android = AndroidGenerator;
+    let node = NodeGenerator;
+    let wasm = WasmGenerator;
+    let python = PythonGenerator;
+    let dotnet = DotnetGenerator;
+    let dart = DartGenerator;
+    let go = GoGenerator;
+    let ruby = RubyGenerator;
+
+    let orchestrator = Orchestrator::new()
+        .with_generator(&c_gen)
+        .with_generator(&cpp)
+        .with_generator(&swift)
+        .with_generator(&android)
+        .with_generator(&node)
+        .with_generator(&wasm)
+        .with_generator(&python)
+        .with_generator(&dotnet)
+        .with_generator(&dart)
+        .with_generator(&go)
+        .with_generator(&ruby);
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = Utf8Path::from_path(dir.path()).unwrap();
+    orchestrator
+        .run(black_box(api), out, &config, true, None)
+        .unwrap();
+}
+
+/// Target: full codegen (all 11 generators) < 500ms for the calculator sample.
+fn bench_full_codegen_calculator(c: &mut Criterion) {
+    let api = load_calculator_api();
+    c.bench_function("full_codegen_calculator", |b| {
+        b.iter(|| run_all_generators(&api));
+    });
+}
+
+/// Target: full codegen (all 11 generators) < 2000ms for the kitchen-sink fixture.
+fn bench_full_codegen_kitchen_sink(c: &mut Criterion) {
+    let api = load_kitchen_sink_api();
+    c.bench_function("full_codegen_kitchen_sink", |b| {
+        b.iter(|| run_all_generators(&api));
+    });
+}
+
 fn bench_generate_all_parallel_vs_serial(c: &mut Criterion) {
     let api = load_kitchen_sink_api();
     let config = GeneratorConfig::default();
@@ -265,5 +329,7 @@ criterion_group!(
     bench_generate_swift_large_api,
     bench_generate_all_large_api,
     bench_generate_all_parallel_vs_serial,
+    bench_full_codegen_calculator,
+    bench_full_codegen_kitchen_sink,
 );
 criterion_main!(benches);

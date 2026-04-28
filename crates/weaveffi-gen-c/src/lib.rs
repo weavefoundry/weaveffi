@@ -5,6 +5,8 @@
 //! is invoked through the [`Generator`] trait and is normally driven by
 //! [`weaveffi_core::codegen::Orchestrator`].
 
+use std::fmt::Write;
+
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
@@ -14,6 +16,30 @@ use weaveffi_core::utils::{
     c_abi_struct_name, render_abi_prefix_aliases, render_prelude, render_trailer, CommentStyle,
 };
 use weaveffi_ir::ir::{Api, EnumDef, Module, Param, StructDef, TypeRef};
+
+/// Number of API surface elements (functions + structs + enums + callbacks +
+/// listeners) used to pre-allocate the output buffer. Each element produces
+/// roughly 200-500 bytes of header text; budget 512 to cover most cases
+/// without re-allocating mid-render.
+const ESTIMATED_BYTES_PER_ELEMENT: usize = 512;
+const HEADER_BASE_BYTES: usize = 2048;
+
+fn estimate_header_capacity(api: &Api) -> usize {
+    fn count(modules: &[Module]) -> usize {
+        modules
+            .iter()
+            .map(|m| {
+                m.functions.len()
+                    + m.structs.len() * 2
+                    + m.enums.len()
+                    + m.callbacks.len()
+                    + m.listeners.len() * 2
+                    + count(&m.modules)
+            })
+            .sum()
+    }
+    HEADER_BASE_BYTES + count(&api.modules) * ESTIMATED_BYTES_PER_ELEMENT
+}
 
 pub struct CGenerator;
 
@@ -267,6 +293,18 @@ fn c_params_sig(params: &[Param], module: &str, prefix: &str) -> Vec<String> {
         .collect()
 }
 
+/// Write a comma-separated parameter signature directly into `out`, optionally
+/// prefixed with extra entries (used to fold callbacks/cancel tokens/out_err
+/// into the same signature without an intermediate `Vec<String>`).
+fn write_params_into(out: &mut String, parts: &[&str]) {
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(part);
+    }
+}
+
 fn c_callback_result_params(ty: &TypeRef, module: &str, prefix: &str) -> Vec<String> {
     match ty {
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
@@ -294,41 +332,27 @@ fn c_callback_result_params(ty: &TypeRef, module: &str, prefix: &str) -> Vec<Str
 
 fn render_c_header(api: &Api, prefix: &str, input_basename: &str, filename: &str) -> String {
     let guard = format!("{}_H", prefix.to_uppercase());
-    let mut out = String::new();
+    let mut out = String::with_capacity(estimate_header_capacity(api));
     out.push_str(&render_prelude(CommentStyle::DoubleSlash, input_basename));
-    out.push_str(&format!("#ifndef {guard}\n"));
-    out.push_str(&format!("#define {guard}\n\n"));
+    let _ = write!(out, "#ifndef {guard}\n#define {guard}\n\n");
     out.push_str("#include <stdint.h>\n");
     out.push_str("#include <stddef.h>\n");
     out.push_str("#include <stdbool.h>\n\n");
     out.push_str(&render_abi_prefix_aliases(prefix));
     out.push_str("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n");
-    out.push_str(&format!("typedef uint64_t {prefix}_handle_t;\n\n"));
-    out.push_str(&format!(
-        "typedef struct {prefix}_error {{ int32_t code; const char* message; }} {prefix}_error;\n\n",
-    ));
-    out.push_str(&format!(
-        "void {prefix}_error_clear({prefix}_error* err);\n"
-    ));
-    out.push_str(&format!("void {prefix}_free_string(const char* ptr);\n"));
-    out.push_str(&format!(
-        "void {prefix}_free_bytes(uint8_t* ptr, size_t len);\n\n"
-    ));
-    out.push_str(&format!(
-        "typedef struct {prefix}_cancel_token {prefix}_cancel_token;\n"
-    ));
-    out.push_str(&format!(
-        "{prefix}_cancel_token* {prefix}_cancel_token_create(void);\n"
-    ));
-    out.push_str(&format!(
-        "void {prefix}_cancel_token_cancel({prefix}_cancel_token* token);\n"
-    ));
-    out.push_str(&format!(
-        "bool {prefix}_cancel_token_is_cancelled(const {prefix}_cancel_token* token);\n"
-    ));
-    out.push_str(&format!(
-        "void {prefix}_cancel_token_destroy({prefix}_cancel_token* token);\n\n"
-    ));
+    let _ = write!(
+        out,
+        "typedef uint64_t {prefix}_handle_t;\n\n\
+         typedef struct {prefix}_error {{ int32_t code; const char* message; }} {prefix}_error;\n\n\
+         void {prefix}_error_clear({prefix}_error* err);\n\
+         void {prefix}_free_string(const char* ptr);\n\
+         void {prefix}_free_bytes(uint8_t* ptr, size_t len);\n\n\
+         typedef struct {prefix}_cancel_token {prefix}_cancel_token;\n\
+         {prefix}_cancel_token* {prefix}_cancel_token_create(void);\n\
+         void {prefix}_cancel_token_cancel({prefix}_cancel_token* token);\n\
+         bool {prefix}_cancel_token_is_cancelled(const {prefix}_cancel_token* token);\n\
+         void {prefix}_cancel_token_destroy({prefix}_cancel_token* token);\n\n",
+    );
     out.push_str("/*\n");
     out.push_str(" * Map convention: Maps are passed as parallel arrays of keys and values.\n");
     out.push_str(" * A map parameter {K:V} named \"m\" expands to:\n");
@@ -342,7 +366,7 @@ fn render_c_header(api: &Api, prefix: &str, input_basename: &str, filename: &str
     }
 
     out.push_str("\n#ifdef __cplusplus\n}\n#endif\n\n");
-    out.push_str(&format!("#endif // {guard}\n\n"));
+    let _ = write!(out, "#endif // {guard}\n\n");
     out.push_str(&render_trailer(CommentStyle::DoubleSlash, filename));
     out
 }
@@ -425,7 +449,7 @@ fn render_enum_header(out: &mut String, module_name: &str, e: &EnumDef, prefix: 
 }
 
 fn render_module_header(out: &mut String, module: &Module, prefix: &str, module_path: &str) {
-    out.push_str(&format!("// Module: {module_path}\n"));
+    let _ = writeln!(out, "// Module: {module_path}");
     for e in &module.enums {
         render_enum_header(out, module_path, e, prefix);
     }
@@ -436,7 +460,6 @@ fn render_module_header(out: &mut String, module: &Module, prefix: &str, module_
         }
     }
     for cb in &module.callbacks {
-        let cb_type = format!("{prefix}_{module_path}_{}_fn", cb.name);
         let mut params: Vec<String> = cb
             .params
             .iter()
@@ -444,74 +467,75 @@ fn render_module_header(out: &mut String, module: &Module, prefix: &str, module_
             .collect();
         params.push("void* context".to_string());
         emit_doc(out, &cb.doc, "");
-        out.push_str(&format!(
-            "typedef void (*{cb_type})({});\n",
-            params.join(", ")
-        ));
+        let _ = write!(
+            out,
+            "typedef void (*{prefix}_{module_path}_{}_fn)(",
+            cb.name
+        );
+        let parts: Vec<&str> = params.iter().map(|s| s.as_str()).collect();
+        write_params_into(out, &parts);
+        out.push_str(");\n");
     }
     for l in &module.listeners {
-        let cb_type = format!("{prefix}_{module_path}_{}_fn", l.event_callback);
-        let reg_fn = format!("{prefix}_{module_path}_register_{}", l.name);
-        let unreg_fn = format!("{prefix}_{module_path}_unregister_{}", l.name);
         emit_doc(out, &l.doc, "");
-        out.push_str(&format!(
-            "uint64_t {reg_fn}({cb_type} callback, void* context);\n"
-        ));
+        let _ = writeln!(
+            out,
+            "uint64_t {prefix}_{module_path}_register_{}({prefix}_{module_path}_{}_fn callback, void* context);",
+            l.name, l.event_callback
+        );
         emit_doc(out, &l.doc, "");
-        out.push_str(&format!("void {unreg_fn}(uint64_t id);\n"));
+        let _ = writeln!(
+            out,
+            "void {prefix}_{module_path}_unregister_{}(uint64_t id);",
+            l.name
+        );
     }
     for f in &module.functions {
         emit_doc(out, &f.doc, "");
         if let Some(msg) = &f.deprecated {
-            out.push_str(&format!(
-                "__attribute__((deprecated(\"{}\")))\n",
+            let _ = writeln!(
+                out,
+                "__attribute__((deprecated(\"{}\")))",
                 msg.replace('"', "\\\"")
-            ));
+            );
         }
         if let Some(TypeRef::Iterator(inner)) = &f.returns {
             let iter_tag = iter_type_name(&f.name, module_path, prefix);
-            out.push_str(&format!("typedef struct {iter_tag} {iter_tag};\n"));
+            let _ = writeln!(out, "typedef struct {iter_tag} {iter_tag};");
 
             let mut params_sig = c_params_sig(&f.params, module_path, prefix);
             params_sig.push(format!("{prefix}_error* out_err"));
-            out.push_str(&format!(
-                "{iter_tag}* {prefix}_{module_path}_{}({});\n",
-                f.name,
-                params_sig.join(", ")
-            ));
+            let _ = write!(out, "{iter_tag}* {prefix}_{module_path}_{}(", f.name);
+            let parts: Vec<&str> = params_sig.iter().map(|s| s.as_str()).collect();
+            write_params_into(out, &parts);
+            out.push_str(");\n");
 
             let (item_ty, item_out_params) = c_ret_type(inner, module_path, prefix);
-            let mut next_params = vec![format!("{iter_tag}* iter")];
-            if item_out_params.is_empty() {
-                next_params.push(format!("{item_ty}* out_item"));
-            } else {
-                next_params.push(format!("{item_ty}* out_item"));
-                next_params.extend(item_out_params);
-            }
+            let mut next_params = vec![format!("{iter_tag}* iter"), format!("{item_ty}* out_item")];
+            next_params.extend(item_out_params);
             next_params.push(format!("{prefix}_error* out_err"));
-            out.push_str(&format!(
-                "int32_t {iter_tag}_next({});\n",
-                next_params.join(", ")
-            ));
+            let _ = write!(out, "int32_t {iter_tag}_next(");
+            let parts: Vec<&str> = next_params.iter().map(|s| s.as_str()).collect();
+            write_params_into(out, &parts);
+            out.push_str(");\n");
 
-            out.push_str(&format!("void {iter_tag}_destroy({iter_tag}* iter);\n"));
+            let _ = writeln!(out, "void {iter_tag}_destroy({iter_tag}* iter);");
             continue;
         }
         if f.r#async {
             let fn_base = format!("{prefix}_{module_path}_{}", f.name);
-            let cb_name = format!("{fn_base}_callback");
 
             let mut cb_params = vec!["void* context".to_string(), format!("{prefix}_error* err")];
             if let Some(ret) = &f.returns {
                 cb_params.extend(c_callback_result_params(ret, module_path, prefix));
             }
-            out.push_str(&format!(
-                "typedef void (*{cb_name})({});\n",
-                cb_params.join(", ")
-            ));
+            let _ = write!(out, "typedef void (*{fn_base}_callback)(");
+            let parts: Vec<&str> = cb_params.iter().map(|s| s.as_str()).collect();
+            write_params_into(out, &parts);
+            out.push_str(");\n");
 
-            out.push_str("/*\n");
-            out.push_str(&format!(" * Async: {fn_base}\n"));
+            let _ = writeln!(out, "/*");
+            let _ = writeln!(out, " * Async: {fn_base}");
             out.push_str(" * The callback is called exactly once, on any thread.\n");
             out.push_str(" * On success, err is NULL and result (if any) is valid.\n");
             out.push_str(" * On failure, err is non-NULL with a non-zero code.\n");
@@ -521,12 +545,12 @@ fn render_module_header(out: &mut String, module: &Module, prefix: &str, module_
             if f.cancellable {
                 params_sig.push(format!("{prefix}_cancel_token* cancel_token"));
             }
-            params_sig.push(format!("{cb_name} callback"));
+            params_sig.push(format!("{fn_base}_callback callback"));
             params_sig.push("void* context".to_string());
-            out.push_str(&format!(
-                "void {fn_base}_async({});\n",
-                params_sig.join(", ")
-            ));
+            let _ = write!(out, "void {fn_base}_async(");
+            let parts: Vec<&str> = params_sig.iter().map(|s| s.as_str()).collect();
+            write_params_into(out, &parts);
+            out.push_str(");\n");
         } else {
             let mut params_sig = c_params_sig(&f.params, module_path, prefix);
             let ret_sig = if let Some(ret) = &f.returns {
@@ -537,13 +561,10 @@ fn render_module_header(out: &mut String, module: &Module, prefix: &str, module_
                 "void".to_string()
             };
             params_sig.push(format!("{prefix}_error* out_err"));
-            let fn_name = format!("{prefix}_{module_path}_{}", f.name);
-            out.push_str(&format!(
-                "{} {}({});\n",
-                ret_sig,
-                fn_name,
-                params_sig.join(", ")
-            ));
+            let _ = write!(out, "{ret_sig} {prefix}_{module_path}_{}(", f.name);
+            let parts: Vec<&str> = params_sig.iter().map(|s| s.as_str()).collect();
+            write_params_into(out, &parts);
+            out.push_str(");\n");
         }
     }
     for sub in &module.modules {

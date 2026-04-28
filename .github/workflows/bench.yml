@@ -1,0 +1,44 @@
+name: Bench
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  bench:
+    name: cargo bench
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: true
+
+      - name: Run cargo bench
+        # The two criterion harnesses (`weaveffi-core` and `weaveffi-cli`)
+        # accept `--noplot`; the workspace `cargo bench --workspace` flag
+        # also fans out to the default `libtest` harness in every other
+        # crate, which rejects `--noplot`, so we invoke each criterion
+        # bench explicitly. `--noplot` skips the gnuplot/plotters HTML
+        # reports so the artifact stays small (a few KB of text instead
+        # of MBs of SVG plots).
+        run: |
+          set -euo pipefail
+          {
+            cargo bench -p weaveffi-core --bench codegen_bench -- --noplot
+            cargo bench -p weaveffi-cli  --bench generate_bench -- --noplot
+          } 2>&1 | tee bench.txt
+
+      - name: Upload bench results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench.txt
+          if-no-files-found: error
+          retention-days: 90

@@ -5,6 +5,7 @@
 - [Comparison](comparison.md)
 - [FAQ](faq.md)
 - [Stability and Versioning](stability.md)
+- [Performance](performance.md)
 - [Roadmap](roadmap.md)
 - [Samples](samples.md)
 - [Reference](reference/README.md)
