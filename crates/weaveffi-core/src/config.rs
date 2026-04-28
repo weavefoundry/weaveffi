@@ -26,6 +26,11 @@ pub struct GeneratorConfig {
     pub template_dir: Option<String>,
     pub pre_generate: Option<String>,
     pub post_generate: Option<String>,
+    /// Basename of the IDL the CLI was invoked with (e.g. `weaveffi.yml`).
+    /// Generators embed this in the prelude header of every generated file.
+    /// Not user-configurable via the config file; populated by the CLI.
+    #[serde(skip)]
+    pub input_basename: Option<String>,
 }
 
 impl GeneratorConfig {
@@ -84,6 +89,10 @@ impl GeneratorConfig {
     pub fn ruby_gem_name(&self) -> &str {
         self.ruby_gem_name.as_deref().unwrap_or("weaveffi")
     }
+
+    pub fn input_basename(&self) -> &str {
+        self.input_basename.as_deref().unwrap_or("weaveffi.yml")
+    }
 }
 
 #[cfg(test)]
@@ -132,6 +141,7 @@ mod tests {
             template_dir: None,
             pre_generate: None,
             post_generate: None,
+            input_basename: None,
         };
 
         assert_eq!(cfg.swift_module_name(), "MySwift");
@@ -172,6 +182,7 @@ mod tests {
             template_dir: None,
             pre_generate: None,
             post_generate: None,
+            input_basename: Some("ignored.yml".into()),
         };
 
         let json = serde_json::to_string(&cfg).unwrap();
@@ -197,5 +208,19 @@ mod tests {
 
         assert_eq!(cfg.swift_module_name(), "WeaveFFI");
         assert!(!cfg.strip_module_prefix);
+        assert_eq!(cfg.input_basename(), "weaveffi.yml");
+    }
+
+    #[test]
+    fn input_basename_is_skipped_during_serde() {
+        let cfg = GeneratorConfig {
+            input_basename: Some("calc.yml".into()),
+            ..GeneratorConfig::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(!json.contains("input_basename"));
+        assert!(!json.contains("calc.yml"));
+        let back: GeneratorConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.input_basename(), "weaveffi.yml");
     }
 }

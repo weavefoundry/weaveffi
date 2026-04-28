@@ -9,7 +9,10 @@ use camino::Utf8Path;
 use heck::ToUpperCamelCase;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::config::GeneratorConfig;
-use weaveffi_core::utils::{c_abi_struct_name, local_type_name, wrapper_name};
+use weaveffi_core::utils::{
+    c_abi_struct_name, local_type_name, render_json_prelude, render_prelude, render_trailer,
+    wrapper_name, CommentStyle,
+};
 use weaveffi_ir::ir::{Api, Function, Module, StructDef, TypeRef};
 
 pub struct NodeGenerator;
@@ -21,22 +24,31 @@ impl NodeGenerator {
         out_dir: &Utf8Path,
         package_name: &str,
         strip_module_prefix: bool,
+        input_basename: &str,
     ) -> Result<()> {
         let dir = out_dir.join("node");
         std::fs::create_dir_all(&dir)?;
+        let dbl = CommentStyle::DoubleSlash;
         std::fs::write(
             dir.join("index.js"),
-            "module.exports = require('./index.node')\n",
+            format!(
+                "{}module.exports = require('./index.node')\n\n{}",
+                render_prelude(dbl, input_basename),
+                render_trailer(dbl, "index.js"),
+            ),
         )?;
         std::fs::write(
             dir.join("types.d.ts"),
-            render_node_dts(api, strip_module_prefix),
+            render_node_dts(api, strip_module_prefix, input_basename),
         )?;
-        std::fs::write(dir.join("package.json"), render_package_json(package_name))?;
-        std::fs::write(dir.join("binding.gyp"), render_binding_gyp())?;
+        std::fs::write(
+            dir.join("package.json"),
+            render_package_json(package_name, input_basename),
+        )?;
+        std::fs::write(dir.join("binding.gyp"), render_binding_gyp(input_basename))?;
         std::fs::write(
             dir.join("weaveffi_addon.c"),
-            render_addon_c(api, strip_module_prefix),
+            render_addon_c(api, strip_module_prefix, input_basename),
         )?;
         Ok(())
     }
@@ -48,7 +60,7 @@ impl Generator for NodeGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "weaveffi", true)
+        self.generate_impl(api, out_dir, "weaveffi", true, "weaveffi.yml")
     }
 
     fn generate_with_config(
@@ -62,49 +74,36 @@ impl Generator for NodeGenerator {
             out_dir,
             config.node_package_name(),
             config.strip_module_prefix,
+            config.input_basename(),
         )
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
-        vec![
-            out_dir.join("node/index.js").to_string(),
-            out_dir.join("node/types.d.ts").to_string(),
-            out_dir.join("node/package.json").to_string(),
+        let mut files = vec![
             out_dir.join("node/binding.gyp").to_string(),
+            out_dir.join("node/index.js").to_string(),
+            out_dir.join("node/package.json").to_string(),
+            out_dir.join("node/types.d.ts").to_string(),
             out_dir.join("node/weaveffi_addon.c").to_string(),
-        ]
+        ];
+        files.sort();
+        files
     }
 }
 
-fn render_package_json(name: &str) -> String {
+fn render_package_json(name: &str, input_basename: &str) -> String {
+    let prelude = render_json_prelude(input_basename);
     format!(
-        r#"{{
-  "name": "{name}",
-  "version": "0.1.0",
-  "main": "index.js",
-  "types": "types.d.ts",
-  "gypfile": true,
-  "scripts": {{
-    "install": "node-gyp rebuild"
-  }}
-}}
-"#
+        "{{\n{prelude}  \"name\": \"{name}\",\n  \"version\": \"0.1.0\",\n  \"main\": \"index.js\",\n  \"types\": \"types.d.ts\",\n  \"gypfile\": true,\n  \"scripts\": {{\n    \"install\": \"node-gyp rebuild\"\n  }}\n}}\n"
     )
 }
 
-fn render_binding_gyp() -> String {
-    r#"{
-  "targets": [
-    {
-      "target_name": "weaveffi",
-      "sources": ["weaveffi_addon.c"],
-      "include_dirs": ["../c"],
-      "libraries": ["-lweaveffi"]
-    }
-  ]
-}
-"#
-    .to_string()
+fn render_binding_gyp(input_basename: &str) -> String {
+    let prelude = render_prelude(CommentStyle::Hash, input_basename);
+    let trailer = render_trailer(CommentStyle::Hash, "binding.gyp");
+    format!(
+        "{prelude}{{\n  \"targets\": [\n    {{\n      \"target_name\": \"weaveffi\",\n      \"sources\": [\"weaveffi_addon.c\"],\n      \"include_dirs\": [\"../c\"],\n      \"libraries\": [\"-lweaveffi\"]\n    }}\n  ]\n}}\n\n{trailer}"
+    )
 }
 
 fn is_c_ptr_type(ty: &TypeRef) -> bool {
@@ -200,8 +199,9 @@ fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Mo
     }
 }
 
-fn render_addon_c(api: &Api, strip_module_prefix: bool) -> String {
-    let mut out = String::from(
+fn render_addon_c(api: &Api, strip_module_prefix: bool, input_basename: &str) -> String {
+    let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
+    out.push_str(
         "#include <node_api.h>\n#include \"weaveffi.h\"\n#include <stdlib.h>\n#include <string.h>\n\n",
     );
 
@@ -256,7 +256,11 @@ fn render_addon_c(api: &Api, strip_module_prefix: bool) -> String {
     }
     out.push_str("  return exports;\n");
     out.push_str("}\n\n");
-    out.push_str("NAPI_MODULE(NODE_GYP_MODULE_NAME, Init)\n");
+    out.push_str("NAPI_MODULE(NODE_GYP_MODULE_NAME, Init)\n\n");
+    out.push_str(&render_trailer(
+        CommentStyle::DoubleSlash,
+        "weaveffi_addon.c",
+    ));
     out
 }
 
@@ -1152,8 +1156,9 @@ fn render_struct_builder_dts(out: &mut String, s: &StructDef) {
     out.push_str("}\n");
 }
 
-fn render_node_dts(api: &Api, strip_module_prefix: bool) -> String {
-    let mut out = String::from("// Generated types for WeaveFFI functions\n");
+fn render_node_dts(api: &Api, strip_module_prefix: bool, input_basename: &str) -> String {
+    let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
+    out.push_str("// Generated types for WeaveFFI functions\n");
     for (m, path) in collect_modules_with_path(&api.modules) {
         for s in &m.structs {
             emit_doc(&mut out, &s.doc, "");
@@ -1206,6 +1211,8 @@ fn render_node_dts(api: &Api, strip_module_prefix: bool) -> String {
             ));
         }
     }
+    out.push('\n');
+    out.push_str(&render_trailer(CommentStyle::DoubleSlash, "types.d.ts"));
     out
 }
 
@@ -1358,7 +1365,7 @@ mod tests {
             since: None,
         });
 
-        let dts = render_node_dts(&make_api(vec![m]), true);
+        let dts = render_node_dts(&make_api(vec![m]), true, "weaveffi.yml");
 
         assert!(dts.contains("export interface Contact {"));
         assert!(dts.contains("  name: string;"));
@@ -1720,7 +1727,7 @@ mod tests {
             m
         }]);
 
-        let dts = render_node_dts(&api, true);
+        let dts = render_node_dts(&api, true, "weaveffi.yml");
 
         assert!(
             dts.contains("Maps to C function: weaveffi_math_add"),
@@ -1761,7 +1768,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi.yml");
         assert!(
             !addon.contains("// TODO: implement"),
             "generated addon.c should not contain TODO comments: {addon}"
@@ -1797,7 +1804,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi.yml");
         assert!(
             addon.contains("napi_get_cb_info"),
             "generated addon.c should call napi_get_cb_info: {addon}"
@@ -1825,7 +1832,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi.yml");
         assert!(
             addon.contains("weaveffi_free_string(result)"),
             "generated addon should free returned strings: {addon}"
@@ -1873,7 +1880,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi.yml");
         assert!(
             addon.contains("err.code"),
             "generated addon.c should check err.code: {addon}"
@@ -1988,7 +1995,7 @@ mod tests {
             });
             m
         }]);
-        let dts = render_node_dts(&api, true);
+        let dts = render_node_dts(&api, true, "weaveffi.yml");
         assert!(
             dts.contains("contact: Contact"),
             "TypedHandle should use class type not bigint: {dts}"
@@ -2033,7 +2040,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let dts = render_node_dts(&api, true);
+        let dts = render_node_dts(&api, true, "weaveffi.yml");
         assert!(
             dts.contains("(Contact | null)[] | null"),
             "should contain deeply nested optional type: {dts}"
@@ -2069,7 +2076,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let dts = render_node_dts(&api, true);
+        let dts = render_node_dts(&api, true, "weaveffi.yml");
         assert!(
             dts.contains("Record<string, number[]>"),
             "should contain map of lists type: {dts}"
@@ -2135,7 +2142,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let dts = render_node_dts(&api, true);
+        let dts = render_node_dts(&api, true, "weaveffi.yml");
         assert!(
             dts.contains("Record<Color, Contact>"),
             "should contain enum-keyed map type: {dts}"
@@ -2174,7 +2181,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi.yml");
         assert!(
             addon.contains("free(name)"),
             "malloc'd JS string copy should be freed after the C call: {addon}"
@@ -2241,7 +2248,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi.yml");
         assert!(
             addon.contains("if (result == NULL)"),
             "optional struct return should null-check before wrapping: {addon}"
@@ -2283,7 +2290,7 @@ mod tests {
             });
             m
         }]);
-        let dts = render_node_dts(&api, true);
+        let dts = render_node_dts(&api, true, "weaveffi.yml");
         assert!(
             dts.contains("Promise<"),
             "async function should return Promise in .d.ts: {dts}"
@@ -2319,7 +2326,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi.yml");
         assert!(
             addon.contains("napi_create_promise"),
             "async addon should call napi_create_promise: {addon}"
@@ -2372,7 +2379,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true);
+        let addon = render_addon_c(&api, true, "weaveffi.yml");
         let create_count = addon.matches("napi_create_promise").count();
         let resolve_count = addon.matches("napi_resolve_deferred").count();
         let reject_count = addon.matches("napi_reject_deferred").count();
@@ -2445,32 +2452,32 @@ mod tests {
 
     #[test]
     fn node_emits_doc_on_function() {
-        let dts = render_node_dts(&make_api(vec![doc_module()]), true);
+        let dts = render_node_dts(&make_api(vec![doc_module()]), true, "weaveffi.yml");
         assert!(dts.contains("Performs a thing."), "{dts}");
     }
 
     #[test]
     fn node_emits_doc_on_struct() {
-        let dts = render_node_dts(&make_api(vec![doc_module()]), true);
+        let dts = render_node_dts(&make_api(vec![doc_module()]), true, "weaveffi.yml");
         assert!(dts.contains("/** An item we track. */"), "{dts}");
     }
 
     #[test]
     fn node_emits_doc_on_enum_variant() {
-        let dts = render_node_dts(&make_api(vec![doc_module()]), true);
+        let dts = render_node_dts(&make_api(vec![doc_module()]), true, "weaveffi.yml");
         assert!(dts.contains("/** Kind of item. */"), "{dts}");
         assert!(dts.contains("/** A small one */"), "{dts}");
     }
 
     #[test]
     fn node_emits_doc_on_field() {
-        let dts = render_node_dts(&make_api(vec![doc_module()]), true);
+        let dts = render_node_dts(&make_api(vec![doc_module()]), true, "weaveffi.yml");
         assert!(dts.contains("/** Stable id */"), "{dts}");
     }
 
     #[test]
     fn node_emits_doc_on_param() {
-        let dts = render_node_dts(&make_api(vec![doc_module()]), true);
+        let dts = render_node_dts(&make_api(vec![doc_module()]), true, "weaveffi.yml");
         assert!(dts.contains("@param x the input value"), "{dts}");
     }
 }
