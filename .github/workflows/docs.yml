@@ -27,10 +27,11 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Install mdBook
-        uses: peaceiris/actions-mdbook@v2
-        with:
-          mdbook-version: 'latest'
+      - name: Install mdbook + mdbook-linkcheck2
+        # Keep this in sync with the docs linkcheck job in quality.yml.
+        run: |
+          cargo install mdbook --locked
+          cargo install mdbook-linkcheck2 --locked
 
       - name: Build mdBook
         run: mdbook build docs
