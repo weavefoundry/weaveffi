@@ -51,8 +51,7 @@ JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_run_taskAsync(JNIEnv* env, jcl
     (*env)->GetJavaVM(env, &ctx->jvm);
     ctx->callback = (*env)->NewGlobalRef(env, callback);
     const char* name_chars = (*env)->GetStringUTFChars(env, name, NULL);
-    jsize name_len = (*env)->GetStringUTFLength(env, name);
-    weaveffi_tasks_run_task_async((const uint8_t*)name_chars, (size_t)name_len, weaveffi_tasks_run_task_jni_cb, ctx);
+    weaveffi_tasks_run_task_async(name_chars, weaveffi_tasks_run_task_jni_cb, ctx);
     (*env)->ReleaseStringUTFChars(env, name, name_chars);
 }
 
@@ -125,7 +124,7 @@ JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_run_n_tasksAsync(JNIEnv* env, 
 
 JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_active_callbacks(JNIEnv* env, jclass clazz) {
     weaveffi_error err = {0, NULL};
-    int64_t rv = weaveffi_tasks_active_callbacks(, &err);
+    int64_t rv = weaveffi_tasks_active_callbacks(&err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return 0;
@@ -136,8 +135,7 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_active_callbacks(JNIEnv* env,
 JNIEXPORT jlong JNICALL Java_com_weaveffi_TaskResult_nativeCreate(JNIEnv* env, jclass clazz, jlong id, jstring value, jboolean success) {
     weaveffi_error err = {0, NULL};
     const char* value_chars = (*env)->GetStringUTFChars(env, value, NULL);
-    jsize value_len = (*env)->GetStringUTFLength(env, value);
-    weaveffi_tasks_TaskResult* rv = weaveffi_tasks_TaskResult_create((int64_t)id, (const uint8_t*)value_chars, (size_t)value_len, (bool)(success == JNI_TRUE), &err);
+    weaveffi_tasks_TaskResult* rv = weaveffi_tasks_TaskResult_create((int64_t)id, value_chars, (bool)(success == JNI_TRUE), &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return 0;

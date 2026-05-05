@@ -52,8 +52,7 @@ JNIEXPORT jint JNICALL Java_com_weaveffi_WeaveFFI_div(JNIEnv* env, jclass clazz,
 JNIEXPORT jstring JNICALL Java_com_weaveffi_WeaveFFI_echo(JNIEnv* env, jclass clazz, jstring s) {
     weaveffi_error err = {0, NULL};
     const char* s_chars = (*env)->GetStringUTFChars(env, s, NULL);
-    jsize s_len = (*env)->GetStringUTFLength(env, s);
-    const char* rv = weaveffi_calculator_echo((const uint8_t*)s_chars, (size_t)s_len, &err);
+    const char* rv = weaveffi_calculator_echo(s_chars, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return NULL;

@@ -44,8 +44,7 @@ typedef struct {
 JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_open_store(JNIEnv* env, jclass clazz, jstring path) {
     weaveffi_error err = {0, NULL};
     const char* path_chars = (*env)->GetStringUTFChars(env, path, NULL);
-    jsize path_len = (*env)->GetStringUTFLength(env, path);
-    weaveffi_handle_t rv = weaveffi_kv_open_store((const uint8_t*)path_chars, (size_t)path_len, &err);
+    weaveffi_handle_t rv = weaveffi_kv_open_store(path_chars, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return 0;
@@ -67,7 +66,6 @@ JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_close_storeJni(JNIEnv* env, jc
 JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_putJni(JNIEnv* env, jclass clazz, jlong store, jstring key, jbyteArray value, jint kind, jobject ttl_seconds) {
     weaveffi_error err = {0, NULL};
     const char* key_chars = (*env)->GetStringUTFChars(env, key, NULL);
-    jsize key_len = (*env)->GetStringUTFLength(env, key);
     jboolean value_is_copy = 0;
     jbyte* value_elems = (*env)->GetByteArrayElements(env, value, &value_is_copy);
     jsize value_len = (*env)->GetArrayLength(env, value);
@@ -79,7 +77,7 @@ JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_putJni(JNIEnv* env, jclass
         ttl_seconds_val = (int64_t)(*env)->CallLongMethod(env, ttl_seconds, ttl_seconds_mid);
         ttl_seconds_ptr = &ttl_seconds_val;
     }
-    bool rv = weaveffi_kv_put((weaveffi_handle_t)store, (const uint8_t*)key_chars, (size_t)key_len, (const uint8_t*)value_elems, (size_t)value_len, (int32_t)kind, ttl_seconds_ptr, &err);
+    bool rv = weaveffi_kv_put((weaveffi_handle_t)store, key_chars, (const uint8_t*)value_elems, (size_t)value_len, (int32_t)kind, ttl_seconds_ptr, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return JNI_FALSE;
@@ -92,8 +90,7 @@ JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_putJni(JNIEnv* env, jclass
 JNIEXPORT jobject JNICALL Java_com_weaveffi_WeaveFFI_getJni(JNIEnv* env, jclass clazz, jlong store, jstring key) {
     weaveffi_error err = {0, NULL};
     const char* key_chars = (*env)->GetStringUTFChars(env, key, NULL);
-    jsize key_len = (*env)->GetStringUTFLength(env, key);
-    const int64_t* rv = (const int64_t*)weaveffi_kv_get((weaveffi_handle_t)store, (const uint8_t*)key_chars, (size_t)key_len, &err);
+    const int64_t* rv = (const int64_t*)weaveffi_kv_get((weaveffi_handle_t)store, key_chars, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return NULL;
@@ -108,8 +105,7 @@ JNIEXPORT jobject JNICALL Java_com_weaveffi_WeaveFFI_getJni(JNIEnv* env, jclass 
 JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_deleteJni(JNIEnv* env, jclass clazz, jlong store, jstring key) {
     weaveffi_error err = {0, NULL};
     const char* key_chars = (*env)->GetStringUTFChars(env, key, NULL);
-    jsize key_len = (*env)->GetStringUTFLength(env, key);
-    bool rv = weaveffi_kv_delete((weaveffi_handle_t)store, (const uint8_t*)key_chars, (size_t)key_len, &err);
+    bool rv = weaveffi_kv_delete((weaveffi_handle_t)store, key_chars, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return JNI_FALSE;
@@ -121,12 +117,10 @@ JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_deleteJni(JNIEnv* env, jcl
 JNIEXPORT jobjectArray JNICALL Java_com_weaveffi_WeaveFFI_list_keysJni(JNIEnv* env, jclass clazz, jlong store, jstring prefix) {
     weaveffi_error err = {0, NULL};
     const char* prefix_chars = NULL;
-    jsize prefix_len = 0;
     if (prefix != NULL) {
         prefix_chars = (*env)->GetStringUTFChars(env, prefix, NULL);
-        prefix_len = (*env)->GetStringUTFLength(env, prefix);
     }
-    const void* rv = weaveffi_kv_list_keys((weaveffi_handle_t)store, (const uint8_t*)prefix_chars, (size_t)prefix_len, &out_len, &err);
+    const void* rv = weaveffi_kv_list_keys((weaveffi_handle_t)store, prefix_chars, &out_len, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return NULL;
@@ -187,11 +181,10 @@ JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_compact_asyncAsync(JNIEnv* env
 JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_legacy_putJni(JNIEnv* env, jclass clazz, jlong store, jstring key, jbyteArray value) {
     weaveffi_error err = {0, NULL};
     const char* key_chars = (*env)->GetStringUTFChars(env, key, NULL);
-    jsize key_len = (*env)->GetStringUTFLength(env, key);
     jboolean value_is_copy = 0;
     jbyte* value_elems = (*env)->GetByteArrayElements(env, value, &value_is_copy);
     jsize value_len = (*env)->GetArrayLength(env, value);
-    bool rv = weaveffi_kv_legacy_put((weaveffi_handle_t)store, (const uint8_t*)key_chars, (size_t)key_len, (const uint8_t*)value_elems, (size_t)value_len, &err);
+    bool rv = weaveffi_kv_legacy_put((weaveffi_handle_t)store, key_chars, (const uint8_t*)value_elems, (size_t)value_len, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return JNI_FALSE;
@@ -233,7 +226,6 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_Store_nativeGetId(JNIEnv* env, jclass 
 JNIEXPORT jlong JNICALL Java_com_weaveffi_Entry_nativeCreate(JNIEnv* env, jclass clazz, jlong id, jstring key, jbyteArray value, jlong created_at, jobject expires_at, jobjectArray tags, jobject metadata) {
     weaveffi_error err = {0, NULL};
     const char* key_chars = (*env)->GetStringUTFChars(env, key, NULL);
-    jsize key_len = (*env)->GetStringUTFLength(env, key);
     jboolean value_is_copy = 0;
     jbyte* value_elems = (*env)->GetByteArrayElements(env, value, &value_is_copy);
     jsize value_len = (*env)->GetArrayLength(env, value);
@@ -264,7 +256,7 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_Entry_nativeCreate(JNIEnv* env, jclass
         metadata_jv[metadata_i] = (jstring)metadata_vo;
         metadata_c_vals[metadata_i] = (*env)->GetStringUTFChars(env, (jstring)metadata_vo, NULL);
     }
-    weaveffi_kv_Entry* rv = weaveffi_kv_Entry_create((int64_t)id, (const uint8_t*)key_chars, (size_t)key_len, (const uint8_t*)value_elems, (size_t)value_len, (int64_t)created_at, expires_at_ptr, (const void*)tags_elems, (size_t)tags_len, (const char* const*)metadata_c_keys, (const char* const*)metadata_c_vals, (size_t)metadata_len, &err);
+    weaveffi_kv_Entry* rv = weaveffi_kv_Entry_create((int64_t)id, key_chars, (const uint8_t*)value_elems, (size_t)value_len, (int64_t)created_at, expires_at_ptr, (const void*)tags_elems, (size_t)tags_len, (const char* const*)metadata_c_keys, (const char* const*)metadata_c_vals, (size_t)metadata_len, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return 0;

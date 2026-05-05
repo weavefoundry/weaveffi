@@ -38,9 +38,8 @@ typedef struct {
 JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_create_document(JNIEnv* env, jclass clazz, jstring title, jobjectArray tags) {
     weaveffi_error err = {0, NULL};
     const char* title_chars = (*env)->GetStringUTFChars(env, title, NULL);
-    jsize title_len = (*env)->GetStringUTFLength(env, title);
     jsize tags_len = (*env)->GetArrayLength(env, tags);
-    weaveffi_docs_Document* rv = weaveffi_docs_create_document((const uint8_t*)title_chars, (size_t)title_len, (const void*)tags_elems, (size_t)tags_len, &err);
+    weaveffi_docs_Document* rv = weaveffi_docs_create_document(title_chars, (const void*)tags_elems, (size_t)tags_len, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return 0;
@@ -94,9 +93,8 @@ JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_publish_asyncAsync(JNIEnv* env
 JNIEXPORT jlong JNICALL Java_com_weaveffi_Document_nativeCreate(JNIEnv* env, jclass clazz, jlong id, jstring title, jint status, jobjectArray tags) {
     weaveffi_error err = {0, NULL};
     const char* title_chars = (*env)->GetStringUTFChars(env, title, NULL);
-    jsize title_len = (*env)->GetStringUTFLength(env, title);
     jsize tags_len = (*env)->GetArrayLength(env, tags);
-    weaveffi_docs_Document* rv = weaveffi_docs_Document_create((int64_t)id, (const uint8_t*)title_chars, (size_t)title_len, (int32_t)status, (const void*)tags_elems, (size_t)tags_len, &err);
+    weaveffi_docs_Document* rv = weaveffi_docs_Document_create((int64_t)id, title_chars, (int32_t)status, (const void*)tags_elems, (size_t)tags_len, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return 0;

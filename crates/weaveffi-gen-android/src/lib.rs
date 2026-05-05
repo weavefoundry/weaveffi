@@ -795,7 +795,13 @@ fn render_jni_c(
                     &path,
                 );
             } else {
-                let _ = writeln!(jni_c, "    {}({}, &err);", c_sym, call_args.join(", "));
+                let args_str = call_args.join(", ");
+                let _ = writeln!(
+                    jni_c,
+                    "    {}({});",
+                    c_sym,
+                    join_call_args(&args_str, "&err")
+                );
                 write_error_check(&mut jni_c, f.returns.as_ref());
                 release_jni_resources(&mut jni_c, &f.params);
                 let _ = writeln!(jni_c, "    return;");
@@ -954,11 +960,6 @@ fn write_param_acquire(out: &mut String, name: &str, ty: &TypeRef) {
                 "    const char* {n}_chars = (*env)->GetStringUTFChars(env, {n}, NULL);",
                 n = name
             );
-            let _ = writeln!(
-                out,
-                "    jsize {n}_len = (*env)->GetStringUTFLength(env, {n});",
-                n = name
-            );
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             let _ = writeln!(out, "    jboolean {n}_is_copy = 0;", n = name);
@@ -984,16 +985,10 @@ fn write_optional_acquire(out: &mut String, name: &str, inner: &TypeRef) {
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             let _ = writeln!(out, "    const char* {n}_chars = NULL;", n = name);
-            let _ = writeln!(out, "    jsize {n}_len = 0;", n = name);
             let _ = writeln!(out, "    if ({n} != NULL) {{", n = name);
             let _ = writeln!(
                 out,
                 "        {n}_chars = (*env)->GetStringUTFChars(env, {n}, NULL);",
-                n = name
-            );
-            let _ = writeln!(
-                out,
-                "        {n}_len = (*env)->GetStringUTFLength(env, {n});",
                 n = name
             );
             let _ = writeln!(out, "    }}");
@@ -1423,8 +1418,7 @@ fn write_map_elem_extract(
 fn build_c_call_args(args: &mut Vec<String>, name: &str, ty: &TypeRef, module: &str) {
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            args.push(format!("(const uint8_t*){n}_chars", n = name));
-            args.push(format!("(size_t){n}_len", n = name));
+            args.push(format!("{n}_chars", n = name));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             args.push(format!("(const uint8_t*){n}_elems", n = name));
@@ -1445,8 +1439,7 @@ fn build_c_call_args(args: &mut Vec<String>, name: &str, ty: &TypeRef, module: &
         TypeRef::Enum(_) => args.push(format!("(int32_t){}", name)),
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                args.push(format!("(const uint8_t*){n}_chars", n = name));
-                args.push(format!("(size_t){n}_len", n = name));
+                args.push(format!("{n}_chars", n = name));
             }
             TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 args.push(format!("(const uint8_t*){n}_elems", n = name));
@@ -1489,6 +1482,21 @@ fn build_c_call_args(args: &mut Vec<String>, name: &str, ty: &TypeRef, module: &
     }
 }
 
+/// Format a C call argument list joined by `", "` and append the
+/// out-parameter `extras` (e.g. `"&err"` or `"&out_len, &err"`).
+///
+/// When `args_str` is empty (the wrapped C function takes only the
+/// implicit out-params) the leading comma that would otherwise split
+/// the empty user args from `extras` is suppressed, so we emit
+/// `f(&err)` rather than the malformed `f(, &err)`.
+fn join_call_args(args_str: &str, extras: &str) -> String {
+    if args_str.is_empty() {
+        extras.to_string()
+    } else {
+        format!("{}, {}", args_str, extras)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_return_handling(
     jni_c: &mut String,
@@ -1500,9 +1508,11 @@ fn write_return_handling(
     module: &str,
 ) {
     let args_str = call_args.join(", ");
+    let call_with_err = join_call_args(&args_str, "&err");
+    let call_with_out_len_err = join_call_args(&args_str, "&out_len, &err");
     match ret_type {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            let _ = writeln!(jni_c, "    const char* rv = {}({}, &err);", c_sym, args_str);
+            let _ = writeln!(jni_c, "    const char* rv = {}({});", c_sym, call_with_err);
             write_error_check(jni_c, returns);
             let _ = writeln!(jni_c, "    jstring out = rv ? (*env)->NewStringUTF(env, rv) : (*env)->NewStringUTF(env, \"\");");
             let _ = writeln!(jni_c, "    weaveffi_free_string(rv);");
@@ -1512,8 +1522,8 @@ fn write_return_handling(
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             let _ = writeln!(
                 jni_c,
-                "    const uint8_t* rv = {}({}, &out_len, &err);",
-                c_sym, args_str
+                "    const uint8_t* rv = {}({});",
+                c_sym, call_with_out_len_err
             );
             write_error_check(jni_c, returns);
             let _ = writeln!(
@@ -1529,14 +1539,14 @@ fn write_return_handling(
             let _ = writeln!(jni_c, "    return out;");
         }
         TypeRef::Bool => {
-            let _ = writeln!(jni_c, "    bool rv = {}({}, &err);", c_sym, args_str);
+            let _ = writeln!(jni_c, "    bool rv = {}({});", c_sym, call_with_err);
             write_error_check(jni_c, returns);
             release_jni_resources(jni_c, params);
             let _ = writeln!(jni_c, "    return rv ? JNI_TRUE : JNI_FALSE;");
         }
         TypeRef::Struct(name) => {
             let c_ty = weaveffi_core::utils::c_abi_struct_name(name, module, "weaveffi");
-            let _ = writeln!(jni_c, "    {}* rv = {}({}, &err);", c_ty, c_sym, args_str);
+            let _ = writeln!(jni_c, "    {}* rv = {}({});", c_ty, c_sym, call_with_err);
             write_error_check(jni_c, returns);
             release_jni_resources(jni_c, params);
             let _ = writeln!(jni_c, "    return (jlong)(intptr_t)rv;");
@@ -1553,7 +1563,7 @@ fn write_return_handling(
         ret_type => {
             let c_ty = c_type_for_return(ret_type);
             let jcast = jni_cast_for(ret_type);
-            let _ = writeln!(jni_c, "    {} rv = {}({}, &err);", c_ty, c_sym, args_str);
+            let _ = writeln!(jni_c, "    {} rv = {}({});", c_ty, c_sym, call_with_err);
             write_error_check(jni_c, returns);
             release_jni_resources(jni_c, params);
             let _ = writeln!(jni_c, "    return {} rv;", jcast);
@@ -1570,9 +1580,10 @@ fn write_optional_return(
     params: &[weaveffi_ir::ir::Param],
     _module: &str,
 ) {
+    let call = join_call_args(args_str, "&err");
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            let _ = writeln!(out, "    const char* rv = {}({}, &err);", c_sym, args_str);
+            let _ = writeln!(out, "    const char* rv = {}({});", c_sym, call);
             write_error_check(out, returns);
             release_jni_resources(out, params);
             let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
@@ -1581,11 +1592,7 @@ fn write_optional_return(
             let _ = writeln!(out, "    return result;");
         }
         TypeRef::I32 | TypeRef::Enum(_) => {
-            let _ = writeln!(
-                out,
-                "    const int32_t* rv = {}({}, &err);",
-                c_sym, args_str
-            );
+            let _ = writeln!(out, "    const int32_t* rv = {}({});", c_sym, call);
             write_error_check(out, returns);
             release_jni_resources(out, params);
             let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
@@ -1609,8 +1616,8 @@ fn write_optional_return(
         | TypeRef::Struct(_) => {
             let _ = writeln!(
                 out,
-                "    const int64_t* rv = (const int64_t*){}({}, &err);",
-                c_sym, args_str
+                "    const int64_t* rv = (const int64_t*){}({});",
+                c_sym, call
             );
             write_error_check(out, returns);
             release_jni_resources(out, params);
@@ -1629,7 +1636,7 @@ fn write_optional_return(
             );
         }
         TypeRef::F64 => {
-            let _ = writeln!(out, "    const double* rv = {}({}, &err);", c_sym, args_str);
+            let _ = writeln!(out, "    const double* rv = {}({});", c_sym, call);
             write_error_check(out, returns);
             release_jni_resources(out, params);
             let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
@@ -1647,7 +1654,7 @@ fn write_optional_return(
             );
         }
         TypeRef::Bool => {
-            let _ = writeln!(out, "    const bool* rv = {}({}, &err);", c_sym, args_str);
+            let _ = writeln!(out, "    const bool* rv = {}({});", c_sym, call);
             write_error_check(out, returns);
             release_jni_resources(out, params);
             let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
@@ -1665,7 +1672,7 @@ fn write_optional_return(
             );
         }
         _ => {
-            let _ = writeln!(out, "    void* rv = {}({}, &err);", c_sym, args_str);
+            let _ = writeln!(out, "    void* rv = {}({});", c_sym, call);
             write_error_check(out, returns);
             release_jni_resources(out, params);
             let _ = writeln!(out, "    return (jobject)rv;");
@@ -1681,13 +1688,10 @@ fn write_list_return(
     returns: Option<&TypeRef>,
     params: &[weaveffi_ir::ir::Param],
 ) {
+    let call = join_call_args(args_str, "&out_len, &err");
     match inner {
         TypeRef::I32 | TypeRef::Enum(_) => {
-            let _ = writeln!(
-                out,
-                "    const int32_t* rv = {}({}, &out_len, &err);",
-                c_sym, args_str
-            );
+            let _ = writeln!(out, "    const int32_t* rv = {}({});", c_sym, call);
             write_error_check(out, returns);
             release_jni_resources(out, params);
             let _ = writeln!(
@@ -1704,8 +1708,8 @@ fn write_list_return(
         | TypeRef::Struct(_) => {
             let _ = writeln!(
                 out,
-                "    const int64_t* rv = (const int64_t*){}({}, &out_len, &err);",
-                c_sym, args_str
+                "    const int64_t* rv = (const int64_t*){}({});",
+                c_sym, call
             );
             write_error_check(out, returns);
             release_jni_resources(out, params);
@@ -1717,11 +1721,7 @@ fn write_list_return(
             let _ = writeln!(out, "    return result;");
         }
         TypeRef::F64 => {
-            let _ = writeln!(
-                out,
-                "    const double* rv = {}({}, &out_len, &err);",
-                c_sym, args_str
-            );
+            let _ = writeln!(out, "    const double* rv = {}({});", c_sym, call);
             write_error_check(out, returns);
             release_jni_resources(out, params);
             let _ = writeln!(
@@ -1732,11 +1732,7 @@ fn write_list_return(
             let _ = writeln!(out, "    return result;");
         }
         TypeRef::Bool => {
-            let _ = writeln!(
-                out,
-                "    const bool* rv = {}({}, &out_len, &err);",
-                c_sym, args_str
-            );
+            let _ = writeln!(out, "    const bool* rv = {}({});", c_sym, call);
             write_error_check(out, returns);
             release_jni_resources(out, params);
             let _ = writeln!(
@@ -1747,11 +1743,7 @@ fn write_list_return(
             let _ = writeln!(out, "    return result;");
         }
         _ => {
-            let _ = writeln!(
-                out,
-                "    const void* rv = {}({}, &out_len, &err);",
-                c_sym, args_str
-            );
+            let _ = writeln!(out, "    const void* rv = {}({});", c_sym, call);
             write_error_check(out, returns);
             release_jni_resources(out, params);
             let _ = writeln!(out, "    return NULL;");
@@ -1773,19 +1765,12 @@ fn write_map_return(
     let _ = writeln!(out, "    size_t out_map_len = 0;");
     let _ = writeln!(out, "    {kc}* out_keys = NULL;", kc = key_c);
     let _ = writeln!(out, "    {vc}* out_vals = NULL;", vc = val_c);
-    if args_str.is_empty() {
-        let _ = writeln!(
-            out,
-            "    {}(out_keys, out_vals, &out_map_len, &err);",
-            c_sym
-        );
-    } else {
-        let _ = writeln!(
-            out,
-            "    {}({}, out_keys, out_vals, &out_map_len, &err);",
-            c_sym, args_str
-        );
-    }
+    let _ = writeln!(
+        out,
+        "    {}({});",
+        c_sym,
+        join_call_args(args_str, "out_keys, out_vals, &out_map_len, &err")
+    );
     write_error_check(out, returns);
     release_jni_resources(out, params);
     let _ = writeln!(
@@ -2170,17 +2155,14 @@ fn render_jni_struct(out: &mut String, module_name: &str, s: &StructDef, jni_pre
             build_c_call_args(&mut call_args, &f.name, &f.ty, module_name);
         }
 
-        if call_args.is_empty() {
-            let _ = writeln!(out, "    {}* rv = {}_create(&err);", prefix, prefix);
-        } else {
-            let _ = writeln!(
-                out,
-                "    {}* rv = {}_create({}, &err);",
-                prefix,
-                prefix,
-                call_args.join(", ")
-            );
-        }
+        let args_str = call_args.join(", ");
+        let _ = writeln!(
+            out,
+            "    {}* rv = {}_create({});",
+            prefix,
+            prefix,
+            join_call_args(&args_str, "&err")
+        );
         write_error_check(out, Some(&TypeRef::Handle));
 
         for f in &s.fields {

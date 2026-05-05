@@ -22,8 +22,7 @@ static void throw_weaveffi_error(JNIEnv* env, weaveffi_error* err) {
 JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_send_message(JNIEnv* env, jclass clazz, jstring text) {
     weaveffi_error err = {0, NULL};
     const char* text_chars = (*env)->GetStringUTFChars(env, text, NULL);
-    jsize text_len = (*env)->GetStringUTFLength(env, text);
-    weaveffi_events_send_message((const uint8_t*)text_chars, (size_t)text_len, &err);
+    weaveffi_events_send_message(text_chars, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         
@@ -34,7 +33,7 @@ JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_send_message(JNIEnv* env, jcla
 
 JNIEXPORT jobjectArray JNICALL Java_com_weaveffi_WeaveFFI_get_messages(JNIEnv* env, jclass clazz) {
     weaveffi_error err = {0, NULL};
-    const void* rv = weaveffi_events_get_messages(, &out_len, &err);
+    const void* rv = weaveffi_events_get_messages(&out_len, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return NULL;
