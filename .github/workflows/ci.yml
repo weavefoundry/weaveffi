@@ -365,10 +365,15 @@ jobs:
           file libweaveffi_jni_test.so
           ldd libweaveffi_jni_test.so || true
           "$NM" -D --defined-only libweaveffi_jni_test.so > nm.out
+          # The Android JNI generator namespaces wrapper functions with the
+          # IDL module ("contacts") unless `strip_module_prefix=true` is set
+          # via inline IDL `[generators.weaveffi]` or a config file. The
+          # contacts sample takes the default, so the exported symbols
+          # include the `contacts_` segment.
           for sym in \
-              Java_com_weaveffi_WeaveFFI_create_contactJni \
-              Java_com_weaveffi_WeaveFFI_count_contacts \
-              Java_com_weaveffi_WeaveFFI_delete_contact \
+              Java_com_weaveffi_WeaveFFI_contacts_create_contactJni \
+              Java_com_weaveffi_WeaveFFI_contacts_count_contacts \
+              Java_com_weaveffi_WeaveFFI_contacts_delete_contact \
               Java_com_weaveffi_Contact_nativeGetId; do
             if ! grep -q " T $sym\$" nm.out; then
               echo "missing exported JNI symbol: $sym" >&2

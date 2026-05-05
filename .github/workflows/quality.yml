@@ -137,10 +137,14 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Install mdbook + mdbook-linkcheck
+      - name: Install mdbook + mdbook-linkcheck2
+        # Use the maintained `mdbook-linkcheck2` fork rather than the
+        # original `mdbook-linkcheck` (last release Oct 2022), which fails
+        # to deserialize mdBook 0.5+ render contexts ("missing field
+        # `sections`").
         run: |
           cargo install mdbook --locked
-          cargo install mdbook-linkcheck --locked
+          cargo install mdbook-linkcheck2 --locked
 
       - name: Validate docs links
         run: scripts/check-links.sh
