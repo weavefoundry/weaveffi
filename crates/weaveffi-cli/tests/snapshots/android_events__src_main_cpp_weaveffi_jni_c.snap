@@ -33,11 +33,8 @@ JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_send_message(JNIEnv* env, jcla
 
 JNIEXPORT jobjectArray JNICALL Java_com_weaveffi_WeaveFFI_get_messages(JNIEnv* env, jclass clazz) {
     weaveffi_error err = {0, NULL};
-    const void* rv = weaveffi_events_get_messages(&out_len, &err);
-    if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
-        return NULL;
-    }
+    jclass _ufe = (*env)->FindClass(env, "java/lang/UnsupportedOperationException");
+    if (_ufe) { (*env)->ThrowNew(env, _ufe, "Iterator<T> returns are not yet supported by the WeaveFFI Android generator"); }
     return NULL;
 }
 

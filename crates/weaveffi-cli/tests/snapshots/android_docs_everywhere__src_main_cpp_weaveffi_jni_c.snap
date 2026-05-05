@@ -39,12 +39,23 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_create_document(JNIEnv* env, 
     weaveffi_error err = {0, NULL};
     const char* title_chars = (*env)->GetStringUTFChars(env, title, NULL);
     jsize tags_len = (*env)->GetArrayLength(env, tags);
-    weaveffi_docs_Document* rv = weaveffi_docs_create_document(title_chars, (const void*)tags_elems, (size_t)tags_len, &err);
+    const char** tags_elems = (const char**)malloc((size_t)tags_len * sizeof(const char*));
+    jstring* tags_jstrs = (jstring*)malloc((size_t)tags_len * sizeof(jstring));
+    for (jsize tags_i = 0; tags_i < tags_len; tags_i++) {
+        tags_jstrs[tags_i] = (jstring)(*env)->GetObjectArrayElement(env, tags, tags_i);
+        tags_elems[tags_i] = (*env)->GetStringUTFChars(env, tags_jstrs[tags_i], NULL);
+    }
+    weaveffi_docs_Document* rv = weaveffi_docs_create_document(title_chars, (const char* const*)tags_elems, (size_t)tags_len, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return 0;
     }
     (*env)->ReleaseStringUTFChars(env, title, title_chars);
+    for (jsize tags_ri = 0; tags_ri < tags_len; tags_ri++) {
+        (*env)->ReleaseStringUTFChars(env, tags_jstrs[tags_ri], tags_elems[tags_ri]);
+    }
+    free((void*)tags_elems);
+    free(tags_jstrs);
     return (jlong)(intptr_t)rv;
 }
 
@@ -94,12 +105,23 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_Document_nativeCreate(JNIEnv* env, jcl
     weaveffi_error err = {0, NULL};
     const char* title_chars = (*env)->GetStringUTFChars(env, title, NULL);
     jsize tags_len = (*env)->GetArrayLength(env, tags);
-    weaveffi_docs_Document* rv = weaveffi_docs_Document_create((int64_t)id, title_chars, (int32_t)status, (const void*)tags_elems, (size_t)tags_len, &err);
+    const char** tags_elems = (const char**)malloc((size_t)tags_len * sizeof(const char*));
+    jstring* tags_jstrs = (jstring*)malloc((size_t)tags_len * sizeof(jstring));
+    for (jsize tags_i = 0; tags_i < tags_len; tags_i++) {
+        tags_jstrs[tags_i] = (jstring)(*env)->GetObjectArrayElement(env, tags, tags_i);
+        tags_elems[tags_i] = (*env)->GetStringUTFChars(env, tags_jstrs[tags_i], NULL);
+    }
+    weaveffi_docs_Document* rv = weaveffi_docs_Document_create((int64_t)id, title_chars, (int32_t)status, (const char* const*)tags_elems, (size_t)tags_len, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return 0;
     }
     (*env)->ReleaseStringUTFChars(env, title, title_chars);
+    for (jsize tags_ri = 0; tags_ri < tags_len; tags_ri++) {
+        (*env)->ReleaseStringUTFChars(env, tags_jstrs[tags_ri], tags_elems[tags_ri]);
+    }
+    free((void*)tags_elems);
+    free(tags_jstrs);
     return (jlong)(intptr_t)rv;
 }
 

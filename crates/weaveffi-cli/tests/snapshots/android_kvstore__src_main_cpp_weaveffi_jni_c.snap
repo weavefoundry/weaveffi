@@ -120,12 +120,9 @@ JNIEXPORT jobjectArray JNICALL Java_com_weaveffi_WeaveFFI_list_keysJni(JNIEnv* e
     if (prefix != NULL) {
         prefix_chars = (*env)->GetStringUTFChars(env, prefix, NULL);
     }
-    const void* rv = weaveffi_kv_list_keys((weaveffi_handle_t)store, prefix_chars, &out_len, &err);
-    if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
-        return NULL;
-    }
     if (prefix != NULL) { (*env)->ReleaseStringUTFChars(env, prefix, prefix_chars); }
+    jclass _ufe = (*env)->FindClass(env, "java/lang/UnsupportedOperationException");
+    if (_ufe) { (*env)->ThrowNew(env, _ufe, "Iterator<T> returns are not yet supported by the WeaveFFI Android generator"); }
     return NULL;
 }
 
@@ -238,6 +235,12 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_Entry_nativeCreate(JNIEnv* env, jclass
         expires_at_ptr = &expires_at_val;
     }
     jsize tags_len = (*env)->GetArrayLength(env, tags);
+    const char** tags_elems = (const char**)malloc((size_t)tags_len * sizeof(const char*));
+    jstring* tags_jstrs = (jstring*)malloc((size_t)tags_len * sizeof(jstring));
+    for (jsize tags_i = 0; tags_i < tags_len; tags_i++) {
+        tags_jstrs[tags_i] = (jstring)(*env)->GetObjectArrayElement(env, tags, tags_i);
+        tags_elems[tags_i] = (*env)->GetStringUTFChars(env, tags_jstrs[tags_i], NULL);
+    }
     jclass metadata_mc = (*env)->FindClass(env, "java/util/Map");
     jsize metadata_len = (jsize)(*env)->CallIntMethod(env, metadata, (*env)->GetMethodID(env, metadata_mc, "size", "()I"));
     jobject metadata_ks = (*env)->CallObjectMethod(env, metadata, (*env)->GetMethodID(env, metadata_mc, "keySet", "()Ljava/util/Set;"));
@@ -256,13 +259,18 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_Entry_nativeCreate(JNIEnv* env, jclass
         metadata_jv[metadata_i] = (jstring)metadata_vo;
         metadata_c_vals[metadata_i] = (*env)->GetStringUTFChars(env, (jstring)metadata_vo, NULL);
     }
-    weaveffi_kv_Entry* rv = weaveffi_kv_Entry_create((int64_t)id, key_chars, (const uint8_t*)value_elems, (size_t)value_len, (int64_t)created_at, expires_at_ptr, (const void*)tags_elems, (size_t)tags_len, (const char* const*)metadata_c_keys, (const char* const*)metadata_c_vals, (size_t)metadata_len, &err);
+    weaveffi_kv_Entry* rv = weaveffi_kv_Entry_create((int64_t)id, key_chars, (const uint8_t*)value_elems, (size_t)value_len, (int64_t)created_at, expires_at_ptr, (const char* const*)tags_elems, (size_t)tags_len, (const char* const*)metadata_c_keys, (const char* const*)metadata_c_vals, (size_t)metadata_len, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return 0;
     }
     (*env)->ReleaseStringUTFChars(env, key, key_chars);
     (*env)->ReleaseByteArrayElements(env, value, value_elems, 0);
+    for (jsize tags_ri = 0; tags_ri < tags_len; tags_ri++) {
+        (*env)->ReleaseStringUTFChars(env, tags_jstrs[tags_ri], tags_elems[tags_ri]);
+    }
+    free((void*)tags_elems);
+    free(tags_jstrs);
     for (jsize metadata_ri = 0; metadata_ri < metadata_len; metadata_ri++) {
         (*env)->ReleaseStringUTFChars(env, metadata_jk[metadata_ri], metadata_c_keys[metadata_ri]);
     }
