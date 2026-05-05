@@ -22,8 +22,7 @@ static void throw_weaveffi_error(JNIEnv* env, weaveffi_error* err) {
 JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_create_productJni(JNIEnv* env, jclass clazz, jstring name, jdouble price, jint category) {
     weaveffi_error err = {0, NULL};
     const char* name_chars = (*env)->GetStringUTFChars(env, name, NULL);
-    jsize name_len = (*env)->GetStringUTFLength(env, name);
-    weaveffi_handle_t rv = weaveffi_products_create_product((const uint8_t*)name_chars, (size_t)name_len, (double)price, (int32_t)category, &err);
+    weaveffi_handle_t rv = weaveffi_products_create_product(name_chars, (double)price, (int32_t)category, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return 0;
@@ -121,15 +120,12 @@ JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_add_product_to_order(JNIEn
 JNIEXPORT jlong JNICALL Java_com_weaveffi_Product_nativeCreate(JNIEnv* env, jclass clazz, jlong id, jstring name, jstring description, jdouble price, jint category, jobjectArray tags) {
     weaveffi_error err = {0, NULL};
     const char* name_chars = (*env)->GetStringUTFChars(env, name, NULL);
-    jsize name_len = (*env)->GetStringUTFLength(env, name);
     const char* description_chars = NULL;
-    jsize description_len = 0;
     if (description != NULL) {
         description_chars = (*env)->GetStringUTFChars(env, description, NULL);
-        description_len = (*env)->GetStringUTFLength(env, description);
     }
     jsize tags_len = (*env)->GetArrayLength(env, tags);
-    weaveffi_products_Product* rv = weaveffi_products_Product_create((int64_t)id, (const uint8_t*)name_chars, (size_t)name_len, (const uint8_t*)description_chars, (size_t)description_len, (double)price, (int32_t)category, (const void*)tags_elems, (size_t)tags_len, &err);
+    weaveffi_products_Product* rv = weaveffi_products_Product_create((int64_t)id, name_chars, description_chars, (double)price, (int32_t)category, (const void*)tags_elems, (size_t)tags_len, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return 0;
@@ -214,8 +210,7 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_Order_nativeCreate(JNIEnv* env, jclass
     jlong* items_elems = (*env)->GetLongArrayElements(env, items, NULL);
     jsize items_len = (*env)->GetArrayLength(env, items);
     const char* status_chars = (*env)->GetStringUTFChars(env, status, NULL);
-    jsize status_len = (*env)->GetStringUTFLength(env, status);
-    weaveffi_orders_Order* rv = weaveffi_orders_Order_create((int64_t)id, (const void*)items_elems, (size_t)items_len, (double)total, (const uint8_t*)status_chars, (size_t)status_len, &err);
+    weaveffi_orders_Order* rv = weaveffi_orders_Order_create((int64_t)id, (const void*)items_elems, (size_t)items_len, (double)total, status_chars, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return 0;

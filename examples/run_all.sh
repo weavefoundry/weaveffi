@@ -171,7 +171,10 @@ run_dotnet() {
 }
 
 run_go() {
-    (cd "$EXAMPLES/go" && go mod download && go run .)
+    # `go mod download` (no args) only writes the per-module `go.mod`
+    # hashes into go.sum. `go run` then refuses to compile because the
+    # source `h1:` hashes are missing. `download all` populates both.
+    (cd "$EXAMPLES/go" && go mod download all && go run .)
 }
 
 run_ruby() {
@@ -215,7 +218,7 @@ run_ruby_kvstore() {
 }
 
 run_go_kvstore() {
-    (cd "$EXAMPLES/go" && go mod download && go run ./kvstore)
+    (cd "$EXAMPLES/go" && go mod download all && go run ./kvstore)
 }
 
 run_dart_kvstore() {
