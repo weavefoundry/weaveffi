@@ -109,49 +109,49 @@ Every PRD-v4 phase is complete. The workspace has graduated from
 "feature-complete prototype" to "1.0 release candidate" pending the
 format-canonicalization polish noted in the README "Status" section.
 
-- [x] Phase 1 — Eliminate `TypeRef::Callback` dead code across the
+- Phase 1 — Eliminate `TypeRef::Callback` dead code across the
   workspace.
-- [x] Phase 2 — Implement `weaveffi upgrade` and bump schema to
+- Phase 2 — Implement `weaveffi upgrade` and bump schema to
   `0.3.0`.
-- [x] Phase 3 — Wire every `GeneratorConfig` option through inline
+- Phase 3 — Wire every `GeneratorConfig` option through inline
   IDL configs.
-- [x] Phase 4 — Source-span-aware diagnostics with `miette`.
-- [x] Phase 5 — Snapshot testing every generator with `insta`.
-- [x] Phase 6 — Deterministic generator output (sort all map
+- Phase 4 — Source-span-aware diagnostics with `miette`.
+- Phase 5 — Snapshot testing every generator with `insta`.
+- Phase 6 — Deterministic generator output (sort all map
   iteration).
-- [x] Phase 7 — `weaveffi watch`, `weaveffi format`, JSON Schema
+- Phase 7 — `weaveffi watch`, `weaveffi format`, JSON Schema
   export.
-- [x] Phase 8 — Real-world end-to-end consumer tests in CI for every
+- Phase 8 — Real-world end-to-end consumer tests in CI for every
   target.
-- [x] Phase 9 — Quality infrastructure: deny, audit, machete, doc
+- Phase 9 — Quality infrastructure: deny, audit, machete, doc
   lints, coverage.
-- [x] Phase 10 — Fuzzing harness for parser, validator, and
+- Phase 10 — Fuzzing harness for parser, validator, and
   `parse_type_ref`.
-- [x] Phase 11 — Doc strings everywhere: `doc:` → native doc comments.
-- [x] Phase 12 — `c_prefix` audit: full propagation through C, C++,
+- Phase 11 — Doc strings everywhere: `doc:` → native doc comments.
+- Phase 12 — `c_prefix` audit: full propagation through C, C++,
   scaffold.
-- [x] Phase 13 — Build a non-trivial real-world sample: `kvstore`.
-- [x] Phase 14 — Parallel codegen with rayon and per-generator
+- Phase 13 — Build a non-trivial real-world sample: `kvstore`.
+- Phase 14 — Parallel codegen with rayon and per-generator
   caching.
-- [x] Phase 15 — Cross-platform CI hardening: Windows path/hook fixes,
+- Phase 15 — Cross-platform CI hardening: Windows path/hook fixes,
   NDK glue, Swift/iOS smoke.
-- [x] Phase 16 — `doctor --json`, target-specific checks, richer
+- Phase 16 — `doctor --json`, target-specific checks, richer
   hints.
-- [x] Phase 17 — `--check` and `--format json` for CI integration.
-- [x] Phase 18 — Add CONTRIBUTING / SECURITY / CODE_OF_CONDUCT /
+- Phase 17 — `--check` and `--format json` for CI integration.
+- Phase 18 — Add CONTRIBUTING / SECURITY / CODE_OF_CONDUCT /
   ARCHITECTURE.
-- [x] Phase 19 — Async robustness: GC pinning, cancellation, leak
+- Phase 19 — Async robustness: GC pinning, cancellation, leak
   tests.
-- [x] Phase 20 — Generator output polish: deterministic order,
+- Phase 20 — Generator output polish: deterministic order,
   named-after-fields, prelude.
-- [x] Phase 21 — Beautiful README, comparison page, marketing polish.
-- [x] Phase 22 — Versioning policy, stability docs, roadmap to 1.0.
-- [x] Phase 23 — Performance: run benchmarks, profile, optimize hot
+- Phase 21 — Beautiful README, comparison page, marketing polish.
+- Phase 22 — Versioning policy, stability docs, roadmap to 1.0.
+- Phase 23 — Performance: run benchmarks, profile, optimize hot
   paths, set targets.
-- [x] Phase 24 — Honesty pass on docs and full SUMMARY audit.
-- [x] Phase 25 — Add `weaveffi extract` enhancements and round-trip
+- Phase 24 — Honesty pass on docs and full SUMMARY audit.
+- Phase 25 — Add `weaveffi extract` enhancements and round-trip
   integrity.
-- [x] Phase 26 — Final quality pass and release-readiness checklist.
+- Phase 26 — Final quality pass and release-readiness checklist.
 
 ## Post-1.0
 
