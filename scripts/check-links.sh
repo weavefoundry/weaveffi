@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Validate every internal link in the WeaveFFI mdbook fails CI on broken
-# anchors or missing files. Uses mdbook-linkcheck under the hood.
+# anchors or missing files. Uses mdbook-linkcheck2 under the hood.
 #
 # Usage:
 #   scripts/check-links.sh           # build + linkcheck
@@ -16,9 +16,9 @@ if ! command -v mdbook >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! command -v mdbook-linkcheck >/dev/null 2>&1; then
-  echo "ERROR: mdbook-linkcheck not found in PATH." >&2
-  echo "Install with: cargo install mdbook-linkcheck --locked" >&2
+if ! command -v mdbook-linkcheck2 >/dev/null 2>&1; then
+  echo "ERROR: mdbook-linkcheck2 not found in PATH." >&2
+  echo "Install with: cargo install mdbook-linkcheck2 --locked" >&2
   exit 1
 fi
 
@@ -26,7 +26,7 @@ OUT_DIR="$(mktemp -d)"
 trap 'rm -rf "$OUT_DIR"' EXIT
 
 if [ "${FOLLOW_WEB:-0}" = "1" ]; then
-  export MDBOOK_OUTPUT__LINKCHECK__FOLLOW_WEB_LINKS=true
+  export MDBOOK_OUTPUT__LINKCHECK2__FOLLOW_WEB_LINKS=true
 fi
 
 echo "Building docs and validating links into $OUT_DIR..."

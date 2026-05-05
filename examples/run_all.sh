@@ -90,6 +90,22 @@ case "$(uname -s)" in
     *)                    IS_WINDOWS=0 ;;
 esac
 
+# `kotlinc` ships with `kotlin-stdlib` only. AsyncStress.kt imports
+# `kotlinx.coroutines.{runBlocking,async,awaitAll,suspendCancellableCoroutine}`,
+# which live in a separate Maven artifact. Fetch the single JVM JAR from
+# Maven Central on demand (caching it under $OUT) so the smoke compile has
+# the right classpath without pulling in Gradle.
+KOTLINX_COROUTINES_VERSION="1.8.0"
+KOTLINX_COROUTINES_JAR="$OUT/kotlinx-coroutines-core-jvm-${KOTLINX_COROUTINES_VERSION}.jar"
+
+ensure_kotlinx_coroutines() {
+    if [ -f "$KOTLINX_COROUTINES_JAR" ]; then
+        return 0
+    fi
+    curl -fsSLo "$KOTLINX_COROUTINES_JAR" \
+        "https://repo1.maven.org/maven2/org/jetbrains/kotlinx/kotlinx-coroutines-core-jvm/${KOTLINX_COROUTINES_VERSION}/kotlinx-coroutines-core-jvm-${KOTLINX_COROUTINES_VERSION}.jar"
+}
+
 selected() {
     local t=$1
     if [ -n "${ONLY:-}" ]; then
@@ -195,7 +211,7 @@ run_wasm() {
 
 run_android() {
     kotlinc "$EXAMPLES/android/src/main/kotlin/com/weaveffi/example/Main.kt" \
-        -include-runtime -d "$OUT/android-smoke.jar" 2>/dev/null
+        -include-runtime -d "$OUT/android-smoke.jar"
 }
 
 run_c_kvstore() {
@@ -260,8 +276,10 @@ run_wasm_async_stress() {
 }
 
 run_android_async_stress() {
-    kotlinc "$EXAMPLES/android/src/main/kotlin/com/weaveffi/example/AsyncStress.kt" \
-        -include-runtime -d "$OUT/android-async-stress.jar" 2>/dev/null
+    ensure_kotlinx_coroutines || return 1
+    kotlinc -cp "$KOTLINX_COROUTINES_JAR" \
+        "$EXAMPLES/android/src/main/kotlin/com/weaveffi/example/AsyncStress.kt" \
+        -include-runtime -d "$OUT/android-async-stress.jar"
 }
 
 run c             run_c
