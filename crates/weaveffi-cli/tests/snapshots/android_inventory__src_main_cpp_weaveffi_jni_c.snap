@@ -125,13 +125,24 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_Product_nativeCreate(JNIEnv* env, jcla
         description_chars = (*env)->GetStringUTFChars(env, description, NULL);
     }
     jsize tags_len = (*env)->GetArrayLength(env, tags);
-    weaveffi_products_Product* rv = weaveffi_products_Product_create((int64_t)id, name_chars, description_chars, (double)price, (int32_t)category, (const void*)tags_elems, (size_t)tags_len, &err);
+    const char** tags_elems = (const char**)malloc((size_t)tags_len * sizeof(const char*));
+    jstring* tags_jstrs = (jstring*)malloc((size_t)tags_len * sizeof(jstring));
+    for (jsize tags_i = 0; tags_i < tags_len; tags_i++) {
+        tags_jstrs[tags_i] = (jstring)(*env)->GetObjectArrayElement(env, tags, tags_i);
+        tags_elems[tags_i] = (*env)->GetStringUTFChars(env, tags_jstrs[tags_i], NULL);
+    }
+    weaveffi_products_Product* rv = weaveffi_products_Product_create((int64_t)id, name_chars, description_chars, (double)price, (int32_t)category, (const char* const*)tags_elems, (size_t)tags_len, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return 0;
     }
     (*env)->ReleaseStringUTFChars(env, name, name_chars);
     if (description != NULL) { (*env)->ReleaseStringUTFChars(env, description, description_chars); }
+    for (jsize tags_ri = 0; tags_ri < tags_len; tags_ri++) {
+        (*env)->ReleaseStringUTFChars(env, tags_jstrs[tags_ri], tags_elems[tags_ri]);
+    }
+    free((void*)tags_elems);
+    free(tags_jstrs);
     return (jlong)(intptr_t)rv;
 }
 

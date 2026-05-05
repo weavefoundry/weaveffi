@@ -231,14 +231,9 @@ JNIEXPORT jobject JNICALL Java_com_weaveffi_WeaveFFI_get_attrs(JNIEnv* env, jcla
 
 JNIEXPORT jlongArray JNICALL Java_com_weaveffi_WeaveFFI_stream_items(JNIEnv* env, jclass clazz) {
     weaveffi_error err = {0, NULL};
-    const int64_t* rv = (const int64_t*)weaveffi_kitchen_stream_items(&out_len, &err);
-    if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
-        return NULL;
-    }
-    jlongArray result = (*env)->NewLongArray(env, (jsize)out_len);
-    if (result && rv) { (*env)->SetLongArrayRegion(env, result, 0, (jsize)out_len, (const jlong*)rv); }
-    return result;
+    jclass _ufe = (*env)->FindClass(env, "java/lang/UnsupportedOperationException");
+    if (_ufe) { (*env)->ThrowNew(env, _ufe, "Iterator<T> returns are not yet supported by the WeaveFFI Android generator"); }
+    return NULL;
 }
 
 JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_cross_module_token(JNIEnv* env, jclass clazz) {
@@ -376,6 +371,12 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_Item_nativeCreate(JNIEnv* env, jclass 
     jbyte* payload_elems = (*env)->GetByteArrayElements(env, payload, &payload_is_copy);
     jsize payload_len = (*env)->GetArrayLength(env, payload);
     jsize tags_len = (*env)->GetArrayLength(env, tags);
+    const char** tags_elems = (const char**)malloc((size_t)tags_len * sizeof(const char*));
+    jstring* tags_jstrs = (jstring*)malloc((size_t)tags_len * sizeof(jstring));
+    for (jsize tags_i = 0; tags_i < tags_len; tags_i++) {
+        tags_jstrs[tags_i] = (jstring)(*env)->GetObjectArrayElement(env, tags, tags_i);
+        tags_elems[tags_i] = (*env)->GetStringUTFChars(env, tags_jstrs[tags_i], NULL);
+    }
     jclass attrs_mc = (*env)->FindClass(env, "java/util/Map");
     jsize attrs_len = (jsize)(*env)->CallIntMethod(env, attrs, (*env)->GetMethodID(env, attrs_mc, "size", "()I"));
     jobject attrs_ks = (*env)->CallObjectMethod(env, attrs, (*env)->GetMethodID(env, attrs_mc, "keySet", "()Ljava/util/Set;"));
@@ -402,13 +403,18 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_Item_nativeCreate(JNIEnv* env, jclass 
         parent_val = (int64_t)(*env)->CallLongMethod(env, parent, parent_mid);
         parent_ptr = &parent_val;
     }
-    weaveffi_kitchen_Item* rv = weaveffi_kitchen_Item_create((int64_t)id, name_chars, (int32_t)count, (bool)(enabled == JNI_TRUE), (double)ratio, (uint32_t)nick, (const uint8_t*)payload_elems, (size_t)payload_len, (const void*)tags_elems, (size_t)tags_len, (const char* const*)attrs_c_keys, (const char* const*)attrs_c_vals, (size_t)attrs_len, parent_ptr, (const weaveffi_shared_Token*)(intptr_t)token, (int32_t)priority, &err);
+    weaveffi_kitchen_Item* rv = weaveffi_kitchen_Item_create((int64_t)id, name_chars, (int32_t)count, (bool)(enabled == JNI_TRUE), (double)ratio, (uint32_t)nick, (const uint8_t*)payload_elems, (size_t)payload_len, (const char* const*)tags_elems, (size_t)tags_len, (const char* const*)attrs_c_keys, (const char* const*)attrs_c_vals, (size_t)attrs_len, parent_ptr, (const weaveffi_shared_Token*)(intptr_t)token, (int32_t)priority, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return 0;
     }
     (*env)->ReleaseStringUTFChars(env, name, name_chars);
     (*env)->ReleaseByteArrayElements(env, payload, payload_elems, 0);
+    for (jsize tags_ri = 0; tags_ri < tags_len; tags_ri++) {
+        (*env)->ReleaseStringUTFChars(env, tags_jstrs[tags_ri], tags_elems[tags_ri]);
+    }
+    free((void*)tags_elems);
+    free(tags_jstrs);
     for (jsize attrs_ri = 0; attrs_ri < attrs_len; attrs_ri++) {
         (*env)->ReleaseStringUTFChars(env, attrs_jk[attrs_ri], attrs_c_keys[attrs_ri]);
     }

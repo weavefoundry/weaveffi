@@ -1159,13 +1159,48 @@ fn write_list_acquire(out: &mut String, name: &str, inner: &TypeRef) {
                 n = name
             );
         }
-        _ => {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            // Java passes List<String> as String[] (jobjectArray). The C ABI
+            // expects `const char* const*` plus a length. We allocate two
+            // parallel arrays: `_elems` holds the UTF-8 char pointers, and
+            // `_jstrs` keeps the original jstrings around so we can call
+            // ReleaseStringUTFChars for each one in the release path.
             let _ = writeln!(
                 out,
                 "    jsize {n}_len = (*env)->GetArrayLength(env, {n});",
                 n = name
             );
+            let _ = writeln!(
+                out,
+                "    const char** {n}_elems = (const char**)malloc((size_t){n}_len * sizeof(const char*));",
+                n = name
+            );
+            let _ = writeln!(
+                out,
+                "    jstring* {n}_jstrs = (jstring*)malloc((size_t){n}_len * sizeof(jstring));",
+                n = name
+            );
+            let _ = writeln!(
+                out,
+                "    for (jsize {n}_i = 0; {n}_i < {n}_len; {n}_i++) {{",
+                n = name
+            );
+            let _ = writeln!(
+                out,
+                "        {n}_jstrs[{n}_i] = (jstring)(*env)->GetObjectArrayElement(env, {n}, {n}_i);",
+                n = name
+            );
+            let _ = writeln!(
+                out,
+                "        {n}_elems[{n}_i] = (*env)->GetStringUTFChars(env, {n}_jstrs[{n}_i], NULL);",
+                n = name
+            );
+            let _ = writeln!(out, "    }}");
         }
+        other => unimplemented!(
+            "List<{:?}> JNI parameter acquisition is not yet supported",
+            other
+        ),
     }
 }
 
@@ -1464,12 +1499,21 @@ fn build_c_call_args(args: &mut Vec<String>, name: &str, ty: &TypeRef, module: &
                 TypeRef::Bool => {
                     args.push(format!("(const bool*){n}_elems", n = name));
                 }
-                TypeRef::TypedHandle(_) | TypeRef::Handle => {
-                    args.push(format!("(const weaveffi_handle_t*){n}_elems", n = name));
-                }
-                _ => {
+                TypeRef::TypedHandle(_) | TypeRef::Handle | TypeRef::Struct(_) => {
+                    // The C ABI for List<Struct>/List<Handle> is `T* const*`,
+                    // but the JNI side stores the elements as a `jlong*` of
+                    // opaque handles. The void cast lets the underlying buffer
+                    // pointer flow through; this relies on jlong and pointer
+                    // values being interchangeable on 64-bit Android.
                     args.push(format!("(const void*){n}_elems", n = name));
                 }
+                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                    args.push(format!("(const char* const*){n}_elems", n = name));
+                }
+                other => unimplemented!(
+                    "List<{:?}> JNI parameter call site is not yet supported",
+                    other
+                ),
             }
             args.push(format!("(size_t){n}_len", n = name));
         }
@@ -1554,8 +1598,26 @@ fn write_return_handling(
         TypeRef::Optional(inner) => {
             write_optional_return(jni_c, inner, c_sym, &args_str, returns, params, module);
         }
-        TypeRef::List(inner) | TypeRef::Iterator(inner) => {
+        TypeRef::List(inner) => {
             write_list_return(jni_c, inner, c_sym, &args_str, returns, params);
+        }
+        TypeRef::Iterator(_) => {
+            // Iterator returns expose an opaque `<Name>Iterator*` handle from
+            // the C ABI (not a buffer + length), so they need a different
+            // wrapping strategy than List<T>. Marshalling that into a Kotlin
+            // Iterator (or a materialized array) is not yet implemented.
+            // Emit a stub that throws at runtime so the rest of the binding
+            // still compiles and the unsupported call surface is obvious.
+            release_jni_resources(jni_c, params);
+            let _ = writeln!(
+                jni_c,
+                "    jclass _ufe = (*env)->FindClass(env, \"java/lang/UnsupportedOperationException\");"
+            );
+            let _ = writeln!(
+                jni_c,
+                "    if (_ufe) {{ (*env)->ThrowNew(env, _ufe, \"Iterator<T> returns are not yet supported by the WeaveFFI Android generator\"); }}"
+            );
+            let _ = writeln!(jni_c, "    return NULL;");
         }
         TypeRef::Map(k, v) => {
             write_map_return(jni_c, k, v, c_sym, &args_str, returns, params);
@@ -1904,44 +1966,66 @@ fn release_jni_resources(out: &mut String, params: &[weaveffi_ir::ir::Param]) {
                 }
                 _ => {}
             },
-            TypeRef::List(inner) => match inner.as_ref() {
-                TypeRef::I32 | TypeRef::Enum(_) => {
-                    let _ = writeln!(
-                        out,
-                        "    (*env)->ReleaseIntArrayElements(env, {n}, {n}_elems, 0);",
-                        n = p.name
-                    );
-                }
-                TypeRef::U32
-                | TypeRef::I64
-                | TypeRef::TypedHandle(_)
-                | TypeRef::Handle
-                | TypeRef::Struct(_) => {
-                    let _ = writeln!(
-                        out,
-                        "    (*env)->ReleaseLongArrayElements(env, {n}, {n}_elems, 0);",
-                        n = p.name
-                    );
-                }
-                TypeRef::F64 => {
-                    let _ = writeln!(
-                        out,
-                        "    (*env)->ReleaseDoubleArrayElements(env, {n}, {n}_elems, 0);",
-                        n = p.name
-                    );
-                }
-                TypeRef::Bool => {
-                    let _ = writeln!(
-                        out,
-                        "    (*env)->ReleaseBooleanArrayElements(env, {n}, {n}_elems, 0);",
-                        n = p.name
-                    );
-                }
-                _ => {}
-            },
+            TypeRef::List(inner) => write_list_release(out, &p.name, inner),
             TypeRef::Map(k, v) => write_map_release(out, &p.name, k, v),
             _ => {}
         }
+    }
+}
+
+fn write_list_release(out: &mut String, name: &str, inner: &TypeRef) {
+    match inner {
+        TypeRef::I32 | TypeRef::Enum(_) => {
+            let _ = writeln!(
+                out,
+                "    (*env)->ReleaseIntArrayElements(env, {n}, {n}_elems, 0);",
+                n = name
+            );
+        }
+        TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Handle
+        | TypeRef::Struct(_) => {
+            let _ = writeln!(
+                out,
+                "    (*env)->ReleaseLongArrayElements(env, {n}, {n}_elems, 0);",
+                n = name
+            );
+        }
+        TypeRef::F64 => {
+            let _ = writeln!(
+                out,
+                "    (*env)->ReleaseDoubleArrayElements(env, {n}, {n}_elems, 0);",
+                n = name
+            );
+        }
+        TypeRef::Bool => {
+            let _ = writeln!(
+                out,
+                "    (*env)->ReleaseBooleanArrayElements(env, {n}, {n}_elems, 0);",
+                n = name
+            );
+        }
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            let _ = writeln!(
+                out,
+                "    for (jsize {n}_ri = 0; {n}_ri < {n}_len; {n}_ri++) {{",
+                n = name
+            );
+            let _ = writeln!(
+                out,
+                "        (*env)->ReleaseStringUTFChars(env, {n}_jstrs[{n}_ri], {n}_elems[{n}_ri]);",
+                n = name
+            );
+            let _ = writeln!(out, "    }}");
+            let _ = writeln!(out, "    free((void*){n}_elems);", n = name);
+            let _ = writeln!(out, "    free({n}_jstrs);", n = name);
+        }
+        other => unimplemented!(
+            "List<{:?}> JNI parameter release is not yet supported",
+            other
+        ),
     }
 }
 
@@ -2451,41 +2535,7 @@ fn release_jni_resources_single(out: &mut String, name: &str, ty: &TypeRef) {
             }
             _ => {}
         },
-        TypeRef::List(inner) => match inner.as_ref() {
-            TypeRef::I32 | TypeRef::Enum(_) => {
-                let _ = writeln!(
-                    out,
-                    "    (*env)->ReleaseIntArrayElements(env, {n}, {n}_elems, 0);",
-                    n = name
-                );
-            }
-            TypeRef::U32
-            | TypeRef::I64
-            | TypeRef::TypedHandle(_)
-            | TypeRef::Handle
-            | TypeRef::Struct(_) => {
-                let _ = writeln!(
-                    out,
-                    "    (*env)->ReleaseLongArrayElements(env, {n}, {n}_elems, 0);",
-                    n = name
-                );
-            }
-            TypeRef::F64 => {
-                let _ = writeln!(
-                    out,
-                    "    (*env)->ReleaseDoubleArrayElements(env, {n}, {n}_elems, 0);",
-                    n = name
-                );
-            }
-            TypeRef::Bool => {
-                let _ = writeln!(
-                    out,
-                    "    (*env)->ReleaseBooleanArrayElements(env, {n}, {n}_elems, 0);",
-                    n = name
-                );
-            }
-            _ => {}
-        },
+        TypeRef::List(inner) => write_list_release(out, name, inner),
         TypeRef::Map(k, v) => write_map_release(out, name, k, v),
         _ => {}
     }

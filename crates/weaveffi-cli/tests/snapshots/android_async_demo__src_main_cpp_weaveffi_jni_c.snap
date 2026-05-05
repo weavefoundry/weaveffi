@@ -80,7 +80,18 @@ JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_run_batchAsync(JNIEnv* env, jc
     (*env)->GetJavaVM(env, &ctx->jvm);
     ctx->callback = (*env)->NewGlobalRef(env, callback);
     jsize names_len = (*env)->GetArrayLength(env, names);
-    weaveffi_tasks_run_batch_async((const void*)names_elems, (size_t)names_len, weaveffi_tasks_run_batch_jni_cb, ctx);
+    const char** names_elems = (const char**)malloc((size_t)names_len * sizeof(const char*));
+    jstring* names_jstrs = (jstring*)malloc((size_t)names_len * sizeof(jstring));
+    for (jsize names_i = 0; names_i < names_len; names_i++) {
+        names_jstrs[names_i] = (jstring)(*env)->GetObjectArrayElement(env, names, names_i);
+        names_elems[names_i] = (*env)->GetStringUTFChars(env, names_jstrs[names_i], NULL);
+    }
+    weaveffi_tasks_run_batch_async((const char* const*)names_elems, (size_t)names_len, weaveffi_tasks_run_batch_jni_cb, ctx);
+    for (jsize names_ri = 0; names_ri < names_len; names_ri++) {
+        (*env)->ReleaseStringUTFChars(env, names_jstrs[names_ri], names_elems[names_ri]);
+    }
+    free((void*)names_elems);
+    free(names_jstrs);
 }
 
 JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_cancel_task(JNIEnv* env, jclass clazz, jlong id) {
