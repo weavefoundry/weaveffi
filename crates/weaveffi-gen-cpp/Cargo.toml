@@ -1,6 +1,6 @@
 [package]
 name = "weaveffi-gen-cpp"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -10,8 +10,8 @@ keywords = ["ffi", "codegen", "bindings", "cpp", "raii"]
 categories = ["development-tools::ffi"]
 
 [dependencies]
-weaveffi-core = { path = "../weaveffi-core", version = "0.3.0" }
-weaveffi-ir = { path = "../weaveffi-ir", version = "0.3.0" }
+weaveffi-core = { path = "../weaveffi-core", version = "0.4.0" }
+weaveffi-ir = { path = "../weaveffi-ir", version = "0.4.0" }
 anyhow = { workspace = true }
 camino = { workspace = true }
 heck = { workspace = true }

@@ -1,3 +1,47 @@
+## [0.4.0](https://github.com/weavefoundry/weaveffi/compare/v0.3.0...v0.4.0) (2026-05-05)
+
+### ⚠ BREAKING CHANGES
+
+* add prelude header and trailer marker to generator output
+* audit and balance async callback lifetimes across generators
+* emit doc strings in every generator with native syntax
+* enforce deterministic iteration in IR and cache hashing
+* support every GeneratorConfig field via inline IDL generators
+* add weaveffi upgrade subcommand and bump schema to 0.3.0
+* drop TypeRef::Callback in favor of module-level callbacks
+
+### Features
+
+* add cargo-fuzz harnesses for parsers and validator ([0766e2c](https://github.com/weavefoundry/weaveffi/commit/0766e2c07c502373bf3d5947ccfac9e2a6e95c00))
+* add diff --check and --format json for validate and lint ([02ef6ae](https://github.com/weavefoundry/weaveffi/commit/02ef6aeb379e0fca885695366bf8498bd4053a22))
+* add kvstore sample exercising every IDL feature ([f05ffa2](https://github.com/weavefoundry/weaveffi/commit/f05ffa25b3b793e942eb5e0ec082a33b748eb7a0))
+* add prelude header and trailer marker to generator output ([039c66e](https://github.com/weavefoundry/weaveffi/commit/039c66e4469e4704fcb9129b9a09a16d2833446c))
+* add target filter and JSON output to weaveffi doctor ([7cb83c8](https://github.com/weavefoundry/weaveffi/commit/7cb83c8dfda731f0d34c090082b8dd14494d5fe9))
+* add watch, format, and JSON schema export commands ([f067b86](https://github.com/weavefoundry/weaveffi/commit/f067b867ff2cf255d83feed5ee74e9673ff69b72))
+* add weaveffi upgrade subcommand and bump schema to 0.3.0 ([707d99a](https://github.com/weavefoundry/weaveffi/commit/707d99abd5aaca4cee668ac920d8b2b13df4a188))
+* emit doc strings in every generator with native syntax ([f592388](https://github.com/weavefoundry/weaveffi/commit/f5923886560d95e7b9b09275d9566a9085d204e7))
+* extract typed handles, async, listeners, deprecated and mutable refs ([7369415](https://github.com/weavefoundry/weaveffi/commit/7369415130013a6a3d24339f810f9b1fb7e57e67))
+* integrate miette for span-aware diagnostics ([eb0595c](https://github.com/weavefoundry/weaveffi/commit/eb0595c5c0f6173a5710958102b417efe8d1886a))
+* support every GeneratorConfig field via inline IDL generators ([102016e](https://github.com/weavefoundry/weaveffi/commit/102016ed1c52bb0eed52ff6d9894f948fc19deef))
+* thread c_prefix through C, C++, and scaffold output ([68d315f](https://github.com/weavefoundry/weaveffi/commit/68d315fb8b57ffb477a3b00f0a4e931ede289c6c))
+
+### Bug Fixes
+
+* align Android JNI call sites with C ABI, and seed Go example go.sum ([3c3a01e](https://github.com/weavefoundry/weaveffi/commit/3c3a01e2e981c84053896cb534998c6c60bcf3b9))
+* apply inline generators when computing weaveffi diff output ([52bc194](https://github.com/weavefoundry/weaveffi/commit/52bc1949adfc09b795e4c58832cdd09e0111beff))
+* audit and balance async callback lifetimes across generators ([076bc11](https://github.com/weavefoundry/weaveffi/commit/076bc117460b930a4c0cdd916148c71cd138c9c7))
+* enforce deterministic iteration in IR and cache hashing ([b57b1c9](https://github.com/weavefoundry/weaveffi/commit/b57b1c99ed15df2cbc75f44c3a8e09542c397435))
+* wire List<String> JNI parameters end-to-end, and stub Iterator returns in Android generator ([d9b32f6](https://github.com/weavefoundry/weaveffi/commit/d9b32f64789a9ae1d15b858cabc00d3fec995736))
+
+### Performance
+
+* parallelize orchestrator with per-generator cache invalidation ([306582b](https://github.com/weavefoundry/weaveffi/commit/306582bc92ff46124bfec5207c5f280c21830744))
+* pre-allocate generator buffers and add performance targets ([982cc70](https://github.com/weavefoundry/weaveffi/commit/982cc70b0f3251f4c095a15bffa173ae0b1a0fa2))
+
+### Code Refactoring
+
+* drop TypeRef::Callback in favor of module-level callbacks ([6c76e93](https://github.com/weavefoundry/weaveffi/commit/6c76e93caf1c90485a13dfc91464cad4034106f4))
+
 ## [0.3.0](https://github.com/weavefoundry/weaveffi/compare/v0.2.0...v0.3.0) (2026-04-01)
 
 ### ⚠ BREAKING CHANGES
