@@ -42,7 +42,7 @@ jobs:
       - name: Assemble site
         run: |
           mkdir -p site
-          cp -r docs/book/* site/
+          cp -r docs/book/html/* site/
           mkdir -p site/api/rust
           cp -r target/doc/* site/api/rust/
           touch site/.nojekyll
