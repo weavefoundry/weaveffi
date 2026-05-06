@@ -42,6 +42,9 @@ node_modules/
 /docs/api/
 /site/
 
+# Generated social media images (source SVGs are committed)
+/docs/src/assets/comparison-social.jpg
+
 # WeaveFFI cache
 .weaveffi-cache
 
