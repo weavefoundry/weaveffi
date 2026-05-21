@@ -45,17 +45,4 @@ pub extern "C" fn weaveffi_calculator_echo(
     abi::string_to_c_ptr(&input)
 }
 
-#[no_mangle]
-pub extern "C" fn weaveffi_free_string(ptr: *const c_char) {
-    abi::free_string(ptr)
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_free_bytes(ptr: *mut u8, len: usize) {
-    abi::free_bytes(ptr, len)
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_error_clear(err: *mut weaveffi_error) {
-    abi::error_clear(err)
-}
+abi::export_runtime!();

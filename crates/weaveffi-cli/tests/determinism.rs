@@ -9,19 +9,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use camino::Utf8Path;
-use weaveffi_core::codegen::Generator;
+use weaveffi_core::codegen::{ConfiguredGenerator, DynGenerator};
 use weaveffi_core::validate::validate_api;
-use weaveffi_gen_android::AndroidGenerator;
-use weaveffi_gen_c::CGenerator;
-use weaveffi_gen_cpp::CppGenerator;
-use weaveffi_gen_dart::DartGenerator;
-use weaveffi_gen_dotnet::DotnetGenerator;
-use weaveffi_gen_go::GoGenerator;
-use weaveffi_gen_node::NodeGenerator;
-use weaveffi_gen_python::PythonGenerator;
-use weaveffi_gen_ruby::RubyGenerator;
-use weaveffi_gen_swift::SwiftGenerator;
-use weaveffi_gen_wasm::WasmGenerator;
+use weaveffi_gen_android::{AndroidConfig, AndroidGenerator};
+use weaveffi_gen_c::{CConfig, CGenerator};
+use weaveffi_gen_cpp::{CppConfig, CppGenerator};
+use weaveffi_gen_dart::{DartConfig, DartGenerator};
+use weaveffi_gen_dotnet::{DotnetConfig, DotnetGenerator};
+use weaveffi_gen_go::{GoConfig, GoGenerator};
+use weaveffi_gen_node::{NodeConfig, NodeGenerator};
+use weaveffi_gen_python::{PythonConfig, PythonGenerator};
+use weaveffi_gen_ruby::{RubyConfig, RubyGenerator};
+use weaveffi_gen_swift::{SwiftConfig, SwiftGenerator};
+use weaveffi_gen_wasm::{WasmConfig, WasmGenerator};
 use weaveffi_ir::ir::Api;
 use weaveffi_ir::parse::parse_api_str;
 
@@ -62,7 +62,7 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn run_into_tempdir(gen: &dyn Generator, api: &Api) -> (tempfile::TempDir, PathBuf) {
+fn run_into_tempdir(gen: &dyn DynGenerator, api: &Api) -> (tempfile::TempDir, PathBuf) {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let out_dir = Utf8Path::from_path(tmp.path()).expect("utf8 tempdir");
     gen.generate(api, out_dir).expect("generator failed");
@@ -70,7 +70,7 @@ fn run_into_tempdir(gen: &dyn Generator, api: &Api) -> (tempfile::TempDir, PathB
     (tmp, gen_root)
 }
 
-fn assert_byte_identical(gen: &dyn Generator) {
+fn assert_byte_identical(gen: &dyn DynGenerator) {
     let api = load_kitchen_sink();
 
     let (_tmp_a, root_a) = run_into_tempdir(gen, &api);
@@ -116,20 +116,44 @@ fn assert_byte_identical(gen: &dyn Generator) {
 
 #[test]
 fn generator_output_is_byte_identical_across_runs() {
-    let generators: &[&dyn Generator] = &[
-        &CGenerator,
-        &CppGenerator,
-        &SwiftGenerator,
-        &AndroidGenerator,
-        &NodeGenerator,
-        &WasmGenerator,
-        &PythonGenerator,
-        &DotnetGenerator,
-        &DartGenerator,
-        &GoGenerator,
-        &RubyGenerator,
+    let generators: Vec<Box<dyn DynGenerator>> = vec![
+        Box::new(ConfiguredGenerator::new(CGenerator, CConfig::default())),
+        Box::new(ConfiguredGenerator::new(CppGenerator, CppConfig::default())),
+        Box::new(ConfiguredGenerator::new(
+            SwiftGenerator,
+            SwiftConfig::default(),
+        )),
+        Box::new(ConfiguredGenerator::new(
+            AndroidGenerator,
+            AndroidConfig::default(),
+        )),
+        Box::new(ConfiguredGenerator::new(
+            NodeGenerator,
+            NodeConfig::default(),
+        )),
+        Box::new(ConfiguredGenerator::new(
+            WasmGenerator,
+            WasmConfig::default(),
+        )),
+        Box::new(ConfiguredGenerator::new(
+            PythonGenerator,
+            PythonConfig::default(),
+        )),
+        Box::new(ConfiguredGenerator::new(
+            DotnetGenerator,
+            DotnetConfig::default(),
+        )),
+        Box::new(ConfiguredGenerator::new(
+            DartGenerator,
+            DartConfig::default(),
+        )),
+        Box::new(ConfiguredGenerator::new(GoGenerator, GoConfig::default())),
+        Box::new(ConfiguredGenerator::new(
+            RubyGenerator,
+            RubyConfig::default(),
+        )),
     ];
-    for gen in generators {
-        assert_byte_identical(*gen);
+    for gen in &generators {
+        assert_byte_identical(gen.as_ref());
     }
 }

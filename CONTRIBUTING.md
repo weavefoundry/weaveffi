@@ -52,8 +52,8 @@ The short version:
    generator (e.g. `weaveffi-gen-c`). Add it to the workspace `members` list
    in the root `Cargo.toml` and depend on `weaveffi-core` and `weaveffi-ir`.
 2. Implement `Generator` (`name`, `generate`, and the optional
-   `generate_with_config` / `generate_with_templates` /
-   `output_files` / `output_files_with_config` overrides).
+   `generate_with_config` / `output_files` / `output_files_with_config`
+   overrides).
 3. Wire the generator into `crates/weaveffi-cli/src/main.rs` so the
    `--targets` flag accepts it.
 4. Add snapshot fixtures under

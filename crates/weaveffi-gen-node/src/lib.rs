@@ -7,13 +7,40 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
+use serde::{Deserialize, Serialize};
+use weaveffi_core::codegen::common::{
+    emit_doc as common_emit_doc, walk_modules, walk_modules_with_path, DocCommentStyle,
+};
 use weaveffi_core::codegen::Generator;
-use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{
     c_abi_struct_name, local_type_name, render_json_prelude, render_prelude, render_trailer,
     wrapper_name, CommentStyle,
 };
 use weaveffi_ir::ir::{Api, Function, Module, StructDef, TypeRef};
+
+/// Per-target configuration for [`NodeGenerator`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NodeConfig {
+    /// npm package name (default `"weaveffi"`).
+    pub package_name: Option<String>,
+    /// When `true`, strip the IR module name prefix from emitted
+    /// JS/TS function names.
+    pub strip_module_prefix: bool,
+    /// Basename of the IDL the CLI was invoked with.
+    #[serde(skip)]
+    pub input_basename: Option<String>,
+}
+
+impl NodeConfig {
+    pub fn package_name(&self) -> &str {
+        self.package_name.as_deref().unwrap_or("weaveffi")
+    }
+
+    pub fn input_basename(&self) -> &str {
+        self.input_basename.as_deref().unwrap_or("weaveffi.yml")
+    }
+}
 
 pub struct NodeGenerator;
 
@@ -55,30 +82,23 @@ impl NodeGenerator {
 }
 
 impl Generator for NodeGenerator {
+    type Config = NodeConfig;
+
     fn name(&self) -> &'static str {
         "node"
     }
 
-    fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "weaveffi", true, "weaveffi.yml")
-    }
-
-    fn generate_with_config(
-        &self,
-        api: &Api,
-        out_dir: &Utf8Path,
-        config: &GeneratorConfig,
-    ) -> Result<()> {
+    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()> {
         self.generate_impl(
             api,
             out_dir,
-            config.node_package_name(),
+            config.package_name(),
             config.strip_module_prefix,
             config.input_basename(),
         )
     }
 
-    fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
+    fn output_files(&self, _api: &Api, out_dir: &Utf8Path, _config: &Self::Config) -> Vec<String> {
         let mut files = vec![
             out_dir.join("node/binding.gyp").to_string(),
             out_dir.join("node/index.js").to_string(),
@@ -176,27 +196,11 @@ fn napi_getter(ty: &TypeRef) -> &'static str {
 }
 
 fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
-    let mut all = Vec::new();
-    for m in modules {
-        all.push(m);
-        all.extend(collect_all_modules(&m.modules));
-    }
-    all
+    walk_modules(modules).collect()
 }
 
 fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
-    let mut result = Vec::new();
-    for m in modules {
-        collect_module_with_path(m, &m.name, &mut result);
-    }
-    result
-}
-
-fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Module, String)>) {
-    out.push((m, path.to_string()));
-    for sub in &m.modules {
-        collect_module_with_path(sub, &format!("{path}_{}", sub.name), out);
-    }
+    walk_modules_with_path(modules).collect()
 }
 
 fn render_addon_c(api: &Api, strip_module_prefix: bool, input_basename: &str) -> String {
@@ -1051,34 +1055,7 @@ fn ts_type_for(ty: &TypeRef) -> String {
 /// Emits a JSDoc comment at `indent`. Single-line docs collapse to
 /// `/** text */`; multi-line docs expand to a block with ` * ` prefixed lines.
 fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
-    let Some(doc) = doc else {
-        return;
-    };
-    let doc = doc.trim();
-    if doc.is_empty() {
-        return;
-    }
-    if doc.contains('\n') {
-        out.push_str(indent);
-        out.push_str("/**\n");
-        for line in doc.lines() {
-            out.push_str(indent);
-            if line.is_empty() {
-                out.push_str(" *\n");
-            } else {
-                out.push_str(" * ");
-                out.push_str(line);
-                out.push('\n');
-            }
-        }
-        out.push_str(indent);
-        out.push_str(" */\n");
-    } else {
-        out.push_str(indent);
-        out.push_str("/** ");
-        out.push_str(doc);
-        out.push_str(" */\n");
-    }
+    common_emit_doc(out, doc, indent, DocCommentStyle::Javadoc);
 }
 
 /// Emits a JSDoc block for a function: function doc, `@param name desc` for
@@ -1219,7 +1196,6 @@ fn render_node_dts(api: &Api, strip_module_prefix: bool, input_basename: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField};
 
     fn make_api(modules: Vec<Module>) -> Api {
@@ -1423,7 +1399,9 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
 
-        NodeGenerator.generate(&api, out_dir).unwrap();
+        NodeGenerator
+            .generate(&api, out_dir, &NodeConfig::default())
+            .unwrap();
 
         let gyp = std::fs::read_to_string(tmp.join("node").join("binding.gyp")).unwrap();
         assert!(
@@ -1587,7 +1565,16 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
 
-        NodeGenerator.generate(&api, out_dir).unwrap();
+        NodeGenerator
+            .generate(
+                &api,
+                out_dir,
+                &NodeConfig {
+                    strip_module_prefix: true,
+                    ..NodeConfig::default()
+                },
+            )
+            .unwrap();
 
         let dts = std::fs::read_to_string(tmp.join("node").join("types.d.ts")).unwrap();
 
@@ -1653,13 +1640,11 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
 
-        let config = GeneratorConfig {
-            node_package_name: Some("@myorg/cool-lib".into()),
-            ..GeneratorConfig::default()
+        let config = NodeConfig {
+            package_name: Some("@myorg/cool-lib".into()),
+            ..NodeConfig::default()
         };
-        NodeGenerator
-            .generate_with_config(&api, out_dir, &config)
-            .unwrap();
+        NodeGenerator.generate(&api, out_dir, &config).unwrap();
 
         let pkg = std::fs::read_to_string(tmp.join("node").join("package.json")).unwrap();
         assert!(
@@ -1909,9 +1894,9 @@ mod tests {
             m
         }]);
 
-        let config = GeneratorConfig {
+        let config = NodeConfig {
             strip_module_prefix: true,
-            ..Default::default()
+            ..NodeConfig::default()
         };
 
         let tmp = std::env::temp_dir().join("weaveffi_test_node_strip_prefix");
@@ -1919,9 +1904,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
-        NodeGenerator
-            .generate_with_config(&api, out_dir, &config)
-            .unwrap();
+        NodeGenerator.generate(&api, out_dir, &config).unwrap();
 
         let dts = std::fs::read_to_string(tmp.join("node/types.d.ts")).unwrap();
         assert!(
@@ -1943,15 +1926,13 @@ mod tests {
             "C ABI call should still use full name: {addon}"
         );
 
-        let no_strip = GeneratorConfig::default();
+        let no_strip = NodeConfig::default();
         let tmp2 = std::env::temp_dir().join("weaveffi_test_node_no_strip_prefix");
         let _ = std::fs::remove_dir_all(&tmp2);
         std::fs::create_dir_all(&tmp2).unwrap();
         let out_dir2 = Utf8Path::from_path(&tmp2).expect("valid UTF-8");
 
-        NodeGenerator
-            .generate_with_config(&api, out_dir2, &no_strip)
-            .unwrap();
+        NodeGenerator.generate(&api, out_dir2, &no_strip).unwrap();
 
         let dts2 = std::fs::read_to_string(tmp2.join("node/types.d.ts")).unwrap();
         assert!(

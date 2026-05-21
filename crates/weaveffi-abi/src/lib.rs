@@ -4,6 +4,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod arena;
+mod macros;
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;

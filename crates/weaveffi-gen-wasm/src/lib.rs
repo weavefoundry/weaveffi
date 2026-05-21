@@ -7,14 +7,39 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
+use serde::{Deserialize, Serialize};
+use weaveffi_core::codegen::common::{
+    emit_doc as common_emit_doc, walk_modules, walk_modules_with_path, DocCommentStyle,
+};
 use weaveffi_core::codegen::Generator;
-use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{local_type_name, render_prelude, render_trailer, CommentStyle};
 use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, TypeRef};
 
 pub struct WasmGenerator;
 
 const DEFAULT_MODULE_NAME: &str = "weaveffi_wasm";
+
+/// Per-target configuration for [`WasmGenerator`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WasmConfig {
+    /// Module name used for the emitted `<name>.js` loader and
+    /// `<name>.d.ts` (default `"weaveffi_wasm"`).
+    pub module_name: Option<String>,
+    /// Basename of the IDL the CLI was invoked with.
+    #[serde(skip)]
+    pub input_basename: Option<String>,
+}
+
+impl WasmConfig {
+    pub fn module_name(&self) -> &str {
+        self.module_name.as_deref().unwrap_or(DEFAULT_MODULE_NAME)
+    }
+
+    pub fn input_basename(&self) -> &str {
+        self.input_basename.as_deref().unwrap_or("weaveffi.yml")
+    }
+}
 
 impl WasmGenerator {
     fn generate_impl(
@@ -45,39 +70,18 @@ impl WasmGenerator {
 }
 
 impl Generator for WasmGenerator {
+    type Config = WasmConfig;
+
     fn name(&self) -> &'static str {
         "wasm"
     }
 
-    fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, DEFAULT_MODULE_NAME, "weaveffi.yml")
+    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()> {
+        self.generate_impl(api, out_dir, config.module_name(), config.input_basename())
     }
 
-    fn generate_with_config(
-        &self,
-        api: &Api,
-        out_dir: &Utf8Path,
-        config: &GeneratorConfig,
-    ) -> Result<()> {
-        self.generate_impl(
-            api,
-            out_dir,
-            config.wasm_module_name(),
-            config.input_basename(),
-        )
-    }
-
-    fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
-        output_file_list(out_dir, DEFAULT_MODULE_NAME)
-    }
-
-    fn output_files_with_config(
-        &self,
-        _api: &Api,
-        out_dir: &Utf8Path,
-        config: &GeneratorConfig,
-    ) -> Vec<String> {
-        output_file_list(out_dir, config.wasm_module_name())
+    fn output_files(&self, _api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Vec<String> {
+        output_file_list(out_dir, config.module_name())
     }
 }
 
@@ -389,60 +393,17 @@ fn ts_type_for(ty: &TypeRef) -> String {
 }
 
 fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
-    let mut all = Vec::new();
-    for m in modules {
-        all.push(m);
-        all.extend(collect_all_modules(&m.modules));
-    }
-    all
+    walk_modules(modules).collect()
 }
 
 fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
-    let mut result = Vec::new();
-    for m in modules {
-        collect_module_with_path(m, &m.name, &mut result);
-    }
-    result
-}
-
-fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Module, String)>) {
-    out.push((m, path.to_string()));
-    for sub in &m.modules {
-        collect_module_with_path(sub, &format!("{path}_{}", sub.name), out);
-    }
+    walk_modules_with_path(modules).collect()
 }
 
 /// Emits a JSDoc comment at `indent`. Single-line docs collapse to
 /// `/** text */`; multi-line docs expand to a block with ` * ` prefixed lines.
 fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
-    let Some(doc) = doc else {
-        return;
-    };
-    let doc = doc.trim();
-    if doc.is_empty() {
-        return;
-    }
-    if doc.contains('\n') {
-        out.push_str(indent);
-        out.push_str("/**\n");
-        for line in doc.lines() {
-            out.push_str(indent);
-            if line.is_empty() {
-                out.push_str(" *\n");
-            } else {
-                out.push_str(" * ");
-                out.push_str(line);
-                out.push('\n');
-            }
-        }
-        out.push_str(indent);
-        out.push_str(" */\n");
-    } else {
-        out.push_str(indent);
-        out.push_str("/** ");
-        out.push_str(doc);
-        out.push_str(" */\n");
-    }
+    common_emit_doc(out, doc, indent, DocCommentStyle::Javadoc);
 }
 
 /// Emits a JSDoc block for a function: function doc, `@param name desc` for
@@ -1129,7 +1090,6 @@ mod tests {
     use super::*;
     use camino::Utf8Path;
     use weaveffi_core::codegen::Generator;
-    use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{EnumVariant, Module, Param, StructField};
 
     fn empty_api() -> Api {
@@ -1300,7 +1260,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         let out = Utf8Path::from_path(tmp.as_path()).unwrap();
         let api = make_api(vec![]);
-        WasmGenerator.generate(&api, out).unwrap();
+        WasmGenerator
+            .generate(&api, out, &WasmConfig::default())
+            .unwrap();
 
         let readme = std::fs::read_to_string(out.join("wasm/README.md")).unwrap();
         assert!(readme.contains("## Complex Type Handling"));
@@ -1571,7 +1533,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         let out = Utf8Path::from_path(tmp.as_path()).unwrap();
         let api = sample_api();
-        WasmGenerator.generate(&api, out).unwrap();
+        WasmGenerator
+            .generate(&api, out, &WasmConfig::default())
+            .unwrap();
 
         let readme = std::fs::read_to_string(out.join("wasm/README.md")).unwrap();
         assert!(readme.contains("## API Reference"));
@@ -1612,7 +1576,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         let out = Utf8Path::from_path(tmp.as_path()).unwrap();
         let api = sample_api();
-        WasmGenerator.generate(&api, out).unwrap();
+        WasmGenerator
+            .generate(&api, out, &WasmConfig::default())
+            .unwrap();
 
         let dts = std::fs::read_to_string(out.join("wasm/weaveffi_wasm.d.ts")).unwrap();
         assert!(dts.contains("export interface WeaveffiWasmModule"));
@@ -1718,13 +1684,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         let out = Utf8Path::from_path(tmp.as_path()).unwrap();
         let api = sample_api();
-        let config = GeneratorConfig {
-            wasm_module_name: Some("my_bindings".into()),
-            ..GeneratorConfig::default()
+        let config = WasmConfig {
+            module_name: Some("my_bindings".into()),
+            ..WasmConfig::default()
         };
-        WasmGenerator
-            .generate_with_config(&api, out, &config)
-            .unwrap();
+        WasmGenerator.generate(&api, out, &config).unwrap();
 
         assert!(out.join("wasm/my_bindings.js").exists());
         assert!(out.join("wasm/my_bindings.d.ts").exists());
@@ -1736,7 +1700,7 @@ mod tests {
         assert!(dts.contains("MyBindingsModule"));
         assert!(dts.contains("loadMyBindings"));
 
-        let files = WasmGenerator.output_files_with_config(&api, out, &config);
+        let files = WasmGenerator.output_files(&api, out, &config);
         assert!(files.iter().any(|f| f.contains("my_bindings.js")));
         assert!(files.iter().any(|f| f.contains("my_bindings.d.ts")));
 

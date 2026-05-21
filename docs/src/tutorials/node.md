@@ -104,14 +104,9 @@ pub extern "C" fn weaveffi_greeter_hello(
     CString::new(msg).unwrap().into_raw() as *const c_char
 }
 
-#[no_mangle]
-pub extern "C" fn weaveffi_free_string(ptr: *const c_char) { abi::free_string(ptr); }
-
-#[no_mangle]
-pub extern "C" fn weaveffi_free_bytes(ptr: *mut u8, len: usize) { abi::free_bytes(ptr, len); }
-
-#[no_mangle]
-pub extern "C" fn weaveffi_error_clear(err: *mut weaveffi_error) { abi::error_clear(err); }
+// Emit the WeaveFFI C ABI runtime symbols (free_string, free_bytes,
+// error_clear, cancel_token_*) — one line per cdylib.
+abi::export_runtime!();
 ```
 
 Use `scaffold.rs` for the rest of the API. You also need an N-API

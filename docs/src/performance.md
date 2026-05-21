@@ -117,12 +117,6 @@ in the original performance plan, in order of impact.
   faster for our schemas. We accept it as the dominant CLI startup
   cost and document it here.
 
-- **Tera template rendering.** Generators short-circuit user templates
-  by inheriting the default `generate_with_templates` impl that ignores
-  the `Option<&TemplateEngine>` parameter when none is provided. No
-  generator allocates a Tera context unless a user template directory
-  is configured, so there is no work to skip.
-
 ## CI artifacts
 
 The [`bench.yml`][bench-workflow] workflow runs `cargo bench` on every

@@ -9,13 +9,58 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
+use serde::{Deserialize, Serialize};
+use weaveffi_core::codegen::common::{
+    emit_doc as common_emit_doc, is_c_pointer_type as common_is_c_pointer_type, walk_modules,
+    walk_modules_with_path, DocCommentStyle,
+};
 use weaveffi_core::codegen::Generator;
-use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{
     c_abi_struct_name, local_type_name, render_abi_prefix_aliases, render_prelude, render_trailer,
     CommentStyle,
 };
 use weaveffi_ir::ir::{Api, ErrorCode, Function, Module, StructDef, StructField, TypeRef};
+
+/// Per-target configuration for [`CppGenerator`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CppConfig {
+    /// C++ namespace (default `"weaveffi"`).
+    pub namespace: Option<String>,
+    /// Filename of the emitted C++ header (default `"weaveffi.hpp"`).
+    pub header_name: Option<String>,
+    /// C++ standard advertised in the generated `CMakeLists.txt` (default
+    /// `"17"`).
+    pub standard: Option<String>,
+    /// C ABI symbol prefix that the C++ wrappers call into. Must match the
+    /// configured C generator prefix. Defaults to `"weaveffi"`.
+    pub c_prefix: Option<String>,
+    /// Basename of the IDL the CLI was invoked with.
+    #[serde(skip)]
+    pub input_basename: Option<String>,
+}
+
+impl CppConfig {
+    pub fn namespace(&self) -> &str {
+        self.namespace.as_deref().unwrap_or("weaveffi")
+    }
+
+    pub fn header_name(&self) -> &str {
+        self.header_name.as_deref().unwrap_or("weaveffi.hpp")
+    }
+
+    pub fn standard(&self) -> &str {
+        self.standard.as_deref().unwrap_or("17")
+    }
+
+    pub fn c_prefix(&self) -> &str {
+        self.c_prefix.as_deref().unwrap_or("weaveffi")
+    }
+
+    pub fn input_basename(&self) -> &str {
+        self.input_basename.as_deref().unwrap_or("weaveffi.yml")
+    }
+}
 
 pub struct CppGenerator;
 
@@ -47,56 +92,26 @@ impl CppGenerator {
 }
 
 impl Generator for CppGenerator {
+    type Config = CppConfig;
+
     fn name(&self) -> &'static str {
         "cpp"
     }
 
-    fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
+    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()> {
         self.generate_impl(
             api,
             out_dir,
-            "weaveffi",
-            "weaveffi.hpp",
-            "17",
-            "weaveffi",
-            "weaveffi.yml",
-        )
-    }
-
-    fn generate_with_config(
-        &self,
-        api: &Api,
-        out_dir: &Utf8Path,
-        config: &GeneratorConfig,
-    ) -> Result<()> {
-        self.generate_impl(
-            api,
-            out_dir,
-            config.cpp_namespace(),
-            config.cpp_header_name(),
-            config.cpp_standard(),
+            config.namespace(),
+            config.header_name(),
+            config.standard(),
             config.c_prefix(),
             config.input_basename(),
         )
     }
 
-    fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
-        let mut files = vec![
-            out_dir.join("cpp/CMakeLists.txt").to_string(),
-            out_dir.join("cpp/README.md").to_string(),
-            out_dir.join("cpp/weaveffi.hpp").to_string(),
-        ];
-        files.sort();
-        files
-    }
-
-    fn output_files_with_config(
-        &self,
-        _api: &Api,
-        out_dir: &Utf8Path,
-        config: &GeneratorConfig,
-    ) -> Vec<String> {
-        let header_name = config.cpp_header_name();
+    fn output_files(&self, _api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Vec<String> {
+        let header_name = config.header_name();
         let mut files = vec![
             out_dir.join("cpp/CMakeLists.txt").to_string(),
             out_dir.join("cpp/README.md").to_string(),
@@ -162,27 +177,11 @@ Then include the header in your code:
 }
 
 fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
-    let mut all = Vec::new();
-    for m in modules {
-        all.push(m);
-        all.extend(collect_all_modules(&m.modules));
-    }
-    all
+    walk_modules(modules).collect()
 }
 
 fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
-    let mut result = Vec::new();
-    for m in modules {
-        collect_module_with_path(m, &m.name, &mut result);
-    }
-    result
-}
-
-fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Module, String)>) {
-    out.push((m, path.to_string()));
-    for sub in &m.modules {
-        collect_module_with_path(sub, &format!("{path}_{}", sub.name), out);
-    }
+    walk_modules_with_path(modules).collect()
 }
 
 fn render_cpp_header(
@@ -239,51 +238,13 @@ fn render_cpp_header(
 /// Emits a `/** ... */` doc comment at `indent`. Single-line docs collapse to
 /// `/** text */`; multi-line docs expand to a block with ` * ` prefixed lines.
 fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
-    let Some(doc) = doc else {
-        return;
-    };
-    let doc = doc.trim();
-    if doc.is_empty() {
-        return;
-    }
-    if doc.contains('\n') {
-        out.push_str(indent);
-        out.push_str("/**\n");
-        for line in doc.lines() {
-            out.push_str(indent);
-            if line.is_empty() {
-                out.push_str(" *\n");
-            } else {
-                out.push_str(" * ");
-                out.push_str(line);
-                out.push('\n');
-            }
-        }
-        out.push_str(indent);
-        out.push_str(" */\n");
-    } else {
-        out.push_str(indent);
-        out.push_str("/** ");
-        out.push_str(doc);
-        out.push_str(" */\n");
-    }
+    common_emit_doc(out, doc, indent, DocCommentStyle::Javadoc);
 }
 
 // ── C ABI type helpers (mirrors the C generator logic) ──
 
 fn is_c_pointer_type(ty: &TypeRef) -> bool {
-    matches!(
-        ty,
-        TypeRef::StringUtf8
-            | TypeRef::BorrowedStr
-            | TypeRef::Bytes
-            | TypeRef::BorrowedBytes
-            | TypeRef::Struct(_)
-            | TypeRef::TypedHandle(_)
-            | TypeRef::List(_)
-            | TypeRef::Iterator(_)
-            | TypeRef::Map(_, _)
-    )
+    common_is_c_pointer_type(ty)
 }
 
 fn c_element_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
@@ -1562,7 +1523,6 @@ fn render_async_set_value(out: &mut String, ty: &TypeRef, prefix: &str) {
 mod tests {
     use super::*;
     use weaveffi_core::codegen::Generator;
-    use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{
         Api, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param, StructDef,
         StructField, TypeRef,
@@ -1709,7 +1669,7 @@ mod tests {
     fn output_files_lists_hpp() {
         let api = minimal_api();
         let out_dir = Utf8Path::new("/tmp/out");
-        let files = CppGenerator.output_files(&api, out_dir);
+        let files = CppGenerator.output_files(&api, out_dir, &CppConfig::default());
         assert_eq!(
             files,
             vec![
@@ -1728,7 +1688,9 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
 
-        CppGenerator.generate(&api, out_dir).unwrap();
+        CppGenerator
+            .generate(&api, out_dir, &CppConfig::default())
+            .unwrap();
 
         let hpp = tmp.join("cpp").join("weaveffi.hpp");
         assert!(hpp.exists(), "weaveffi.hpp should be created");
@@ -1753,7 +1715,9 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
 
-        CppGenerator.generate(&api, out_dir).unwrap();
+        CppGenerator
+            .generate(&api, out_dir, &CppConfig::default())
+            .unwrap();
 
         let cmake = tmp.join("cpp").join("CMakeLists.txt");
         assert!(cmake.exists(), "CMakeLists.txt should be created");
@@ -2716,18 +2680,16 @@ mod tests {
     #[test]
     fn cpp_custom_namespace() {
         let api = minimal_api();
-        let config = GeneratorConfig {
-            cpp_namespace: Some("mylib".into()),
-            ..GeneratorConfig::default()
+        let config = CppConfig {
+            namespace: Some("mylib".into()),
+            ..CppConfig::default()
         };
         let tmp = std::env::temp_dir().join("weaveffi_test_cpp_custom_ns");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
-        CppGenerator
-            .generate_with_config(&api, out_dir, &config)
-            .unwrap();
+        CppGenerator.generate(&api, out_dir, &config).unwrap();
 
         let content = std::fs::read_to_string(tmp.join("cpp/weaveffi.hpp")).unwrap();
         assert!(
@@ -2749,19 +2711,17 @@ mod tests {
     #[test]
     fn cpp_custom_header_name() {
         let api = minimal_api();
-        let config = GeneratorConfig {
-            cpp_header_name: Some("bindings.hpp".into()),
-            cpp_standard: Some("20".into()),
-            ..GeneratorConfig::default()
+        let config = CppConfig {
+            header_name: Some("bindings.hpp".into()),
+            standard: Some("20".into()),
+            ..CppConfig::default()
         };
         let tmp = std::env::temp_dir().join("weaveffi_test_cpp_custom_header");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
-        CppGenerator
-            .generate_with_config(&api, out_dir, &config)
-            .unwrap();
+        CppGenerator.generate(&api, out_dir, &config).unwrap();
 
         assert!(
             tmp.join("cpp/bindings.hpp").exists(),

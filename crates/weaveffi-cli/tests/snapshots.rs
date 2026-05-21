@@ -9,19 +9,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use camino::Utf8Path;
-use weaveffi_core::codegen::Generator;
+use weaveffi_core::codegen::{ConfiguredGenerator, DynGenerator, Generator};
 use weaveffi_core::validate::validate_api;
-use weaveffi_gen_android::AndroidGenerator;
-use weaveffi_gen_c::CGenerator;
-use weaveffi_gen_cpp::CppGenerator;
-use weaveffi_gen_dart::DartGenerator;
-use weaveffi_gen_dotnet::DotnetGenerator;
-use weaveffi_gen_go::GoGenerator;
-use weaveffi_gen_node::NodeGenerator;
-use weaveffi_gen_python::PythonGenerator;
-use weaveffi_gen_ruby::RubyGenerator;
-use weaveffi_gen_swift::SwiftGenerator;
-use weaveffi_gen_wasm::WasmGenerator;
+use weaveffi_gen_android::{AndroidConfig, AndroidGenerator};
+use weaveffi_gen_c::{CConfig, CGenerator};
+use weaveffi_gen_cpp::{CppConfig, CppGenerator};
+use weaveffi_gen_dart::{DartConfig, DartGenerator};
+use weaveffi_gen_dotnet::{DotnetConfig, DotnetGenerator};
+use weaveffi_gen_go::{GoConfig, GoGenerator};
+use weaveffi_gen_node::{NodeConfig, NodeGenerator};
+use weaveffi_gen_python::{PythonConfig, PythonGenerator};
+use weaveffi_gen_ruby::{RubyConfig, RubyGenerator};
+use weaveffi_gen_swift::{SwiftConfig, SwiftGenerator};
+use weaveffi_gen_wasm::{WasmConfig, WasmGenerator};
 use weaveffi_ir::ir::Api;
 use weaveffi_ir::parse::parse_api_str;
 
@@ -68,11 +68,16 @@ fn sanitize(rel: &Path) -> String {
     rel.to_string_lossy().replace(['/', '\\', '.', '-'], "_")
 }
 
-fn run_snapshot(gen: &dyn Generator, fixture_stem: &str, fixture_file: &str) {
+fn run_snapshot<G: Generator>(gen: &G, fixture_stem: &str, fixture_file: &str)
+where
+    G::Config: Default,
+{
     let api = load_api(fixture_file);
     let tmp = tempfile::tempdir().expect("create tempdir");
     let out_dir = Utf8Path::from_path(tmp.path()).expect("utf8 tempdir");
-    gen.generate(&api, out_dir).expect("generator failed");
+    let config = G::Config::default();
+    gen.generate(&api, out_dir, &config)
+        .expect("generator failed");
 
     let gen_root = out_dir.join(gen.name());
     let files = collect_files_sorted(gen_root.as_std_path());
@@ -650,18 +655,42 @@ snapshot_test!(
 /// must carry the standard WeaveFFI prelude markers in its first five lines.
 #[test]
 fn prelude_present_in_every_generated_file() {
-    let generators: Vec<&dyn Generator> = vec![
-        &CGenerator,
-        &CppGenerator,
-        &SwiftGenerator,
-        &AndroidGenerator,
-        &NodeGenerator,
-        &WasmGenerator,
-        &PythonGenerator,
-        &DotnetGenerator,
-        &DartGenerator,
-        &GoGenerator,
-        &RubyGenerator,
+    let generators: Vec<Box<dyn DynGenerator>> = vec![
+        Box::new(ConfiguredGenerator::new(CGenerator, CConfig::default())),
+        Box::new(ConfiguredGenerator::new(CppGenerator, CppConfig::default())),
+        Box::new(ConfiguredGenerator::new(
+            SwiftGenerator,
+            SwiftConfig::default(),
+        )),
+        Box::new(ConfiguredGenerator::new(
+            AndroidGenerator,
+            AndroidConfig::default(),
+        )),
+        Box::new(ConfiguredGenerator::new(
+            NodeGenerator,
+            NodeConfig::default(),
+        )),
+        Box::new(ConfiguredGenerator::new(
+            WasmGenerator,
+            WasmConfig::default(),
+        )),
+        Box::new(ConfiguredGenerator::new(
+            PythonGenerator,
+            PythonConfig::default(),
+        )),
+        Box::new(ConfiguredGenerator::new(
+            DotnetGenerator,
+            DotnetConfig::default(),
+        )),
+        Box::new(ConfiguredGenerator::new(
+            DartGenerator,
+            DartConfig::default(),
+        )),
+        Box::new(ConfiguredGenerator::new(GoGenerator, GoConfig::default())),
+        Box::new(ConfiguredGenerator::new(
+            RubyGenerator,
+            RubyConfig::default(),
+        )),
     ];
     let fixtures = [
         "01_calculator.yml",

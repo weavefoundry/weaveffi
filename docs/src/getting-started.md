@@ -165,7 +165,6 @@ brevity):
 #![allow(unsafe_code)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::os::raw::c_char;
 use weaveffi_abi::{self as abi, weaveffi_error};
 
 #[no_mangle]
@@ -178,20 +177,10 @@ pub extern "C" fn weaveffi_math_add(
     a + b
 }
 
-#[no_mangle]
-pub extern "C" fn weaveffi_free_string(ptr: *const c_char) {
-    abi::free_string(ptr);
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_free_bytes(ptr: *mut u8, len: usize) {
-    abi::free_bytes(ptr, len);
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_error_clear(err: *mut weaveffi_error) {
-    abi::error_clear(err);
-}
+// Emit the fixed WeaveFFI C ABI runtime surface (free_string, free_bytes,
+// error_clear, cancel_token_*) in one line. Call this exactly once per
+// cdylib.
+abi::export_runtime!();
 ```
 
 Key points:
@@ -200,8 +189,11 @@ Key points:
 - `out_err` must always be cleared on success with `abi::error_set_ok`.
 - On error, call `abi::error_set(out_err, code, message)` and return a
   zero/null value.
-- The library must export `weaveffi_free_string`, `weaveffi_free_bytes`, and
-  `weaveffi_error_clear` for the runtime.
+- The library must export the WeaveFFI runtime symbols — invoke
+  [`weaveffi_abi::export_runtime!()`][export-runtime-doc] to emit all of
+  them in one line instead of writing each `#[no_mangle]` thunk by hand.
+
+[export-runtime-doc]: https://docs.rs/weaveffi-abi/latest/weaveffi_abi/macro.export_runtime.html
 
 Build with:
 

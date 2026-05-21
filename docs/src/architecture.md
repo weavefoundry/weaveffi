@@ -64,7 +64,7 @@ weaveffi-fuzz ──► weaveffi-ir, weaveffi-core (workspace-private; unpublish
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `weaveffi-ir`        | The IR types (`Api`, `Module`, `Function`, `TypeRef`, …), the `parse_api_str` parser, the `parse_type_ref` mini-grammar, and `CURRENT_SCHEMA_VERSION`. |
 | `weaveffi-abi`       | Stable C ABI runtime symbols: `weaveffi_error`, `weaveffi_error_clear`, `weaveffi_free_string`, `weaveffi_free_bytes`, the arena, cancel tokens. |
-| `weaveffi-core`      | The `Generator` trait, the `Orchestrator`, validation rules, generator config resolution, the per-generator hash cache, and the Tera template engine. |
+| `weaveffi-core`      | The `Generator` trait, the `Orchestrator`, validation rules, generator config resolution, and the per-generator hash cache. |
 | `weaveffi-gen-*`     | Eleven generator crates. Each implements `Generator` and produces target-specific output (header, wrapper, package metadata).                    |
 | `weaveffi-cli`       | The `weaveffi` binary. Parses the IDL, applies validation, instantiates every generator, and dispatches the `Orchestrator`.                      |
 | `weaveffi-fuzz`      | `cargo-fuzz` harnesses for the parsers, the validator, and `parse_type_ref`. Workspace-private (not published to crates.io).                     |
@@ -213,16 +213,6 @@ pub trait Generator: Send + Sync {
         self.generate(api, out_dir)
     }
 
-    fn generate_with_templates(
-        &self,
-        api: &Api,
-        out_dir: &Utf8Path,
-        config: &GeneratorConfig,
-        _templates: Option<&TemplateEngine>,
-    ) -> Result<()> {
-        self.generate_with_config(api, out_dir, config)
-    }
-
     fn output_files(&self, _api: &Api, _out_dir: &Utf8Path) -> Vec<String> {
         vec![]
     }
@@ -238,6 +228,11 @@ pub trait Generator: Send + Sync {
 }
 ```
 
+Generators emit code by direct string construction; there is no
+template-engine layer. Earlier prototypes wired in Tera with the
+intent of supporting user template overrides, but no generator ever
+read from it and the abstraction was removed in 0.4.0.
+
 The signature reference above uses `Result<T>` from `anyhow`/`color-eyre`
 and the IR types from `weaveffi_ir`; consult those crates for the
 precise import set.
@@ -247,9 +242,8 @@ Implementation notes:
 - Always implement `name()` (returns the `--target` flag value, e.g.
   `"swift"`).
 - Implement the highest-level `generate_*` method your generator needs
-  and let the defaults forward through. Generators that do not look at
-  templates can stop at `generate_with_config`; generators that do not
-  read configuration can stop at `generate`.
+  and let the defaults forward through. Generators that do not read
+  configuration can stop at `generate`.
 - `output_files_with_config` is queried by `--dry-run` and the diff
   workflow. Override it whenever your generator's file list depends on
   the IR or config (most do).

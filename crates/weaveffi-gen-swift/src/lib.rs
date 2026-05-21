@@ -9,12 +9,38 @@ use std::fmt::Write;
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
+use serde::{Deserialize, Serialize};
+use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, walk_modules, DocCommentStyle};
 use weaveffi_core::codegen::Generator;
-use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{
     c_symbol_name, local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
 };
 use weaveffi_ir::ir::{Api, EnumDef, Function, Module, Param, StructDef, StructField, TypeRef};
+
+/// Per-target configuration for [`SwiftGenerator`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SwiftConfig {
+    /// SwiftPM module name (default `"WeaveFFI"`).
+    pub module_name: Option<String>,
+    /// When `true`, strip the IR module name prefix from emitted function
+    /// names (e.g. `add` instead of `math_add`).
+    pub strip_module_prefix: bool,
+    /// Basename of the IDL the CLI was invoked with.
+    /// Populated by the CLI; not user-configurable via `[swift]`.
+    #[serde(skip)]
+    pub input_basename: Option<String>,
+}
+
+impl SwiftConfig {
+    pub fn module_name(&self) -> &str {
+        self.module_name.as_deref().unwrap_or("WeaveFFI")
+    }
+
+    pub fn input_basename(&self) -> &str {
+        self.input_basename.as_deref().unwrap_or("weaveffi.yml")
+    }
+}
 
 /// Each module contributes ~2KB of Swift wrapper text on average (struct
 /// shims, getters, async wrappers); pre-allocating from this estimate
@@ -103,52 +129,24 @@ let package = Package(\n    \
 }
 
 impl Generator for SwiftGenerator {
+    type Config = SwiftConfig;
+
     fn name(&self) -> &'static str {
         "swift"
     }
 
-    fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "WeaveFFI", true, "weaveffi.yml")
-    }
-
-    fn generate_with_config(
-        &self,
-        api: &Api,
-        out_dir: &Utf8Path,
-        config: &GeneratorConfig,
-    ) -> Result<()> {
+    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()> {
         self.generate_impl(
             api,
             out_dir,
-            config.swift_module_name(),
+            config.module_name(),
             config.strip_module_prefix,
             config.input_basename(),
         )
     }
 
-    fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
-        let module_name = "WeaveFFI";
-        let c_module = format!("C{module_name}");
-        let mut files = vec![
-            out_dir.join("swift/Package.swift").to_string(),
-            out_dir
-                .join(format!("swift/{c_module}/module.modulemap"))
-                .to_string(),
-            out_dir
-                .join(format!("swift/Sources/{module_name}/{module_name}.swift"))
-                .to_string(),
-        ];
-        files.sort();
-        files
-    }
-
-    fn output_files_with_config(
-        &self,
-        _api: &Api,
-        out_dir: &Utf8Path,
-        config: &GeneratorConfig,
-    ) -> Vec<String> {
-        let module_name = config.swift_module_name();
+    fn output_files(&self, _api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Vec<String> {
+        let module_name = config.module_name();
         let c_module = format!("C{module_name}");
         let mut files = vec![
             out_dir.join("swift/Package.swift").to_string(),
@@ -167,23 +165,7 @@ impl Generator for SwiftGenerator {
 /// Emits a `///`-prefixed Swift doc comment at `indent`. Each line of the
 /// (possibly multi-line) doc gets its own `///` prefix.
 fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
-    let Some(doc) = doc else {
-        return;
-    };
-    let doc = doc.trim();
-    if doc.is_empty() {
-        return;
-    }
-    for line in doc.lines() {
-        out.push_str(indent);
-        if line.is_empty() {
-            out.push_str("///\n");
-        } else {
-            out.push_str("/// ");
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
+    common_emit_doc(out, doc, indent, DocCommentStyle::TripleSlash);
 }
 
 /// Emits Swift doc comments for a function: the function's own doc followed by
@@ -384,12 +366,7 @@ fn render_swift_wrapper(
 }
 
 fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
-    let mut all = Vec::new();
-    for m in modules {
-        all.push(m);
-        all.extend(collect_all_modules(&m.modules));
-    }
-    all
+    walk_modules(modules).collect()
 }
 
 fn render_swift_module_types(out: &mut String, m: &Module, module_path: &str) {
@@ -2816,7 +2793,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
-        SwiftGenerator.generate(&api, out_dir).unwrap();
+        SwiftGenerator
+            .generate(&api, out_dir, &SwiftConfig::default())
+            .unwrap();
         let swift = std::fs::read_to_string(
             tmp.join("swift")
                 .join("Sources")
@@ -3095,7 +3074,16 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
 
-        SwiftGenerator.generate(&api, out_dir).unwrap();
+        SwiftGenerator
+            .generate(
+                &api,
+                out_dir,
+                &SwiftConfig {
+                    strip_module_prefix: true,
+                    ..SwiftConfig::default()
+                },
+            )
+            .unwrap();
 
         let swift = std::fs::read_to_string(
             tmp.join("swift")
@@ -3378,9 +3366,9 @@ mod tests {
             modules: vec![],
         }]);
 
-        let config = GeneratorConfig {
-            swift_module_name: Some("MyCoolLib".into()),
-            ..Default::default()
+        let config = SwiftConfig {
+            module_name: Some("MyCoolLib".into()),
+            ..SwiftConfig::default()
         };
 
         let tmp = std::env::temp_dir().join("weaveffi_test_swift_custom_module");
@@ -3388,9 +3376,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
 
-        SwiftGenerator
-            .generate_with_config(&api, out_dir, &config)
-            .unwrap();
+        SwiftGenerator.generate(&api, out_dir, &config).unwrap();
 
         let pkg = std::fs::read_to_string(tmp.join("swift").join("Package.swift")).unwrap();
         assert!(
@@ -3612,9 +3598,9 @@ mod tests {
             modules: vec![],
         }]);
 
-        let config = GeneratorConfig {
+        let config = SwiftConfig {
             strip_module_prefix: true,
-            ..Default::default()
+            ..SwiftConfig::default()
         };
 
         let tmp = std::env::temp_dir().join("weaveffi_test_swift_strip_prefix");
@@ -3622,9 +3608,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
-        SwiftGenerator
-            .generate_with_config(&api, out_dir, &config)
-            .unwrap();
+        SwiftGenerator.generate(&api, out_dir, &config).unwrap();
 
         let swift =
             std::fs::read_to_string(tmp.join("swift/Sources/WeaveFFI/WeaveFFI.swift")).unwrap();
@@ -3642,9 +3626,9 @@ mod tests {
             "C ABI call should still use full name: {swift}"
         );
 
-        let no_strip_config = GeneratorConfig {
+        let no_strip_config = SwiftConfig {
             strip_module_prefix: false,
-            ..Default::default()
+            ..SwiftConfig::default()
         };
         let tmp2 = std::env::temp_dir().join("weaveffi_test_swift_no_strip_prefix");
         let _ = std::fs::remove_dir_all(&tmp2);
@@ -3652,7 +3636,7 @@ mod tests {
         let out_dir2 = Utf8Path::from_path(&tmp2).expect("valid UTF-8");
 
         SwiftGenerator
-            .generate_with_config(&api, out_dir2, &no_strip_config)
+            .generate(&api, out_dir2, &no_strip_config)
             .unwrap();
 
         let swift2 =

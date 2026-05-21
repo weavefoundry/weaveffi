@@ -32,15 +32,27 @@ weaveffi generate api.yml -o generated --config weaveffi.toml
 ```
 
 ```toml
-swift_module_name = "MyApp"
-android_package = "com.example.myapp"
-node_package_name = "@myorg/myapp"
-wasm_module_name = "myapp_wasm"
-c_prefix = "myapp"
+[swift]
+module_name = "MyApp"
+
+[android]
+package = "com.example.myapp"
+
+[node]
+package_name = "@myorg/myapp"
+
+[wasm]
+module_name = "myapp_wasm"
+
+[c]
+prefix = "myapp"
+
+[global]
 strip_module_prefix = true
 ```
 
-Every key is optional; omit anything you want defaulted.
+Every section and key is optional; omit anything you want defaulted.
+The `[global]` table accepts the alias `[weaveffi]`.
 
 ### 2. Embed `generators:` in the IDL
 
@@ -91,20 +103,32 @@ For day-to-day project recipes:
 
 ```toml
 # iOS / macOS
-swift_module_name = "MyAppFFI"
-c_prefix = "myapp"
+[swift]
+module_name = "MyAppFFI"
+
+[c]
+prefix = "myapp"
 ```
 
 ```toml
 # Android
-android_package = "com.example.myapp.ffi"
-c_prefix = "myapp"
+[android]
+package = "com.example.myapp.ffi"
+
+[c]
+prefix = "myapp"
 ```
 
 ```toml
 # Node
-node_package_name = "@myorg/myapp-native"
+[node]
+package_name = "@myorg/myapp-native"
 ```
+
+When you set `[c] prefix = ...` and do not explicitly set
+`[cpp] c_prefix = ...`, the CLI copies the C prefix into the C++ wrapper
+config automatically so the C++ header keeps calling the same symbols
+the C ABI exports.
 
 ### 4. Wire it into CI
 
@@ -128,56 +152,44 @@ weaveffi --quiet lint api.yml --format json > lint-report.json || \
 
 ## Reference
 
-### TOML keys
+TOML config files and inline IDL `generators:` blocks share the same
+section names and key names. Pick the location that fits your workflow;
+the keys are identical.
+
+### Per-target sections
+
+| Section     | Key                    | Type   | Default            | Description                                                                 |
+|-------------|------------------------|--------|--------------------|-----------------------------------------------------------------------------|
+| `[swift]`   | `module_name`          | string | `"WeaveFFI"`       | Swift module name in `Package.swift` and the `Sources/` directory           |
+| `[swift]`   | `strip_module_prefix`  | bool   | `false`            | Strip the IR module prefix from emitted Swift symbols                       |
+| `[android]` | `package`              | string | `"com.weaveffi"`   | Java/Kotlin package declaration in the JNI wrapper                          |
+| `[android]` | `strip_module_prefix`  | bool   | `false`            | Strip the IR module prefix from emitted Java/Kotlin symbols                 |
+| `[node]`    | `package_name`         | string | `"weaveffi"`       | npm package name in the Node.js loader                                      |
+| `[node]`    | `strip_module_prefix`  | bool   | `false`            | Strip the IR module prefix from emitted JS/TS symbols                       |
+| `[wasm]`    | `module_name`          | string | `"weaveffi_wasm"`  | Module name in the WASM JS loader                                           |
+| `[c]`       | `prefix`               | string | `"weaveffi"`       | Prefix prepended to every C ABI symbol (`{prefix}_{module}_{function}`)     |
+| `[cpp]`     | `namespace`            | string | `"weaveffi"`       | C++ namespace for the wrapper                                               |
+| `[cpp]`     | `header_name`          | string | `"weaveffi.hpp"`   | Header file name for the C++ output                                         |
+| `[cpp]`     | `standard`             | string | `"17"`             | C++ standard for the generated `CMakeLists.txt`                             |
+| `[cpp]`     | `c_prefix`             | string | inherits `[c]`     | C ABI prefix that the C++ wrappers call into                                |
+| `[python]`  | `package_name`         | string | `"weaveffi"`       | Python package name                                                         |
+| `[python]`  | `strip_module_prefix`  | bool   | `false`            | Strip the IR module prefix from emitted Python symbols                      |
+| `[dotnet]`  | `namespace`            | string | `"WeaveFFI"`       | .NET namespace                                                              |
+| `[dotnet]`  | `strip_module_prefix`  | bool   | `false`            | Strip the IR module prefix from emitted C# symbols                          |
+| `[dart]`    | `package_name`         | string | `"weaveffi"`       | Dart package name in `pubspec.yaml`                                         |
+| `[go]`      | `module_path`          | string | `"weaveffi"`       | Go module path in `go.mod`                                                  |
+| `[ruby]`    | `module_name`          | string | `"WeaveFFI"`       | Ruby module that wraps the bindings                                         |
+| `[ruby]`    | `gem_name`             | string | `"weaveffi"`       | Ruby gem name                                                               |
+
+### `[global]` section
 
 | Key                    | Type   | Default            | Description                                                                 |
 |------------------------|--------|--------------------|-----------------------------------------------------------------------------|
-| `swift_module_name`    | string | `"WeaveFFI"`       | Swift module name in `Package.swift` and the `Sources/` directory           |
-| `android_package`      | string | `"com.weaveffi"`   | Java/Kotlin package declaration in the JNI wrapper                          |
-| `node_package_name`    | string | `"weaveffi"`       | npm package name in the Node.js loader                                      |
-| `wasm_module_name`     | string | `"weaveffi_wasm"`  | Module name in the WASM JS loader                                           |
-| `c_prefix`             | string | `"weaveffi"`       | Prefix prepended to every C ABI symbol (`{prefix}_{module}_{function}`)     |
-| `strip_module_prefix`  | bool   | `false`            | Strip the module name from generated identifiers when supported             |
-| `python_package_name`  | string | `"weaveffi"`       | Python package name                                                         |
-| `dotnet_namespace`     | string | `"WeaveFFI"`       | .NET namespace                                                              |
-| `cpp_namespace`        | string | `"weaveffi"`       | C++ namespace for the wrapper                                               |
-| `cpp_header_name`      | string | `"weaveffi.hpp"`   | Header file name for the C++ output                                         |
-| `cpp_standard`         | string | `"17"`             | C++ standard for the generated `CMakeLists.txt`                             |
-| `dart_package_name`    | string | `"weaveffi"`       | Dart package name in `pubspec.yaml`                                         |
-| `go_module_path`       | string | `"weaveffi"`       | Go module path in `go.mod`                                                  |
-| `ruby_module_name`     | string | `"WeaveFFI"`       | Ruby module that wraps the bindings                                         |
-| `ruby_gem_name`        | string | `"weaveffi"`       | Ruby gem name                                                               |
-| `template_dir`         | string | _none_             | Directory of `.tera` overrides loaded by every generator                    |
+| `strip_module_prefix`  | bool   | `false`            | Shorthand: enable `strip_module_prefix` on every target that supports it    |
 | `pre_generate`         | string | _none_             | Shell command run before any generator starts                               |
 | `post_generate`        | string | _none_             | Shell command run after every generator finishes                            |
 
-### Inline `generators:` keys
-
-Inline keys drop the `{target}_` prefix and live under their target's
-subtable.
-
-| Inline (IDL)                    | TOML field             | Type   |
-|---------------------------------|------------------------|--------|
-| `swift.module_name`             | `swift_module_name`    | string |
-| `android.package`               | `android_package`      | string |
-| `node.package_name`             | `node_package_name`    | string |
-| `wasm.module_name`              | `wasm_module_name`     | string |
-| `c.prefix`                      | `c_prefix`             | string |
-| `python.package_name`           | `python_package_name`  | string |
-| `dotnet.namespace`              | `dotnet_namespace`     | string |
-| `cpp.namespace`                 | `cpp_namespace`        | string |
-| `cpp.header_name`               | `cpp_header_name`      | string |
-| `cpp.standard`                  | `cpp_standard`         | string |
-| `dart.package_name`             | `dart_package_name`    | string |
-| `go.module_path`                | `go_module_path`       | string |
-| `ruby.module_name`              | `ruby_module_name`     | string |
-| `ruby.gem_name`                 | `ruby_gem_name`        | string |
-| `weaveffi.strip_module_prefix`  | `strip_module_prefix`  | bool   |
-| `weaveffi.template_dir`         | `template_dir`         | string |
-| `weaveffi.pre_generate`         | `pre_generate`         | string |
-| `weaveffi.post_generate`        | `post_generate`        | string |
-
-The alias `global` is accepted for the `weaveffi` section.
+The alias `[weaveffi]` is accepted for the `[global]` section.
 
 ### Performance and CI flags
 
@@ -237,17 +249,19 @@ The alias `global` is accepted for the `weaveffi` section.
 - **Inline value overrides TOML silently** — there is no warning when
   both are set. If a TOML override "doesn't take", check for an inline
   block in the IDL.
-- **`c_prefix` rewrites every generator** — picking a custom prefix
+- **`[c] prefix` rewrites every generator** — picking a custom prefix
   also rewrites the runtime symbols (`{prefix}_free_string`, ...). The
-  Rust cdylib must be built with the same prefix.
+  Rust cdylib must be built with the same prefix. The C++ wrapper picks
+  it up automatically; if you set both `[c] prefix` and
+  `[cpp] c_prefix` make sure they agree.
 - **`strip_module_prefix = true` flattens names** — collisions across
   modules become possible. Pick one or the other consistently.
 - **Hooks run shell commands as-is** — `pre_generate` and
   `post_generate` are passed straight to `sh -c`. Quote them
   carefully and never include untrusted input.
-- **Cache only tracks IR + generator name** — if you change a template
-  override outside the IR (e.g. via `template_dir`) and want all
-  generators to re-run, pass `--force`.
+- **Cache covers IR, generator name, generator config, and CLI version** —
+  changing the IR, any generator config field, or upgrading the CLI
+  invalidates the per-generator cache and triggers re-emission.
 - **Older CLIs ignore unknown keys** — adding a new generator key
   with a project-wide implication does not error out on older
   toolchains. Pin the CLI version in CI when you need that guarantee.

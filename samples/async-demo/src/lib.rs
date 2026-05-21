@@ -175,17 +175,8 @@ pub extern "C" fn weaveffi_tasks_TaskResult_list_free(results: *mut *mut TaskRes
     }
 }
 
-// ── Shared free functions ───────────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn weaveffi_free_string(ptr: *const c_char) {
-    abi::free_string(ptr)
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_error_clear(err: *mut weaveffi_error) {
-    abi::error_clear(err)
-}
+// ── Shared runtime exports ─────────────────────────────────
+abi::export_runtime!();
 
 #[cfg(test)]
 mod tests {

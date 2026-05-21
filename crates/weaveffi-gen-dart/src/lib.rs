@@ -7,12 +7,37 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
+use serde::{Deserialize, Serialize};
+use weaveffi_core::codegen::common::{
+    emit_doc as common_emit_doc, walk_modules, walk_modules_with_path, DocCommentStyle,
+};
 use weaveffi_core::codegen::Generator;
-use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{
     c_symbol_name, local_type_name, render_prelude, render_trailer, CommentStyle,
 };
 use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, TypeRef};
+
+/// Per-target configuration for [`DartGenerator`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DartConfig {
+    /// Dart package name (recorded in `pubspec.yaml`). Defaults to
+    /// `"weaveffi"`.
+    pub package_name: Option<String>,
+    /// Basename of the IDL the CLI was invoked with.
+    #[serde(skip)]
+    pub input_basename: Option<String>,
+}
+
+impl DartConfig {
+    pub fn package_name(&self) -> &str {
+        self.package_name.as_deref().unwrap_or("weaveffi")
+    }
+
+    pub fn input_basename(&self) -> &str {
+        self.input_basename.as_deref().unwrap_or("weaveffi.yml")
+    }
+}
 
 pub struct DartGenerator;
 
@@ -41,29 +66,17 @@ impl DartGenerator {
 }
 
 impl Generator for DartGenerator {
+    type Config = DartConfig;
+
     fn name(&self) -> &'static str {
         "dart"
     }
 
-    fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "weaveffi", "weaveffi.yml")
+    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()> {
+        self.generate_impl(api, out_dir, config.package_name(), config.input_basename())
     }
 
-    fn generate_with_config(
-        &self,
-        api: &Api,
-        out_dir: &Utf8Path,
-        config: &GeneratorConfig,
-    ) -> Result<()> {
-        self.generate_impl(
-            api,
-            out_dir,
-            config.dart_package_name(),
-            config.input_basename(),
-        )
-    }
-
-    fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
+    fn output_files(&self, _api: &Api, out_dir: &Utf8Path, _config: &Self::Config) -> Vec<String> {
         let mut files = vec![
             out_dir.join("dart/README.md").to_string(),
             out_dir.join("dart/lib/weaveffi.dart").to_string(),
@@ -199,49 +212,15 @@ import 'package:weaveffi/weaveffi.dart';
 }
 
 fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
-    let mut all = Vec::new();
-    for m in modules {
-        all.push(m);
-        all.extend(collect_all_modules(&m.modules));
-    }
-    all
+    walk_modules(modules).collect()
 }
 
 fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
-    let mut result = Vec::new();
-    for m in modules {
-        collect_module_with_path(m, &m.name, &mut result);
-    }
-    result
+    walk_modules_with_path(modules).collect()
 }
 
-fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Module, String)>) {
-    out.push((m, path.to_string()));
-    for sub in &m.modules {
-        collect_module_with_path(sub, &format!("{path}_{}", sub.name), out);
-    }
-}
-
-/// Emits a Dart `///` doc comment at `indent`. Each input line is prefixed
-/// with `/// `; blank lines become `///`.
 fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
-    let Some(doc) = doc else {
-        return;
-    };
-    let doc = doc.trim();
-    if doc.is_empty() {
-        return;
-    }
-    for line in doc.lines() {
-        out.push_str(indent);
-        if line.is_empty() {
-            out.push_str("///\n");
-        } else {
-            out.push_str("/// ");
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
+    common_emit_doc(out, doc, indent, DocCommentStyle::TripleSlash);
 }
 
 fn render_dart_module(api: &Api, input_basename: &str) -> String {
@@ -853,7 +832,6 @@ fn emit_result_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
 mod tests {
     use super::*;
     use camino::Utf8Path;
-    use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{
         Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
     };
@@ -888,7 +866,7 @@ mod tests {
     fn output_files_lists_dart_file() {
         let api = make_api(vec![]);
         let out = Utf8Path::new("/tmp/out");
-        let files = DartGenerator.output_files(&api, out);
+        let files = DartGenerator.output_files(&api, out, &DartConfig::default());
         assert_eq!(
             files,
             vec![
@@ -982,7 +960,9 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
-        DartGenerator.generate(&api, out_dir).unwrap();
+        DartGenerator
+            .generate(&api, out_dir, &DartConfig::default())
+            .unwrap();
 
         let dart = std::fs::read_to_string(tmp.join("dart/lib/weaveffi.dart")).unwrap();
 
@@ -1498,7 +1478,9 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
-        DartGenerator.generate(&api, out_dir).unwrap();
+        DartGenerator
+            .generate(&api, out_dir, &DartConfig::default())
+            .unwrap();
 
         let pubspec_path = tmp.join("dart/pubspec.yaml");
         assert!(pubspec_path.exists(), "pubspec.yaml should exist");
@@ -1930,13 +1912,11 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
-        let config = GeneratorConfig {
-            dart_package_name: Some("my_custom_dart".into()),
-            ..Default::default()
+        let config = DartConfig {
+            package_name: Some("my_custom_dart".into()),
+            ..DartConfig::default()
         };
-        DartGenerator
-            .generate_with_config(&api, out_dir, &config)
-            .unwrap();
+        DartGenerator.generate(&api, out_dir, &config).unwrap();
 
         let pubspec = std::fs::read_to_string(tmp.join("dart/pubspec.yaml")).unwrap();
         assert!(

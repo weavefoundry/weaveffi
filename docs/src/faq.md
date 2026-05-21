@@ -115,19 +115,14 @@ assign stable numeric codes to expected failures. See the
 
 ## 6. Can I customize the generated code?
 
-Yes, via three escape hatches in increasing order of power:
+Yes, via two escape hatches in increasing order of power:
 
 1. **Generator config** (`--config cfg.toml` or inline `generators:`
    table in the IDL). Controls Swift module names, Android package,
    C prefix, C++ namespace, Dart/Go/Ruby package names, and other
    per-target knobs. See the
    [Generator Configuration guide](guides/config.md).
-2. **Custom Tera templates** (`--templates ./tpl/`). Each generator
-   exposes its built-in [Tera](https://keats.github.io/tera/)
-   templates; drop a same-named file in your overrides directory to
-   replace it. Useful for tweaking comments, file headers, or
-   per-language idioms without forking WeaveFFI.
-3. **Hook commands** (`pre_generate` / `post_generate` in the
+2. **Hook commands** (`pre_generate` / `post_generate` in the
    config). Run arbitrary shell commands before and after generation
    — useful for `prettier`, `swiftformat`, `gofmt`, etc.
 

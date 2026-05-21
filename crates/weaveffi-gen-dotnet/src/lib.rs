@@ -7,12 +7,38 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
+use serde::{Deserialize, Serialize};
+use weaveffi_core::codegen::common::{walk_modules, walk_modules_with_path};
 use weaveffi_core::codegen::Generator;
-use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{
     c_symbol_name, local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
 };
 use weaveffi_ir::ir::{Api, EnumDef, Function, Module, Param, StructDef, StructField, TypeRef};
+
+/// Per-target configuration for [`DotnetGenerator`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DotnetConfig {
+    /// C# namespace (and on-disk basename used for `.cs`/`.csproj`/`.nuspec`).
+    /// Defaults to `"WeaveFFI"`.
+    pub namespace: Option<String>,
+    /// When `true`, strip the IR module name prefix from emitted C# method
+    /// names.
+    pub strip_module_prefix: bool,
+    /// Basename of the IDL the CLI was invoked with.
+    #[serde(skip)]
+    pub input_basename: Option<String>,
+}
+
+impl DotnetConfig {
+    pub fn namespace(&self) -> &str {
+        self.namespace.as_deref().unwrap_or("WeaveFFI")
+    }
+
+    pub fn input_basename(&self) -> &str {
+        self.input_basename.as_deref().unwrap_or("weaveffi.yml")
+    }
+}
 
 pub struct DotnetGenerator;
 
@@ -54,47 +80,24 @@ impl DotnetGenerator {
 }
 
 impl Generator for DotnetGenerator {
+    type Config = DotnetConfig;
+
     fn name(&self) -> &'static str {
         "dotnet"
     }
 
-    fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "WeaveFFI", true, "weaveffi.yml")
-    }
-
-    fn generate_with_config(
-        &self,
-        api: &Api,
-        out_dir: &Utf8Path,
-        config: &GeneratorConfig,
-    ) -> Result<()> {
+    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()> {
         self.generate_impl(
             api,
             out_dir,
-            config.dotnet_namespace(),
+            config.namespace(),
             config.strip_module_prefix,
             config.input_basename(),
         )
     }
 
-    fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
-        let mut files = vec![
-            out_dir.join("dotnet/README.md").to_string(),
-            out_dir.join("dotnet/WeaveFFI.cs").to_string(),
-            out_dir.join("dotnet/WeaveFFI.csproj").to_string(),
-            out_dir.join("dotnet/WeaveFFI.nuspec").to_string(),
-        ];
-        files.sort();
-        files
-    }
-
-    fn output_files_with_config(
-        &self,
-        _api: &Api,
-        out_dir: &Utf8Path,
-        config: &GeneratorConfig,
-    ) -> Vec<String> {
-        let ns = config.dotnet_namespace();
+    fn output_files(&self, _api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Vec<String> {
+        let ns = config.namespace();
         let mut files = vec![
             out_dir.join("dotnet/README.md").to_string(),
             out_dir.join(format!("dotnet/{ns}.cs")).to_string(),
@@ -279,12 +282,7 @@ The resulting `.nupkg` will be in `bin/Debug/` (or `bin/Release/` with `-c Relea
 }
 
 fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
-    let mut all = Vec::new();
-    for m in modules {
-        all.push(m);
-        all.extend(collect_all_modules(&m.modules));
-    }
-    all
+    walk_modules(modules).collect()
 }
 
 /// Emits a C# XML doc comment at `indent`. Single-line docs collapse to
@@ -425,18 +423,7 @@ fn render_csharp(
 }
 
 fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
-    let mut result = Vec::new();
-    for m in modules {
-        collect_module_with_path(m, &m.name, &mut result);
-    }
-    result
-}
-
-fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Module, String)>) {
-    out.push((m, path.to_string()));
-    for sub in &m.modules {
-        collect_module_with_path(sub, &format!("{path}_{}", sub.name), out);
-    }
+    walk_modules_with_path(modules).collect()
 }
 
 fn render_exception_class(out: &mut String) {
@@ -1687,7 +1674,6 @@ fn safe_cs_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField};
 
     fn make_api(modules: Vec<Module>) -> Api {
@@ -1720,7 +1706,7 @@ mod tests {
     fn output_files_lists_all() {
         let api = make_api(vec![]);
         let out = Utf8Path::new("/tmp/out");
-        let files = DotnetGenerator.output_files(&api, out);
+        let files = DotnetGenerator.output_files(&api, out, &DotnetConfig::default());
         assert_eq!(
             files,
             vec![
@@ -1763,7 +1749,9 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
-        DotnetGenerator.generate(&api, out_dir).unwrap();
+        DotnetGenerator
+            .generate(&api, out_dir, &DotnetConfig::default())
+            .unwrap();
 
         let cs = std::fs::read_to_string(tmp.join("dotnet/WeaveFFI.cs")).unwrap();
         assert!(cs.contains("namespace WeaveFFI"));
@@ -1809,7 +1797,9 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let out = Utf8Path::from_path(dir.path()).unwrap();
-        DotnetGenerator.generate(&api, out).unwrap();
+        DotnetGenerator
+            .generate(&api, out, &DotnetConfig::default())
+            .unwrap();
         let dotnet_dir = out.join("dotnet");
         let cs_files: Vec<_> = std::fs::read_dir(&dotnet_dir)
             .unwrap()
@@ -1836,7 +1826,9 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
-        DotnetGenerator.generate(&api, out_dir).unwrap();
+        DotnetGenerator
+            .generate(&api, out_dir, &DotnetConfig::default())
+            .unwrap();
 
         let csproj_path = tmp.join("dotnet/WeaveFFI.csproj");
         assert!(csproj_path.exists(), ".csproj file must exist");
@@ -2776,7 +2768,16 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
-        DotnetGenerator.generate(&api, out_dir).unwrap();
+        DotnetGenerator
+            .generate(
+                &api,
+                out_dir,
+                &DotnetConfig {
+                    strip_module_prefix: true,
+                    ..DotnetConfig::default()
+                },
+            )
+            .unwrap();
 
         let cs = std::fs::read_to_string(tmp.join("dotnet/WeaveFFI.cs")).unwrap();
 
@@ -2844,7 +2845,16 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
-        DotnetGenerator.generate(&api, out_dir).unwrap();
+        DotnetGenerator
+            .generate(
+                &api,
+                out_dir,
+                &DotnetConfig {
+                    strip_module_prefix: true,
+                    ..DotnetConfig::default()
+                },
+            )
+            .unwrap();
         let cs = std::fs::read_to_string(tmp.join("dotnet/WeaveFFI.cs")).unwrap();
 
         assert!(
@@ -3442,7 +3452,16 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
-        DotnetGenerator.generate(&api, out_dir).unwrap();
+        DotnetGenerator
+            .generate(
+                &api,
+                out_dir,
+                &DotnetConfig {
+                    strip_module_prefix: true,
+                    ..DotnetConfig::default()
+                },
+            )
+            .unwrap();
         let cs = std::fs::read_to_string(tmp.join("dotnet/WeaveFFI.cs")).unwrap();
 
         // Enum
@@ -3625,9 +3644,9 @@ mod tests {
             since: None,
         }])]);
 
-        let config = GeneratorConfig {
-            dotnet_namespace: Some("MyCompany.Bindings".into()),
-            ..Default::default()
+        let config = DotnetConfig {
+            namespace: Some("MyCompany.Bindings".into()),
+            ..DotnetConfig::default()
         };
 
         let tmp = std::env::temp_dir().join("weaveffi_test_dotnet_custom_ns");
@@ -3635,9 +3654,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
-        DotnetGenerator
-            .generate_with_config(&api, out_dir, &config)
-            .unwrap();
+        DotnetGenerator.generate(&api, out_dir, &config).unwrap();
 
         let cs_path = tmp.join("dotnet/MyCompany.Bindings.cs");
         assert!(
@@ -3696,9 +3713,9 @@ mod tests {
             modules: vec![],
         }]);
 
-        let config = GeneratorConfig {
+        let config = DotnetConfig {
             strip_module_prefix: true,
-            ..Default::default()
+            ..DotnetConfig::default()
         };
 
         let tmp = std::env::temp_dir().join("weaveffi_test_dotnet_strip_prefix");
@@ -3706,9 +3723,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
-        DotnetGenerator
-            .generate_with_config(&api, out_dir, &config)
-            .unwrap();
+        DotnetGenerator.generate(&api, out_dir, &config).unwrap();
 
         let cs = std::fs::read_to_string(tmp.join("dotnet/WeaveFFI.cs")).unwrap();
         assert!(
@@ -3724,15 +3739,13 @@ mod tests {
             "C ABI call should still use full name: {cs}"
         );
 
-        let no_strip = GeneratorConfig::default();
+        let no_strip = DotnetConfig::default();
         let tmp2 = std::env::temp_dir().join("weaveffi_test_dotnet_no_strip_prefix");
         let _ = std::fs::remove_dir_all(&tmp2);
         std::fs::create_dir_all(&tmp2).unwrap();
         let out_dir2 = Utf8Path::from_path(&tmp2).expect("valid UTF-8");
 
-        DotnetGenerator
-            .generate_with_config(&api, out_dir2, &no_strip)
-            .unwrap();
+        DotnetGenerator.generate(&api, out_dir2, &no_strip).unwrap();
 
         let cs2 = std::fs::read_to_string(tmp2.join("dotnet/WeaveFFI.cs")).unwrap();
         assert!(

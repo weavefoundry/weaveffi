@@ -131,26 +131,16 @@ pub fn render_scaffold(api: &Api, c_prefix: &str) -> String {
     out.push_str("#![allow(unsafe_code)]\n");
     out.push_str("#![allow(clippy::not_unsafe_ptr_arg_deref)]\n\n");
     out.push_str("use std::os::raw::c_char;\n");
-    out.push_str("use weaveffi_abi::*;\n\n");
+    out.push_str("use weaveffi_abi::{self as abi, *};\n\n");
 
     for m in &api.modules {
         render_module(&mut out, m, c_prefix);
     }
 
-    out.push_str("#[no_mangle]\n");
-    out.push_str("pub extern \"C\" fn weaveffi_free_string(ptr: *const c_char) {\n");
-    out.push_str("    free_string(ptr);\n");
-    out.push_str("}\n\n");
-
-    out.push_str("#[no_mangle]\n");
-    out.push_str("pub extern \"C\" fn weaveffi_free_bytes(ptr: *mut u8, len: usize) {\n");
-    out.push_str("    free_bytes(ptr, len);\n");
-    out.push_str("}\n\n");
-
-    out.push_str("#[no_mangle]\n");
-    out.push_str("pub extern \"C\" fn weaveffi_error_clear(err: *mut weaveffi_error) {\n");
-    out.push_str("    error_clear(err);\n");
-    out.push_str("}\n");
+    out.push_str("// Re-export the fixed WeaveFFI C ABI runtime surface\n");
+    out.push_str("// (string/byte deallocation, error clearing, cancel-token lifecycle)\n");
+    out.push_str("// so consumer wrappers can call into this cdylib.\n");
+    out.push_str("abi::export_runtime!();\n");
 
     out
 }
@@ -361,19 +351,28 @@ mod tests {
     fn scaffold_imports_abi() {
         let api = minimal_api(vec![], vec![]);
         let out = render_scaffold(&api, "weaveffi");
-        assert!(out.contains("use weaveffi_abi::*;"));
+        assert!(out.contains("use weaveffi_abi::{self as abi, *};"));
     }
 
     #[test]
-    fn scaffold_includes_runtime_exports() {
+    fn scaffold_includes_runtime_exports_via_macro() {
         let api = minimal_api(vec![], vec![]);
         let out = render_scaffold(&api, "weaveffi");
-        assert!(out.contains("fn weaveffi_free_string("));
-        assert!(out.contains("fn weaveffi_free_bytes("));
-        assert!(out.contains("fn weaveffi_error_clear("));
         assert!(
-            out.contains("free_string(ptr);"),
-            "runtime exports should delegate to abi"
+            out.contains("abi::export_runtime!();"),
+            "scaffold must call the export_runtime! macro instead of hand-writing thunks: {out}"
+        );
+        assert!(
+            !out.contains("fn weaveffi_free_string("),
+            "scaffold should not hand-write runtime thunks; the macro emits them: {out}"
+        );
+        assert!(
+            !out.contains("fn weaveffi_free_bytes("),
+            "scaffold should not hand-write runtime thunks; the macro emits them: {out}"
+        );
+        assert!(
+            !out.contains("fn weaveffi_error_clear("),
+            "scaffold should not hand-write runtime thunks; the macro emits them: {out}"
         );
     }
 
@@ -429,12 +428,8 @@ mod tests {
             "user struct should not retain default prefix: {out}"
         );
         assert!(
-            out.contains("pub extern \"C\" fn weaveffi_free_string("),
-            "runtime free_string export must keep weaveffi_ name: {out}"
-        );
-        assert!(
-            out.contains("pub extern \"C\" fn weaveffi_error_clear("),
-            "runtime error_clear export must keep weaveffi_ name: {out}"
+            out.contains("abi::export_runtime!();"),
+            "runtime exports must come from the export_runtime! macro: {out}"
         );
     }
 
