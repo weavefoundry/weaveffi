@@ -10,7 +10,7 @@ fn custom_c_prefix_propagates() {
     let dir = tempfile::tempdir().expect("failed to create temp dir");
     let out = dir.path().join("out");
     let cfg = dir.path().join("cfg.toml");
-    fs::write(&cfg, "c_prefix = \"myffi\"\n").expect("failed to write cfg.toml");
+    fs::write(&cfg, "[c]\nprefix = \"myffi\"\n").expect("failed to write cfg.toml");
 
     assert_cmd::Command::cargo_bin("weaveffi")
         .expect("binary not found")

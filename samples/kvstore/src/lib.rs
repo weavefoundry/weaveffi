@@ -899,42 +899,8 @@ pub extern "C" fn weaveffi_kv_stats_Stats_get_expired_entries(ptr: *const Stats)
     unsafe { (*ptr).expired_entries }
 }
 
-// ── Shared helpers ──────────────────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn weaveffi_free_string(ptr: *const c_char) {
-    abi::free_string(ptr)
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_free_bytes(ptr: *mut u8, len: usize) {
-    abi::free_bytes(ptr, len)
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_error_clear(err: *mut weaveffi_error) {
-    abi::error_clear(err)
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_cancel_token_create() -> *mut weaveffi_cancel_token {
-    abi::cancel_token_create()
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_cancel_token_cancel(token: *mut weaveffi_cancel_token) {
-    abi::cancel_token_cancel(token)
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_cancel_token_is_cancelled(token: *const weaveffi_cancel_token) -> bool {
-    abi::cancel_token_is_cancelled(token)
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_cancel_token_destroy(token: *mut weaveffi_cancel_token) {
-    abi::cancel_token_destroy(token)
-}
+// ── Shared runtime exports ─────────────────────────────────
+abi::export_runtime!();
 
 #[cfg(test)]
 mod tests {

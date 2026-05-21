@@ -6,13 +6,41 @@
 
 use anyhow::Result;
 use camino::Utf8Path;
+use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
+use weaveffi_core::codegen::common::{
+    emit_doc as common_emit_doc, walk_modules, walk_modules_with_path, DocCommentStyle,
+};
 use weaveffi_core::codegen::Generator;
-use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{
     c_symbol_name, local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
 };
 use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, TypeRef};
+
+/// Per-target configuration for [`AndroidGenerator`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AndroidConfig {
+    /// JVM package for the generated Kotlin wrapper (default
+    /// `"com.weaveffi"`).
+    pub package: Option<String>,
+    /// When `true`, strip the IR module name prefix from emitted
+    /// Kotlin function names.
+    pub strip_module_prefix: bool,
+    /// Basename of the IDL the CLI was invoked with.
+    #[serde(skip)]
+    pub input_basename: Option<String>,
+}
+
+impl AndroidConfig {
+    pub fn package(&self) -> &str {
+        self.package.as_deref().unwrap_or("com.weaveffi")
+    }
+
+    pub fn input_basename(&self) -> &str {
+        self.input_basename.as_deref().unwrap_or("weaveffi.yml")
+    }
+}
 
 pub struct AndroidGenerator;
 
@@ -66,54 +94,24 @@ impl AndroidGenerator {
 }
 
 impl Generator for AndroidGenerator {
+    type Config = AndroidConfig;
+
     fn name(&self) -> &'static str {
         "android"
     }
 
-    fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "com.weaveffi", true, "weaveffi.yml")
-    }
-
-    fn generate_with_config(
-        &self,
-        api: &Api,
-        out_dir: &Utf8Path,
-        config: &GeneratorConfig,
-    ) -> Result<()> {
+    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()> {
         self.generate_impl(
             api,
             out_dir,
-            config.android_package(),
+            config.package(),
             config.strip_module_prefix,
             config.input_basename(),
         )
     }
 
-    fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
-        let mut files = vec![
-            out_dir.join("android/build.gradle").to_string(),
-            out_dir.join("android/settings.gradle").to_string(),
-            out_dir
-                .join("android/src/main/cpp/CMakeLists.txt")
-                .to_string(),
-            out_dir
-                .join("android/src/main/cpp/weaveffi_jni.c")
-                .to_string(),
-            out_dir
-                .join("android/src/main/kotlin/com/weaveffi/WeaveFFI.kt")
-                .to_string(),
-        ];
-        files.sort();
-        files
-    }
-
-    fn output_files_with_config(
-        &self,
-        _api: &Api,
-        out_dir: &Utf8Path,
-        config: &GeneratorConfig,
-    ) -> Vec<String> {
-        let pkg_path = config.android_package().replace('.', "/");
+    fn output_files(&self, _api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Vec<String> {
+        let pkg_path = config.package().replace('.', "/");
         let mut files = vec![
             out_dir.join("android/build.gradle").to_string(),
             out_dir.join("android/settings.gradle").to_string(),
@@ -135,34 +133,7 @@ impl Generator for AndroidGenerator {
 /// Emits a Kotlin KDoc comment at `indent`. Single-line docs collapse to
 /// `/** text */`; multi-line docs expand to a block with ` * ` prefixed lines.
 fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
-    let Some(doc) = doc else {
-        return;
-    };
-    let doc = doc.trim();
-    if doc.is_empty() {
-        return;
-    }
-    if doc.contains('\n') {
-        out.push_str(indent);
-        out.push_str("/**\n");
-        for line in doc.lines() {
-            out.push_str(indent);
-            if line.is_empty() {
-                out.push_str(" *\n");
-            } else {
-                out.push_str(" * ");
-                out.push_str(line);
-                out.push('\n');
-            }
-        }
-        out.push_str(indent);
-        out.push_str(" */\n");
-    } else {
-        out.push_str(indent);
-        out.push_str("/** ");
-        out.push_str(doc);
-        out.push_str(" */\n");
-    }
+    common_emit_doc(out, doc, indent, DocCommentStyle::Javadoc);
 }
 
 /// Emits a KDoc block for a function: function doc plus `@param name desc`
@@ -406,27 +377,11 @@ fn has_enum_involvement(f: &Function) -> bool {
 }
 
 fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
-    let mut all = Vec::new();
-    for m in modules {
-        all.push(m);
-        all.extend(collect_all_modules(&m.modules));
-    }
-    all
+    walk_modules(modules).collect()
 }
 
 fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
-    let mut result = Vec::new();
-    for m in modules {
-        collect_module_with_path(m, &m.name, &mut result);
-    }
-    result
-}
-
-fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Module, String)>) {
-    out.push((m, path.to_string()));
-    for sub in &m.modules {
-        collect_module_with_path(sub, &format!("{path}_{}", sub.name), out);
-    }
+    walk_modules_with_path(modules).collect()
 }
 
 fn render_kotlin(
@@ -2730,7 +2685,9 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let out = Utf8Path::from_path(dir.path()).unwrap();
-        AndroidGenerator.generate(&api, out).unwrap();
+        AndroidGenerator
+            .generate(&api, out, &AndroidConfig::default())
+            .unwrap();
         let kotlin =
             std::fs::read_to_string(out.join("android/src/main/kotlin/com/weaveffi/WeaveFFI.kt"))
                 .unwrap();
@@ -3703,7 +3660,9 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
 
-        AndroidGenerator.generate(&api, out_dir).unwrap();
+        AndroidGenerator
+            .generate(&api, out_dir, &AndroidConfig::default())
+            .unwrap();
 
         let kotlin =
             std::fs::read_to_string(tmp.join("android/src/main/kotlin/com/weaveffi/WeaveFFI.kt"))
@@ -3909,7 +3868,9 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
 
-        AndroidGenerator.generate(&api, out_dir).unwrap();
+        AndroidGenerator
+            .generate(&api, out_dir, &AndroidConfig::default())
+            .unwrap();
 
         let gradle = std::fs::read_to_string(tmp.join("android/build.gradle")).unwrap();
         assert!(
@@ -4004,9 +3965,9 @@ mod tests {
             modules: vec![],
         }]);
 
-        let config = GeneratorConfig {
-            android_package: Some("com.mycompany.ffi".into()),
-            ..Default::default()
+        let config = AndroidConfig {
+            package: Some("com.mycompany.ffi".into()),
+            ..AndroidConfig::default()
         };
 
         let tmp = std::env::temp_dir().join("weaveffi_test_android_custom_package");
@@ -4014,9 +3975,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
 
-        AndroidGenerator
-            .generate_with_config(&api, out_dir, &config)
-            .unwrap();
+        AndroidGenerator.generate(&api, out_dir, &config).unwrap();
 
         let kotlin_path = tmp.join("android/src/main/kotlin/com/mycompany/ffi/WeaveFFI.kt");
         assert!(
@@ -4156,9 +4115,9 @@ mod tests {
             modules: vec![],
         }]);
 
-        let config = GeneratorConfig {
+        let config = AndroidConfig {
             strip_module_prefix: true,
-            ..Default::default()
+            ..AndroidConfig::default()
         };
 
         let tmp = std::env::temp_dir().join("weaveffi_test_android_strip_prefix");
@@ -4166,9 +4125,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
-        AndroidGenerator
-            .generate_with_config(&api, out_dir, &config)
-            .unwrap();
+        AndroidGenerator.generate(&api, out_dir, &config).unwrap();
 
         let kotlin =
             std::fs::read_to_string(tmp.join("android/src/main/kotlin/com/weaveffi/WeaveFFI.kt"))
@@ -4190,14 +4147,14 @@ mod tests {
             "C ABI call should still use full name: {jni}"
         );
 
-        let no_strip = GeneratorConfig::default();
+        let no_strip = AndroidConfig::default();
         let tmp2 = std::env::temp_dir().join("weaveffi_test_android_no_strip_prefix");
         let _ = std::fs::remove_dir_all(&tmp2);
         std::fs::create_dir_all(&tmp2).unwrap();
         let out_dir2 = Utf8Path::from_path(&tmp2).expect("valid UTF-8");
 
         AndroidGenerator
-            .generate_with_config(&api, out_dir2, &no_strip)
+            .generate(&api, out_dir2, &no_strip)
             .unwrap();
 
         let kotlin2 =

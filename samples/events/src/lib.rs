@@ -90,15 +90,7 @@ pub extern "C" fn weaveffi_events_MessageIterator_destroy(iter: *mut MessageIter
     }
 }
 
-#[no_mangle]
-pub extern "C" fn weaveffi_free_string(ptr: *const c_char) {
-    abi::free_string(ptr)
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_error_clear(err: *mut weaveffi_error) {
-    abi::error_clear(err)
-}
+abi::export_runtime!();
 
 #[cfg(test)]
 mod tests {

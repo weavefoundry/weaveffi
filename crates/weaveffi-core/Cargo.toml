@@ -17,7 +17,6 @@ camino = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-tera = { workspace = true }
 miette = { workspace = true }
 rayon = { workspace = true }
 

@@ -10,8 +10,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use camino::Utf8Path;
-use weaveffi_core::codegen::{Generator, Orchestrator};
-use weaveffi_core::config::GeneratorConfig;
+use weaveffi_core::codegen::{ConfiguredGenerator, Generator, Orchestrator, OrchestratorHooks};
 use weaveffi_ir::ir::{Api, Function, Module, Param, TypeRef};
 
 const HOOK_HELPER: &str = env!("CARGO_BIN_EXE_hook_helper");
@@ -28,17 +27,22 @@ fn helper_cmd(arg: &str) -> String {
     format!("{} {}", quote_arg(HOOK_HELPER), arg)
 }
 
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+struct TestConfig;
+
 struct CountingGenerator {
     name: &'static str,
     calls: Arc<AtomicUsize>,
 }
 
 impl Generator for CountingGenerator {
+    type Config = TestConfig;
+
     fn name(&self) -> &'static str {
         self.name
     }
 
-    fn generate(&self, _api: &Api, out_dir: &Utf8Path) -> Result<()> {
+    fn generate(&self, _api: &Api, out_dir: &Utf8Path, _config: &Self::Config) -> Result<()> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let dir = out_dir.join(self.name);
         std::fs::create_dir_all(dir.as_std_path())?;
@@ -86,23 +90,27 @@ fn test_api() -> Api {
     }
 }
 
+fn configured(
+    name: &'static str,
+    calls: Arc<AtomicUsize>,
+) -> ConfiguredGenerator<CountingGenerator> {
+    ConfiguredGenerator::new(CountingGenerator { name, calls }, TestConfig)
+}
+
 #[test]
 fn pre_hook_runs_before_generate() {
     let dir = tempfile::tempdir().unwrap();
     let out_dir = Utf8Path::from_path(dir.path()).unwrap();
     let api = test_api();
-    let config = GeneratorConfig {
+    let hooks = OrchestratorHooks {
         pre_generate: Some(helper_cmd("ok")),
-        ..Default::default()
+        ..OrchestratorHooks::default()
     };
     let calls = Arc::new(AtomicUsize::new(0));
-    let gen = CountingGenerator {
-        name: "counting",
-        calls: Arc::clone(&calls),
-    };
+    let gen = configured("counting", Arc::clone(&calls));
 
     let orch = Orchestrator::new().with_generator(&gen);
-    orch.run(&api, out_dir, &config, true, None).unwrap();
+    orch.run(&api, out_dir, &hooks, true).unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
@@ -111,18 +119,15 @@ fn pre_hook_failure_aborts() {
     let dir = tempfile::tempdir().unwrap();
     let out_dir = Utf8Path::from_path(dir.path()).unwrap();
     let api = test_api();
-    let config = GeneratorConfig {
+    let hooks = OrchestratorHooks {
         pre_generate: Some(helper_cmd("fail")),
-        ..Default::default()
+        ..OrchestratorHooks::default()
     };
     let calls = Arc::new(AtomicUsize::new(0));
-    let gen = CountingGenerator {
-        name: "counting",
-        calls: Arc::clone(&calls),
-    };
+    let gen = configured("counting", Arc::clone(&calls));
 
     let orch = Orchestrator::new().with_generator(&gen);
-    let result = orch.run(&api, out_dir, &config, true, None);
+    let result = orch.run(&api, out_dir, &hooks, true);
     assert!(result.is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 0, "generator should not run");
 }
@@ -132,18 +137,15 @@ fn post_hook_runs_after_generate() {
     let dir = tempfile::tempdir().unwrap();
     let out_dir = Utf8Path::from_path(dir.path()).unwrap();
     let api = test_api();
-    let config = GeneratorConfig {
+    let hooks = OrchestratorHooks {
         post_generate: Some(helper_cmd("ok")),
-        ..Default::default()
+        ..OrchestratorHooks::default()
     };
     let calls = Arc::new(AtomicUsize::new(0));
-    let gen = CountingGenerator {
-        name: "counting",
-        calls: Arc::clone(&calls),
-    };
+    let gen = configured("counting", Arc::clone(&calls));
 
     let orch = Orchestrator::new().with_generator(&gen);
-    orch.run(&api, out_dir, &config, true, None).unwrap();
+    orch.run(&api, out_dir, &hooks, true).unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
@@ -152,18 +154,15 @@ fn post_hook_failure_returns_error() {
     let dir = tempfile::tempdir().unwrap();
     let out_dir = Utf8Path::from_path(dir.path()).unwrap();
     let api = test_api();
-    let config = GeneratorConfig {
+    let hooks = OrchestratorHooks {
         post_generate: Some(helper_cmd("fail")),
-        ..Default::default()
+        ..OrchestratorHooks::default()
     };
     let calls = Arc::new(AtomicUsize::new(0));
-    let gen = CountingGenerator {
-        name: "counting",
-        calls: Arc::clone(&calls),
-    };
+    let gen = configured("counting", Arc::clone(&calls));
 
     let orch = Orchestrator::new().with_generator(&gen);
-    let result = orch.run(&api, out_dir, &config, true, None);
+    let result = orch.run(&api, out_dir, &hooks, true);
     assert!(result.is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 1, "generator should have run");
 }

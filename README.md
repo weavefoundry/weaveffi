@@ -239,7 +239,7 @@ weaveffi schema-version    # prints 0.3.0
 | Command | Description |
 |---------|-------------|
 | `weaveffi new <name>` | Scaffold a new project with a starter IDL and `Cargo.toml` |
-| `weaveffi generate <file> -o <dir>` | Generate bindings; `--target c,swift,...` to subset, `--scaffold` to emit Rust FFI stubs, `--config cfg.toml` for generator options, `--templates dir/` for custom Tera overrides, `--dry-run` to preview |
+| `weaveffi generate <file> -o <dir>` | Generate bindings; `--target c,swift,...` to subset, `--scaffold` to emit Rust FFI stubs, `--config cfg.toml` for generator options, `--dry-run` to preview |
 | `weaveffi validate <file>` | Validate an IDL definition without generating; `--format json` for machine-readable output |
 | `weaveffi lint <file>` | Lint an IDL and report non-fatal warnings |
 | `weaveffi diff <file>` | Show what would change if bindings were regenerated; `--check` for CI |

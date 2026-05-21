@@ -10,12 +10,40 @@ use std::fmt::Write;
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
+use serde::{Deserialize, Serialize};
+use weaveffi_core::codegen::common::{
+    emit_doc as common_emit_doc, is_c_pointer_type as common_is_c_pointer_type, DocCommentStyle,
+};
 use weaveffi_core::codegen::Generator;
-use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{
     c_abi_struct_name, render_abi_prefix_aliases, render_prelude, render_trailer, CommentStyle,
 };
 use weaveffi_ir::ir::{Api, EnumDef, Module, Param, StructDef, TypeRef};
+
+/// Per-target configuration for [`CGenerator`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CConfig {
+    /// Prefix applied to every emitted C symbol (default `"weaveffi"`).
+    /// Renames produce both `prefix_*` user symbols and
+    /// `#define prefix_runtime weaveffi_runtime` aliases for the ABI helpers.
+    pub prefix: Option<String>,
+    /// Basename of the IDL the CLI was invoked with (e.g. `weaveffi.yml`).
+    /// Embedded in the prelude header of every generated file. Populated
+    /// by the CLI; not user-configurable via the `[c]` config section.
+    #[serde(skip)]
+    pub input_basename: Option<String>,
+}
+
+impl CConfig {
+    pub fn prefix(&self) -> &str {
+        self.prefix.as_deref().unwrap_or("weaveffi")
+    }
+
+    pub fn input_basename(&self) -> &str {
+        self.input_basename.as_deref().unwrap_or("weaveffi.yml")
+    }
+}
 
 /// Number of API surface elements (functions + structs + enums + callbacks +
 /// listeners) used to pre-allocate the output buffer. Each element produces
@@ -68,39 +96,18 @@ impl CGenerator {
 }
 
 impl Generator for CGenerator {
+    type Config = CConfig;
+
     fn name(&self) -> &'static str {
         "c"
     }
 
-    fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "weaveffi", "weaveffi.yml")
+    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()> {
+        self.generate_impl(api, out_dir, config.prefix(), config.input_basename())
     }
 
-    fn generate_with_config(
-        &self,
-        api: &Api,
-        out_dir: &Utf8Path,
-        config: &GeneratorConfig,
-    ) -> Result<()> {
-        self.generate_impl(api, out_dir, config.c_prefix(), config.input_basename())
-    }
-
-    fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
-        let mut files = vec![
-            out_dir.join("c/weaveffi.c").to_string(),
-            out_dir.join("c/weaveffi.h").to_string(),
-        ];
-        files.sort();
-        files
-    }
-
-    fn output_files_with_config(
-        &self,
-        _api: &Api,
-        out_dir: &Utf8Path,
-        config: &GeneratorConfig,
-    ) -> Vec<String> {
-        let prefix = config.c_prefix();
+    fn output_files(&self, _api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Vec<String> {
+        let prefix = config.prefix();
         let mut files = vec![
             out_dir.join(format!("c/{prefix}.c")).to_string(),
             out_dir.join(format!("c/{prefix}.h")).to_string(),
@@ -113,48 +120,18 @@ impl Generator for CGenerator {
 /// Emits a `/** ... */` doc comment at `indent`. Single-line docs collapse to
 /// `/** text */`; multi-line docs expand to a block with ` * ` prefixed lines.
 fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
-    let Some(doc) = doc else {
-        return;
-    };
-    let doc = doc.trim();
-    if doc.is_empty() {
-        return;
-    }
-    if doc.contains('\n') {
-        out.push_str(indent);
-        out.push_str("/**\n");
-        for line in doc.lines() {
-            out.push_str(indent);
-            if line.is_empty() {
-                out.push_str(" *\n");
-            } else {
-                out.push_str(" * ");
-                out.push_str(line);
-                out.push('\n');
-            }
-        }
-        out.push_str(indent);
-        out.push_str(" */\n");
-    } else {
-        out.push_str(indent);
-        out.push_str("/** ");
-        out.push_str(doc);
-        out.push_str(" */\n");
-    }
+    common_emit_doc(out, doc, indent, DocCommentStyle::Javadoc);
 }
 
+/// Predicate forwarded to [`weaveffi_core::codegen::common::is_c_pointer_type`].
+///
+/// The C generator never queries this predicate with `Iterator(_)`
+/// (iterators are forbidden as parameters and only valid as a top-level
+/// return type, which the generator handles separately), so adopting
+/// the shared predicate that includes `Iterator(_)` does not change
+/// C-generator output.
 fn is_c_pointer_type(ty: &TypeRef) -> bool {
-    matches!(
-        ty,
-        TypeRef::StringUtf8
-            | TypeRef::BorrowedStr
-            | TypeRef::Bytes
-            | TypeRef::BorrowedBytes
-            | TypeRef::Struct(_)
-            | TypeRef::TypedHandle(_)
-            | TypeRef::List(_)
-            | TypeRef::Map(_, _)
-    )
+    common_is_c_pointer_type(ty)
 }
 
 /// Returns the scalar C type name for use in pointer/array contexts.
@@ -588,7 +565,6 @@ mod tests {
     use super::*;
     use camino::Utf8Path;
     use weaveffi_core::codegen::Generator;
-    use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{
         Api, CallbackDef, EnumDef, EnumVariant, Function, ListenerDef, Module, Param, StructDef,
         StructField, TypeRef,
@@ -655,7 +631,9 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
 
-        CGenerator.generate(&api, out_dir).unwrap();
+        CGenerator
+            .generate(&api, out_dir, &CConfig::default())
+            .unwrap();
 
         let header = std::fs::read_to_string(tmp.join("c").join("weaveffi.h")).unwrap();
         assert!(
@@ -1208,7 +1186,9 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
 
-        CGenerator.generate(&api, out_dir).unwrap();
+        CGenerator
+            .generate(&api, out_dir, &CConfig::default())
+            .unwrap();
 
         let header = std::fs::read_to_string(tmp.join("c").join("weaveffi.h")).unwrap();
 
@@ -1478,13 +1458,11 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
 
-        let config = GeneratorConfig {
-            c_prefix: Some("mylib".into()),
-            ..GeneratorConfig::default()
+        let config = CConfig {
+            prefix: Some("mylib".into()),
+            ..CConfig::default()
         };
-        CGenerator
-            .generate_with_config(&api, out_dir, &config)
-            .unwrap();
+        CGenerator.generate(&api, out_dir, &config).unwrap();
 
         assert!(
             tmp.join("c").join("mylib.h").exists(),
@@ -1508,7 +1486,7 @@ mod tests {
             "should alias runtime free_string to weaveffi_free_string: {header}"
         );
 
-        let files = CGenerator.output_files_with_config(&api, out_dir, &config);
+        let files = CGenerator.output_files(&api, out_dir, &config);
         assert!(
             files.iter().any(|f| f.ends_with("mylib.h")),
             "output_files_with_config should list mylib.h"
@@ -2504,10 +2482,8 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let out_dir = Utf8Path::from_path(dir.path()).unwrap();
-        let config = GeneratorConfig::default();
-        CGenerator
-            .generate_with_config(&api, out_dir, &config)
-            .unwrap();
+        let config = CConfig::default();
+        CGenerator.generate(&api, out_dir, &config).unwrap();
         let header = std::fs::read_to_string(out_dir.join("c/weaveffi.h")).unwrap();
         assert!(
             header.contains("weaveffi_contacts_ContactBuilder"),
@@ -2563,10 +2539,8 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let out_dir = Utf8Path::from_path(dir.path()).unwrap();
-        let config = GeneratorConfig::default();
-        CGenerator
-            .generate_with_config(&api, out_dir, &config)
-            .unwrap();
+        let config = CConfig::default();
+        CGenerator.generate(&api, out_dir, &config).unwrap();
         let header = std::fs::read_to_string(out_dir.join("c/weaveffi.h")).unwrap();
         assert!(
             !header.contains("Builder"),

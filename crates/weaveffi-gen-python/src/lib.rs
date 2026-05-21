@@ -6,12 +6,41 @@
 
 use anyhow::Result;
 use camino::Utf8Path;
+use serde::{Deserialize, Serialize};
+use weaveffi_core::codegen::common::{
+    emit_doc as common_emit_doc, is_c_pointer_type as common_is_c_pointer_type, walk_modules,
+    walk_modules_with_path, DocCommentStyle,
+};
 use weaveffi_core::codegen::Generator;
-use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{
     c_symbol_name, local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
 };
 use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, StructField, TypeRef};
+
+/// Per-target configuration for [`PythonGenerator`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PythonConfig {
+    /// pip-installable Python package name (default `"weaveffi"`). Also
+    /// determines the on-disk package directory inside `python/`.
+    pub package_name: Option<String>,
+    /// When `true`, strip the IR module name prefix from emitted Python
+    /// function names.
+    pub strip_module_prefix: bool,
+    /// Basename of the IDL the CLI was invoked with.
+    #[serde(skip)]
+    pub input_basename: Option<String>,
+}
+
+impl PythonConfig {
+    pub fn package_name(&self) -> &str {
+        self.package_name.as_deref().unwrap_or("weaveffi")
+    }
+
+    pub fn input_basename(&self) -> &str {
+        self.input_basename.as_deref().unwrap_or("weaveffi.yml")
+    }
+}
 
 pub struct PythonGenerator;
 
@@ -58,56 +87,24 @@ impl PythonGenerator {
 }
 
 impl Generator for PythonGenerator {
+    type Config = PythonConfig;
+
     fn name(&self) -> &'static str {
         "python"
     }
 
-    fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "weaveffi", true, "weaveffi.yml")
-    }
-
-    fn generate_with_config(
-        &self,
-        api: &Api,
-        out_dir: &Utf8Path,
-        config: &GeneratorConfig,
-    ) -> Result<()> {
+    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()> {
         self.generate_impl(
             api,
             out_dir,
-            config.python_package_name(),
+            config.package_name(),
             config.strip_module_prefix,
             config.input_basename(),
         )
     }
 
-    fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
-        let pkg = "weaveffi";
-        let mut files = vec![
-            out_dir.join("python/README.md").to_string(),
-            out_dir.join("python/pyproject.toml").to_string(),
-            out_dir.join("python/setup.py").to_string(),
-            out_dir
-                .join(format!("python/{pkg}/__init__.py"))
-                .to_string(),
-            out_dir
-                .join(format!("python/{pkg}/weaveffi.py"))
-                .to_string(),
-            out_dir
-                .join(format!("python/{pkg}/weaveffi.pyi"))
-                .to_string(),
-        ];
-        files.sort();
-        files
-    }
-
-    fn output_files_with_config(
-        &self,
-        _api: &Api,
-        out_dir: &Utf8Path,
-        config: &GeneratorConfig,
-    ) -> Vec<String> {
-        let pkg = config.python_package_name();
+    fn output_files(&self, _api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Vec<String> {
+        let pkg = config.package_name();
         let mut files = vec![
             out_dir.join("python/README.md").to_string(),
             out_dir.join("python/pyproject.toml").to_string(),
@@ -130,18 +127,7 @@ impl Generator for PythonGenerator {
 // ── Type helpers ──
 
 fn is_c_pointer_type(ty: &TypeRef) -> bool {
-    matches!(
-        ty,
-        TypeRef::StringUtf8
-            | TypeRef::BorrowedStr
-            | TypeRef::Bytes
-            | TypeRef::BorrowedBytes
-            | TypeRef::Struct(_)
-            | TypeRef::TypedHandle(_)
-            | TypeRef::List(_)
-            | TypeRef::Map(_, _)
-            | TypeRef::Iterator(_)
-    )
+    common_is_c_pointer_type(ty)
 }
 
 fn snake_to_pascal(s: &str) -> String {
@@ -555,27 +541,11 @@ fn render_python_module(api: &Api, strip_module_prefix: bool, input_basename: &s
 }
 
 fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
-    let mut all = Vec::new();
-    for m in modules {
-        all.push(m);
-        all.extend(collect_all_modules(&m.modules));
-    }
-    all
+    walk_modules(modules).collect()
 }
 
 fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
-    let mut result = Vec::new();
-    for m in modules {
-        collect_module_with_path(m, &m.name, &mut result);
-    }
-    result
-}
-
-fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Module, String)>) {
-    out.push((m, path.to_string()));
-    for sub in &m.modules {
-        collect_module_with_path(sub, &format!("{path}_{}", sub.name), out);
-    }
+    walk_modules_with_path(modules).collect()
 }
 
 fn render_python_module_content(
@@ -606,23 +576,7 @@ fn render_python_module_content(
 /// Emits a Python `# ...` line comment at `indent`. Used above C ABI binding
 /// declarations (`attach_function`-style binds) where docstrings can't live.
 fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
-    let Some(doc) = doc else {
-        return;
-    };
-    let doc = doc.trim();
-    if doc.is_empty() {
-        return;
-    }
-    for line in doc.lines() {
-        out.push_str(indent);
-        if line.is_empty() {
-            out.push_str("#\n");
-        } else {
-            out.push_str("# ");
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
+    common_emit_doc(out, doc, indent, DocCommentStyle::Hash);
 }
 
 /// Emits a Python triple-quoted `"""..."""` docstring as the first statement
@@ -1605,7 +1559,6 @@ fn render_pyi_function(
 mod tests {
     use super::*;
     use camino::Utf8Path;
-    use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{
         Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
     };
@@ -1667,7 +1620,16 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
-        PythonGenerator.generate(&api, out_dir).unwrap();
+        PythonGenerator
+            .generate(
+                &api,
+                out_dir,
+                &PythonConfig {
+                    strip_module_prefix: true,
+                    ..PythonConfig::default()
+                },
+            )
+            .unwrap();
 
         let init = std::fs::read_to_string(tmp.join("python/weaveffi/__init__.py")).unwrap();
         assert!(init.contains("from .weaveffi import *"));
@@ -1683,7 +1645,7 @@ mod tests {
     fn output_files_lists_all() {
         let api = make_api(vec![]);
         let out = Utf8Path::new("/tmp/out");
-        let files = PythonGenerator.output_files(&api, out);
+        let files = PythonGenerator.output_files(&api, out, &PythonConfig::default());
         assert_eq!(
             files,
             vec![
@@ -2042,7 +2004,9 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let out = Utf8Path::from_path(dir.path()).unwrap();
-        PythonGenerator.generate(&api, out).unwrap();
+        PythonGenerator
+            .generate(&api, out, &PythonConfig::default())
+            .unwrap();
         let py = std::fs::read_to_string(out.join("python/weaveffi/weaveffi.py")).unwrap();
         assert!(
             py.contains("class ContactBuilder"),
@@ -2583,7 +2547,16 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
-        PythonGenerator.generate(&api, out_dir).unwrap();
+        PythonGenerator
+            .generate(
+                &api,
+                out_dir,
+                &PythonConfig {
+                    strip_module_prefix: true,
+                    ..PythonConfig::default()
+                },
+            )
+            .unwrap();
 
         let py = std::fs::read_to_string(tmp.join("python/weaveffi/weaveffi.py")).unwrap();
 
@@ -2851,7 +2824,16 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
-        PythonGenerator.generate(&api, out_dir).unwrap();
+        PythonGenerator
+            .generate(
+                &api,
+                out_dir,
+                &PythonConfig {
+                    strip_module_prefix: true,
+                    ..PythonConfig::default()
+                },
+            )
+            .unwrap();
 
         let pyi_path = tmp.join("python/weaveffi/weaveffi.pyi");
         assert!(pyi_path.exists(), ".pyi file must exist");
@@ -2946,7 +2928,16 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
-        PythonGenerator.generate(&api, out_dir).unwrap();
+        PythonGenerator
+            .generate(
+                &api,
+                out_dir,
+                &PythonConfig {
+                    strip_module_prefix: true,
+                    ..PythonConfig::default()
+                },
+            )
+            .unwrap();
 
         let py = std::fs::read_to_string(tmp.join("python/weaveffi/weaveffi.py")).unwrap();
 
@@ -3713,7 +3704,16 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
-        PythonGenerator.generate(&api, out_dir).unwrap();
+        PythonGenerator
+            .generate(
+                &api,
+                out_dir,
+                &PythonConfig {
+                    strip_module_prefix: true,
+                    ..PythonConfig::default()
+                },
+            )
+            .unwrap();
 
         let py = std::fs::read_to_string(tmp.join("python/weaveffi/weaveffi.py")).unwrap();
         let pyi = std::fs::read_to_string(tmp.join("python/weaveffi/weaveffi.pyi")).unwrap();
@@ -3807,7 +3807,9 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
-        PythonGenerator.generate(&api, out_dir).unwrap();
+        PythonGenerator
+            .generate(&api, out_dir, &PythonConfig::default())
+            .unwrap();
 
         let pyproject = std::fs::read_to_string(tmp.join("python/pyproject.toml")).unwrap();
         assert!(
@@ -3910,9 +3912,9 @@ mod tests {
             since: None,
         }])]);
 
-        let config = GeneratorConfig {
-            python_package_name: Some("my_bindings".into()),
-            ..Default::default()
+        let config = PythonConfig {
+            package_name: Some("my_bindings".into()),
+            ..PythonConfig::default()
         };
 
         let tmp = std::env::temp_dir().join("weaveffi_test_py_custom_pkg");
@@ -3920,9 +3922,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
-        PythonGenerator
-            .generate_with_config(&api, out_dir, &config)
-            .unwrap();
+        PythonGenerator.generate(&api, out_dir, &config).unwrap();
 
         assert!(
             tmp.join("python/my_bindings/__init__.py").exists(),
@@ -3979,9 +3979,9 @@ mod tests {
             modules: vec![],
         }]);
 
-        let config = GeneratorConfig {
+        let config = PythonConfig {
             strip_module_prefix: true,
-            ..Default::default()
+            ..PythonConfig::default()
         };
 
         let tmp = std::env::temp_dir().join("weaveffi_test_python_strip_prefix");
@@ -3989,9 +3989,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
-        PythonGenerator
-            .generate_with_config(&api, out_dir, &config)
-            .unwrap();
+        PythonGenerator.generate(&api, out_dir, &config).unwrap();
 
         let py = std::fs::read_to_string(tmp.join("python/weaveffi/weaveffi.py")).unwrap();
         assert!(
@@ -4013,15 +4011,13 @@ mod tests {
             "pyi stripped name should be create_contact: {pyi}"
         );
 
-        let no_strip = GeneratorConfig::default();
+        let no_strip = PythonConfig::default();
         let tmp2 = std::env::temp_dir().join("weaveffi_test_python_no_strip_prefix");
         let _ = std::fs::remove_dir_all(&tmp2);
         std::fs::create_dir_all(&tmp2).unwrap();
         let out_dir2 = Utf8Path::from_path(&tmp2).expect("valid UTF-8");
 
-        PythonGenerator
-            .generate_with_config(&api, out_dir2, &no_strip)
-            .unwrap();
+        PythonGenerator.generate(&api, out_dir2, &no_strip).unwrap();
 
         let py2 = std::fs::read_to_string(tmp2.join("python/weaveffi/weaveffi.py")).unwrap();
         assert!(

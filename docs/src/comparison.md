@@ -50,7 +50,7 @@ evaluate against it: **UniFFI**, **cbindgen**, **diplomat**, **SWIG**, and
 | `watch` mode                       | ✓            | —          | ✓ (`--watch`) | —          | —        | partial     |
 | `format` IDL canonicalizer         | ✓            | —          | n/a          | n/a          | —        | n/a         |
 | Schema migrations (`upgrade`)      | ✓            | —          | n/a          | n/a          | —        | n/a         |
-| Custom template overrides (Tera)   | ✓            | partial (Mako) | —        | partial      | ✓ (`%typemap`) | partial |
+| Custom template overrides          | —            | partial (Mako) | —        | partial      | ✓ (`%typemap`) | partial |
 | Snapshot-tested generator output   | ✓            | ✓          | ✓            | ✓            | partial  | ✓           |
 | Maturity                           | pre-1.0      | 1.0+ in Mozilla shipping products | 1.0+ widely deployed | pre-1.0 | 30+ years, ubiquitous | pre-1.0 |
 | License                            | MIT OR Apache-2.0 | MPL-2.0 | MPL-2.0 | BSD-3-Clause | GPL with FOSS exception | MIT OR Apache-2.0 |

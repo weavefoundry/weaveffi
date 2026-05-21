@@ -17,23 +17,72 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::process::Command;
 use tracing_subscriber::EnvFilter;
-use weaveffi_core::codegen::{Generator, Orchestrator};
-use weaveffi_core::config::GeneratorConfig;
-use weaveffi_core::templates::TemplateEngine;
+use weaveffi_core::codegen::{ConfiguredGenerator, DynGenerator, Orchestrator, OrchestratorHooks};
 use weaveffi_core::validate::{collect_warnings, validate_api, ValidationError, ValidationWarning};
-use weaveffi_gen_android::AndroidGenerator;
-use weaveffi_gen_c::CGenerator;
-use weaveffi_gen_cpp::CppGenerator;
-use weaveffi_gen_dart::DartGenerator;
-use weaveffi_gen_dotnet::DotnetGenerator;
-use weaveffi_gen_go::GoGenerator;
-use weaveffi_gen_node::NodeGenerator;
-use weaveffi_gen_python::PythonGenerator;
-use weaveffi_gen_ruby::RubyGenerator;
-use weaveffi_gen_swift::SwiftGenerator;
-use weaveffi_gen_wasm::WasmGenerator;
+use weaveffi_gen_android::{AndroidConfig, AndroidGenerator};
+use weaveffi_gen_c::{CConfig, CGenerator};
+use weaveffi_gen_cpp::{CppConfig, CppGenerator};
+use weaveffi_gen_dart::{DartConfig, DartGenerator};
+use weaveffi_gen_dotnet::{DotnetConfig, DotnetGenerator};
+use weaveffi_gen_go::{GoConfig, GoGenerator};
+use weaveffi_gen_node::{NodeConfig, NodeGenerator};
+use weaveffi_gen_python::{PythonConfig, PythonGenerator};
+use weaveffi_gen_ruby::{RubyConfig, RubyGenerator};
+use weaveffi_gen_swift::{SwiftConfig, SwiftGenerator};
+use weaveffi_gen_wasm::{WasmConfig, WasmGenerator};
 use weaveffi_ir::ir::{CURRENT_SCHEMA_VERSION, SUPPORTED_VERSIONS};
 use weaveffi_ir::parse::parse_api_str;
+
+/// Top-level configuration loaded from `--config <toml>`. Each per-language
+/// section is the generator crate's own `Config` type, so adding a knob to a
+/// generator only requires changing that generator's crate.
+///
+/// Inline `api.generators` overrides from the IDL are merged on top of this
+/// after loading.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct CliConfig {
+    #[serde(rename = "c")]
+    c: CConfig,
+    #[serde(rename = "cpp")]
+    cpp: CppConfig,
+    #[serde(rename = "swift")]
+    swift: SwiftConfig,
+    #[serde(rename = "android")]
+    android: AndroidConfig,
+    #[serde(rename = "node")]
+    node: NodeConfig,
+    #[serde(rename = "wasm")]
+    wasm: WasmConfig,
+    #[serde(rename = "python")]
+    python: PythonConfig,
+    #[serde(rename = "dotnet")]
+    dotnet: DotnetConfig,
+    #[serde(rename = "dart")]
+    dart: DartConfig,
+    #[serde(rename = "go")]
+    go: GoConfig,
+    #[serde(rename = "ruby")]
+    ruby: RubyConfig,
+    /// Global knobs that apply across all generators. The TOML file may use
+    /// `[global]` or `[weaveffi]` as the section name.
+    #[serde(alias = "weaveffi")]
+    global: GlobalConfig,
+}
+
+/// Knobs that affect multiple generators or the orchestrator itself.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+struct GlobalConfig {
+    /// Shorthand: when `true`, set `strip_module_prefix` on every per-target
+    /// config that supports it. Per-target sections may still set the flag
+    /// directly.
+    strip_module_prefix: bool,
+    /// Shell command executed once before any generator runs.
+    pre_generate: Option<String>,
+    /// Shell command executed once after every generator succeeds.
+    post_generate: Option<String>,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "weaveffi", version, about = "WeaveFFI CLI")]
@@ -75,9 +124,6 @@ enum Commands {
         /// Parse and validate only; print which files would be generated without writing them
         #[arg(long)]
         dry_run: bool,
-        /// Path to a directory containing user template overrides (.tera files)
-        #[arg(long)]
-        templates: Option<String>,
     },
     Validate {
         /// Input IDL/IR file (yaml|yml|json|toml)
@@ -204,7 +250,6 @@ fn main() -> Result<()> {
             warn,
             force,
             dry_run,
-            templates,
         } => cmd_generate(
             &input,
             &out,
@@ -214,7 +259,6 @@ fn main() -> Result<()> {
             warn,
             force,
             dry_run,
-            templates.as_deref(),
             quiet,
         )?,
         Commands::Validate {
@@ -383,156 +427,141 @@ fn cmd_new(name: &str, quiet: bool) -> Result<()> {
     Ok(())
 }
 
-fn load_config(path: Option<&str>) -> Result<GeneratorConfig> {
-    match path {
-        Some(p) => {
-            let contents = std::fs::read_to_string(p)
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to read config file: {}", p))?;
-            toml::from_str(&contents)
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to parse config file: {}", p))
+impl CliConfig {
+    fn load(path: Option<&str>) -> Result<Self> {
+        match path {
+            Some(p) => {
+                let contents = std::fs::read_to_string(p)
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("failed to read config file: {}", p))?;
+                toml::from_str(&contents)
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("failed to parse config file: {}", p))
+            }
+            None => Ok(Self::default()),
         }
-        None => Ok(GeneratorConfig::default()),
+    }
+
+    /// Fan `global.strip_module_prefix` out to every per-target config that
+    /// honors it, propagate the C symbol prefix to the C++ wrapper config
+    /// when it was only set on `[c]`, then stamp the IDL `input_basename`
+    /// on every per-target config. Must run after [`merge_inline_generators`]
+    /// so per-target overrides can disable a flag or override the propagated
+    /// prefix.
+    fn finalize(&mut self, input_basename: Option<String>) {
+        if self.global.strip_module_prefix {
+            self.android.strip_module_prefix = true;
+            self.node.strip_module_prefix = true;
+            self.python.strip_module_prefix = true;
+            self.dotnet.strip_module_prefix = true;
+            self.swift.strip_module_prefix = true;
+        }
+        // The C++ wrapper has to call into the same `extern "C"` symbols the
+        // C generator emits. Default `cpp.c_prefix` to `c.prefix` so users
+        // only have to set the prefix in one place.
+        if self.cpp.c_prefix.is_none() {
+            if let Some(p) = self.c.prefix.clone() {
+                self.cpp.c_prefix = Some(p);
+            }
+        }
+        macro_rules! stamp {
+            ($($field:ident),* $(,)?) => {
+                $(self.$field.input_basename = input_basename.clone();)*
+            };
+        }
+        stamp!(c, cpp, swift, android, node, wasm, python, dotnet, dart, go, ruby);
+    }
+
+    fn hooks(&self) -> OrchestratorHooks {
+        OrchestratorHooks {
+            pre_generate: self.global.pre_generate.clone(),
+            post_generate: self.global.post_generate.clone(),
+        }
+    }
+
+    /// The C ABI prefix passed to the Rust scaffold generator. Mirrors the
+    /// C generator's `prefix` so the scaffold's `#[no_mangle]` symbols line
+    /// up with what the C/C++ wrappers call.
+    fn scaffold_prefix(&self) -> String {
+        self.c.prefix().to_string()
+    }
+
+    /// Build the heterogeneous list of object-safe generators that the
+    /// orchestrator and dry-run paths share. Order matches the legacy CLI
+    /// for stable test output.
+    fn build_generators(&self) -> Vec<Box<dyn DynGenerator>> {
+        vec![
+            Box::new(ConfiguredGenerator::new(CGenerator, self.c.clone())),
+            Box::new(ConfiguredGenerator::new(CppGenerator, self.cpp.clone())),
+            Box::new(ConfiguredGenerator::new(SwiftGenerator, self.swift.clone())),
+            Box::new(ConfiguredGenerator::new(
+                AndroidGenerator,
+                self.android.clone(),
+            )),
+            Box::new(ConfiguredGenerator::new(NodeGenerator, self.node.clone())),
+            Box::new(ConfiguredGenerator::new(WasmGenerator, self.wasm.clone())),
+            Box::new(ConfiguredGenerator::new(
+                PythonGenerator,
+                self.python.clone(),
+            )),
+            Box::new(ConfiguredGenerator::new(
+                DotnetGenerator,
+                self.dotnet.clone(),
+            )),
+            Box::new(ConfiguredGenerator::new(DartGenerator, self.dart.clone())),
+            Box::new(ConfiguredGenerator::new(GoGenerator, self.go.clone())),
+            Box::new(ConfiguredGenerator::new(RubyGenerator, self.ruby.clone())),
+        ]
     }
 }
 
-/// Subset of `GeneratorConfig` fields with every value optional so that inline
-/// IDL overrides only touch keys the user actually set.
-#[derive(Default, Deserialize)]
-struct InlineGeneratorOverrides {
-    swift_module_name: Option<String>,
-    android_package: Option<String>,
-    node_package_name: Option<String>,
-    wasm_module_name: Option<String>,
-    c_prefix: Option<String>,
-    python_package_name: Option<String>,
-    dotnet_namespace: Option<String>,
-    cpp_namespace: Option<String>,
-    cpp_header_name: Option<String>,
-    cpp_standard: Option<String>,
-    dart_package_name: Option<String>,
-    go_module_path: Option<String>,
-    ruby_module_name: Option<String>,
-    ruby_gem_name: Option<String>,
-    strip_module_prefix: Option<bool>,
-    template_dir: Option<String>,
-    pre_generate: Option<String>,
-    post_generate: Option<String>,
-}
-
-impl InlineGeneratorOverrides {
-    fn apply(self, config: &mut GeneratorConfig) {
-        if let Some(v) = self.swift_module_name {
-            config.swift_module_name = Some(v);
-        }
-        if let Some(v) = self.android_package {
-            config.android_package = Some(v);
-        }
-        if let Some(v) = self.node_package_name {
-            config.node_package_name = Some(v);
-        }
-        if let Some(v) = self.wasm_module_name {
-            config.wasm_module_name = Some(v);
-        }
-        if let Some(v) = self.c_prefix {
-            config.c_prefix = Some(v);
-        }
-        if let Some(v) = self.python_package_name {
-            config.python_package_name = Some(v);
-        }
-        if let Some(v) = self.dotnet_namespace {
-            config.dotnet_namespace = Some(v);
-        }
-        if let Some(v) = self.cpp_namespace {
-            config.cpp_namespace = Some(v);
-        }
-        if let Some(v) = self.cpp_header_name {
-            config.cpp_header_name = Some(v);
-        }
-        if let Some(v) = self.cpp_standard {
-            config.cpp_standard = Some(v);
-        }
-        if let Some(v) = self.dart_package_name {
-            config.dart_package_name = Some(v);
-        }
-        if let Some(v) = self.go_module_path {
-            config.go_module_path = Some(v);
-        }
-        if let Some(v) = self.ruby_module_name {
-            config.ruby_module_name = Some(v);
-        }
-        if let Some(v) = self.ruby_gem_name {
-            config.ruby_gem_name = Some(v);
-        }
-        if let Some(v) = self.strip_module_prefix {
-            config.strip_module_prefix = v;
-        }
-        if let Some(v) = self.template_dir {
-            config.template_dir = Some(v);
-        }
-        if let Some(v) = self.pre_generate {
-            config.pre_generate = Some(v);
-        }
-        if let Some(v) = self.post_generate {
-            config.post_generate = Some(v);
-        }
-    }
-}
-
-/// Merge `[generators]` overrides from the IDL into `config`.
+/// Apply per-target overrides from the IDL's `generators:` block to the
+/// loaded [`CliConfig`].
 ///
 /// Inline IDL values **override** anything supplied via `--config <toml>`,
 /// because the IDL is project-local and committed alongside the API
 /// definition while a TOML file is typically per-environment.
 ///
-/// Each `(target, table)` pair is interpreted as follows:
+/// For each per-target section (`swift`, `c`, `cpp`, …) the body is
+/// deserialized directly into that target's `Config` struct, overwriting any
+/// fields the user set. The special `weaveffi`/`global` section maps to
+/// [`GlobalConfig`].
 ///
-/// * For per-target sections (`swift`, `android`, `node`, `wasm`, `c`,
-///   `python`, `dotnet`, `cpp`, `dart`, `go`, `ruby`), every key in `table`
-///   is prefixed with `{target}_` and the resulting flat table is
-///   deserialized into [`InlineGeneratorOverrides`]. So `swift.module_name`
-///   maps to `swift_module_name`, `cpp.standard` maps to `cpp_standard`,
-///   and so on.
-/// * For the special section `weaveffi` (or its alias `global`), the table
-///   keys are treated as direct [`GeneratorConfig`] field names:
-///   `strip_module_prefix`, `template_dir`, `pre_generate`, `post_generate`.
-///
-/// Unknown target names and unknown keys within a known target are silently
-/// ignored so that older CLIs can read newer IDL files without crashing.
-fn merge_inline_generators(
-    config: &mut GeneratorConfig,
-    generators: &BTreeMap<String, toml::Value>,
-) {
-    const KNOWN_TARGETS: &[&str] = &[
-        "swift", "android", "node", "wasm", "c", "python", "dotnet", "cpp", "dart", "go", "ruby",
-    ];
-
+/// Unknown target names and unknown keys are silently ignored so that older
+/// CLIs can read newer IDL files without crashing.
+fn merge_inline_generators(config: &mut CliConfig, generators: &BTreeMap<String, toml::Value>) {
     for (target, value) in generators {
         let Some(table) = value.as_table() else {
             continue;
         };
+        let table_value = toml::Value::Table(table.clone());
 
-        if target == "weaveffi" || target == "global" {
-            if let Ok(overrides) =
-                InlineGeneratorOverrides::deserialize(toml::Value::Table(table.clone()))
-            {
-                overrides.apply(config);
+        macro_rules! merge_target {
+            ($field:ident, $config_ty:ty) => {{
+                if let Ok(cfg) = <$config_ty>::deserialize(table_value.clone()) {
+                    config.$field = cfg;
+                }
+            }};
+        }
+
+        match target.as_str() {
+            "c" => merge_target!(c, CConfig),
+            "cpp" => merge_target!(cpp, CppConfig),
+            "swift" => merge_target!(swift, SwiftConfig),
+            "android" => merge_target!(android, AndroidConfig),
+            "node" => merge_target!(node, NodeConfig),
+            "wasm" => merge_target!(wasm, WasmConfig),
+            "python" => merge_target!(python, PythonConfig),
+            "dotnet" => merge_target!(dotnet, DotnetConfig),
+            "dart" => merge_target!(dart, DartConfig),
+            "go" => merge_target!(go, GoConfig),
+            "ruby" => merge_target!(ruby, RubyConfig),
+            "global" | "weaveffi" => {
+                if let Ok(g) = GlobalConfig::deserialize(table_value) {
+                    config.global = g;
+                }
             }
-            continue;
-        }
-
-        if !KNOWN_TARGETS.contains(&target.as_str()) {
-            continue;
-        }
-
-        let mut prefixed = toml::value::Table::new();
-        for (key, val) in table {
-            prefixed.insert(format!("{target}_{key}"), val.clone());
-        }
-
-        if let Ok(overrides) = InlineGeneratorOverrides::deserialize(toml::Value::Table(prefixed)) {
-            overrides.apply(config);
+            _ => {}
         }
     }
 }
@@ -547,10 +576,9 @@ fn cmd_generate(
     warn: bool,
     force: bool,
     dry_run: bool,
-    templates_path: Option<&str>,
     quiet: bool,
 ) -> Result<()> {
-    let mut config = load_config(config_path)?;
+    let mut config = CliConfig::load(config_path)?;
 
     let in_path = Utf8Path::new(input);
     let ext = in_path.extension().unwrap_or("");
@@ -566,7 +594,6 @@ fn cmd_generate(
             other
         ),
     };
-    config.input_basename = in_path.file_name().map(str::to_string);
     let contents = std::fs::read_to_string(in_path.as_std_path())
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to read input file: {}", input))?;
@@ -577,6 +604,7 @@ fn cmd_generate(
     if let Some(ref generators) = api.generators {
         merge_inline_generators(&mut config, generators);
     }
+    config.finalize(in_path.file_name().map(str::to_string));
 
     if warn {
         for w in collect_warnings(&api) {
@@ -585,32 +613,20 @@ fn cmd_generate(
     }
 
     let out_dir = Utf8Path::new(out);
-
-    let c = CGenerator;
-    let cpp = CppGenerator;
-    let swift = SwiftGenerator;
-    let android = AndroidGenerator;
-    let node = NodeGenerator;
-    let wasm = WasmGenerator;
-    let python = PythonGenerator;
-    let dotnet = DotnetGenerator;
-    let dart = DartGenerator;
-    let go = GoGenerator;
-    let ruby = RubyGenerator;
-    let all: Vec<&dyn Generator> = vec![
-        &c, &cpp, &swift, &android, &node, &wasm, &python, &dotnet, &dart, &go, &ruby,
-    ];
+    let scaffold_prefix = config.scaffold_prefix();
+    let hooks = config.hooks();
+    let generators = config.build_generators();
 
     let filter: Option<Vec<&str>> = targets.map(|t| t.split(',').map(str::trim).collect());
-
-    let selected: Vec<&dyn Generator> = all
-        .into_iter()
-        .filter(|gen| filter.as_ref().is_none_or(|ts| ts.contains(&gen.name())))
+    let selected: Vec<&dyn DynGenerator> = generators
+        .iter()
+        .map(|g| g.as_ref())
+        .filter(|g| filter.as_ref().is_none_or(|ts| ts.contains(&g.name())))
         .collect();
 
     if dry_run {
         for gen in &selected {
-            for path in gen.output_files_with_config(&api, out_dir, &config) {
+            for path in gen.output_files(&api, out_dir) {
                 println!("{path}");
             }
         }
@@ -621,28 +637,18 @@ fn cmd_generate(
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to create output directory: {}", out))?;
 
-    let engine = match templates_path {
-        Some(dir) => {
-            let mut te = TemplateEngine::new();
-            te.load_dir(Utf8Path::new(dir))
-                .map_err(|e| miette!("failed to load templates from {}: {:#}", dir, e))?;
-            Some(te)
-        }
-        None => None,
-    };
-
     let mut orchestrator = Orchestrator::new();
-    for &gen in &selected {
-        orchestrator = orchestrator.with_generator(gen);
+    for gen in &selected {
+        orchestrator = orchestrator.with_generator(*gen);
     }
 
     orchestrator
-        .run(&api, out_dir, &config, force, engine.as_ref())
+        .run(&api, out_dir, &hooks, force)
         .map_err(|e| miette!("{:#}", e))?;
 
     if emit_scaffold {
         let scaffold_path = out_dir.join("scaffold.rs");
-        let contents = scaffold::render_scaffold(&api, config.c_prefix());
+        let contents = scaffold::render_scaffold(&api, &scaffold_prefix);
         std::fs::write(scaffold_path.as_std_path(), contents)
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to write {}", scaffold_path))?;
@@ -804,34 +810,20 @@ fn cmd_diff(input: &str, out: Option<&str>, check: bool, quiet: bool) -> Result<
     let tmp_path = Utf8Path::from_path(tmp.path())
         .ok_or_else(|| miette!("temp directory path is not valid UTF-8"))?;
 
-    let c = CGenerator;
-    let cpp = CppGenerator;
-    let swift = SwiftGenerator;
-    let android = AndroidGenerator;
-    let node = NodeGenerator;
-    let wasm = WasmGenerator;
-    let python = PythonGenerator;
-    let dotnet = DotnetGenerator;
-    let dart = DartGenerator;
-    let go = GoGenerator;
-    let ruby = RubyGenerator;
-    let all: Vec<&dyn Generator> = vec![
-        &c, &cpp, &swift, &android, &node, &wasm, &python, &dotnet, &dart, &go, &ruby,
-    ];
-
-    let mut config = GeneratorConfig {
-        input_basename: in_path.file_name().map(str::to_string),
-        ..GeneratorConfig::default()
-    };
+    let mut config = CliConfig::default();
     if let Some(ref generators) = api.generators {
         merge_inline_generators(&mut config, generators);
     }
+    config.finalize(in_path.file_name().map(str::to_string));
+    let hooks = config.hooks();
+    let generators = config.build_generators();
+
     let mut orchestrator = Orchestrator::new();
-    for &gen in &all {
-        orchestrator = orchestrator.with_generator(gen);
+    for gen in &generators {
+        orchestrator = orchestrator.with_generator(gen.as_ref());
     }
     orchestrator
-        .run(&api, tmp_path, &config, true, None)
+        .run(&api, tmp_path, &hooks, true)
         .map_err(|e| miette!("{:#}", e))?;
 
     let out_dir = Utf8Path::new(out);
@@ -2129,7 +2121,6 @@ fn cmd_watch(
         false,
         false,
         false,
-        None,
         quiet,
     ) {
         eprintln!("error: {e:?}");
@@ -2178,7 +2169,6 @@ fn cmd_watch(
                     false,
                     false,
                     false,
-                    None,
                     quiet,
                 ) {
                     eprintln!("error: {e:?}");
@@ -2341,18 +2331,21 @@ mod tests {
         std::fs::write(
             &cfg_path,
             concat!(
-                "swift_module_name = \"MyApp\"\n",
-                "android_package = \"com.example.myapp\"\n",
+                "[swift]\n",
+                "module_name = \"MyApp\"\n",
+                "[android]\n",
+                "package = \"com.example.myapp\"\n",
+                "[global]\n",
                 "strip_module_prefix = true\n",
             ),
         )
         .unwrap();
 
-        let cfg = load_config(Some(cfg_path.to_str().unwrap())).unwrap();
-        assert_eq!(cfg.swift_module_name(), "MyApp");
-        assert_eq!(cfg.android_package(), "com.example.myapp");
-        assert!(cfg.strip_module_prefix);
-        assert_eq!(cfg.c_prefix(), "weaveffi");
+        let cfg = CliConfig::load(Some(cfg_path.to_str().unwrap())).unwrap();
+        assert_eq!(cfg.swift.module_name(), "MyApp");
+        assert_eq!(cfg.android.package(), "com.example.myapp");
+        assert!(cfg.global.strip_module_prefix);
+        assert_eq!(cfg.c.prefix(), "weaveffi");
     }
 
     #[test]
@@ -2386,9 +2379,9 @@ mod tests {
         let api: weaveffi_ir::ir::Api = serde_yaml::from_str(yaml).unwrap();
         assert!(api.generators.is_some());
 
-        let mut config = GeneratorConfig::default();
+        let mut config = CliConfig::default();
         merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
-        assert_eq!(config.swift_module_name, Some("MySwiftModule".to_string()));
+        assert_eq!(config.swift.module_name(), "MySwiftModule");
     }
 
     #[test]
@@ -2403,9 +2396,9 @@ mod tests {
             "    package_name: my_dart_pkg\n",
         );
         let api: weaveffi_ir::ir::Api = serde_yaml::from_str(yaml).unwrap();
-        let mut config = GeneratorConfig::default();
+        let mut config = CliConfig::default();
         merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
-        assert_eq!(config.dart_package_name.as_deref(), Some("my_dart_pkg"));
+        assert_eq!(config.dart.package_name(), "my_dart_pkg");
     }
 
     #[test]
@@ -2420,12 +2413,9 @@ mod tests {
             "    module_path: github.com/me/myffi\n",
         );
         let api: weaveffi_ir::ir::Api = serde_yaml::from_str(yaml).unwrap();
-        let mut config = GeneratorConfig::default();
+        let mut config = CliConfig::default();
         merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
-        assert_eq!(
-            config.go_module_path.as_deref(),
-            Some("github.com/me/myffi")
-        );
+        assert_eq!(config.go.module_path(), "github.com/me/myffi");
     }
 
     #[test]
@@ -2440,9 +2430,9 @@ mod tests {
             "    module_name: MyRubyMod\n",
         );
         let api: weaveffi_ir::ir::Api = serde_yaml::from_str(yaml).unwrap();
-        let mut config = GeneratorConfig::default();
+        let mut config = CliConfig::default();
         merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
-        assert_eq!(config.ruby_module_name.as_deref(), Some("MyRubyMod"));
+        assert_eq!(config.ruby.module_name(), "MyRubyMod");
     }
 
     #[test]
@@ -2457,9 +2447,9 @@ mod tests {
             "    gem_name: my_ruby_gem\n",
         );
         let api: weaveffi_ir::ir::Api = serde_yaml::from_str(yaml).unwrap();
-        let mut config = GeneratorConfig::default();
+        let mut config = CliConfig::default();
         merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
-        assert_eq!(config.ruby_gem_name.as_deref(), Some("my_ruby_gem"));
+        assert_eq!(config.ruby.gem_name(), "my_ruby_gem");
     }
 
     #[test]
@@ -2474,27 +2464,19 @@ mod tests {
             "    strip_module_prefix: true\n",
         );
         let api: weaveffi_ir::ir::Api = serde_yaml::from_str(yaml).unwrap();
-        let mut config = GeneratorConfig::default();
-        assert!(!config.strip_module_prefix);
+        let mut config = CliConfig::default();
+        assert!(!config.global.strip_module_prefix);
         merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
-        assert!(config.strip_module_prefix);
-    }
-
-    #[test]
-    fn inline_global_template_dir_merges() {
-        let yaml = concat!(
-            "version: \"0.1.0\"\n",
-            "modules:\n",
-            "  - name: m\n",
-            "    functions: []\n",
-            "generators:\n",
-            "  weaveffi:\n",
-            "    template_dir: ./my_templates\n",
+        config.finalize(None);
+        assert!(config.global.strip_module_prefix);
+        assert!(
+            config.python.strip_module_prefix,
+            "finalize should fan strip_module_prefix out to python"
         );
-        let api: weaveffi_ir::ir::Api = serde_yaml::from_str(yaml).unwrap();
-        let mut config = GeneratorConfig::default();
-        merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
-        assert_eq!(config.template_dir.as_deref(), Some("./my_templates"));
+        assert!(
+            config.swift.strip_module_prefix,
+            "finalize should fan strip_module_prefix out to swift"
+        );
     }
 
     #[test]
@@ -2509,9 +2491,9 @@ mod tests {
             "    pre_generate: \"echo hi\"\n",
         );
         let api: weaveffi_ir::ir::Api = serde_yaml::from_str(yaml).unwrap();
-        let mut config = GeneratorConfig::default();
+        let mut config = CliConfig::default();
         merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
-        assert_eq!(config.pre_generate.as_deref(), Some("echo hi"));
+        assert_eq!(config.global.pre_generate.as_deref(), Some("echo hi"));
     }
 
     #[test]
@@ -2528,9 +2510,9 @@ mod tests {
             "    module_name: KeptSwift\n",
         );
         let api: weaveffi_ir::ir::Api = serde_yaml::from_str(yaml).unwrap();
-        let mut config = GeneratorConfig::default();
+        let mut config = CliConfig::default();
         merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
-        assert_eq!(config.swift_module_name.as_deref(), Some("KeptSwift"));
+        assert_eq!(config.swift.module_name(), "KeptSwift");
     }
 
     #[test]
@@ -2546,9 +2528,9 @@ mod tests {
             "    unrecognized_future_key: \"some value\"\n",
         );
         let api: weaveffi_ir::ir::Api = serde_yaml::from_str(yaml).unwrap();
-        let mut config = GeneratorConfig::default();
+        let mut config = CliConfig::default();
         merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
-        assert_eq!(config.swift_module_name.as_deref(), Some("KeptSwift"));
+        assert_eq!(config.swift.module_name(), "KeptSwift");
     }
 
     #[test]
@@ -2571,22 +2553,28 @@ mod tests {
         );
         let api: weaveffi_ir::ir::Api = serde_yaml::from_str(yaml).unwrap();
 
-        let mut config = GeneratorConfig {
-            swift_module_name: Some("FromFile".into()),
-            android_package: Some("com.file.app".into()),
-            ..Default::default()
+        let mut config = CliConfig {
+            swift: SwiftConfig {
+                module_name: Some("FromFile".into()),
+                ..SwiftConfig::default()
+            },
+            android: AndroidConfig {
+                package: Some("com.file.app".into()),
+                ..AndroidConfig::default()
+            },
+            ..CliConfig::default()
         };
         merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
-        assert_eq!(config.swift_module_name, Some("FromIDL".to_string()));
-        assert_eq!(config.android_package, Some("com.idl.app".to_string()));
+        assert_eq!(config.swift.module_name(), "FromIDL");
+        assert_eq!(config.android.package(), "com.idl.app");
     }
 
     #[test]
     fn config_default_when_no_file() {
-        let cfg = load_config(None).unwrap();
-        assert_eq!(cfg.swift_module_name(), "WeaveFFI");
-        assert_eq!(cfg.android_package(), "com.weaveffi");
-        assert!(!cfg.strip_module_prefix);
+        let cfg = CliConfig::load(None).unwrap();
+        assert_eq!(cfg.swift.module_name(), "WeaveFFI");
+        assert_eq!(cfg.android.package(), "com.weaveffi");
+        assert!(!cfg.global.strip_module_prefix);
     }
 
     #[test]
@@ -2613,10 +2601,7 @@ mod tests {
         let input = yml.to_str().unwrap();
         let out_str = out.to_str().unwrap();
 
-        cmd_generate(
-            input, out_str, None, false, None, false, false, true, None, false,
-        )
-        .unwrap();
+        cmd_generate(input, out_str, None, false, None, false, false, true, false).unwrap();
 
         assert!(!out.exists(), "dry-run should not create output directory");
 
@@ -2628,23 +2613,11 @@ mod tests {
         };
         let out_dir = Utf8Path::new(out_str);
 
-        let c = CGenerator;
-        let cpp = CppGenerator;
-        let swift = SwiftGenerator;
-        let android = AndroidGenerator;
-        let node = NodeGenerator;
-        let wasm = WasmGenerator;
-        let python = PythonGenerator;
-        let dotnet = DotnetGenerator;
-        let dart = DartGenerator;
-        let go = GoGenerator;
-        let ruby = RubyGenerator;
-        let all: Vec<&dyn Generator> = vec![
-            &c, &cpp, &swift, &android, &node, &wasm, &python, &dotnet, &dart, &go, &ruby,
-        ];
+        let config = CliConfig::default();
+        let generators = config.build_generators();
 
         let mut files: Vec<String> = Vec::new();
-        for gen in &all {
+        for gen in &generators {
             files.extend(gen.output_files(&api, out_dir));
         }
 

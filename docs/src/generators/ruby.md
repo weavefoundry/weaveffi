@@ -234,8 +234,9 @@ The Ruby module name and gem name can be customised via generator
 configuration:
 
 ```toml
-ruby_module_name = "MyBindings"
-ruby_gem_name = "my_bindings"
+[ruby]
+module_name = "MyBindings"
+gem_name = "my_bindings"
 ```
 
 ## Memory and ownership

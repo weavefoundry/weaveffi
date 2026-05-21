@@ -7,12 +7,43 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToShoutySnakeCase, ToSnakeCase};
+use serde::{Deserialize, Serialize};
+use weaveffi_core::codegen::common::{
+    emit_doc as common_emit_doc, is_c_pointer_type as common_is_c_pointer_type, walk_modules,
+    walk_modules_with_path, DocCommentStyle,
+};
 use weaveffi_core::codegen::Generator;
-use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{
     c_symbol_name, local_type_name, render_prelude, render_trailer, CommentStyle,
 };
 use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, StructField, TypeRef};
+
+/// Per-target configuration for [`RubyGenerator`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RubyConfig {
+    /// Top-level Ruby module name (default `"WeaveFFI"`).
+    pub module_name: Option<String>,
+    /// Ruby gem name written into `weaveffi.gemspec` (default `"weaveffi"`).
+    pub gem_name: Option<String>,
+    /// Basename of the IDL the CLI was invoked with.
+    #[serde(skip)]
+    pub input_basename: Option<String>,
+}
+
+impl RubyConfig {
+    pub fn module_name(&self) -> &str {
+        self.module_name.as_deref().unwrap_or("WeaveFFI")
+    }
+
+    pub fn gem_name(&self) -> &str {
+        self.gem_name.as_deref().unwrap_or("weaveffi")
+    }
+
+    pub fn input_basename(&self) -> &str {
+        self.input_basename.as_deref().unwrap_or("weaveffi.yml")
+    }
+}
 
 pub struct RubyGenerator;
 
@@ -42,30 +73,23 @@ impl RubyGenerator {
 }
 
 impl Generator for RubyGenerator {
+    type Config = RubyConfig;
+
     fn name(&self) -> &'static str {
         "ruby"
     }
 
-    fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "WeaveFFI", "weaveffi", "weaveffi.yml")
-    }
-
-    fn generate_with_config(
-        &self,
-        api: &Api,
-        out_dir: &Utf8Path,
-        config: &GeneratorConfig,
-    ) -> Result<()> {
+    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()> {
         self.generate_impl(
             api,
             out_dir,
-            config.ruby_module_name(),
-            config.ruby_gem_name(),
+            config.module_name(),
+            config.gem_name(),
             config.input_basename(),
         )
     }
 
-    fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
+    fn output_files(&self, _api: &Api, out_dir: &Utf8Path, _config: &Self::Config) -> Vec<String> {
         let mut files = vec![
             out_dir.join("ruby/README.md").to_string(),
             out_dir.join("ruby/lib/weaveffi.rb").to_string(),
@@ -79,18 +103,7 @@ impl Generator for RubyGenerator {
 // ── Type helpers ──
 
 fn is_c_pointer_type(ty: &TypeRef) -> bool {
-    matches!(
-        ty,
-        TypeRef::StringUtf8
-            | TypeRef::BorrowedStr
-            | TypeRef::Bytes
-            | TypeRef::BorrowedBytes
-            | TypeRef::Struct(_)
-            | TypeRef::TypedHandle(_)
-            | TypeRef::List(_)
-            | TypeRef::Map(_, _)
-            | TypeRef::Iterator(_)
-    )
+    common_is_c_pointer_type(ty)
 }
 
 fn rb_ffi_scalar(ty: &TypeRef) -> &'static str {
@@ -257,27 +270,11 @@ fn rb_element_expr(var: &str, ty: &TypeRef) -> String {
 
 #[allow(dead_code)]
 fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
-    let mut all = Vec::new();
-    for m in modules {
-        all.push(m);
-        all.extend(collect_all_modules(&m.modules));
-    }
-    all
+    walk_modules(modules).collect()
 }
 
 fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
-    let mut result = Vec::new();
-    for m in modules {
-        collect_module_with_path(m, &m.name, &mut result);
-    }
-    result
-}
-
-fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Module, String)>) {
-    out.push((m, path.to_string()));
-    for sub in &m.modules {
-        collect_module_with_path(sub, &format!("{path}_{}", sub.name), out);
-    }
+    walk_modules_with_path(modules).collect()
 }
 
 // ── Rendering ──
@@ -285,23 +282,7 @@ fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Mo
 /// Emits a Ruby `# ...` doc comment at `indent`. Each input line is prefixed
 /// with `# `; blank lines become `#`.
 fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
-    let Some(doc) = doc else {
-        return;
-    };
-    let doc = doc.trim();
-    if doc.is_empty() {
-        return;
-    }
-    for line in doc.lines() {
-        out.push_str(indent);
-        if line.is_empty() {
-            out.push_str("#\n");
-        } else {
-            out.push_str("# ");
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
+    common_emit_doc(out, doc, indent, DocCommentStyle::Hash);
 }
 
 fn render_ruby_module(api: &Api, module_name: &str, input_basename: &str) -> String {
@@ -969,7 +950,6 @@ require 'weaveffi'
 mod tests {
     use super::*;
     use camino::Utf8Path;
-    use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{
         Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
     };
@@ -1031,7 +1011,9 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let out_dir = Utf8Path::from_path(dir.path()).unwrap();
-        RubyGenerator.generate(&api, out_dir).unwrap();
+        RubyGenerator
+            .generate(&api, out_dir, &RubyConfig::default())
+            .unwrap();
 
         let file = out_dir.join("ruby/lib/weaveffi.rb");
         assert!(file.exists(), "weaveffi.rb should exist");
@@ -1046,7 +1028,7 @@ mod tests {
     fn output_files_returns_correct_path() {
         let api = make_api(vec![]);
         let out_dir = Utf8Path::new("/tmp/out");
-        let files = RubyGenerator.output_files(&api, out_dir);
+        let files = RubyGenerator.output_files(&api, out_dir, &RubyConfig::default());
         assert_eq!(
             files,
             vec![
@@ -1062,7 +1044,9 @@ mod tests {
         let api = make_api(vec![simple_module("math", vec![])]);
         let dir = tempfile::tempdir().unwrap();
         let out_dir = Utf8Path::from_path(dir.path()).unwrap();
-        RubyGenerator.generate(&api, out_dir).unwrap();
+        RubyGenerator
+            .generate(&api, out_dir, &RubyConfig::default())
+            .unwrap();
 
         let gemspec = out_dir.join("ruby/weaveffi.gemspec");
         assert!(gemspec.exists(), "gemspec should exist");
@@ -1902,7 +1886,7 @@ mod tests {
         let out_dir = Utf8Path::from_path(tmp.path()).expect("valid UTF-8");
 
         RubyGenerator
-            .generate_with_config(&api, out_dir, &GeneratorConfig::default())
+            .generate(&api, out_dir, &RubyConfig::default())
             .unwrap();
 
         let rb = std::fs::read_to_string(tmp.path().join("ruby/lib/weaveffi.rb")).unwrap();
@@ -1964,7 +1948,7 @@ mod tests {
         let out_dir = Utf8Path::from_path(tmp.path()).expect("valid UTF-8");
 
         RubyGenerator
-            .generate_with_config(&api, out_dir, &GeneratorConfig::default())
+            .generate(&api, out_dir, &RubyConfig::default())
             .unwrap();
 
         let rb = std::fs::read_to_string(tmp.path().join("ruby/lib/weaveffi.rb")).unwrap();
@@ -2033,7 +2017,7 @@ mod tests {
         let out_dir = Utf8Path::from_path(tmp.path()).expect("valid UTF-8");
 
         RubyGenerator
-            .generate_with_config(&api, out_dir, &GeneratorConfig::default())
+            .generate(&api, out_dir, &RubyConfig::default())
             .unwrap();
 
         let rb = std::fs::read_to_string(tmp.path().join("ruby/lib/weaveffi.rb")).unwrap();
@@ -2086,7 +2070,7 @@ mod tests {
         let out_dir = Utf8Path::from_path(tmp.path()).expect("valid UTF-8");
 
         RubyGenerator
-            .generate_with_config(&api, out_dir, &GeneratorConfig::default())
+            .generate(&api, out_dir, &RubyConfig::default())
             .unwrap();
 
         let rb = std::fs::read_to_string(tmp.path().join("ruby/lib/weaveffi.rb")).unwrap();
@@ -2137,7 +2121,7 @@ mod tests {
         let out_dir = Utf8Path::from_path(tmp.path()).expect("valid UTF-8");
 
         RubyGenerator
-            .generate_with_config(&api, out_dir, &GeneratorConfig::default())
+            .generate(&api, out_dir, &RubyConfig::default())
             .unwrap();
 
         let rb = std::fs::read_to_string(tmp.path().join("ruby/lib/weaveffi.rb")).unwrap();
@@ -2163,7 +2147,7 @@ mod tests {
         let out_dir = Utf8Path::from_path(tmp.path()).expect("valid UTF-8");
 
         RubyGenerator
-            .generate_with_config(&api, out_dir, &GeneratorConfig::default())
+            .generate(&api, out_dir, &RubyConfig::default())
             .unwrap();
 
         let rb = std::fs::read_to_string(tmp.path().join("ruby/lib/weaveffi.rb")).unwrap();
@@ -2230,14 +2214,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let out_dir = Utf8Path::from_path(tmp.path()).expect("valid UTF-8");
 
-        let config = GeneratorConfig {
-            ruby_module_name: Some("MyBindings".into()),
-            ruby_gem_name: Some("my_bindings".into()),
-            ..Default::default()
+        let config = RubyConfig {
+            module_name: Some("MyBindings".into()),
+            gem_name: Some("my_bindings".into()),
+            ..RubyConfig::default()
         };
-        RubyGenerator
-            .generate_with_config(&api, out_dir, &config)
-            .unwrap();
+        RubyGenerator.generate(&api, out_dir, &config).unwrap();
 
         let rb = std::fs::read_to_string(tmp.path().join("ruby/lib/weaveffi.rb")).unwrap();
         assert!(rb.contains("module MyBindings"), "custom module name: {rb}");

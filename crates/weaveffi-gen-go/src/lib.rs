@@ -7,12 +7,36 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
+use serde::{Deserialize, Serialize};
+use weaveffi_core::codegen::common::{
+    emit_doc as common_emit_doc, walk_modules, walk_modules_with_path, DocCommentStyle,
+};
 use weaveffi_core::codegen::Generator;
-use weaveffi_core::config::GeneratorConfig;
 use weaveffi_core::utils::{
     c_symbol_name, local_type_name, render_prelude, render_trailer, CommentStyle,
 };
 use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, StructField, TypeRef};
+
+/// Per-target configuration for [`GoGenerator`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GoConfig {
+    /// Go module path written to `go.mod` (default `"weaveffi"`).
+    pub module_path: Option<String>,
+    /// Basename of the IDL the CLI was invoked with.
+    #[serde(skip)]
+    pub input_basename: Option<String>,
+}
+
+impl GoConfig {
+    pub fn module_path(&self) -> &str {
+        self.module_path.as_deref().unwrap_or("weaveffi")
+    }
+
+    pub fn input_basename(&self) -> &str {
+        self.input_basename.as_deref().unwrap_or("weaveffi.yml")
+    }
+}
 
 pub struct GoGenerator;
 
@@ -37,29 +61,17 @@ impl GoGenerator {
 }
 
 impl Generator for GoGenerator {
+    type Config = GoConfig;
+
     fn name(&self) -> &'static str {
         "go"
     }
 
-    fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
-        self.generate_impl(api, out_dir, "weaveffi", "weaveffi.yml")
+    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()> {
+        self.generate_impl(api, out_dir, config.module_path(), config.input_basename())
     }
 
-    fn generate_with_config(
-        &self,
-        api: &Api,
-        out_dir: &Utf8Path,
-        config: &GeneratorConfig,
-    ) -> Result<()> {
-        self.generate_impl(
-            api,
-            out_dir,
-            config.go_module_path(),
-            config.input_basename(),
-        )
-    }
-
-    fn output_files(&self, _api: &Api, out_dir: &Utf8Path) -> Vec<String> {
+    fn output_files(&self, _api: &Api, out_dir: &Utf8Path, _config: &Self::Config) -> Vec<String> {
         let mut files = vec![
             out_dir.join("go/README.md").to_string(),
             out_dir.join("go/go.mod").to_string(),
@@ -179,27 +191,11 @@ fn type_has_bool(ty: &TypeRef) -> bool {
 }
 
 fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
-    let mut all = Vec::new();
-    for m in modules {
-        all.push(m);
-        all.extend(collect_all_modules(&m.modules));
-    }
-    all
+    walk_modules(modules).collect()
 }
 
 fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
-    let mut result = Vec::new();
-    for m in modules {
-        collect_module_with_path(m, &m.name, &mut result);
-    }
-    result
-}
-
-fn collect_module_with_path<'a>(m: &'a Module, path: &str, out: &mut Vec<(&'a Module, String)>) {
-    out.push((m, path.to_string()));
-    for sub in &m.modules {
-        collect_module_with_path(sub, &format!("{path}_{}", sub.name), out);
-    }
+    walk_modules_with_path(modules).collect()
 }
 
 fn scan_imports(api: &Api) -> (bool, bool, bool) {
@@ -286,7 +282,16 @@ converts the result back to Go types. Errors are returned as Go `error` values.
 /// Emits a Go `// ...` doc comment at `indent`. If `symbol` is provided, the
 /// first non-empty line is prefixed with the symbol name to follow Go's doc
 /// convention. Subsequent lines are emitted verbatim with `// `.
+///
+/// Without a symbol, this delegates to the shared
+/// [`weaveffi_core::codegen::common::emit_doc`] helper using
+/// [`DocCommentStyle::DoubleSlash`]. The symbol-prefix flavour stays
+/// generator-local because godoc's first-line convention is unique to Go.
 fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str, symbol: Option<&str>) {
+    let Some(symbol) = symbol else {
+        common_emit_doc(out, doc, indent, DocCommentStyle::DoubleSlash);
+        return;
+    };
     let Some(doc) = doc else {
         return;
     };
@@ -297,24 +302,15 @@ fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str, symbol: Option
     let mut lines = doc.lines();
     if let Some(first) = lines.next() {
         out.push_str(indent);
-        match symbol {
-            Some(sym) => {
-                let lower = first
-                    .chars()
-                    .next()
-                    .map(|c| c.is_lowercase())
-                    .unwrap_or(false);
-                if lower {
-                    out.push_str(&format!("// {sym} {}\n", first));
-                } else {
-                    out.push_str(&format!("// {sym}: {}\n", first));
-                }
-            }
-            None => {
-                out.push_str("// ");
-                out.push_str(first);
-                out.push('\n');
-            }
+        let lower = first
+            .chars()
+            .next()
+            .map(|c| c.is_lowercase())
+            .unwrap_or(false);
+        if lower {
+            out.push_str(&format!("// {symbol} {}\n", first));
+        } else {
+            out.push_str(&format!("// {symbol}: {}\n", first));
         }
     }
     for line in lines {
@@ -1006,7 +1002,6 @@ mod tests {
     use super::*;
     use camino::Utf8Path;
     use weaveffi_core::codegen::Generator;
-    use weaveffi_core::config::GeneratorConfig;
     use weaveffi_ir::ir::{
         Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
     };
@@ -1076,7 +1071,7 @@ mod tests {
     fn output_files_correct() {
         let api = calculator_api();
         let out = Utf8Path::new("out");
-        let files = GoGenerator.output_files(&api, out);
+        let files = GoGenerator.output_files(&api, out, &GoConfig::default());
         assert_eq!(
             files,
             vec![
@@ -1816,7 +1811,9 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
 
-        GoGenerator.generate(&api, out_dir).unwrap();
+        GoGenerator
+            .generate(&api, out_dir, &GoConfig::default())
+            .unwrap();
 
         let go_file = tmp.join("go/weaveffi.go");
         assert!(go_file.exists(), "go/weaveffi.go should exist");
@@ -1837,7 +1834,9 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
-        GoGenerator.generate(&api, out_dir).unwrap();
+        GoGenerator
+            .generate(&api, out_dir, &GoConfig::default())
+            .unwrap();
 
         let go_mod_path = tmp.join("go/go.mod");
         assert!(go_mod_path.exists(), "go/go.mod should exist");
@@ -2036,7 +2035,7 @@ mod tests {
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
         GoGenerator
-            .generate_with_config(&api, out_dir, &GeneratorConfig::default())
+            .generate(&api, out_dir, &GoConfig::default())
             .unwrap();
 
         let go = std::fs::read_to_string(tmp.join("go/weaveffi.go")).unwrap();
@@ -2119,7 +2118,7 @@ mod tests {
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
         GoGenerator
-            .generate_with_config(&api, out_dir, &GeneratorConfig::default())
+            .generate(&api, out_dir, &GoConfig::default())
             .unwrap();
 
         let go = std::fs::read_to_string(tmp.join("go/weaveffi.go")).unwrap();
@@ -2208,7 +2207,7 @@ mod tests {
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
         GoGenerator
-            .generate_with_config(&api, out_dir, &GeneratorConfig::default())
+            .generate(&api, out_dir, &GoConfig::default())
             .unwrap();
 
         let go = std::fs::read_to_string(tmp.join("go/weaveffi.go")).unwrap();
@@ -2284,7 +2283,7 @@ mod tests {
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
         GoGenerator
-            .generate_with_config(&api, out_dir, &GeneratorConfig::default())
+            .generate(&api, out_dir, &GoConfig::default())
             .unwrap();
 
         let go = std::fs::read_to_string(tmp.join("go/weaveffi.go")).unwrap();
@@ -2484,7 +2483,7 @@ mod tests {
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
         GoGenerator
-            .generate_with_config(&api, out_dir, &GeneratorConfig::default())
+            .generate(&api, out_dir, &GoConfig::default())
             .unwrap();
 
         let go = std::fs::read_to_string(tmp.join("go/weaveffi.go")).unwrap();
@@ -2553,13 +2552,11 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
 
-        let config = GeneratorConfig {
-            go_module_path: Some("github.com/myorg/mylib".into()),
-            ..Default::default()
+        let config = GoConfig {
+            module_path: Some("github.com/myorg/mylib".into()),
+            ..GoConfig::default()
         };
-        GoGenerator
-            .generate_with_config(&api, out_dir, &config)
-            .unwrap();
+        GoGenerator.generate(&api, out_dir, &config).unwrap();
 
         let go_mod = std::fs::read_to_string(tmp.join("go/go.mod")).unwrap();
         assert!(

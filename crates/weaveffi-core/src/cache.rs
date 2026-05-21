@@ -7,6 +7,11 @@ use weaveffi_ir::ir::Api;
 
 const CACHE_DIR: &str = ".weaveffi-cache";
 
+/// Version string baked into every cache entry. Bumping the WeaveFFI CLI
+/// version automatically invalidates every cache file so users never see
+/// stale generator output after an upgrade.
+pub const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Serialize the API to canonical JSON and return its SHA-256 hex digest.
 ///
 /// The IR is first serialized to a `serde_json::Value`, whose `Object`
@@ -24,10 +29,9 @@ pub fn hash_api(api: &Api) -> String {
 
 /// Return the SHA-256 hex digest of the API content keyed by `generator_name`.
 ///
-/// Mixing the generator name into the digest gives every generator its own
-/// cache key, so adding/removing a generator from the orchestrator does not
-/// invalidate the others, and so two generators that happen to consume the
-/// exact same IR still write to distinct cache entries.
+/// Kept for tests and direct callers that only need an IR-keyed digest;
+/// the orchestrator goes through [`hash_generator_inputs`] so that config
+/// and CLI version changes invalidate the cache too.
 pub fn hash_api_for_generator(api: &Api, generator_name: &str) -> String {
     let value = serde_json::to_value(api).expect("Api serialization should not fail");
     let json = serde_json::to_string(&value).expect("Value serialization should not fail");
@@ -35,6 +39,33 @@ pub fn hash_api_for_generator(api: &Api, generator_name: &str) -> String {
     hasher.update(generator_name.as_bytes());
     hasher.update(b":");
     hasher.update(json.as_bytes());
+    let hash = hasher.finalize();
+    format!("{hash:x}")
+}
+
+/// Return the SHA-256 hex digest of every input that affects a single
+/// generator's output: the canonical IR, the generator's name, the
+/// generator's typed config (already serialized to canonical JSON bytes
+/// by the caller via [`crate::codegen::DynGenerator::config_hash_input`]),
+/// and the CLI version.
+///
+/// This is the cache key the orchestrator stores under
+/// `{out_dir}/.weaveffi-cache/{generator_name}.hash`, so any change to
+/// the IR, generator config, or CLI version invalidates that entry and
+/// triggers a re-run.
+pub fn hash_generator_inputs(api: &Api, generator_name: &str, config_bytes: &[u8]) -> String {
+    let api_value = serde_json::to_value(api).expect("Api serialization should not fail");
+    let api_json = serde_json::to_string(&api_value).expect("Value serialization should not fail");
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"v1\0");
+    hasher.update(CLI_VERSION.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(generator_name.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(api_json.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(config_bytes);
     let hash = hasher.finalize();
     format!("{hash:x}")
 }
@@ -97,11 +128,22 @@ fn migrate_legacy_cache(out_dir: &Utf8Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codegen::{Generator, Orchestrator};
-    use crate::config::GeneratorConfig;
+    use crate::codegen::{ConfiguredGenerator, Generator, Orchestrator, OrchestratorHooks};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use weaveffi_ir::ir::{Function, Module, Param, TypeRef};
+
+    /// Minimal serde-able config so the cache tests can exercise the
+    /// orchestrator without depending on any real per-language config.
+    #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+    struct TestConfig {
+        knob: Option<String>,
+    }
+
+    fn config_bytes(c: &TestConfig) -> Vec<u8> {
+        let v = serde_json::to_value(c).unwrap();
+        serde_json::to_vec(&v).unwrap()
+    }
 
     fn minimal_api() -> Api {
         Api {
@@ -148,17 +190,32 @@ mod tests {
     }
 
     impl Generator for CountingGenerator {
+        type Config = TestConfig;
+
         fn name(&self) -> &'static str {
             self.name
         }
 
-        fn generate(&self, _api: &Api, out_dir: &Utf8Path) -> anyhow::Result<()> {
+        fn generate(
+            &self,
+            _api: &Api,
+            out_dir: &Utf8Path,
+            _config: &Self::Config,
+        ) -> anyhow::Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let dir = out_dir.join(self.name);
             std::fs::create_dir_all(dir.as_std_path())?;
             std::fs::write(dir.join("output.txt").as_std_path(), "generated")?;
             Ok(())
         }
+    }
+
+    fn configured(
+        name: &'static str,
+        calls: Arc<AtomicUsize>,
+        cfg: TestConfig,
+    ) -> ConfiguredGenerator<CountingGenerator> {
+        ConfiguredGenerator::new(CountingGenerator { name, calls }, cfg)
     }
 
     #[test]
@@ -302,15 +359,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out_dir = Utf8Path::from_path(dir.path()).unwrap();
         let api = minimal_api();
-        let config = GeneratorConfig::default();
+        let hooks = OrchestratorHooks::default();
         let calls = Arc::new(AtomicUsize::new(0));
-        let gen = CountingGenerator {
-            name: "counting",
-            calls: Arc::clone(&calls),
-        };
+        let gen = configured("counting", Arc::clone(&calls), TestConfig::default());
 
         let orch = Orchestrator::new().with_generator(&gen);
-        orch.run(&api, out_dir, &config, false, None).unwrap();
+        orch.run(&api, out_dir, &hooks, false).unwrap();
 
         assert!(out_dir.join(CACHE_DIR).join("counting.hash").exists());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -321,18 +375,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out_dir = Utf8Path::from_path(dir.path()).unwrap();
         let api = minimal_api();
-        let config = GeneratorConfig::default();
+        let hooks = OrchestratorHooks::default();
         let calls = Arc::new(AtomicUsize::new(0));
-        let gen = CountingGenerator {
-            name: "counting",
-            calls: Arc::clone(&calls),
-        };
+        let gen = configured("counting", Arc::clone(&calls), TestConfig::default());
 
         let orch = Orchestrator::new().with_generator(&gen);
-        orch.run(&api, out_dir, &config, false, None).unwrap();
+        orch.run(&api, out_dir, &hooks, false).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        orch.run(&api, out_dir, &config, false, None).unwrap();
+        orch.run(&api, out_dir, &hooks, false).unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -345,15 +396,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out_dir = Utf8Path::from_path(dir.path()).unwrap();
         let api = minimal_api();
-        let config = GeneratorConfig::default();
+        let hooks = OrchestratorHooks::default();
         let calls = Arc::new(AtomicUsize::new(0));
-        let gen = CountingGenerator {
-            name: "counting",
-            calls: Arc::clone(&calls),
-        };
+        let gen = configured("counting", Arc::clone(&calls), TestConfig::default());
 
         let orch = Orchestrator::new().with_generator(&gen);
-        orch.run(&api, out_dir, &config, false, None).unwrap();
+        orch.run(&api, out_dir, &hooks, false).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let mut modified_api = api;
@@ -381,8 +429,7 @@ mod tests {
             since: None,
         });
 
-        orch.run(&modified_api, out_dir, &config, false, None)
-            .unwrap();
+        orch.run(&modified_api, out_dir, &hooks, false).unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
@@ -395,18 +442,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out_dir = Utf8Path::from_path(dir.path()).unwrap();
         let api = minimal_api();
-        let config = GeneratorConfig::default();
+        let hooks = OrchestratorHooks::default();
         let calls = Arc::new(AtomicUsize::new(0));
-        let gen = CountingGenerator {
-            name: "counting",
-            calls: Arc::clone(&calls),
-        };
+        let gen = configured("counting", Arc::clone(&calls), TestConfig::default());
 
         let orch = Orchestrator::new().with_generator(&gen);
-        orch.run(&api, out_dir, &config, true, None).unwrap();
+        orch.run(&api, out_dir, &hooks, true).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        orch.run(&api, out_dir, &config, true, None).unwrap();
+        orch.run(&api, out_dir, &hooks, true).unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
@@ -421,15 +465,12 @@ mod tests {
         std::fs::write(out_dir.join(CACHE_DIR), "stale-legacy").unwrap();
 
         let api = minimal_api();
-        let config = GeneratorConfig::default();
+        let hooks = OrchestratorHooks::default();
         let calls = Arc::new(AtomicUsize::new(0));
-        let gen = CountingGenerator {
-            name: "counting",
-            calls: Arc::clone(&calls),
-        };
+        let gen = configured("counting", Arc::clone(&calls), TestConfig::default());
 
         let orch = Orchestrator::new().with_generator(&gen);
-        orch.run(&api, out_dir, &config, false, None).unwrap();
+        orch.run(&api, out_dir, &hooks, false).unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -442,30 +483,24 @@ mod tests {
     fn single_generator_cache_invalidates_independently() {
         let dir = tempfile::tempdir().unwrap();
         let out_dir = Utf8Path::from_path(dir.path()).unwrap();
-        let config = GeneratorConfig::default();
+        let hooks = OrchestratorHooks::default();
         let c_calls = Arc::new(AtomicUsize::new(0));
         let s_calls = Arc::new(AtomicUsize::new(0));
-        let c_gen = CountingGenerator {
-            name: "c",
-            calls: Arc::clone(&c_calls),
-        };
-        let s_gen = CountingGenerator {
-            name: "swift",
-            calls: Arc::clone(&s_calls),
-        };
+        let c_gen = configured("c", Arc::clone(&c_calls), TestConfig::default());
+        let s_gen = configured("swift", Arc::clone(&s_calls), TestConfig::default());
         let orch = Orchestrator::new()
             .with_generator(&c_gen)
             .with_generator(&s_gen);
 
         let api = minimal_api();
-        orch.run(&api, out_dir, &config, false, None).unwrap();
+        orch.run(&api, out_dir, &hooks, false).unwrap();
         assert_eq!(c_calls.load(Ordering::SeqCst), 1);
         assert_eq!(s_calls.load(Ordering::SeqCst), 1);
 
         // Invalidate only the C generator's cache; the API itself is unchanged.
         std::fs::remove_file(out_dir.join(CACHE_DIR).join("c.hash")).unwrap();
 
-        orch.run(&api, out_dir, &config, false, None).unwrap();
+        orch.run(&api, out_dir, &hooks, false).unwrap();
         assert_eq!(
             c_calls.load(Ordering::SeqCst),
             2,
@@ -475,6 +510,121 @@ mod tests {
             s_calls.load(Ordering::SeqCst),
             1,
             "Swift generator's cache is intact and must be skipped"
+        );
+    }
+
+    #[test]
+    fn hash_generator_inputs_changes_when_config_bytes_change() {
+        let api = minimal_api();
+        let base = config_bytes(&TestConfig::default());
+
+        let changed = config_bytes(&TestConfig {
+            knob: Some("flipped".into()),
+        });
+
+        assert_ne!(
+            hash_generator_inputs(&api, "c", &base),
+            hash_generator_inputs(&api, "c", &changed),
+            "changing config bytes must change the per-generator hash"
+        );
+    }
+
+    #[test]
+    fn hash_generator_inputs_includes_cli_version() {
+        let api = minimal_api();
+        let cfg = config_bytes(&TestConfig::default());
+
+        // Compute the canonical hash, then compute the digest the same way
+        // but pretend a different CLI version produced it. The two must
+        // differ — otherwise upgrades silently leave stale output.
+        let real = hash_generator_inputs(&api, "c", &cfg);
+
+        let api_value = serde_json::to_value(&api).unwrap();
+        let api_json = serde_json::to_string(&api_value).unwrap();
+
+        let mut h = Sha256::new();
+        h.update(b"v1\0");
+        h.update(b"0.0.0-pretend-old\0");
+        h.update(b"c\0");
+        h.update(api_json.as_bytes());
+        h.update(b"\0");
+        h.update(&cfg);
+        let pretend = format!("{:x}", h.finalize());
+
+        assert_ne!(
+            real, pretend,
+            "CLI_VERSION must be part of the cache key so an upgrade invalidates it"
+        );
+        assert_eq!(CLI_VERSION, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn cache_invalidated_on_config_only_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
+        let api = minimal_api();
+        let hooks = OrchestratorHooks::default();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gen = configured("c", Arc::clone(&calls), TestConfig::default());
+        Orchestrator::new()
+            .with_generator(&gen)
+            .run(&api, out_dir, &hooks, false)
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Re-run with the *same* IR but a changed generator config.
+        let gen2 = configured(
+            "c",
+            Arc::clone(&calls),
+            TestConfig {
+                knob: Some("changed".into()),
+            },
+        );
+        Orchestrator::new()
+            .with_generator(&gen2)
+            .run(&api, out_dir, &hooks, false)
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "changing generator config must invalidate the cache and re-run the generator"
+        );
+
+        // A third run with the same `changed` config should hit the cache again.
+        Orchestrator::new()
+            .with_generator(&gen2)
+            .run(&api, out_dir, &hooks, false)
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "running with the same config twice should not regenerate"
+        );
+    }
+
+    #[test]
+    fn cache_invalidated_when_pre_generated_hash_has_wrong_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
+        let api = minimal_api();
+        let hooks = OrchestratorHooks::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gen = configured("c", Arc::clone(&calls), TestConfig::default());
+        let orch = Orchestrator::new().with_generator(&gen);
+
+        // Pre-seed the cache with a hash that was computed with the
+        // legacy IR-only function. The orchestrator now keys on
+        // `hash_generator_inputs`, so the stale entry must not match
+        // and the generator must re-run.
+        let stale = hash_api_for_generator(&api, "c");
+        write_generator_cache(out_dir, "c", &stale).unwrap();
+
+        orch.run(&api, out_dir, &hooks, false).unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "legacy IR-only hash must not satisfy the new cache key shape"
         );
     }
 }

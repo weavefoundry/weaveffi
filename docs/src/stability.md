@@ -40,8 +40,10 @@ PRD, with a schema-version bump and a `weaveffi upgrade` migration), but the
 contract is "no contract." Things that have already changed during 0.x:
 
 - IR type-reference syntax (`callback` was removed in `0.3.0`).
-- The `Generator` trait gained `generate_with_config` and
-  `generate_with_templates` methods.
+- The `Generator` trait gained `generate_with_config` in `0.3.0`. A
+  prototype Tera template hook (`generate_with_templates`,
+  `--templates`, `template_dir`) was added and then removed in `0.4.0`
+  because no generator ever consumed it.
 - The C ABI runtime added `weaveffi_arena_*` and `weaveffi_cancel_token_*`
   families.
 - `weaveffi doctor` gained `--target` and `--format json`.
