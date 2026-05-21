@@ -1,3 +1,13 @@
+## [0.5.0](https://github.com/weavefoundry/weaveffi/compare/v0.4.0...v0.5.0) (2026-05-21)
+
+### ⚠ BREAKING CHANGES
+
+* overhaul generator pipeline with per-target configs (#6)
+
+### Features
+
+* overhaul generator pipeline with per-target configs ([#6](https://github.com/weavefoundry/weaveffi/issues/6)) ([1948f79](https://github.com/weavefoundry/weaveffi/commit/1948f79346c017b7b279d7ff5110397af3d672c2))
+
 ## [0.4.0](https://github.com/weavefoundry/weaveffi/compare/v0.3.0...v0.4.0) (2026-05-05)
 
 ### ⚠ BREAKING CHANGES
