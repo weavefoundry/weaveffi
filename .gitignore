@@ -33,9 +33,6 @@ node_modules/
 # macOS
 .DS_Store
 
-# Ralphy progress tracking
-.ralphy/progress.txt
-
 # mdBook build outputs (do not commit generated docs)
 /docs/book/
 /docs/site/
