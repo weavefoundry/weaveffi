@@ -36,8 +36,9 @@ After the 1.0.0 release, the following surfaces will be governed by SemVer:
 
 While the workspace is at `0.x`, **everything** above may change without
 warning. In practice we try to keep breaking changes batched (one batch per
-PRD, with a schema-version bump and a `weaveffi upgrade` migration), but the
-contract is "no contract." Things that have already changed during 0.x:
+minor release, with a schema-version bump and a `weaveffi upgrade`
+migration), but the contract is "no contract." Things that have already
+changed during 0.x:
 
 - IR type-reference syntax (`callback` was removed in `0.3.0`).
 - The `Generator` trait gained `generate_with_config` in `0.3.0`. A
@@ -106,9 +107,9 @@ section explaining what the upgrader rewrote.
 > **Regenerating with the same WeaveFFI version on the same IDL produces
 > byte-identical output.**
 
-This is enforced by the determinism tests added in [PRD-v4 Phase
-6](roadmap.md): every generator's output is hashed and re-hashed on the
-kitchen-sink fixture, and any deviation fails CI. Internally, every
+This is enforced by the determinism tests: every generator's output is
+hashed and re-hashed on the kitchen-sink fixture, and any deviation fails
+CI. Internally, every
 `HashMap` iteration that contributes to generated output has been replaced
 by `BTreeMap` or an explicit sort. The `serde_json`-backed cache key uses a
 canonical key ordering.
@@ -159,8 +160,6 @@ guard.
 
 ## See also
 
-- [Roadmap](roadmap.md) — what's shipped, what's planned for 1.0, what's
-  beyond.
 - [IDL Schema](reference/idl.md) — the type system the schema version
   governs.
 - [Getting Started](getting-started.md) — installation and the basic

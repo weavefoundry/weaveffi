@@ -634,11 +634,15 @@ fn readme_has_required_top_level_sections() {
 }
 
 #[test]
-fn readme_status_marks_1_0_release_candidate() {
+fn readme_status_describes_pre_1_0_development() {
     let readme = read_workspace_file("README.md");
     assert!(
-        readme.contains("1.0.0 release candidate"),
-        "README status section should mark the workspace as a 1.0.0 release candidate"
+        readme.contains("0.x"),
+        "README status section should describe the project as in active 0.x development"
+    );
+    assert!(
+        !readme.contains("release candidate"),
+        "README status section should not claim to be a release candidate"
     );
 }
 
