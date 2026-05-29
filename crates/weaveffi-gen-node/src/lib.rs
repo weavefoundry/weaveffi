@@ -16,7 +16,7 @@ use weaveffi_core::utils::{
     c_abi_struct_name, local_type_name, render_json_prelude, render_prelude, render_trailer,
     wrapper_name, CommentStyle,
 };
-use weaveffi_ir::ir::{Api, Function, Module, StructDef, TypeRef};
+use weaveffi_ir::ir::{Api, Function, StructDef, TypeRef};
 
 /// Per-target configuration for [`NodeGenerator`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -195,23 +195,13 @@ fn napi_getter(ty: &TypeRef) -> &'static str {
     }
 }
 
-fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
-    walk_modules(modules).collect()
-}
-
-fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
-    walk_modules_with_path(modules).collect()
-}
-
 fn render_addon_c(api: &Api, strip_module_prefix: bool, input_basename: &str) -> String {
     let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
     out.push_str(
         "#include <node_api.h>\n#include \"weaveffi.h\"\n#include <stdlib.h>\n#include <string.h>\n\n",
     );
 
-    let has_async = collect_all_modules(&api.modules)
-        .iter()
-        .any(|m| m.functions.iter().any(|f| f.r#async));
+    let has_async = walk_modules(&api.modules).any(|m| m.functions.iter().any(|f| f.r#async));
     if has_async {
         out.push_str("typedef struct {\n");
         out.push_str("    napi_env env;\n");
@@ -221,7 +211,7 @@ fn render_addon_c(api: &Api, strip_module_prefix: bool, input_basename: &str) ->
 
     let mut all_exports: Vec<(String, String)> = Vec::new();
 
-    for (m, path) in collect_modules_with_path(&api.modules) {
+    for (m, path) in walk_modules_with_path(&api.modules) {
         for f in &m.functions {
             let c_name = format!("weaveffi_{}_{}", path, f.name);
             let napi_name = format!("Napi_{c_name}");
@@ -1136,7 +1126,7 @@ fn render_struct_builder_dts(out: &mut String, s: &StructDef) {
 fn render_node_dts(api: &Api, strip_module_prefix: bool, input_basename: &str) -> String {
     let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
     out.push_str("// Generated types for WeaveFFI functions\n");
-    for (m, path) in collect_modules_with_path(&api.modules) {
+    for (m, path) in walk_modules_with_path(&api.modules) {
         for s in &m.structs {
             emit_doc(&mut out, &s.doc, "");
             out.push_str(&format!("export interface {} {{\n", s.name));

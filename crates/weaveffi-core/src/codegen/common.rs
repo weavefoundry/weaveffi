@@ -153,6 +153,26 @@ pub fn is_c_pointer_type(ty: &TypeRef) -> bool {
     )
 }
 
+/// Convert a `snake_case` identifier to `PascalCase` by uppercasing the
+/// first character of each `_`-separated segment and preserving the rest.
+///
+/// This deliberately splits on `_` only — it does **not** re-case interior
+/// letters the way `heck::ToUpperCamelCase` does — so an acronym-bearing
+/// name like `get_HTTP` becomes `GetHTTP`, not `GetHttp`. It is the single
+/// source of truth for the `snake_to_pascal` / `to_pascal_case` helpers
+/// that the Python, Android, and WASM generators each defined locally.
+pub fn pascal_case(s: &str) -> String {
+    s.split('_')
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,5 +438,27 @@ mod tests {
         assert!(!is_c_pointer_type(&TypeRef::Optional(Box::new(
             TypeRef::StringUtf8
         ))));
+    }
+
+    // --- pascal_case ---
+
+    #[test]
+    fn pascal_case_snake_segments() {
+        assert_eq!(pascal_case("first_name"), "FirstName");
+        assert_eq!(pascal_case("name"), "Name");
+        assert_eq!(pascal_case("is_active"), "IsActive");
+    }
+
+    #[test]
+    fn pascal_case_preserves_interior_casing() {
+        // Unlike heck, interior letters keep their case (acronym-safe).
+        assert_eq!(pascal_case("get_HTTP"), "GetHTTP");
+        assert_eq!(pascal_case("toJSON"), "ToJSON");
+    }
+
+    #[test]
+    fn pascal_case_empty_and_trailing_underscore() {
+        assert_eq!(pascal_case(""), "");
+        assert_eq!(pascal_case("a_"), "A");
     }
 }

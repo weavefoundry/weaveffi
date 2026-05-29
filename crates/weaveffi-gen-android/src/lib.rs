@@ -9,13 +9,13 @@ use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use weaveffi_core::codegen::common::{
-    emit_doc as common_emit_doc, walk_modules, walk_modules_with_path, DocCommentStyle,
+    emit_doc as common_emit_doc, pascal_case, walk_modules, walk_modules_with_path, DocCommentStyle,
 };
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::utils::{
     c_symbol_name, local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
 };
-use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, TypeRef};
+use weaveffi_ir::ir::{Api, EnumDef, Function, StructDef, TypeRef};
 
 /// Per-target configuration for [`AndroidGenerator`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -376,21 +376,13 @@ fn has_enum_involvement(f: &Function) -> bool {
         || matches!(&f.returns, Some(TypeRef::Enum(_)))
 }
 
-fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
-    walk_modules(modules).collect()
-}
-
-fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
-    walk_modules_with_path(modules).collect()
-}
-
 fn render_kotlin(
     api: &Api,
     package: &str,
     strip_module_prefix: bool,
     input_basename: &str,
 ) -> String {
-    let all_mods = collect_all_modules(&api.modules);
+    let all_mods = walk_modules(&api.modules).collect::<Vec<_>>();
     let has_async = all_mods
         .iter()
         .any(|m| m.functions.iter().any(|f| f.r#async));
@@ -402,7 +394,7 @@ fn render_kotlin(
         kotlin.push_str("import kotlin.coroutines.resumeWithException\n\n");
     }
     kotlin.push_str("class WeaveFFI {\n    companion object {\n        init { System.loadLibrary(\"weaveffi\") }\n\n");
-    for (m, path) in collect_modules_with_path(&api.modules) {
+    for (m, path) in walk_modules_with_path(&api.modules) {
         for f in &m.functions {
             let func_name = wrapper_name(&path, &f.name, strip_module_prefix);
             emit_fn_doc(&mut kotlin, &f.doc, &f.params, "        ");
@@ -509,7 +501,7 @@ fn render_kotlin(
         }
     }
     kotlin.push_str("    }\n}\n");
-    for m in collect_all_modules(&api.modules) {
+    for m in walk_modules(&api.modules) {
         for e in &m.enums {
             render_kotlin_enum(&mut kotlin, e);
         }
@@ -607,8 +599,7 @@ fn render_kotlin_enum(out: &mut String, e: &EnumDef) {
 }
 
 fn render_kotlin_error_types(out: &mut String, api: &Api) {
-    let error_codes: Vec<_> = collect_all_modules(&api.modules)
-        .iter()
+    let error_codes: Vec<_> = walk_modules(&api.modules)
         .filter_map(|m| m.errors.as_ref())
         .flat_map(|e| &e.codes)
         .collect();
@@ -647,7 +638,7 @@ fn render_jni_c(
     let mut jni_c = render_prelude(CommentStyle::DoubleSlash, input_basename);
     jni_c.push_str("#include <jni.h>\n#include <stdbool.h>\n#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n#include \"weaveffi.h\"\n\n");
 
-    let all_mods = collect_all_modules(&api.modules);
+    let all_mods = walk_modules(&api.modules).collect::<Vec<_>>();
     let error_codes: Vec<_> = all_mods
         .iter()
         .filter_map(|m| m.errors.as_ref())
@@ -693,7 +684,7 @@ fn render_jni_c(
         jni_c.push_str("} weaveffi_jni_async_ctx;\n\n");
     }
 
-    for (m, path) in collect_modules_with_path(&api.modules) {
+    for (m, path) in walk_modules_with_path(&api.modules) {
         for f in &m.functions {
             if f.r#async {
                 let func_name = wrapper_name(&path, &f.name, strip_module_prefix);
@@ -765,7 +756,7 @@ fn render_jni_c(
             let _ = writeln!(jni_c, "}}\n");
         }
     }
-    for (m, path) in collect_modules_with_path(&api.modules) {
+    for (m, path) in walk_modules_with_path(&api.modules) {
         for s in &m.structs {
             render_jni_struct(&mut jni_c, &path, s, &jni_prefix);
         }
@@ -2017,18 +2008,6 @@ fn write_map_release(out: &mut String, name: &str, key: &TypeRef, val: &TypeRef)
     let _ = writeln!(out, "    free((void*){n}_c_vals);", n = name);
 }
 
-fn to_pascal_case(s: &str) -> String {
-    s.split('_')
-        .map(|part| {
-            let mut c = part.chars();
-            match c.next() {
-                None => String::new(),
-                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-            }
-        })
-        .collect()
-}
-
 fn kotlin_getter_type(t: &TypeRef) -> String {
     match t {
         TypeRef::Struct(name) => local_type_name(name).to_string(),
@@ -2064,7 +2043,7 @@ fn render_kotlin_struct(out: &mut String, s: &StructDef) {
         "        @JvmStatic external fun nativeDestroy(handle: Long)"
     );
     for f in &s.fields {
-        let pascal = to_pascal_case(&f.name);
+        let pascal = pascal_case(&f.name);
         let _ = writeln!(
             out,
             "        @JvmStatic external fun nativeGet{}(handle: Long): {}",
@@ -2087,7 +2066,7 @@ fn render_kotlin_struct(out: &mut String, s: &StructDef) {
     let _ = writeln!(out);
 
     for f in &s.fields {
-        let pascal = to_pascal_case(&f.name);
+        let pascal = pascal_case(&f.name);
         let kt_type = kotlin_getter_type(&f.ty);
         emit_doc(out, &f.doc, "    ");
         match &f.ty {
@@ -2135,7 +2114,7 @@ fn render_kotlin_builder(out: &mut String, s: &StructDef) {
         let _ = writeln!(out, "    private var {}: {}? = null", f.name, kt_getter);
     }
     for f in &s.fields {
-        let pascal = to_pascal_case(&f.name);
+        let pascal = pascal_case(&f.name);
         let kt_getter = kotlin_getter_type(&f.ty);
         emit_doc(out, &f.doc, "    ");
         let _ = writeln!(
@@ -2230,7 +2209,7 @@ fn render_jni_struct(out: &mut String, module_name: &str, s: &StructDef, jni_pre
 
     // nativeGet{Field} for each field
     for f in &s.fields {
-        let pascal = to_pascal_case(&f.name);
+        let pascal = pascal_case(&f.name);
         let jret = jni_ret_type(Some(&f.ty));
         let getter_c = format!("{}_get_{}", prefix, f.name);
 
@@ -2881,10 +2860,10 @@ mod tests {
     }
 
     #[test]
-    fn to_pascal_case_converts_snake_case() {
-        assert_eq!(to_pascal_case("first_name"), "FirstName");
-        assert_eq!(to_pascal_case("name"), "Name");
-        assert_eq!(to_pascal_case("is_active"), "IsActive");
+    fn pascal_case_converts_snake_case() {
+        assert_eq!(pascal_case("first_name"), "FirstName");
+        assert_eq!(pascal_case("name"), "Name");
+        assert_eq!(pascal_case("is_active"), "IsActive");
     }
 
     #[test]

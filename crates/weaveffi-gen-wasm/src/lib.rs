@@ -392,14 +392,6 @@ fn ts_type_for(ty: &TypeRef) -> String {
     }
 }
 
-fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
-    walk_modules(modules).collect()
-}
-
-fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
-    walk_modules_with_path(modules).collect()
-}
-
 /// Emits a JSDoc comment at `indent`. Single-line docs collapse to
 /// `/** text */`; multi-line docs expand to a block with ` * ` prefixed lines.
 fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
@@ -474,7 +466,7 @@ fn render_wasm_dts(api: &Api, module_name: &str, input_basename: &str, filename:
     let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
     out.push_str("// Generated TypeScript declarations for WeaveFFI WASM bindings\n\n");
 
-    for (m, _path) in collect_modules_with_path(&api.modules) {
+    for (m, _path) in walk_modules_with_path(&api.modules) {
         for s in &m.structs {
             emit_doc(&mut out, &s.doc, "");
             out.push_str(&format!("export interface {} {{\n", s.name));
@@ -501,7 +493,7 @@ fn render_wasm_dts(api: &Api, module_name: &str, input_basename: &str, filename:
     }
 
     out.push_str(&format!("export interface {interface_name} {{\n"));
-    let all_mods = collect_all_modules(&api.modules);
+    let all_mods = walk_modules(&api.modules).collect::<Vec<_>>();
     if all_mods.iter().any(|m| !m.functions.is_empty()) {
         out.push_str("  _raw: WebAssembly.Exports;\n");
         for module in &api.modules {
@@ -598,7 +590,7 @@ fn render_wasm_js_stub(
         out.push_str("}\n\n");
     }
 
-    let all_mods = collect_all_modules(&api.modules);
+    let all_mods = walk_modules(&api.modules).collect::<Vec<_>>();
     let has_functions = all_mods.iter().any(|m| !m.functions.is_empty());
     let has_async = api_has_async(api);
     if has_functions {
@@ -633,7 +625,7 @@ fn render_wasm_js_stub(
         out.push_str("}\n\n");
     }
 
-    for (module, _path) in collect_modules_with_path(&api.modules) {
+    for (module, _path) in walk_modules_with_path(&api.modules) {
         for e in &module.enums {
             out.push_str(&format!("export const {} = Object.freeze({{\n", e.name));
             for v in &e.variants {
@@ -643,7 +635,7 @@ fn render_wasm_js_stub(
         }
     }
 
-    for (module, path) in collect_modules_with_path(&api.modules) {
+    for (module, path) in walk_modules_with_path(&api.modules) {
         for s in &module.structs {
             out.push_str(&format!("class {} {{\n", s.name));
             out.push_str("  constructor(wasm, handle) {\n");
@@ -750,7 +742,7 @@ fn render_wasm_js_stub(
             out.push_str("  }\n\n");
 
             let mut trampolines: Vec<(String, Vec<&'static str>)> = Vec::new();
-            for m in collect_all_modules(&api.modules) {
+            for m in walk_modules(&api.modules) {
                 for f in &m.functions {
                     if f.r#async {
                         let params = async_cb_wasm_params(f.returns.as_ref());
@@ -921,9 +913,7 @@ fn emit_js_function_wrapper(out: &mut String, module_name: &str, func: &Function
 }
 
 fn api_has_async(api: &Api) -> bool {
-    collect_all_modules(&api.modules)
-        .iter()
-        .any(|m| m.functions.iter().any(|f| f.r#async))
+    walk_modules(&api.modules).any(|m| m.functions.iter().any(|f| f.r#async))
 }
 
 fn async_cb_wasm_params(returns: Option<&TypeRef>) -> Vec<&'static str> {

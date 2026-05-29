@@ -15,7 +15,7 @@ use weaveffi_core::codegen::Generator;
 use weaveffi_core::utils::{
     c_symbol_name, local_type_name, render_prelude, render_trailer, CommentStyle,
 };
-use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, TypeRef};
+use weaveffi_ir::ir::{Api, EnumDef, Function, StructDef, TypeRef};
 
 /// Per-target configuration for [`DartGenerator`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -211,23 +211,13 @@ import 'package:weaveffi/weaveffi.dart';
     )
 }
 
-fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
-    walk_modules(modules).collect()
-}
-
-fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
-    walk_modules_with_path(modules).collect()
-}
-
 fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
     common_emit_doc(out, doc, indent, DocCommentStyle::TripleSlash);
 }
 
 fn render_dart_module(api: &Api, input_basename: &str) -> String {
     let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
-    let has_async = collect_all_modules(&api.modules)
-        .iter()
-        .any(|m| m.functions.iter().any(|f| f.r#async));
+    let has_async = walk_modules(&api.modules).any(|m| m.functions.iter().any(|f| f.r#async));
 
     out.push_str("// ignore_for_file: non_constant_identifier_names, camel_case_types\n\n");
     out.push_str("import 'dart:ffi';\n");
@@ -278,7 +268,7 @@ fn render_dart_module(api: &Api, input_basename: &str) -> String {
     out.push_str("  }\n");
     out.push_str("}\n");
 
-    for (module, path) in collect_modules_with_path(&api.modules) {
+    for (module, path) in walk_modules_with_path(&api.modules) {
         for e in &module.enums {
             render_enum(&mut out, e);
         }

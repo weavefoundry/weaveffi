@@ -299,10 +299,6 @@ The resulting `.nupkg` will be in `bin/Debug/` (or `bin/Release/` with `-c Relea
     )
 }
 
-fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
-    walk_modules(modules).collect()
-}
-
 /// Emits a C# XML doc comment at `indent`. Single-line docs collapse to
 /// `/// <summary>text</summary>`; multi-line docs expand to a `<summary>`
 /// block with each input line wrapped in its own line.
@@ -405,7 +401,7 @@ fn render_csharp(
     out.push_str(
         "using System;\nusing System.Collections.Generic;\nusing System.Runtime.InteropServices;\n",
     );
-    let all_mods = collect_all_modules(&api.modules);
+    let all_mods = walk_modules(&api.modules).collect::<Vec<_>>();
     if all_mods
         .iter()
         .any(|m| m.functions.iter().any(|f| f.r#async))
@@ -419,7 +415,7 @@ fn render_csharp(
     render_error_struct(&mut out);
     render_helpers_class(&mut out);
 
-    for (m, path) in collect_modules_with_path(&api.modules) {
+    for (m, path) in walk_modules_with_path(&api.modules) {
         for e in &m.enums {
             render_enum(&mut out, e);
         }
@@ -438,10 +434,6 @@ fn render_csharp(
     out.push_str("}\n\n");
     out.push_str(&render_trailer(CommentStyle::DoubleSlash, filename));
     out
-}
-
-fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
-    walk_modules_with_path(modules).collect()
 }
 
 fn render_exception_class(out: &mut String) {
@@ -797,7 +789,7 @@ fn render_native_methods(out: &mut String, api: &Api) {
         "        internal static extern void weaveffi_free_bytes(IntPtr ptr, UIntPtr len);\n\n",
     );
 
-    for (m, path) in collect_modules_with_path(&api.modules) {
+    for (m, path) in walk_modules_with_path(&api.modules) {
         for s in &m.structs {
             render_struct_pinvoke(out, &path, s);
         }

@@ -12,8 +12,8 @@ use heck::ToUpperCamelCase;
 use serde::{Deserialize, Serialize};
 use weaveffi_core::abi::{self, AbiParam};
 use weaveffi_core::codegen::common::{
-    emit_doc as common_emit_doc, is_c_pointer_type as common_is_c_pointer_type, walk_modules,
-    walk_modules_with_path, DocCommentStyle,
+    emit_doc as common_emit_doc, is_c_pointer_type, walk_modules, walk_modules_with_path,
+    DocCommentStyle,
 };
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::utils::{
@@ -177,14 +177,6 @@ Then include the header in your code:
     out
 }
 
-fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
-    walk_modules(modules).collect()
-}
-
-fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
-    walk_modules_with_path(modules).collect()
-}
-
 fn render_cpp_header(
     api: &Api,
     namespace: &str,
@@ -203,10 +195,7 @@ fn render_cpp_header(
     out.push_str("#include <unordered_map>\n");
     out.push_str("#include <memory>\n");
     out.push_str("#include <stdexcept>\n");
-    if collect_all_modules(&api.modules)
-        .iter()
-        .any(|m| m.functions.iter().any(|f| f.r#async))
-    {
+    if walk_modules(&api.modules).any(|m| m.functions.iter().any(|f| f.r#async)) {
         out.push_str("#include <future>\n");
     }
     out.push('\n');
@@ -218,14 +207,13 @@ fn render_cpp_header(
 
     out.push_str(&format!("namespace {namespace} {{\n\n"));
 
-    let error_codes: Vec<_> = collect_all_modules(&api.modules)
-        .iter()
+    let error_codes: Vec<_> = walk_modules(&api.modules)
         .filter_map(|m| m.errors.as_ref())
         .flat_map(|e| &e.codes)
         .collect();
     render_cpp_error_classes(&mut out, &error_codes);
 
-    for (module, path) in collect_modules_with_path(&api.modules) {
+    for (module, path) in walk_modules_with_path(&api.modules) {
         render_cpp_enums(&mut out, module);
         render_cpp_classes(&mut out, module, &path, c_prefix);
         render_cpp_functions(&mut out, module, &error_codes, &path, c_prefix);
@@ -243,10 +231,6 @@ fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
 }
 
 // ── C ABI type helpers (mirrors the C generator logic) ──
-
-fn is_c_pointer_type(ty: &TypeRef) -> bool {
-    common_is_c_pointer_type(ty)
-}
 
 /// Renders ABI parameter slots to C declarations (`<type> <name>`), the form
 /// used inside the generated `extern "C"` block.
@@ -314,7 +298,7 @@ fn render_extern_c(out: &mut String, api: &Api, prefix: &str) {
         "void {prefix}_cancel_token_destroy({prefix}_cancel_token* token);\n\n"
     ));
 
-    for (module, path) in collect_modules_with_path(&api.modules) {
+    for (module, path) in walk_modules_with_path(&api.modules) {
         for e in &module.enums {
             let tag = format!("{prefix}_{}_{}", path, e.name);
             emit_doc(out, &e.doc, "");
