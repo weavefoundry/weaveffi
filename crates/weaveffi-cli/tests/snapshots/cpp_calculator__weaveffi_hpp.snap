@@ -19,10 +19,7 @@ extern "C" {
 
 typedef uint64_t weaveffi_handle_t;
 
-typedef struct weaveffi_error {
-    int32_t code;
-    const char* message;
-} weaveffi_error;
+typedef struct weaveffi_error { int32_t code; const char* message; } weaveffi_error;
 
 void weaveffi_error_clear(weaveffi_error* err);
 void weaveffi_free_string(const char* ptr);

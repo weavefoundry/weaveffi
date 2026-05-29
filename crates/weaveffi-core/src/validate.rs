@@ -293,55 +293,92 @@ fn validate_api_inner(api: &mut Api) -> Result<(), ValidationError> {
 pub fn resolve_type_refs(api: &mut Api) {
     let mut global_types: BTreeMap<String, (String, bool)> = BTreeMap::new();
     for module in &api.modules {
-        for s in &module.structs {
-            global_types
-                .entry(s.name.clone())
-                .or_insert((module.name.clone(), false));
-        }
-        for e in &module.enums {
-            global_types
-                .entry(e.name.clone())
-                .or_insert((module.name.clone(), true));
-        }
+        index_module_types(module, "", &mut global_types);
     }
 
     for module in &mut api.modules {
-        let local_enum_names: BTreeSet<String> =
-            module.enums.iter().map(|e| e.name.clone()).collect();
-        let local_struct_names: BTreeSet<String> =
-            module.structs.iter().map(|s| s.name.clone()).collect();
-        let module_name = module.name.clone();
-        for f in &mut module.functions {
-            for p in &mut f.params {
-                resolve_single_type_ref(
-                    &mut p.ty,
-                    &local_enum_names,
-                    &local_struct_names,
-                    &module_name,
-                    &global_types,
-                );
-            }
-            if let Some(ret) = &mut f.returns {
-                resolve_single_type_ref(
-                    ret,
-                    &local_enum_names,
-                    &local_struct_names,
-                    &module_name,
-                    &global_types,
-                );
-            }
+        resolve_module_type_refs(module, "", &global_types);
+    }
+}
+
+/// Recursively index every struct/enum in the module tree by its bare name,
+/// recording the owner's *dot-joined* module path (e.g. `graphics.shapes`) so
+/// cross-module and nested references can be auto-qualified. First definition
+/// wins on a name clash (pre-existing behavior).
+fn index_module_types(
+    module: &Module,
+    parent_path: &str,
+    out: &mut BTreeMap<String, (String, bool)>,
+) {
+    let path = join_module_path(parent_path, &module.name);
+    for s in &module.structs {
+        out.entry(s.name.clone()).or_insert((path.clone(), false));
+    }
+    for e in &module.enums {
+        out.entry(e.name.clone()).or_insert((path.clone(), true));
+    }
+    for child in &module.modules {
+        index_module_types(child, &path, out);
+    }
+}
+
+/// Resolve every type reference inside `module` (and recursively its
+/// submodules), qualifying cross-module references against `global_types`.
+/// `current_module` is tracked as a dot-joined path so multi-level nesting
+/// resolves correctly.
+fn resolve_module_type_refs(
+    module: &mut Module,
+    parent_path: &str,
+    global_types: &BTreeMap<String, (String, bool)>,
+) {
+    let module_path = join_module_path(parent_path, &module.name);
+    let local_enum_names: BTreeSet<String> = module.enums.iter().map(|e| e.name.clone()).collect();
+    let local_struct_names: BTreeSet<String> =
+        module.structs.iter().map(|s| s.name.clone()).collect();
+    for f in &mut module.functions {
+        for p in &mut f.params {
+            resolve_single_type_ref(
+                &mut p.ty,
+                &local_enum_names,
+                &local_struct_names,
+                &module_path,
+                global_types,
+            );
         }
-        for s in &mut module.structs {
-            for field in &mut s.fields {
-                resolve_single_type_ref(
-                    &mut field.ty,
-                    &local_enum_names,
-                    &local_struct_names,
-                    &module_name,
-                    &global_types,
-                );
-            }
+        if let Some(ret) = &mut f.returns {
+            resolve_single_type_ref(
+                ret,
+                &local_enum_names,
+                &local_struct_names,
+                &module_path,
+                global_types,
+            );
         }
+    }
+    for s in &mut module.structs {
+        for field in &mut s.fields {
+            resolve_single_type_ref(
+                &mut field.ty,
+                &local_enum_names,
+                &local_struct_names,
+                &module_path,
+                global_types,
+            );
+        }
+    }
+    for child in &mut module.modules {
+        resolve_module_type_refs(child, &module_path, global_types);
+    }
+}
+
+/// Join a parent module path with a child segment using `.`. A top-level
+/// module (empty parent) is just its own name, preserving the single-segment
+/// behavior that existed before nested resolution.
+fn join_module_path(parent_path: &str, name: &str) -> String {
+    if parent_path.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent_path}.{name}")
     }
 }
 
@@ -399,15 +436,22 @@ fn resolve_single_type_ref(
 }
 
 pub fn find_type_in_api(api: &Api, name: &str) -> Option<(String, bool)> {
-    for module in &api.modules {
+    fn search(module: &Module, parent_path: &str, name: &str) -> Option<(String, bool)> {
+        let path = join_module_path(parent_path, &module.name);
         if module.structs.iter().any(|s| s.name == name) {
-            return Some((module.name.clone(), false));
+            return Some((path, false));
         }
         if module.enums.iter().any(|e| e.name == name) {
-            return Some((module.name.clone(), true));
+            return Some((path, true));
         }
+        module
+            .modules
+            .iter()
+            .find_map(|child| search(child, &path, name))
     }
-    None
+    api.modules
+        .iter()
+        .find_map(|module| search(module, "", name))
 }
 
 fn validate_module(module: &Module, all_modules: &[Module]) -> Result<(), ValidationError> {
@@ -520,7 +564,7 @@ fn validate_module(module: &Module, all_modules: &[Module]) -> Result<(), Valida
                     location: format!("field '{}' of struct '{}'", f.name, s.name),
                 });
             }
-            validate_type_ref(&f.ty, &known_types, all_modules, &module.name)?;
+            validate_type_ref(&f.ty, &known_types, all_modules)?;
         }
     }
     for f in &module.functions {
@@ -533,7 +577,7 @@ fn validate_module(module: &Module, all_modules: &[Module]) -> Result<(), Valida
                     ),
                 });
             }
-            validate_type_ref(&p.ty, &known_types, all_modules, &module.name)?;
+            validate_type_ref(&p.ty, &known_types, all_modules)?;
         }
         if let Some(ret) = &f.returns {
             if let Some(ty) = contains_borrowed(ret) {
@@ -542,7 +586,7 @@ fn validate_module(module: &Module, all_modules: &[Module]) -> Result<(), Valida
                     location: format!("return type of {}::{}", module.name, f.name),
                 });
             }
-            validate_type_ref(ret, &known_types, all_modules, &module.name)?;
+            validate_type_ref(ret, &known_types, all_modules)?;
         }
     }
 
@@ -637,28 +681,32 @@ fn contains_iterator(ty: &TypeRef) -> bool {
     }
 }
 
+/// Does a struct/enum named `name` exist anywhere in the module tree,
+/// including nested submodules? Validation runs before reference qualification,
+/// so an unqualified reference is valid if its bare name is defined anywhere;
+/// the resolver later rewrites it to the owning module's full path.
+fn type_exists(modules: &[Module], name: &str) -> bool {
+    modules.iter().any(|m| {
+        m.structs.iter().any(|s| s.name == name)
+            || m.enums.iter().any(|e| e.name == name)
+            || type_exists(&m.modules, name)
+    })
+}
+
 fn validate_type_ref(
     ty: &TypeRef,
     known: &BTreeSet<&str>,
     all_modules: &[Module],
-    current_module: &str,
 ) -> Result<(), ValidationError> {
     match ty {
         TypeRef::Struct(name) | TypeRef::Enum(name) | TypeRef::TypedHandle(name) => {
-            if !known.contains(name.as_str()) {
-                let found_elsewhere = all_modules.iter().any(|m| {
-                    m.name != current_module
-                        && (m.structs.iter().any(|s| s.name == *name)
-                            || m.enums.iter().any(|e| e.name == *name))
-                });
-                if !found_elsewhere {
-                    return Err(ValidationError::UnknownTypeRef { name: name.clone() });
-                }
+            if !known.contains(name.as_str()) && !type_exists(all_modules, name) {
+                return Err(ValidationError::UnknownTypeRef { name: name.clone() });
             }
             Ok(())
         }
         TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
-            validate_type_ref(inner, known, all_modules, current_module)
+            validate_type_ref(inner, known, all_modules)
         }
         TypeRef::Map(k, v) => {
             let bad_key = match k.as_ref() {
@@ -670,8 +718,8 @@ fn validate_type_ref(
             if let Some(key_type) = bad_key {
                 return Err(ValidationError::InvalidMapKey { key_type });
             }
-            validate_type_ref(k, known, all_modules, current_module)?;
-            validate_type_ref(v, known, all_modules, current_module)
+            validate_type_ref(k, known, all_modules)?;
+            validate_type_ref(v, known, all_modules)
         }
         _ => Ok(()),
     }
@@ -2898,6 +2946,168 @@ mod tests {
             generators: None,
         };
         assert!(validate_api(&mut api, None).is_ok());
+    }
+
+    fn function_returning(name: &str, ret: TypeRef) -> Function {
+        Function {
+            name: name.to_string(),
+            params: vec![],
+            returns: Some(ret),
+            doc: None,
+            r#async: false,
+            cancellable: false,
+            deprecated: None,
+            since: None,
+        }
+    }
+
+    #[test]
+    fn find_type_in_api_finds_nested_type() {
+        let api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "graphics".to_string(),
+                functions: vec![],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![Module {
+                    name: "shapes".to_string(),
+                    functions: vec![],
+                    structs: vec![simple_struct("Circle")],
+                    enums: vec![],
+                    callbacks: vec![],
+                    listeners: vec![],
+                    errors: None,
+                    modules: vec![],
+                }],
+            }],
+            generators: None,
+        };
+        // Nested types report their full dot-joined owner path.
+        assert_eq!(
+            find_type_in_api(&api, "Circle"),
+            Some(("graphics.shapes".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn resolve_qualifies_reference_to_nested_module_type() {
+        // A top-level module references a struct defined in one of its own
+        // nested submodules by bare name; resolution must qualify it to the
+        // full dotted path so codegen can mangle the right C symbol.
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "app".to_string(),
+                functions: vec![function_returning(
+                    "make",
+                    TypeRef::Struct("Widget".to_string()),
+                )],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![Module {
+                    name: "ui".to_string(),
+                    functions: vec![],
+                    structs: vec![simple_struct("Widget")],
+                    enums: vec![],
+                    callbacks: vec![],
+                    listeners: vec![],
+                    errors: None,
+                    modules: vec![],
+                }],
+            }],
+            generators: None,
+        };
+        validate_api(&mut api, None).unwrap();
+        assert_eq!(
+            api.modules[0].functions[0].returns,
+            Some(TypeRef::Struct("app.ui.Widget".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_qualifies_nested_module_reference_to_parent_type() {
+        // A nested module references a type owned by an ancestor module. Before
+        // the nested-aware resolver, refs inside submodules were never
+        // qualified at all; now they resolve to the owner's dotted path.
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "lib".to_string(),
+                functions: vec![],
+                structs: vec![simple_struct("Token")],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![Module {
+                    name: "inner".to_string(),
+                    functions: vec![function_returning(
+                        "fetch",
+                        TypeRef::Struct("Token".to_string()),
+                    )],
+                    structs: vec![],
+                    enums: vec![],
+                    callbacks: vec![],
+                    listeners: vec![],
+                    errors: None,
+                    modules: vec![],
+                }],
+            }],
+            generators: None,
+        };
+        validate_api(&mut api, None).unwrap();
+        assert_eq!(
+            api.modules[0].modules[0].functions[0].returns,
+            Some(TypeRef::Struct("lib.Token".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_converts_nested_enum_reference_to_enum_variant() {
+        // An unqualified reference to an enum that lives in another module must
+        // be rewritten as `TypeRef::Enum` (not `Struct`) with the dotted path,
+        // using the global index's `is_enum` flag.
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![
+                Module {
+                    name: "consumer".to_string(),
+                    functions: vec![function_returning(
+                        "status",
+                        TypeRef::Struct("Phase".to_string()),
+                    )],
+                    structs: vec![],
+                    enums: vec![],
+                    callbacks: vec![],
+                    listeners: vec![],
+                    errors: None,
+                    modules: vec![],
+                },
+                Module {
+                    name: "shared".to_string(),
+                    functions: vec![],
+                    structs: vec![],
+                    enums: vec![simple_enum("Phase")],
+                    callbacks: vec![],
+                    listeners: vec![],
+                    errors: None,
+                    modules: vec![],
+                },
+            ],
+            generators: None,
+        };
+        validate_api(&mut api, None).unwrap();
+        assert_eq!(
+            api.modules[0].functions[0].returns,
+            Some(TypeRef::Enum("shared.Phase".to_string()))
+        );
     }
 
     #[test]

@@ -318,13 +318,20 @@ require 'ffi'
 module {module_name}
   extend FFI::Library
 
-  case FFI::Platform::OS
-  when /darwin/
-    ffi_lib 'libweaveffi.dylib'
-  when /mswin|mingw/
-    ffi_lib 'weaveffi.dll'
+  # An explicit path in WEAVEFFI_LIBRARY wins, so callers can point at a
+  # specific build artifact regardless of its file name or location.
+  _wv_override = ENV['WEAVEFFI_LIBRARY']
+  if _wv_override && !_wv_override.empty?
+    ffi_lib _wv_override
   else
-    ffi_lib 'libweaveffi.so'
+    case FFI::Platform::OS
+    when /darwin/
+      ffi_lib 'libweaveffi.dylib'
+    when /mswin|mingw/
+      ffi_lib 'weaveffi.dll'
+    else
+      ffi_lib 'libweaveffi.so'
+    end
   end
 
   class ErrorStruct < FFI::Struct

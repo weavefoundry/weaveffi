@@ -13,6 +13,10 @@ import 'dart:async';
 import 'package:ffi/ffi.dart';
 
 DynamicLibrary _openLibrary() {
+  // An explicit path in WEAVEFFI_LIBRARY wins, so callers can point at a
+  // specific build artifact regardless of its file name or location.
+  final override = Platform.environment['WEAVEFFI_LIBRARY'];
+  if (override != null && override.isNotEmpty) return DynamicLibrary.open(override);
   if (Platform.isMacOS) return DynamicLibrary.open('libweaveffi.dylib');
   if (Platform.isLinux) return DynamicLibrary.open('libweaveffi.so');
   if (Platform.isWindows) return DynamicLibrary.open('weaveffi.dll');
@@ -42,9 +46,10 @@ class WeaveffiException implements Exception {
 
 void _checkError(Pointer<_WeaveffiError> err) {
   if (err.ref.code != 0) {
+    final code = err.ref.code;
     final msg = err.ref.message.toDartString();
     _weaveffiErrorClear(err);
-    throw WeaveffiException(err.ref.code, msg);
+    throw WeaveffiException(code, msg);
   }
 }
 
@@ -71,23 +76,23 @@ typedef _DartWeaveffiDocsDocumentDestroy = void Function(Pointer<Void>);
 final _weaveffiDocsDocumentDestroy = _lib.lookupFunction<
     _NativeWeaveffiDocsDocumentDestroy, _DartWeaveffiDocsDocumentDestroy>('weaveffi_docs_Document_destroy');
 
-typedef _NativeWeaveffiDocsDocumentGetId = Int64 Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiDocsDocumentGetId = int Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiDocsDocumentGetId = Int64 Function(Pointer<Void>);
+typedef _DartWeaveffiDocsDocumentGetId = int Function(Pointer<Void>);
 final _weaveffiDocsDocumentGetId = _lib.lookupFunction<
     _NativeWeaveffiDocsDocumentGetId, _DartWeaveffiDocsDocumentGetId>('weaveffi_docs_Document_get_id');
 
-typedef _NativeWeaveffiDocsDocumentGetTitle = Pointer<Utf8> Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiDocsDocumentGetTitle = Pointer<Utf8> Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiDocsDocumentGetTitle = Pointer<Utf8> Function(Pointer<Void>);
+typedef _DartWeaveffiDocsDocumentGetTitle = Pointer<Utf8> Function(Pointer<Void>);
 final _weaveffiDocsDocumentGetTitle = _lib.lookupFunction<
     _NativeWeaveffiDocsDocumentGetTitle, _DartWeaveffiDocsDocumentGetTitle>('weaveffi_docs_Document_get_title');
 
-typedef _NativeWeaveffiDocsDocumentGetStatus = Int32 Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiDocsDocumentGetStatus = int Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiDocsDocumentGetStatus = Int32 Function(Pointer<Void>);
+typedef _DartWeaveffiDocsDocumentGetStatus = int Function(Pointer<Void>);
 final _weaveffiDocsDocumentGetStatus = _lib.lookupFunction<
     _NativeWeaveffiDocsDocumentGetStatus, _DartWeaveffiDocsDocumentGetStatus>('weaveffi_docs_Document_get_status');
 
-typedef _NativeWeaveffiDocsDocumentGetTags = Pointer<Void> Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiDocsDocumentGetTags = Pointer<Void> Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiDocsDocumentGetTags = Pointer<Void> Function(Pointer<Void>);
+typedef _DartWeaveffiDocsDocumentGetTags = Pointer<Void> Function(Pointer<Void>);
 final _weaveffiDocsDocumentGetTags = _lib.lookupFunction<
     _NativeWeaveffiDocsDocumentGetTags, _DartWeaveffiDocsDocumentGetTags>('weaveffi_docs_Document_get_tags');
 
@@ -104,50 +109,26 @@ class Document {
 
   /// Stable opaque identifier
   int get id {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiDocsDocumentGetId(_handle, err);
-      _checkError(err);
-      return result;
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiDocsDocumentGetId(_handle);
+    return result;
   }
 
   /// Human-readable title shown in lists
   String get title {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiDocsDocumentGetTitle(_handle, err);
-      _checkError(err);
-      return result.toDartString();
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiDocsDocumentGetTitle(_handle);
+    return result.toDartString();
   }
 
   /// Current lifecycle status
   Status get status {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiDocsDocumentGetStatus(_handle, err);
-      _checkError(err);
-      return Status.fromValue(result);
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiDocsDocumentGetStatus(_handle);
+    return Status.fromValue(result);
   }
 
   /// Free-form tags for grouping
   List<String> get tags {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiDocsDocumentGetTags(_handle, err);
-      _checkError(err);
-      return result;
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiDocsDocumentGetTags(_handle);
+    return result;
   }
 }
 

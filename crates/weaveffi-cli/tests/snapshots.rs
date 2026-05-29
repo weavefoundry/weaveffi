@@ -192,6 +192,12 @@ snapshot_test!(
     "07_docs_everywhere.yml"
 );
 snapshot_test!(snapshot_c_kvstore, CGenerator, "kvstore", "08_kvstore.yml");
+snapshot_test!(
+    snapshot_c_nested_modules,
+    CGenerator,
+    "nested_modules",
+    "09_nested_modules.yml"
+);
 
 snapshot_test!(
     snapshot_cpp_calculator,
@@ -235,6 +241,12 @@ snapshot_test!(
     CppGenerator,
     "kvstore",
     "08_kvstore.yml"
+);
+snapshot_test!(
+    snapshot_cpp_nested_modules,
+    CppGenerator,
+    "nested_modules",
+    "09_nested_modules.yml"
 );
 
 snapshot_test!(
@@ -285,6 +297,12 @@ snapshot_test!(
     "kvstore",
     "08_kvstore.yml"
 );
+snapshot_test!(
+    snapshot_swift_nested_modules,
+    SwiftGenerator,
+    "nested_modules",
+    "09_nested_modules.yml"
+);
 
 snapshot_test!(
     snapshot_android_calculator,
@@ -333,6 +351,12 @@ snapshot_test!(
     AndroidGenerator,
     "kvstore",
     "08_kvstore.yml"
+);
+snapshot_test!(
+    snapshot_android_nested_modules,
+    AndroidGenerator,
+    "nested_modules",
+    "09_nested_modules.yml"
 );
 
 snapshot_test!(
@@ -383,6 +407,12 @@ snapshot_test!(
     "kvstore",
     "08_kvstore.yml"
 );
+snapshot_test!(
+    snapshot_node_nested_modules,
+    NodeGenerator,
+    "nested_modules",
+    "09_nested_modules.yml"
+);
 
 snapshot_test!(
     snapshot_wasm_calculator,
@@ -431,6 +461,12 @@ snapshot_test!(
     WasmGenerator,
     "kvstore",
     "08_kvstore.yml"
+);
+snapshot_test!(
+    snapshot_wasm_nested_modules,
+    WasmGenerator,
+    "nested_modules",
+    "09_nested_modules.yml"
 );
 
 snapshot_test!(
@@ -481,6 +517,12 @@ snapshot_test!(
     "kvstore",
     "08_kvstore.yml"
 );
+snapshot_test!(
+    snapshot_python_nested_modules,
+    PythonGenerator,
+    "nested_modules",
+    "09_nested_modules.yml"
+);
 
 snapshot_test!(
     snapshot_dotnet_calculator,
@@ -529,6 +571,12 @@ snapshot_test!(
     DotnetGenerator,
     "kvstore",
     "08_kvstore.yml"
+);
+snapshot_test!(
+    snapshot_dotnet_nested_modules,
+    DotnetGenerator,
+    "nested_modules",
+    "09_nested_modules.yml"
 );
 
 snapshot_test!(
@@ -579,6 +627,12 @@ snapshot_test!(
     "kvstore",
     "08_kvstore.yml"
 );
+snapshot_test!(
+    snapshot_dart_nested_modules,
+    DartGenerator,
+    "nested_modules",
+    "09_nested_modules.yml"
+);
 
 snapshot_test!(
     snapshot_go_calculator,
@@ -622,6 +676,12 @@ snapshot_test!(
     GoGenerator,
     "kvstore",
     "08_kvstore.yml"
+);
+snapshot_test!(
+    snapshot_go_nested_modules,
+    GoGenerator,
+    "nested_modules",
+    "09_nested_modules.yml"
 );
 
 snapshot_test!(
@@ -671,6 +731,12 @@ snapshot_test!(
     RubyGenerator,
     "kvstore",
     "08_kvstore.yml"
+);
+snapshot_test!(
+    snapshot_ruby_nested_modules,
+    RubyGenerator,
+    "nested_modules",
+    "09_nested_modules.yml"
 );
 
 /// Phase 5 prelude coverage: every generator, every fixture, every output file
@@ -723,6 +789,7 @@ fn prelude_present_in_every_generated_file() {
         "06_kitchen_sink.yml",
         "07_docs_everywhere.yml",
         "08_kvstore.yml",
+        "09_nested_modules.yml",
     ];
 
     for fixture in fixtures {

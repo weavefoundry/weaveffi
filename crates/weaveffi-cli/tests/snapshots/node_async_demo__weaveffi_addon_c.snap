@@ -23,7 +23,24 @@ static void weaveffi_tasks_run_task_napi_cb(void* context, weaveffi_error* err, 
         napi_reject_deferred(ctx->env, ctx->deferred, err_msg);
     } else {
         napi_value val;
-        napi_create_int64(ctx->env, (int64_t)(intptr_t)result, &val);
+        {
+          weaveffi_tasks_TaskResult* val_p = (weaveffi_tasks_TaskResult*)result;
+          napi_create_object(ctx->env, &val);
+          napi_value val_id;
+          napi_create_int64(ctx->env, weaveffi_tasks_TaskResult_get_id(val_p), &val_id);
+          napi_set_named_property(ctx->env, val, "id", val_id);
+          napi_value val_value;
+          {
+            char* val_value_s = (char*)weaveffi_tasks_TaskResult_get_value(val_p);
+            napi_create_string_utf8(ctx->env, val_value_s, NAPI_AUTO_LENGTH, &val_value);
+            weaveffi_free_string(val_value_s);
+          }
+          napi_set_named_property(ctx->env, val, "value", val_value);
+          napi_value val_success;
+          napi_get_boolean(ctx->env, weaveffi_tasks_TaskResult_get_success(val_p), &val_success);
+          napi_set_named_property(ctx->env, val, "success", val_success);
+          weaveffi_tasks_TaskResult_destroy(val_p);
+        }
         napi_resolve_deferred(ctx->env, ctx->deferred, val);
     }
     free(ctx);

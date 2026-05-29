@@ -119,18 +119,28 @@ pub fn wrapper_name(module: &str, func: &str, strip_module_prefix: bool) -> Stri
 
 /// Extract the local type name from a potentially qualified `module.TypeName`.
 ///
-/// `"other.Contact"` → `"Contact"`, `"Contact"` → `"Contact"`.
+/// Uses `rsplit_once` so that *multi-level* module paths keep working: only the
+/// final dotted segment is the type name.
+///
+/// `"other.Contact"` → `"Contact"`, `"a.b.Widget"` → `"Widget"`,
+/// `"Contact"` → `"Contact"`.
 pub fn local_type_name(name: &str) -> &str {
-    name.split_once('.').map_or(name, |(_, local)| local)
+    name.rsplit_once('.').map_or(name, |(_, local)| local)
 }
 
 /// Build the C ABI struct name, resolving cross-module qualified references.
 ///
+/// Qualified references use dot-separated module paths; the C ABI flattens
+/// those to underscore-joined symbol prefixes, so `rsplit_once` peels off the
+/// type name and the remaining dotted path becomes underscores.
+///
 /// `"other.Contact"` with any current module → `"{prefix}_other_Contact"`.
+/// `"a.b.Widget"` with any current module → `"{prefix}_a_b_Widget"`.
 /// `"Contact"` with current module `"math"` → `"{prefix}_math_Contact"`.
 pub fn c_abi_struct_name(name: &str, current_module: &str, prefix: &str) -> String {
-    if let Some((mod_name, type_name)) = name.split_once('.') {
-        format!("{prefix}_{mod_name}_{type_name}")
+    if let Some((module_path, type_name)) = name.rsplit_once('.') {
+        let module_path = module_path.replace('.', "_");
+        format!("{prefix}_{module_path}_{type_name}")
     } else {
         format!("{prefix}_{current_module}_{name}")
     }
@@ -151,6 +161,11 @@ mod tests {
     }
 
     #[test]
+    fn local_type_name_multi_level() {
+        assert_eq!(local_type_name("a.b.Widget"), "Widget");
+    }
+
+    #[test]
     fn c_abi_struct_name_unqualified() {
         assert_eq!(
             c_abi_struct_name("Contact", "math", "weaveffi"),
@@ -163,6 +178,14 @@ mod tests {
         assert_eq!(
             c_abi_struct_name("types.Name", "ops", "weaveffi"),
             "weaveffi_types_Name"
+        );
+    }
+
+    #[test]
+    fn c_abi_struct_name_multi_level_flattens_path() {
+        assert_eq!(
+            c_abi_struct_name("a.b.Widget", "ops", "weaveffi"),
+            "weaveffi_a_b_Widget"
         );
     }
 

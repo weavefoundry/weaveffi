@@ -13,6 +13,10 @@ import 'dart:async';
 import 'package:ffi/ffi.dart';
 
 DynamicLibrary _openLibrary() {
+  // An explicit path in WEAVEFFI_LIBRARY wins, so callers can point at a
+  // specific build artifact regardless of its file name or location.
+  final override = Platform.environment['WEAVEFFI_LIBRARY'];
+  if (override != null && override.isNotEmpty) return DynamicLibrary.open(override);
   if (Platform.isMacOS) return DynamicLibrary.open('libweaveffi.dylib');
   if (Platform.isLinux) return DynamicLibrary.open('libweaveffi.so');
   if (Platform.isWindows) return DynamicLibrary.open('weaveffi.dll');
@@ -42,9 +46,10 @@ class WeaveffiException implements Exception {
 
 void _checkError(Pointer<_WeaveffiError> err) {
   if (err.ref.code != 0) {
+    final code = err.ref.code;
     final msg = err.ref.message.toDartString();
     _weaveffiErrorClear(err);
-    throw WeaveffiException(err.ref.code, msg);
+    throw WeaveffiException(code, msg);
   }
 }
 
@@ -53,18 +58,18 @@ typedef _DartWeaveffiTasksTaskResultDestroy = void Function(Pointer<Void>);
 final _weaveffiTasksTaskResultDestroy = _lib.lookupFunction<
     _NativeWeaveffiTasksTaskResultDestroy, _DartWeaveffiTasksTaskResultDestroy>('weaveffi_tasks_TaskResult_destroy');
 
-typedef _NativeWeaveffiTasksTaskResultGetId = Int64 Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiTasksTaskResultGetId = int Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiTasksTaskResultGetId = Int64 Function(Pointer<Void>);
+typedef _DartWeaveffiTasksTaskResultGetId = int Function(Pointer<Void>);
 final _weaveffiTasksTaskResultGetId = _lib.lookupFunction<
     _NativeWeaveffiTasksTaskResultGetId, _DartWeaveffiTasksTaskResultGetId>('weaveffi_tasks_TaskResult_get_id');
 
-typedef _NativeWeaveffiTasksTaskResultGetValue = Pointer<Utf8> Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiTasksTaskResultGetValue = Pointer<Utf8> Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiTasksTaskResultGetValue = Pointer<Utf8> Function(Pointer<Void>);
+typedef _DartWeaveffiTasksTaskResultGetValue = Pointer<Utf8> Function(Pointer<Void>);
 final _weaveffiTasksTaskResultGetValue = _lib.lookupFunction<
     _NativeWeaveffiTasksTaskResultGetValue, _DartWeaveffiTasksTaskResultGetValue>('weaveffi_tasks_TaskResult_get_value');
 
-typedef _NativeWeaveffiTasksTaskResultGetSuccess = Int32 Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiTasksTaskResultGetSuccess = int Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiTasksTaskResultGetSuccess = Int32 Function(Pointer<Void>);
+typedef _DartWeaveffiTasksTaskResultGetSuccess = int Function(Pointer<Void>);
 final _weaveffiTasksTaskResultGetSuccess = _lib.lookupFunction<
     _NativeWeaveffiTasksTaskResultGetSuccess, _DartWeaveffiTasksTaskResultGetSuccess>('weaveffi_tasks_TaskResult_get_success');
 
@@ -77,36 +82,18 @@ class TaskResult {
   }
 
   int get id {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiTasksTaskResultGetId(_handle, err);
-      _checkError(err);
-      return result;
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiTasksTaskResultGetId(_handle);
+    return result;
   }
 
   String get value {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiTasksTaskResultGetValue(_handle, err);
-      _checkError(err);
-      return result.toDartString();
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiTasksTaskResultGetValue(_handle);
+    return result.toDartString();
   }
 
   bool get success {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiTasksTaskResultGetSuccess(_handle, err);
-      _checkError(err);
-      return result != 0;
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiTasksTaskResultGetSuccess(_handle);
+    return result != 0;
   }
 }
 

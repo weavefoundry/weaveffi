@@ -5,6 +5,8 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // DO NOT EDIT — your changes will be overwritten.
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
+#nullable enable
+
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;

@@ -77,19 +77,19 @@ void weaveffi_kv_Entry_get_metadata(const weaveffi_kv_Entry* ptr, const char** o
 typedef struct weaveffi_kv_EntryBuilder weaveffi_kv_EntryBuilder;
 weaveffi_kv_EntryBuilder* weaveffi_kv_Entry_Builder_new(void);
 /** Stable monotonic identifier assigned on insert */
-void weaveffi_kv_Entry_Builder_set_id(weaveffi_kv_EntryBuilder* builder, int64_t value);
+void weaveffi_kv_Entry_Builder_set_id(weaveffi_kv_EntryBuilder* builder, int64_t id);
 /** UTF-8 lookup key */
-void weaveffi_kv_Entry_Builder_set_key(weaveffi_kv_EntryBuilder* builder, const char* value);
+void weaveffi_kv_Entry_Builder_set_key(weaveffi_kv_EntryBuilder* builder, const char* key);
 /** Opaque binary payload */
 void weaveffi_kv_Entry_Builder_set_value(weaveffi_kv_EntryBuilder* builder, const uint8_t* value_ptr, size_t value_len);
 /** Unix-timestamp seconds when the entry was created */
-void weaveffi_kv_Entry_Builder_set_created_at(weaveffi_kv_EntryBuilder* builder, int64_t value);
+void weaveffi_kv_Entry_Builder_set_created_at(weaveffi_kv_EntryBuilder* builder, int64_t created_at);
 /** Optional unix-timestamp seconds at which the entry expires */
-void weaveffi_kv_Entry_Builder_set_expires_at(weaveffi_kv_EntryBuilder* builder, const int64_t* value);
+void weaveffi_kv_Entry_Builder_set_expires_at(weaveffi_kv_EntryBuilder* builder, const int64_t* expires_at);
 /** Free-form labels attached to the entry */
-void weaveffi_kv_Entry_Builder_set_tags(weaveffi_kv_EntryBuilder* builder, const char* const* value, size_t value_len);
+void weaveffi_kv_Entry_Builder_set_tags(weaveffi_kv_EntryBuilder* builder, const char* const* tags, size_t tags_len);
 /** Arbitrary string-valued metadata pairs */
-void weaveffi_kv_Entry_Builder_set_metadata(weaveffi_kv_EntryBuilder* builder, const char* const* value_keys, const char* const* value_values, size_t value_len);
+void weaveffi_kv_Entry_Builder_set_metadata(weaveffi_kv_EntryBuilder* builder, const char* const* metadata_keys, const char* const* metadata_values, size_t metadata_len);
 weaveffi_kv_Entry* weaveffi_kv_Entry_Builder_build(weaveffi_kv_EntryBuilder* builder, weaveffi_error* out_err);
 void weaveffi_kv_Entry_Builder_destroy(weaveffi_kv_EntryBuilder* builder);
 
@@ -120,16 +120,11 @@ int64_t weaveffi_kv_count(weaveffi_kv_Store* store, weaveffi_error* out_err);
 void weaveffi_kv_clear(weaveffi_kv_Store* store, weaveffi_error* out_err);
 /** Reclaim space asynchronously; returns the number of bytes reclaimed */
 typedef void (*weaveffi_kv_compact_async_callback)(void* context, weaveffi_error* err, int64_t result);
-/*
- * Async: weaveffi_kv_compact_async
- * The callback is called exactly once, on any thread.
- * On success, err is NULL and result (if any) is valid.
- * On failure, err is non-NULL with a non-zero code.
- */
 void weaveffi_kv_compact_async_async(weaveffi_kv_Store* store, weaveffi_cancel_token* cancel_token, weaveffi_kv_compact_async_callback callback, void* context);
 /** Legacy single-shot put kept for compatibility */
 __attribute__((deprecated("use put() with explicit kind")))
 bool weaveffi_kv_legacy_put(weaveffi_kv_Store* store, const char* key, const uint8_t* value_ptr, size_t value_len, weaveffi_error* out_err);
+
 // Module: kv_stats
 /** Aggregate store statistics */
 typedef struct weaveffi_kv_stats_Stats weaveffi_kv_stats_Stats;
@@ -144,7 +139,6 @@ int64_t weaveffi_kv_stats_Stats_get_expired_entries(const weaveffi_kv_stats_Stat
 
 /** Snapshot the current store statistics */
 weaveffi_kv_stats_Stats* weaveffi_kv_stats_get_stats(weaveffi_kv_stats_Store* store, weaveffi_error* out_err);
-
 
 
 #ifdef __cplusplus

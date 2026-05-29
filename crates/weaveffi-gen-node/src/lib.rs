@@ -4,6 +4,8 @@
 //! companion N-API addon. Async functions surface as `Promise`-returning
 //! methods. Implements the [`Generator`] trait.
 
+use std::collections::HashMap;
+
 use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
@@ -210,6 +212,7 @@ fn render_addon_c(api: &Api, strip_module_prefix: bool, input_basename: &str) ->
     }
 
     let mut all_exports: Vec<(String, String)> = Vec::new();
+    let structs = struct_registry(api);
 
     for (m, path) in walk_modules_with_path(&api.modules) {
         for f in &m.functions {
@@ -219,7 +222,7 @@ fn render_addon_c(api: &Api, strip_module_prefix: bool, input_basename: &str) ->
             all_exports.push((js_name, napi_name.clone()));
 
             if f.r#async {
-                render_async_callback(&mut out, f, &c_name, &path);
+                render_async_callback(&mut out, f, &c_name, &path, &structs);
             }
 
             out.push_str(&format!(
@@ -228,7 +231,7 @@ fn render_addon_c(api: &Api, strip_module_prefix: bool, input_basename: &str) ->
             if f.r#async {
                 render_async_napi_body(&mut out, f, &c_name, &path);
             } else {
-                render_napi_body(&mut out, f, &c_name, &path);
+                render_napi_body(&mut out, f, &c_name, &path, &structs);
             }
             out.push_str("}\n\n");
         }
@@ -278,7 +281,12 @@ fn async_cb_result_params_node(ret: Option<&TypeRef>, module: &str) -> String {
     }
 }
 
-fn emit_async_resolve_value(out: &mut String, ret: Option<&TypeRef>) {
+fn emit_async_resolve_value(
+    out: &mut String,
+    ret: Option<&TypeRef>,
+    module: &str,
+    structs: &HashMap<String, StructDef>,
+) {
     out.push_str("        napi_value val;\n");
     match ret {
         None => out.push_str("        napi_get_undefined(ctx->env, &val);\n"),
@@ -295,8 +303,10 @@ fn emit_async_resolve_value(out: &mut String, ret: Option<&TypeRef>) {
         Some(TypeRef::TypedHandle(_) | TypeRef::Handle) => {
             out.push_str("        napi_create_int64(ctx->env, (int64_t)result, &val);\n");
         }
-        Some(TypeRef::Struct(_)) => {
-            out.push_str("        napi_create_int64(ctx->env, (int64_t)(intptr_t)result, &val);\n");
+        Some(TypeRef::Struct(name)) => {
+            emit_struct_to_object(
+                out, "ctx->env", name, "result", "val", module, structs, "        ", true,
+            );
         }
         Some(TypeRef::Enum(_)) => {
             out.push_str("        napi_create_int32(ctx->env, (int32_t)result, &val);\n");
@@ -309,7 +319,13 @@ fn emit_async_resolve_value(out: &mut String, ret: Option<&TypeRef>) {
     out.push_str("        napi_resolve_deferred(ctx->env, ctx->deferred, val);\n");
 }
 
-fn render_async_callback(out: &mut String, f: &Function, c_name: &str, module: &str) {
+fn render_async_callback(
+    out: &mut String,
+    f: &Function,
+    c_name: &str,
+    module: &str,
+    structs: &HashMap<String, StructDef>,
+) {
     let cb_name = format!("{c_name}_napi_cb");
     let cb_result = async_cb_result_params_node(f.returns.as_ref(), module);
 
@@ -324,7 +340,7 @@ fn render_async_callback(out: &mut String, f: &Function, c_name: &str, module: &
     );
     out.push_str("        napi_reject_deferred(ctx->env, ctx->deferred, err_msg);\n");
     out.push_str("    } else {\n");
-    emit_async_resolve_value(out, f.returns.as_ref());
+    emit_async_resolve_value(out, f.returns.as_ref(), module, structs);
     out.push_str("    }\n");
     out.push_str("    free(ctx);\n");
     out.push_str("}\n\n");
@@ -371,7 +387,13 @@ fn render_async_napi_body(out: &mut String, f: &Function, c_name: &str, module: 
     out.push_str("  return promise;\n");
 }
 
-fn render_napi_body(out: &mut String, f: &Function, c_name: &str, module: &str) {
+fn render_napi_body(
+    out: &mut String,
+    f: &Function,
+    c_name: &str,
+    module: &str,
+    structs: &HashMap<String, StructDef>,
+) {
     let n = f.params.len();
     if n > 0 {
         out.push_str(&format!("  size_t argc = {n};\n"));
@@ -417,7 +439,7 @@ fn render_napi_body(out: &mut String, f: &Function, c_name: &str, module: &str) 
     out.push_str("  }\n");
 
     match &f.returns {
-        Some(ret) => emit_ret_to_napi(out, ret, module, &f.name),
+        Some(ret) => emit_ret_to_napi(out, ret, module, &f.name, structs),
         None => {
             out.push_str("  napi_value ret;\n");
             out.push_str("  napi_get_undefined(env, &ret);\n");
@@ -831,7 +853,193 @@ fn emit_ret_out_params(out: &mut String, c_args: &mut Vec<String>, ty: &TypeRef,
     }
 }
 
-fn emit_ret_to_napi(out: &mut String, ty: &TypeRef, module: &str, fn_name: &str) {
+/// Build a `name -> StructDef` registry over every (possibly nested) module so
+/// that struct-returning functions can materialize a real JS object (matching
+/// the shape declared in `types.d.ts`) instead of leaking a raw handle number.
+fn struct_registry(api: &Api) -> HashMap<String, StructDef> {
+    walk_modules(&api.modules)
+        .flat_map(|m| m.structs.iter())
+        .map(|s| (s.name.clone(), s.clone()))
+        .collect()
+}
+
+/// Materialize an *owned* C struct pointer (`ptr_expr`) into a plain JS object
+/// assigned to `obj_var`, by invoking each generated field getter. The pointer
+/// is consumed: after the fields are read it is destroyed, because the C ABI
+/// hands back owned struct handles (the same ownership the other backends free).
+#[allow(clippy::too_many_arguments)]
+fn emit_struct_to_object(
+    out: &mut String,
+    env: &str,
+    struct_name: &str,
+    ptr_expr: &str,
+    obj_var: &str,
+    module: &str,
+    structs: &HashMap<String, StructDef>,
+    indent: &str,
+    destroy: bool,
+) {
+    let abi = c_abi_struct_name(struct_name, module, "weaveffi");
+    let Some(def) = structs.get(local_type_name(struct_name)).cloned() else {
+        // Unknown struct: fall back to the raw handle rather than emit broken C.
+        out.push_str(&format!(
+            "{indent}napi_create_int64({env}, (int64_t)(intptr_t){ptr_expr}, &{obj_var});\n"
+        ));
+        return;
+    };
+    let p = format!("{obj_var}_p");
+    out.push_str(&format!("{indent}{{\n"));
+    out.push_str(&format!("{indent}  {abi}* {p} = ({abi}*){ptr_expr};\n"));
+    out.push_str(&format!(
+        "{indent}  napi_create_object({env}, &{obj_var});\n"
+    ));
+    for field in &def.fields {
+        let getter = format!("{abi}_get_{}", field.name);
+        let fv = format!("{obj_var}_{}", field.name);
+        out.push_str(&format!("{indent}  napi_value {fv};\n"));
+        emit_struct_field_to_napi(
+            out,
+            env,
+            &field.ty,
+            &getter,
+            &p,
+            &fv,
+            module,
+            structs,
+            &format!("{indent}  "),
+        );
+        out.push_str(&format!(
+            "{indent}  napi_set_named_property({env}, {obj_var}, \"{}\", {fv});\n",
+            field.name
+        ));
+    }
+    if destroy {
+        out.push_str(&format!("{indent}  {abi}_destroy({p});\n"));
+    }
+    out.push_str(&format!("{indent}}}\n"));
+}
+
+/// Marshal one struct field, read via `getter(pv)`, into the JS value `fv`.
+/// Scalars, enums, handles, owned strings, optional strings and nested structs
+/// are fully materialized; collection- and optional-scalar-typed fields fall
+/// back to `null` (the getter ABIs differ and no conformance sample needs them).
+#[allow(clippy::too_many_arguments)]
+fn emit_struct_field_to_napi(
+    out: &mut String,
+    env: &str,
+    ty: &TypeRef,
+    getter: &str,
+    pv: &str,
+    fv: &str,
+    module: &str,
+    structs: &HashMap<String, StructDef>,
+    indent: &str,
+) {
+    match ty {
+        TypeRef::I32 => out.push_str(&format!(
+            "{indent}napi_create_int32({env}, {getter}({pv}), &{fv});\n"
+        )),
+        TypeRef::U32 => out.push_str(&format!(
+            "{indent}napi_create_uint32({env}, {getter}({pv}), &{fv});\n"
+        )),
+        TypeRef::I64 => out.push_str(&format!(
+            "{indent}napi_create_int64({env}, {getter}({pv}), &{fv});\n"
+        )),
+        TypeRef::F64 => out.push_str(&format!(
+            "{indent}napi_create_double({env}, {getter}({pv}), &{fv});\n"
+        )),
+        TypeRef::Bool => out.push_str(&format!(
+            "{indent}napi_get_boolean({env}, {getter}({pv}), &{fv});\n"
+        )),
+        TypeRef::Enum(_) => out.push_str(&format!(
+            "{indent}napi_create_int32({env}, (int32_t){getter}({pv}), &{fv});\n"
+        )),
+        TypeRef::Handle | TypeRef::TypedHandle(_) => out.push_str(&format!(
+            "{indent}napi_create_int64({env}, (int64_t){getter}({pv}), &{fv});\n"
+        )),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            let owned = matches!(ty, TypeRef::StringUtf8);
+            out.push_str(&format!("{indent}{{\n"));
+            out.push_str(&format!(
+                "{indent}  char* {fv}_s = (char*){getter}({pv});\n"
+            ));
+            out.push_str(&format!(
+                "{indent}  napi_create_string_utf8({env}, {fv}_s, NAPI_AUTO_LENGTH, &{fv});\n"
+            ));
+            if owned {
+                out.push_str(&format!("{indent}  weaveffi_free_string({fv}_s);\n"));
+            }
+            out.push_str(&format!("{indent}}}\n"));
+        }
+        TypeRef::Struct(name) => {
+            emit_struct_to_object(
+                out,
+                env,
+                name,
+                &format!("{getter}({pv})"),
+                fv,
+                module,
+                structs,
+                indent,
+                true,
+            );
+        }
+        TypeRef::Optional(inner)
+            if matches!(inner.as_ref(), TypeRef::StringUtf8 | TypeRef::BorrowedStr) =>
+        {
+            let owned = matches!(inner.as_ref(), TypeRef::StringUtf8);
+            out.push_str(&format!("{indent}{{\n"));
+            out.push_str(&format!(
+                "{indent}  char* {fv}_s = (char*){getter}({pv});\n"
+            ));
+            out.push_str(&format!(
+                "{indent}  if ({fv}_s == NULL) {{ napi_get_null({env}, &{fv}); }}\n"
+            ));
+            out.push_str(&format!(
+                "{indent}  else {{ napi_create_string_utf8({env}, {fv}_s, NAPI_AUTO_LENGTH, &{fv});"
+            ));
+            if owned {
+                out.push_str(&format!(" weaveffi_free_string({fv}_s);"));
+            }
+            out.push_str(" }\n");
+            out.push_str(&format!("{indent}}}\n"));
+        }
+        TypeRef::Optional(inner) if matches!(inner.as_ref(), TypeRef::Struct(_)) => {
+            let TypeRef::Struct(name) = inner.as_ref() else {
+                unreachable!()
+            };
+            let abi = c_abi_struct_name(name, module, "weaveffi");
+            out.push_str(&format!("{indent}{{\n"));
+            out.push_str(&format!("{indent}  {abi}* {fv}_sp = {getter}({pv});\n"));
+            out.push_str(&format!(
+                "{indent}  if ({fv}_sp == NULL) {{ napi_get_null({env}, &{fv}); }}\n"
+            ));
+            out.push_str(&format!("{indent}  else {{\n"));
+            emit_struct_to_object(
+                out,
+                env,
+                name,
+                &format!("{fv}_sp"),
+                fv,
+                module,
+                structs,
+                &format!("{indent}    "),
+                true,
+            );
+            out.push_str(&format!("{indent}  }}\n"));
+            out.push_str(&format!("{indent}}}\n"));
+        }
+        _ => out.push_str(&format!("{indent}napi_get_null({env}, &{fv});\n")),
+    }
+}
+
+fn emit_ret_to_napi(
+    out: &mut String,
+    ty: &TypeRef,
+    module: &str,
+    fn_name: &str,
+    structs: &HashMap<String, StructDef>,
+) {
     out.push_str("  napi_value ret;\n");
     match ty {
         TypeRef::I32 => out.push_str("  napi_create_int32(env, result, &ret);\n"),
@@ -849,8 +1057,10 @@ fn emit_ret_to_napi(out: &mut String, ty: &TypeRef, module: &str, fn_name: &str)
         TypeRef::TypedHandle(_) | TypeRef::Handle => {
             out.push_str("  napi_create_int64(env, (int64_t)result, &ret);\n");
         }
-        TypeRef::Struct(_) => {
-            out.push_str("  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);\n");
+        TypeRef::Struct(name) => {
+            emit_struct_to_object(
+                out, "env", name, "result", "ret", module, structs, "  ", true,
+            );
         }
         TypeRef::Enum(_) => {
             out.push_str("  napi_create_int32(env, (int32_t)result, &ret);\n");
@@ -866,10 +1076,10 @@ fn emit_ret_to_napi(out: &mut String, ty: &TypeRef, module: &str, fn_name: &str)
             out.push_str("  if (result == NULL) {\n");
             out.push_str("    napi_get_null(env, &ret);\n");
             out.push_str("  } else {\n");
-            emit_optional_ret_inner(out, inner, module);
+            emit_optional_ret_inner(out, inner, module, structs);
             out.push_str("  }\n");
         }
-        TypeRef::List(inner) => emit_list_ret(out, inner, module, "  "),
+        TypeRef::List(inner) => emit_list_ret(out, inner, module, "  ", structs),
         TypeRef::Map(_, _) => {
             out.push_str("  napi_create_object(env, &ret);\n");
         }
@@ -926,7 +1136,12 @@ fn emit_ret_to_napi(out: &mut String, ty: &TypeRef, module: &str, fn_name: &str)
     out.push_str("  return ret;\n");
 }
 
-fn emit_optional_ret_inner(out: &mut String, inner: &TypeRef, module: &str) {
+fn emit_optional_ret_inner(
+    out: &mut String,
+    inner: &TypeRef,
+    module: &str,
+    structs: &HashMap<String, StructDef>,
+) {
     match inner {
         TypeRef::I32 => {
             out.push_str("    napi_create_int32(env, *result, &ret);\n");
@@ -960,15 +1175,23 @@ fn emit_optional_ret_inner(out: &mut String, inner: &TypeRef, module: &str) {
             out.push_str("    napi_create_string_utf8(env, result, NAPI_AUTO_LENGTH, &ret);\n");
             out.push_str("    weaveffi_free_string(result);\n");
         }
-        TypeRef::Struct(_) => {
-            out.push_str("    napi_create_int64(env, (int64_t)(intptr_t)result, &ret);\n");
+        TypeRef::Struct(name) => {
+            emit_struct_to_object(
+                out, "env", name, "result", "ret", module, structs, "    ", true,
+            );
         }
-        TypeRef::List(li) => emit_list_ret(out, li, module, "    "),
+        TypeRef::List(li) => emit_list_ret(out, li, module, "    ", structs),
         _ => out.push_str("    napi_get_null(env, &ret);\n"),
     }
 }
 
-fn emit_list_ret(out: &mut String, inner: &TypeRef, _module: &str, ind: &str) {
+fn emit_list_ret(
+    out: &mut String,
+    inner: &TypeRef,
+    module: &str,
+    ind: &str,
+    structs: &HashMap<String, StructDef>,
+) {
     out.push_str(&format!(
         "{ind}napi_create_array_with_length(env, out_len, &ret);\n"
     ));
@@ -1001,9 +1224,23 @@ fn emit_list_ret(out: &mut String, inner: &TypeRef, _module: &str, ind: &str) {
             ));
             out.push_str(&format!("{ind}  weaveffi_free_string(result[ret_i]);\n"));
         }
-        TypeRef::Struct(_) | TypeRef::Enum(_) => out.push_str(&format!(
-            "{ind}  napi_create_int64(env, (int64_t)(intptr_t)result[ret_i], &elem);\n"
+        TypeRef::Enum(_) => out.push_str(&format!(
+            "{ind}  napi_create_int32(env, (int32_t)result[ret_i], &elem);\n"
         )),
+        TypeRef::Struct(name) => {
+            let elem_indent = format!("{ind}  ");
+            emit_struct_to_object(
+                out,
+                "env",
+                name,
+                "result[ret_i]",
+                "elem",
+                module,
+                structs,
+                &elem_indent,
+                true,
+            );
+        }
         _ => out.push_str(&format!(
             "{ind}  napi_create_int64(env, (int64_t)result[ret_i], &elem);\n"
         )),

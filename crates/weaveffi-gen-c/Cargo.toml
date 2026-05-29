@@ -14,7 +14,6 @@ weaveffi-core = { path = "../weaveffi-core", version = "0.5.0" }
 weaveffi-ir = { path = "../weaveffi-ir", version = "0.5.0" }
 anyhow = { workspace = true }
 camino = { workspace = true }
-heck = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]

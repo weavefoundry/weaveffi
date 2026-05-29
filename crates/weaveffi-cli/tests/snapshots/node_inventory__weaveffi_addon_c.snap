@@ -49,7 +49,37 @@ static napi_value Napi_weaveffi_products_get_product(napi_env env, napi_callback
     return NULL;
   }
   napi_value ret;
-  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
+  {
+    weaveffi_products_Product* ret_p = (weaveffi_products_Product*)result;
+    napi_create_object(env, &ret);
+    napi_value ret_id;
+    napi_create_int64(env, weaveffi_products_Product_get_id(ret_p), &ret_id);
+    napi_set_named_property(env, ret, "id", ret_id);
+    napi_value ret_name;
+    {
+      char* ret_name_s = (char*)weaveffi_products_Product_get_name(ret_p);
+      napi_create_string_utf8(env, ret_name_s, NAPI_AUTO_LENGTH, &ret_name);
+      weaveffi_free_string(ret_name_s);
+    }
+    napi_set_named_property(env, ret, "name", ret_name);
+    napi_value ret_description;
+    {
+      char* ret_description_s = (char*)weaveffi_products_Product_get_description(ret_p);
+      if (ret_description_s == NULL) { napi_get_null(env, &ret_description); }
+      else { napi_create_string_utf8(env, ret_description_s, NAPI_AUTO_LENGTH, &ret_description); weaveffi_free_string(ret_description_s); }
+    }
+    napi_set_named_property(env, ret, "description", ret_description);
+    napi_value ret_price;
+    napi_create_double(env, weaveffi_products_Product_get_price(ret_p), &ret_price);
+    napi_set_named_property(env, ret, "price", ret_price);
+    napi_value ret_category;
+    napi_create_int32(env, (int32_t)weaveffi_products_Product_get_category(ret_p), &ret_category);
+    napi_set_named_property(env, ret, "category", ret_category);
+    napi_value ret_tags;
+    napi_get_null(env, &ret_tags);
+    napi_set_named_property(env, ret, "tags", ret_tags);
+    weaveffi_products_Product_destroy(ret_p);
+  }
   return ret;
 }
 
@@ -71,7 +101,37 @@ static napi_value Napi_weaveffi_products_search_products(napi_env env, napi_call
   napi_create_array_with_length(env, out_len, &ret);
   for (size_t ret_i = 0; ret_i < out_len; ret_i++) {
     napi_value elem;
-    napi_create_int64(env, (int64_t)(intptr_t)result[ret_i], &elem);
+    {
+      weaveffi_products_Product* elem_p = (weaveffi_products_Product*)result[ret_i];
+      napi_create_object(env, &elem);
+      napi_value elem_id;
+      napi_create_int64(env, weaveffi_products_Product_get_id(elem_p), &elem_id);
+      napi_set_named_property(env, elem, "id", elem_id);
+      napi_value elem_name;
+      {
+        char* elem_name_s = (char*)weaveffi_products_Product_get_name(elem_p);
+        napi_create_string_utf8(env, elem_name_s, NAPI_AUTO_LENGTH, &elem_name);
+        weaveffi_free_string(elem_name_s);
+      }
+      napi_set_named_property(env, elem, "name", elem_name);
+      napi_value elem_description;
+      {
+        char* elem_description_s = (char*)weaveffi_products_Product_get_description(elem_p);
+        if (elem_description_s == NULL) { napi_get_null(env, &elem_description); }
+        else { napi_create_string_utf8(env, elem_description_s, NAPI_AUTO_LENGTH, &elem_description); weaveffi_free_string(elem_description_s); }
+      }
+      napi_set_named_property(env, elem, "description", elem_description);
+      napi_value elem_price;
+      napi_create_double(env, weaveffi_products_Product_get_price(elem_p), &elem_price);
+      napi_set_named_property(env, elem, "price", elem_price);
+      napi_value elem_category;
+      napi_create_int32(env, (int32_t)weaveffi_products_Product_get_category(elem_p), &elem_category);
+      napi_set_named_property(env, elem, "category", elem_category);
+      napi_value elem_tags;
+      napi_get_null(env, &elem_tags);
+      napi_set_named_property(env, elem, "tags", elem_tags);
+      weaveffi_products_Product_destroy(elem_p);
+    }
     napi_set_element(env, ret, (uint32_t)ret_i, elem);
   }
   free(result);
@@ -157,7 +217,27 @@ static napi_value Napi_weaveffi_orders_get_order(napi_env env, napi_callback_inf
     return NULL;
   }
   napi_value ret;
-  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
+  {
+    weaveffi_orders_Order* ret_p = (weaveffi_orders_Order*)result;
+    napi_create_object(env, &ret);
+    napi_value ret_id;
+    napi_create_int64(env, weaveffi_orders_Order_get_id(ret_p), &ret_id);
+    napi_set_named_property(env, ret, "id", ret_id);
+    napi_value ret_items;
+    napi_get_null(env, &ret_items);
+    napi_set_named_property(env, ret, "items", ret_items);
+    napi_value ret_total;
+    napi_create_double(env, weaveffi_orders_Order_get_total(ret_p), &ret_total);
+    napi_set_named_property(env, ret, "total", ret_total);
+    napi_value ret_status;
+    {
+      char* ret_status_s = (char*)weaveffi_orders_Order_get_status(ret_p);
+      napi_create_string_utf8(env, ret_status_s, NAPI_AUTO_LENGTH, &ret_status);
+      weaveffi_free_string(ret_status_s);
+    }
+    napi_set_named_property(env, ret, "status", ret_status);
+    weaveffi_orders_Order_destroy(ret_p);
+  }
   return ret;
 }
 

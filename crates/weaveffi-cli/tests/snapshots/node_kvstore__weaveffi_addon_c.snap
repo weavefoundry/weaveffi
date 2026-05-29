@@ -112,7 +112,36 @@ static napi_value Napi_weaveffi_kv_get(napi_env env, napi_callback_info info) {
   if (result == NULL) {
     napi_get_null(env, &ret);
   } else {
-    napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
+    {
+      weaveffi_kv_Entry* ret_p = (weaveffi_kv_Entry*)result;
+      napi_create_object(env, &ret);
+      napi_value ret_id;
+      napi_create_int64(env, weaveffi_kv_Entry_get_id(ret_p), &ret_id);
+      napi_set_named_property(env, ret, "id", ret_id);
+      napi_value ret_key;
+      {
+        char* ret_key_s = (char*)weaveffi_kv_Entry_get_key(ret_p);
+        napi_create_string_utf8(env, ret_key_s, NAPI_AUTO_LENGTH, &ret_key);
+        weaveffi_free_string(ret_key_s);
+      }
+      napi_set_named_property(env, ret, "key", ret_key);
+      napi_value ret_value;
+      napi_get_null(env, &ret_value);
+      napi_set_named_property(env, ret, "value", ret_value);
+      napi_value ret_created_at;
+      napi_create_int64(env, weaveffi_kv_Entry_get_created_at(ret_p), &ret_created_at);
+      napi_set_named_property(env, ret, "created_at", ret_created_at);
+      napi_value ret_expires_at;
+      napi_get_null(env, &ret_expires_at);
+      napi_set_named_property(env, ret, "expires_at", ret_expires_at);
+      napi_value ret_tags;
+      napi_get_null(env, &ret_tags);
+      napi_set_named_property(env, ret, "tags", ret_tags);
+      napi_value ret_metadata;
+      napi_get_null(env, &ret_metadata);
+      napi_set_named_property(env, ret, "metadata", ret_metadata);
+      weaveffi_kv_Entry_destroy(ret_p);
+    }
   }
   return ret;
 }
@@ -281,7 +310,20 @@ static napi_value Napi_weaveffi_kv_stats_get_stats(napi_env env, napi_callback_i
     return NULL;
   }
   napi_value ret;
-  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
+  {
+    weaveffi_kv_stats_Stats* ret_p = (weaveffi_kv_stats_Stats*)result;
+    napi_create_object(env, &ret);
+    napi_value ret_total_entries;
+    napi_create_int64(env, weaveffi_kv_stats_Stats_get_total_entries(ret_p), &ret_total_entries);
+    napi_set_named_property(env, ret, "total_entries", ret_total_entries);
+    napi_value ret_total_bytes;
+    napi_create_int64(env, weaveffi_kv_stats_Stats_get_total_bytes(ret_p), &ret_total_bytes);
+    napi_set_named_property(env, ret, "total_bytes", ret_total_bytes);
+    napi_value ret_expired_entries;
+    napi_create_int64(env, weaveffi_kv_stats_Stats_get_expired_entries(ret_p), &ret_expired_entries);
+    napi_set_named_property(env, ret, "expired_entries", ret_expired_entries);
+    weaveffi_kv_stats_Stats_destroy(ret_p);
+  }
   return ret;
 }
 

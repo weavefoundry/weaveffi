@@ -394,14 +394,13 @@ fn render_go(api: &Api, input_basename: &str) -> String {
     out.push('\n');
 
     if needs_bool {
+        // cgo models C `_Bool` as a distinct Go type whose underlying kind is
+        // bool, so convert with the type itself rather than integer literals.
         out.push_str("func boolToC(b bool) C._Bool {\n");
-        out.push_str("\tif b {\n");
-        out.push_str("\t\treturn 1\n");
-        out.push_str("\t}\n");
-        out.push_str("\treturn 0\n");
+        out.push_str("\treturn C._Bool(b)\n");
         out.push_str("}\n\n");
         out.push_str("func cToBool(b C._Bool) bool {\n");
-        out.push_str("\treturn b != 0\n");
+        out.push_str("\treturn bool(b)\n");
         out.push_str("}\n\n");
     }
 

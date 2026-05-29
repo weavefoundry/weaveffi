@@ -11,11 +11,13 @@ use camino::Utf8Path;
 use heck::ToUpperCamelCase;
 use serde::{Deserialize, Serialize};
 use weaveffi_core::abi::{self, AbiParam};
+use weaveffi_core::cabi;
 use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, is_c_pointer_type, walk_modules, walk_modules_with_path,
     DocCommentStyle,
 };
 use weaveffi_core::codegen::Generator;
+use weaveffi_core::model::BindingModel;
 use weaveffi_core::utils::{
     c_abi_struct_name, local_type_name, render_abi_prefix_aliases, render_prelude, render_trailer,
     CommentStyle,
@@ -245,181 +247,21 @@ fn c_element_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
     abi::element_ctype(ty, module).render_c(prefix)
 }
 
-fn c_param_type(ty: &TypeRef, name: &str, module: &str, prefix: &str) -> String {
-    render_param_decls(&abi::lower_param(name, ty, module, false), prefix).join(", ")
-}
-
-fn c_ret_type(ty: &TypeRef, module: &str, prefix: &str) -> (String, Vec<String>) {
-    // The C++ wrapper lowers an iterator-returning function's ABI slot exactly
-    // like a list (`elem* result, size_t* out_len`); the iterator object itself
-    // is reconstructed in the wrapper layer.
-    let lowered = match ty {
-        TypeRef::Iterator(inner) => abi::lower_return(&TypeRef::List(inner.clone()), module),
-        _ => abi::lower_return(ty, module),
-    };
-    (
-        lowered.ret.render_c(prefix),
-        render_param_decls(&lowered.out_params, prefix),
-    )
-}
-
 fn c_callback_result_params(ty: &TypeRef, module: &str, prefix: &str) -> Vec<String> {
     render_param_decls(&abi::callback_result_params(ty, module), prefix)
 }
 
 // ── extern "C" block ──
+//
+// Rendered from the shared [`weaveffi_core::cabi`] model renderer — the exact
+// same declarations the C generator emits — so the C++ wrapper can never drift
+// from the ABI it binds (iterators as opaque handles, listeners present, etc.).
 
 fn render_extern_c(out: &mut String, api: &Api, prefix: &str) {
-    out.push_str(&format!("typedef uint64_t {prefix}_handle_t;\n\n"));
-    out.push_str(&format!("typedef struct {prefix}_error {{\n"));
-    out.push_str("    int32_t code;\n");
-    out.push_str("    const char* message;\n");
-    out.push_str(&format!("}} {prefix}_error;\n\n"));
-    out.push_str(&format!(
-        "void {prefix}_error_clear({prefix}_error* err);\n"
-    ));
-    out.push_str(&format!("void {prefix}_free_string(const char* ptr);\n"));
-    out.push_str(&format!(
-        "void {prefix}_free_bytes(uint8_t* ptr, size_t len);\n\n"
-    ));
-    out.push_str(&format!(
-        "typedef struct {prefix}_cancel_token {prefix}_cancel_token;\n"
-    ));
-    out.push_str(&format!(
-        "{prefix}_cancel_token* {prefix}_cancel_token_create(void);\n"
-    ));
-    out.push_str(&format!(
-        "void {prefix}_cancel_token_cancel({prefix}_cancel_token* token);\n"
-    ));
-    out.push_str(&format!(
-        "bool {prefix}_cancel_token_is_cancelled(const {prefix}_cancel_token* token);\n"
-    ));
-    out.push_str(&format!(
-        "void {prefix}_cancel_token_destroy({prefix}_cancel_token* token);\n\n"
-    ));
-
-    for (module, path) in walk_modules_with_path(&api.modules) {
-        for e in &module.enums {
-            let tag = format!("{prefix}_{}_{}", path, e.name);
-            emit_doc(out, &e.doc, "");
-            if e.variants.iter().any(|v| v.doc.is_some()) {
-                out.push_str("typedef enum {\n");
-                for (i, v) in e.variants.iter().enumerate() {
-                    emit_doc(out, &v.doc, "    ");
-                    let comma = if i + 1 == e.variants.len() { "" } else { "," };
-                    out.push_str(&format!("    {tag}_{} = {}{comma}\n", v.name, v.value));
-                }
-                out.push_str(&format!("}} {tag};\n"));
-            } else {
-                let vars: Vec<String> = e
-                    .variants
-                    .iter()
-                    .map(|v| format!("{tag}_{} = {}", v.name, v.value))
-                    .collect();
-                out.push_str(&format!("typedef enum {{ {} }} {tag};\n", vars.join(", ")));
-            }
-        }
-
-        for s in &module.structs {
-            let tag = format!("{prefix}_{}_{}", path, s.name);
-            emit_doc(out, &s.doc, "");
-            out.push_str(&format!("typedef struct {tag} {tag};\n"));
-
-            let mut params: Vec<String> = s
-                .fields
-                .iter()
-                .map(|f| c_param_type(&f.ty, &f.name, &path, prefix))
-                .collect();
-            params.push(format!("{prefix}_error* out_err"));
-            out.push_str(&format!("{tag}* {tag}_create({});\n", params.join(", ")));
-            out.push_str(&format!("void {tag}_destroy({tag}* ptr);\n"));
-
-            for field in &s.fields {
-                let (ret_ty, extra) = c_ret_type(&field.ty, &path, prefix);
-                let getter = format!("{tag}_get_{}", field.name);
-                emit_doc(out, &field.doc, "");
-                if extra.is_empty() {
-                    out.push_str(&format!("{ret_ty} {getter}(const {tag}* ptr);\n"));
-                } else {
-                    out.push_str(&format!(
-                        "{ret_ty} {getter}(const {tag}* ptr, {});\n",
-                        extra.join(", ")
-                    ));
-                }
-            }
-
-            if s.builder {
-                let builder_ty = format!("{tag}Builder");
-                out.push_str(&format!("typedef struct {builder_ty} {builder_ty};\n"));
-                out.push_str(&format!("{builder_ty}* {tag}_Builder_new(void);\n"));
-                for field in &s.fields {
-                    let param = c_param_type(&field.ty, "value", &path, prefix);
-                    emit_doc(out, &field.doc, "");
-                    out.push_str(&format!(
-                        "void {tag}_Builder_set_{}({builder_ty}* builder, {});\n",
-                        field.name, param
-                    ));
-                }
-                out.push_str(&format!(
-                    "{tag}* {tag}_Builder_build({builder_ty}* builder, {prefix}_error* out_err);\n"
-                ));
-                out.push_str(&format!(
-                    "void {tag}_Builder_destroy({builder_ty}* builder);\n"
-                ));
-            }
-        }
-
-        for f in &module.functions {
-            emit_doc(out, &f.doc, "");
-            if f.r#async {
-                let fn_base = format!("{prefix}_{}_{}", path, f.name);
-                let cb_name = format!("{fn_base}_callback");
-                let mut cb_params =
-                    vec!["void* context".to_string(), format!("{prefix}_error* err")];
-                if let Some(ret) = &f.returns {
-                    cb_params.extend(c_callback_result_params(ret, &path, prefix));
-                }
-                out.push_str(&format!(
-                    "typedef void (*{cb_name})({});\n",
-                    cb_params.join(", ")
-                ));
-                let mut params_sig: Vec<String> = f
-                    .params
-                    .iter()
-                    .map(|p| c_param_type(&p.ty, &p.name, &path, prefix))
-                    .collect();
-                if f.cancellable {
-                    params_sig.push(format!("{prefix}_cancel_token* cancel_token"));
-                }
-                params_sig.push(format!("{cb_name} callback"));
-                params_sig.push("void* context".to_string());
-                out.push_str(&format!(
-                    "void {fn_base}_async({});\n",
-                    params_sig.join(", ")
-                ));
-            } else {
-                let mut p: Vec<String> = f
-                    .params
-                    .iter()
-                    .map(|p| c_param_type(&p.ty, &p.name, &path, prefix))
-                    .collect();
-                let ret = if let Some(r) = &f.returns {
-                    let (rt, extra) = c_ret_type(r, &path, prefix);
-                    p.extend(extra);
-                    rt
-                } else {
-                    "void".into()
-                };
-                p.push(format!("{prefix}_error* out_err"));
-                out.push_str(&format!(
-                    "{ret} {prefix}_{}_{}({});\n",
-                    path,
-                    f.name,
-                    p.join(", ")
-                ));
-            }
-        }
-
+    let model = BindingModel::build(api, prefix);
+    cabi::render_runtime_decls(out, prefix);
+    for m in &model.modules {
+        cabi::render_module_decls(out, m, prefix);
         out.push('\n');
     }
 }
@@ -991,6 +833,14 @@ fn render_cpp_function(
     error_codes: &[&ErrorCode],
     prefix: &str,
 ) {
+    // Iterator-returning functions use the opaque-handle + next/destroy ABI,
+    // which is structurally different from a list return, so they get a
+    // dedicated renderer that drives the iterator to exhaustion.
+    if let Some(TypeRef::Iterator(inner)) = &func.returns {
+        render_cpp_iterator_function(out, func, inner, abi_module, error_codes, prefix);
+        return;
+    }
+
     let cpp_ret = func.returns.as_ref().map_or("void".to_string(), cpp_type);
     let cpp_params: Vec<String> = func
         .params
@@ -1081,6 +931,143 @@ fn render_cpp_function(
         render_cpp_return(out, ret, prefix);
     }
 
+    out.push_str("}\n\n");
+}
+
+/// Emit the body of an `if (err.code != 0) { ... }` throw block at `indent`
+/// (the indent of the statements *inside* the braces). Translates the C error
+/// struct into the matching C++ exception, clearing the error first.
+fn emit_error_throw_body(out: &mut String, error_codes: &[&ErrorCode], prefix: &str, indent: &str) {
+    out.push_str(&format!(
+        "{indent}std::string msg(err.message ? err.message : \"unknown error\");\n"
+    ));
+    out.push_str(&format!("{indent}int32_t code = err.code;\n"));
+    out.push_str(&format!("{indent}{prefix}_error_clear(&err);\n"));
+    if error_codes.is_empty() {
+        out.push_str(&format!("{indent}throw WeaveFFIError(code, msg);\n"));
+    } else {
+        out.push_str(&format!("{indent}switch (code) {{\n"));
+        for ec in error_codes {
+            out.push_str(&format!(
+                "{indent}case {}: throw {}Error(msg);\n",
+                ec.code, ec.name
+            ));
+        }
+        out.push_str(&format!(
+            "{indent}default: throw WeaveFFIError(code, msg);\n"
+        ));
+        out.push_str(&format!("{indent}}}\n"));
+    }
+}
+
+/// Render an iterator-returning function. The C ABI yields an opaque iterator
+/// handle plus `_next`/`_destroy`; the wrapper drives it to exhaustion and
+/// returns a `std::vector` of the element type (idiomatic eager collection).
+fn render_cpp_iterator_function(
+    out: &mut String,
+    func: &Function,
+    inner: &TypeRef,
+    abi_module: &str,
+    error_codes: &[&ErrorCode],
+    prefix: &str,
+) {
+    let elem_cpp = cpp_type(inner);
+    let cpp_params: Vec<String> = func
+        .params
+        .iter()
+        .map(|p| cpp_param_decl(&p.ty, &p.name))
+        .collect();
+    let fn_name = format!("{}_{}", abi_module, func.name);
+
+    emit_doc(out, &func.doc, "");
+    if let Some(msg) = &func.deprecated {
+        let escaped = msg.replace('"', "\\\"");
+        out.push_str(&format!("[[deprecated(\"{escaped}\")]]\n"));
+    }
+    out.push_str(&format!(
+        "inline std::vector<{elem_cpp}> {fn_name}({}) {{\n",
+        cpp_params.join(", ")
+    ));
+
+    let mut setup = Vec::new();
+    let mut c_args = Vec::new();
+    for p in &func.params {
+        let (s, a) = param_to_c_args(&p.ty, &p.name, abi_module, prefix);
+        setup.extend(s);
+        c_args.extend(a);
+    }
+    for line in &setup {
+        out.push_str(&format!("    {line}\n"));
+    }
+    out.push_str(&format!("    {prefix}_error err{{}};\n"));
+
+    let launcher = format!("{prefix}_{}_{}", abi_module, func.name);
+    let iter_tag = format!(
+        "{prefix}_{}_{}Iterator",
+        abi_module,
+        func.name.to_upper_camel_case()
+    );
+    let next_fn = format!("{iter_tag}_next");
+    let destroy_fn = format!("{iter_tag}_destroy");
+
+    c_args.push("&err".into());
+    out.push_str(&format!(
+        "    {iter_tag}* iter = {launcher}({});\n",
+        c_args.join(", ")
+    ));
+    out.push_str("    if (err.code != 0) {\n");
+    emit_error_throw_body(out, error_codes, prefix, "        ");
+    out.push_str("    }\n");
+
+    let item_ret = abi::lower_return(inner, abi_module);
+    let item_ty = item_ret.ret.render_c(prefix);
+    out.push_str(&format!("    std::vector<{elem_cpp}> ret;\n"));
+    out.push_str("    while (true) {\n");
+    out.push_str(&format!("        {item_ty} item{{}};\n"));
+    let mut next_args = vec!["iter".to_string(), "&item".to_string()];
+    if !item_ret.out_params.is_empty() {
+        out.push_str("        size_t item_len = 0;\n");
+        next_args.push("&item_len".to_string());
+    }
+    next_args.push("&err".to_string());
+    out.push_str(&format!(
+        "        int32_t has_item = {next_fn}({});\n",
+        next_args.join(", ")
+    ));
+    out.push_str("        if (err.code != 0) {\n");
+    out.push_str(&format!("            {destroy_fn}(iter);\n"));
+    emit_error_throw_body(out, error_codes, prefix, "            ");
+    out.push_str("        }\n");
+    out.push_str("        if (has_item == 0) break;\n");
+    match inner {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            out.push_str("        ret.emplace_back(item);\n");
+            out.push_str(&format!("        {prefix}_free_string(item);\n"));
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            out.push_str("        ret.emplace_back(item, item + item_len);\n");
+            out.push_str(&format!(
+                "        {prefix}_free_bytes(const_cast<uint8_t*>(item), item_len);\n"
+            ));
+        }
+        TypeRef::Struct(n) => {
+            out.push_str(&format!(
+                "        ret.emplace_back({}(item));\n",
+                local_type_name(n)
+            ));
+        }
+        TypeRef::Enum(n) => {
+            out.push_str(&format!(
+                "        ret.emplace_back(static_cast<{n}>(item));\n"
+            ));
+        }
+        _ => {
+            out.push_str("        ret.emplace_back(item);\n");
+        }
+    }
+    out.push_str("    }\n");
+    out.push_str(&format!("    {destroy_fn}(iter);\n"));
+    out.push_str("    return ret;\n");
     out.push_str("}\n\n");
 }
 

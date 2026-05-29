@@ -13,6 +13,10 @@ import 'dart:async';
 import 'package:ffi/ffi.dart';
 
 DynamicLibrary _openLibrary() {
+  // An explicit path in WEAVEFFI_LIBRARY wins, so callers can point at a
+  // specific build artifact regardless of its file name or location.
+  final override = Platform.environment['WEAVEFFI_LIBRARY'];
+  if (override != null && override.isNotEmpty) return DynamicLibrary.open(override);
   if (Platform.isMacOS) return DynamicLibrary.open('libweaveffi.dylib');
   if (Platform.isLinux) return DynamicLibrary.open('libweaveffi.so');
   if (Platform.isWindows) return DynamicLibrary.open('weaveffi.dll');
@@ -42,9 +46,10 @@ class WeaveffiException implements Exception {
 
 void _checkError(Pointer<_WeaveffiError> err) {
   if (err.ref.code != 0) {
+    final code = err.ref.code;
     final msg = err.ref.message.toDartString();
     _weaveffiErrorClear(err);
-    throw WeaveffiException(err.ref.code, msg);
+    throw WeaveffiException(code, msg);
   }
 }
 
@@ -69,8 +74,8 @@ typedef _DartWeaveffiKvStoreDestroy = void Function(Pointer<Void>);
 final _weaveffiKvStoreDestroy = _lib.lookupFunction<
     _NativeWeaveffiKvStoreDestroy, _DartWeaveffiKvStoreDestroy>('weaveffi_kv_Store_destroy');
 
-typedef _NativeWeaveffiKvStoreGetId = Int64 Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKvStoreGetId = int Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKvStoreGetId = Int64 Function(Pointer<Void>);
+typedef _DartWeaveffiKvStoreGetId = int Function(Pointer<Void>);
 final _weaveffiKvStoreGetId = _lib.lookupFunction<
     _NativeWeaveffiKvStoreGetId, _DartWeaveffiKvStoreGetId>('weaveffi_kv_Store_get_id');
 
@@ -85,14 +90,8 @@ class Store {
 
   /// Internal store identifier
   int get id {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiKvStoreGetId(_handle, err);
-      _checkError(err);
-      return result;
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiKvStoreGetId(_handle);
+    return result;
   }
 }
 
@@ -101,38 +100,38 @@ typedef _DartWeaveffiKvEntryDestroy = void Function(Pointer<Void>);
 final _weaveffiKvEntryDestroy = _lib.lookupFunction<
     _NativeWeaveffiKvEntryDestroy, _DartWeaveffiKvEntryDestroy>('weaveffi_kv_Entry_destroy');
 
-typedef _NativeWeaveffiKvEntryGetId = Int64 Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKvEntryGetId = int Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKvEntryGetId = Int64 Function(Pointer<Void>);
+typedef _DartWeaveffiKvEntryGetId = int Function(Pointer<Void>);
 final _weaveffiKvEntryGetId = _lib.lookupFunction<
     _NativeWeaveffiKvEntryGetId, _DartWeaveffiKvEntryGetId>('weaveffi_kv_Entry_get_id');
 
-typedef _NativeWeaveffiKvEntryGetKey = Pointer<Utf8> Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKvEntryGetKey = Pointer<Utf8> Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKvEntryGetKey = Pointer<Utf8> Function(Pointer<Void>);
+typedef _DartWeaveffiKvEntryGetKey = Pointer<Utf8> Function(Pointer<Void>);
 final _weaveffiKvEntryGetKey = _lib.lookupFunction<
     _NativeWeaveffiKvEntryGetKey, _DartWeaveffiKvEntryGetKey>('weaveffi_kv_Entry_get_key');
 
-typedef _NativeWeaveffiKvEntryGetValue = Pointer<Uint8> Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKvEntryGetValue = Pointer<Uint8> Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKvEntryGetValue = Pointer<Uint8> Function(Pointer<Void>);
+typedef _DartWeaveffiKvEntryGetValue = Pointer<Uint8> Function(Pointer<Void>);
 final _weaveffiKvEntryGetValue = _lib.lookupFunction<
     _NativeWeaveffiKvEntryGetValue, _DartWeaveffiKvEntryGetValue>('weaveffi_kv_Entry_get_value');
 
-typedef _NativeWeaveffiKvEntryGetCreatedAt = Int64 Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKvEntryGetCreatedAt = int Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKvEntryGetCreatedAt = Int64 Function(Pointer<Void>);
+typedef _DartWeaveffiKvEntryGetCreatedAt = int Function(Pointer<Void>);
 final _weaveffiKvEntryGetCreatedAt = _lib.lookupFunction<
     _NativeWeaveffiKvEntryGetCreatedAt, _DartWeaveffiKvEntryGetCreatedAt>('weaveffi_kv_Entry_get_created_at');
 
-typedef _NativeWeaveffiKvEntryGetExpiresAt = Int64 Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKvEntryGetExpiresAt = int Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKvEntryGetExpiresAt = Int64 Function(Pointer<Void>);
+typedef _DartWeaveffiKvEntryGetExpiresAt = int Function(Pointer<Void>);
 final _weaveffiKvEntryGetExpiresAt = _lib.lookupFunction<
     _NativeWeaveffiKvEntryGetExpiresAt, _DartWeaveffiKvEntryGetExpiresAt>('weaveffi_kv_Entry_get_expires_at');
 
-typedef _NativeWeaveffiKvEntryGetTags = Pointer<Void> Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKvEntryGetTags = Pointer<Void> Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKvEntryGetTags = Pointer<Void> Function(Pointer<Void>);
+typedef _DartWeaveffiKvEntryGetTags = Pointer<Void> Function(Pointer<Void>);
 final _weaveffiKvEntryGetTags = _lib.lookupFunction<
     _NativeWeaveffiKvEntryGetTags, _DartWeaveffiKvEntryGetTags>('weaveffi_kv_Entry_get_tags');
 
-typedef _NativeWeaveffiKvEntryGetMetadata = Pointer<Void> Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKvEntryGetMetadata = Pointer<Void> Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKvEntryGetMetadata = Pointer<Void> Function(Pointer<Void>);
+typedef _DartWeaveffiKvEntryGetMetadata = Pointer<Void> Function(Pointer<Void>);
 final _weaveffiKvEntryGetMetadata = _lib.lookupFunction<
     _NativeWeaveffiKvEntryGetMetadata, _DartWeaveffiKvEntryGetMetadata>('weaveffi_kv_Entry_get_metadata');
 
@@ -147,86 +146,44 @@ class Entry {
 
   /// Stable monotonic identifier assigned on insert
   int get id {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiKvEntryGetId(_handle, err);
-      _checkError(err);
-      return result;
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiKvEntryGetId(_handle);
+    return result;
   }
 
   /// UTF-8 lookup key
   String get key {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiKvEntryGetKey(_handle, err);
-      _checkError(err);
-      return result.toDartString();
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiKvEntryGetKey(_handle);
+    return result.toDartString();
   }
 
   /// Opaque binary payload
   List<int> get value {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiKvEntryGetValue(_handle, err);
-      _checkError(err);
-      return result;
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiKvEntryGetValue(_handle);
+    return result;
   }
 
   /// Unix-timestamp seconds when the entry was created
   int get createdAt {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiKvEntryGetCreatedAt(_handle, err);
-      _checkError(err);
-      return result;
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiKvEntryGetCreatedAt(_handle);
+    return result;
   }
 
   /// Optional unix-timestamp seconds at which the entry expires
   int? get expiresAt {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiKvEntryGetExpiresAt(_handle, err);
-      _checkError(err);
-      return result;
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiKvEntryGetExpiresAt(_handle);
+    return result;
   }
 
   /// Free-form labels attached to the entry
   List<String> get tags {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiKvEntryGetTags(_handle, err);
-      _checkError(err);
-      return result;
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiKvEntryGetTags(_handle);
+    return result;
   }
 
   /// Arbitrary string-valued metadata pairs
   Map<String, String> get metadata {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiKvEntryGetMetadata(_handle, err);
-      _checkError(err);
-      return result;
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiKvEntryGetMetadata(_handle);
+    return result;
   }
 }
 
@@ -406,11 +363,13 @@ final _weaveffiKvListKeys = _lib.lookupFunction<
 /// Stream every key, optionally filtered by a prefix
 Iterable<String> listKeys(Store store, String? prefix) {
   final err = calloc<_WeaveffiError>();
+  final prefixPtr = prefix == null ? nullptr : prefix.toNativeUtf8();
   try {
-    final result = _weaveffiKvListKeys(store._handle, prefix, err);
+    final result = _weaveffiKvListKeys(store._handle, prefixPtr, err);
     _checkError(err);
     return result;
   } finally {
+    if (prefixPtr != nullptr) calloc.free(prefixPtr);
     calloc.free(err);
   }
 }
@@ -509,18 +468,18 @@ typedef _DartWeaveffiKvStatsStatsDestroy = void Function(Pointer<Void>);
 final _weaveffiKvStatsStatsDestroy = _lib.lookupFunction<
     _NativeWeaveffiKvStatsStatsDestroy, _DartWeaveffiKvStatsStatsDestroy>('weaveffi_kv_stats_Stats_destroy');
 
-typedef _NativeWeaveffiKvStatsStatsGetTotalEntries = Int64 Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKvStatsStatsGetTotalEntries = int Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKvStatsStatsGetTotalEntries = Int64 Function(Pointer<Void>);
+typedef _DartWeaveffiKvStatsStatsGetTotalEntries = int Function(Pointer<Void>);
 final _weaveffiKvStatsStatsGetTotalEntries = _lib.lookupFunction<
     _NativeWeaveffiKvStatsStatsGetTotalEntries, _DartWeaveffiKvStatsStatsGetTotalEntries>('weaveffi_kv_stats_Stats_get_total_entries');
 
-typedef _NativeWeaveffiKvStatsStatsGetTotalBytes = Int64 Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKvStatsStatsGetTotalBytes = int Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKvStatsStatsGetTotalBytes = Int64 Function(Pointer<Void>);
+typedef _DartWeaveffiKvStatsStatsGetTotalBytes = int Function(Pointer<Void>);
 final _weaveffiKvStatsStatsGetTotalBytes = _lib.lookupFunction<
     _NativeWeaveffiKvStatsStatsGetTotalBytes, _DartWeaveffiKvStatsStatsGetTotalBytes>('weaveffi_kv_stats_Stats_get_total_bytes');
 
-typedef _NativeWeaveffiKvStatsStatsGetExpiredEntries = Int64 Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKvStatsStatsGetExpiredEntries = int Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKvStatsStatsGetExpiredEntries = Int64 Function(Pointer<Void>);
+typedef _DartWeaveffiKvStatsStatsGetExpiredEntries = int Function(Pointer<Void>);
 final _weaveffiKvStatsStatsGetExpiredEntries = _lib.lookupFunction<
     _NativeWeaveffiKvStatsStatsGetExpiredEntries, _DartWeaveffiKvStatsStatsGetExpiredEntries>('weaveffi_kv_stats_Stats_get_expired_entries');
 
@@ -535,38 +494,20 @@ class Stats {
 
   /// Number of live entries
   int get totalEntries {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiKvStatsStatsGetTotalEntries(_handle, err);
-      _checkError(err);
-      return result;
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiKvStatsStatsGetTotalEntries(_handle);
+    return result;
   }
 
   /// Sum of all value byte lengths
   int get totalBytes {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiKvStatsStatsGetTotalBytes(_handle, err);
-      _checkError(err);
-      return result;
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiKvStatsStatsGetTotalBytes(_handle);
+    return result;
   }
 
   /// Number of entries past their TTL but not yet evicted
   int get expiredEntries {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiKvStatsStatsGetExpiredEntries(_handle, err);
-      _checkError(err);
-      return result;
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiKvStatsStatsGetExpiredEntries(_handle);
+    return result;
   }
 }
 

@@ -19,10 +19,7 @@ extern "C" {
 
 typedef uint64_t weaveffi_handle_t;
 
-typedef struct weaveffi_error {
-    int32_t code;
-    const char* message;
-} weaveffi_error;
+typedef struct weaveffi_error { int32_t code; const char* message; } weaveffi_error;
 
 void weaveffi_error_clear(weaveffi_error* err);
 void weaveffi_free_string(const char* ptr);
@@ -34,10 +31,16 @@ void weaveffi_cancel_token_cancel(weaveffi_cancel_token* token);
 bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token* token);
 void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
 
+typedef void (*weaveffi_events_OnMessage_fn)(const char* message, void* context);
+uint64_t weaveffi_events_register_message_listener(weaveffi_events_OnMessage_fn callback, void* context);
+void weaveffi_events_unregister_message_listener(uint64_t id);
 /** Send a message, triggering the OnMessage callback */
 void weaveffi_events_send_message(const char* text, weaveffi_error* out_err);
 /** Return an iterator over all sent messages */
-const char** weaveffi_events_get_messages(size_t* out_len, weaveffi_error* out_err);
+typedef struct weaveffi_events_GetMessagesIterator weaveffi_events_GetMessagesIterator;
+weaveffi_events_GetMessagesIterator* weaveffi_events_get_messages(weaveffi_error* out_err);
+int32_t weaveffi_events_GetMessagesIterator_next(weaveffi_events_GetMessagesIterator* iter, const char** out_item, weaveffi_error* out_err);
+void weaveffi_events_GetMessagesIterator_destroy(weaveffi_events_GetMessagesIterator* iter);
 
 } // extern "C"
 
@@ -65,9 +68,8 @@ inline void events_send_message(const std::string& text) {
 
 /** Return an iterator over all sent messages */
 inline std::vector<std::string> events_get_messages() {
-    size_t out_len = 0;
     weaveffi_error err{};
-    auto result = weaveffi_events_get_messages(&out_len, &err);
+    weaveffi_events_GetMessagesIterator* iter = weaveffi_events_get_messages(&err);
     if (err.code != 0) {
         std::string msg(err.message ? err.message : "unknown error");
         int32_t code = err.code;
@@ -75,8 +77,21 @@ inline std::vector<std::string> events_get_messages() {
         throw WeaveFFIError(code, msg);
     }
     std::vector<std::string> ret;
-    ret.reserve(out_len);
-    for (size_t i = 0; i < out_len; ++i) ret.emplace_back(result[i]);
+    while (true) {
+        const char* item{};
+        int32_t has_item = weaveffi_events_GetMessagesIterator_next(iter, &item, &err);
+        if (err.code != 0) {
+            weaveffi_events_GetMessagesIterator_destroy(iter);
+            std::string msg(err.message ? err.message : "unknown error");
+            int32_t code = err.code;
+            weaveffi_error_clear(&err);
+            throw WeaveFFIError(code, msg);
+        }
+        if (has_item == 0) break;
+        ret.emplace_back(item);
+        weaveffi_free_string(item);
+    }
+    weaveffi_events_GetMessagesIterator_destroy(iter);
     return ret;
 }
 

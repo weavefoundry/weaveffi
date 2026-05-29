@@ -12,6 +12,10 @@ import 'dart:io' show Platform;
 import 'package:ffi/ffi.dart';
 
 DynamicLibrary _openLibrary() {
+  // An explicit path in WEAVEFFI_LIBRARY wins, so callers can point at a
+  // specific build artifact regardless of its file name or location.
+  final override = Platform.environment['WEAVEFFI_LIBRARY'];
+  if (override != null && override.isNotEmpty) return DynamicLibrary.open(override);
   if (Platform.isMacOS) return DynamicLibrary.open('libweaveffi.dylib');
   if (Platform.isLinux) return DynamicLibrary.open('libweaveffi.so');
   if (Platform.isWindows) return DynamicLibrary.open('weaveffi.dll');
@@ -41,9 +45,10 @@ class WeaveffiException implements Exception {
 
 void _checkError(Pointer<_WeaveffiError> err) {
   if (err.ref.code != 0) {
+    final code = err.ref.code;
     final msg = err.ref.message.toDartString();
     _weaveffiErrorClear(err);
-    throw WeaveffiException(err.ref.code, msg);
+    throw WeaveffiException(code, msg);
   }
 }
 
@@ -65,33 +70,33 @@ typedef _DartWeaveffiProductsProductDestroy = void Function(Pointer<Void>);
 final _weaveffiProductsProductDestroy = _lib.lookupFunction<
     _NativeWeaveffiProductsProductDestroy, _DartWeaveffiProductsProductDestroy>('weaveffi_products_Product_destroy');
 
-typedef _NativeWeaveffiProductsProductGetId = Int64 Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiProductsProductGetId = int Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiProductsProductGetId = Int64 Function(Pointer<Void>);
+typedef _DartWeaveffiProductsProductGetId = int Function(Pointer<Void>);
 final _weaveffiProductsProductGetId = _lib.lookupFunction<
     _NativeWeaveffiProductsProductGetId, _DartWeaveffiProductsProductGetId>('weaveffi_products_Product_get_id');
 
-typedef _NativeWeaveffiProductsProductGetName = Pointer<Utf8> Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiProductsProductGetName = Pointer<Utf8> Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiProductsProductGetName = Pointer<Utf8> Function(Pointer<Void>);
+typedef _DartWeaveffiProductsProductGetName = Pointer<Utf8> Function(Pointer<Void>);
 final _weaveffiProductsProductGetName = _lib.lookupFunction<
     _NativeWeaveffiProductsProductGetName, _DartWeaveffiProductsProductGetName>('weaveffi_products_Product_get_name');
 
-typedef _NativeWeaveffiProductsProductGetDescription = Pointer<Utf8> Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiProductsProductGetDescription = Pointer<Utf8> Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiProductsProductGetDescription = Pointer<Utf8> Function(Pointer<Void>);
+typedef _DartWeaveffiProductsProductGetDescription = Pointer<Utf8> Function(Pointer<Void>);
 final _weaveffiProductsProductGetDescription = _lib.lookupFunction<
     _NativeWeaveffiProductsProductGetDescription, _DartWeaveffiProductsProductGetDescription>('weaveffi_products_Product_get_description');
 
-typedef _NativeWeaveffiProductsProductGetPrice = Double Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiProductsProductGetPrice = double Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiProductsProductGetPrice = Double Function(Pointer<Void>);
+typedef _DartWeaveffiProductsProductGetPrice = double Function(Pointer<Void>);
 final _weaveffiProductsProductGetPrice = _lib.lookupFunction<
     _NativeWeaveffiProductsProductGetPrice, _DartWeaveffiProductsProductGetPrice>('weaveffi_products_Product_get_price');
 
-typedef _NativeWeaveffiProductsProductGetCategory = Int32 Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiProductsProductGetCategory = int Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiProductsProductGetCategory = Int32 Function(Pointer<Void>);
+typedef _DartWeaveffiProductsProductGetCategory = int Function(Pointer<Void>);
 final _weaveffiProductsProductGetCategory = _lib.lookupFunction<
     _NativeWeaveffiProductsProductGetCategory, _DartWeaveffiProductsProductGetCategory>('weaveffi_products_Product_get_category');
 
-typedef _NativeWeaveffiProductsProductGetTags = Pointer<Void> Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiProductsProductGetTags = Pointer<Void> Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiProductsProductGetTags = Pointer<Void> Function(Pointer<Void>);
+typedef _DartWeaveffiProductsProductGetTags = Pointer<Void> Function(Pointer<Void>);
 final _weaveffiProductsProductGetTags = _lib.lookupFunction<
     _NativeWeaveffiProductsProductGetTags, _DartWeaveffiProductsProductGetTags>('weaveffi_products_Product_get_tags');
 
@@ -104,70 +109,34 @@ class Product {
   }
 
   int get id {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiProductsProductGetId(_handle, err);
-      _checkError(err);
-      return result;
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiProductsProductGetId(_handle);
+    return result;
   }
 
   String get name {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiProductsProductGetName(_handle, err);
-      _checkError(err);
-      return result.toDartString();
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiProductsProductGetName(_handle);
+    return result.toDartString();
   }
 
   String? get description {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiProductsProductGetDescription(_handle, err);
-      _checkError(err);
-      if (result == nullptr) return null;
-      return result.toDartString();
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiProductsProductGetDescription(_handle);
+    if (result == nullptr) return null;
+    return result.toDartString();
   }
 
   double get price {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiProductsProductGetPrice(_handle, err);
-      _checkError(err);
-      return result;
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiProductsProductGetPrice(_handle);
+    return result;
   }
 
   Category get category {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiProductsProductGetCategory(_handle, err);
-      _checkError(err);
-      return Category.fromValue(result);
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiProductsProductGetCategory(_handle);
+    return Category.fromValue(result);
   }
 
   List<String> get tags {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiProductsProductGetTags(_handle, err);
-      _checkError(err);
-      return result;
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiProductsProductGetTags(_handle);
+    return result;
   }
 }
 
@@ -205,18 +174,23 @@ Product getProduct(int id) {
   }
 }
 
-typedef _NativeWeaveffiProductsSearchProducts = Pointer<Void> Function(Int32, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiProductsSearchProducts = Pointer<Void> Function(int, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiProductsSearchProducts = Pointer<Void> Function(Int32, Pointer<Size>, Pointer<_WeaveffiError>);
+typedef _DartWeaveffiProductsSearchProducts = Pointer<Void> Function(int, Pointer<Size>, Pointer<_WeaveffiError>);
 final _weaveffiProductsSearchProducts = _lib.lookupFunction<
     _NativeWeaveffiProductsSearchProducts, _DartWeaveffiProductsSearchProducts>('weaveffi_products_search_products');
 
 List<Product> searchProducts(Category category) {
   final err = calloc<_WeaveffiError>();
+  final outLen = calloc<Size>();
   try {
-    final result = _weaveffiProductsSearchProducts(category.value, err);
+    final result = _weaveffiProductsSearchProducts(category.value, outLen, err);
     _checkError(err);
-    return result;
+    final n = outLen.value;
+    if (result == nullptr || n == 0) return <Product>[];
+    final arr = result.cast<Pointer<Void>>();
+    return List<Product>.generate(n, (i) => Product._(arr[i]));
   } finally {
+    calloc.free(outLen);
     calloc.free(err);
   }
 }
@@ -258,18 +232,18 @@ typedef _DartWeaveffiOrdersOrderItemDestroy = void Function(Pointer<Void>);
 final _weaveffiOrdersOrderItemDestroy = _lib.lookupFunction<
     _NativeWeaveffiOrdersOrderItemDestroy, _DartWeaveffiOrdersOrderItemDestroy>('weaveffi_orders_OrderItem_destroy');
 
-typedef _NativeWeaveffiOrdersOrderItemGetProductId = Int64 Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiOrdersOrderItemGetProductId = int Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiOrdersOrderItemGetProductId = Int64 Function(Pointer<Void>);
+typedef _DartWeaveffiOrdersOrderItemGetProductId = int Function(Pointer<Void>);
 final _weaveffiOrdersOrderItemGetProductId = _lib.lookupFunction<
     _NativeWeaveffiOrdersOrderItemGetProductId, _DartWeaveffiOrdersOrderItemGetProductId>('weaveffi_orders_OrderItem_get_product_id');
 
-typedef _NativeWeaveffiOrdersOrderItemGetQuantity = Int32 Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiOrdersOrderItemGetQuantity = int Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiOrdersOrderItemGetQuantity = Int32 Function(Pointer<Void>);
+typedef _DartWeaveffiOrdersOrderItemGetQuantity = int Function(Pointer<Void>);
 final _weaveffiOrdersOrderItemGetQuantity = _lib.lookupFunction<
     _NativeWeaveffiOrdersOrderItemGetQuantity, _DartWeaveffiOrdersOrderItemGetQuantity>('weaveffi_orders_OrderItem_get_quantity');
 
-typedef _NativeWeaveffiOrdersOrderItemGetUnitPrice = Double Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiOrdersOrderItemGetUnitPrice = double Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiOrdersOrderItemGetUnitPrice = Double Function(Pointer<Void>);
+typedef _DartWeaveffiOrdersOrderItemGetUnitPrice = double Function(Pointer<Void>);
 final _weaveffiOrdersOrderItemGetUnitPrice = _lib.lookupFunction<
     _NativeWeaveffiOrdersOrderItemGetUnitPrice, _DartWeaveffiOrdersOrderItemGetUnitPrice>('weaveffi_orders_OrderItem_get_unit_price');
 
@@ -282,36 +256,18 @@ class OrderItem {
   }
 
   int get productId {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiOrdersOrderItemGetProductId(_handle, err);
-      _checkError(err);
-      return result;
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiOrdersOrderItemGetProductId(_handle);
+    return result;
   }
 
   int get quantity {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiOrdersOrderItemGetQuantity(_handle, err);
-      _checkError(err);
-      return result;
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiOrdersOrderItemGetQuantity(_handle);
+    return result;
   }
 
   double get unitPrice {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiOrdersOrderItemGetUnitPrice(_handle, err);
-      _checkError(err);
-      return result;
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiOrdersOrderItemGetUnitPrice(_handle);
+    return result;
   }
 }
 
@@ -320,23 +276,23 @@ typedef _DartWeaveffiOrdersOrderDestroy = void Function(Pointer<Void>);
 final _weaveffiOrdersOrderDestroy = _lib.lookupFunction<
     _NativeWeaveffiOrdersOrderDestroy, _DartWeaveffiOrdersOrderDestroy>('weaveffi_orders_Order_destroy');
 
-typedef _NativeWeaveffiOrdersOrderGetId = Int64 Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiOrdersOrderGetId = int Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiOrdersOrderGetId = Int64 Function(Pointer<Void>);
+typedef _DartWeaveffiOrdersOrderGetId = int Function(Pointer<Void>);
 final _weaveffiOrdersOrderGetId = _lib.lookupFunction<
     _NativeWeaveffiOrdersOrderGetId, _DartWeaveffiOrdersOrderGetId>('weaveffi_orders_Order_get_id');
 
-typedef _NativeWeaveffiOrdersOrderGetItems = Pointer<Void> Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiOrdersOrderGetItems = Pointer<Void> Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiOrdersOrderGetItems = Pointer<Void> Function(Pointer<Void>);
+typedef _DartWeaveffiOrdersOrderGetItems = Pointer<Void> Function(Pointer<Void>);
 final _weaveffiOrdersOrderGetItems = _lib.lookupFunction<
     _NativeWeaveffiOrdersOrderGetItems, _DartWeaveffiOrdersOrderGetItems>('weaveffi_orders_Order_get_items');
 
-typedef _NativeWeaveffiOrdersOrderGetTotal = Double Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiOrdersOrderGetTotal = double Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiOrdersOrderGetTotal = Double Function(Pointer<Void>);
+typedef _DartWeaveffiOrdersOrderGetTotal = double Function(Pointer<Void>);
 final _weaveffiOrdersOrderGetTotal = _lib.lookupFunction<
     _NativeWeaveffiOrdersOrderGetTotal, _DartWeaveffiOrdersOrderGetTotal>('weaveffi_orders_Order_get_total');
 
-typedef _NativeWeaveffiOrdersOrderGetStatus = Pointer<Utf8> Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiOrdersOrderGetStatus = Pointer<Utf8> Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiOrdersOrderGetStatus = Pointer<Utf8> Function(Pointer<Void>);
+typedef _DartWeaveffiOrdersOrderGetStatus = Pointer<Utf8> Function(Pointer<Void>);
 final _weaveffiOrdersOrderGetStatus = _lib.lookupFunction<
     _NativeWeaveffiOrdersOrderGetStatus, _DartWeaveffiOrdersOrderGetStatus>('weaveffi_orders_Order_get_status');
 
@@ -349,47 +305,23 @@ class Order {
   }
 
   int get id {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiOrdersOrderGetId(_handle, err);
-      _checkError(err);
-      return result;
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiOrdersOrderGetId(_handle);
+    return result;
   }
 
   List<OrderItem> get items {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiOrdersOrderGetItems(_handle, err);
-      _checkError(err);
-      return result;
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiOrdersOrderGetItems(_handle);
+    return result;
   }
 
   double get total {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiOrdersOrderGetTotal(_handle, err);
-      _checkError(err);
-      return result;
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiOrdersOrderGetTotal(_handle);
+    return result;
   }
 
   String get status {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiOrdersOrderGetStatus(_handle, err);
-      _checkError(err);
-      return result.toDartString();
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiOrdersOrderGetStatus(_handle);
+    return result.toDartString();
   }
 }
 

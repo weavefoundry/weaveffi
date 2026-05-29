@@ -1,3 +1,4 @@
+use weaveffi_core::utils::c_abi_struct_name;
 use weaveffi_ir::ir::{Api, Module, StructDef, TypeRef};
 
 fn is_pointer_type(ty: &TypeRef) -> bool {
@@ -25,7 +26,7 @@ fn rust_scalar_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
         TypeRef::Bytes | TypeRef::BorrowedBytes => "u8".into(),
         TypeRef::Handle => "u64".into(),
         TypeRef::TypedHandle(name) => name.clone(),
-        TypeRef::Struct(s) => format!("{prefix}_{module}_{s}"),
+        TypeRef::Struct(s) => c_abi_struct_name(s, module, prefix),
         TypeRef::Enum(_) => "i32".into(),
         TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
             rust_scalar_type(inner, module, prefix)
@@ -53,7 +54,10 @@ fn rust_param_fragments(name: &str, ty: &TypeRef, module: &str, prefix: &str) ->
         }
         TypeRef::Handle => vec![format!("{name}: u64")],
         TypeRef::TypedHandle(th) => vec![format!("{name}: *mut {th}")],
-        TypeRef::Struct(s) => vec![format!("{name}: *const {prefix}_{module}_{s}")],
+        TypeRef::Struct(s) => {
+            let tag = c_abi_struct_name(s, module, prefix);
+            vec![format!("{name}: *const {tag}")]
+        }
         TypeRef::Enum(_) => vec![format!("{name}: i32")],
         TypeRef::Optional(inner) => {
             if is_pointer_type(inner) {
@@ -107,7 +111,10 @@ fn rust_return_type(ty: &TypeRef, module: &str, prefix: &str) -> (String, bool) 
         TypeRef::Bytes | TypeRef::BorrowedBytes => ("*mut u8".into(), true),
         TypeRef::Handle => ("u64".into(), false),
         TypeRef::TypedHandle(name) => (format!("*mut {name}"), false),
-        TypeRef::Struct(s) => (format!("*mut {prefix}_{module}_{s}"), false),
+        TypeRef::Struct(s) => (
+            format!("*mut {}", c_abi_struct_name(s, module, prefix)),
+            false,
+        ),
         TypeRef::Enum(_) => ("i32".into(), false),
         TypeRef::Optional(inner) => {
             if is_pointer_type(inner) {
@@ -138,7 +145,7 @@ pub fn render_scaffold(api: &Api, c_prefix: &str) -> String {
     out.push_str("use weaveffi_abi::{self as abi, *};\n\n");
 
     for m in &api.modules {
-        render_module(&mut out, m, c_prefix);
+        render_module(&mut out, m, "", c_prefix);
     }
 
     out.push_str("// Re-export the fixed WeaveFFI C ABI runtime surface\n");
@@ -149,32 +156,53 @@ pub fn render_scaffold(api: &Api, c_prefix: &str) -> String {
     out
 }
 
-fn render_module(out: &mut String, module: &Module, prefix: &str) {
-    let mod_name = &module.name;
+fn render_module(out: &mut String, module: &Module, parent_path: &str, prefix: &str) {
+    // C ABI symbols flatten the whole module path to underscores, so a nested
+    // module `graphics.shapes` contributes the prefix segment `graphics_shapes`.
+    // This must match the binding generators (which key off the same joined
+    // path) and the qualified references the resolver produces.
+    let mod_name = if parent_path.is_empty() {
+        module.name.clone()
+    } else {
+        format!("{parent_path}_{}", module.name)
+    };
 
     for s in &module.structs {
-        render_struct_scaffold(out, mod_name, s, prefix);
+        render_struct_scaffold(out, &mod_name, s, prefix);
     }
 
     for f in &module.functions {
         let fn_name = format!("{prefix}_{mod_name}_{}", f.name);
         let mut params = Vec::new();
         for p in &f.params {
-            params.extend(rust_param_fragments(&p.name, &p.ty, mod_name, prefix));
+            params.extend(rust_param_fragments(&p.name, &p.ty, &mod_name, prefix));
         }
 
         if f.r#async {
-            render_async_function(out, &fn_name, &params, f.returns.as_ref(), mod_name, prefix);
+            render_async_function(
+                out,
+                &fn_name,
+                &params,
+                f.returns.as_ref(),
+                &mod_name,
+                prefix,
+            );
         } else {
             render_sync_function(
                 out,
                 &fn_name,
                 &mut params,
                 f.returns.as_ref(),
-                mod_name,
+                &mod_name,
                 prefix,
             );
         }
+    }
+
+    // Recurse so nested-module producers also get stubs, with the full joined
+    // path threaded through.
+    for child in &module.modules {
+        render_module(out, child, &mod_name, prefix);
     }
 }
 
@@ -278,7 +306,7 @@ fn render_async_function(
 }
 
 fn render_struct_scaffold(out: &mut String, module: &str, s: &StructDef, prefix: &str) {
-    let tag = format!("{prefix}_{module}_{}", s.name);
+    let tag = c_abi_struct_name(&s.name, module, prefix);
 
     out.push_str("#[repr(C)]\n");
     out.push_str(&format!("pub struct {tag} {{\n"));
@@ -901,6 +929,111 @@ mod tests {
         assert!(
             out.contains("callback: weaveffi_calc_sync_data_callback"),
             "missing callback parameter: {out}"
+        );
+    }
+
+    #[test]
+    fn scaffold_recurses_into_nested_modules_with_joined_path() {
+        // A nested submodule's functions/structs must get stubs, and their C
+        // symbols must use the underscore-joined module path so they line up
+        // with the generated bindings.
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "graphics".into(),
+                functions: vec![],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![Module {
+                    name: "shapes".into(),
+                    functions: vec![Function {
+                        name: "make".into(),
+                        params: vec![],
+                        returns: Some(TypeRef::I32),
+                        doc: None,
+                        r#async: false,
+                        cancellable: false,
+                        deprecated: None,
+                        since: None,
+                    }],
+                    structs: vec![StructDef {
+                        name: "Shape".into(),
+                        doc: None,
+                        fields: vec![StructField {
+                            name: "sides".into(),
+                            ty: TypeRef::I32,
+                            doc: None,
+                            default: None,
+                        }],
+                        builder: false,
+                    }],
+                    enums: vec![],
+                    callbacks: vec![],
+                    listeners: vec![],
+                    errors: None,
+                    modules: vec![],
+                }],
+            }],
+            generators: None,
+        };
+        let out = render_scaffold(&api, "weaveffi");
+        assert!(
+            out.contains("pub extern \"C\" fn weaveffi_graphics_shapes_make("),
+            "nested fn should use joined path: {out}"
+        );
+        assert!(
+            out.contains("pub struct weaveffi_graphics_shapes_Shape"),
+            "nested struct should use joined path: {out}"
+        );
+        assert!(
+            out.contains("pub extern \"C\" fn weaveffi_graphics_shapes_Shape_create("),
+            "nested struct create should use joined path: {out}"
+        );
+    }
+
+    #[test]
+    fn scaffold_qualified_cross_module_struct_ref_mangles_correctly() {
+        // After resolution, a cross-module struct reference is dot-qualified
+        // (e.g. `shared.Token`). The scaffold must flatten it to the owning
+        // module's C symbol, never embed the dot or the referrer's module.
+        let api = Api {
+            version: "0.1.0".into(),
+            modules: vec![Module {
+                name: "kitchen".into(),
+                functions: vec![Function {
+                    name: "cross".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::Struct("shared.Token".into())),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let out = render_scaffold(&api, "weaveffi");
+        assert!(
+            out.contains("-> *mut weaveffi_shared_Token"),
+            "qualified struct ref should mangle to owner module: {out}"
+        );
+        assert!(
+            !out.contains("weaveffi_kitchen_shared"),
+            "qualified ref must not embed the referrer module: {out}"
+        );
+        assert!(
+            !out.contains("shared.Token"),
+            "qualified ref must not leak the dotted name into Rust: {out}"
         );
     }
 
