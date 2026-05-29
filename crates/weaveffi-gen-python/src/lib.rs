@@ -9,7 +9,7 @@ use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
 use weaveffi_core::abi::{self, CType};
 use weaveffi_core::codegen::common::{
-    emit_doc as common_emit_doc, is_c_pointer_type as common_is_c_pointer_type, walk_modules,
+    emit_doc as common_emit_doc, is_c_pointer_type, pascal_case, walk_modules,
     walk_modules_with_path, DocCommentStyle,
 };
 use weaveffi_core::codegen::Generator;
@@ -127,24 +127,8 @@ impl Generator for PythonGenerator {
 
 // ── Type helpers ──
 
-fn is_c_pointer_type(ty: &TypeRef) -> bool {
-    common_is_c_pointer_type(ty)
-}
-
-fn snake_to_pascal(s: &str) -> String {
-    s.split('_')
-        .map(|part| {
-            let mut c = part.chars();
-            match c.next() {
-                None => String::new(),
-                Some(first) => first.to_uppercase().chain(c).collect(),
-            }
-        })
-        .collect()
-}
-
 fn iter_type_name(func_name: &str, module: &str) -> String {
-    let pascal = snake_to_pascal(func_name);
+    let pascal = pascal_case(func_name);
     format!("weaveffi_{module}_{pascal}Iterator")
 }
 
@@ -516,9 +500,7 @@ fn render_async_ffi_call_body(out: &mut String, module_name: &str, f: &Function)
 fn render_python_module(api: &Api, strip_module_prefix: bool, input_basename: &str) -> String {
     let mut out = render_prelude(CommentStyle::Hash, input_basename);
     render_preamble(&mut out);
-    let has_async = collect_all_modules(&api.modules)
-        .iter()
-        .any(|m| m.functions.iter().any(|f| f.r#async));
+    let has_async = walk_modules(&api.modules).any(|m| m.functions.iter().any(|f| f.r#async));
     if has_async {
         out.push_str("\nimport asyncio\nimport threading\n");
     }
@@ -528,14 +510,6 @@ fn render_python_module(api: &Api, strip_module_prefix: bool, input_basename: &s
     out.push('\n');
     out.push_str(&render_trailer(CommentStyle::Hash, "weaveffi.py"));
     out
-}
-
-fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
-    walk_modules(modules).collect()
-}
-
-fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
-    walk_modules_with_path(modules).collect()
 }
 
 fn render_python_module_content(
@@ -1313,7 +1287,7 @@ fn py_read_iter_item(inner: &TypeRef) -> String {
 
 fn render_iterator_class(out: &mut String, module_name: &str, func_name: &str, inner: &TypeRef) {
     let iter_tag = iter_type_name(func_name, module_name);
-    let pascal = snake_to_pascal(func_name);
+    let pascal = pascal_case(func_name);
     let class_name = format!("_{pascal}Iterator");
     let item_scalar = py_ctypes_scalar(inner);
     let read_expr = py_read_iter_item(inner);
@@ -1477,7 +1451,7 @@ from weaveffi import *
 fn render_pyi_module(api: &Api, strip_module_prefix: bool, input_basename: &str) -> String {
     let mut out = render_prelude(CommentStyle::Hash, input_basename);
     out.push_str("from enum import IntEnum\nfrom typing import Dict, Iterator, List, Optional\n");
-    for (m, path) in collect_modules_with_path(&api.modules) {
+    for (m, path) in walk_modules_with_path(&api.modules) {
         for e in &m.enums {
             render_pyi_enum(&mut out, e);
         }

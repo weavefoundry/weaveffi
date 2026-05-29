@@ -15,7 +15,7 @@ use weaveffi_core::codegen::Generator;
 use weaveffi_core::utils::{
     c_symbol_name, local_type_name, render_prelude, render_trailer, CommentStyle,
 };
-use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, StructField, TypeRef};
+use weaveffi_ir::ir::{Api, EnumDef, Function, StructDef, StructField, TypeRef};
 
 /// Per-target configuration for [`GoGenerator`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -190,29 +190,20 @@ fn type_has_bool(ty: &TypeRef) -> bool {
     }
 }
 
-fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
-    walk_modules(modules).collect()
-}
-
-fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
-    walk_modules_with_path(modules).collect()
-}
-
 fn scan_imports(api: &Api) -> (bool, bool, bool) {
-    let has_sync_funcs = collect_all_modules(&api.modules)
-        .iter()
-        .any(|m| m.functions.iter().any(|f| !f.r#async));
+    let has_sync_funcs =
+        walk_modules(&api.modules).any(|m| m.functions.iter().any(|f| !f.r#async));
 
     let needs_fmt = has_sync_funcs;
 
-    let needs_unsafe = collect_all_modules(&api.modules).iter().any(|m| {
+    let needs_unsafe = walk_modules(&api.modules).any(|m| {
         m.functions.iter().filter(|f| !f.r#async).any(|f| {
             f.params.iter().any(|p| param_uses_unsafe(&p.ty))
                 || f.returns.as_ref().is_some_and(return_uses_unsafe)
         })
     });
 
-    let needs_bool = collect_all_modules(&api.modules).iter().any(|m| {
+    let needs_bool = walk_modules(&api.modules).any(|m| {
         m.functions.iter().filter(|f| !f.r#async).any(|f| {
             f.params.iter().any(|p| type_has_bool(&p.ty))
                 || f.returns.as_ref().is_some_and(type_has_bool)
@@ -415,7 +406,7 @@ fn render_go(api: &Api, input_basename: &str) -> String {
         out.push_str("}\n\n");
     }
 
-    for (m, path) in collect_modules_with_path(&api.modules) {
+    for (m, path) in walk_modules_with_path(&api.modules) {
         for e in &m.enums {
             render_enum(&mut out, e);
         }

@@ -278,7 +278,7 @@ fn render_swift_wrapper(
     out.push_str(&render_prelude(CommentStyle::DoubleSlash, input_basename));
     out.push_str("import CWeaveFFI\nimport Foundation\n\n");
 
-    let all_mods = collect_all_modules(&api.modules);
+    let all_mods = walk_modules(&api.modules).collect::<Vec<_>>();
     let error_codes: Vec<_> = all_mods
         .iter()
         .filter_map(|m| m.errors.as_ref())
@@ -363,10 +363,6 @@ fn render_swift_wrapper(
     }
     out.push_str(&render_trailer(CommentStyle::DoubleSlash, filename));
     out
-}
-
-fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
-    walk_modules(modules).collect()
 }
 
 fn render_swift_module_types(out: &mut String, m: &Module, module_path: &str) {

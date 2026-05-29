@@ -10,14 +10,13 @@ use heck::{ToShoutySnakeCase, ToSnakeCase};
 use serde::{Deserialize, Serialize};
 use weaveffi_core::abi::{self, CType};
 use weaveffi_core::codegen::common::{
-    emit_doc as common_emit_doc, is_c_pointer_type as common_is_c_pointer_type, walk_modules,
-    walk_modules_with_path, DocCommentStyle,
+    emit_doc as common_emit_doc, is_c_pointer_type, walk_modules_with_path, DocCommentStyle,
 };
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::utils::{
     c_symbol_name, local_type_name, render_prelude, render_trailer, CommentStyle,
 };
-use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, StructField, TypeRef};
+use weaveffi_ir::ir::{Api, EnumDef, Function, StructDef, StructField, TypeRef};
 
 /// Per-target configuration for [`RubyGenerator`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -102,10 +101,6 @@ impl Generator for RubyGenerator {
 }
 
 // ── Type helpers ──
-
-fn is_c_pointer_type(ty: &TypeRef) -> bool {
-    common_is_c_pointer_type(ty)
-}
 
 /// Maps a shared ABI [`CType`] onto its Ruby FFI symbol. The structural
 /// lowering comes from [`weaveffi_core::abi`]; this is the Ruby vocabulary.
@@ -272,15 +267,6 @@ fn rb_element_expr(var: &str, ty: &TypeRef) -> String {
     }
 }
 
-#[allow(dead_code)]
-fn collect_all_modules(modules: &[Module]) -> Vec<&Module> {
-    walk_modules(modules).collect()
-}
-
-fn collect_modules_with_path(modules: &[Module]) -> Vec<(&Module, String)> {
-    walk_modules_with_path(modules).collect()
-}
-
 // ── Rendering ──
 
 /// Emits a Ruby `# ...` doc comment at `indent`. Each input line is prefixed
@@ -292,7 +278,7 @@ fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
 fn render_ruby_module(api: &Api, module_name: &str, input_basename: &str) -> String {
     let mut out = render_prelude(CommentStyle::Hash, input_basename);
     render_preamble(&mut out, module_name);
-    for (m, path) in collect_modules_with_path(&api.modules) {
+    for (m, path) in walk_modules_with_path(&api.modules) {
         out.push_str(&format!("\n  # === Module: {} ===\n", path));
         for e in &m.enums {
             render_enum(&mut out, e);
