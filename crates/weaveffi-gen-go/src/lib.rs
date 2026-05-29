@@ -191,8 +191,7 @@ fn type_has_bool(ty: &TypeRef) -> bool {
 }
 
 fn scan_imports(api: &Api) -> (bool, bool, bool) {
-    let has_sync_funcs =
-        walk_modules(&api.modules).any(|m| m.functions.iter().any(|f| !f.r#async));
+    let has_sync_funcs = walk_modules(&api.modules).any(|m| m.functions.iter().any(|f| !f.r#async));
 
     let needs_fmt = has_sync_funcs;
 
