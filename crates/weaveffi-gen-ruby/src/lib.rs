@@ -8,6 +8,7 @@ use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToShoutySnakeCase, ToSnakeCase};
 use serde::{Deserialize, Serialize};
+use weaveffi_core::abi::{self, CType};
 use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, is_c_pointer_type as common_is_c_pointer_type, walk_modules,
     walk_modules_with_path, DocCommentStyle,
@@ -106,49 +107,52 @@ fn is_c_pointer_type(ty: &TypeRef) -> bool {
     common_is_c_pointer_type(ty)
 }
 
-fn rb_ffi_scalar(ty: &TypeRef) -> &'static str {
+/// Maps a shared ABI [`CType`] onto its Ruby FFI symbol. The structural
+/// lowering comes from [`weaveffi_core::abi`]; this is the Ruby vocabulary.
+/// `string_as_pointer` distinguishes the two char-pointer conventions: `ffi`
+/// auto-marshals `:string` for *input* parameters but owned-return pointers
+/// must stay `:pointer` so the caller can free them.
+fn rb_ffi_type(ty: &CType, string_as_pointer: bool) -> &'static str {
     match ty {
-        TypeRef::I32 | TypeRef::Bool | TypeRef::Enum(_) => ":int32",
-        TypeRef::U32 => ":uint32",
-        TypeRef::I64 => ":int64",
-        TypeRef::F64 => ":double",
-        TypeRef::Handle => ":uint64",
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => ":string",
+        CType::Int32 | CType::Bool | CType::Enum { .. } => ":int32",
+        CType::Uint32 => ":uint32",
+        CType::Int64 => ":int64",
+        CType::Uint64 => ":uint64",
+        CType::Double => ":double",
+        CType::Handle => ":uint64",
+        CType::Size => ":size_t",
+        CType::Void => ":void",
+        CType::Ptr { pointee, .. } if matches!(**pointee, CType::Char) && !string_as_pointer => {
+            ":string"
+        }
         _ => ":pointer",
     }
 }
 
 fn rb_param_ffi_types(ty: &TypeRef) -> Vec<&'static str> {
-    match ty {
-        TypeRef::Bytes | TypeRef::BorrowedBytes => vec![":pointer", ":size_t"],
-        TypeRef::Optional(inner) if !is_c_pointer_type(inner) => vec![":pointer"],
-        TypeRef::Optional(inner) => rb_param_ffi_types(inner),
-        TypeRef::List(_) => vec![":pointer", ":size_t"],
-        TypeRef::Map(_, _) => vec![":pointer", ":pointer", ":size_t"],
-        _ => vec![rb_ffi_scalar(ty)],
-    }
+    abi::lower_param("_", ty, "", false)
+        .iter()
+        .map(|p| rb_ffi_type(&p.ty, false))
+        .collect()
 }
 
 fn rb_return_ffi_type(ty: &TypeRef) -> &'static str {
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => ":pointer",
-        TypeRef::Bytes | TypeRef::BorrowedBytes => ":pointer",
-        TypeRef::Optional(inner) if is_c_pointer_type(inner) => rb_return_ffi_type(inner),
-        TypeRef::Optional(_) => ":pointer",
-        TypeRef::List(_) => ":pointer",
-        TypeRef::Map(_, _) => ":void",
-        _ => rb_ffi_scalar(ty),
+    // Iterator constructors return the opaque handle; `_next` is emitted apart.
+    if matches!(ty, TypeRef::Iterator(_)) {
+        return ":pointer";
     }
+    rb_ffi_type(&abi::lower_return(ty, "").ret, true)
 }
 
 fn rb_return_out_params(ty: &TypeRef) -> Vec<&'static str> {
-    match ty {
-        TypeRef::Bytes | TypeRef::BorrowedBytes => vec![":pointer"],
-        TypeRef::Optional(inner) if is_c_pointer_type(inner) => rb_return_out_params(inner),
-        TypeRef::List(_) | TypeRef::Iterator(_) => vec![":pointer"],
-        TypeRef::Map(_, _) => vec![":pointer", ":pointer", ":pointer"],
-        _ => vec![],
+    if matches!(ty, TypeRef::Iterator(_)) {
+        return vec![":pointer"];
     }
+    abi::lower_return(ty, "")
+        .out_params
+        .iter()
+        .map(|p| rb_ffi_type(&p.ty, true))
+        .collect()
 }
 
 fn rb_read_method(ty: &TypeRef) -> &'static str {
@@ -1548,15 +1552,21 @@ mod tests {
 
     #[test]
     fn ffi_type_mapping() {
-        assert_eq!(rb_ffi_scalar(&TypeRef::I32), ":int32");
-        assert_eq!(rb_ffi_scalar(&TypeRef::U32), ":uint32");
-        assert_eq!(rb_ffi_scalar(&TypeRef::I64), ":int64");
-        assert_eq!(rb_ffi_scalar(&TypeRef::F64), ":double");
-        assert_eq!(rb_ffi_scalar(&TypeRef::Bool), ":int32");
-        assert_eq!(rb_ffi_scalar(&TypeRef::Handle), ":uint64");
-        assert_eq!(rb_ffi_scalar(&TypeRef::StringUtf8), ":string");
-        assert_eq!(rb_ffi_scalar(&TypeRef::Enum("Color".into())), ":int32");
-        assert_eq!(rb_ffi_scalar(&TypeRef::Struct("Foo".into())), ":pointer");
+        assert_eq!(rb_param_ffi_types(&TypeRef::I32), vec![":int32"]);
+        assert_eq!(rb_param_ffi_types(&TypeRef::U32), vec![":uint32"]);
+        assert_eq!(rb_param_ffi_types(&TypeRef::I64), vec![":int64"]);
+        assert_eq!(rb_param_ffi_types(&TypeRef::F64), vec![":double"]);
+        assert_eq!(rb_param_ffi_types(&TypeRef::Bool), vec![":int32"]);
+        assert_eq!(rb_param_ffi_types(&TypeRef::Handle), vec![":uint64"]);
+        assert_eq!(rb_param_ffi_types(&TypeRef::StringUtf8), vec![":string"]);
+        assert_eq!(
+            rb_param_ffi_types(&TypeRef::Enum("Color".into())),
+            vec![":int32"]
+        );
+        assert_eq!(
+            rb_param_ffi_types(&TypeRef::Struct("Foo".into())),
+            vec![":pointer"]
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
 use serde::{Deserialize, Serialize};
+use weaveffi_core::abi::{self, AbiParam, CType};
 use weaveffi_core::codegen::common::{walk_modules, walk_modules_with_path};
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::utils::{
@@ -163,41 +164,49 @@ fn pinvoke_type(ty: &TypeRef) -> String {
     }
 }
 
-fn pinvoke_param_list(p: &Param) -> Vec<String> {
-    match &p.ty {
-        TypeRef::Bytes | TypeRef::BorrowedBytes => vec![
-            format!("IntPtr {}_ptr", p.name),
-            format!("UIntPtr {}_len", p.name),
-        ],
-        TypeRef::List(_) => vec![
-            format!("IntPtr {}", p.name),
-            format!("UIntPtr {}_len", p.name),
-        ],
-        TypeRef::Map(_, _) => vec![
-            format!("IntPtr {}_keys", p.name),
-            format!("IntPtr {}_values", p.name),
-            format!("UIntPtr {}_len", p.name),
-        ],
-        TypeRef::Optional(inner)
-            if matches!(inner.as_ref(), TypeRef::Bytes | TypeRef::BorrowedBytes) =>
-        {
-            vec![
-                format!("IntPtr {}_ptr", p.name),
-                format!("UIntPtr {}_len", p.name),
-            ]
-        }
-        _ => vec![format!("{} {}", pinvoke_type(&p.ty), p.name)],
+/// Maps a shared ABI [`CType`] to its P/Invoke spelling. All pointers collapse
+/// to `IntPtr`; `size_t` becomes `UIntPtr`. The structural lowering (which slots
+/// exist, in what order) comes from [`weaveffi_core::abi`].
+fn cs_pinvoke_ctype(ty: &CType) -> String {
+    match ty {
+        CType::Int32 | CType::Bool | CType::Enum { .. } => "int".into(),
+        CType::Uint32 => "uint".into(),
+        CType::Int64 => "long".into(),
+        CType::Uint64 | CType::Handle => "ulong".into(),
+        CType::Double => "double".into(),
+        CType::Size => "UIntPtr".into(),
+        CType::Void => "void".into(),
+        CType::Uint8 => "byte".into(),
+        CType::Char => "sbyte".into(),
+        CType::Ptr { .. }
+        | CType::StructTag { .. }
+        | CType::CancelToken
+        | CType::Error
+        | CType::Named(_) => "IntPtr".into(),
     }
+}
+
+/// Renders a return out-param. C# expresses the trailing pointer level of a
+/// `T*` out-slot with the `out` keyword on the pointee value type.
+fn cs_out_param(p: &AbiParam) -> String {
+    let pointee = match &p.ty {
+        CType::Ptr { pointee, .. } => cs_pinvoke_ctype(pointee),
+        other => cs_pinvoke_ctype(other),
+    };
+    format!("out {} {}", pointee, p.name)
+}
+
+fn pinvoke_param_list(p: &Param) -> Vec<String> {
+    abi::lower_param(&p.name, &p.ty, "", false)
+        .iter()
+        .map(|slot| format!("{} {}", cs_pinvoke_ctype(&slot.ty), slot.name))
+        .collect()
 }
 
 fn pinvoke_return_info(ty: &TypeRef) -> (String, Vec<String>) {
     match ty {
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            ("IntPtr".into(), vec!["out UIntPtr out_len".into()])
-        }
-        TypeRef::List(_) | TypeRef::Iterator(_) => {
-            ("IntPtr".into(), vec!["out UIntPtr out_len".into()])
-        }
+        // Map returns use an array-base `out IntPtr` convention distinct from
+        // the element-typed out-slots of the shared model.
         TypeRef::Map(_, _) => (
             "void".into(),
             vec![
@@ -206,12 +215,21 @@ fn pinvoke_return_info(ty: &TypeRef) -> (String, Vec<String>) {
                 "out UIntPtr out_len".into(),
             ],
         ),
-        TypeRef::Optional(inner)
-            if matches!(inner.as_ref(), TypeRef::Bytes | TypeRef::BorrowedBytes) =>
-        {
-            ("IntPtr".into(), vec!["out UIntPtr out_len".into()])
+        // Iterator constructors lower like a list at the ABI boundary.
+        TypeRef::Iterator(inner) => {
+            let r = abi::lower_return(&TypeRef::List(inner.clone()), "");
+            (
+                cs_pinvoke_ctype(&r.ret),
+                r.out_params.iter().map(cs_out_param).collect(),
+            )
         }
-        _ => (pinvoke_type(ty), vec![]),
+        _ => {
+            let r = abi::lower_return(ty, "");
+            (
+                cs_pinvoke_ctype(&r.ret),
+                r.out_params.iter().map(cs_out_param).collect(),
+            )
+        }
     }
 }
 

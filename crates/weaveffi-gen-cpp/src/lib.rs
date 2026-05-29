@@ -10,6 +10,7 @@ use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
 use serde::{Deserialize, Serialize};
+use weaveffi_core::abi::{self, AbiParam};
 use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, is_c_pointer_type as common_is_c_pointer_type, walk_modules,
     walk_modules_with_path, DocCommentStyle,
@@ -247,139 +248,39 @@ fn is_c_pointer_type(ty: &TypeRef) -> bool {
     common_is_c_pointer_type(ty)
 }
 
+/// Renders ABI parameter slots to C declarations (`<type> <name>`), the form
+/// used inside the generated `extern "C"` block.
+fn render_param_decls(params: &[AbiParam], prefix: &str) -> Vec<String> {
+    params
+        .iter()
+        .map(|p| format!("{} {}", p.ty.render_c(prefix), p.name))
+        .collect()
+}
+
 fn c_element_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
-    match ty {
-        TypeRef::I32 => "int32_t".into(),
-        TypeRef::U32 => "uint32_t".into(),
-        TypeRef::I64 => "int64_t".into(),
-        TypeRef::F64 => "double".into(),
-        TypeRef::Bool => "bool".into(),
-        TypeRef::Handle => format!("{prefix}_handle_t"),
-        TypeRef::TypedHandle(n) => format!("{prefix}_{module}_{n}*"),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*".into(),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => "const uint8_t*".into(),
-        TypeRef::Struct(s) => format!("{}*", c_abi_struct_name(s, module, prefix)),
-        TypeRef::Enum(e) => format!("{prefix}_{module}_{e}"),
-        TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
-            c_element_type(inner, module, prefix)
-        }
-        TypeRef::Map(_, _) => "void*".into(),
-    }
+    abi::element_ctype(ty, module).render_c(prefix)
 }
 
 fn c_param_type(ty: &TypeRef, name: &str, module: &str, prefix: &str) -> String {
-    match ty {
-        TypeRef::I32 => format!("int32_t {name}"),
-        TypeRef::U32 => format!("uint32_t {name}"),
-        TypeRef::I64 => format!("int64_t {name}"),
-        TypeRef::F64 => format!("double {name}"),
-        TypeRef::Bool => format!("bool {name}"),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("const char* {name}"),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            format!("const uint8_t* {name}_ptr, size_t {name}_len")
-        }
-        TypeRef::Handle => format!("{prefix}_handle_t {name}"),
-        TypeRef::TypedHandle(n) => format!("{prefix}_{module}_{n}* {name}"),
-        TypeRef::Struct(s) => format!("const {}* {name}", c_abi_struct_name(s, module, prefix)),
-        TypeRef::Enum(e) => format!("{prefix}_{module}_{e} {name}"),
-        TypeRef::Optional(inner) => {
-            if is_c_pointer_type(inner) {
-                c_param_type(inner, name, module, prefix)
-            } else {
-                let base = c_element_type(inner, module, prefix);
-                format!("const {base}* {name}")
-            }
-        }
-        TypeRef::List(inner) => {
-            let elem = c_element_type(inner, module, prefix);
-            if is_c_pointer_type(inner) {
-                format!("{elem} const* {name}, size_t {name}_len")
-            } else {
-                format!("const {elem}* {name}, size_t {name}_len")
-            }
-        }
-        TypeRef::Map(k, v) => {
-            let ke = c_element_type(k, module, prefix);
-            let ve = c_element_type(v, module, prefix);
-            let kp = if is_c_pointer_type(k) {
-                format!("{ke} const* {name}_keys")
-            } else {
-                format!("const {ke}* {name}_keys")
-            };
-            let vp = if is_c_pointer_type(v) {
-                format!("{ve} const* {name}_values")
-            } else {
-                format!("const {ve}* {name}_values")
-            };
-            format!("{kp}, {vp}, size_t {name}_len")
-        }
-        TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
-    }
+    render_param_decls(&abi::lower_param(name, ty, module, false), prefix).join(", ")
 }
 
 fn c_ret_type(ty: &TypeRef, module: &str, prefix: &str) -> (String, Vec<String>) {
-    match ty {
-        TypeRef::I32 => ("int32_t".into(), vec![]),
-        TypeRef::U32 => ("uint32_t".into(), vec![]),
-        TypeRef::I64 => ("int64_t".into(), vec![]),
-        TypeRef::F64 => ("double".into(), vec![]),
-        TypeRef::Bool => ("bool".into(), vec![]),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => ("const char*".into(), vec![]),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            ("const uint8_t*".into(), vec!["size_t* out_len".into()])
-        }
-        TypeRef::Handle => (format!("{prefix}_handle_t"), vec![]),
-        TypeRef::TypedHandle(n) => (format!("{prefix}_{module}_{n}*"), vec![]),
-        TypeRef::Struct(s) => (format!("{}*", c_abi_struct_name(s, module, prefix)), vec![]),
-        TypeRef::Enum(e) => (format!("{prefix}_{module}_{e}"), vec![]),
-        TypeRef::Optional(inner) => {
-            if is_c_pointer_type(inner) {
-                c_ret_type(inner, module, prefix)
-            } else {
-                (
-                    format!("{}*", c_element_type(inner, module, prefix)),
-                    vec![],
-                )
-            }
-        }
-        TypeRef::List(inner) | TypeRef::Iterator(inner) => (
-            format!("{}*", c_element_type(inner, module, prefix)),
-            vec!["size_t* out_len".into()],
-        ),
-        TypeRef::Map(k, v) => (
-            "void".into(),
-            vec![
-                format!("{}* out_keys", c_element_type(k, module, prefix)),
-                format!("{}* out_values", c_element_type(v, module, prefix)),
-                "size_t* out_len".into(),
-            ],
-        ),
-    }
+    // The C++ wrapper lowers an iterator-returning function's ABI slot exactly
+    // like a list (`elem* result, size_t* out_len`); the iterator object itself
+    // is reconstructed in the wrapper layer.
+    let lowered = match ty {
+        TypeRef::Iterator(inner) => abi::lower_return(&TypeRef::List(inner.clone()), module),
+        _ => abi::lower_return(ty, module),
+    };
+    (
+        lowered.ret.render_c(prefix),
+        render_param_decls(&lowered.out_params, prefix),
+    )
 }
 
 fn c_callback_result_params(ty: &TypeRef, module: &str, prefix: &str) -> Vec<String> {
-    match ty {
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            vec!["const uint8_t* result".into(), "size_t result_len".into()]
-        }
-        TypeRef::List(inner) => {
-            let elem = c_element_type(inner, module, prefix);
-            vec![format!("{elem}* result"), "size_t result_len".into()]
-        }
-        TypeRef::Map(k, v) => {
-            let ke = c_element_type(k, module, prefix);
-            let ve = c_element_type(v, module, prefix);
-            vec![
-                format!("{ke}* result_keys"),
-                format!("{ve}* result_values"),
-                "size_t result_len".into(),
-            ]
-        }
-        _ => {
-            let (ret_ty, _) = c_ret_type(ty, module, prefix);
-            vec![format!("{ret_ty} result")]
-        }
-    }
+    render_param_decls(&abi::callback_result_params(ty, module), prefix)
 }
 
 // ── extern "C" block ──
