@@ -7,6 +7,7 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
+use weaveffi_core::abi::{self, CType};
 use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, is_c_pointer_type as common_is_c_pointer_type, walk_modules,
     walk_modules_with_path, DocCommentStyle,
@@ -183,55 +184,68 @@ fn py_type_hint(ty: &TypeRef) -> String {
     }
 }
 
-fn py_param_argtypes(ty: &TypeRef) -> Vec<String> {
+/// Maps a shared ABI [`CType`] onto its `ctypes` spelling. The structural
+/// lowering (which slots exist, in what order) comes from
+/// [`weaveffi_core::abi`]; this is the Python-specific vocabulary applied to
+/// each slot. Opaque handles and structs collapse to `c_void_p`; `char*`
+/// becomes the `c_char_p` convenience type.
+fn py_ctype(ty: &CType) -> String {
     match ty {
-        TypeRef::Bytes | TypeRef::BorrowedBytes => vec![
-            "ctypes.POINTER(ctypes.c_uint8)".into(),
-            "ctypes.c_size_t".into(),
-        ],
-        TypeRef::Optional(inner) if !is_c_pointer_type(inner) => {
-            vec![format!("ctypes.POINTER({})", py_ctypes_scalar(inner))]
+        CType::Int32 => "ctypes.c_int32".into(),
+        CType::Uint32 => "ctypes.c_uint32".into(),
+        CType::Int64 => "ctypes.c_int64".into(),
+        CType::Uint64 => "ctypes.c_uint64".into(),
+        CType::Double => "ctypes.c_double".into(),
+        CType::Bool => "ctypes.c_int32".into(),
+        CType::Size => "ctypes.c_size_t".into(),
+        CType::Handle => "ctypes.c_uint64".into(),
+        CType::Char => "ctypes.c_char".into(),
+        CType::Uint8 => "ctypes.c_uint8".into(),
+        CType::Void => "None".into(),
+        CType::Enum { .. } => "ctypes.c_int32".into(),
+        CType::CancelToken | CType::Error | CType::StructTag { .. } | CType::Named(_) => {
+            "ctypes.c_void_p".into()
         }
-        TypeRef::Optional(inner) => py_param_argtypes(inner),
-        TypeRef::List(inner) => vec![
-            format!("ctypes.POINTER({})", py_ctypes_scalar(inner)),
-            "ctypes.c_size_t".into(),
-        ],
-        TypeRef::Map(k, v) => vec![
-            format!("ctypes.POINTER({})", py_ctypes_scalar(k)),
-            format!("ctypes.POINTER({})", py_ctypes_scalar(v)),
-            "ctypes.c_size_t".into(),
-        ],
-        _ => vec![py_ctypes_scalar(ty).into()],
+        CType::Ptr { pointee, .. } => match pointee.as_ref() {
+            CType::Char => "ctypes.c_char_p".into(),
+            CType::StructTag { .. } | CType::CancelToken | CType::Void | CType::Named(_) => {
+                "ctypes.c_void_p".into()
+            }
+            other => format!("ctypes.POINTER({})", py_ctype(other)),
+        },
     }
+}
+
+fn py_param_argtypes(ty: &TypeRef) -> Vec<String> {
+    abi::lower_param("_", ty, "", false)
+        .iter()
+        .map(|p| py_ctype(&p.ty))
+        .collect()
 }
 
 /// Returns `(restype, out_param_argtypes)` for a return type.
 fn py_return_info(ty: &TypeRef) -> (String, Vec<String>) {
-    match ty {
-        TypeRef::Bytes | TypeRef::BorrowedBytes => (
-            "ctypes.POINTER(ctypes.c_uint8)".into(),
-            vec!["ctypes.POINTER(ctypes.c_size_t)".into()],
-        ),
-        TypeRef::Optional(inner) if !is_c_pointer_type(inner) => (
-            format!("ctypes.POINTER({})", py_ctypes_scalar(inner)),
-            vec![],
-        ),
-        TypeRef::Optional(inner) => py_return_info(inner),
-        TypeRef::List(inner) => (
-            format!("ctypes.POINTER({})", py_ctypes_scalar(inner)),
-            vec!["ctypes.POINTER(ctypes.c_size_t)".into()],
-        ),
-        TypeRef::Map(k, v) => (
+    // Map returns marshal via `byref` out-params, which ctypes models with an
+    // extra `POINTER` level beyond the shared C ABI shape. This convention is
+    // Python-specific, so it stays local rather than in the shared model.
+    if let Some((k, v)) = get_map_kv(ty) {
+        return (
             "None".into(),
             vec![
                 format!("ctypes.POINTER(ctypes.POINTER({}))", py_ctypes_scalar(k)),
                 format!("ctypes.POINTER(ctypes.POINTER({}))", py_ctypes_scalar(v)),
                 "ctypes.POINTER(ctypes.c_size_t)".into(),
             ],
-        ),
-        _ => (py_ctypes_scalar(ty).into(), vec![]),
+        );
     }
+    // Iterator constructors return the opaque iterator handle; the `_next`
+    // signature is emitted separately by the iterator code path.
+    if matches!(ty, TypeRef::Iterator(_)) {
+        return ("ctypes.c_void_p".into(), vec![]);
+    }
+    let r = abi::lower_return(ty, "");
+    let out = r.out_params.iter().map(|p| py_ctype(&p.ty)).collect();
+    (py_ctype(&r.ret), out)
 }
 
 fn get_map_kv(ty: &TypeRef) -> Option<(&TypeRef, &TypeRef)> {
@@ -246,39 +260,15 @@ fn get_map_kv(ty: &TypeRef) -> Option<(&TypeRef, &TypeRef)> {
 fn py_async_cb_trailing_fields(ret: &Option<TypeRef>) -> Vec<(String, String)> {
     match ret {
         None => vec![],
-        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => vec![
-            ("result".into(), "ctypes.POINTER(ctypes.c_uint8)".into()),
-            ("result_len".into(), "ctypes.c_size_t".into()),
-        ],
-        Some(TypeRef::List(inner)) => vec![
-            (
-                "result".into(),
-                format!("ctypes.POINTER({})", py_ctypes_scalar(inner)),
-            ),
-            ("result_len".into(), "ctypes.c_size_t".into()),
-        ],
-        Some(TypeRef::Map(k, v)) => vec![
-            (
-                "result_keys".into(),
-                format!("ctypes.POINTER({})", py_ctypes_scalar(k)),
-            ),
-            (
-                "result_values".into(),
-                format!("ctypes.POINTER({})", py_ctypes_scalar(v)),
-            ),
-            ("result_len".into(), "ctypes.c_size_t".into()),
-        ],
-        Some(TypeRef::Optional(inner)) => {
-            if is_c_pointer_type(inner) {
-                py_async_cb_trailing_fields(&Some(*inner.clone()))
-            } else {
-                vec![(
-                    "result".into(),
-                    format!("ctypes.POINTER({})", py_ctypes_scalar(inner)),
-                )]
-            }
+        // Optional peeling stays local so `Optional<bytes>`/`<list>`/`<map>`
+        // still surface their trailing `result_len`, matching the inner type.
+        Some(TypeRef::Optional(inner)) if is_c_pointer_type(inner) => {
+            py_async_cb_trailing_fields(&Some((**inner).clone()))
         }
-        Some(ty) => vec![("result".into(), py_ctypes_scalar(ty).to_string())],
+        Some(ty) => abi::callback_result_params(ty, "")
+            .into_iter()
+            .map(|p| (p.name, py_ctype(&p.ty)))
+            .collect(),
     }
 }
 

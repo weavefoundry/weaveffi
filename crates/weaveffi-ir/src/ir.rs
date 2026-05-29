@@ -19,13 +19,21 @@ pub const CURRENT_SCHEMA_VERSION: &str = "0.3.0";
 
 pub const SUPPORTED_VERSIONS: &[&str] = &["0.1.0", "0.2.0", "0.3.0"];
 
+/// `skip_serializing_if` predicate for `bool` fields that default to `false`.
+/// Keeps the canonical IDL emitted by `weaveffi format`/`extract` minimal by
+/// omitting flags the user never set (e.g. `async: false`, `mutable: false`).
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// `Eq` is omitted because `toml::Value` contains `f64`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Top-level WeaveFFI API definition.")]
 pub struct Api {
     pub version: String,
     pub modules: Vec<Module>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<BTreeMap<String, serde_json::Value>>")]
     pub generators: Option<BTreeMap<String, toml::Value>>,
 }
@@ -38,17 +46,17 @@ pub struct Api {
 pub struct Module {
     pub name: String,
     pub functions: Vec<Function>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub structs: Vec<StructDef>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enums: Vec<EnumDef>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub callbacks: Vec<CallbackDef>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub listeners: Vec<ListenerDef>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub errors: Option<ErrorDomain>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modules: Vec<Module>,
 }
 
@@ -56,17 +64,17 @@ pub struct Module {
 pub struct Function {
     pub name: String,
     pub params: Vec<Param>,
-    #[serde(rename = "return", default)]
+    #[serde(rename = "return", default, skip_serializing_if = "Option::is_none")]
     pub returns: Option<TypeRef>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
-    #[serde(default, rename = "async")]
+    #[serde(default, rename = "async", skip_serializing_if = "is_false")]
     pub r#async: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub cancellable: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deprecated: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<String>,
 }
 
@@ -75,9 +83,9 @@ pub struct Param {
     pub name: String,
     #[serde(rename = "type")]
     pub ty: TypeRef,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub mutable: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
 }
 
@@ -85,7 +93,7 @@ pub struct Param {
 pub struct CallbackDef {
     pub name: String,
     pub params: Vec<Param>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
 }
 
@@ -93,7 +101,7 @@ pub struct CallbackDef {
 pub struct ListenerDef {
     pub name: String,
     pub event_callback: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
 }
 
@@ -250,7 +258,7 @@ impl JsonSchema for TypeRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct EnumDef {
     pub name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
     pub variants: Vec<EnumVariant>,
 }
@@ -259,7 +267,7 @@ pub struct EnumDef {
 pub struct EnumVariant {
     pub name: String,
     pub value: i32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
 }
 
@@ -268,10 +276,10 @@ pub struct EnumVariant {
 #[schemars(description = "A struct (record) type with named fields.")]
 pub struct StructDef {
     pub name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
     pub fields: Vec<StructField>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub builder: bool,
 }
 
@@ -280,9 +288,9 @@ pub struct StructField {
     pub name: String,
     #[serde(rename = "type")]
     pub ty: TypeRef,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<serde_json::Value>")]
     pub default: Option<serde_yaml::Value>,
 }
@@ -298,7 +306,7 @@ pub struct ErrorCode {
     pub name: String,
     pub code: i32,
     pub message: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
 }
 
@@ -1265,6 +1273,74 @@ modules:
             fields[1].default,
             Some(serde_yaml::Value::Number(serde_yaml::Number::from(0)))
         );
+    }
+
+    #[test]
+    fn serialization_omits_defaulted_fields() {
+        // A minimal API whose every optional/defaulted field is at its
+        // default must serialize without emitting those fields, so the
+        // canonical IDL produced by `weaveffi format`/`extract` stays terse.
+        let api = Api {
+            version: "0.3.0".into(),
+            modules: vec![Module {
+                name: "calc".into(),
+                functions: vec![Function {
+                    name: "add".into(),
+                    params: vec![Param {
+                        name: "a".into(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                        doc: None,
+                    }],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+        };
+        let yaml = serde_yaml::to_string(&api).unwrap();
+        for needle in [
+            "generators",
+            "structs",
+            "enums",
+            "callbacks",
+            "listeners",
+            "errors",
+            "modules:\n", // nested module list (top-level key is "modules")
+            "doc",
+            "async",
+            "cancellable",
+            "deprecated",
+            "since",
+            "mutable",
+            "null",
+            "[]",
+            "false",
+        ] {
+            // `modules:` appears once at the top level; assert the *nested*
+            // empty module list under a module is gone by checking it never
+            // shows an empty sequence.
+            if needle == "modules:\n" {
+                continue;
+            }
+            assert!(
+                !yaml.contains(needle),
+                "default field `{needle}` leaked into canonical YAML:\n{yaml}"
+            );
+        }
+        // Round-trips back to an equal value.
+        let back: Api = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(back, api);
     }
 
     #[test]

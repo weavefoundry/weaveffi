@@ -49,14 +49,10 @@ jobs:
         #   RUSTSEC-2023-0057 / RUSTSEC-2023-0058 — apply to the crates.io
         #     `inventory` crate; our `samples/inventory` shares the name but
         #     is an unrelated, unpublished sample cdylib.
-        #   RUSTSEC-2026-0097 — `rand 0.8.5` unsound `rng()` path, pulled in
-        #     transitively via `tera`. Not reachable from our code; remove
-        #     once tera bumps its rand dep.
         run: |
           cargo audit --deny warnings \
             --ignore RUSTSEC-2023-0057 \
-            --ignore RUSTSEC-2023-0058 \
-            --ignore RUSTSEC-2026-0097
+            --ignore RUSTSEC-2023-0058
 
   machete:
     name: cargo-machete

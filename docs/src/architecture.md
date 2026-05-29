@@ -64,9 +64,9 @@ weaveffi-fuzz ──► weaveffi-ir, weaveffi-core (workspace-private; unpublish
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `weaveffi-ir`        | The IR types (`Api`, `Module`, `Function`, `TypeRef`, …), the `parse_api_str` parser, the `parse_type_ref` mini-grammar, and `CURRENT_SCHEMA_VERSION`. |
 | `weaveffi-abi`       | Stable C ABI runtime symbols: `weaveffi_error`, `weaveffi_error_clear`, `weaveffi_free_string`, `weaveffi_free_bytes`, the arena, cancel tokens. |
-| `weaveffi-core`      | The `Generator` trait, the `Orchestrator`, validation rules, generator config resolution, and the per-generator hash cache. |
+| `weaveffi-core`      | The `Generator` trait, the `Orchestrator`, the `abi` C-ABI lowering model, validation rules, generator config resolution, and the per-generator hash cache. |
 | `weaveffi-gen-*`     | Eleven generator crates. Each implements `Generator` and produces target-specific output (header, wrapper, package metadata).                    |
-| `weaveffi-cli`       | The `weaveffi` binary. Parses the IDL, applies validation, instantiates every generator, and dispatches the `Orchestrator`.                      |
+| `weaveffi-cli`       | The `weaveffi` binary. Parses the IDL, applies validation, instantiates every generator (via the `cli_targets!` registry), and dispatches the `Orchestrator`. Self-contained subcommands live in their own modules (`doctor.rs`, `upgrade.rs`, `extract.rs`, `scaffold.rs`). |
 | `weaveffi-fuzz`      | `cargo-fuzz` harnesses for the parsers, the validator, and `parse_type_ref`. Workspace-private (not published to crates.io).                     |
 
 Crates that contain `unsafe` code (`weaveffi-abi`, every `samples/*`
@@ -74,6 +74,56 @@ cdylib, `weaveffi-fuzz`, and the scaffold output emitted by
 `weaveffi generate --scaffold`) opt in with
 `#![allow(unsafe_code)]` at the top of their main source file. The
 workspace-wide `unsafe_code = deny` lint forbids it everywhere else.
+
+### CLI internals
+
+`weaveffi-cli` is split so that `main.rs` holds only argument parsing and
+command dispatch; each self-contained subcommand group lives in its own
+module:
+
+| Module        | Responsibility                                                        |
+| ------------- | --------------------------------------------------------------------- |
+| `main.rs`     | `clap` definitions, the `cli_targets!` registry, and dispatch.        |
+| `doctor.rs`   | `weaveffi doctor` — probes host toolchains per target.                |
+| `upgrade.rs`  | `weaveffi upgrade` — migrates IDLs across schema versions.            |
+| `extract.rs`  | `weaveffi extract` — derives an IDL from annotated Rust source.       |
+| `scaffold.rs` | the Rust producer stubs emitted by `weaveffi generate --scaffold`.    |
+
+#### The `cli_targets!` registry
+
+The 11 language targets used to be spelled out a dozen times (config
+struct fields, the `--target` parser, inline-generator merging, and the
+`Orchestrator` wiring). They now live in **one** declarative macro,
+`cli_targets!`, invoked once near the top of `main.rs`:
+
+```rust
+cli_targets! {
+    "c"       => c:       CConfig       via CGenerator,
+    "cpp"     => cpp:     CppConfig     via CppGenerator,
+    "swift"   => swift:   SwiftConfig   via SwiftGenerator,   strip,
+    // … one line per target …
+    "ruby"    => ruby:    RubyConfig    via RubyGenerator,
+}
+```
+
+That single invocation expands to the `CliConfig` struct (one typed
+field per target), `build_generators`, `apply_inline_target`, and the
+`strip_module_prefix`/input-stamping fan-out. Adding a language is a
+one-line change here; see [Adding a new generator](#adding-a-new-generator).
+
+#### Format canonicalization
+
+`weaveffi format` (and `format --check`) round-trips an IDL through the
+IR and re-serializes it, so the on-disk form is *canonical*. For the
+check to be a no-op on an already-formatted file, serialization must omit
+every field that is at its default — otherwise `serde` would inject
+`null`, `[]`, and `false` noise that the parser then drops on the next
+read, making `format` non-idempotent. The IR types therefore tag their
+optional/defaulted fields with `#[serde(skip_serializing_if = …)]`
+(`Option::is_none`, `Vec::is_empty`, and a local `is_false` for booleans
+that default to `false`). This keeps canonical IDLs terse and makes
+`format` idempotent; it also removes the now-meaningless `default`
+annotations from the generated `weaveffi.schema.json`.
 
 ## The IR
 
@@ -111,7 +161,7 @@ every version the upgrader can read (currently `["0.1.0", "0.2.0",
 
 1. Bump `CURRENT_SCHEMA_VERSION` and append the new version to
    `SUPPORTED_VERSIONS`.
-2. Add migration code in `cmd_upgrade` (`weaveffi-cli/src/main.rs`).
+2. Add migration code in `cmd_upgrade` (`weaveffi-cli/src/upgrade.rs`).
 3. Update every sample IDL, the `weaveffi new` template, the README
    quickstart, and the [Getting Started](getting-started.md) doc.
 
@@ -264,6 +314,62 @@ generated C output uses it consistently, including references to
 Struct lifecycle, enum constants, and getter symbols follow the
 patterns in the [C generator reference](generators/c.md).
 
+## The ABI lowering model
+
+The C ABI is the foundation every binding sits on: a flat, C-callable
+surface where each IDL type lowers to a fixed sequence of C parameters.
+A `string` becomes one `const char*`; `bytes` becomes
+`const uint8_t* {name}_ptr, size_t {name}_len`; a `map<K,V>` becomes
+parallel `{name}_keys` / `{name}_values` / `{name}_len` slots;
+collection and out-of-band returns append `out_*` pointers; and every
+fallible call ends with a trailing `{prefix}_error*`.
+
+That calling convention is defined **once**, in
+[`weaveffi_core::abi`][abi-source], rather than re-derived inside each
+generator:
+
+- `CType` — a prefix-agnostic algebra of C types (`Int32`, `Size`,
+  `Ptr { pointee, const_pos }`, `StructTag { module, name }`, …) with a
+  single `render_c(prefix)` method that produces canonical C spelling.
+- `element_ctype(ty, module)` — the C type of a single element.
+- `lower_param(name, ty, module, mutable)` — expands one IDL parameter
+  into its ordered `AbiParam` slots.
+- `lower_return(ty, module)` — the return `CType` plus any trailing
+  `out_*` `AbiParam`s.
+- `callback_result_params(ty, module)` — the trailing slots an async
+  callback receives after `(context, err)`.
+
+The C and C++ generators render these slots straight to C
+declarations, so their headers *are* the model by construction. The
+declarative consumer generators (Python, Ruby, .NET) call the same
+`lower_*` functions and map each `CType` onto their own FFI vocabulary
+(`ctypes.c_*`, Ruby FFI symbols, P/Invoke `IntPtr`/`UIntPtr`). This is
+what guarantees the producer header and every consumer agree on the
+parameter arity and order of a symbol — the class of drift that
+previously hid in a dozen hand-written copies of the lowering.
+
+A few conventions are genuinely language-specific and stay local to
+their generator rather than leaking into the shared model:
+
+- **Iterator returns.** The C ABI returns an opaque iterator handle
+  (`{prefix}_{module}_{Iter}*`) while other backends model the same
+  slot differently, so `lower_return` refuses an `Iterator` and each
+  caller lowers it explicitly.
+- **`byref` out-params.** ctypes (Python) and P/Invoke (.NET) express a
+  map return's `out_keys` / `out_values` with an extra pointer level or
+  the C# `out` keyword; those renderings stay in the respective
+  generator.
+
+Imperative generators (Go cgo, Node, Dart, Swift) build their FFI
+signatures inline with marshalling code and share the single
+`is_c_pointer_type` classifier in `weaveffi_core::codegen::common`. The
+Android (JNI) and WASM backends target different ABIs entirely and do
+not consume the C lowering.
+
+When you add a parameter shape or change how a type crosses the
+boundary, change `weaveffi_core::abi` and let the consumers inherit it;
+the snapshot suite will show every generator the edit touches.
+
 ## Determinism
 
 > Regenerating with the same WeaveFFI version on the same IDL produces
@@ -296,6 +402,11 @@ Press `a` to accept, `r` to reject, `s` to skip. Commit accepted
 `.snap` files in the same commit as the code change that produced
 them — never commit `.snap.new`. CI rejects pending snapshots.
 
+The harness redacts the WeaveFFI version in each file's generated-by
+prelude to `[VERSION]` before snapshotting (and separately asserts the
+real prelude is present), so a routine version bump does not invalidate
+every snapshot in the corpus.
+
 ## Adding a new generator
 
 A condensed checklist (the long version lives in
@@ -307,9 +418,13 @@ A condensed checklist (the long version lives in
 2. Implement `Generator` (start with `generate`; override
    `generate_with_config` once you accept config; override
    `output_files_with_config` so `--dry-run` and `weaveffi diff` work).
-3. Wire the generator into `crates/weaveffi-cli/src/main.rs` so
-   `--target <name>` accepts it (add a `&LangGenerator` to the
-   `Orchestrator` and an entry to the `--target` parser).
+3. Wire the generator into the `cli_targets!` registry macro in
+   `crates/weaveffi-cli/src/main.rs` — add one line
+   (`"<name>" => <field>: <Config> via <Generator>`, plus `strip` if the
+   generator honors `strip_module_prefix`). That single entry is the
+   source of truth: it expands to the `CliConfig` field, the
+   `--target <name>` parser entry, inline-config merging, and the
+   `Orchestrator` registration. No other CLI edits are required.
 4. Add snapshot fixtures in `crates/weaveffi-cli/tests/snapshots.rs`
    covering at minimum the calculator, contacts, inventory,
    async-demo, and events sample IDLs.
@@ -334,5 +449,6 @@ A condensed checklist (the long version lives in
   every async-capable generator implements.
 
 [ir-source]: https://github.com/weavefoundry/weaveffi/blob/main/crates/weaveffi-ir/src/ir.rs
+[abi-source]: https://github.com/weavefoundry/weaveffi/blob/main/crates/weaveffi-core/src/abi/mod.rs
 [insta]: https://insta.rs/
 [contributing]: https://github.com/weavefoundry/weaveffi/blob/main/CONTRIBUTING.md

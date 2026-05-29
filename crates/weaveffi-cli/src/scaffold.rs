@@ -41,7 +41,11 @@ fn rust_param_fragments(name: &str, ty: &TypeRef, module: &str, prefix: &str) ->
         TypeRef::I64 => vec![format!("{name}: i64")],
         TypeRef::F64 => vec![format!("{name}: f64")],
         TypeRef::Bool => vec![format!("{name}: bool")],
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr | TypeRef::Bytes | TypeRef::BorrowedBytes => {
+        // A string parameter is a single NUL-terminated `const char*` in the C
+        // ABI (see the generated header and `samples/`), not a pointer+length
+        // pair. Only byte slices carry an explicit length.
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![format!("{name}: *const c_char")],
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
             vec![
                 format!("{name}_ptr: *const u8"),
                 format!("{name}_len: usize"),
@@ -494,7 +498,7 @@ mod tests {
         let out = render_scaffold(&api, "weaveffi");
         assert!(
             out.contains(
-                "pub extern \"C\" fn weaveffi_calc_echo(s_ptr: *const u8, s_len: usize, out_err: *mut weaveffi_error) -> *const c_char {"
+                "pub extern \"C\" fn weaveffi_calc_echo(s: *const c_char, out_err: *mut weaveffi_error) -> *const c_char {"
             ),
             "missing echo stub: {out}"
         );
