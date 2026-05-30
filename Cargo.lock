@@ -2062,7 +2062,6 @@ dependencies = [
  "anyhow",
  "camino",
  "serde",
- "tempfile",
  "weaveffi-core",
  "weaveffi-ir",
 ]

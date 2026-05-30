@@ -1,4 +1,5 @@
-//! Shared rendering of the **C ABI declarations** from a [`BindingModel`].
+//! Shared rendering of the **C ABI declarations** from a
+//! [`BindingModel`](crate::model::BindingModel).
 //!
 //! Both the C generator (which emits the canonical `{prefix}.h`) and the C++
 //! generator (whose idiomatic wrapper opens an `extern "C"` block re-declaring
