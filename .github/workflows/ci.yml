@@ -205,6 +205,54 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  conformance:
+    # Correctness gate: every consumer binds through the *generated* wrappers and
+    # asserts concrete results, so a backend that lowers a type wrong, drifts a
+    # symbol, or skips a feature fails here (unlike the examples/ smoke programs
+    # in build-test, which mostly check exit status). Covers contacts + events
+    # across C, C++, Python, Ruby, Dart, Go, Swift, .NET, and Node. Wasm and
+    # Kotlin are out of scope for this dylib-based harness (see conformance/run.sh).
+    name: Conformance harness
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Set up Dart
+        uses: dart-lang/setup-dart@v1
+
+      - name: Set up Swift
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "5.10"
+
+      - name: Install consumer toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang g++ python3 golang-go ruby-ffi
+
+      - name: Run conformance harness
+        run: bash conformance/run.sh
+
   windows-e2e:
     name: Windows E2E
     runs-on: windows-latest
