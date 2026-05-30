@@ -1,3 +1,13 @@
+## [0.6.0](https://github.com/weavefoundry/weaveffi/compare/v0.5.0...v0.6.0) (2026-05-30)
+
+### ⚠ BREAKING CHANGES
+
+* unify all language generators on a shared binding model (#9)
+
+### Features
+
+* unify all language generators on a shared binding model ([#9](https://github.com/weavefoundry/weaveffi/issues/9)) ([28dda30](https://github.com/weavefoundry/weaveffi/commit/28dda30a35debb5927a60c16043be165771e1d33))
+
 ## [0.5.0](https://github.com/weavefoundry/weaveffi/compare/v0.4.0...v0.5.0) (2026-05-21)
 
 ### ⚠ BREAKING CHANGES
