@@ -651,6 +651,7 @@ fn render_preamble(out: &mut String) {
         r#""""WeaveFFI Python ctypes bindings (auto-generated)"""
 import contextlib
 import ctypes
+import os
 import platform
 from enum import IntEnum
 from typing import Dict, Iterator, List, Optional
@@ -671,6 +672,11 @@ class _WeaveffiErrorStruct(ctypes.Structure):
 
 
 def _load_library() -> ctypes.CDLL:
+    # An explicit path in WEAVEFFI_LIBRARY wins, so callers can point at a
+    # specific build artifact regardless of its file name or location.
+    override = os.environ.get("WEAVEFFI_LIBRARY")
+    if override:
+        return ctypes.CDLL(override)
     system = platform.system()
     if system == "Darwin":
         name = "libweaveffi.dylib"

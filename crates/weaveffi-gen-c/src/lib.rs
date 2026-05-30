@@ -1,23 +1,26 @@
-//! C header and source-file generator for WeaveFFI.
+//! C header generator for WeaveFFI.
 //!
-//! Emits a single `weaveffi.h` (plus optional helper sources) describing the
-//! stable C ABI surface defined by an [`weaveffi_ir::ir::Api`]. The generator
-//! is invoked through the [`Generator`] trait and is normally driven by
-//! [`weaveffi_core::codegen::Orchestrator`].
+//! Emits a single `{prefix}.h` describing the stable C ABI surface of an
+//! [`Api`], plus a companion `{prefix}.c` placeholder for future convenience
+//! wrappers. This is the canonical backend: the header it emits *is* the C ABI
+//! every other language binds to.
+//!
+//! Like every WeaveFFI backend it renders from the shared
+//! [`weaveffi_core::model::BindingModel`], so symbol names and parameter
+//! lowering are computed once and shared, never re-derived here.
 
 use std::fmt::Write;
 
 use anyhow::Result;
 use camino::Utf8Path;
-use heck::ToUpperCamelCase;
 use serde::{Deserialize, Serialize};
-use weaveffi_core::abi::{self, AbiParam};
-use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
+use weaveffi_core::cabi;
 use weaveffi_core::codegen::Generator;
+use weaveffi_core::model::BindingModel;
 use weaveffi_core::utils::{
     render_abi_prefix_aliases, render_prelude, render_trailer, CommentStyle,
 };
-use weaveffi_ir::ir::{Api, EnumDef, Module, Param, StructDef, TypeRef};
+use weaveffi_ir::ir::Api;
 
 /// Per-target configuration for [`CGenerator`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -44,40 +47,18 @@ impl CConfig {
     }
 }
 
-/// Number of API surface elements (functions + structs + enums + callbacks +
-/// listeners) used to pre-allocate the output buffer. Each element produces
-/// roughly 200-500 bytes of header text; budget 512 to cover most cases
-/// without re-allocating mid-render.
-const ESTIMATED_BYTES_PER_ELEMENT: usize = 512;
-const HEADER_BASE_BYTES: usize = 2048;
-
-fn estimate_header_capacity(api: &Api) -> usize {
-    fn count(modules: &[Module]) -> usize {
-        modules
-            .iter()
-            .map(|m| {
-                m.functions.len()
-                    + m.structs.len() * 2
-                    + m.enums.len()
-                    + m.callbacks.len()
-                    + m.listeners.len() * 2
-                    + count(&m.modules)
-            })
-            .sum()
-    }
-    HEADER_BASE_BYTES + count(&api.modules) * ESTIMATED_BYTES_PER_ELEMENT
-}
-
 pub struct CGenerator;
 
-impl CGenerator {
-    fn generate_impl(
-        &self,
-        api: &Api,
-        out_dir: &Utf8Path,
-        prefix: &str,
-        input_basename: &str,
-    ) -> Result<()> {
+impl Generator for CGenerator {
+    type Config = CConfig;
+
+    fn name(&self) -> &'static str {
+        "c"
+    }
+
+    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()> {
+        let prefix = config.prefix();
+        let input_basename = config.input_basename();
         let dir = out_dir.join("c");
         std::fs::create_dir_all(&dir)?;
         let header_name = format!("{prefix}.h");
@@ -92,18 +73,6 @@ impl CGenerator {
         )?;
         Ok(())
     }
-}
-
-impl Generator for CGenerator {
-    type Config = CConfig;
-
-    fn name(&self) -> &'static str {
-        "c"
-    }
-
-    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()> {
-        self.generate_impl(api, out_dir, config.prefix(), config.input_basename())
-    }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Vec<String> {
         let prefix = config.prefix();
@@ -116,63 +85,15 @@ impl Generator for CGenerator {
     }
 }
 
-/// Emits a `/** ... */` doc comment at `indent`. Single-line docs collapse to
-/// `/** text */`; multi-line docs expand to a block with ` * ` prefixed lines.
-fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
-    common_emit_doc(out, doc, indent, DocCommentStyle::Javadoc);
-}
-
-/// Render lowered ABI parameter slots as `"<c-type> <name>"` declarations.
-fn render_param_decls(params: &[AbiParam], prefix: &str) -> Vec<String> {
-    params
-        .iter()
-        .map(|p| format!("{} {}", p.ty.render_c(prefix), p.name))
-        .collect()
-}
-
-fn iter_type_name(func_name: &str, module: &str, prefix: &str) -> String {
-    let pascal = func_name.to_upper_camel_case();
-    format!("{prefix}_{module}_{pascal}Iterator")
-}
-
-fn c_type_for_param(ty: &TypeRef, name: &str, module: &str, prefix: &str, mutable: bool) -> String {
-    render_param_decls(&abi::lower_param(name, ty, module, mutable), prefix).join(", ")
-}
-
-fn c_ret_type(ty: &TypeRef, module: &str, prefix: &str) -> (String, Vec<String>) {
-    let r = abi::lower_return(ty, module);
-    (
-        r.ret.render_c(prefix),
-        render_param_decls(&r.out_params, prefix),
-    )
-}
-
-fn c_params_sig(params: &[Param], module: &str, prefix: &str) -> Vec<String> {
-    params
-        .iter()
-        .map(|p| c_type_for_param(&p.ty, &p.name, module, prefix, p.mutable))
-        .collect()
-}
-
-/// Write a comma-separated parameter signature directly into `out`, optionally
-/// prefixed with extra entries (used to fold callbacks/cancel tokens/out_err
-/// into the same signature without an intermediate `Vec<String>`).
-fn write_params_into(out: &mut String, parts: &[&str]) {
-    for (i, part) in parts.iter().enumerate() {
-        if i > 0 {
-            out.push_str(", ");
-        }
-        out.push_str(part);
-    }
-}
-
-fn c_callback_result_params(ty: &TypeRef, module: &str, prefix: &str) -> Vec<String> {
-    render_param_decls(&abi::callback_result_params(ty, module), prefix)
-}
-
-fn render_c_header(api: &Api, prefix: &str, input_basename: &str, filename: &str) -> String {
+/// Render the complete `{prefix}.h` for `api` using `prefix` for every symbol.
+///
+/// The per-declaration rendering is shared with the C++ backend via
+/// [`weaveffi_core::cabi`]; this function only adds the header framing
+/// (include guard, includes, prefix aliases, the map-convention comment).
+pub fn render_c_header(api: &Api, prefix: &str, input_basename: &str, filename: &str) -> String {
+    let model = BindingModel::build(api, prefix);
     let guard = format!("{}_H", prefix.to_uppercase());
-    let mut out = String::with_capacity(estimate_header_capacity(api));
+    let mut out = String::with_capacity(2048 + model.modules.len() * 4096);
     out.push_str(&render_prelude(CommentStyle::DoubleSlash, input_basename));
     let _ = write!(out, "#ifndef {guard}\n#define {guard}\n\n");
     out.push_str("#include <stdint.h>\n");
@@ -180,19 +101,7 @@ fn render_c_header(api: &Api, prefix: &str, input_basename: &str, filename: &str
     out.push_str("#include <stdbool.h>\n\n");
     out.push_str(&render_abi_prefix_aliases(prefix));
     out.push_str("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n");
-    let _ = write!(
-        out,
-        "typedef uint64_t {prefix}_handle_t;\n\n\
-         typedef struct {prefix}_error {{ int32_t code; const char* message; }} {prefix}_error;\n\n\
-         void {prefix}_error_clear({prefix}_error* err);\n\
-         void {prefix}_free_string(const char* ptr);\n\
-         void {prefix}_free_bytes(uint8_t* ptr, size_t len);\n\n\
-         typedef struct {prefix}_cancel_token {prefix}_cancel_token;\n\
-         {prefix}_cancel_token* {prefix}_cancel_token_create(void);\n\
-         void {prefix}_cancel_token_cancel({prefix}_cancel_token* token);\n\
-         bool {prefix}_cancel_token_is_cancelled(const {prefix}_cancel_token* token);\n\
-         void {prefix}_cancel_token_destroy({prefix}_cancel_token* token);\n\n",
-    );
+    cabi::render_runtime_decls(&mut out, prefix);
     out.push_str("/*\n");
     out.push_str(" * Map convention: Maps are passed as parallel arrays of keys and values.\n");
     out.push_str(" * A map parameter {K:V} named \"m\" expands to:\n");
@@ -201,8 +110,10 @@ fn render_c_header(api: &Api, prefix: &str, input_basename: &str, filename: &str
     out.push_str(" *   K* out_keys, V* out_values, size_t* out_len\n");
     out.push_str(" */\n\n");
 
-    for m in &api.modules {
-        render_module_header(&mut out, m, prefix, &m.name);
+    for m in &model.modules {
+        let _ = writeln!(out, "// Module: {}", m.path);
+        cabi::render_module_decls(&mut out, m, prefix);
+        out.push('\n');
     }
 
     out.push_str("\n#ifdef __cplusplus\n}\n#endif\n\n");
@@ -211,214 +122,12 @@ fn render_c_header(api: &Api, prefix: &str, input_basename: &str, filename: &str
     out
 }
 
-fn render_struct_header(out: &mut String, module_name: &str, s: &StructDef, prefix: &str) {
-    let tag = format!("{prefix}_{module_name}_{}", s.name);
-
-    emit_doc(out, &s.doc, "");
-    out.push_str(&format!("typedef struct {tag} {tag};\n"));
-
-    let mut params: Vec<String> = s
-        .fields
-        .iter()
-        .map(|f| c_type_for_param(&f.ty, &f.name, module_name, prefix, false))
-        .collect();
-    params.push(format!("{prefix}_error* out_err"));
-    out.push_str(&format!("{tag}* {tag}_create({});\n", params.join(", ")));
-
-    out.push_str(&format!("void {tag}_destroy({tag}* ptr);\n"));
-
-    for field in &s.fields {
-        let (ret_ty, out_params) = c_ret_type(&field.ty, module_name, prefix);
-        let getter = format!("{tag}_get_{}", field.name);
-        emit_doc(out, &field.doc, "");
-        if out_params.is_empty() {
-            out.push_str(&format!("{ret_ty} {getter}(const {tag}* ptr);\n"));
-        } else {
-            let extra = out_params.join(", ");
-            out.push_str(&format!("{ret_ty} {getter}(const {tag}* ptr, {extra});\n"));
-        }
-    }
-    out.push('\n');
-}
-
-fn render_builder_header(out: &mut String, module_name: &str, s: &StructDef, prefix: &str) {
-    let tag = format!("{prefix}_{module_name}_{}", s.name);
-    let builder_ty = format!("{tag}Builder");
-    out.push_str(&format!("typedef struct {builder_ty} {builder_ty};\n"));
-    out.push_str(&format!("{builder_ty}* {tag}_Builder_new(void);\n"));
-    for field in &s.fields {
-        let param = c_type_for_param(&field.ty, "value", module_name, prefix, false);
-        emit_doc(out, &field.doc, "");
-        out.push_str(&format!(
-            "void {tag}_Builder_set_{}({builder_ty}* builder, {});\n",
-            field.name, param
-        ));
-    }
-    out.push_str(&format!(
-        "{tag}* {tag}_Builder_build({builder_ty}* builder, {prefix}_error* out_err);\n"
-    ));
-    out.push_str(&format!(
-        "void {tag}_Builder_destroy({builder_ty}* builder);\n"
-    ));
-    out.push('\n');
-}
-
-fn render_enum_header(out: &mut String, module_name: &str, e: &EnumDef, prefix: &str) {
-    let tag = format!("{prefix}_{module_name}_{}", e.name);
-    let any_variant_doc = e.variants.iter().any(|v| v.doc.is_some());
-    emit_doc(out, &e.doc, "");
-    if any_variant_doc {
-        out.push_str("typedef enum {\n");
-        for (i, v) in e.variants.iter().enumerate() {
-            emit_doc(out, &v.doc, "    ");
-            let comma = if i + 1 == e.variants.len() { "" } else { "," };
-            out.push_str(&format!("    {tag}_{} = {}{comma}\n", v.name, v.value));
-        }
-        out.push_str(&format!("}} {tag};\n"));
-    } else {
-        let variants: Vec<String> = e
-            .variants
-            .iter()
-            .map(|v| format!("{tag}_{} = {}", v.name, v.value))
-            .collect();
-        out.push_str(&format!(
-            "typedef enum {{ {} }} {tag};\n",
-            variants.join(", ")
-        ));
-    }
-}
-
-fn render_module_header(out: &mut String, module: &Module, prefix: &str, module_path: &str) {
-    let _ = writeln!(out, "// Module: {module_path}");
-    for e in &module.enums {
-        render_enum_header(out, module_path, e, prefix);
-    }
-    for s in &module.structs {
-        render_struct_header(out, module_path, s, prefix);
-        if s.builder {
-            render_builder_header(out, module_path, s, prefix);
-        }
-    }
-    for cb in &module.callbacks {
-        let mut params: Vec<String> = cb
-            .params
-            .iter()
-            .map(|p| c_type_for_param(&p.ty, &p.name, module_path, prefix, p.mutable))
-            .collect();
-        params.push("void* context".to_string());
-        emit_doc(out, &cb.doc, "");
-        let _ = write!(
-            out,
-            "typedef void (*{prefix}_{module_path}_{}_fn)(",
-            cb.name
-        );
-        let parts: Vec<&str> = params.iter().map(|s| s.as_str()).collect();
-        write_params_into(out, &parts);
-        out.push_str(");\n");
-    }
-    for l in &module.listeners {
-        emit_doc(out, &l.doc, "");
-        let _ = writeln!(
-            out,
-            "uint64_t {prefix}_{module_path}_register_{}({prefix}_{module_path}_{}_fn callback, void* context);",
-            l.name, l.event_callback
-        );
-        emit_doc(out, &l.doc, "");
-        let _ = writeln!(
-            out,
-            "void {prefix}_{module_path}_unregister_{}(uint64_t id);",
-            l.name
-        );
-    }
-    for f in &module.functions {
-        emit_doc(out, &f.doc, "");
-        if let Some(msg) = &f.deprecated {
-            let _ = writeln!(
-                out,
-                "__attribute__((deprecated(\"{}\")))",
-                msg.replace('"', "\\\"")
-            );
-        }
-        if let Some(TypeRef::Iterator(inner)) = &f.returns {
-            let iter_tag = iter_type_name(&f.name, module_path, prefix);
-            let _ = writeln!(out, "typedef struct {iter_tag} {iter_tag};");
-
-            let mut params_sig = c_params_sig(&f.params, module_path, prefix);
-            params_sig.push(format!("{prefix}_error* out_err"));
-            let _ = write!(out, "{iter_tag}* {prefix}_{module_path}_{}(", f.name);
-            let parts: Vec<&str> = params_sig.iter().map(|s| s.as_str()).collect();
-            write_params_into(out, &parts);
-            out.push_str(");\n");
-
-            let (item_ty, item_out_params) = c_ret_type(inner, module_path, prefix);
-            let mut next_params = vec![format!("{iter_tag}* iter"), format!("{item_ty}* out_item")];
-            next_params.extend(item_out_params);
-            next_params.push(format!("{prefix}_error* out_err"));
-            let _ = write!(out, "int32_t {iter_tag}_next(");
-            let parts: Vec<&str> = next_params.iter().map(|s| s.as_str()).collect();
-            write_params_into(out, &parts);
-            out.push_str(");\n");
-
-            let _ = writeln!(out, "void {iter_tag}_destroy({iter_tag}* iter);");
-            continue;
-        }
-        if f.r#async {
-            let fn_base = format!("{prefix}_{module_path}_{}", f.name);
-
-            let mut cb_params = vec!["void* context".to_string(), format!("{prefix}_error* err")];
-            if let Some(ret) = &f.returns {
-                cb_params.extend(c_callback_result_params(ret, module_path, prefix));
-            }
-            let _ = write!(out, "typedef void (*{fn_base}_callback)(");
-            let parts: Vec<&str> = cb_params.iter().map(|s| s.as_str()).collect();
-            write_params_into(out, &parts);
-            out.push_str(");\n");
-
-            let _ = writeln!(out, "/*");
-            let _ = writeln!(out, " * Async: {fn_base}");
-            out.push_str(" * The callback is called exactly once, on any thread.\n");
-            out.push_str(" * On success, err is NULL and result (if any) is valid.\n");
-            out.push_str(" * On failure, err is non-NULL with a non-zero code.\n");
-            out.push_str(" */\n");
-
-            let mut params_sig = c_params_sig(&f.params, module_path, prefix);
-            if f.cancellable {
-                params_sig.push(format!("{prefix}_cancel_token* cancel_token"));
-            }
-            params_sig.push(format!("{fn_base}_callback callback"));
-            params_sig.push("void* context".to_string());
-            let _ = write!(out, "void {fn_base}_async(");
-            let parts: Vec<&str> = params_sig.iter().map(|s| s.as_str()).collect();
-            write_params_into(out, &parts);
-            out.push_str(");\n");
-        } else {
-            let mut params_sig = c_params_sig(&f.params, module_path, prefix);
-            let ret_sig = if let Some(ret) = &f.returns {
-                let (ret_ty, out_params) = c_ret_type(ret, module_path, prefix);
-                params_sig.extend(out_params);
-                ret_ty
-            } else {
-                "void".to_string()
-            };
-            params_sig.push(format!("{prefix}_error* out_err"));
-            let _ = write!(out, "{ret_sig} {prefix}_{module_path}_{}(", f.name);
-            let parts: Vec<&str> = params_sig.iter().map(|s| s.as_str()).collect();
-            write_params_into(out, &parts);
-            out.push_str(");\n");
-        }
-    }
-    for sub in &module.modules {
-        let nested_path = format!("{module_path}_{}", sub.name);
-        render_module_header(out, sub, prefix, &nested_path);
-    }
-    out.push('\n');
-}
-
 fn render_c_convenience_c(prefix: &str, input_basename: &str, filename: &str) -> String {
     let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
-    out.push_str(&format!(
+    let _ = write!(
+        out,
         "#include \"{prefix}.h\"\n\n// Optional convenience wrappers can be added here in future versions.\n\n"
-    ));
+    );
     out.push_str(&render_trailer(CommentStyle::DoubleSlash, filename));
     out
 }
@@ -426,2320 +135,205 @@ fn render_c_convenience_c(prefix: &str, input_basename: &str, filename: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use camino::Utf8Path;
-    use weaveffi_core::codegen::Generator;
     use weaveffi_ir::ir::{
-        Api, CallbackDef, EnumDef, EnumVariant, Function, ListenerDef, Module, Param, StructDef,
+        CallbackDef, EnumDef, EnumVariant, Function, ListenerDef, Module, Param, StructDef,
         StructField, TypeRef,
     };
 
-    #[test]
-    fn generate_c_header_contains_expected_symbols() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "calculator".to_string(),
-                functions: vec![
-                    Function {
-                        name: "add".to_string(),
-                        params: vec![
-                            Param {
-                                name: "a".to_string(),
-                                ty: TypeRef::I32,
-                                mutable: false,
-                                doc: None,
-                            },
-                            Param {
-                                name: "b".to_string(),
-                                ty: TypeRef::I32,
-                                mutable: false,
-                                doc: None,
-                            },
-                        ],
-                        returns: Some(TypeRef::I32),
-                        doc: None,
-                        r#async: false,
-                        cancellable: false,
-                        deprecated: None,
-                        since: None,
-                    },
-                    Function {
-                        name: "echo".to_string(),
-                        params: vec![Param {
-                            name: "msg".to_string(),
-                            ty: TypeRef::StringUtf8,
-                            mutable: false,
-                            doc: None,
-                        }],
-                        returns: Some(TypeRef::StringUtf8),
-                        doc: None,
-                        r#async: false,
-                        cancellable: false,
-                        deprecated: None,
-                        since: None,
-                    },
-                ],
-                errors: None,
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                modules: vec![],
-            }],
-            generators: None,
-        };
-
-        let tmp = std::env::temp_dir().join("weaveffi_test_c_gen");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
-
-        CGenerator
-            .generate(&api, out_dir, &CConfig::default())
-            .unwrap();
-
-        let header = std::fs::read_to_string(tmp.join("c").join("weaveffi.h")).unwrap();
-        assert!(
-            header.contains("#ifndef WEAVEFFI_H"),
-            "missing include guard"
-        );
-        assert!(
-            header.contains("weaveffi_calculator_add"),
-            "missing add symbol"
-        );
-        assert!(
-            header.contains("weaveffi_calculator_echo"),
-            "missing echo symbol"
-        );
-        assert!(header.contains("int32_t"), "missing i32 type mapping");
-        assert!(header.contains("const char*"), "missing string return type");
-
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn param(name: &str, ty: TypeRef) -> Param {
+        Param {
+            name: name.into(),
+            ty,
+            mutable: false,
+            doc: None,
+        }
     }
 
-    #[test]
-    fn generate_c_header_with_structs() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "contacts".to_string(),
-                functions: vec![],
-                structs: vec![StructDef {
-                    name: "Contact".to_string(),
-                    doc: None,
-                    fields: vec![
-                        StructField {
-                            name: "name".to_string(),
-                            ty: TypeRef::StringUtf8,
-                            doc: None,
-                            default: None,
-                        },
-                        StructField {
-                            name: "age".to_string(),
-                            ty: TypeRef::I32,
-                            doc: None,
-                            default: None,
-                        },
-                    ],
-                    builder: false,
-                }],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-
-        assert!(
-            header.contains("typedef struct weaveffi_contacts_Contact weaveffi_contacts_Contact;"),
-            "missing opaque typedef"
-        );
-        assert!(
-            header.contains("weaveffi_contacts_Contact* weaveffi_contacts_Contact_create("),
-            "missing create function"
-        );
-        assert!(
-            header.contains("weaveffi_error* out_err"),
-            "create missing out_err param"
-        );
-        assert!(
-            header.contains(
-                "void weaveffi_contacts_Contact_destroy(weaveffi_contacts_Contact* ptr);"
-            ),
-            "missing destroy function"
-        );
-        assert!(
-            header.contains(
-                "const char* weaveffi_contacts_Contact_get_name(const weaveffi_contacts_Contact* ptr);"
-            ),
-            "missing name getter"
-        );
-        assert!(
-            header.contains(
-                "int32_t weaveffi_contacts_Contact_get_age(const weaveffi_contacts_Contact* ptr);"
-            ),
-            "missing age getter"
-        );
-
-        let typedef_pos = header
-            .find("typedef struct weaveffi_contacts_Contact")
-            .unwrap();
-        let endif_pos = header.find("#ifdef __cplusplus\n}\n#endif").unwrap();
-        assert!(
-            typedef_pos < endif_pos,
-            "struct declarations must appear before closing guard"
-        );
+    fn func(name: &str, params: Vec<Param>, returns: Option<TypeRef>) -> Function {
+        Function {
+            name: name.into(),
+            params,
+            returns,
+            doc: None,
+            r#async: false,
+            cancellable: false,
+            deprecated: None,
+            since: None,
+        }
     }
 
-    #[test]
-    fn generate_c_header_with_enums() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "contacts".to_string(),
-                functions: vec![],
-                structs: vec![],
-                enums: vec![EnumDef {
-                    name: "Color".to_string(),
-                    doc: None,
-                    variants: vec![
-                        EnumVariant {
-                            name: "Red".to_string(),
-                            value: 0,
-                            doc: None,
-                        },
-                        EnumVariant {
-                            name: "Green".to_string(),
-                            value: 1,
-                            doc: None,
-                        },
-                        EnumVariant {
-                            name: "Blue".to_string(),
-                            value: 2,
-                            doc: None,
-                        },
-                    ],
-                }],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(header.contains("typedef enum {"), "missing typedef enum");
-        assert!(
-            header.contains("weaveffi_contacts_Color_Red = 0"),
-            "missing Red variant"
-        );
-        assert!(
-            header.contains("weaveffi_contacts_Color_Green = 1"),
-            "missing Green variant"
-        );
-        assert!(
-            header.contains("weaveffi_contacts_Color_Blue = 2"),
-            "missing Blue variant"
-        );
-        assert!(
-            header.contains("} weaveffi_contacts_Color;"),
-            "missing enum type name"
-        );
+    fn module(name: &str) -> Module {
+        Module {
+            name: name.into(),
+            functions: vec![],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }
     }
 
-    #[test]
-    fn enum_declarations_before_struct_declarations() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "contacts".to_string(),
-                functions: vec![],
-                structs: vec![StructDef {
-                    name: "Contact".to_string(),
-                    doc: None,
-                    fields: vec![StructField {
-                        name: "age".to_string(),
-                        ty: TypeRef::I32,
-                        doc: None,
-                        default: None,
-                    }],
-                    builder: false,
-                }],
-                enums: vec![EnumDef {
-                    name: "Color".to_string(),
-                    doc: None,
-                    variants: vec![EnumVariant {
-                        name: "Red".to_string(),
-                        value: 0,
-                        doc: None,
-                    }],
-                }],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-        let enum_pos = header.find("typedef enum").unwrap();
-        let struct_pos = header.find("typedef struct weaveffi_contacts_").unwrap();
-        assert!(enum_pos < struct_pos, "enums must appear before structs");
-    }
-
-    #[test]
-    fn c_type_struct_param() {
-        let result = c_type_for_param(
-            &TypeRef::Struct("Contact".to_string()),
-            "person",
-            "contacts",
-            "weaveffi",
-            false,
-        );
-        assert_eq!(result, "const weaveffi_contacts_Contact* person");
-    }
-
-    #[test]
-    fn c_type_enum_param() {
-        let result = c_type_for_param(
-            &TypeRef::Enum("Color".to_string()),
-            "color",
-            "contacts",
-            "weaveffi",
-            false,
-        );
-        assert_eq!(result, "weaveffi_contacts_Color color");
-    }
-
-    #[test]
-    fn c_type_optional_value_param() {
-        let ty = TypeRef::Optional(Box::new(TypeRef::I32));
-        assert_eq!(
-            c_type_for_param(&ty, "val", "m", "weaveffi", false),
-            "const int32_t* val"
-        );
-    }
-
-    #[test]
-    fn c_type_optional_pointer_param() {
-        let ty = TypeRef::Optional(Box::new(TypeRef::StringUtf8));
-        assert_eq!(
-            c_type_for_param(&ty, "name", "m", "weaveffi", false),
-            "const char* name"
-        );
-    }
-
-    #[test]
-    fn c_type_optional_struct_param() {
-        let ty = TypeRef::Optional(Box::new(TypeRef::Struct("Contact".into())));
-        assert_eq!(
-            c_type_for_param(&ty, "person", "contacts", "weaveffi", false),
-            "const weaveffi_contacts_Contact* person"
-        );
-    }
-
-    #[test]
-    fn c_type_optional_enum_param() {
-        let ty = TypeRef::Optional(Box::new(TypeRef::Enum("Color".into())));
-        assert_eq!(
-            c_type_for_param(&ty, "color", "contacts", "weaveffi", false),
-            "const weaveffi_contacts_Color* color"
-        );
-    }
-
-    #[test]
-    fn c_type_list_value_param() {
-        let ty = TypeRef::List(Box::new(TypeRef::I32));
-        assert_eq!(
-            c_type_for_param(&ty, "items", "m", "weaveffi", false),
-            "const int32_t* items, size_t items_len"
-        );
-    }
-
-    #[test]
-    fn c_type_list_struct_param() {
-        let ty = TypeRef::List(Box::new(TypeRef::Struct("Contact".into())));
-        assert_eq!(
-            c_type_for_param(&ty, "items", "contacts", "weaveffi", false),
-            "weaveffi_contacts_Contact* const* items, size_t items_len"
-        );
-    }
-
-    #[test]
-    fn c_ret_struct() {
-        let (ty, out_params) =
-            c_ret_type(&TypeRef::Struct("Contact".into()), "contacts", "weaveffi");
-        assert_eq!(ty, "weaveffi_contacts_Contact*");
-        assert!(out_params.is_empty());
-    }
-
-    #[test]
-    fn c_ret_enum() {
-        let (ty, out_params) = c_ret_type(&TypeRef::Enum("Color".into()), "contacts", "weaveffi");
-        assert_eq!(ty, "weaveffi_contacts_Color");
-        assert!(out_params.is_empty());
-    }
-
-    #[test]
-    fn c_ret_optional_value() {
-        let (ty, out_params) =
-            c_ret_type(&TypeRef::Optional(Box::new(TypeRef::I32)), "m", "weaveffi");
-        assert_eq!(ty, "int32_t*");
-        assert!(out_params.is_empty());
-    }
-
-    #[test]
-    fn c_ret_optional_pointer() {
-        let (ty, out_params) = c_ret_type(
-            &TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
-            "m",
-            "weaveffi",
-        );
-        assert_eq!(ty, "const char*");
-        assert!(out_params.is_empty());
-    }
-
-    #[test]
-    fn c_ret_list_value() {
-        let (ty, out_params) = c_ret_type(&TypeRef::List(Box::new(TypeRef::I32)), "m", "weaveffi");
-        assert_eq!(ty, "int32_t*");
-        assert_eq!(out_params, vec!["size_t* out_len"]);
-    }
-
-    #[test]
-    fn c_ret_list_struct() {
-        let (ty, out_params) = c_ret_type(
-            &TypeRef::List(Box::new(TypeRef::Struct("Contact".into()))),
-            "contacts",
-            "weaveffi",
-        );
-        assert_eq!(ty, "weaveffi_contacts_Contact**");
-        assert_eq!(out_params, vec!["size_t* out_len"]);
-    }
-
-    #[test]
-    fn generate_c_header_with_optional_and_list_function() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "store".to_string(),
-                functions: vec![
-                    Function {
-                        name: "find".to_string(),
-                        params: vec![Param {
-                            name: "id".to_string(),
-                            ty: TypeRef::Optional(Box::new(TypeRef::I32)),
-                            mutable: false,
-                            doc: None,
-                        }],
-                        returns: Some(TypeRef::Optional(Box::new(TypeRef::I32))),
-                        doc: None,
-                        r#async: false,
-                        cancellable: false,
-                        deprecated: None,
-                        since: None,
-                    },
-                    Function {
-                        name: "list_ids".to_string(),
-                        params: vec![Param {
-                            name: "tags".to_string(),
-                            ty: TypeRef::List(Box::new(TypeRef::I32)),
-                            mutable: false,
-                            doc: None,
-                        }],
-                        returns: Some(TypeRef::List(Box::new(TypeRef::I32))),
-                        doc: None,
-                        r#async: false,
-                        cancellable: false,
-                        deprecated: None,
-                        since: None,
-                    },
-                ],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(
-            header.contains(
-                "int32_t* weaveffi_store_find(const int32_t* id, weaveffi_error* out_err);"
-            ),
-            "missing optional param/return function: {header}"
-        );
-        assert!(
-            header.contains("int32_t* weaveffi_store_list_ids(const int32_t* tags, size_t tags_len, size_t* out_len, weaveffi_error* out_err);"),
-            "missing list param/return function: {header}"
-        );
-    }
-
-    #[test]
-    fn generate_c_header_with_contacts() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "contacts".to_string(),
-                enums: vec![EnumDef {
-                    name: "ContactType".to_string(),
-                    doc: None,
-                    variants: vec![
-                        EnumVariant {
-                            name: "Personal".to_string(),
-                            value: 0,
-                            doc: None,
-                        },
-                        EnumVariant {
-                            name: "Work".to_string(),
-                            value: 1,
-                            doc: None,
-                        },
-                        EnumVariant {
-                            name: "Other".to_string(),
-                            value: 2,
-                            doc: None,
-                        },
-                    ],
-                }],
-                callbacks: vec![],
-                listeners: vec![],
-                structs: vec![StructDef {
-                    name: "Contact".to_string(),
-                    doc: None,
-                    fields: vec![
-                        StructField {
-                            name: "id".to_string(),
-                            ty: TypeRef::I64,
-                            doc: None,
-                            default: None,
-                        },
-                        StructField {
-                            name: "first_name".to_string(),
-                            ty: TypeRef::StringUtf8,
-                            doc: None,
-                            default: None,
-                        },
-                        StructField {
-                            name: "last_name".to_string(),
-                            ty: TypeRef::StringUtf8,
-                            doc: None,
-                            default: None,
-                        },
-                        StructField {
-                            name: "email".to_string(),
-                            ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
-                            doc: None,
-                            default: None,
-                        },
-                        StructField {
-                            name: "contact_type".to_string(),
-                            ty: TypeRef::Enum("ContactType".to_string()),
-                            doc: None,
-                            default: None,
-                        },
-                    ],
-                    builder: false,
-                }],
-                functions: vec![
-                    Function {
-                        name: "create_contact".to_string(),
-                        params: vec![
-                            Param {
-                                name: "first_name".to_string(),
-                                ty: TypeRef::StringUtf8,
-                                mutable: false,
-                                doc: None,
-                            },
-                            Param {
-                                name: "last_name".to_string(),
-                                ty: TypeRef::StringUtf8,
-                                mutable: false,
-                                doc: None,
-                            },
-                            Param {
-                                name: "email".to_string(),
-                                ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
-                                mutable: false,
-                                doc: None,
-                            },
-                            Param {
-                                name: "contact_type".to_string(),
-                                ty: TypeRef::Enum("ContactType".to_string()),
-                                mutable: false,
-                                doc: None,
-                            },
-                        ],
-                        returns: Some(TypeRef::Handle),
-                        doc: None,
-                        r#async: false,
-                        cancellable: false,
-                        deprecated: None,
-                        since: None,
-                    },
-                    Function {
-                        name: "get_contact".to_string(),
-                        params: vec![Param {
-                            name: "id".to_string(),
-                            ty: TypeRef::Handle,
-                            mutable: false,
-                            doc: None,
-                        }],
-                        returns: Some(TypeRef::Struct("Contact".to_string())),
-                        doc: None,
-                        r#async: false,
-                        cancellable: false,
-                        deprecated: None,
-                        since: None,
-                    },
-                    Function {
-                        name: "list_contacts".to_string(),
-                        params: vec![],
-                        returns: Some(TypeRef::List(Box::new(TypeRef::Struct(
-                            "Contact".to_string(),
-                        )))),
-                        doc: None,
-                        r#async: false,
-                        cancellable: false,
-                        deprecated: None,
-                        since: None,
-                    },
-                    Function {
-                        name: "delete_contact".to_string(),
-                        params: vec![Param {
-                            name: "id".to_string(),
-                            ty: TypeRef::Handle,
-                            mutable: false,
-                            doc: None,
-                        }],
-                        returns: Some(TypeRef::Bool),
-                        doc: None,
-                        r#async: false,
-                        cancellable: false,
-                        deprecated: None,
-                        since: None,
-                    },
-                    Function {
-                        name: "count_contacts".to_string(),
-                        params: vec![],
-                        returns: Some(TypeRef::I32),
-                        doc: None,
-                        r#async: false,
-                        cancellable: false,
-                        deprecated: None,
-                        since: None,
-                    },
-                ],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-
-        let tmp = std::env::temp_dir().join("weaveffi_test_c_gen_contacts");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
-
-        CGenerator
-            .generate(&api, out_dir, &CConfig::default())
-            .unwrap();
-
-        let header = std::fs::read_to_string(tmp.join("c").join("weaveffi.h")).unwrap();
-
-        assert!(
-            header.contains("weaveffi_contacts_ContactType_Personal = 0"),
-            "missing Personal variant"
-        );
-        assert!(
-            header.contains("weaveffi_contacts_ContactType_Work = 1"),
-            "missing Work variant"
-        );
-        assert!(
-            header.contains("weaveffi_contacts_ContactType_Other = 2"),
-            "missing Other variant"
-        );
-        assert!(
-            header.contains("} weaveffi_contacts_ContactType;"),
-            "missing ContactType enum typedef"
-        );
-
-        assert!(
-            header.contains("typedef struct weaveffi_contacts_Contact weaveffi_contacts_Contact;"),
-            "missing opaque struct typedef"
-        );
-
-        assert!(
-            header.contains("weaveffi_contacts_Contact* weaveffi_contacts_Contact_create("),
-            "missing Contact create prototype"
-        );
-        assert!(
-            header.contains(
-                "void weaveffi_contacts_Contact_destroy(weaveffi_contacts_Contact* ptr);"
-            ),
-            "missing Contact destroy prototype"
-        );
-
-        assert!(
-            header.contains(
-                "int64_t weaveffi_contacts_Contact_get_id(const weaveffi_contacts_Contact* ptr);"
-            ),
-            "missing id getter"
-        );
-        assert!(
-            header.contains(
-                "const char* weaveffi_contacts_Contact_get_first_name(const weaveffi_contacts_Contact* ptr);"
-            ),
-            "missing first_name getter"
-        );
-        assert!(
-            header.contains(
-                "const char* weaveffi_contacts_Contact_get_last_name(const weaveffi_contacts_Contact* ptr);"
-            ),
-            "missing last_name getter"
-        );
-        assert!(
-            header.contains(
-                "const char* weaveffi_contacts_Contact_get_email(const weaveffi_contacts_Contact* ptr);"
-            ),
-            "missing email getter"
-        );
-        assert!(
-            header.contains(
-                "weaveffi_contacts_ContactType weaveffi_contacts_Contact_get_contact_type(const weaveffi_contacts_Contact* ptr);"
-            ),
-            "missing contact_type getter"
-        );
-
-        assert!(
-            header.contains("weaveffi_handle_t weaveffi_contacts_create_contact("),
-            "missing create_contact declaration"
-        );
-        assert!(
-            header.contains("weaveffi_contacts_Contact* weaveffi_contacts_get_contact("),
-            "missing get_contact declaration"
-        );
-        assert!(
-            header.contains("weaveffi_contacts_Contact** weaveffi_contacts_list_contacts("),
-            "missing list_contacts declaration"
-        );
-        assert!(
-            header.contains("bool weaveffi_contacts_delete_contact("),
-            "missing delete_contact declaration"
-        );
-        assert!(
-            header.contains("int32_t weaveffi_contacts_count_contacts("),
-            "missing count_contacts declaration"
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn generate_c_header_with_enum_param_and_return() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "paint".to_string(),
-                functions: vec![Function {
-                    name: "mix".to_string(),
-                    params: vec![Param {
-                        name: "a".to_string(),
-                        ty: TypeRef::Enum("Color".into()),
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::Enum("Color".into())),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![EnumDef {
-                    name: "Color".to_string(),
-                    doc: None,
-                    variants: vec![
-                        EnumVariant {
-                            name: "Red".to_string(),
-                            value: 0,
-                            doc: None,
-                        },
-                        EnumVariant {
-                            name: "Green".to_string(),
-                            value: 1,
-                            doc: None,
-                        },
-                    ],
-                }],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(
-            header.contains("typedef enum { weaveffi_paint_Color_Red = 0, weaveffi_paint_Color_Green = 1 } weaveffi_paint_Color;"),
-            "missing enum typedef: {header}"
-        );
-        assert!(
-            header.contains("weaveffi_paint_Color weaveffi_paint_mix(weaveffi_paint_Color a, weaveffi_error* out_err);"),
-            "missing function with enum param/return: {header}"
-        );
-    }
-
-    #[test]
-    fn c_type_map_param() {
-        let result = c_type_for_param(
-            &TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
-            "scores",
-            "m",
-            "weaveffi",
-            false,
-        );
-        assert_eq!(
-            result,
-            "const char* const* scores_keys, const int32_t* scores_values, size_t scores_len"
-        );
-    }
-
-    #[test]
-    fn c_ret_map() {
-        let (ty, out_params) = c_ret_type(
-            &TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
-            "m",
-            "weaveffi",
-        );
-        assert_eq!(ty, "void");
-        assert_eq!(
-            out_params,
-            vec![
-                "const char** out_keys",
-                "int32_t* out_values",
-                "size_t* out_len"
-            ]
-        );
-    }
-
-    #[test]
-    fn c_header_with_map_type() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "store".to_string(),
-                functions: vec![Function {
-                    name: "update_scores".to_string(),
-                    params: vec![Param {
-                        name: "scores".to_string(),
-                        ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: None,
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(
-            header.contains(
-                "const char* const* scores_keys, const int32_t* scores_values, size_t scores_len"
-            ),
-            "missing map param expansion: {header}"
-        );
-        assert!(
-            header.contains("Map convention"),
-            "missing map convention comment: {header}"
-        );
-    }
-
-    #[test]
-    fn c_custom_prefix() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "calculator".to_string(),
-                functions: vec![Function {
-                    name: "add".to_string(),
-                    params: vec![
-                        Param {
-                            name: "a".to_string(),
-                            ty: TypeRef::I32,
-                            mutable: false,
-                            doc: None,
-                        },
-                        Param {
-                            name: "b".to_string(),
-                            ty: TypeRef::I32,
-                            mutable: false,
-                            doc: None,
-                        },
-                    ],
-                    returns: Some(TypeRef::I32),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-
-        let tmp = std::env::temp_dir().join("weaveffi_test_c_custom_prefix");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
-
-        let config = CConfig {
-            prefix: Some("mylib".into()),
-            ..CConfig::default()
-        };
-        CGenerator.generate(&api, out_dir, &config).unwrap();
-
-        assert!(
-            tmp.join("c").join("mylib.h").exists(),
-            "header should be named mylib.h"
-        );
-        let header = std::fs::read_to_string(tmp.join("c").join("mylib.h")).unwrap();
-        assert!(
-            header.contains("mylib_calculator_add"),
-            "should use custom prefix for function names"
-        );
-        assert!(
-            !header.contains("weaveffi_calculator_add"),
-            "should not emit default prefix for user-defined symbols: {header}"
-        );
-        assert!(
-            header.contains("#define mylib_error weaveffi_error"),
-            "should alias runtime error type to weaveffi_error: {header}"
-        );
-        assert!(
-            header.contains("#define mylib_free_string weaveffi_free_string"),
-            "should alias runtime free_string to weaveffi_free_string: {header}"
-        );
-
-        let files = CGenerator.output_files(&api, out_dir, &config);
-        assert!(
-            files.iter().any(|f| f.ends_with("mylib.h")),
-            "output_files_with_config should list mylib.h"
-        );
-        assert!(
-            files.iter().any(|f| f.ends_with("mylib.c")),
-            "output_files_with_config should list mylib.c"
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn c_deeply_nested_optional() {
-        let api = Api {
-            version: "0.1.0".into(),
-            modules: vec![Module {
-                name: "edge".into(),
-                functions: vec![Function {
-                    name: "process".into(),
-                    params: vec![Param {
-                        name: "data".into(),
-                        ty: TypeRef::Optional(Box::new(TypeRef::List(Box::new(
-                            TypeRef::Optional(Box::new(TypeRef::Struct("Contact".into()))),
-                        )))),
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: None,
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![StructDef {
-                    name: "Contact".into(),
-                    doc: None,
-                    fields: vec![StructField {
-                        name: "name".into(),
-                        ty: TypeRef::StringUtf8,
-                        doc: None,
-                        default: None,
-                    }],
-                    builder: false,
-                }],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(
-            header.contains("weaveffi_edge_process"),
-            "should contain function name: {header}"
-        );
-        assert!(
-            header.contains("data"),
-            "should contain param name: {header}"
-        );
-        assert!(
-            header.contains("data_len"),
-            "list param should expand to include length: {header}"
-        );
-    }
-
-    #[test]
-    fn c_map_of_lists() {
-        let api = Api {
-            version: "0.1.0".into(),
-            modules: vec![Module {
-                name: "edge".into(),
-                functions: vec![Function {
-                    name: "process".into(),
-                    params: vec![Param {
-                        name: "scores".into(),
-                        ty: TypeRef::Map(
-                            Box::new(TypeRef::StringUtf8),
-                            Box::new(TypeRef::List(Box::new(TypeRef::I32))),
-                        ),
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: None,
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(
-            header.contains("scores_keys"),
-            "map param should have keys: {header}"
-        );
-        assert!(
-            header.contains("scores_values"),
-            "map param should have values: {header}"
-        );
-        assert!(
-            header.contains("scores_len"),
-            "map param should have length: {header}"
-        );
-    }
-
-    #[test]
-    fn c_typed_handle_type() {
-        let api = Api {
-            version: "0.1.0".into(),
-            modules: vec![Module {
-                name: "contacts".into(),
-                functions: vec![Function {
-                    name: "get_info".into(),
-                    params: vec![Param {
-                        name: "contact".into(),
-                        ty: TypeRef::TypedHandle("Contact".into()),
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::TypedHandle("Contact".into())),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![StructDef {
-                    name: "Contact".into(),
-                    doc: None,
-                    fields: vec![StructField {
-                        name: "name".into(),
-                        ty: TypeRef::StringUtf8,
-                        doc: None,
-                        default: None,
-                    }],
-                    builder: false,
-                }],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(
-            header.contains("weaveffi_contacts_Contact* contact"),
-            "TypedHandle param should use opaque struct pointer: {header}"
-        );
-        assert!(
-            header.contains("weaveffi_contacts_Contact* weaveffi_contacts_get_info("),
-            "TypedHandle return should use opaque struct pointer: {header}"
-        );
-    }
-
-    #[test]
-    fn c_type_borrowed_str_param() {
-        let result = c_type_for_param(&TypeRef::BorrowedStr, "msg", "io", "weaveffi", false);
-        assert_eq!(result, "const char* msg");
-    }
-
-    #[test]
-    fn c_type_borrowed_bytes_param() {
-        let result = c_type_for_param(&TypeRef::BorrowedBytes, "data", "io", "weaveffi", false);
-        assert_eq!(result, "const uint8_t* data_ptr, size_t data_len");
-    }
-
-    #[test]
-    fn c_header_with_borrowed_params() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "io".to_string(),
-                functions: vec![Function {
-                    name: "write".to_string(),
-                    params: vec![
-                        Param {
-                            name: "msg".to_string(),
-                            ty: TypeRef::BorrowedStr,
-                            mutable: false,
-                            doc: None,
-                        },
-                        Param {
-                            name: "raw".to_string(),
-                            ty: TypeRef::BorrowedBytes,
-                            mutable: false,
-                            doc: None,
-                        },
-                    ],
-                    returns: None,
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(
-            header.contains("const char* msg"),
-            "BorrowedStr param should map to const char*: {header}"
-        );
-        assert!(
-            header.contains("const uint8_t* raw_ptr, size_t raw_len"),
-            "BorrowedBytes param should map to const uint8_t* + size_t: {header}"
-        );
-        assert!(
-            header.contains("weaveffi_io_write("),
-            "missing function declaration: {header}"
-        );
-    }
-
-    #[test]
-    fn c_enum_keyed_map() {
-        let api = Api {
-            version: "0.1.0".into(),
-            modules: vec![Module {
-                name: "edge".into(),
-                functions: vec![Function {
-                    name: "process".into(),
-                    params: vec![Param {
-                        name: "contacts".into(),
-                        ty: TypeRef::Map(
-                            Box::new(TypeRef::Enum("Color".into())),
-                            Box::new(TypeRef::Struct("Contact".into())),
-                        ),
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: None,
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![StructDef {
-                    name: "Contact".into(),
-                    doc: None,
-                    fields: vec![StructField {
-                        name: "name".into(),
-                        ty: TypeRef::StringUtf8,
-                        doc: None,
-                        default: None,
-                    }],
-                    builder: false,
-                }],
-                enums: vec![EnumDef {
-                    name: "Color".into(),
-                    doc: None,
-                    variants: vec![
-                        EnumVariant {
-                            name: "Red".into(),
-                            value: 0,
-                            doc: None,
-                        },
-                        EnumVariant {
-                            name: "Green".into(),
-                            value: 1,
-                            doc: None,
-                        },
-                        EnumVariant {
-                            name: "Blue".into(),
-                            value: 2,
-                            doc: None,
-                        },
-                    ],
-                }],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(
-            header.contains("contacts_keys"),
-            "map param should have keys: {header}"
-        );
-        assert!(
-            header.contains("contacts_values"),
-            "map param should have values: {header}"
-        );
-        assert!(
-            header.contains("Color"),
-            "should reference Color enum: {header}"
-        );
-    }
-
-    #[test]
-    fn c_no_double_free_on_error() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "contacts".to_string(),
-                functions: vec![Function {
-                    name: "find_contact".to_string(),
-                    params: vec![Param {
-                        name: "name".to_string(),
-                        ty: TypeRef::StringUtf8,
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::Struct("Contact".to_string())),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![StructDef {
-                    name: "Contact".to_string(),
-                    doc: None,
-                    fields: vec![StructField {
-                        name: "name".to_string(),
-                        ty: TypeRef::StringUtf8,
-                        doc: None,
-                        default: None,
-                    }],
-                    builder: false,
-                }],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-
-        assert!(
-            header.contains("const char* name"),
-            "string param should be borrowed const pointer: {header}"
-        );
-        assert!(
-            header.contains(
-                "weaveffi_contacts_Contact* weaveffi_contacts_find_contact(const char* name, weaveffi_error* out_err);"
-            ),
-            "find_contact should take borrowed name and use out_err as last param: {header}"
-        );
-        assert!(
-            header.contains(
-                "void weaveffi_contacts_Contact_destroy(weaveffi_contacts_Contact* ptr);"
-            ),
-            "struct should have _destroy for lifecycle: {header}"
-        );
-        assert!(
-            header.contains("weaveffi_contacts_Contact* weaveffi_contacts_find_contact("),
-            "struct return should be opaque pointer: {header}"
-        );
-    }
-
-    #[test]
-    fn c_async_function_has_callback_typedef() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "tasks".to_string(),
-                functions: vec![
-                    Function {
-                        name: "run".to_string(),
-                        params: vec![Param {
-                            name: "id".to_string(),
-                            ty: TypeRef::I32,
-                            mutable: false,
-                            doc: None,
-                        }],
-                        returns: Some(TypeRef::I32),
-                        doc: None,
-                        r#async: true,
-                        cancellable: false,
-                        deprecated: None,
-                        since: None,
-                    },
-                    Function {
-                        name: "fire".to_string(),
-                        params: vec![],
-                        returns: None,
-                        doc: None,
-                        r#async: true,
-                        cancellable: false,
-                        deprecated: None,
-                        since: None,
-                    },
-                ],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(
-            header.contains("typedef void (*weaveffi_tasks_run_callback)(void* context, weaveffi_error* err, int32_t result);"),
-            "missing callback typedef with result param: {header}"
-        );
-        assert!(
-            header.contains(
-                "typedef void (*weaveffi_tasks_fire_callback)(void* context, weaveffi_error* err);"
-            ),
-            "missing callback typedef without result param: {header}"
-        );
-    }
-
-    #[test]
-    fn c_async_function_signature() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "tasks".to_string(),
-                functions: vec![Function {
-                    name: "run".to_string(),
-                    params: vec![Param {
-                        name: "id".to_string(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::I32),
-                    doc: None,
-                    r#async: true,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(
-            header.contains("void weaveffi_tasks_run_async(int32_t id, weaveffi_tasks_run_callback callback, void* context);"),
-            "missing async function signature: {header}"
-        );
-        assert!(
-            !header.contains("int32_t weaveffi_tasks_run("),
-            "async function should not have sync signature: {header}"
-        );
-        assert!(
-            header.contains("callback is called exactly once"),
-            "missing callback contract comment: {header}"
-        );
-    }
-
-    #[test]
-    fn c_null_check_on_optional_return() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "contacts".to_string(),
-                functions: vec![Function {
-                    name: "find_contact".to_string(),
-                    params: vec![Param {
-                        name: "id".to_string(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
-                        "Contact".to_string(),
-                    )))),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-
-        assert!(
-            header.contains("weaveffi_contacts_Contact* weaveffi_contacts_find_contact(int32_t id, weaveffi_error* out_err);"),
-            "optional struct return should use same pointer type as non-optional: {header}"
-        );
-        assert!(
-            !header.contains("out_is_present"),
-            "optional struct should not use separate is-present out-param: {header}"
-        );
-        assert!(
-            !header.contains("bool*"),
-            "optional struct should not add bool* out-param: {header}"
-        );
-    }
-
-    #[test]
-    fn c_cancellable_async_has_token() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "tasks".to_string(),
-                functions: vec![
-                    Function {
-                        name: "run".to_string(),
-                        params: vec![Param {
-                            name: "id".to_string(),
-                            ty: TypeRef::I32,
-                            mutable: false,
-                            doc: None,
-                        }],
-                        returns: Some(TypeRef::I32),
-                        doc: None,
-                        r#async: true,
-                        cancellable: true,
-                        deprecated: None,
-                        since: None,
-                    },
-                    Function {
-                        name: "fire".to_string(),
-                        params: vec![],
-                        returns: None,
-                        doc: None,
-                        r#async: true,
-                        cancellable: false,
-                        deprecated: None,
-                        since: None,
-                    },
-                ],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-
-        assert!(
-            header.contains("weaveffi_cancel_token* cancel_token"),
-            "cancellable async should have cancel_token param: {header}"
-        );
-        assert!(
-            header.contains("void weaveffi_tasks_run_async(int32_t id, weaveffi_cancel_token* cancel_token, weaveffi_tasks_run_callback callback, void* context);"),
-            "cancellable async should have cancel_token before callback: {header}"
-        );
-
-        let fire_line = header
-            .lines()
-            .find(|l| l.contains("weaveffi_tasks_fire_async"))
-            .expect("fire_async should be present");
-        assert!(
-            !fire_line.contains("cancel_token"),
-            "non-cancellable async should NOT have cancel_token: {fire_line}"
-        );
-
-        assert!(
-            header.contains("weaveffi_cancel_token_create"),
-            "header should declare cancel_token_create: {header}"
-        );
-        assert!(
-            header.contains("weaveffi_cancel_token_destroy"),
-            "header should declare cancel_token_destroy: {header}"
-        );
-    }
-
-    #[test]
-    fn c_cross_module_struct() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![
-                Module {
-                    name: "types".to_string(),
-                    functions: vec![],
-                    structs: vec![StructDef {
-                        name: "Name".to_string(),
-                        doc: None,
-                        fields: vec![StructField {
-                            name: "value".to_string(),
-                            ty: TypeRef::StringUtf8,
-                            doc: None,
-                            default: None,
-                        }],
-                        builder: false,
-                    }],
-                    enums: vec![],
-                    callbacks: vec![],
-                    listeners: vec![],
-                    errors: None,
-                    modules: vec![],
-                },
-                Module {
-                    name: "ops".to_string(),
-                    functions: vec![Function {
-                        name: "get_name".to_string(),
-                        params: vec![Param {
-                            name: "id".to_string(),
-                            ty: TypeRef::I32,
-                            mutable: false,
-                            doc: None,
-                        }],
-                        returns: Some(TypeRef::Struct("types.Name".to_string())),
-                        doc: None,
-                        r#async: false,
-                        cancellable: false,
-                        deprecated: None,
-                        since: None,
-                    }],
-                    structs: vec![],
-                    enums: vec![],
-                    callbacks: vec![],
-                    listeners: vec![],
-                    errors: None,
-                    modules: vec![],
-                },
-            ],
-            generators: None,
-        };
-
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-
-        assert!(
-            header.contains("typedef struct weaveffi_types_Name weaveffi_types_Name;"),
-            "struct def should use its own module prefix: {header}"
-        );
-        assert!(
-            header.contains("weaveffi_types_Name* weaveffi_ops_get_name("),
-            "cross-module return should use weaveffi_types_Name, not weaveffi_ops_types.Name: {header}"
-        );
-        assert!(
-            !header.contains("types.Name"),
-            "dot-qualified name should not appear in generated C code: {header}"
-        );
-    }
-
-    #[test]
-    fn c_nested_module_naming() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "parent".to_string(),
-                functions: vec![Function {
-                    name: "top_fn".to_string(),
-                    params: vec![Param {
-                        name: "x".to_string(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::I32),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![Module {
-                    name: "child".to_string(),
-                    functions: vec![Function {
-                        name: "inner_fn".to_string(),
-                        params: vec![Param {
-                            name: "y".to_string(),
-                            ty: TypeRef::I32,
-                            mutable: false,
-                            doc: None,
-                        }],
-                        returns: Some(TypeRef::I32),
-                        doc: None,
-                        r#async: false,
-                        cancellable: false,
-                        deprecated: None,
-                        since: None,
-                    }],
-                    structs: vec![],
-                    enums: vec![],
-                    callbacks: vec![],
-                    listeners: vec![],
-                    errors: None,
-                    modules: vec![],
-                }],
-            }],
-            generators: None,
-        };
-
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(
-            header.contains("weaveffi_parent_top_fn"),
-            "parent function should use weaveffi_parent_top_fn: {header}"
-        );
-        assert!(
-            header.contains("weaveffi_parent_child_inner_fn"),
-            "nested function should use weaveffi_parent_child_inner_fn: {header}"
-        );
-        assert!(
-            header.contains("// Module: parent\n"),
-            "parent module comment: {header}"
-        );
-        assert!(
-            header.contains("// Module: parent_child\n"),
-            "nested module comment: {header}"
-        );
-    }
-
-    #[test]
-    fn c_callback_typedef_generated() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "events".to_string(),
-                functions: vec![],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![CallbackDef {
-                    name: "on_data".to_string(),
-                    params: vec![
-                        Param {
-                            name: "payload".to_string(),
-                            ty: TypeRef::StringUtf8,
-                            mutable: false,
-                            doc: None,
-                        },
-                        Param {
-                            name: "len".to_string(),
-                            ty: TypeRef::I32,
-                            mutable: false,
-                            doc: None,
-                        },
-                    ],
-                    doc: None,
-                }],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(
-            header.contains("typedef void (*weaveffi_events_on_data_fn)(const char* payload, int32_t len, void* context);"),
-            "missing callback typedef: {header}"
-        );
-    }
-
-    #[test]
-    fn c_listener_register_unregister_generated() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "events".to_string(),
-                functions: vec![],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![CallbackDef {
-                    name: "on_data".to_string(),
-                    params: vec![Param {
-                        name: "payload".to_string(),
-                        ty: TypeRef::StringUtf8,
-                        mutable: false,
-                        doc: None,
-                    }],
-                    doc: None,
-                }],
-                listeners: vec![ListenerDef {
-                    name: "data_stream".to_string(),
-                    event_callback: "on_data".to_string(),
-                    doc: None,
-                }],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(
-            header.contains("uint64_t weaveffi_events_register_data_stream(weaveffi_events_on_data_fn callback, void* context);"),
-            "missing register function: {header}"
-        );
-        assert!(
-            header.contains("void weaveffi_events_unregister_data_stream(uint64_t id);"),
-            "missing unregister function: {header}"
-        );
-    }
-
-    #[test]
-    fn c_callback_no_params() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "lifecycle".to_string(),
-                functions: vec![],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![CallbackDef {
-                    name: "on_ready".to_string(),
-                    params: vec![],
-                    doc: None,
-                }],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(
-            header.contains("typedef void (*weaveffi_lifecycle_on_ready_fn)(void* context);"),
-            "callback with no params should only have context: {header}"
-        );
-    }
-
-    #[test]
-    fn c_iterator_return_generates_opaque_and_next_and_destroy() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "data".to_string(),
-                functions: vec![Function {
-                    name: "list_items".to_string(),
-                    params: vec![],
-                    returns: Some(TypeRef::Iterator(Box::new(TypeRef::I32))),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(
-            header.contains(
-                "typedef struct weaveffi_data_ListItemsIterator weaveffi_data_ListItemsIterator;"
-            ),
-            "missing iterator opaque typedef: {header}"
-        );
-        assert!(
-            header.contains("weaveffi_data_ListItemsIterator* weaveffi_data_list_items(weaveffi_error* out_err);"),
-            "missing iterator-returning function: {header}"
-        );
-        assert!(
-            header.contains("int32_t weaveffi_data_ListItemsIterator_next(weaveffi_data_ListItemsIterator* iter, int32_t* out_item, weaveffi_error* out_err);"),
-            "missing _next function: {header}"
-        );
-        assert!(
-            header.contains("void weaveffi_data_ListItemsIterator_destroy(weaveffi_data_ListItemsIterator* iter);"),
-            "missing _destroy function: {header}"
-        );
-    }
-
-    #[test]
-    fn c_iterator_with_struct_item() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "contacts".to_string(),
-                functions: vec![Function {
-                    name: "list_contacts".to_string(),
-                    params: vec![Param {
-                        name: "filter".to_string(),
-                        ty: TypeRef::StringUtf8,
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::Iterator(Box::new(TypeRef::Struct(
-                        "Contact".to_string(),
-                    )))),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![StructDef {
-                    name: "Contact".to_string(),
-                    doc: None,
-                    fields: vec![StructField {
-                        name: "name".to_string(),
-                        ty: TypeRef::StringUtf8,
-                        doc: None,
-                        default: None,
-                    }],
-                    builder: false,
-                }],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(
-            header.contains("typedef struct weaveffi_contacts_ListContactsIterator weaveffi_contacts_ListContactsIterator;"),
-            "missing iterator typedef: {header}"
-        );
-        assert!(
-            header.contains("weaveffi_contacts_ListContactsIterator* weaveffi_contacts_list_contacts(const char* filter, weaveffi_error* out_err);"),
-            "missing function returning iterator: {header}"
-        );
-        assert!(
-            header.contains("weaveffi_contacts_Contact** out_item"),
-            "struct iterator next should have pointer-to-pointer out param: {header}"
-        );
-        assert!(
-            header.contains("weaveffi_contacts_ListContactsIterator_destroy("),
-            "missing destroy: {header}"
-        );
-    }
-
-    #[test]
-    fn c_builder_header_generated() {
-        let api = Api {
-            version: "0.1.0".into(),
-            modules: vec![Module {
-                name: "contacts".into(),
-                functions: vec![],
-                structs: vec![StructDef {
-                    name: "Contact".into(),
-                    doc: None,
-                    fields: vec![
-                        StructField {
-                            name: "name".into(),
-                            ty: TypeRef::StringUtf8,
-                            doc: None,
-                            default: None,
-                        },
-                        StructField {
-                            name: "age".into(),
-                            ty: TypeRef::I32,
-                            doc: None,
-                            default: None,
-                        },
-                    ],
-                    builder: true,
-                }],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
-        let config = CConfig::default();
-        CGenerator.generate(&api, out_dir, &config).unwrap();
-        let header = std::fs::read_to_string(out_dir.join("c/weaveffi.h")).unwrap();
-        assert!(
-            header.contains("weaveffi_contacts_ContactBuilder"),
-            "missing builder typedef: {header}"
-        );
-        assert!(
-            header.contains("weaveffi_contacts_Contact_Builder_new"),
-            "missing Builder_new: {header}"
-        );
-        assert!(
-            header.contains("weaveffi_contacts_Contact_Builder_set_name"),
-            "missing Builder_set_name: {header}"
-        );
-        assert!(
-            header.contains("weaveffi_contacts_Contact_Builder_set_age"),
-            "missing Builder_set_age: {header}"
-        );
-        assert!(
-            header.contains("weaveffi_contacts_Contact_Builder_build"),
-            "missing Builder_build: {header}"
-        );
-        assert!(
-            header.contains("weaveffi_contacts_Contact_Builder_destroy"),
-            "missing Builder_destroy: {header}"
-        );
-    }
-
-    #[test]
-    fn c_no_builder_when_false() {
-        let api = Api {
-            version: "0.1.0".into(),
-            modules: vec![Module {
-                name: "contacts".into(),
-                functions: vec![],
-                structs: vec![StructDef {
-                    name: "Contact".into(),
-                    doc: None,
-                    fields: vec![StructField {
-                        name: "name".into(),
-                        ty: TypeRef::StringUtf8,
-                        doc: None,
-                        default: None,
-                    }],
-                    builder: false,
-                }],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
-        let config = CConfig::default();
-        CGenerator.generate(&api, out_dir, &config).unwrap();
-        let header = std::fs::read_to_string(out_dir.join("c/weaveffi.h")).unwrap();
-        assert!(
-            !header.contains("Builder"),
-            "should not contain Builder when builder=false: {header}"
-        );
-    }
-
-    #[test]
-    fn c_type_mutable_string_param() {
-        let result = c_type_for_param(&TypeRef::StringUtf8, "buf", "io", "weaveffi", true);
-        assert_eq!(result, "char* buf");
-    }
-
-    #[test]
-    fn c_type_mutable_bytes_param() {
-        let result = c_type_for_param(&TypeRef::BorrowedBytes, "data", "io", "weaveffi", true);
-        assert_eq!(result, "uint8_t* data_ptr, size_t data_len");
-    }
-
-    #[test]
-    fn c_type_mutable_struct_param() {
-        let result = c_type_for_param(
-            &TypeRef::Struct("Contact".into()),
-            "person",
-            "contacts",
-            "weaveffi",
-            true,
-        );
-        assert_eq!(result, "weaveffi_contacts_Contact* person");
-    }
-
-    #[test]
-    fn c_type_immutable_struct_param_has_const() {
-        let result = c_type_for_param(
-            &TypeRef::Struct("Contact".into()),
-            "person",
-            "contacts",
-            "weaveffi",
-            false,
-        );
-        assert_eq!(result, "const weaveffi_contacts_Contact* person");
-    }
-
-    #[test]
-    fn c_type_mutable_list_param() {
-        let ty = TypeRef::List(Box::new(TypeRef::I32));
-        let result = c_type_for_param(&ty, "items", "m", "weaveffi", true);
-        assert_eq!(result, "int32_t* items, size_t items_len");
-    }
-
-    #[test]
-    fn c_type_mutable_optional_value_param() {
-        let ty = TypeRef::Optional(Box::new(TypeRef::I32));
-        let result = c_type_for_param(&ty, "val", "m", "weaveffi", true);
-        assert_eq!(result, "int32_t* val");
-    }
-
-    #[test]
-    fn c_header_mutable_param_omits_const() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "io".to_string(),
-                functions: vec![Function {
-                    name: "fill_buffer".to_string(),
-                    params: vec![Param {
-                        name: "buf".to_string(),
-                        ty: TypeRef::Bytes,
-                        mutable: true,
-                        doc: None,
-                    }],
-                    returns: None,
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(
-            header.contains("uint8_t* buf_ptr"),
-            "mutable bytes should omit const: {header}"
-        );
-        assert!(
-            !header.contains("const uint8_t* buf_ptr"),
-            "mutable bytes should not have const: {header}"
-        );
-    }
-
-    #[test]
-    fn c_header_immutable_param_has_const() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "io".to_string(),
-                functions: vec![Function {
-                    name: "read_data".to_string(),
-                    params: vec![Param {
-                        name: "buf".to_string(),
-                        ty: TypeRef::Bytes,
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: None,
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(
-            header.contains("const uint8_t* buf_ptr"),
-            "immutable bytes should have const: {header}"
-        );
-    }
-
-    #[test]
-    fn c_header_mixed_mutable_and_immutable_params() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "io".to_string(),
-                functions: vec![Function {
-                    name: "transform".to_string(),
-                    params: vec![
-                        Param {
-                            name: "input".to_string(),
-                            ty: TypeRef::StringUtf8,
-                            mutable: false,
-                            doc: None,
-                        },
-                        Param {
-                            name: "output".to_string(),
-                            ty: TypeRef::Struct("Buffer".into()),
-                            mutable: true,
-                            doc: None,
-                        },
-                    ],
-                    returns: None,
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![StructDef {
-                    name: "Buffer".to_string(),
-                    doc: None,
-                    fields: vec![StructField {
-                        name: "data".to_string(),
-                        ty: TypeRef::Bytes,
-                        doc: None,
-                        default: None,
-                    }],
-                    builder: false,
-                }],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(
-            header.contains("const char* input"),
-            "immutable string should have const: {header}"
-        );
-        assert!(
-            header.contains("weaveffi_io_Buffer* output"),
-            "mutable struct should omit const: {header}"
-        );
-        assert!(
-            !header.contains("const weaveffi_io_Buffer* output"),
-            "mutable struct should not have const: {header}"
-        );
-    }
-
-    #[test]
-    fn deprecated_function_generates_annotation() {
-        let api = Api {
-            version: "0.1.0".to_string(),
-            modules: vec![Module {
-                name: "math".to_string(),
-                functions: vec![Function {
-                    name: "add_old".to_string(),
-                    params: vec![
-                        Param {
-                            name: "a".to_string(),
-                            ty: TypeRef::I32,
-                            mutable: false,
-                            doc: None,
-                        },
-                        Param {
-                            name: "b".to_string(),
-                            ty: TypeRef::I32,
-                            mutable: false,
-                            doc: None,
-                        },
-                    ],
-                    returns: Some(TypeRef::I32),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: Some("Use add_v2 instead".to_string()),
-                    since: Some("0.1.0".to_string()),
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-        };
-        let header = render_c_header(&api, "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(
-            header.contains("__attribute__((deprecated(\"Use add_v2 instead\")))"),
-            "missing deprecated attribute: {header}"
-        );
-        assert!(
-            header.contains("weaveffi_math_add_old"),
-            "missing function declaration: {header}"
-        );
-    }
-
-    fn doc_api() -> Api {
+    fn api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.1.0".into(),
-            modules: vec![Module {
-                name: "docs".into(),
-                functions: vec![Function {
-                    name: "do_thing".into(),
-                    params: vec![Param {
-                        name: "x".into(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: Some("the input value".into()),
-                    }],
-                    returns: Some(TypeRef::I32),
-                    doc: Some("Performs a thing.".into()),
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![StructDef {
-                    name: "Item".into(),
-                    doc: Some("An item we track.".into()),
-                    fields: vec![StructField {
-                        name: "id".into(),
-                        ty: TypeRef::I64,
-                        doc: Some("Stable id".into()),
-                        default: None,
-                    }],
-                    builder: false,
-                }],
-                enums: vec![EnumDef {
-                    name: "Kind".into(),
-                    doc: Some("Kind of item.".into()),
-                    variants: vec![EnumVariant {
-                        name: "Small".into(),
-                        value: 0,
-                        doc: Some("A small one".into()),
-                    }],
-                }],
-                callbacks: vec![CallbackDef {
-                    name: "OnReady".into(),
-                    doc: Some("Fires when ready".into()),
-                    params: vec![],
-                }],
-                listeners: vec![ListenerDef {
-                    name: "ready_listener".into(),
-                    event_callback: "OnReady".into(),
-                    doc: Some("Subscribe to ready".into()),
-                }],
-                errors: None,
-                modules: vec![],
-            }],
+            version: "0.3.0".into(),
+            modules,
             generators: None,
         }
     }
 
-    #[test]
-    fn c_emits_doc_on_function() {
-        let header = render_c_header(&doc_api(), "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(header.contains("/** Performs a thing. */"), "{header}");
+    fn header(api: &Api, prefix: &str) -> String {
+        render_c_header(api, prefix, "weaveffi.yml", "weaveffi.h")
     }
 
     #[test]
-    fn c_emits_doc_on_struct() {
-        let header = render_c_header(&doc_api(), "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(header.contains("/** An item we track. */"), "{header}");
+    fn emits_guard_and_runtime_decls() {
+        let h = header(&api(vec![module("math")]), "weaveffi");
+        assert!(h.contains("#ifndef WEAVEFFI_H"));
+        assert!(h.contains("typedef uint64_t weaveffi_handle_t;"));
+        assert!(h.contains("void weaveffi_free_string(const char* ptr);"));
     }
 
     #[test]
-    fn c_emits_doc_on_enum_variant() {
-        let header = render_c_header(&doc_api(), "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(header.contains("/** Kind of item. */"), "{header}");
-        assert!(header.contains("/** A small one */"), "{header}");
+    fn sync_function_signature() {
+        let m = Module {
+            functions: vec![func(
+                "add",
+                vec![param("a", TypeRef::I32), param("b", TypeRef::I32)],
+                Some(TypeRef::I32),
+            )],
+            ..module("math")
+        };
+        let h = header(&api(vec![m]), "weaveffi");
+        assert!(
+            h.contains("int32_t weaveffi_math_add(int32_t a, int32_t b, weaveffi_error* out_err);")
+        );
     }
 
     #[test]
-    fn c_emits_doc_on_field() {
-        let header = render_c_header(&doc_api(), "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(header.contains("/** Stable id */"), "{header}");
+    fn custom_prefix_is_honored() {
+        let m = Module {
+            functions: vec![func("ping", vec![], None)],
+            ..module("net")
+        };
+        let h = header(&api(vec![m]), "acme");
+        assert!(h.contains("#ifndef ACME_H"));
+        assert!(h.contains("void acme_net_ping(acme_error* out_err);"));
+        assert!(h.contains("#define acme_error weaveffi_error"));
     }
 
     #[test]
-    fn c_emits_doc_on_callback_and_listener() {
-        let header = render_c_header(&doc_api(), "weaveffi", "weaveffi.yml", "weaveffi.h");
-        assert!(header.contains("/** Fires when ready */"), "{header}");
-        assert!(header.contains("/** Subscribe to ready */"), "{header}");
+    fn struct_with_builder() {
+        let m = Module {
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                    default: None,
+                }],
+                builder: true,
+            }],
+            ..module("contacts")
+        };
+        let h = header(&api(vec![m]), "weaveffi");
+        assert!(h.contains("typedef struct weaveffi_contacts_Contact weaveffi_contacts_Contact;"));
+        assert!(h.contains(
+            "const char* weaveffi_contacts_Contact_get_name(const weaveffi_contacts_Contact* ptr);"
+        ));
+        assert!(h.contains(
+            "weaveffi_contacts_ContactBuilder* weaveffi_contacts_Contact_Builder_new(void);"
+        ));
+    }
+
+    #[test]
+    fn enum_constants() {
+        let m = Module {
+            enums: vec![EnumDef {
+                name: "Color".into(),
+                doc: None,
+                variants: vec![EnumVariant {
+                    name: "Red".into(),
+                    value: 0,
+                    doc: None,
+                }],
+            }],
+            ..module("gfx")
+        };
+        let h = header(&api(vec![m]), "weaveffi");
+        assert!(h.contains("weaveffi_gfx_Color_Red = 0"));
+    }
+
+    #[test]
+    fn iterator_emits_next_and_destroy() {
+        let m = Module {
+            functions: vec![func(
+                "get_messages",
+                vec![],
+                Some(TypeRef::Iterator(Box::new(TypeRef::StringUtf8))),
+            )],
+            ..module("events")
+        };
+        let h = header(&api(vec![m]), "weaveffi");
+        assert!(h.contains(
+            "weaveffi_events_GetMessagesIterator* weaveffi_events_get_messages(weaveffi_error* out_err);"
+        ));
+        assert!(h.contains("weaveffi_events_GetMessagesIterator_next("));
+        assert!(h.contains("void weaveffi_events_GetMessagesIterator_destroy(weaveffi_events_GetMessagesIterator* iter);"));
+    }
+
+    #[test]
+    fn callback_and_listener() {
+        let m = Module {
+            callbacks: vec![CallbackDef {
+                name: "on_message".into(),
+                params: vec![param("text", TypeRef::StringUtf8)],
+                doc: None,
+            }],
+            listeners: vec![ListenerDef {
+                name: "messages".into(),
+                event_callback: "on_message".into(),
+                doc: None,
+            }],
+            ..module("events")
+        };
+        let h = header(&api(vec![m]), "weaveffi");
+        assert!(h.contains(
+            "typedef void (*weaveffi_events_on_message_fn)(const char* text, void* context);"
+        ));
+        assert!(h.contains("uint64_t weaveffi_events_register_messages(weaveffi_events_on_message_fn callback, void* context);"));
+        assert!(h.contains("void weaveffi_events_unregister_messages(uint64_t id);"));
+    }
+
+    #[test]
+    fn async_emits_callback_typedef_and_launcher() {
+        let m = Module {
+            functions: vec![Function {
+                r#async: true,
+                cancellable: true,
+                ..func(
+                    "fetch",
+                    vec![param("id", TypeRef::I64)],
+                    Some(TypeRef::StringUtf8),
+                )
+            }],
+            ..module("net")
+        };
+        let h = header(&api(vec![m]), "weaveffi");
+        assert!(h.contains("typedef void (*weaveffi_net_fetch_callback)(void* context, weaveffi_error* err, const char* result);"));
+        assert!(h.contains("weaveffi_net_fetch_async("));
+        assert!(h.contains("weaveffi_cancel_token* cancel_token"));
+    }
+
+    #[test]
+    fn output_files_lists_header_and_source() {
+        let tmp = std::env::temp_dir().join("weaveffi_c_outfiles");
+        let out_dir = Utf8Path::from_path(&tmp).unwrap();
+        let files = CGenerator.output_files(&api(vec![module("m")]), out_dir, &CConfig::default());
+        assert!(files.iter().any(|f| f.ends_with("c/weaveffi.h")));
+        assert!(files.iter().any(|f| f.ends_with("c/weaveffi.c")));
     }
 }

@@ -33,19 +33,42 @@ pub struct AbiReturn {
     pub out_params: Vec<AbiParam>,
 }
 
+/// Split a (possibly qualified) type reference into its C module-path segment
+/// and bare type name.
+///
+/// Qualified references use dot-separated module paths (`a.b.Name`); the C ABI
+/// flattens those to underscore-joined symbol prefixes (`a_b`). An unqualified
+/// reference belongs to `current_module`. Using `rsplit_once` (rather than
+/// `split_once`) is what makes *multi-level* nesting work: only the final
+/// segment is the type name, everything before it is the module path.
+///
+/// * `a.b.Name`, current `x`  -> (`a_b`, `Name`)
+/// * `shared.Status`, current `orders` -> (`shared`, `Status`)
+/// * `Name`, current `a_b`    -> (`a_b`, `Name`)
+pub fn split_qualified(name: &str, current_module: &str) -> (String, String) {
+    match name.rsplit_once('.') {
+        Some((module_path, type_name)) => (module_path.replace('.', "_"), type_name.to_string()),
+        None => (current_module.to_string(), name.to_string()),
+    }
+}
+
 /// Resolve a struct reference (possibly `module.Name`) to its C tag type.
 pub fn struct_tag(name: &str, current_module: &str) -> CType {
-    if let Some((module, type_name)) = name.split_once('.') {
-        CType::StructTag {
-            module: module.to_string(),
-            name: type_name.to_string(),
-        }
-    } else {
-        CType::StructTag {
-            module: current_module.to_string(),
-            name: name.to_string(),
-        }
-    }
+    let (module, name) = split_qualified(name, current_module);
+    CType::StructTag { module, name }
+}
+
+/// Resolve an enum reference (possibly `module.Name`) to its C enum type.
+fn enum_ctype(name: &str, current_module: &str) -> CType {
+    let (module, name) = split_qualified(name, current_module);
+    CType::Enum { module, name }
+}
+
+/// Resolve a typed-handle reference (possibly `module.Name`) to its C
+/// `struct Tag*` pointer type.
+fn typed_handle_ctype(name: &str, current_module: &str) -> CType {
+    let (module, name) = split_qualified(name, current_module);
+    CType::ptr(CType::StructTag { module, name })
 }
 
 /// The C "element" type used in pointer/array contexts. Composite shapes
@@ -58,17 +81,11 @@ pub fn element_ctype(ty: &TypeRef, module: &str) -> CType {
         TypeRef::F64 => CType::Double,
         TypeRef::Bool => CType::Bool,
         TypeRef::Handle => CType::Handle,
-        TypeRef::TypedHandle(n) => CType::ptr(CType::StructTag {
-            module: module.to_string(),
-            name: n.clone(),
-        }),
+        TypeRef::TypedHandle(n) => typed_handle_ctype(n, module),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => CType::const_ptr(CType::Char),
         TypeRef::Bytes | TypeRef::BorrowedBytes => CType::const_ptr(CType::Uint8),
         TypeRef::Struct(s) => CType::ptr(struct_tag(s, module)),
-        TypeRef::Enum(e) => CType::Enum {
-            module: module.to_string(),
-            name: e.clone(),
-        },
+        TypeRef::Enum(e) => enum_ctype(e, module),
         TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
             element_ctype(inner, module)
         }
@@ -107,13 +124,7 @@ pub fn lower_param(name: &str, ty: &TypeRef, module: &str, mutable: bool) -> Vec
             AbiParam::new(format!("{name}_len"), CType::Size),
         ],
         TypeRef::Handle => vec![AbiParam::new(name, CType::Handle)],
-        TypeRef::TypedHandle(n) => vec![AbiParam::new(
-            name,
-            CType::ptr(CType::StructTag {
-                module: module.to_string(),
-                name: n.clone(),
-            }),
-        )],
+        TypeRef::TypedHandle(n) => vec![AbiParam::new(name, typed_handle_ctype(n, module))],
         TypeRef::Struct(s) => vec![AbiParam::new(
             name,
             CType::Ptr {
@@ -121,13 +132,7 @@ pub fn lower_param(name: &str, ty: &TypeRef, module: &str, mutable: bool) -> Vec
                 pointee: Box::new(struct_tag(s, module)),
             },
         )],
-        TypeRef::Enum(e) => vec![AbiParam::new(
-            name,
-            CType::Enum {
-                module: module.to_string(),
-                name: e.clone(),
-            },
-        )],
+        TypeRef::Enum(e) => vec![AbiParam::new(name, enum_ctype(e, module))],
         TypeRef::Optional(inner) => {
             if is_c_pointer_type(inner) {
                 lower_param(name, inner, module, mutable)
@@ -218,15 +223,9 @@ pub fn lower_return(ty: &TypeRef, module: &str) -> AbiReturn {
             out_params: vec![AbiParam::new("out_len", CType::ptr(CType::Size))],
         },
         TypeRef::Handle => no_out(CType::Handle),
-        TypeRef::TypedHandle(n) => no_out(CType::ptr(CType::StructTag {
-            module: module.to_string(),
-            name: n.clone(),
-        })),
+        TypeRef::TypedHandle(n) => no_out(typed_handle_ctype(n, module)),
         TypeRef::Struct(s) => no_out(CType::ptr(struct_tag(s, module))),
-        TypeRef::Enum(e) => no_out(CType::Enum {
-            module: module.to_string(),
-            name: e.clone(),
-        }),
+        TypeRef::Enum(e) => no_out(enum_ctype(e, module)),
         TypeRef::Optional(inner) => {
             if is_c_pointer_type(inner) {
                 lower_return(inner, module)
@@ -393,5 +392,57 @@ mod tests {
     fn cross_module_struct_param_resolves_module() {
         let p = lower_param("c", &TypeRef::Struct("other.Contact".into()), "ops", false);
         assert_eq!(render(&p), ["const weaveffi_other_Contact* c"]);
+    }
+
+    #[test]
+    fn split_qualified_handles_levels() {
+        // Unqualified -> belongs to current module.
+        assert_eq!(
+            split_qualified("Name", "current"),
+            ("current".to_string(), "Name".to_string())
+        );
+        // Single-level qualified.
+        assert_eq!(
+            split_qualified("shared.Status", "orders"),
+            ("shared".to_string(), "Status".to_string())
+        );
+        // Multi-level qualified: only the final segment is the type name; the
+        // dotted module path flattens to an underscore-joined C prefix.
+        assert_eq!(
+            split_qualified("a.b.c.Name", "x"),
+            ("a_b_c".to_string(), "Name".to_string())
+        );
+    }
+
+    #[test]
+    fn cross_module_enum_param_resolves_module() {
+        // Regression: a sibling-module enum must render `weaveffi_<owner>_<Enum>`,
+        // never `weaveffi_<current>_<owner>.<Enum>`.
+        let p = lower_param("s", &TypeRef::Enum("shared.Status".into()), "orders", false);
+        assert_eq!(render(&p), ["weaveffi_shared_Status s"]);
+    }
+
+    #[test]
+    fn cross_module_enum_return_resolves_module() {
+        let r = lower_return(&TypeRef::Enum("shared.Status".into()), "orders");
+        assert_eq!(r.ret.render_c("weaveffi"), "weaveffi_shared_Status");
+    }
+
+    #[test]
+    fn cross_module_typed_handle_param_resolves_module() {
+        let p = lower_param(
+            "h",
+            &TypeRef::TypedHandle("auth.Session".into()),
+            "api",
+            false,
+        );
+        assert_eq!(render(&p), ["weaveffi_auth_Session* h"]);
+    }
+
+    #[test]
+    fn nested_module_struct_return_flattens_path() {
+        // Multi-level nesting: `a.b.Widget` -> `weaveffi_a_b_Widget*`.
+        let r = lower_return(&TypeRef::Struct("a.b.Widget".into()), "root");
+        assert_eq!(r.ret.render_c("weaveffi"), "weaveffi_a_b_Widget*");
     }
 }

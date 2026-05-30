@@ -1,0 +1,63 @@
+version: "0.3.0"
+# Exercises multi-level nested modules and type references that cross nesting
+# boundaries in every direction:
+#   * parent  -> nested child   (graphics.Canvas.root : shapes.Shape)
+#   * nested  -> parent         (graphics.shapes.Shape.unit : graphics.Unit enum)
+#   * nested  -> deeper nested   (graphics.shapes.Shape.detail : geometry.Detail)
+#   * nested  -> ancestor return (graphics.shapes.describe -> Canvas)
+#   * deeper  -> ancestor param  (geometry.compute(shape: Shape))
+# All bare names below are auto-qualified by the resolver to their full
+# dot-joined module path, which the C ABI then flattens to underscores
+# (e.g. graphics.shapes.geometry.Detail -> weaveffi_graphics_shapes_geometry_Detail).
+modules:
+  - name: graphics
+    enums:
+      - name: Unit
+        doc: A measurement unit shared with nested submodules.
+        variants:
+          - { name: pixels, value: 0 }
+          - { name: points, value: 1 }
+    structs:
+      - name: Canvas
+        doc: Top-level struct that references a struct defined one level deeper.
+        fields:
+          - { name: width, type: i32 }
+          - { name: root, type: Shape, doc: Reference down into a nested module }
+    functions:
+      - name: new_canvas
+        doc: Construct a Canvas.
+        params:
+          - { name: width, type: i32 }
+        return: Canvas
+    modules:
+      - name: shapes
+        structs:
+          - name: Shape
+            doc: A struct one level deep that references both an ancestor enum and a deeper struct.
+            fields:
+              - { name: sides, type: i32 }
+              - { name: unit, type: Unit, doc: Reference up to the parent module's enum }
+              - { name: detail, type: Detail, doc: Reference down into a deeper module }
+        functions:
+          - name: make_shape
+            doc: Construct a Shape.
+            params:
+              - { name: sides, type: i32 }
+            return: Shape
+          - name: describe
+            doc: Nested function returning a struct owned by an ancestor module.
+            params: []
+            return: Canvas
+        modules:
+          - name: geometry
+            structs:
+              - name: Detail
+                doc: A struct two levels deep.
+                fields:
+                  - { name: area, type: f64 }
+            functions:
+              - name: compute
+                doc: Deeper function taking an ancestor-module struct.
+                params:
+                  - { name: shape, type: Shape }
+                return: Detail

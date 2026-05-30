@@ -398,6 +398,10 @@ fn render_csharp(
     filename: &str,
 ) -> String {
     let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
+    // Opt the file into the nullable annotation context so the `string?`
+    // signatures (optional strings) are valid regardless of the consuming
+    // project's <Nullable> setting; without this, default projects warn CS8632.
+    out.push_str("#nullable enable\n\n");
     out.push_str(
         "using System;\nusing System.Collections.Generic;\nusing System.Runtime.InteropServices;\n",
     );

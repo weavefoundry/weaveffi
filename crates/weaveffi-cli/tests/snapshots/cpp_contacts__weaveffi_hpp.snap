@@ -19,10 +19,7 @@ extern "C" {
 
 typedef uint64_t weaveffi_handle_t;
 
-typedef struct weaveffi_error {
-    int32_t code;
-    const char* message;
-} weaveffi_error;
+typedef struct weaveffi_error { int32_t code; const char* message; } weaveffi_error;
 
 void weaveffi_error_clear(weaveffi_error* err);
 void weaveffi_free_string(const char* ptr);
@@ -43,6 +40,7 @@ const char* weaveffi_contacts_Contact_get_first_name(const weaveffi_contacts_Con
 const char* weaveffi_contacts_Contact_get_last_name(const weaveffi_contacts_Contact* ptr);
 const char* weaveffi_contacts_Contact_get_email(const weaveffi_contacts_Contact* ptr);
 weaveffi_contacts_ContactType weaveffi_contacts_Contact_get_contact_type(const weaveffi_contacts_Contact* ptr);
+
 weaveffi_handle_t weaveffi_contacts_create_contact(const char* first_name, const char* last_name, const char* email, weaveffi_contacts_ContactType contact_type, weaveffi_error* out_err);
 weaveffi_contacts_Contact* weaveffi_contacts_get_contact(weaveffi_handle_t id, weaveffi_error* out_err);
 weaveffi_contacts_Contact** weaveffi_contacts_list_contacts(size_t* out_len, weaveffi_error* out_err);

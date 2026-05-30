@@ -12,6 +12,10 @@ import 'dart:io' show Platform;
 import 'package:ffi/ffi.dart';
 
 DynamicLibrary _openLibrary() {
+  // An explicit path in WEAVEFFI_LIBRARY wins, so callers can point at a
+  // specific build artifact regardless of its file name or location.
+  final override = Platform.environment['WEAVEFFI_LIBRARY'];
+  if (override != null && override.isNotEmpty) return DynamicLibrary.open(override);
   if (Platform.isMacOS) return DynamicLibrary.open('libweaveffi.dylib');
   if (Platform.isLinux) return DynamicLibrary.open('libweaveffi.so');
   if (Platform.isWindows) return DynamicLibrary.open('weaveffi.dll');
@@ -41,9 +45,10 @@ class WeaveffiException implements Exception {
 
 void _checkError(Pointer<_WeaveffiError> err) {
   if (err.ref.code != 0) {
+    final code = err.ref.code;
     final msg = err.ref.message.toDartString();
     _weaveffiErrorClear(err);
-    throw WeaveffiException(err.ref.code, msg);
+    throw WeaveffiException(code, msg);
   }
 }
 
@@ -64,28 +69,28 @@ typedef _DartWeaveffiContactsContactDestroy = void Function(Pointer<Void>);
 final _weaveffiContactsContactDestroy = _lib.lookupFunction<
     _NativeWeaveffiContactsContactDestroy, _DartWeaveffiContactsContactDestroy>('weaveffi_contacts_Contact_destroy');
 
-typedef _NativeWeaveffiContactsContactGetId = Int64 Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiContactsContactGetId = int Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiContactsContactGetId = Int64 Function(Pointer<Void>);
+typedef _DartWeaveffiContactsContactGetId = int Function(Pointer<Void>);
 final _weaveffiContactsContactGetId = _lib.lookupFunction<
     _NativeWeaveffiContactsContactGetId, _DartWeaveffiContactsContactGetId>('weaveffi_contacts_Contact_get_id');
 
-typedef _NativeWeaveffiContactsContactGetFirstName = Pointer<Utf8> Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiContactsContactGetFirstName = Pointer<Utf8> Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiContactsContactGetFirstName = Pointer<Utf8> Function(Pointer<Void>);
+typedef _DartWeaveffiContactsContactGetFirstName = Pointer<Utf8> Function(Pointer<Void>);
 final _weaveffiContactsContactGetFirstName = _lib.lookupFunction<
     _NativeWeaveffiContactsContactGetFirstName, _DartWeaveffiContactsContactGetFirstName>('weaveffi_contacts_Contact_get_first_name');
 
-typedef _NativeWeaveffiContactsContactGetLastName = Pointer<Utf8> Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiContactsContactGetLastName = Pointer<Utf8> Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiContactsContactGetLastName = Pointer<Utf8> Function(Pointer<Void>);
+typedef _DartWeaveffiContactsContactGetLastName = Pointer<Utf8> Function(Pointer<Void>);
 final _weaveffiContactsContactGetLastName = _lib.lookupFunction<
     _NativeWeaveffiContactsContactGetLastName, _DartWeaveffiContactsContactGetLastName>('weaveffi_contacts_Contact_get_last_name');
 
-typedef _NativeWeaveffiContactsContactGetEmail = Pointer<Utf8> Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiContactsContactGetEmail = Pointer<Utf8> Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiContactsContactGetEmail = Pointer<Utf8> Function(Pointer<Void>);
+typedef _DartWeaveffiContactsContactGetEmail = Pointer<Utf8> Function(Pointer<Void>);
 final _weaveffiContactsContactGetEmail = _lib.lookupFunction<
     _NativeWeaveffiContactsContactGetEmail, _DartWeaveffiContactsContactGetEmail>('weaveffi_contacts_Contact_get_email');
 
-typedef _NativeWeaveffiContactsContactGetContactType = Int32 Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiContactsContactGetContactType = int Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiContactsContactGetContactType = Int32 Function(Pointer<Void>);
+typedef _DartWeaveffiContactsContactGetContactType = int Function(Pointer<Void>);
 final _weaveffiContactsContactGetContactType = _lib.lookupFunction<
     _NativeWeaveffiContactsContactGetContactType, _DartWeaveffiContactsContactGetContactType>('weaveffi_contacts_Contact_get_contact_type');
 
@@ -98,59 +103,29 @@ class Contact {
   }
 
   int get id {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiContactsContactGetId(_handle, err);
-      _checkError(err);
-      return result;
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiContactsContactGetId(_handle);
+    return result;
   }
 
   String get firstName {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiContactsContactGetFirstName(_handle, err);
-      _checkError(err);
-      return result.toDartString();
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiContactsContactGetFirstName(_handle);
+    return result.toDartString();
   }
 
   String get lastName {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiContactsContactGetLastName(_handle, err);
-      _checkError(err);
-      return result.toDartString();
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiContactsContactGetLastName(_handle);
+    return result.toDartString();
   }
 
   String? get email {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiContactsContactGetEmail(_handle, err);
-      _checkError(err);
-      if (result == nullptr) return null;
-      return result.toDartString();
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiContactsContactGetEmail(_handle);
+    if (result == nullptr) return null;
+    return result.toDartString();
   }
 
   ContactType get contactType {
-    final err = calloc<_WeaveffiError>();
-    try {
-      final result = _weaveffiContactsContactGetContactType(_handle, err);
-      _checkError(err);
-      return ContactType.fromValue(result);
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiContactsContactGetContactType(_handle);
+    return ContactType.fromValue(result);
   }
 }
 
@@ -163,13 +138,15 @@ int createContact(String firstName, String lastName, String? email, ContactType 
   final err = calloc<_WeaveffiError>();
   final firstNamePtr = firstName.toNativeUtf8();
   final lastNamePtr = lastName.toNativeUtf8();
+  final emailPtr = email == null ? nullptr : email.toNativeUtf8();
   try {
-    final result = _weaveffiContactsCreateContact(firstNamePtr, lastNamePtr, email, contactType.value, err);
+    final result = _weaveffiContactsCreateContact(firstNamePtr, lastNamePtr, emailPtr, contactType.value, err);
     _checkError(err);
     return result;
   } finally {
     calloc.free(firstNamePtr);
     calloc.free(lastNamePtr);
+    if (emailPtr != nullptr) calloc.free(emailPtr);
     calloc.free(err);
   }
 }
@@ -190,18 +167,23 @@ Contact getContact(int id) {
   }
 }
 
-typedef _NativeWeaveffiContactsListContacts = Pointer<Void> Function(Pointer<_WeaveffiError>);
-typedef _DartWeaveffiContactsListContacts = Pointer<Void> Function(Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiContactsListContacts = Pointer<Void> Function(Pointer<Size>, Pointer<_WeaveffiError>);
+typedef _DartWeaveffiContactsListContacts = Pointer<Void> Function(Pointer<Size>, Pointer<_WeaveffiError>);
 final _weaveffiContactsListContacts = _lib.lookupFunction<
     _NativeWeaveffiContactsListContacts, _DartWeaveffiContactsListContacts>('weaveffi_contacts_list_contacts');
 
 List<Contact> listContacts() {
   final err = calloc<_WeaveffiError>();
+  final outLen = calloc<Size>();
   try {
-    final result = _weaveffiContactsListContacts(err);
+    final result = _weaveffiContactsListContacts(outLen, err);
     _checkError(err);
-    return result;
+    final n = outLen.value;
+    if (result == nullptr || n == 0) return <Contact>[];
+    final arr = result.cast<Pointer<Void>>();
+    return List<Contact>.generate(n, (i) => Contact._(arr[i]));
   } finally {
+    calloc.free(outLen);
     calloc.free(err);
   }
 }

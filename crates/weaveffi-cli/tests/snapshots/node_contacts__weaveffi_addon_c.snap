@@ -62,7 +62,38 @@ static napi_value Napi_weaveffi_contacts_get_contact(napi_env env, napi_callback
     return NULL;
   }
   napi_value ret;
-  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
+  {
+    weaveffi_contacts_Contact* ret_p = (weaveffi_contacts_Contact*)result;
+    napi_create_object(env, &ret);
+    napi_value ret_id;
+    napi_create_int64(env, weaveffi_contacts_Contact_get_id(ret_p), &ret_id);
+    napi_set_named_property(env, ret, "id", ret_id);
+    napi_value ret_first_name;
+    {
+      char* ret_first_name_s = (char*)weaveffi_contacts_Contact_get_first_name(ret_p);
+      napi_create_string_utf8(env, ret_first_name_s, NAPI_AUTO_LENGTH, &ret_first_name);
+      weaveffi_free_string(ret_first_name_s);
+    }
+    napi_set_named_property(env, ret, "first_name", ret_first_name);
+    napi_value ret_last_name;
+    {
+      char* ret_last_name_s = (char*)weaveffi_contacts_Contact_get_last_name(ret_p);
+      napi_create_string_utf8(env, ret_last_name_s, NAPI_AUTO_LENGTH, &ret_last_name);
+      weaveffi_free_string(ret_last_name_s);
+    }
+    napi_set_named_property(env, ret, "last_name", ret_last_name);
+    napi_value ret_email;
+    {
+      char* ret_email_s = (char*)weaveffi_contacts_Contact_get_email(ret_p);
+      if (ret_email_s == NULL) { napi_get_null(env, &ret_email); }
+      else { napi_create_string_utf8(env, ret_email_s, NAPI_AUTO_LENGTH, &ret_email); weaveffi_free_string(ret_email_s); }
+    }
+    napi_set_named_property(env, ret, "email", ret_email);
+    napi_value ret_contact_type;
+    napi_create_int32(env, (int32_t)weaveffi_contacts_Contact_get_contact_type(ret_p), &ret_contact_type);
+    napi_set_named_property(env, ret, "contact_type", ret_contact_type);
+    weaveffi_contacts_Contact_destroy(ret_p);
+  }
   return ret;
 }
 
@@ -81,7 +112,38 @@ static napi_value Napi_weaveffi_contacts_list_contacts(napi_env env, napi_callba
   napi_create_array_with_length(env, out_len, &ret);
   for (size_t ret_i = 0; ret_i < out_len; ret_i++) {
     napi_value elem;
-    napi_create_int64(env, (int64_t)(intptr_t)result[ret_i], &elem);
+    {
+      weaveffi_contacts_Contact* elem_p = (weaveffi_contacts_Contact*)result[ret_i];
+      napi_create_object(env, &elem);
+      napi_value elem_id;
+      napi_create_int64(env, weaveffi_contacts_Contact_get_id(elem_p), &elem_id);
+      napi_set_named_property(env, elem, "id", elem_id);
+      napi_value elem_first_name;
+      {
+        char* elem_first_name_s = (char*)weaveffi_contacts_Contact_get_first_name(elem_p);
+        napi_create_string_utf8(env, elem_first_name_s, NAPI_AUTO_LENGTH, &elem_first_name);
+        weaveffi_free_string(elem_first_name_s);
+      }
+      napi_set_named_property(env, elem, "first_name", elem_first_name);
+      napi_value elem_last_name;
+      {
+        char* elem_last_name_s = (char*)weaveffi_contacts_Contact_get_last_name(elem_p);
+        napi_create_string_utf8(env, elem_last_name_s, NAPI_AUTO_LENGTH, &elem_last_name);
+        weaveffi_free_string(elem_last_name_s);
+      }
+      napi_set_named_property(env, elem, "last_name", elem_last_name);
+      napi_value elem_email;
+      {
+        char* elem_email_s = (char*)weaveffi_contacts_Contact_get_email(elem_p);
+        if (elem_email_s == NULL) { napi_get_null(env, &elem_email); }
+        else { napi_create_string_utf8(env, elem_email_s, NAPI_AUTO_LENGTH, &elem_email); weaveffi_free_string(elem_email_s); }
+      }
+      napi_set_named_property(env, elem, "email", elem_email);
+      napi_value elem_contact_type;
+      napi_create_int32(env, (int32_t)weaveffi_contacts_Contact_get_contact_type(elem_p), &elem_contact_type);
+      napi_set_named_property(env, elem, "contact_type", elem_contact_type);
+      weaveffi_contacts_Contact_destroy(elem_p);
+    }
     napi_set_element(env, ret, (uint32_t)ret_i, elem);
   }
   free(result);

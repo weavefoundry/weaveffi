@@ -12,6 +12,10 @@ import 'dart:io' show Platform;
 import 'package:ffi/ffi.dart';
 
 DynamicLibrary _openLibrary() {
+  // An explicit path in WEAVEFFI_LIBRARY wins, so callers can point at a
+  // specific build artifact regardless of its file name or location.
+  final override = Platform.environment['WEAVEFFI_LIBRARY'];
+  if (override != null && override.isNotEmpty) return DynamicLibrary.open(override);
   if (Platform.isMacOS) return DynamicLibrary.open('libweaveffi.dylib');
   if (Platform.isLinux) return DynamicLibrary.open('libweaveffi.so');
   if (Platform.isWindows) return DynamicLibrary.open('weaveffi.dll');
@@ -41,9 +45,10 @@ class WeaveffiException implements Exception {
 
 void _checkError(Pointer<_WeaveffiError> err) {
   if (err.ref.code != 0) {
+    final code = err.ref.code;
     final msg = err.ref.message.toDartString();
     _weaveffiErrorClear(err);
-    throw WeaveffiException(err.ref.code, msg);
+    throw WeaveffiException(code, msg);
   }
 }
 

@@ -237,6 +237,19 @@ fn is_c_value_type(ty: &TypeRef) -> bool {
     )
 }
 
+/// True for `string`/`borrowed_str` directly or wrapped in `optional`. These
+/// marshal to a NUL-terminated `const char*` via `withCString`, distinct from
+/// `bytes` (which pass an explicit `(ptr, len)` pair).
+fn is_string_shaped(ty: &TypeRef) -> bool {
+    match ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => true,
+        TypeRef::Optional(inner) => {
+            matches!(inner.as_ref(), TypeRef::StringUtf8 | TypeRef::BorrowedStr)
+        }
+        _ => false,
+    }
+}
+
 fn needs_closure(ty: &TypeRef) -> bool {
     match ty {
         TypeRef::StringUtf8
@@ -245,7 +258,7 @@ fn needs_closure(ty: &TypeRef) -> bool {
         | TypeRef::BorrowedBytes
         | TypeRef::List(_)
         | TypeRef::Map(_, _) => true,
-        TypeRef::Optional(inner) => is_c_value_type(inner),
+        TypeRef::Optional(inner) => is_c_value_type(inner) || is_string_shaped(ty),
         _ => false,
     }
 }
@@ -256,7 +269,17 @@ fn has_buffer_params(params: &[Param]) -> bool {
 
 fn render_swift_enum(out: &mut String, e: &EnumDef) {
     emit_doc(out, &e.doc, "");
-    out.push_str(&format!("public enum {}: Int32 {{\n", e.name));
+    // Match how Swift imports the generated C enum: a C enum with only
+    // non-negative discriminants is imported with a `UInt32` raw value,
+    // otherwise `Int32`. Mirroring the raw type here keeps every `.rawValue`
+    // round-trip against the C symbols type-correct (the C getters return, and
+    // the C constructors accept, that same unsigned/signed width).
+    let raw = if e.variants.iter().any(|v| v.value < 0) {
+        "Int32"
+    } else {
+        "UInt32"
+    };
+    out.push_str(&format!("public enum {}: {} {{\n", e.name, raw));
     for v in &e.variants {
         emit_doc(out, &v.doc, "    ");
         out.push_str(&format!(
@@ -342,6 +365,11 @@ fn render_swift_wrapper(
     out.push_str("@inline(__always)\nfunc withOptionalPointer<T, R>(to value: T?, _ body: (UnsafePointer<T>?) throws -> R) rethrows -> R {\n");
     out.push_str("    guard let value = value else { return try body(nil) }\n");
     out.push_str("    return try withUnsafePointer(to: value) { try body($0) }\n");
+    out.push_str("}\n\n");
+
+    out.push_str("@inline(__always)\nfunc withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CChar>?) throws -> R) rethrows -> R {\n");
+    out.push_str("    guard let value = value else { return try body(nil) }\n");
+    out.push_str("    return try value.withCString { try body($0) }\n");
     out.push_str("}\n\n");
 
     let has_async = all_mods
@@ -611,6 +639,12 @@ fn render_swift_getter(out: &mut String, prefix: &str, field: &StructField) {
                 }
             }
         }
+        TypeRef::Enum(name) => {
+            out.push_str(&format!(
+                "        return {}(rawValue: {}(ptr).rawValue)!\n",
+                name, getter
+            ));
+        }
         _ => {
             out.push_str(&format!("        return {}(ptr)\n", getter));
         }
@@ -711,13 +745,6 @@ fn render_swift_async_function(
 
     for p in &f.params {
         match &p.ty {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                out.push_str(&format!(
-                    "{}let {n}_bytes = Array({n}.utf8)\n",
-                    base,
-                    n = p.name
-                ));
-            }
             TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 out.push_str(&format!("{}let {n}_bytes = Array({n})\n", base, n = p.name));
             }
@@ -803,10 +830,23 @@ fn render_swift_async_function(
     for p in &closure_params {
         let indent = format!("{}{}", base, "    ".repeat(closure_depth));
         match &p.ty {
-            TypeRef::StringUtf8
-            | TypeRef::BorrowedStr
-            | TypeRef::Bytes
-            | TypeRef::BorrowedBytes => {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                out.push_str(&format!(
+                    "{}{}.withCString {{ {}_ptr in\n",
+                    indent, p.name, p.name
+                ));
+                closure_depth += 1;
+            }
+            TypeRef::Optional(inner)
+                if matches!(inner.as_ref(), TypeRef::StringUtf8 | TypeRef::BorrowedStr) =>
+            {
+                out.push_str(&format!(
+                    "{}withOptionalCString({}) {{ {}_ptr in\n",
+                    indent, p.name, p.name
+                ));
+                closure_depth += 1;
+            }
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 out.push_str(&format!(
                     "{}{}_bytes.withUnsafeBufferPointer {{ {}_buf in\n",
                     indent, p.name, p.name
@@ -1234,10 +1274,10 @@ fn build_c_call_args(params: &[Param], module_name: &str) -> String {
     let mut args: Vec<String> = Vec::new();
     for p in params {
         match &p.ty {
-            TypeRef::StringUtf8
-            | TypeRef::BorrowedStr
-            | TypeRef::Bytes
-            | TypeRef::BorrowedBytes => {
+            // Strings are a single NUL-terminated `const char*`.
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => args.push(format!("{}_ptr", p.name)),
+            // Bytes pass an explicit (ptr, len) pair.
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 args.push(format!("{}_ptr", p.name));
                 args.push(format!("{}_len", p.name));
             }
@@ -1250,10 +1290,8 @@ fn build_c_call_args(params: &[Param], module_name: &str) -> String {
                 TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
                     args.push(format!("{}?.ptr", p.name))
                 }
-                TypeRef::StringUtf8
-                | TypeRef::BorrowedStr
-                | TypeRef::Bytes
-                | TypeRef::BorrowedBytes => {
+                TypeRef::StringUtf8 | TypeRef::BorrowedStr => args.push(format!("{}_ptr", p.name)),
+                TypeRef::Bytes | TypeRef::BorrowedBytes => {
                     args.push(format!("{}_ptr", p.name));
                     args.push(format!("{}_len", p.name));
                 }
@@ -1654,12 +1692,6 @@ fn map_array_source(ty: &TypeRef, name: &str, suffix: &str) -> String {
 fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module_name: &str) {
     for p in params {
         match &p.ty {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                out.push_str(&format!(
-                    "        let {n}_bytes = Array({n}.utf8)\n",
-                    n = p.name
-                ));
-            }
             TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 out.push_str(&format!("        let {n}_bytes = Array({n})\n", n = p.name));
             }
@@ -1774,10 +1806,37 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
         let indent = "        ".to_string() + &"    ".repeat(closure_depth);
         let is_first = closure_depth == 0;
         match &p.ty {
-            TypeRef::StringUtf8
-            | TypeRef::BorrowedStr
-            | TypeRef::Bytes
-            | TypeRef::BorrowedBytes => {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                if needs_return && is_first {
+                    out.push_str(&format!(
+                        "{}let result: {} = {}.withCString {{ {}_ptr in\n",
+                        indent, ret_type, p.name, p.name
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "{}{}.withCString {{ {}_ptr in\n",
+                        indent, p.name, p.name
+                    ));
+                }
+                closure_depth += 1;
+            }
+            TypeRef::Optional(inner)
+                if matches!(inner.as_ref(), TypeRef::StringUtf8 | TypeRef::BorrowedStr) =>
+            {
+                if needs_return && is_first {
+                    out.push_str(&format!(
+                        "{}let result: {} = withOptionalCString({}) {{ {}_ptr in\n",
+                        indent, ret_type, p.name, p.name
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "{}withOptionalCString({}) {{ {}_ptr in\n",
+                        indent, p.name, p.name
+                    ));
+                }
+                closure_depth += 1;
+            }
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 if needs_return && is_first {
                     out.push_str(&format!(
                         "{}let result: {} = {}_bytes.withUnsafeBufferPointer {{ {}_buf in\n",
@@ -1981,12 +2040,6 @@ fn render_buffered_struct_create(
 ) {
     for p in params {
         match &p.ty {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                out.push_str(&format!(
-                    "        let {n}_bytes = Array({n}.utf8)\n",
-                    n = p.name
-                ));
-            }
             TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 out.push_str(&format!("        let {n}_bytes = Array({n})\n", n = p.name));
             }
@@ -2075,10 +2128,37 @@ fn render_buffered_struct_create(
         let indent = "        ".to_string() + &"    ".repeat(closure_depth);
         let is_first = closure_depth == 0;
         match &p.ty {
-            TypeRef::StringUtf8
-            | TypeRef::BorrowedStr
-            | TypeRef::Bytes
-            | TypeRef::BorrowedBytes => {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                if needs_return && is_first {
+                    out.push_str(&format!(
+                        "{}let result: {} = {}.withCString {{ {}_ptr in\n",
+                        indent, ret_type, p.name, p.name
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "{}{}.withCString {{ {}_ptr in\n",
+                        indent, p.name, p.name
+                    ));
+                }
+                closure_depth += 1;
+            }
+            TypeRef::Optional(inner)
+                if matches!(inner.as_ref(), TypeRef::StringUtf8 | TypeRef::BorrowedStr) =>
+            {
+                if needs_return && is_first {
+                    out.push_str(&format!(
+                        "{}let result: {} = withOptionalCString({}) {{ {}_ptr in\n",
+                        indent, ret_type, p.name, p.name
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "{}withOptionalCString({}) {{ {}_ptr in\n",
+                        indent, p.name, p.name
+                    ));
+                }
+                closure_depth += 1;
+            }
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 if needs_return && is_first {
                     out.push_str(&format!(
                         "{}let result: {} = {}_bytes.withUnsafeBufferPointer {{ {}_buf in\n",
@@ -2300,7 +2380,7 @@ mod tests {
 
         let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
-            out.contains("public enum Color: Int32 {"),
+            out.contains("public enum Color: UInt32 {"),
             "missing enum declaration: {out}"
         );
         assert!(out.contains("case red = 0"), "missing red variant: {out}");
@@ -3090,7 +3170,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            swift.contains("public enum Color: Int32 {"),
+            swift.contains("public enum Color: UInt32 {"),
             "missing enum declaration: {swift}"
         );
         assert!(swift.contains("case red = 0"), "missing red case: {swift}");

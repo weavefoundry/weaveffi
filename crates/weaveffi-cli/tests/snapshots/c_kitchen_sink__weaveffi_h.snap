@@ -85,23 +85,23 @@ weaveffi_kitchen_Priority weaveffi_kitchen_Item_get_priority(const weaveffi_kitc
 typedef struct weaveffi_kitchen_ItemBuilder weaveffi_kitchen_ItemBuilder;
 weaveffi_kitchen_ItemBuilder* weaveffi_kitchen_Item_Builder_new(void);
 /** Stable identifier */
-void weaveffi_kitchen_Item_Builder_set_id(weaveffi_kitchen_ItemBuilder* builder, int64_t value);
+void weaveffi_kitchen_Item_Builder_set_id(weaveffi_kitchen_ItemBuilder* builder, int64_t id);
 /** Display name */
-void weaveffi_kitchen_Item_Builder_set_name(weaveffi_kitchen_ItemBuilder* builder, const char* value);
+void weaveffi_kitchen_Item_Builder_set_name(weaveffi_kitchen_ItemBuilder* builder, const char* name);
 /** Initial count */
-void weaveffi_kitchen_Item_Builder_set_count(weaveffi_kitchen_ItemBuilder* builder, int32_t value);
+void weaveffi_kitchen_Item_Builder_set_count(weaveffi_kitchen_ItemBuilder* builder, int32_t count);
 /** Whether the item is enabled */
-void weaveffi_kitchen_Item_Builder_set_enabled(weaveffi_kitchen_ItemBuilder* builder, bool value);
+void weaveffi_kitchen_Item_Builder_set_enabled(weaveffi_kitchen_ItemBuilder* builder, bool enabled);
 /** Scaling ratio */
-void weaveffi_kitchen_Item_Builder_set_ratio(weaveffi_kitchen_ItemBuilder* builder, double value);
-void weaveffi_kitchen_Item_Builder_set_nick(weaveffi_kitchen_ItemBuilder* builder, uint32_t value);
-void weaveffi_kitchen_Item_Builder_set_payload(weaveffi_kitchen_ItemBuilder* builder, const uint8_t* value_ptr, size_t value_len);
-void weaveffi_kitchen_Item_Builder_set_tags(weaveffi_kitchen_ItemBuilder* builder, const char* const* value, size_t value_len);
-void weaveffi_kitchen_Item_Builder_set_attrs(weaveffi_kitchen_ItemBuilder* builder, const char* const* value_keys, const char* const* value_values, size_t value_len);
-void weaveffi_kitchen_Item_Builder_set_parent(weaveffi_kitchen_ItemBuilder* builder, const int64_t* value);
+void weaveffi_kitchen_Item_Builder_set_ratio(weaveffi_kitchen_ItemBuilder* builder, double ratio);
+void weaveffi_kitchen_Item_Builder_set_nick(weaveffi_kitchen_ItemBuilder* builder, uint32_t nick);
+void weaveffi_kitchen_Item_Builder_set_payload(weaveffi_kitchen_ItemBuilder* builder, const uint8_t* payload_ptr, size_t payload_len);
+void weaveffi_kitchen_Item_Builder_set_tags(weaveffi_kitchen_ItemBuilder* builder, const char* const* tags, size_t tags_len);
+void weaveffi_kitchen_Item_Builder_set_attrs(weaveffi_kitchen_ItemBuilder* builder, const char* const* attrs_keys, const char* const* attrs_values, size_t attrs_len);
+void weaveffi_kitchen_Item_Builder_set_parent(weaveffi_kitchen_ItemBuilder* builder, const int64_t* parent);
 /** Cross-module struct reference */
-void weaveffi_kitchen_Item_Builder_set_token(weaveffi_kitchen_ItemBuilder* builder, const weaveffi_shared_Token* value);
-void weaveffi_kitchen_Item_Builder_set_priority(weaveffi_kitchen_ItemBuilder* builder, weaveffi_kitchen_Priority value);
+void weaveffi_kitchen_Item_Builder_set_token(weaveffi_kitchen_ItemBuilder* builder, const weaveffi_shared_Token* token);
+void weaveffi_kitchen_Item_Builder_set_priority(weaveffi_kitchen_ItemBuilder* builder, weaveffi_kitchen_Priority priority);
 weaveffi_kitchen_Item* weaveffi_kitchen_Item_Builder_build(weaveffi_kitchen_ItemBuilder* builder, weaveffi_error* out_err);
 void weaveffi_kitchen_Item_Builder_destroy(weaveffi_kitchen_ItemBuilder* builder);
 
@@ -142,31 +142,19 @@ void weaveffi_kitchen_StreamItemsIterator_destroy(weaveffi_kitchen_StreamItemsIt
 weaveffi_shared_Token* weaveffi_kitchen_cross_module_token(weaveffi_error* out_err);
 /** Async operation */
 typedef void (*weaveffi_kitchen_do_async_callback)(void* context, weaveffi_error* err, const char* result);
-/*
- * Async: weaveffi_kitchen_do_async
- * The callback is called exactly once, on any thread.
- * On success, err is NULL and result (if any) is valid.
- * On failure, err is non-NULL with a non-zero code.
- */
 void weaveffi_kitchen_do_async_async(const char* input, weaveffi_kitchen_do_async_callback callback, void* context);
 /** Cancellable async operation */
 typedef void (*weaveffi_kitchen_do_cancellable_callback)(void* context, weaveffi_error* err, const char* result);
-/*
- * Async: weaveffi_kitchen_do_cancellable
- * The callback is called exactly once, on any thread.
- * On success, err is NULL and result (if any) is valid.
- * On failure, err is non-NULL with a non-zero code.
- */
 void weaveffi_kitchen_do_cancellable_async(const char* input, weaveffi_cancel_token* cancel_token, weaveffi_kitchen_do_cancellable_callback callback, void* context);
 /** Legacy operation kept for compatibility */
 __attribute__((deprecated("Use new_op instead")))
 int32_t weaveffi_kitchen_legacy_op(weaveffi_error* out_err);
 /** Replacement for legacy_op */
 int32_t weaveffi_kitchen_new_op(weaveffi_error* out_err);
+
 // Module: kitchen_nested
 /** Trivial nested-module function */
 const char* weaveffi_kitchen_nested_hello(weaveffi_error* out_err);
-
 
 
 #ifdef __cplusplus

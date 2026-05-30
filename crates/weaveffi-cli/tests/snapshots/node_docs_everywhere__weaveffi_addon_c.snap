@@ -46,7 +46,27 @@ static napi_value Napi_weaveffi_docs_create_document(napi_env env, napi_callback
     return NULL;
   }
   napi_value ret;
-  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
+  {
+    weaveffi_docs_Document* ret_p = (weaveffi_docs_Document*)result;
+    napi_create_object(env, &ret);
+    napi_value ret_id;
+    napi_create_int64(env, weaveffi_docs_Document_get_id(ret_p), &ret_id);
+    napi_set_named_property(env, ret, "id", ret_id);
+    napi_value ret_title;
+    {
+      char* ret_title_s = (char*)weaveffi_docs_Document_get_title(ret_p);
+      napi_create_string_utf8(env, ret_title_s, NAPI_AUTO_LENGTH, &ret_title);
+      weaveffi_free_string(ret_title_s);
+    }
+    napi_set_named_property(env, ret, "title", ret_title);
+    napi_value ret_status;
+    napi_create_int32(env, (int32_t)weaveffi_docs_Document_get_status(ret_p), &ret_status);
+    napi_set_named_property(env, ret, "status", ret_status);
+    napi_value ret_tags;
+    napi_get_null(env, &ret_tags);
+    napi_set_named_property(env, ret, "tags", ret_tags);
+    weaveffi_docs_Document_destroy(ret_p);
+  }
   return ret;
 }
 
@@ -67,7 +87,27 @@ static napi_value Napi_weaveffi_docs_get_document(napi_env env, napi_callback_in
   if (result == NULL) {
     napi_get_null(env, &ret);
   } else {
-    napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
+    {
+      weaveffi_docs_Document* ret_p = (weaveffi_docs_Document*)result;
+      napi_create_object(env, &ret);
+      napi_value ret_id;
+      napi_create_int64(env, weaveffi_docs_Document_get_id(ret_p), &ret_id);
+      napi_set_named_property(env, ret, "id", ret_id);
+      napi_value ret_title;
+      {
+        char* ret_title_s = (char*)weaveffi_docs_Document_get_title(ret_p);
+        napi_create_string_utf8(env, ret_title_s, NAPI_AUTO_LENGTH, &ret_title);
+        weaveffi_free_string(ret_title_s);
+      }
+      napi_set_named_property(env, ret, "title", ret_title);
+      napi_value ret_status;
+      napi_create_int32(env, (int32_t)weaveffi_docs_Document_get_status(ret_p), &ret_status);
+      napi_set_named_property(env, ret, "status", ret_status);
+      napi_value ret_tags;
+      napi_get_null(env, &ret_tags);
+      napi_set_named_property(env, ret, "tags", ret_tags);
+      weaveffi_docs_Document_destroy(ret_p);
+    }
   }
   return ret;
 }

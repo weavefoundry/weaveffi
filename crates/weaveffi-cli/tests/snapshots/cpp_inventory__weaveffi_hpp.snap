@@ -19,10 +19,7 @@ extern "C" {
 
 typedef uint64_t weaveffi_handle_t;
 
-typedef struct weaveffi_error {
-    int32_t code;
-    const char* message;
-} weaveffi_error;
+typedef struct weaveffi_error { int32_t code; const char* message; } weaveffi_error;
 
 void weaveffi_error_clear(weaveffi_error* err);
 void weaveffi_free_string(const char* ptr);
@@ -44,6 +41,7 @@ const char* weaveffi_products_Product_get_description(const weaveffi_products_Pr
 double weaveffi_products_Product_get_price(const weaveffi_products_Product* ptr);
 weaveffi_products_Category weaveffi_products_Product_get_category(const weaveffi_products_Product* ptr);
 const char** weaveffi_products_Product_get_tags(const weaveffi_products_Product* ptr, size_t* out_len);
+
 weaveffi_handle_t weaveffi_products_create_product(const char* name, double price, weaveffi_products_Category category, weaveffi_error* out_err);
 weaveffi_products_Product* weaveffi_products_get_product(weaveffi_handle_t id, weaveffi_error* out_err);
 weaveffi_products_Product** weaveffi_products_search_products(weaveffi_products_Category category, size_t* out_len, weaveffi_error* out_err);
@@ -56,6 +54,7 @@ void weaveffi_orders_OrderItem_destroy(weaveffi_orders_OrderItem* ptr);
 int64_t weaveffi_orders_OrderItem_get_product_id(const weaveffi_orders_OrderItem* ptr);
 int32_t weaveffi_orders_OrderItem_get_quantity(const weaveffi_orders_OrderItem* ptr);
 double weaveffi_orders_OrderItem_get_unit_price(const weaveffi_orders_OrderItem* ptr);
+
 typedef struct weaveffi_orders_Order weaveffi_orders_Order;
 weaveffi_orders_Order* weaveffi_orders_Order_create(int64_t id, weaveffi_orders_OrderItem* const* items, size_t items_len, double total, const char* status, weaveffi_error* out_err);
 void weaveffi_orders_Order_destroy(weaveffi_orders_Order* ptr);
@@ -63,6 +62,7 @@ int64_t weaveffi_orders_Order_get_id(const weaveffi_orders_Order* ptr);
 weaveffi_orders_OrderItem** weaveffi_orders_Order_get_items(const weaveffi_orders_Order* ptr, size_t* out_len);
 double weaveffi_orders_Order_get_total(const weaveffi_orders_Order* ptr);
 const char* weaveffi_orders_Order_get_status(const weaveffi_orders_Order* ptr);
+
 weaveffi_handle_t weaveffi_orders_create_order(weaveffi_orders_OrderItem* const* items, size_t items_len, weaveffi_error* out_err);
 weaveffi_orders_Order* weaveffi_orders_get_order(weaveffi_handle_t id, weaveffi_error* out_err);
 bool weaveffi_orders_cancel_order(weaveffi_handle_t id, weaveffi_error* out_err);

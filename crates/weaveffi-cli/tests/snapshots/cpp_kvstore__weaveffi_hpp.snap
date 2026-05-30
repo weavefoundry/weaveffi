@@ -20,10 +20,7 @@ extern "C" {
 
 typedef uint64_t weaveffi_handle_t;
 
-typedef struct weaveffi_error {
-    int32_t code;
-    const char* message;
-} weaveffi_error;
+typedef struct weaveffi_error { int32_t code; const char* message; } weaveffi_error;
 
 void weaveffi_error_clear(weaveffi_error* err);
 void weaveffi_free_string(const char* ptr);
@@ -50,6 +47,7 @@ weaveffi_kv_Store* weaveffi_kv_Store_create(int64_t id, weaveffi_error* out_err)
 void weaveffi_kv_Store_destroy(weaveffi_kv_Store* ptr);
 /** Internal store identifier */
 int64_t weaveffi_kv_Store_get_id(const weaveffi_kv_Store* ptr);
+
 /** A single key-value entry persisted in the store */
 typedef struct weaveffi_kv_Entry weaveffi_kv_Entry;
 weaveffi_kv_Entry* weaveffi_kv_Entry_create(int64_t id, const char* key, const uint8_t* value_ptr, size_t value_len, int64_t created_at, const int64_t* expires_at, const char* const* tags, size_t tags_len, const char* const* metadata_keys, const char* const* metadata_values, size_t metadata_len, weaveffi_error* out_err);
@@ -68,24 +66,32 @@ int64_t* weaveffi_kv_Entry_get_expires_at(const weaveffi_kv_Entry* ptr);
 const char** weaveffi_kv_Entry_get_tags(const weaveffi_kv_Entry* ptr, size_t* out_len);
 /** Arbitrary string-valued metadata pairs */
 void weaveffi_kv_Entry_get_metadata(const weaveffi_kv_Entry* ptr, const char** out_keys, const char** out_values, size_t* out_len);
+
 typedef struct weaveffi_kv_EntryBuilder weaveffi_kv_EntryBuilder;
 weaveffi_kv_EntryBuilder* weaveffi_kv_Entry_Builder_new(void);
 /** Stable monotonic identifier assigned on insert */
-void weaveffi_kv_Entry_Builder_set_id(weaveffi_kv_EntryBuilder* builder, int64_t value);
+void weaveffi_kv_Entry_Builder_set_id(weaveffi_kv_EntryBuilder* builder, int64_t id);
 /** UTF-8 lookup key */
-void weaveffi_kv_Entry_Builder_set_key(weaveffi_kv_EntryBuilder* builder, const char* value);
+void weaveffi_kv_Entry_Builder_set_key(weaveffi_kv_EntryBuilder* builder, const char* key);
 /** Opaque binary payload */
 void weaveffi_kv_Entry_Builder_set_value(weaveffi_kv_EntryBuilder* builder, const uint8_t* value_ptr, size_t value_len);
 /** Unix-timestamp seconds when the entry was created */
-void weaveffi_kv_Entry_Builder_set_created_at(weaveffi_kv_EntryBuilder* builder, int64_t value);
+void weaveffi_kv_Entry_Builder_set_created_at(weaveffi_kv_EntryBuilder* builder, int64_t created_at);
 /** Optional unix-timestamp seconds at which the entry expires */
-void weaveffi_kv_Entry_Builder_set_expires_at(weaveffi_kv_EntryBuilder* builder, const int64_t* value);
+void weaveffi_kv_Entry_Builder_set_expires_at(weaveffi_kv_EntryBuilder* builder, const int64_t* expires_at);
 /** Free-form labels attached to the entry */
-void weaveffi_kv_Entry_Builder_set_tags(weaveffi_kv_EntryBuilder* builder, const char* const* value, size_t value_len);
+void weaveffi_kv_Entry_Builder_set_tags(weaveffi_kv_EntryBuilder* builder, const char* const* tags, size_t tags_len);
 /** Arbitrary string-valued metadata pairs */
-void weaveffi_kv_Entry_Builder_set_metadata(weaveffi_kv_EntryBuilder* builder, const char* const* value_keys, const char* const* value_values, size_t value_len);
+void weaveffi_kv_Entry_Builder_set_metadata(weaveffi_kv_EntryBuilder* builder, const char* const* metadata_keys, const char* const* metadata_values, size_t metadata_len);
 weaveffi_kv_Entry* weaveffi_kv_Entry_Builder_build(weaveffi_kv_EntryBuilder* builder, weaveffi_error* out_err);
 void weaveffi_kv_Entry_Builder_destroy(weaveffi_kv_EntryBuilder* builder);
+
+/** Fires when an entry is evicted from the store */
+typedef void (*weaveffi_kv_OnEvict_fn)(const char* key, void* context);
+/** Subscribe to per-key eviction notifications */
+uint64_t weaveffi_kv_register_eviction_listener(weaveffi_kv_OnEvict_fn callback, void* context);
+/** Subscribe to per-key eviction notifications */
+void weaveffi_kv_unregister_eviction_listener(uint64_t id);
 /** Open (or create) a store backed by the given filesystem path */
 weaveffi_kv_Store* weaveffi_kv_open_store(const char* path, weaveffi_error* out_err);
 /** Close the store and release all in-memory resources */
@@ -97,7 +103,10 @@ weaveffi_kv_Entry* weaveffi_kv_get(weaveffi_kv_Store* store, const char* key, we
 /** Remove the entry for the given key, returning true if it existed */
 bool weaveffi_kv_delete(weaveffi_kv_Store* store, const char* key, weaveffi_error* out_err);
 /** Stream every key, optionally filtered by a prefix */
-const char** weaveffi_kv_list_keys(weaveffi_kv_Store* store, const char* prefix, size_t* out_len, weaveffi_error* out_err);
+typedef struct weaveffi_kv_ListKeysIterator weaveffi_kv_ListKeysIterator;
+weaveffi_kv_ListKeysIterator* weaveffi_kv_list_keys(weaveffi_kv_Store* store, const char* prefix, weaveffi_error* out_err);
+int32_t weaveffi_kv_ListKeysIterator_next(weaveffi_kv_ListKeysIterator* iter, const char** out_item, weaveffi_error* out_err);
+void weaveffi_kv_ListKeysIterator_destroy(weaveffi_kv_ListKeysIterator* iter);
 /** Return the number of live entries in the store */
 int64_t weaveffi_kv_count(weaveffi_kv_Store* store, weaveffi_error* out_err);
 /** Drop every entry from the store */
@@ -106,6 +115,7 @@ void weaveffi_kv_clear(weaveffi_kv_Store* store, weaveffi_error* out_err);
 typedef void (*weaveffi_kv_compact_async_callback)(void* context, weaveffi_error* err, int64_t result);
 void weaveffi_kv_compact_async_async(weaveffi_kv_Store* store, weaveffi_cancel_token* cancel_token, weaveffi_kv_compact_async_callback callback, void* context);
 /** Legacy single-shot put kept for compatibility */
+__attribute__((deprecated("use put() with explicit kind")))
 bool weaveffi_kv_legacy_put(weaveffi_kv_Store* store, const char* key, const uint8_t* value_ptr, size_t value_len, weaveffi_error* out_err);
 
 /** Aggregate store statistics */
@@ -118,6 +128,7 @@ int64_t weaveffi_kv_stats_Stats_get_total_entries(const weaveffi_kv_stats_Stats*
 int64_t weaveffi_kv_stats_Stats_get_total_bytes(const weaveffi_kv_stats_Stats* ptr);
 /** Number of entries past their TTL but not yet evicted */
 int64_t weaveffi_kv_stats_Stats_get_expired_entries(const weaveffi_kv_stats_Stats* ptr);
+
 /** Snapshot the current store statistics */
 weaveffi_kv_stats_Stats* weaveffi_kv_stats_get_stats(weaveffi_kv_stats_Store* store, weaveffi_error* out_err);
 
@@ -475,9 +486,8 @@ inline bool kv_delete(Store& store, const std::string& key) {
 
 /** Stream every key, optionally filtered by a prefix */
 inline std::vector<std::string> kv_list_keys(Store& store, const std::optional<std::string>& prefix) {
-    size_t out_len = 0;
     weaveffi_error err{};
-    auto result = weaveffi_kv_list_keys(static_cast<weaveffi_kv_Store*>(store.handle()), prefix.has_value() ? prefix.value().c_str() : nullptr, &out_len, &err);
+    weaveffi_kv_ListKeysIterator* iter = weaveffi_kv_list_keys(static_cast<weaveffi_kv_Store*>(store.handle()), prefix.has_value() ? prefix.value().c_str() : nullptr, &err);
     if (err.code != 0) {
         std::string msg(err.message ? err.message : "unknown error");
         int32_t code = err.code;
@@ -491,8 +501,27 @@ inline std::vector<std::string> kv_list_keys(Store& store, const std::optional<s
         }
     }
     std::vector<std::string> ret;
-    ret.reserve(out_len);
-    for (size_t i = 0; i < out_len; ++i) ret.emplace_back(result[i]);
+    while (true) {
+        const char* item{};
+        int32_t has_item = weaveffi_kv_ListKeysIterator_next(iter, &item, &err);
+        if (err.code != 0) {
+            weaveffi_kv_ListKeysIterator_destroy(iter);
+            std::string msg(err.message ? err.message : "unknown error");
+            int32_t code = err.code;
+            weaveffi_error_clear(&err);
+            switch (code) {
+            case 1001: throw KEY_NOT_FOUNDError(msg);
+            case 1002: throw EXPIREDError(msg);
+            case 1003: throw STORE_FULLError(msg);
+            case 1004: throw IO_ERRORError(msg);
+            default: throw WeaveFFIError(code, msg);
+            }
+        }
+        if (has_item == 0) break;
+        ret.emplace_back(item);
+        weaveffi_free_string(item);
+    }
+    weaveffi_kv_ListKeysIterator_destroy(iter);
     return ret;
 }
 

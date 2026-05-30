@@ -65,7 +65,7 @@ fn doc_swift_contains_enum_declaration() {
             .unwrap();
 
     assert!(
-        swift.contains("public enum ContactType: Int32 {"),
+        swift.contains("public enum ContactType: UInt32 {"),
         "Swift enum declaration missing: {swift}"
     );
     assert!(

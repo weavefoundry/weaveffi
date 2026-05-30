@@ -20,10 +20,7 @@ extern "C" {
 
 typedef uint64_t weaveffi_handle_t;
 
-typedef struct weaveffi_error {
-    int32_t code;
-    const char* message;
-} weaveffi_error;
+typedef struct weaveffi_error { int32_t code; const char* message; } weaveffi_error;
 
 void weaveffi_error_clear(weaveffi_error* err);
 void weaveffi_free_string(const char* ptr);
@@ -64,18 +61,26 @@ const char* weaveffi_docs_Document_get_title(const weaveffi_docs_Document* ptr);
 weaveffi_docs_Status weaveffi_docs_Document_get_status(const weaveffi_docs_Document* ptr);
 /** Free-form tags for grouping */
 const char** weaveffi_docs_Document_get_tags(const weaveffi_docs_Document* ptr, size_t* out_len);
+
 typedef struct weaveffi_docs_DocumentBuilder weaveffi_docs_DocumentBuilder;
 weaveffi_docs_DocumentBuilder* weaveffi_docs_Document_Builder_new(void);
 /** Stable opaque identifier */
-void weaveffi_docs_Document_Builder_set_id(weaveffi_docs_DocumentBuilder* builder, int64_t value);
+void weaveffi_docs_Document_Builder_set_id(weaveffi_docs_DocumentBuilder* builder, int64_t id);
 /** Human-readable title shown in lists */
-void weaveffi_docs_Document_Builder_set_title(weaveffi_docs_DocumentBuilder* builder, const char* value);
+void weaveffi_docs_Document_Builder_set_title(weaveffi_docs_DocumentBuilder* builder, const char* title);
 /** Current lifecycle status */
-void weaveffi_docs_Document_Builder_set_status(weaveffi_docs_DocumentBuilder* builder, weaveffi_docs_Status value);
+void weaveffi_docs_Document_Builder_set_status(weaveffi_docs_DocumentBuilder* builder, weaveffi_docs_Status status);
 /** Free-form tags for grouping */
-void weaveffi_docs_Document_Builder_set_tags(weaveffi_docs_DocumentBuilder* builder, const char* const* value, size_t value_len);
+void weaveffi_docs_Document_Builder_set_tags(weaveffi_docs_DocumentBuilder* builder, const char* const* tags, size_t tags_len);
 weaveffi_docs_Document* weaveffi_docs_Document_Builder_build(weaveffi_docs_DocumentBuilder* builder, weaveffi_error* out_err);
 void weaveffi_docs_Document_Builder_destroy(weaveffi_docs_DocumentBuilder* builder);
+
+/** Fires after a document has been persisted successfully */
+typedef void (*weaveffi_docs_OnSaved_fn)(int64_t doc_id, int32_t revision, void* context);
+/** Subscribe to document-saved notifications */
+uint64_t weaveffi_docs_register_saved_listener(weaveffi_docs_OnSaved_fn callback, void* context);
+/** Subscribe to document-saved notifications */
+void weaveffi_docs_unregister_saved_listener(uint64_t id);
 /**
  * Create a brand new document.
  *

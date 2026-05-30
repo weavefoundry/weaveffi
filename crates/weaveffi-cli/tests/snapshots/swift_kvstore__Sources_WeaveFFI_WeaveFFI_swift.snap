@@ -60,13 +60,19 @@ func withOptionalPointer<T, R>(to value: T?, _ body: (UnsafePointer<T>?) throws 
     return try withUnsafePointer(to: value) { try body($0) }
 }
 
+@inline(__always)
+func withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CChar>?) throws -> R) rethrows -> R {
+    guard let value = value else { return try body(nil) }
+    return try value.withCString { try body($0) }
+}
+
 private final class ContinuationRef<T> {
     let value: CheckedContinuation<T, Error>
     init(_ value: CheckedContinuation<T, Error>) { self.value = value }
 }
 
 /// Persistence semantics applied to a stored entry
-public enum EntryKind: Int32 {
+public enum EntryKind: UInt32 {
     /// In-memory only; lost on close
     case volatile = 0
     /// Flushed to durable storage
@@ -222,13 +228,10 @@ public class EntryBuilder {
         guard let tags = _tags else { fatalError("missing field: tags") }
         guard let metadata = _metadata else { fatalError("missing field: metadata") }
         var err = weaveffi_error(code: 0, message: nil)
-        let key_bytes = Array(key.utf8)
         let value_bytes = Array(value)
         let metadata_keys = Array(metadata.keys)
         let metadata_values = metadata_keys.map { metadata[$0]! }
-        let result: OpaquePointer? = key_bytes.withUnsafeBufferPointer { key_buf in
-            let key_ptr = key_buf.baseAddress!
-            let key_len = key_buf.count
+        let result: OpaquePointer? = key.withCString { key_ptr in
             value_bytes.withUnsafeBufferPointer { value_buf in
                 let value_ptr = value_buf.baseAddress!
                 let value_len = value_buf.count
@@ -241,7 +244,7 @@ public class EntryBuilder {
                             metadata_values.withUnsafeBufferPointer { metadata_values_buf in
                                 let metadata_values_ptr = metadata_values_buf.baseAddress
                                 let metadata_len = metadata_values_buf.count
-                                    return weaveffi_kv_Entry_create(id, key_ptr, key_len, value_ptr, value_len, created_at, expires_at_ptr, tags_ptr, tags_len, metadata_keys_ptr, metadata_values_ptr, metadata_len, &err)
+                                    return weaveffi_kv_Entry_create(id, key_ptr, value_ptr, value_len, created_at, expires_at_ptr, tags_ptr, tags_len, metadata_keys_ptr, metadata_values_ptr, metadata_len, &err)
                             }
                         }
                     }
@@ -286,11 +289,8 @@ public enum Kv {
     /// Open (or create) a store backed by the given filesystem path
     public static func kv_open_store(_ path: String) throws -> Store {
         var err = weaveffi_error(code: 0, message: nil)
-        let path_bytes = Array(path.utf8)
-        let result: OpaquePointer? = path_bytes.withUnsafeBufferPointer { path_buf in
-            let path_ptr = path_buf.baseAddress!
-            let path_len = path_buf.count
-                return weaveffi_kv_open_store(path_ptr, path_len, &err)
+        let result: OpaquePointer? = path.withCString { path_ptr in
+                return weaveffi_kv_open_store(path_ptr, &err)
         }
         try check(&err)
         guard let result = result else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
@@ -305,16 +305,13 @@ public enum Kv {
     /// Insert or replace a value, returning true on success
     public static func kv_put(_ store: Store, _ key: String, _ value: Data, _ kind: EntryKind, _ ttl_seconds: Int64?) throws -> Bool {
         var err = weaveffi_error(code: 0, message: nil)
-        let key_bytes = Array(key.utf8)
         let value_bytes = Array(value)
-        let result: Bool = key_bytes.withUnsafeBufferPointer { key_buf in
-            let key_ptr = key_buf.baseAddress!
-            let key_len = key_buf.count
+        let result: Bool = key.withCString { key_ptr in
             value_bytes.withUnsafeBufferPointer { value_buf in
                 let value_ptr = value_buf.baseAddress!
                 let value_len = value_buf.count
                 withOptionalPointer(to: ttl_seconds) { ttl_seconds_ptr in
-                        return weaveffi_kv_put(store.ptr, key_ptr, key_len, value_ptr, value_len, weaveffi_kv_EntryKind(kind.rawValue), ttl_seconds_ptr, &err)
+                        return weaveffi_kv_put(store.ptr, key_ptr, value_ptr, value_len, weaveffi_kv_EntryKind(kind.rawValue), ttl_seconds_ptr, &err)
                 }
             }
         }
@@ -324,11 +321,8 @@ public enum Kv {
     /// Look up an entry by key; returns null if missing or expired
     public static func kv_get(_ store: Store, _ key: String) throws -> Entry? {
         var err = weaveffi_error(code: 0, message: nil)
-        let key_bytes = Array(key.utf8)
-        let result: Entry? = key_bytes.withUnsafeBufferPointer { key_buf in
-            let key_ptr = key_buf.baseAddress!
-            let key_len = key_buf.count
-                let rv = weaveffi_kv_get(store.ptr, key_ptr, key_len, &err)
+        let result: Entry? = key.withCString { key_ptr in
+                let rv = weaveffi_kv_get(store.ptr, key_ptr, &err)
                 try check(&err)
                 return rv.map { Entry(ptr: $0) }
         }
@@ -337,11 +331,8 @@ public enum Kv {
     /// Remove the entry for the given key, returning true if it existed
     public static func kv_delete(_ store: Store, _ key: String) throws -> Bool {
         var err = weaveffi_error(code: 0, message: nil)
-        let key_bytes = Array(key.utf8)
-        let result: Bool = key_bytes.withUnsafeBufferPointer { key_buf in
-            let key_ptr = key_buf.baseAddress!
-            let key_len = key_buf.count
-                return weaveffi_kv_delete(store.ptr, key_ptr, key_len, &err)
+        let result: Bool = key.withCString { key_ptr in
+                return weaveffi_kv_delete(store.ptr, key_ptr, &err)
         }
         try check(&err)
         return result
@@ -349,15 +340,18 @@ public enum Kv {
     /// Stream every key, optionally filtered by a prefix
     public static func kv_list_keys(_ store: Store, _ prefix: String?) throws -> [String] {
         var err = weaveffi_error(code: 0, message: nil)
-        let iter = weaveffi_kv_list_keys(store.ptr, prefix_ptr, prefix_len, &err)
-        try check(&err)
-        guard let iter = iter else { return [] }
-        var items: [String] = []
-        while let ptr = weaveffi_kv_ListKeysIterator_next(iter) {
-            items.append(String(cString: ptr))
+        let result: [String] = withOptionalCString(prefix) { prefix_ptr in
+                let iter = weaveffi_kv_list_keys(store.ptr, prefix_ptr, &err)
+                try check(&err)
+                guard let iter = iter else { return [] }
+                var items: [String] = []
+                while let ptr = weaveffi_kv_ListKeysIterator_next(iter) {
+                    items.append(String(cString: ptr))
+                }
+                weaveffi_kv_ListKeysIterator_destroy(iter)
+                return items
         }
-        weaveffi_kv_ListKeysIterator_destroy(iter)
-        return items
+        return result
     }
     /// Return the number of live entries in the store
     public static func kv_count(_ store: Store) throws -> Int64 {
@@ -392,15 +386,12 @@ public enum Kv {
     @available(*, deprecated, message: "use put() with explicit kind")
     public static func kv_legacy_put(_ store: Store, _ key: String, _ value: Data) throws -> Bool {
         var err = weaveffi_error(code: 0, message: nil)
-        let key_bytes = Array(key.utf8)
         let value_bytes = Array(value)
-        let result: Bool = key_bytes.withUnsafeBufferPointer { key_buf in
-            let key_ptr = key_buf.baseAddress!
-            let key_len = key_buf.count
+        let result: Bool = key.withCString { key_ptr in
             value_bytes.withUnsafeBufferPointer { value_buf in
                 let value_ptr = value_buf.baseAddress!
                 let value_len = value_buf.count
-                    return weaveffi_kv_legacy_put(store.ptr, key_ptr, key_len, value_ptr, value_len, &err)
+                    return weaveffi_kv_legacy_put(store.ptr, key_ptr, value_ptr, value_len, &err)
             }
         }
         try check(&err)
