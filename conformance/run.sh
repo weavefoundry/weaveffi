@@ -152,8 +152,11 @@ dart_consumer() {
 dart_contacts() { dart_consumer contacts contacts.dart; }
 
 # A directory containing `libweaveffi.<ext>` symlinked to the sample cdylib, so
-# build-time `-lweaveffi` / `#cgo -lweaveffi` resolve. (Runtime load still finds
-# the real lib via DYLD_LIBRARY_PATH/LD_LIBRARY_PATH = $LIBDIR.)
+# build-time `-lweaveffi` / `#cgo -lweaveffi` resolve. On Linux the consumer then
+# records `libweaveffi.so` as its DT_NEEDED (cargo cdylibs carry no SONAME, so the
+# link-time basename is used verbatim) rather than the real lib's name in $LIBDIR,
+# so callers must add this dir to LD_LIBRARY_PATH/DYLD_LIBRARY_PATH at run time for
+# the loader to resolve the alias back to the real cdylib.
 weaveffi_linkdir() {
     local sample="$1" dir="$OUT/linkalias-$1"
     mkdir -p "$dir"
@@ -178,6 +181,8 @@ EOF
     ( cd "$moddir" \
         && GOPROXY=off GOSUMDB=off GOFLAGS=-mod=mod \
            CGO_CFLAGS="-I$GENROOT/$sample/c" CGO_LDFLAGS="-L$linkdir" \
+           LD_LIBRARY_PATH="$linkdir:${LD_LIBRARY_PATH:-}" \
+           DYLD_LIBRARY_PATH="$linkdir:${DYLD_LIBRARY_PATH:-}" \
            go run . )
 }
 
@@ -273,7 +278,10 @@ node_consumer() {
 EOF
     ( cd "$b" && npx --yes node-gyp@latest configure build >/dev/null 2>&1 ) \
         || { echo "node-gyp build failed" >&2; return 1; }
-    WV_ADDON="$b/build/Release/index.node" node "$ROOT/conformance/node/$src"
+    WV_ADDON="$b/build/Release/index.node" \
+    LD_LIBRARY_PATH="$linkdir:${LD_LIBRARY_PATH:-}" \
+    DYLD_LIBRARY_PATH="$linkdir:${DYLD_LIBRARY_PATH:-}" \
+        node "$ROOT/conformance/node/$src"
 }
 
 node_contacts() { node_consumer contacts contacts.js; }
