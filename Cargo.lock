@@ -881,9 +881,9 @@ dependencies = [
 
 [[package]]
 name = "kqueue"
-version = "1.1.1"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eac30106d7dce88daf4a3fcb4879ea939476d5074a9b7ddd0fb97fa4bed5596a"
+checksum = "273c0752728918e0ac4976f2b275b6fefb9ecd400585dec929419f3844cd87b5"
 dependencies = [
  "kqueue-sys",
  "libc",
@@ -1975,11 +1975,11 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-abi"
-version = "0.6.0"
+version = "0.7.0"
 
 [[package]]
 name = "weaveffi-cli"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "assert_cmd",
  "camino",
@@ -2017,7 +2017,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -2036,7 +2036,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-fuzz"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "libfuzzer-sys",
  "weaveffi-core",
@@ -2045,7 +2045,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-android"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -2057,7 +2057,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-c"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -2068,7 +2068,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-cpp"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -2080,7 +2080,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-dart"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -2092,7 +2092,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-dotnet"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -2105,7 +2105,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-go"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -2117,7 +2117,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-node"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -2129,7 +2129,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-python"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -2141,7 +2141,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-ruby"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -2154,7 +2154,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-swift"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -2166,7 +2166,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-wasm"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -2178,7 +2178,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-ir"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "miette",
  "schemars",

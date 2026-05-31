@@ -1,3 +1,13 @@
+## [0.7.0](https://github.com/weavefoundry/weaveffi/compare/v0.6.0...v0.7.0) (2026-05-31)
+
+### ⚠ BREAKING CHANGES
+
+* honor custom c_prefix across all language generators (#11)
+
+### Bug Fixes
+
+* honor custom c_prefix across all language generators ([#11](https://github.com/weavefoundry/weaveffi/issues/11)) ([12fd483](https://github.com/weavefoundry/weaveffi/commit/12fd4838d13a6d90bdb4ef45b23eb700a35a853c))
+
 ## [0.6.0](https://github.com/weavefoundry/weaveffi/compare/v0.5.0...v0.6.0) (2026-05-30)
 
 ### ⚠ BREAKING CHANGES
