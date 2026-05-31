@@ -1,6 +1,12 @@
-/// Build the C symbol name for a function: `weaveffi_<module>_<func>`.
-pub fn c_symbol_name(module: &str, func: &str) -> String {
-    format!("weaveffi_{}_{}", module, func)
+/// Build the C symbol name for a function: `<prefix>_<module>_<func>`.
+///
+/// `prefix` is the configured ABI symbol prefix (default `"weaveffi"`).
+/// Every backend must route user-symbol construction through this (or the
+/// equivalent [`crate::model::BindingModel`] fields) so a non-default
+/// `c_prefix` is honored consistently across all eleven languages — not just
+/// the C and C++ headers.
+pub fn c_symbol_name(prefix: &str, module: &str, func: &str) -> String {
+    format!("{prefix}_{module}_{func}")
 }
 
 /// Comment syntax used to emit the standard prelude/trailer in generated files.
@@ -149,6 +155,15 @@ pub fn c_abi_struct_name(name: &str, current_module: &str, prefix: &str) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn c_symbol_name_uses_prefix() {
+        assert_eq!(
+            c_symbol_name("weaveffi", "calc", "add"),
+            "weaveffi_calc_add"
+        );
+        assert_eq!(c_symbol_name("myffi", "calc", "add"), "myffi_calc_add");
+    }
 
     #[test]
     fn local_type_name_unqualified() {

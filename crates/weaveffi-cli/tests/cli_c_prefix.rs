@@ -1,10 +1,95 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+fn repo_root() -> PathBuf {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    Path::new(manifest_dir)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
+/// Recursively read every file under `dir` and concatenate the text contents.
+fn read_tree(dir: &Path) -> String {
+    let mut out = String::new();
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.push_str(&read_tree(&path));
+        } else if let Ok(contents) = fs::read_to_string(&path) {
+            out.push_str(&contents);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// The C ABI prefix must reach **every** language backend, not just C/C++.
+/// Before the unified `c_prefix` plumbing, nine of the eleven generators
+/// hard-coded `weaveffi_`, so a custom prefix produced consumer code that
+/// linked against symbols the (re-prefixed) producer never exported. This
+/// test is the toolchain-free regression oracle for that bug: it generates
+/// all targets with `[global] c_prefix = "myffi"` and asserts each one emits
+/// the prefixed user symbol `myffi_calculator_add` and never the
+/// default-prefixed `weaveffi_calculator_add`.
+#[test]
+fn custom_c_prefix_propagates_to_all_targets() {
+    let repo_root = repo_root();
+    let input = repo_root.join("samples/calculator/calculator.yml");
+
+    let dir = tempfile::tempdir().expect("failed to create temp dir");
+    let out = dir.path().join("out");
+    let cfg = dir.path().join("cfg.toml");
+    fs::write(&cfg, "[global]\nc_prefix = \"myffi\"\n").expect("failed to write cfg.toml");
+
+    assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args([
+            "generate",
+            input.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--config",
+            cfg.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Every backend's output directory. The C symbol `calculator_add` is a
+    // plain sync function present in the calculator sample, so every backend
+    // that binds to it must reference the prefixed form.
+    for target in [
+        "c", "cpp", "swift", "android", "node", "wasm", "python", "dotnet", "dart", "go", "ruby",
+    ] {
+        let target_dir = out.join(target);
+        assert!(
+            target_dir.is_dir(),
+            "target `{target}` produced no output directory at {}",
+            target_dir.display()
+        );
+        let tree = read_tree(&target_dir);
+        assert!(
+            tree.contains("myffi_calculator_add"),
+            "target `{target}` did not honor the custom c_prefix \
+             (missing user symbol `myffi_calculator_add`)"
+        );
+        assert!(
+            !tree.contains("weaveffi_calculator_add"),
+            "target `{target}` leaked the default-prefixed user symbol \
+             `weaveffi_calculator_add` despite a custom c_prefix"
+        );
+    }
+}
 
 #[test]
 fn custom_c_prefix_propagates() {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
+    let repo_root = repo_root();
     let input = repo_root.join("samples/calculator/calculator.yml");
 
     let dir = tempfile::tempdir().expect("failed to create temp dir");

@@ -105,6 +105,20 @@ macro_rules! cli_targets {
             fn fan_strip_module_prefix(&mut self) {
                 $( $( cli_targets!(@strip self, $field, $strip); )? )*
             }
+
+            /// Fan the resolved global C ABI `prefix` out to every per-target
+            /// config that has not set its own. The C symbol prefix is global
+            /// by nature — every consumer must call the identical exported
+            /// symbols — so a single `[global] c_prefix` (or `[c] prefix`)
+            /// reaches all eleven languages.
+            fn fan_c_prefix(&mut self, resolved: Option<String>) {
+                let Some(p) = resolved else { return };
+                $(
+                    if self.$field.prefix.is_none() {
+                        self.$field.prefix = Some(p.clone());
+                    }
+                )*
+            }
         }
     };
     (@strip $self:ident, $field:ident, strip) => {
@@ -134,6 +148,10 @@ struct GlobalConfig {
     /// config that supports it. Per-target sections may still set the flag
     /// directly.
     strip_module_prefix: bool,
+    /// Global C ABI symbol prefix (default `"weaveffi"`). Applies to every
+    /// target so generated consumers across all languages call the identical
+    /// exported symbols. A per-target `prefix` overrides this for that target.
+    c_prefix: Option<String>,
     /// Shell command executed once before any generator runs.
     pre_generate: Option<String>,
     /// Shell command executed once after every generator succeeds.
@@ -510,14 +528,16 @@ impl CliConfig {
         if self.global.strip_module_prefix {
             self.fan_strip_module_prefix();
         }
-        // The C++ wrapper has to call into the same `extern "C"` symbols the
-        // C generator emits. Default `cpp.c_prefix` to `c.prefix` so users
-        // only have to set the prefix in one place.
-        if self.cpp.c_prefix.is_none() {
-            if let Some(p) = self.c.prefix.clone() {
-                self.cpp.c_prefix = Some(p);
-            }
-        }
+        // The C ABI prefix is global: every backend must call the exact same
+        // `extern "C"` symbols. Resolve it once (`[global] c_prefix` wins, then
+        // `[c] prefix`) and fan it out to every per-target config so a custom
+        // prefix is honored across all eleven languages, not just C/C++.
+        let resolved_prefix = self
+            .global
+            .c_prefix
+            .clone()
+            .or_else(|| self.c.prefix.clone());
+        self.fan_c_prefix(resolved_prefix);
         self.stamp_input_basename(input_basename);
     }
 

@@ -8,14 +8,11 @@ use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use serde::{Deserialize, Serialize};
-use weaveffi_core::codegen::common::{
-    emit_doc as common_emit_doc, walk_modules, walk_modules_with_path, DocCommentStyle,
-};
+use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
 use weaveffi_core::codegen::Generator;
-use weaveffi_core::utils::{
-    c_symbol_name, local_type_name, render_prelude, render_trailer, CommentStyle,
-};
-use weaveffi_ir::ir::{Api, EnumDef, Function, StructDef, TypeRef};
+use weaveffi_core::model::{BindingModel, EnumBinding, FnBinding, StructBinding};
+use weaveffi_core::utils::{local_type_name, render_prelude, render_trailer, CommentStyle};
+use weaveffi_ir::ir::{Api, TypeRef};
 
 /// Per-target configuration for [`DartGenerator`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -24,6 +21,10 @@ pub struct DartConfig {
     /// Dart package name (recorded in `pubspec.yaml`). Defaults to
     /// `"weaveffi"`.
     pub package_name: Option<String>,
+    /// C ABI symbol prefix (default `"weaveffi"`). Normally set once globally
+    /// via `[global] c_prefix`; honored so the `dart:ffi` bindings call the
+    /// same exported symbols the producer emits.
+    pub prefix: Option<String>,
     /// Basename of the IDL the CLI was invoked with.
     #[serde(skip)]
     pub input_basename: Option<String>,
@@ -32,6 +33,10 @@ pub struct DartConfig {
 impl DartConfig {
     pub fn package_name(&self) -> &str {
         self.package_name.as_deref().unwrap_or("weaveffi")
+    }
+
+    pub fn prefix(&self) -> &str {
+        self.prefix.as_deref().unwrap_or("weaveffi")
     }
 
     pub fn input_basename(&self) -> &str {
@@ -47,6 +52,7 @@ impl DartGenerator {
         api: &Api,
         out_dir: &Utf8Path,
         package_name: &str,
+        prefix: &str,
         input_basename: &str,
     ) -> Result<()> {
         let dart_dir = out_dir.join("dart");
@@ -54,7 +60,7 @@ impl DartGenerator {
         std::fs::create_dir_all(&lib_dir)?;
         std::fs::write(
             lib_dir.join("weaveffi.dart"),
-            render_dart_module(api, input_basename),
+            render_dart_module(api, prefix, input_basename),
         )?;
         std::fs::write(
             dart_dir.join("pubspec.yaml"),
@@ -73,7 +79,13 @@ impl Generator for DartGenerator {
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()> {
-        self.generate_impl(api, out_dir, config.package_name(), config.input_basename())
+        self.generate_impl(
+            api,
+            out_dir,
+            config.package_name(),
+            config.prefix(),
+            config.input_basename(),
+        )
     }
 
     fn output_files(&self, _api: &Api, out_dir: &Utf8Path, _config: &Self::Config) -> Vec<String> {
@@ -215,9 +227,10 @@ fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
     common_emit_doc(out, doc, indent, DocCommentStyle::TripleSlash);
 }
 
-fn render_dart_module(api: &Api, input_basename: &str) -> String {
+fn render_dart_module(api: &Api, prefix: &str, input_basename: &str) -> String {
+    let model = BindingModel::build(api, prefix);
     let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
-    let has_async = walk_modules(&api.modules).any(|m| m.functions.iter().any(|f| f.r#async));
+    let has_async = model.functions().any(|(_, f)| f.is_async);
 
     out.push_str("// ignore_for_file: non_constant_identifier_names, camel_case_types\n\n");
     out.push_str("import 'dart:ffi';\n");
@@ -276,18 +289,18 @@ fn render_dart_module(api: &Api, input_basename: &str) -> String {
     out.push_str("  }\n");
     out.push_str("}\n");
 
-    for (module, path) in walk_modules_with_path(&api.modules) {
+    for module in &model.modules {
         for e in &module.enums {
             render_enum(&mut out, e);
         }
         for s in &module.structs {
-            render_struct(&mut out, &path, s);
-            if s.builder {
+            render_struct(&mut out, s);
+            if s.builder.is_some() {
                 render_dart_builder(&mut out, s);
             }
         }
         for f in &module.functions {
-            render_function(&mut out, &path, f);
+            render_function(&mut out, f);
         }
     }
 
@@ -296,7 +309,7 @@ fn render_dart_module(api: &Api, input_basename: &str) -> String {
     out
 }
 
-fn render_enum(out: &mut String, e: &EnumDef) {
+fn render_enum(out: &mut String, e: &EnumBinding) {
     let name = e.name.to_upper_camel_case();
     out.push('\n');
     emit_doc(out, &e.doc, "");
@@ -315,14 +328,14 @@ fn render_enum(out: &mut String, e: &EnumDef) {
     out.push_str("}\n");
 }
 
-fn render_struct(out: &mut String, module_path: &str, s: &StructDef) {
+fn render_struct(out: &mut String, s: &StructBinding) {
     let class_name = s.name.to_upper_camel_case();
-    let c_prefix = format!("weaveffi_{}_{}", module_path, s.name);
-
-    let destroy_sym = format!("{c_prefix}_destroy");
+    // Symbols come precomputed from the shared BindingModel, so Dart never
+    // re-derives the `{prefix}_{module}_{Name}_*` scheme itself.
+    let destroy_sym = &s.destroy_symbol;
     emit_typedef_and_lookup(
         out,
-        &destroy_sym,
+        destroy_sym,
         "Pointer<Void>",
         "Pointer<Void>",
         "Void",
@@ -330,11 +343,11 @@ fn render_struct(out: &mut String, module_path: &str, s: &StructDef) {
     );
 
     for field in &s.fields {
-        let getter_sym = format!("{c_prefix}_get_{}", field.name);
+        let getter_sym = &field.getter_symbol;
         let nr = native_ffi_type(&field.ty);
         let dr = dart_ffi_type(&field.ty);
         // Struct getters take only the opaque handle; they report no error.
-        emit_typedef_and_lookup(out, &getter_sym, "Pointer<Void>", "Pointer<Void>", &nr, &dr);
+        emit_typedef_and_lookup(out, getter_sym, "Pointer<Void>", "Pointer<Void>", &nr, &dr);
     }
 
     out.push('\n');
@@ -351,7 +364,7 @@ fn render_struct(out: &mut String, module_path: &str, s: &StructDef) {
     out.push_str("  }\n");
 
     for field in &s.fields {
-        let getter_sym = format!("{c_prefix}_get_{}", field.name);
+        let getter_sym = &field.getter_symbol;
         let dart_ret = dart_type(&field.ty);
         let fname = field.name.to_lower_camel_case();
 
@@ -369,7 +382,7 @@ fn render_struct(out: &mut String, module_path: &str, s: &StructDef) {
     out.push_str("}\n");
 }
 
-fn render_dart_builder(out: &mut String, s: &StructDef) {
+fn render_dart_builder(out: &mut String, s: &StructBinding) {
     let class_name = s.name.to_upper_camel_case();
     let builder_name = format!("{class_name}Builder");
 
@@ -410,18 +423,21 @@ fn render_dart_builder(out: &mut String, s: &StructDef) {
     out.push_str("}\n");
 }
 
-fn render_function(out: &mut String, module_path: &str, f: &Function) {
-    let c_sym = c_symbol_name(module_path, &f.name);
+fn render_function(out: &mut String, f: &FnBinding) {
+    // `c_base` is the prefixed `{prefix}_{module}_{name}` symbol the shared
+    // BindingModel already computed; the async/iterator suffixing matches the C
+    // ABI by construction.
+    let c_sym = f.c_base.as_str();
     let wrapper_name = f.name.to_lower_camel_case();
-    let pub_ret = f.returns.as_ref().map_or("void".into(), dart_type);
+    let pub_ret = f.ret.as_ref().map_or("void".into(), dart_type);
     let wrapper_params: Vec<String> = f
         .params
         .iter()
         .map(|p| format!("{} {}", dart_type(&p.ty), p.name.to_lower_camel_case()))
         .collect();
 
-    if f.r#async {
-        render_async_function(out, &c_sym, f, &wrapper_name, &pub_ret, &wrapper_params);
+    if f.is_async {
+        render_async_function(out, c_sym, f, &wrapper_name, &pub_ret, &wrapper_params);
         return;
     }
 
@@ -429,19 +445,19 @@ fn render_function(out: &mut String, module_path: &str, f: &Function) {
     let mut dart_params: Vec<String> = f.params.iter().map(|p| dart_ffi_type(&p.ty)).collect();
     // List returns lower to `T** f(..., size_t* out_len, err)`: the count comes
     // back through an out-parameter that precedes the trailing error slot.
-    if matches!(f.returns, Some(TypeRef::List(_))) {
+    if matches!(f.ret, Some(TypeRef::List(_))) {
         native_params.push("Pointer<Size>".into());
         dart_params.push("Pointer<Size>".into());
     }
     native_params.push("Pointer<_WeaveffiError>".into());
     dart_params.push("Pointer<_WeaveffiError>".into());
 
-    let native_ret = f.returns.as_ref().map_or("Void".into(), native_ffi_type);
-    let dart_ret = f.returns.as_ref().map_or("void".into(), dart_ffi_type);
+    let native_ret = f.ret.as_ref().map_or("Void".into(), native_ffi_type);
+    let dart_ret = f.ret.as_ref().map_or("void".into(), dart_ffi_type);
 
     emit_typedef_and_lookup(
         out,
-        &c_sym,
+        c_sym,
         &native_params.join(", "),
         &dart_params.join(", "),
         &native_ret,
@@ -458,7 +474,7 @@ fn render_function(out: &mut String, module_path: &str, f: &Function) {
         "{pub_ret} {wrapper_name}({}) {{\n",
         wrapper_params.join(", ")
     ));
-    emit_function_body(out, f, &c_sym);
+    emit_function_body(out, f, c_sym);
     out.push_str("}\n");
 }
 
@@ -510,12 +526,12 @@ fn async_cb_extra_params(ret: Option<&TypeRef>) -> Vec<(&'static str, &'static s
 fn render_async_function(
     out: &mut String,
     c_sym: &str,
-    f: &Function,
+    f: &FnBinding,
     wrapper_name: &str,
     pub_ret: &str,
     wrapper_params: &[String],
 ) {
-    let cb_extras = async_cb_extra_params(f.returns.as_ref());
+    let cb_extras = async_cb_extra_params(f.ret.as_ref());
     let cb_native_params: Vec<String> = std::iter::once("Pointer<Void>".to_string())
         .chain(std::iter::once("Pointer<_WeaveffiError>".to_string()))
         .chain(cb_extras.iter().map(|(n, _)| (*n).to_string()))
@@ -561,7 +577,7 @@ fn render_async_function(
         wrapper_params.join(", ")
     ));
 
-    let completer_type = if f.returns.is_some() {
+    let completer_type = if f.ret.is_some() {
         pub_ret.to_string()
     } else {
         "void".to_string()
@@ -613,7 +629,7 @@ fn render_async_function(
     out.push_str("        completer.completeError(WeaveffiException(code, msg));\n");
     out.push_str("        return;\n");
     out.push_str("      }\n");
-    emit_async_complete(out, f.returns.as_ref(), "      ");
+    emit_async_complete(out, f.ret.as_ref(), "      ");
     out.push_str("    } catch (e) {\n");
     out.push_str("      completer.completeError(e);\n");
     out.push_str("    } finally {\n");
@@ -731,10 +747,10 @@ fn is_string_param(ty: &TypeRef) -> bool {
             if matches!(inner.as_ref(), TypeRef::StringUtf8 | TypeRef::BorrowedStr))
 }
 
-fn emit_function_body(out: &mut String, f: &Function, c_sym: &str) {
+fn emit_function_body(out: &mut String, f: &FnBinding, c_sym: &str) {
     out.push_str("  final err = calloc<_WeaveffiError>();\n");
 
-    let returns_list = matches!(f.returns, Some(TypeRef::List(_)));
+    let returns_list = matches!(f.ret, Some(TypeRef::List(_)));
     if returns_list {
         out.push_str("  final outLen = calloc<Size>();\n");
     }
@@ -777,7 +793,7 @@ fn emit_function_body(out: &mut String, f: &Function, c_sym: &str) {
     call_args.push("err".into());
 
     let var = c_sym.to_lower_camel_case();
-    match &f.returns {
+    match &f.ret {
         Some(TypeRef::List(inner)) => {
             out.push_str(&format!(
                 "    final result = _{var}({});\n",
@@ -1189,7 +1205,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let dart = render_dart_module(&api, "weaveffi.yml");
+        let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
 
         assert!(dart.contains("class Contact {"), "missing class: {dart}");
         assert!(
@@ -1255,7 +1271,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let dart = render_dart_module(&api, "weaveffi.yml");
+        let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
         assert!(
             dart.contains("class PointBuilder {"),
             "builder class: {dart}"
@@ -1317,7 +1333,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let dart = render_dart_module(&api, "weaveffi.yml");
+        let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
 
         assert!(dart.contains("enum Color {"), "missing enum: {dart}");
         assert!(dart.contains("red(0)"), "missing red: {dart}");
@@ -1362,7 +1378,7 @@ mod tests {
             since: None,
         }])]);
 
-        let dart = render_dart_module(&api, "weaveffi.yml");
+        let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
         assert!(
             dart.contains("void reset()"),
             "missing void function: {dart}"
@@ -1400,7 +1416,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let dart = render_dart_module(&api, "weaveffi.yml");
+        let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
         assert!(
             dart.contains("String echo(String msg)"),
             "missing signature: {dart}"
@@ -1437,7 +1453,7 @@ mod tests {
             since: None,
         }])]);
 
-        let dart = render_dart_module(&api, "weaveffi.yml");
+        let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
         assert!(
             dart.contains("bool isValid(bool flag)"),
             "missing signature: {dart}"
@@ -1464,7 +1480,7 @@ mod tests {
             since: None,
         }])]);
 
-        let dart = render_dart_module(&api, "weaveffi.yml");
+        let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
         assert!(
             dart.contains("import 'dart:async'"),
             "missing dart:async import: {dart}"
@@ -1504,7 +1520,7 @@ mod tests {
             deprecated: None,
             since: None,
         }])]);
-        let dart = render_dart_module(&api, "weaveffi.yml");
+        let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
         let pin_count = dart.matches(".listener(").count();
         let unpin_count = dart.matches("callable.close()").count();
         assert_eq!(
@@ -1545,7 +1561,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let dart = render_dart_module(&api, "weaveffi.yml");
+        let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
         assert!(
             dart.contains("Contact getContact(int id)"),
             "missing signature: {dart}"
@@ -1569,7 +1585,7 @@ mod tests {
             since: None,
         }])]);
 
-        let dart = render_dart_module(&api, "weaveffi.yml");
+        let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
         assert!(
             dart.contains("Int64 Function("),
             "missing Int64 for Handle: {dart}"
@@ -1646,7 +1662,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let dart = render_dart_module(&api, "weaveffi.yml");
+        let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
         assert!(
             dart.contains("String? findUser(int id)"),
             "missing optional return type: {dart}"
@@ -1688,7 +1704,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let dart = render_dart_module(&api, "weaveffi.yml");
+        let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
         assert!(
             dart.contains("List<String> getScores(List<int> items)"),
             "missing list signature: {dart}"
@@ -1724,7 +1740,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let dart = render_dart_module(&api, "weaveffi.yml");
+        let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
         assert!(
             dart.contains("Map<String, int> getEntries()"),
             "missing map return type: {dart}"
@@ -1775,7 +1791,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let dart = render_dart_module(&api, "weaveffi.yml");
+        let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
         assert!(
             dart.contains("Session createSession(String name)"),
             "missing typed handle return: {dart}"
@@ -1949,7 +1965,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let dart = render_dart_module(&api, "weaveffi.yml");
+        let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
 
         assert!(
             dart.contains("enum ContactType {"),
@@ -2074,7 +2090,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let dart = render_dart_module(&api, "weaveffi.yml");
+        let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
 
         assert!(
             !dart.contains("weaveffi_free_string(namePtr"),
@@ -2132,7 +2148,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let dart = render_dart_module(&api, "weaveffi.yml");
+        let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
 
         let fn_start = dart
             .find("Contact? findContact(")
@@ -2198,26 +2214,26 @@ mod tests {
 
     #[test]
     fn dart_emits_doc_on_function() {
-        let dart = render_dart_module(&doc_api(), "weaveffi.yml");
+        let dart = render_dart_module(&doc_api(), "weaveffi", "weaveffi.yml");
         assert!(dart.contains("/// Performs a thing."), "{dart}");
     }
 
     #[test]
     fn dart_emits_doc_on_struct() {
-        let dart = render_dart_module(&doc_api(), "weaveffi.yml");
+        let dart = render_dart_module(&doc_api(), "weaveffi", "weaveffi.yml");
         assert!(dart.contains("/// An item we track."), "{dart}");
     }
 
     #[test]
     fn dart_emits_doc_on_enum_variant() {
-        let dart = render_dart_module(&doc_api(), "weaveffi.yml");
+        let dart = render_dart_module(&doc_api(), "weaveffi", "weaveffi.yml");
         assert!(dart.contains("/// Kind of item."), "{dart}");
         assert!(dart.contains("/// A small one"), "{dart}");
     }
 
     #[test]
     fn dart_emits_doc_on_field() {
-        let dart = render_dart_module(&doc_api(), "weaveffi.yml");
+        let dart = render_dart_module(&doc_api(), "weaveffi", "weaveffi.yml");
         assert!(dart.contains("/// Stable id"), "{dart}");
     }
 }

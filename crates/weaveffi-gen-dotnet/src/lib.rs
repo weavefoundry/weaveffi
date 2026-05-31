@@ -8,13 +8,16 @@ use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use weaveffi_core::abi::{self, AbiParam, CType};
-use weaveffi_core::codegen::common::{walk_modules, walk_modules_with_path};
 use weaveffi_core::codegen::Generator;
-use weaveffi_core::utils::{
-    c_symbol_name, local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
+use weaveffi_core::model::{
+    BindingModel, EnumBinding, FieldBinding, FnBinding, ModuleBinding, ParamBinding, StructBinding,
 };
-use weaveffi_ir::ir::{Api, EnumDef, Function, Module, Param, StructDef, StructField, TypeRef};
+use weaveffi_core::utils::{
+    local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
+};
+use weaveffi_ir::ir::{Api, Module, TypeRef};
 
 /// Per-target configuration for [`DotnetGenerator`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -26,6 +29,10 @@ pub struct DotnetConfig {
     /// When `true`, strip the IR module name prefix from emitted C# method
     /// names.
     pub strip_module_prefix: bool,
+    /// C ABI symbol prefix (default `"weaveffi"`). Normally set once globally
+    /// via `[global] c_prefix`; honored so the P/Invoke bindings call the same
+    /// exported symbols the producer emits.
+    pub prefix: Option<String>,
     /// Basename of the IDL the CLI was invoked with.
     #[serde(skip)]
     pub input_basename: Option<String>,
@@ -34,6 +41,10 @@ pub struct DotnetConfig {
 impl DotnetConfig {
     pub fn namespace(&self) -> &str {
         self.namespace.as_deref().unwrap_or("WeaveFFI")
+    }
+
+    pub fn prefix(&self) -> &str {
+        self.prefix.as_deref().unwrap_or("weaveffi")
     }
 
     pub fn input_basename(&self) -> &str {
@@ -50,6 +61,7 @@ impl DotnetGenerator {
         out_dir: &Utf8Path,
         namespace: &str,
         strip_module_prefix: bool,
+        prefix: &str,
         input_basename: &str,
     ) -> Result<()> {
         let dir = out_dir.join("dotnet");
@@ -63,6 +75,7 @@ impl DotnetGenerator {
                 api,
                 namespace,
                 strip_module_prefix,
+                prefix,
                 input_basename,
                 &cs_filename,
             ),
@@ -93,6 +106,7 @@ impl Generator for DotnetGenerator {
             out_dir,
             config.namespace(),
             config.strip_module_prefix,
+            config.prefix(),
             config.input_basename(),
         )
     }
@@ -196,7 +210,7 @@ fn cs_out_param(p: &AbiParam) -> String {
     format!("out {} {}", pointee, p.name)
 }
 
-fn pinvoke_param_list(p: &Param) -> Vec<String> {
+fn pinvoke_param_list(p: &ParamBinding) -> Vec<String> {
     abi::lower_param(&p.name, &p.ty, "", false)
         .iter()
         .map(|slot| format!("{} {}", cs_pinvoke_ctype(&slot.ty), slot.name))
@@ -331,14 +345,9 @@ fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
 
 /// Emits a full XML doc block: function `<summary>` plus a `<param>` element
 /// per documented parameter. Skips entirely when there is nothing to emit.
-fn emit_fn_doc(
-    out: &mut String,
-    doc: &Option<String>,
-    params: &[weaveffi_ir::ir::Param],
-    indent: &str,
-) {
+fn emit_fn_doc(out: &mut String, doc: &Option<String>, params: &[ParamBinding], indent: &str) {
     let trimmed_doc = doc.as_ref().map(|d| d.trim()).filter(|d| !d.is_empty());
-    let documented_params: Vec<&weaveffi_ir::ir::Param> = params
+    let documented_params: Vec<&ParamBinding> = params
         .iter()
         .filter(|p| {
             p.doc
@@ -394,9 +403,11 @@ fn render_csharp(
     api: &Api,
     namespace: &str,
     strip_module_prefix: bool,
+    prefix: &str,
     input_basename: &str,
     filename: &str,
 ) -> String {
+    let model = BindingModel::build(api, prefix);
     let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
     // Opt the file into the nullable annotation context so the `string?`
     // signatures (optional strings) are valid regardless of the consuming
@@ -405,11 +416,7 @@ fn render_csharp(
     out.push_str(
         "using System;\nusing System.Collections.Generic;\nusing System.Runtime.InteropServices;\n",
     );
-    let all_mods = walk_modules(&api.modules).collect::<Vec<_>>();
-    if all_mods
-        .iter()
-        .any(|m| m.functions.iter().any(|f| f.r#async))
-    {
+    if model.functions().any(|(_, f)| f.is_async) {
         out.push_str("using System.Threading.Tasks;\n");
     }
     out.push('\n');
@@ -419,20 +426,22 @@ fn render_csharp(
     render_error_struct(&mut out);
     render_helpers_class(&mut out);
 
-    for (m, path) in walk_modules_with_path(&api.modules) {
+    for m in &model.modules {
         for e in &m.enums {
             render_enum(&mut out, e);
         }
         for s in &m.structs {
-            render_struct_class(&mut out, &path, s);
-            render_builder_class(&mut out, &path, s);
+            render_struct_class(&mut out, s);
+            render_builder_class(&mut out, s);
         }
     }
 
-    render_native_methods(&mut out, api);
+    render_native_methods(&mut out, &model);
 
+    let by_path: HashMap<&str, &ModuleBinding> =
+        model.modules.iter().map(|m| (m.path.as_str(), m)).collect();
     for m in &api.modules {
-        render_wrapper_class(&mut out, m, &m.name, "    ", strip_module_prefix);
+        render_wrapper_class(&mut out, &by_path, m, &m.name, "    ", strip_module_prefix);
     }
 
     out.push_str("}\n\n");
@@ -482,7 +491,7 @@ fn render_helpers_class(out: &mut String) {
     out.push_str("    }\n\n");
 }
 
-fn render_enum(out: &mut String, e: &EnumDef) {
+fn render_enum(out: &mut String, e: &EnumBinding) {
     emit_doc(out, &e.doc, "    ");
     out.push_str(&format!("    public enum {}\n    {{\n", e.name));
     for v in &e.variants {
@@ -492,9 +501,7 @@ fn render_enum(out: &mut String, e: &EnumDef) {
     out.push_str("    }\n\n");
 }
 
-fn render_struct_class(out: &mut String, module_name: &str, s: &StructDef) {
-    let prefix = format!("weaveffi_{}_{}", module_name, s.name);
-
+fn render_struct_class(out: &mut String, s: &StructBinding) {
     emit_doc(out, &s.doc, "    ");
     out.push_str(&format!(
         "    public class {} : IDisposable\n    {{\n",
@@ -509,13 +516,14 @@ fn render_struct_class(out: &mut String, module_name: &str, s: &StructDef) {
     out.push_str("        internal IntPtr Handle => _handle;\n\n");
 
     for field in &s.fields {
-        render_struct_getter(out, &prefix, field);
+        render_struct_getter(out, field);
     }
 
     out.push_str("        public void Dispose()\n        {\n");
     out.push_str("            if (!_disposed)\n            {\n");
     out.push_str(&format!(
-        "                NativeMethods.{prefix}_destroy(_handle);\n"
+        "                NativeMethods.{}(_handle);\n",
+        s.destroy_symbol
     ));
     out.push_str("                _disposed = true;\n");
     out.push_str("            }\n");
@@ -537,9 +545,8 @@ fn cs_type_builder_storage(ty: &TypeRef) -> String {
     }
 }
 
-fn render_builder_class(out: &mut String, module_name: &str, s: &StructDef) {
-    let _ = module_name;
-    if !s.builder {
+fn render_builder_class(out: &mut String, s: &StructBinding) {
+    if s.builder.is_none() {
         return;
     }
     let builder_name = format!("{}Builder", s.name);
@@ -576,9 +583,9 @@ fn render_builder_class(out: &mut String, module_name: &str, s: &StructDef) {
     ));
 }
 
-fn render_struct_getter(out: &mut String, prefix: &str, field: &StructField) {
+fn render_struct_getter(out: &mut String, field: &FieldBinding) {
     let prop_name = field.name.to_upper_camel_case();
-    let getter_sym = format!("{}_get_{}", prefix, field.name);
+    let getter_sym = &field.getter_symbol;
     let cs = cs_type(&field.ty);
 
     emit_doc(out, &field.doc, "        ");
@@ -782,7 +789,7 @@ fn render_list_unmarshal(out: &mut String, inner: &TypeRef, indent: &str) {
     }
 }
 
-fn render_native_methods(out: &mut String, api: &Api) {
+fn render_native_methods(out: &mut String, model: &BindingModel) {
     out.push_str("    internal static class NativeMethods\n    {\n");
     out.push_str("        private const string LibName = \"weaveffi\";\n\n");
 
@@ -793,14 +800,14 @@ fn render_native_methods(out: &mut String, api: &Api) {
         "        internal static extern void weaveffi_free_bytes(IntPtr ptr, UIntPtr len);\n\n",
     );
 
-    for (m, path) in walk_modules_with_path(&api.modules) {
+    for m in &model.modules {
         for s in &m.structs {
-            render_struct_pinvoke(out, &path, s);
+            render_struct_pinvoke(out, s);
         }
         for f in &m.functions {
-            render_function_pinvoke(out, &path, f);
-            if f.r#async {
-                render_async_function_pinvoke(out, &path, f);
+            render_function_pinvoke(out, f);
+            if f.is_async {
+                render_async_function_pinvoke(out, f);
             }
         }
     }
@@ -808,18 +815,20 @@ fn render_native_methods(out: &mut String, api: &Api) {
     out.push_str("    }\n\n");
 }
 
-fn render_struct_pinvoke(out: &mut String, module_name: &str, s: &StructDef) {
-    let prefix = format!("weaveffi_{}_{}", module_name, s.name);
+fn render_struct_pinvoke(out: &mut String, s: &StructBinding) {
+    let create_sym = &s.create.symbol;
+    let destroy_sym = &s.destroy_symbol;
 
     let mut create_params: Vec<String> = s
         .fields
         .iter()
         .flat_map(|f| {
-            let p = Param {
+            let p = ParamBinding {
                 name: f.name.clone(),
                 ty: f.ty.clone(),
                 mutable: false,
                 doc: f.doc.clone(),
+                abi: Vec::new(),
             };
             pinvoke_param_list(&p)
         })
@@ -827,22 +836,22 @@ fn render_struct_pinvoke(out: &mut String, module_name: &str, s: &StructDef) {
     create_params.push("ref WeaveffiError err".into());
 
     out.push_str(&format!(
-        "        [DllImport(LibName, EntryPoint = \"{prefix}_create\", CallingConvention = CallingConvention.Cdecl)]\n"
+        "        [DllImport(LibName, EntryPoint = \"{create_sym}\", CallingConvention = CallingConvention.Cdecl)]\n"
     ));
     out.push_str(&format!(
-        "        internal static extern IntPtr {prefix}_create({});\n\n",
+        "        internal static extern IntPtr {create_sym}({});\n\n",
         create_params.join(", ")
     ));
 
     out.push_str(&format!(
-        "        [DllImport(LibName, EntryPoint = \"{prefix}_destroy\", CallingConvention = CallingConvention.Cdecl)]\n"
+        "        [DllImport(LibName, EntryPoint = \"{destroy_sym}\", CallingConvention = CallingConvention.Cdecl)]\n"
     ));
     out.push_str(&format!(
-        "        internal static extern void {prefix}_destroy(IntPtr ptr);\n\n"
+        "        internal static extern void {destroy_sym}(IntPtr ptr);\n\n"
     ));
 
     for field in &s.fields {
-        let getter_sym = format!("{prefix}_get_{}", field.name);
+        let getter_sym = &field.getter_symbol;
         let (ret_type, extra_params) = pinvoke_return_info(&field.ty);
 
         out.push_str(&format!(
@@ -857,8 +866,8 @@ fn render_struct_pinvoke(out: &mut String, module_name: &str, s: &StructDef) {
     }
 }
 
-fn render_function_pinvoke(out: &mut String, module_name: &str, f: &Function) {
-    let c_sym = c_symbol_name(module_name, &f.name);
+fn render_function_pinvoke(out: &mut String, f: &FnBinding) {
+    let c_sym = &f.c_base;
 
     out.push_str(&format!(
         "        [DllImport(LibName, EntryPoint = \"{c_sym}\", CallingConvention = CallingConvention.Cdecl)]\n"
@@ -866,7 +875,7 @@ fn render_function_pinvoke(out: &mut String, module_name: &str, f: &Function) {
 
     let mut params: Vec<String> = f.params.iter().flat_map(pinvoke_param_list).collect();
 
-    let ret_type = if let Some(ret) = &f.returns {
+    let ret_type = if let Some(ret) = &f.ret {
         let (ret_cs, extra) = pinvoke_return_info(ret);
         params.extend(extra);
         ret_cs
@@ -906,10 +915,10 @@ fn async_cb_lambda_params(ret: &Option<TypeRef>) -> &'static str {
     }
 }
 
-fn render_async_function_pinvoke(out: &mut String, module_name: &str, f: &Function) {
-    let c_sym = c_symbol_name(module_name, &f.name);
+fn render_async_function_pinvoke(out: &mut String, f: &FnBinding) {
+    let c_sym = &f.c_base;
     let delegate_name = format!("AsyncCb_{c_sym}");
-    let cb_params = async_cb_delegate_result_params(&f.returns);
+    let cb_params = async_cb_delegate_result_params(&f.ret);
 
     out.push_str("        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]\n");
     out.push_str(&format!(
@@ -934,6 +943,7 @@ fn render_async_function_pinvoke(out: &mut String, module_name: &str, f: &Functi
 
 fn render_wrapper_class(
     out: &mut String,
+    by_path: &HashMap<&str, &ModuleBinding>,
     m: &Module,
     module_path: &str,
     indent: &str,
@@ -944,7 +954,8 @@ fn render_wrapper_class(
         "{indent}public static class {class_name}\n{indent}{{\n"
     ));
 
-    for f in &m.functions {
+    let mb = by_path[module_path];
+    for f in &mb.functions {
         let mut buf = String::new();
         render_wrapper_method(&mut buf, module_path, f, strip_module_prefix);
         reindent(out, &buf, indent.len().saturating_sub(4));
@@ -953,7 +964,14 @@ fn render_wrapper_class(
     for sub in &m.modules {
         let sub_path = format!("{module_path}_{}", sub.name);
         let inner_indent = format!("{indent}    ");
-        render_wrapper_class(out, sub, &sub_path, &inner_indent, strip_module_prefix);
+        render_wrapper_class(
+            out,
+            by_path,
+            sub,
+            &sub_path,
+            &inner_indent,
+            strip_module_prefix,
+        );
     }
 
     out.push_str(&format!("{indent}}}\n\n"));
@@ -1002,19 +1020,15 @@ fn reindent(out: &mut String, buf: &str, extra: usize) {
 fn render_wrapper_method(
     out: &mut String,
     module_path: &str,
-    f: &Function,
+    f: &FnBinding,
     strip_module_prefix: bool,
 ) {
-    if f.r#async {
+    if f.is_async {
         render_async_wrapper_method(out, module_path, f, strip_module_prefix);
         return;
     }
     let method_name = wrapper_name(module_path, &f.name, strip_module_prefix).to_upper_camel_case();
-    let ret_cs = f
-        .returns
-        .as_ref()
-        .map(cs_type)
-        .unwrap_or_else(|| "void".into());
+    let ret_cs = f.ret.as_ref().map(cs_type).unwrap_or_else(|| "void".into());
 
     let params_sig: Vec<String> = f
         .params
@@ -1044,14 +1058,14 @@ fn render_wrapper_method(
             render_marshal_setup(out, p, "            ");
         }
         out.push_str("            try\n            {\n");
-        render_pinvoke_call_and_return(out, module_path, f, "                ");
+        render_pinvoke_call_and_return(out, f, "                ");
         out.push_str("            }\n            finally\n            {\n");
         for p in &f.params {
             render_marshal_cleanup(out, p, "                ");
         }
         out.push_str("            }\n");
     } else {
-        render_pinvoke_call_and_return(out, module_path, f, "            ");
+        render_pinvoke_call_and_return(out, f, "            ");
     }
 
     out.push_str("        }\n\n");
@@ -1060,24 +1074,20 @@ fn render_wrapper_method(
 fn render_async_wrapper_method(
     out: &mut String,
     module_path: &str,
-    f: &Function,
+    f: &FnBinding,
     strip_module_prefix: bool,
 ) {
     let method_name = wrapper_name(module_path, &f.name, strip_module_prefix).to_upper_camel_case();
-    let c_sym = c_symbol_name(module_path, &f.name);
+    let c_sym = &f.c_base;
     let delegate_name = format!("NativeMethods.AsyncCb_{c_sym}");
 
     let task_ret = f
-        .returns
+        .ret
         .as_ref()
         .map(|ty| format!("Task<{}>", cs_type(ty)))
         .unwrap_or_else(|| "Task".into());
 
-    let tcs_type = f
-        .returns
-        .as_ref()
-        .map(cs_type)
-        .unwrap_or_else(|| "bool".into());
+    let tcs_type = f.ret.as_ref().map(cs_type).unwrap_or_else(|| "bool".into());
 
     let params_sig: Vec<String> = f
         .params
@@ -1102,7 +1112,7 @@ fn render_async_wrapper_method(
         "            var tcs = new TaskCompletionSource<{tcs_type}>(TaskCreationOptions.RunContinuationsAsynchronously);\n"
     ));
 
-    let cb_lambda_params = async_cb_lambda_params(&f.returns);
+    let cb_lambda_params = async_cb_lambda_params(&f.ret);
     out.push_str(&format!(
         "            {delegate_name} callback = {cb_lambda_params} =>\n            {{\n"
     ));
@@ -1123,7 +1133,7 @@ fn render_async_wrapper_method(
     out.push_str("                        }\n");
     out.push_str("                    }\n");
 
-    render_async_set_result(out, &f.returns, "                    ");
+    render_async_set_result(out, &f.ret, "                    ");
 
     out.push_str("                }\n");
     out.push_str("                finally\n                {\n");
@@ -1177,7 +1187,7 @@ fn render_async_wrapper_method(
         out.push_str("            }\n");
     }
 
-    if f.returns.is_some() {
+    if f.ret.is_some() {
         out.push_str("            return await tcs.Task;\n");
     } else {
         out.push_str("            await tcs.Task;\n");
@@ -1219,7 +1229,7 @@ fn render_async_set_result(out: &mut String, ret: &Option<TypeRef>, indent: &str
     }
 }
 
-fn render_marshal_setup(out: &mut String, p: &Param, indent: &str) {
+fn render_marshal_setup(out: &mut String, p: &ParamBinding, indent: &str) {
     let name = safe_cs_name(&p.name);
     match &p.ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
@@ -1284,7 +1294,7 @@ fn render_marshal_setup(out: &mut String, p: &Param, indent: &str) {
     }
 }
 
-fn render_marshal_cleanup(out: &mut String, p: &Param, indent: &str) {
+fn render_marshal_cleanup(out: &mut String, p: &ParamBinding, indent: &str) {
     let name = safe_cs_name(&p.name);
     match &p.ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
@@ -1319,16 +1329,16 @@ fn render_marshal_cleanup(out: &mut String, p: &Param, indent: &str) {
     }
 }
 
-fn render_pinvoke_call_and_return(out: &mut String, module_path: &str, f: &Function, indent: &str) {
-    let c_sym = c_symbol_name(module_path, &f.name);
+fn render_pinvoke_call_and_return(out: &mut String, f: &FnBinding, indent: &str) {
+    let c_sym = &f.c_base;
     let call_args = build_call_args(&f.params);
 
-    if let Some(TypeRef::Map(k, v)) = &f.returns {
-        render_map_return_call(out, &c_sym, &call_args, k, v, indent);
+    if let Some(TypeRef::Map(k, v)) = &f.ret {
+        render_map_return_call(out, c_sym, &call_args, k, v, indent);
         return;
     }
 
-    let has_out_len = f.returns.as_ref().is_some_and(|r| {
+    let has_out_len = f.ret.as_ref().is_some_and(|r| {
         matches!(
             r,
             TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) | TypeRef::Iterator(_)
@@ -1339,7 +1349,7 @@ fn render_pinvoke_call_and_return(out: &mut String, module_path: &str, f: &Funct
         )
     });
 
-    if f.returns.is_some() {
+    if f.ret.is_some() {
         let args_part = if call_args.is_empty() {
             String::new()
         } else {
@@ -1362,12 +1372,12 @@ fn render_pinvoke_call_and_return(out: &mut String, module_path: &str, f: &Funct
 
     out.push_str(&format!("{indent}WeaveffiError.Check(err);\n"));
 
-    if let Some(ret_ty) = &f.returns {
+    if let Some(ret_ty) = &f.ret {
         render_return_conversion(out, ret_ty, indent);
     }
 }
 
-fn build_call_args(params: &[Param]) -> String {
+fn build_call_args(params: &[ParamBinding]) -> String {
     params
         .iter()
         .flat_map(|p| {
@@ -1959,7 +1969,14 @@ mod tests {
             since: None,
         }])]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(cs.contains("namespace WeaveFFI"), "missing namespace: {cs}");
         assert!(cs.contains("DllImport"), "missing DllImport: {cs}");
         assert!(cs.contains("weaveffi_math_add"), "missing C symbol: {cs}");
@@ -1990,7 +2007,14 @@ mod tests {
             since: None,
         }])]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("public static void Reset()"),
             "missing void wrapper: {cs}"
@@ -2019,7 +2043,14 @@ mod tests {
             since: None,
         }])]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("flag ? 1 : 0"),
             "missing bool-to-int conversion: {cs}"
@@ -2077,7 +2108,14 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(cs.contains("public enum Color"), "missing enum: {cs}");
         assert!(cs.contains("Red = 0"), "missing Red: {cs}");
         assert!(cs.contains("Green = 1"), "missing Green: {cs}");
@@ -2124,7 +2162,14 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("public class Contact : IDisposable"),
             "missing IDisposable: {cs}"
@@ -2186,7 +2231,14 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("public string FirstName"),
             "missing FirstName: {cs}"
@@ -2243,7 +2295,14 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("public void Dispose()"),
             "missing Dispose: {cs}"
@@ -2290,7 +2349,14 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("weaveffi_contacts_Contact_create("),
             "missing create P/Invoke: {cs}"
@@ -2340,7 +2406,14 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("Marshal.PtrToStringUTF8(result)"),
             "missing PtrToStringUTF8: {cs}"
@@ -2381,7 +2454,14 @@ mod tests {
             since: None,
         }])]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("internal static class NativeMethods"),
             "missing NativeMethods: {cs}"
@@ -2422,7 +2502,14 @@ mod tests {
             since: None,
         }])]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("ref WeaveffiError err"),
             "missing error param in P/Invoke: {cs}"
@@ -2432,7 +2519,14 @@ mod tests {
     #[test]
     fn header_has_using_statements() {
         let api = make_api(vec![]);
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(cs.contains("using System;"), "missing System: {cs}");
         assert!(
             cs.contains("using System.Runtime.InteropServices;"),
@@ -2492,7 +2586,14 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("new Contact(result)"),
             "missing struct wrapping: {cs}"
@@ -2525,7 +2626,14 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("public static int[] GetIds()"),
             "missing list return method: {cs}"
@@ -2559,7 +2667,14 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("public static Dictionary<int, double> GetScores()"),
             "missing map return: {cs}"
@@ -2595,7 +2710,14 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("public string? Email"),
             "missing optional string getter: {cs}"
@@ -2645,7 +2767,14 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("StringToCoTaskMemUTF8(name)"),
             "missing name marshal: {cs}"
@@ -2944,7 +3073,14 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
 
         assert!(
             cs.contains("public class Person : IDisposable"),
@@ -3061,7 +3197,14 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
 
         assert!(
             cs.contains("<summary>Task priority levels</summary>"),
@@ -3154,7 +3297,14 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
 
         assert!(
             cs.contains("public static long? Update(string? label, int? count)"),
@@ -3250,7 +3400,14 @@ mod tests {
             modules: vec![],
         }]);
 
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
 
         assert!(
             cs.contains("public static int[] GetIds()"),
@@ -3605,7 +3762,14 @@ mod tests {
     #[test]
     fn dotnet_has_memory_helpers() {
         let api = make_api(vec![simple_module(vec![])]);
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("internal static class WeaveFFIHelpers"),
             "missing WeaveFFIHelpers class: {cs}"
@@ -3809,7 +3973,14 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("Contact?[]?"),
             "should contain deeply nested optional type: {cs}"
@@ -3845,7 +4016,14 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("Dictionary<string, int[]>"),
             "should contain map of lists type: {cs}"
@@ -3911,7 +4089,14 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("Dictionary<Color, Contact>"),
             "should contain enum-keyed map type: {cs}"
@@ -3958,7 +4143,14 @@ mod tests {
             }],
             generators: None,
         };
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("Contact contact"),
             "TypedHandle should use class type not ulong: {cs}"
@@ -4001,7 +4193,14 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("StringToCoTaskMemUTF8"),
             "string param should be marshalled to unmanaged memory: {cs}"
@@ -4074,7 +4273,14 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("result == IntPtr.Zero ? null : new Contact(result)"),
             "optional struct return should null-check before wrap: {cs}"
@@ -4107,7 +4313,14 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("async Task<"),
             "missing async Task< in signature: {cs}"
@@ -4140,7 +4353,14 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("TaskCompletionSource"),
             "missing TaskCompletionSource: {cs}"
@@ -4178,7 +4398,14 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("GCHandle.Alloc(callback, GCHandleType.Normal)"),
             "missing GCHandle.Alloc(..., Normal): {cs}"
@@ -4232,7 +4459,14 @@ mod tests {
                 modules: vec![],
             }],
         }]);
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("public static class Parent"),
             "top-level wrapper class missing: {cs}"
@@ -4276,7 +4510,14 @@ mod tests {
             deprecated: Some("Use AddV2 instead".into()),
             since: Some("0.1.0".into()),
         }])]);
-        let cs = render_csharp(&api, "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("[Obsolete(\"Use AddV2 instead\")]"),
             "missing Obsolete attribute: {cs}"
@@ -4330,7 +4571,14 @@ mod tests {
 
     #[test]
     fn dotnet_emits_doc_on_function() {
-        let cs = render_csharp(&doc_api(), "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &doc_api(),
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("/// <summary>Performs a thing.</summary>"),
             "{cs}"
@@ -4339,7 +4587,14 @@ mod tests {
 
     #[test]
     fn dotnet_emits_doc_on_struct() {
-        let cs = render_csharp(&doc_api(), "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &doc_api(),
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("/// <summary>An item we track.</summary>"),
             "{cs}"
@@ -4348,23 +4603,95 @@ mod tests {
 
     #[test]
     fn dotnet_emits_doc_on_enum_variant() {
-        let cs = render_csharp(&doc_api(), "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &doc_api(),
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(cs.contains("/// <summary>Kind of item.</summary>"), "{cs}");
         assert!(cs.contains("/// <summary>A small one</summary>"), "{cs}");
     }
 
     #[test]
     fn dotnet_emits_doc_on_field() {
-        let cs = render_csharp(&doc_api(), "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &doc_api(),
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(cs.contains("/// <summary>Stable id</summary>"), "{cs}");
     }
 
     #[test]
     fn dotnet_emits_doc_on_param() {
-        let cs = render_csharp(&doc_api(), "WeaveFFI", true, "weaveffi.yml", "WeaveFFI.cs");
+        let cs = render_csharp(
+            &doc_api(),
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
         assert!(
             cs.contains("/// <param name=\"x\">the input value</param>"),
             "{cs}"
+        );
+    }
+
+    #[test]
+    fn dotnet_custom_prefix_threads_to_user_symbols() {
+        let api = make_api(vec![simple_module(vec![Function {
+            name: "add".into(),
+            params: vec![
+                Param {
+                    name: "a".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: None,
+                },
+                Param {
+                    name: "b".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: None,
+                },
+            ],
+            returns: Some(TypeRef::I32),
+            doc: None,
+            r#async: false,
+            cancellable: false,
+            deprecated: None,
+            since: None,
+        }])]);
+
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "myffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
+
+        // User symbols pick up the configured ABI prefix...
+        assert!(
+            cs.contains("myffi_math_add"),
+            "user symbol must honor the custom prefix: {cs}"
+        );
+        assert!(
+            !cs.contains("weaveffi_math_add"),
+            "user symbol must not retain the default prefix: {cs}"
+        );
+        // ...while runtime ABI helpers stay literally `weaveffi_*`.
+        assert!(
+            cs.contains("weaveffi_free_string"),
+            "runtime ABI helper must stay literal: {cs}"
         );
     }
 }
