@@ -9,13 +9,14 @@ use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use weaveffi_core::codegen::common::{
-    emit_doc as common_emit_doc, pascal_case, walk_modules, walk_modules_with_path, DocCommentStyle,
+    emit_doc as common_emit_doc, pascal_case, walk_modules, DocCommentStyle,
 };
 use weaveffi_core::codegen::Generator;
+use weaveffi_core::model::{BindingModel, EnumBinding, FnBinding, ParamBinding, StructBinding};
 use weaveffi_core::utils::{
-    c_symbol_name, local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
+    local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
 };
-use weaveffi_ir::ir::{Api, EnumDef, Function, StructDef, TypeRef};
+use weaveffi_ir::ir::{Api, TypeRef};
 
 /// Per-target configuration for [`AndroidGenerator`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -27,6 +28,10 @@ pub struct AndroidConfig {
     /// When `true`, strip the IR module name prefix from emitted
     /// Kotlin function names.
     pub strip_module_prefix: bool,
+    /// C ABI symbol prefix (default `"weaveffi"`). Normally set once globally
+    /// via `[global] c_prefix`; honored so the JNI shim calls the same
+    /// exported symbols the producer emits.
+    pub prefix: Option<String>,
     /// Basename of the IDL the CLI was invoked with.
     #[serde(skip)]
     pub input_basename: Option<String>,
@@ -35,6 +40,10 @@ pub struct AndroidConfig {
 impl AndroidConfig {
     pub fn package(&self) -> &str {
         self.package.as_deref().unwrap_or("com.weaveffi")
+    }
+
+    pub fn prefix(&self) -> &str {
+        self.prefix.as_deref().unwrap_or("weaveffi")
     }
 
     pub fn input_basename(&self) -> &str {
@@ -52,6 +61,7 @@ impl AndroidGenerator {
         package: &str,
         strip_module_prefix: bool,
         input_basename: &str,
+        c_prefix: &str,
     ) -> Result<()> {
         let dir = out_dir.join("android");
         std::fs::create_dir_all(&dir)?;
@@ -86,7 +96,7 @@ impl AndroidGenerator {
                 render_trailer(CommentStyle::Hash, "CMakeLists.txt"),
             ),
         )?;
-        let jni_c = render_jni_c(api, package, strip_module_prefix, input_basename);
+        let jni_c = render_jni_c(api, package, strip_module_prefix, input_basename, c_prefix);
         std::fs::write(jni_dir.join("weaveffi_jni.c"), jni_c)?;
 
         Ok(())
@@ -107,6 +117,7 @@ impl Generator for AndroidGenerator {
             config.package(),
             config.strip_module_prefix,
             config.input_basename(),
+            config.prefix(),
         )
     }
 
@@ -139,12 +150,7 @@ fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
 /// Emits a KDoc block for a function: function doc plus `@param name desc`
 /// lines for each documented parameter. Skips entirely when there is nothing
 /// to document.
-fn emit_fn_doc(
-    out: &mut String,
-    doc: &Option<String>,
-    params: &[weaveffi_ir::ir::Param],
-    indent: &str,
-) {
+fn emit_fn_doc(out: &mut String, doc: &Option<String>, params: &[ParamBinding], indent: &str) {
     let has_param_docs = params.iter().any(|p| p.doc.is_some());
     let trimmed_doc = doc.as_ref().map(|d| d.trim()).filter(|d| !d.is_empty());
     if trimmed_doc.is_none() && !has_param_docs {
@@ -369,11 +375,11 @@ fn kotlin_public_type(t: &TypeRef) -> String {
     }
 }
 
-fn has_enum_involvement(f: &Function) -> bool {
+fn has_enum_involvement(f: &FnBinding) -> bool {
     f.params
         .iter()
         .any(|p| matches!(&p.ty, TypeRef::Enum(_) | TypeRef::TypedHandle(_)))
-        || matches!(&f.returns, Some(TypeRef::Enum(_)))
+        || matches!(&f.ret, Some(TypeRef::Enum(_)))
 }
 
 fn render_kotlin(
@@ -382,10 +388,14 @@ fn render_kotlin(
     strip_module_prefix: bool,
     input_basename: &str,
 ) -> String {
-    let all_mods = walk_modules(&api.modules).collect::<Vec<_>>();
-    let has_async = all_mods
+    // The Kotlin layer emits no C symbols (it relies on JNI naming + the
+    // wrapper conventions), so the model prefix is irrelevant here; build with
+    // the default so we can consume the shared binding shapes uniformly.
+    let model = BindingModel::build(api, "weaveffi");
+    let has_async = model
+        .modules
         .iter()
-        .any(|m| m.functions.iter().any(|f| f.r#async));
+        .any(|m| m.functions.iter().any(|f| f.is_async));
     let mut kotlin = render_prelude(CommentStyle::DoubleSlash, input_basename);
     kotlin.push_str(&format!("package {package}\n\n"));
     if has_async {
@@ -394,9 +404,9 @@ fn render_kotlin(
         kotlin.push_str("import kotlin.coroutines.resumeWithException\n\n");
     }
     kotlin.push_str("class WeaveFFI {\n    companion object {\n        init { System.loadLibrary(\"weaveffi\") }\n\n");
-    for (m, path) in walk_modules_with_path(&api.modules) {
+    for m in &model.modules {
         for f in &m.functions {
-            let func_name = wrapper_name(&path, &f.name, strip_module_prefix);
+            let func_name = wrapper_name(&m.path, &f.name, strip_module_prefix);
             emit_fn_doc(&mut kotlin, &f.doc, &f.params, "        ");
             if let Some(msg) = &f.deprecated {
                 let _ = writeln!(
@@ -405,7 +415,7 @@ fn render_kotlin(
                     msg.replace('"', "\\\"")
                 );
             }
-            if f.r#async {
+            if f.is_async {
                 render_kotlin_async_fun(&mut kotlin, f, &func_name);
             } else if has_enum_involvement(f) {
                 let native_params: Vec<String> = f
@@ -414,7 +424,7 @@ fn render_kotlin(
                     .map(|p| format!("{}: {}", p.name, kotlin_jni_type(&p.ty)))
                     .collect();
                 let native_ret = f
-                    .returns
+                    .ret
                     .as_ref()
                     .map(kotlin_jni_type)
                     .unwrap_or_else(|| "Unit".to_string());
@@ -432,7 +442,7 @@ fn render_kotlin(
                     .map(|p| format!("{}: {}", p.name, kotlin_public_type(&p.ty)))
                     .collect();
                 let public_ret = f
-                    .returns
+                    .ret
                     .as_ref()
                     .map(kotlin_public_type)
                     .unwrap_or_else(|| "Unit".to_string());
@@ -451,7 +461,7 @@ fn render_kotlin(
                     .collect();
                 let call = format!("{}Jni({})", func_name, call_args.join(", "));
 
-                if let Some(TypeRef::Enum(name)) = &f.returns {
+                if let Some(TypeRef::Enum(name)) = &f.ret {
                     let _ = writeln!(
                         kotlin,
                         "        @JvmStatic fun {}({}): {} = {}.fromValue({})",
@@ -461,7 +471,7 @@ fn render_kotlin(
                         name,
                         call
                     );
-                } else if f.returns.is_some() {
+                } else if f.ret.is_some() {
                     let _ = writeln!(
                         kotlin,
                         "        @JvmStatic fun {}({}): {} = {}",
@@ -486,7 +496,7 @@ fn render_kotlin(
                     .map(|p| format!("{}: {}", p.name, kotlin_type(&p.ty)))
                     .collect();
                 let ret = f
-                    .returns
+                    .ret
                     .as_ref()
                     .map(kotlin_type)
                     .unwrap_or_else(|| "Unit".to_string());
@@ -501,13 +511,13 @@ fn render_kotlin(
         }
     }
     kotlin.push_str("    }\n}\n");
-    for m in walk_modules(&api.modules) {
+    for m in &model.modules {
         for e in &m.enums {
             render_kotlin_enum(&mut kotlin, e);
         }
         for s in &m.structs {
             render_kotlin_struct(&mut kotlin, s);
-            if s.builder {
+            if s.builder.is_some() {
                 render_kotlin_builder(&mut kotlin, s);
             }
         }
@@ -525,7 +535,7 @@ fn render_kotlin(
     kotlin
 }
 
-fn render_kotlin_async_fun(out: &mut String, f: &Function, func_name: &str) {
+fn render_kotlin_async_fun(out: &mut String, f: &FnBinding, func_name: &str) {
     let mut native_param_chain: Vec<String> = f
         .params
         .iter()
@@ -549,7 +559,7 @@ fn render_kotlin_async_fun(out: &mut String, f: &Function, func_name: &str) {
         .map(|p| format!("{}: {}", p.name, kotlin_type(&p.ty)))
         .collect();
     let ret = f
-        .returns
+        .ret
         .as_ref()
         .map(kotlin_type)
         .unwrap_or_else(|| "Unit".to_string());
@@ -578,7 +588,7 @@ fn render_kotlin_async_fun(out: &mut String, f: &Function, func_name: &str) {
     let _ = writeln!(out, "        }}");
 }
 
-fn render_kotlin_enum(out: &mut String, e: &EnumDef) {
+fn render_kotlin_enum(out: &mut String, e: &EnumBinding) {
     let _ = writeln!(out);
     emit_doc(out, &e.doc, "");
     let _ = writeln!(out, "enum class {}(val value: Int) {{", e.name);
@@ -632,11 +642,14 @@ fn render_jni_c(
     package: &str,
     strip_module_prefix: bool,
     input_basename: &str,
+    c_prefix: &str,
 ) -> String {
     let jni_prefix = package.replace('.', "_");
     let jni_pkg_path = package.replace('.', "/");
+    let model = BindingModel::build(api, c_prefix);
     let mut jni_c = render_prelude(CommentStyle::DoubleSlash, input_basename);
-    jni_c.push_str("#include <jni.h>\n#include <stdbool.h>\n#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n#include \"weaveffi.h\"\n\n");
+    jni_c.push_str("#include <jni.h>\n#include <stdbool.h>\n#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n");
+    let _ = writeln!(jni_c, "#include \"{c_prefix}.h\"\n");
 
     let all_mods = walk_modules(&api.modules).collect::<Vec<_>>();
     let error_codes: Vec<_> = all_mods
@@ -684,19 +697,26 @@ fn render_jni_c(
         jni_c.push_str("} weaveffi_jni_async_ctx;\n\n");
     }
 
-    for (m, path) in walk_modules_with_path(&api.modules) {
+    for m in &model.modules {
         for f in &m.functions {
-            if f.r#async {
-                let func_name = wrapper_name(&path, &f.name, strip_module_prefix);
-                render_jni_async_function(&mut jni_c, &path, f, &func_name, &jni_prefix);
+            if f.is_async {
+                let func_name = wrapper_name(&m.path, &f.name, strip_module_prefix);
+                render_jni_async_function(
+                    &mut jni_c,
+                    &m.path,
+                    f,
+                    &func_name,
+                    &jni_prefix,
+                    c_prefix,
+                );
                 continue;
             }
-            let jret = jni_ret_type(f.returns.as_ref());
+            let jret = jni_ret_type(f.ret.as_ref());
             let mut jparams: Vec<String> = vec!["JNIEnv* env".into(), "jclass clazz".into()];
             for p in &f.params {
                 jparams.push(format!("{} {}", jni_param_type(&p.ty), p.name));
             }
-            let func_name = wrapper_name(&path, &f.name, strip_module_prefix);
+            let func_name = wrapper_name(&m.path, &f.name, strip_module_prefix);
             let jni_name = if has_enum_involvement(f) {
                 format!("{}Jni", func_name)
             } else {
@@ -716,29 +736,30 @@ fn render_jni_c(
                 write_param_acquire(&mut jni_c, &p.name, &p.ty);
             }
 
-            let c_sym = c_symbol_name(&path, &f.name);
+            let c_sym = &f.c_base;
             let mut call_args: Vec<String> = Vec::new();
             for p in &f.params {
-                build_c_call_args(&mut call_args, &p.name, &p.ty, &path);
+                build_c_call_args(&mut call_args, &p.name, &p.ty, &m.path, c_prefix);
             }
 
             let needs_out_len = matches!(
-                f.returns,
+                f.ret,
                 Some(TypeRef::Bytes | TypeRef::BorrowedBytes) | Some(TypeRef::List(_))
             );
             if needs_out_len {
                 let _ = writeln!(jni_c, "    size_t out_len = 0;");
             }
 
-            if let Some(ret_type) = f.returns.as_ref() {
+            if let Some(ret_type) = f.ret.as_ref() {
                 write_return_handling(
                     &mut jni_c,
                     ret_type,
-                    &c_sym,
+                    c_sym,
                     &call_args,
-                    f.returns.as_ref(),
+                    f.ret.as_ref(),
                     &f.params,
-                    &path,
+                    &m.path,
+                    c_prefix,
                 );
             } else {
                 let args_str = call_args.join(", ");
@@ -748,7 +769,7 @@ fn render_jni_c(
                     c_sym,
                     join_call_args(&args_str, "&err")
                 );
-                write_error_check(&mut jni_c, f.returns.as_ref());
+                write_error_check(&mut jni_c, f.ret.as_ref());
                 release_jni_resources(&mut jni_c, &f.params);
                 let _ = writeln!(jni_c, "    return;");
             }
@@ -756,9 +777,9 @@ fn render_jni_c(
             let _ = writeln!(jni_c, "}}\n");
         }
     }
-    for (m, path) in walk_modules_with_path(&api.modules) {
+    for m in &model.modules {
         for s in &m.structs {
-            render_jni_struct(&mut jni_c, &path, s, &jni_prefix);
+            render_jni_struct(&mut jni_c, &m.path, s, &jni_prefix, c_prefix);
         }
     }
     jni_c.push('\n');
@@ -827,13 +848,14 @@ fn write_jni_box_result(out: &mut String, ret: Option<&TypeRef>) {
 fn render_jni_async_function(
     out: &mut String,
     module_name: &str,
-    f: &Function,
+    f: &FnBinding,
     func_name: &str,
     jni_prefix: &str,
+    c_prefix: &str,
 ) {
-    let c_sym = c_symbol_name(module_name, &f.name);
+    let c_sym = &f.c_base;
     let cb_name = format!("{c_sym}_jni_cb");
-    let cb_result_params = async_cb_result_params(f.returns.as_ref());
+    let cb_result_params = async_cb_result_params(f.ret.as_ref());
 
     let _ = writeln!(
         out,
@@ -849,7 +871,7 @@ fn render_jni_async_function(
     out.push_str("        jmethodID mid = (*env)->GetMethodID(env, cls, \"onError\", \"(Ljava/lang/String;)V\");\n");
     out.push_str("        (*env)->CallVoidMethod(env, ctx->callback, mid, jmsg);\n");
     out.push_str("    } else {\n");
-    write_jni_box_result(out, f.returns.as_ref());
+    write_jni_box_result(out, f.ret.as_ref());
     out.push_str("    }\n");
     out.push_str("    (*env)->DeleteGlobalRef(env, ctx->callback);\n");
     out.push_str("    free(ctx);\n");
@@ -883,7 +905,7 @@ fn render_jni_async_function(
 
     let mut call_args: Vec<String> = Vec::new();
     for p in &f.params {
-        build_c_call_args(&mut call_args, &p.name, &p.ty, module_name);
+        build_c_call_args(&mut call_args, &p.name, &p.ty, module_name, c_prefix);
     }
     if f.cancellable {
         call_args.push("(weaveffi_cancel_token*)(intptr_t)cancelToken".to_string());
@@ -1396,7 +1418,13 @@ fn write_map_elem_extract(
     }
 }
 
-fn build_c_call_args(args: &mut Vec<String>, name: &str, ty: &TypeRef, module: &str) {
+fn build_c_call_args(
+    args: &mut Vec<String>,
+    name: &str,
+    ty: &TypeRef,
+    module: &str,
+    c_prefix: &str,
+) {
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             args.push(format!("{n}_chars", n = name));
@@ -1414,7 +1442,7 @@ fn build_c_call_args(args: &mut Vec<String>, name: &str, ty: &TypeRef, module: &
             args.push(format!("(weaveffi_handle_t){}", name))
         }
         TypeRef::Struct(sname) => {
-            let c_struct = weaveffi_core::utils::c_abi_struct_name(sname, module, "weaveffi");
+            let c_struct = weaveffi_core::utils::c_abi_struct_name(sname, module, c_prefix);
             args.push(format!("(const {}*)(intptr_t){}", c_struct, name));
         }
         TypeRef::Enum(_) => args.push(format!("(int32_t){}", name)),
@@ -1494,8 +1522,9 @@ fn write_return_handling(
     c_sym: &str,
     call_args: &[String],
     returns: Option<&TypeRef>,
-    params: &[weaveffi_ir::ir::Param],
+    params: &[ParamBinding],
     module: &str,
+    c_prefix: &str,
 ) {
     let args_str = call_args.join(", ");
     let call_with_err = join_call_args(&args_str, "&err");
@@ -1535,7 +1564,7 @@ fn write_return_handling(
             let _ = writeln!(jni_c, "    return rv ? JNI_TRUE : JNI_FALSE;");
         }
         TypeRef::Struct(name) => {
-            let c_ty = weaveffi_core::utils::c_abi_struct_name(name, module, "weaveffi");
+            let c_ty = weaveffi_core::utils::c_abi_struct_name(name, module, c_prefix);
             let _ = writeln!(jni_c, "    {}* rv = {}({});", c_ty, c_sym, call_with_err);
             write_error_check(jni_c, returns);
             release_jni_resources(jni_c, params);
@@ -1585,7 +1614,7 @@ fn write_optional_return(
     c_sym: &str,
     args_str: &str,
     returns: Option<&TypeRef>,
-    params: &[weaveffi_ir::ir::Param],
+    params: &[ParamBinding],
     _module: &str,
 ) {
     let call = join_call_args(args_str, "&err");
@@ -1694,7 +1723,7 @@ fn write_list_return(
     c_sym: &str,
     args_str: &str,
     returns: Option<&TypeRef>,
-    params: &[weaveffi_ir::ir::Param],
+    params: &[ParamBinding],
 ) {
     let call = join_call_args(args_str, "&out_len, &err");
     match inner {
@@ -1766,7 +1795,7 @@ fn write_map_return(
     c_sym: &str,
     args_str: &str,
     returns: Option<&TypeRef>,
-    params: &[weaveffi_ir::ir::Param],
+    params: &[ParamBinding],
 ) {
     let key_c = map_elem_c_type(key);
     let val_c = map_elem_c_type(val);
@@ -1878,7 +1907,7 @@ fn write_error_check(out: &mut String, ret_type: Option<&TypeRef>) {
     let _ = writeln!(out, "    }}");
 }
 
-fn release_jni_resources(out: &mut String, params: &[weaveffi_ir::ir::Param]) {
+fn release_jni_resources(out: &mut String, params: &[ParamBinding]) {
     for p in params {
         match &p.ty {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
@@ -2016,7 +2045,7 @@ fn kotlin_getter_type(t: &TypeRef) -> String {
     }
 }
 
-fn render_kotlin_struct(out: &mut String, s: &StructDef) {
+fn render_kotlin_struct(out: &mut String, s: &StructBinding) {
     let _ = writeln!(out);
     emit_doc(out, &s.doc, "");
     let _ = writeln!(
@@ -2102,8 +2131,8 @@ fn render_kotlin_struct(out: &mut String, s: &StructDef) {
     let _ = writeln!(out, "}}");
 }
 
-fn render_kotlin_builder(out: &mut String, s: &StructDef) {
-    if !s.builder {
+fn render_kotlin_builder(out: &mut String, s: &StructBinding) {
+    if s.builder.is_none() {
         return;
     }
     let _ = writeln!(out);
@@ -2146,8 +2175,17 @@ fn render_kotlin_builder(out: &mut String, s: &StructDef) {
     let _ = writeln!(out, "}}");
 }
 
-fn render_jni_struct(out: &mut String, module_name: &str, s: &StructDef, jni_prefix: &str) {
-    let prefix = format!("weaveffi_{}_{}", module_name, s.name);
+fn render_jni_struct(
+    out: &mut String,
+    module_name: &str,
+    s: &StructBinding,
+    jni_prefix: &str,
+    c_prefix: &str,
+) {
+    // The opaque tag is precomputed in the shared model. `module_name`/`c_prefix`
+    // remain in use below for the by-name references to *other* struct types
+    // during field/parameter marshalling.
+    let prefix = &s.c_tag;
 
     // nativeCreate
     {
@@ -2170,7 +2208,7 @@ fn render_jni_struct(out: &mut String, module_name: &str, s: &StructDef, jni_pre
 
         let mut call_args: Vec<String> = Vec::new();
         for f in &s.fields {
-            build_c_call_args(&mut call_args, &f.name, &f.ty, module_name);
+            build_c_call_args(&mut call_args, &f.name, &f.ty, module_name, c_prefix);
         }
 
         let args_str = call_args.join(", ");
@@ -2201,8 +2239,8 @@ fn render_jni_struct(out: &mut String, module_name: &str, s: &StructDef, jni_pre
         );
         let _ = writeln!(
             out,
-            "    {}_destroy(({}*)(intptr_t)handle);",
-            prefix, prefix
+            "    {}(({}*)(intptr_t)handle);",
+            s.destroy_symbol, prefix
         );
         let _ = writeln!(out, "}}\n");
     }
@@ -2211,7 +2249,7 @@ fn render_jni_struct(out: &mut String, module_name: &str, s: &StructDef, jni_pre
     for f in &s.fields {
         let pascal = pascal_case(&f.name);
         let jret = jni_ret_type(Some(&f.ty));
-        let getter_c = format!("{}_get_{}", prefix, f.name);
+        let getter_c = &f.getter_symbol;
 
         let _ = writeln!(
             out,
@@ -2263,8 +2301,7 @@ fn render_jni_struct(out: &mut String, module_name: &str, s: &StructDef, jni_pre
                 let _ = writeln!(out, "    return rv ? JNI_TRUE : JNI_FALSE;");
             }
             TypeRef::Struct(name) => {
-                let c_struct =
-                    weaveffi_core::utils::c_abi_struct_name(name, module_name, "weaveffi");
+                let c_struct = weaveffi_core::utils::c_abi_struct_name(name, module_name, c_prefix);
                 let _ = writeln!(
                     out,
                     "    const {c_struct}* rv = {getter_c}((const {prefix}*)(intptr_t)handle);",
@@ -2275,10 +2312,10 @@ fn render_jni_struct(out: &mut String, module_name: &str, s: &StructDef, jni_pre
                 let _ = writeln!(out, "    return (jlong)(intptr_t)rv;");
             }
             TypeRef::Optional(inner) => {
-                write_struct_optional_getter(out, inner, &getter_c, &prefix);
+                write_struct_optional_getter(out, inner, getter_c, prefix);
             }
             TypeRef::List(inner) => {
-                write_struct_list_getter(out, inner, &getter_c, &prefix);
+                write_struct_list_getter(out, inner, getter_c, prefix);
             }
             other => {
                 let c_ty = c_type_for_return(other);
@@ -2685,7 +2722,7 @@ mod tests {
     #[test]
     fn jni_struct_native_create() {
         let api = make_struct_api();
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
             jni.contains("Java_com_weaveffi_Contact_nativeCreate"),
             "missing JNI nativeCreate: {jni}"
@@ -2699,7 +2736,7 @@ mod tests {
     #[test]
     fn jni_struct_native_destroy() {
         let api = make_struct_api();
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
             jni.contains("Java_com_weaveffi_Contact_nativeDestroy"),
             "missing JNI nativeDestroy: {jni}"
@@ -2713,7 +2750,7 @@ mod tests {
     #[test]
     fn jni_struct_native_getters() {
         let api = make_struct_api();
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
             jni.contains("Java_com_weaveffi_Contact_nativeGetName"),
             "missing JNI nativeGetName: {jni}"
@@ -2735,7 +2772,7 @@ mod tests {
     #[test]
     fn jni_struct_string_getter_frees() {
         let api = make_struct_api();
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
             jni.contains("weaveffi_free_string(rv)"),
             "missing free_string in getter: {jni}"
@@ -2745,7 +2782,7 @@ mod tests {
     #[test]
     fn jni_struct_create_handles_string_param() {
         let api = make_struct_api();
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
             jni.contains("GetStringUTFChars(env, name, NULL)"),
             "missing string acquisition in create: {jni}"
@@ -2759,7 +2796,7 @@ mod tests {
     #[test]
     fn jni_struct_create_error_check() {
         let api = make_struct_api();
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         let create_section: &str = jni
             .split("Java_com_weaveffi_Contact_nativeCreate")
             .nth(1)
@@ -2799,7 +2836,7 @@ mod tests {
             "missing bytes property: {kt}"
         );
 
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
             jni.contains("weaveffi_storage_Blob_get_data("),
             "missing bytes getter C call: {jni}"
@@ -2839,7 +2876,7 @@ mod tests {
             "missing nested struct property: {kt}"
         );
 
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
             jni.contains("weaveffi_geo_Line_get_start("),
             "missing nested struct getter C call: {jni}"
@@ -2899,7 +2936,7 @@ mod tests {
             "missing struct param as Long: {kt}"
         );
 
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
             jni.contains("(const weaveffi_contacts_Contact*)(intptr_t)contact"),
             "missing struct param cast: {jni}"
@@ -2933,7 +2970,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
             jni.contains("weaveffi_contacts_Contact* rv"),
             "missing struct return type: {jni}"
@@ -3141,7 +3178,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
             jni.contains("jint color"),
             "missing jint param in JNI: {jni}"
@@ -3178,7 +3215,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
             jni.contains("JNIEXPORT jint JNICALL"),
             "missing jint return in JNI: {jni}"
@@ -3266,7 +3303,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(jni.contains("jobject id"), "missing jobject param: {jni}");
         assert!(
             jni.contains("java/lang/Integer"),
@@ -3306,7 +3343,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
             jni.contains("jstring query"),
             "missing jstring param: {jni}"
@@ -3339,7 +3376,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
             jni.contains("JNIEXPORT jobject JNICALL"),
             "missing jobject return: {jni}"
@@ -3380,7 +3417,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
             jni.contains("JNIEXPORT jstring JNICALL"),
             "missing jstring return: {jni}"
@@ -3476,7 +3513,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
             jni.contains("jintArray ids"),
             "missing jintArray param: {jni}"
@@ -3513,7 +3550,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
             jni.contains("JNIEXPORT jintArray JNICALL"),
             "missing jintArray return: {jni}"
@@ -3806,7 +3843,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
             jni.contains("jobject scores"),
             "missing jobject param: {jni}"
@@ -3897,7 +3934,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
             jni.contains("JNIEXPORT jobject JNICALL"),
             "missing jobject return: {jni}"
@@ -4044,7 +4081,7 @@ mod tests {
             "missing InvalidInput subclass: {kt}"
         );
 
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
             jni.contains("throw_weaveffi_error(env, &err)"),
             "missing throw_weaveffi_error call: {jni}"
@@ -4376,7 +4413,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
             jni.contains("GetStringUTFChars"),
             "input StringUtf8 should use GetStringUTFChars: {jni}"
@@ -4413,6 +4450,67 @@ mod tests {
 
         let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(kt.contains("class Contact"), "struct class Contact: {kt}");
+    }
+
+    #[test]
+    fn android_custom_prefix_threads_to_c_symbols() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "greet".into(),
+                params: vec![Param {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                    doc: None,
+                }],
+                returns: Some(TypeRef::StringUtf8),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "myffi");
+
+        // The JNI C shim must call the user C symbol with the custom C ABI
+        // prefix, and include the matching C header `myffi.h`.
+        assert!(
+            jni.contains("myffi_contacts_greet("),
+            "shim should call custom-prefixed user C symbol: {jni}"
+        );
+        assert!(
+            jni.contains("#include \"myffi.h\""),
+            "shim should include the custom C header: {jni}"
+        );
+        // The default-prefixed user C symbol must NOT leak into the shim.
+        assert!(
+            !jni.contains("weaveffi_contacts_greet"),
+            "default-prefixed user C symbol must not appear: {jni}"
+        );
+        // JNI export names are package-derived (not C-ABI-prefixed) and stay
+        // literal regardless of the C ABI prefix.
+        assert!(
+            jni.contains("Java_com_weaveffi_WeaveFFI_greet"),
+            "JNI export name must stay package-derived: {jni}"
+        );
+        // Runtime helpers keep the literal `weaveffi_` runtime prefix.
+        assert!(
+            jni.contains("weaveffi_error"),
+            "runtime weaveffi_error helper must remain literal: {jni}"
+        );
+        assert!(
+            jni.contains("weaveffi_free_string"),
+            "runtime weaveffi_free_string helper must remain literal: {jni}"
+        );
     }
 
     #[test]
@@ -4454,7 +4552,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
+        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
             jni.contains("if (rv == NULL)"),
             "optional struct return needs null check: {jni}"
@@ -4575,7 +4673,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let c = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml");
+        let c = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         let pin_count = c.matches("NewGlobalRef(env, callback)").count();
         let unpin_count = c.matches("DeleteGlobalRef(env, ctx->callback)").count();
         let malloc_count = c.matches("malloc(sizeof(weaveffi_jni_async_ctx))").count();

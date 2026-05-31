@@ -9,14 +9,17 @@ use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
 use weaveffi_core::abi::{self, CType};
 use weaveffi_core::codegen::common::{
-    emit_doc as common_emit_doc, is_c_pointer_type, pascal_case, walk_modules,
-    walk_modules_with_path, DocCommentStyle,
+    emit_doc as common_emit_doc, is_c_pointer_type, pascal_case, DocCommentStyle,
 };
 use weaveffi_core::codegen::Generator;
-use weaveffi_core::utils::{
-    c_symbol_name, local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
+use weaveffi_core::model::{
+    BindingModel, CallShape, EnumBinding, FieldBinding, FnBinding, ModuleBinding, ParamBinding,
+    StructBinding,
 };
-use weaveffi_ir::ir::{Api, EnumDef, Function, Module, StructDef, StructField, TypeRef};
+use weaveffi_core::utils::{
+    local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
+};
+use weaveffi_ir::ir::{Api, TypeRef};
 
 /// Per-target configuration for [`PythonGenerator`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -28,6 +31,10 @@ pub struct PythonConfig {
     /// When `true`, strip the IR module name prefix from emitted Python
     /// function names.
     pub strip_module_prefix: bool,
+    /// C ABI symbol prefix (default `"weaveffi"`). Normally set once globally
+    /// via `[global] c_prefix`; honored so the ctypes bindings call the same
+    /// exported symbols the producer emits.
+    pub prefix: Option<String>,
     /// Basename of the IDL the CLI was invoked with.
     #[serde(skip)]
     pub input_basename: Option<String>,
@@ -36,6 +43,10 @@ pub struct PythonConfig {
 impl PythonConfig {
     pub fn package_name(&self) -> &str {
         self.package_name.as_deref().unwrap_or("weaveffi")
+    }
+
+    pub fn prefix(&self) -> &str {
+        self.prefix.as_deref().unwrap_or("weaveffi")
     }
 
     pub fn input_basename(&self) -> &str {
@@ -52,6 +63,7 @@ impl PythonGenerator {
         out_dir: &Utf8Path,
         package_name: &str,
         strip_module_prefix: bool,
+        prefix: &str,
         input_basename: &str,
     ) -> Result<()> {
         let dir = out_dir.join("python");
@@ -68,7 +80,7 @@ impl PythonGenerator {
         )?;
         std::fs::write(
             pkg_dir.join("weaveffi.py"),
-            render_python_module(api, strip_module_prefix, input_basename),
+            render_python_module(api, strip_module_prefix, prefix, input_basename),
         )?;
         std::fs::write(
             pkg_dir.join("weaveffi.pyi"),
@@ -100,6 +112,7 @@ impl Generator for PythonGenerator {
             out_dir,
             config.package_name(),
             config.strip_module_prefix,
+            config.prefix(),
             config.input_basename(),
         )
     }
@@ -126,11 +139,6 @@ impl Generator for PythonGenerator {
 }
 
 // ── Type helpers ──
-
-fn iter_type_name(func_name: &str, module: &str) -> String {
-    let pascal = pascal_case(func_name);
-    format!("weaveffi_{module}_{pascal}Iterator")
-}
 
 fn py_ctypes_scalar(ty: &TypeRef) -> &'static str {
     match ty {
@@ -411,16 +419,15 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
     }
 }
 
-fn render_async_ffi_call_body(out: &mut String, module_name: &str, f: &Function) {
-    let c_sym = c_symbol_name(module_name, &f.name);
-    let c_async = format!("{c_sym}_async");
+fn render_async_ffi_call_body(out: &mut String, f: &FnBinding) {
+    let c_async = format!("{}_async", f.c_base);
     let ind = "    ";
 
     out.push_str(&format!("{ind}_fn = _lib.{c_async}\n"));
     out.push_str(&format!("{ind}_ev = threading.Event()\n"));
     out.push_str(&format!("{ind}_state = {{\"err\": None, \"val\": None}}\n"));
 
-    let trailing = py_async_cb_trailing_fields(&f.returns);
+    let trailing = py_async_cb_trailing_fields(&f.ret);
     let mut cb_param_list: Vec<String> = vec!["context".into(), "err".into()];
     cb_param_list.extend(trailing.iter().map(|(n, _)| n.clone()));
     let cb_params_joined = cb_param_list.join(", ");
@@ -441,7 +448,7 @@ fn render_async_ffi_call_body(out: &mut String, module_name: &str, f: &Function)
         "{ind}            _state[\"err\"] = WeaveffiError(_code, _msg)\n"
     ));
     out.push_str(&format!("{ind}        else:\n"));
-    append_async_success_handler(out, &f.returns, "                ");
+    append_async_success_handler(out, &f.ret, "                ");
     out.push_str(&format!("{ind}    finally:\n"));
     out.push_str(&format!("{ind}        _ev.set()\n"));
 
@@ -490,50 +497,49 @@ fn render_async_ffi_call_body(out: &mut String, module_name: &str, f: &Function)
     out.push_str(&format!("{ind}_ev.wait()\n"));
     out.push_str(&format!("{ind}if _state[\"err\"] is not None:\n"));
     out.push_str(&format!("{ind}    raise _state[\"err\"]\n"));
-    if f.returns.is_some() {
+    if f.ret.is_some() {
         out.push_str(&format!("{ind}return _state[\"val\"]\n"));
     }
 }
 
 // ── Rendering ──
 
-fn render_python_module(api: &Api, strip_module_prefix: bool, input_basename: &str) -> String {
+fn render_python_module(
+    api: &Api,
+    strip_module_prefix: bool,
+    prefix: &str,
+    input_basename: &str,
+) -> String {
+    let model = BindingModel::build(api, prefix);
     let mut out = render_prelude(CommentStyle::Hash, input_basename);
     render_preamble(&mut out);
-    let has_async = walk_modules(&api.modules).any(|m| m.functions.iter().any(|f| f.r#async));
+    let has_async = model.functions().any(|(_, f)| f.is_async);
     if has_async {
         out.push_str("\nimport asyncio\nimport threading\n");
     }
-    for m in &api.modules {
-        render_python_module_content(&mut out, m, &m.name, strip_module_prefix);
+    // The model is a flat, pre-order list of modules, each carrying its joined
+    // symbol path — the same traversal order the recursive walk produced.
+    for m in &model.modules {
+        render_python_module_content(&mut out, m, strip_module_prefix);
     }
     out.push('\n');
     out.push_str(&render_trailer(CommentStyle::Hash, "weaveffi.py"));
     out
 }
 
-fn render_python_module_content(
-    out: &mut String,
-    m: &Module,
-    module_path: &str,
-    strip_module_prefix: bool,
-) {
-    out.push_str(&format!("\n\n# === Module: {} ===", module_path));
+fn render_python_module_content(out: &mut String, m: &ModuleBinding, strip_module_prefix: bool) {
+    out.push_str(&format!("\n\n# === Module: {} ===", m.path));
     for e in &m.enums {
         render_enum(out, e);
     }
     for s in &m.structs {
-        render_struct(out, module_path, s);
-        if s.builder {
+        render_struct(out, s);
+        if s.builder.is_some() {
             render_builder(out, s);
         }
     }
     for f in &m.functions {
-        render_function(out, module_path, f, strip_module_prefix);
-    }
-    for sub in &m.modules {
-        let sub_path = format!("{module_path}_{}", sub.name);
-        render_python_module_content(out, sub, &sub_path, strip_module_prefix);
+        render_function(out, &m.path, f, strip_module_prefix);
     }
 }
 
@@ -581,11 +587,11 @@ fn emit_docstring(out: &mut String, doc: &Option<String>, indent: &str) {
 fn emit_fn_docstring(
     out: &mut String,
     doc: &Option<String>,
-    params: &[weaveffi_ir::ir::Param],
+    params: &[ParamBinding],
     indent: &str,
 ) {
     let trimmed_doc = doc.as_ref().map(|d| d.trim()).filter(|d| !d.is_empty());
-    let documented_params: Vec<&weaveffi_ir::ir::Param> = params
+    let documented_params: Vec<&ParamBinding> = params
         .iter()
         .filter(|p| {
             p.doc
@@ -730,7 +736,7 @@ def _bytes_to_string(ptr) -> Optional[str]:
     );
 }
 
-fn render_enum(out: &mut String, e: &EnumDef) {
+fn render_enum(out: &mut String, e: &EnumBinding) {
     out.push_str(&format!("\n\nclass {}(IntEnum):\n", e.name));
     emit_docstring(out, &e.doc, "    ");
     for v in &e.variants {
@@ -746,8 +752,8 @@ fn render_enum(out: &mut String, e: &EnumDef) {
     }
 }
 
-fn render_struct(out: &mut String, module_name: &str, s: &StructDef) {
-    let prefix = format!("weaveffi_{}_{}", module_name, s.name);
+fn render_struct(out: &mut String, s: &StructBinding) {
+    let destroy = &s.destroy_symbol;
 
     out.push_str(&format!("\n\nclass {}:\n", s.name));
     emit_docstring(out, &s.doc, "    ");
@@ -758,21 +764,19 @@ fn render_struct(out: &mut String, module_name: &str, s: &StructDef) {
     out.push_str("\n\n    def __del__(self) -> None:");
     out.push_str("\n        if self._ptr is not None:");
     out.push_str(&format!(
-        "\n            _lib.{prefix}_destroy.argtypes = [ctypes.c_void_p]"
+        "\n            _lib.{destroy}.argtypes = [ctypes.c_void_p]"
     ));
-    out.push_str(&format!(
-        "\n            _lib.{prefix}_destroy.restype = None"
-    ));
-    out.push_str(&format!("\n            _lib.{prefix}_destroy(self._ptr)"));
+    out.push_str(&format!("\n            _lib.{destroy}.restype = None"));
+    out.push_str(&format!("\n            _lib.{destroy}(self._ptr)"));
     out.push_str("\n            self._ptr = None");
 
     for field in &s.fields {
-        render_getter(out, &prefix, field);
+        render_getter(out, field);
     }
     out.push('\n');
 }
 
-fn render_builder(out: &mut String, s: &StructDef) {
+fn render_builder(out: &mut String, s: &StructBinding) {
     let builder_name = format!("{}Builder", s.name);
     out.push_str(&format!("\n\nclass {}:\n", builder_name));
     emit_docstring(out, &s.doc, "    ");
@@ -828,8 +832,8 @@ fn render_builder(out: &mut String, s: &StructDef) {
     out.push('\n');
 }
 
-fn render_getter(out: &mut String, prefix: &str, field: &StructField) {
-    let getter = format!("{prefix}_get_{}", field.name);
+fn render_getter(out: &mut String, field: &FieldBinding) {
+    let getter = &field.getter_symbol;
     let py_ty = py_type_hint(&field.ty);
     let ind = "        ";
 
@@ -870,7 +874,7 @@ fn render_getter(out: &mut String, prefix: &str, field: &StructField) {
     render_return_value(out, &field.ty, ind);
 }
 
-fn render_function(out: &mut String, module_name: &str, f: &Function, strip_module_prefix: bool) {
+fn render_function(out: &mut String, module_name: &str, f: &FnBinding, strip_module_prefix: bool) {
     let func_name = wrapper_name(module_name, &f.name, strip_module_prefix);
     let params_sig: Vec<String> = f
         .params
@@ -878,19 +882,19 @@ fn render_function(out: &mut String, module_name: &str, f: &Function, strip_modu
         .map(|p| format!("{}: {}", p.name, py_type_hint(&p.ty)))
         .collect();
     let ret_hint = f
-        .returns
+        .ret
         .as_ref()
         .map(py_type_hint)
         .unwrap_or_else(|| "None".to_string());
 
-    let def_name = if f.r#async {
+    let def_name = if f.is_async {
         format!("_{func_name}_sync")
     } else {
         func_name.clone()
     };
 
-    if let Some(TypeRef::Iterator(inner)) = &f.returns {
-        render_iterator_class(out, module_name, &f.name, inner);
+    if let (Some(TypeRef::Iterator(inner)), CallShape::Iterator(it)) = (&f.ret, &f.shape) {
+        render_iterator_class(out, &it.iter_tag, &f.name, inner);
     }
 
     out.push_str(&format!(
@@ -911,11 +915,10 @@ fn render_function(out: &mut String, module_name: &str, f: &Function, strip_modu
         ));
     }
 
-    if f.r#async {
-        render_async_ffi_call_body(out, module_name, f);
+    if f.is_async {
+        render_async_ffi_call_body(out, f);
     } else {
-        let c_sym = c_symbol_name(module_name, &f.name);
-        out.push_str(&format!("{ind}_fn = _lib.{c_sym}\n"));
+        out.push_str(&format!("{ind}_fn = _lib.{}\n", f.c_base));
 
         let mut argtypes: Vec<String> = Vec::new();
         for p in &f.params {
@@ -923,7 +926,7 @@ fn render_function(out: &mut String, module_name: &str, f: &Function, strip_modu
         }
         let mut out_ret_argtypes = Vec::new();
         let restype;
-        if let Some(ret_ty) = &f.returns {
+        if let Some(ret_ty) = &f.ret {
             let (rt, oat) = py_return_info(ret_ty);
             argtypes.extend(oat.iter().cloned());
             restype = rt;
@@ -945,10 +948,10 @@ fn render_function(out: &mut String, module_name: &str, f: &Function, strip_modu
 
         out.push_str(&format!("{ind}_err = _WeaveffiErrorStruct()\n"));
 
-        let is_map_ret = f.returns.as_ref().and_then(get_map_kv).is_some();
+        let is_map_ret = f.ret.as_ref().and_then(get_map_kv).is_some();
         let has_out_len = !out_ret_argtypes.is_empty() && !is_map_ret;
 
-        if let Some((k, v)) = f.returns.as_ref().and_then(get_map_kv) {
+        if let Some((k, v)) = f.ret.as_ref().and_then(get_map_kv) {
             out.push_str(&format!(
                 "{ind}_out_keys = ctypes.POINTER({})()\n",
                 py_ctypes_scalar(k)
@@ -976,7 +979,7 @@ fn render_function(out: &mut String, module_name: &str, f: &Function, strip_modu
         call_args.push("ctypes.byref(_err)".into());
 
         let call_expr = format!("_fn({})", call_args.join(", "));
-        if f.returns.is_some() && !is_map_ret {
+        if f.ret.is_some() && !is_map_ret {
             out.push_str(&format!("{ind}_result = {call_expr}\n"));
         } else {
             out.push_str(&format!("{ind}{call_expr}\n"));
@@ -984,16 +987,16 @@ fn render_function(out: &mut String, module_name: &str, f: &Function, strip_modu
 
         out.push_str(&format!("{ind}_check_error(_err)\n"));
 
-        if let Some(ret_ty) = &f.returns {
-            if let TypeRef::Iterator(inner) = ret_ty {
-                render_iterator_return(out, module_name, &f.name, inner, ind);
+        if let Some(ret_ty) = &f.ret {
+            if let (TypeRef::Iterator(inner), CallShape::Iterator(it)) = (ret_ty, &f.shape) {
+                render_iterator_return(out, &it.iter_tag, inner, ind);
             } else {
                 render_return_value(out, ret_ty, ind);
             }
         }
     }
 
-    if f.r#async {
+    if f.is_async {
         let params_joined = params_sig.join(", ");
         out.push_str(&format!(
             "\n\nasync def {}({}) -> {}:\n",
@@ -1007,7 +1010,7 @@ fn render_function(out: &mut String, module_name: &str, f: &Function, strip_modu
         } else {
             format!("{def_name}, {}", arg_names.join(", "))
         };
-        if f.returns.is_some() {
+        if f.ret.is_some() {
             out.push_str(&format!(
                 "    return await _loop.run_in_executor(None, {executor_args})\n"
             ));
@@ -1291,8 +1294,7 @@ fn py_read_iter_item(inner: &TypeRef) -> String {
     }
 }
 
-fn render_iterator_class(out: &mut String, module_name: &str, func_name: &str, inner: &TypeRef) {
-    let iter_tag = iter_type_name(func_name, module_name);
+fn render_iterator_class(out: &mut String, iter_tag: &str, func_name: &str, inner: &TypeRef) {
     let pascal = pascal_case(func_name);
     let class_name = format!("_{pascal}Iterator");
     let item_scalar = py_ctypes_scalar(inner);
@@ -1341,14 +1343,7 @@ fn render_iterator_class(out: &mut String, module_name: &str, func_name: &str, i
     out.push('\n');
 }
 
-fn render_iterator_return(
-    out: &mut String,
-    module_name: &str,
-    func_name: &str,
-    inner: &TypeRef,
-    ind: &str,
-) {
-    let iter_tag = iter_type_name(func_name, module_name);
+fn render_iterator_return(out: &mut String, iter_tag: &str, inner: &TypeRef, ind: &str) {
     let item_scalar = py_ctypes_scalar(inner);
     let read_expr = py_read_iter_item(inner);
 
@@ -1455,9 +1450,12 @@ from weaveffi import *
 // ── Type stub (.pyi) rendering ──
 
 fn render_pyi_module(api: &Api, strip_module_prefix: bool, input_basename: &str) -> String {
+    // Type stubs contain no C symbols, so the ABI prefix is irrelevant here; the
+    // model is used purely for its flattened, path-carrying module traversal.
+    let model = BindingModel::build(api, "weaveffi");
     let mut out = render_prelude(CommentStyle::Hash, input_basename);
     out.push_str("from enum import IntEnum\nfrom typing import Dict, Iterator, List, Optional\n");
-    for (m, path) in walk_modules_with_path(&api.modules) {
+    for m in &model.modules {
         for e in &m.enums {
             render_pyi_enum(&mut out, e);
         }
@@ -1465,7 +1463,7 @@ fn render_pyi_module(api: &Api, strip_module_prefix: bool, input_basename: &str)
             render_pyi_struct(&mut out, s);
         }
         for f in &m.functions {
-            render_pyi_function(&mut out, &path, f, strip_module_prefix);
+            render_pyi_function(&mut out, &m.path, f, strip_module_prefix);
         }
     }
     out.push('\n');
@@ -1473,7 +1471,7 @@ fn render_pyi_module(api: &Api, strip_module_prefix: bool, input_basename: &str)
     out
 }
 
-fn render_pyi_enum(out: &mut String, e: &EnumDef) {
+fn render_pyi_enum(out: &mut String, e: &EnumBinding) {
     out.push('\n');
     emit_doc(out, &e.doc, "");
     out.push_str(&format!("class {}(IntEnum):\n", e.name));
@@ -1483,7 +1481,7 @@ fn render_pyi_enum(out: &mut String, e: &EnumDef) {
     }
 }
 
-fn render_pyi_struct(out: &mut String, s: &StructDef) {
+fn render_pyi_struct(out: &mut String, s: &StructBinding) {
     out.push('\n');
     emit_doc(out, &s.doc, "");
     out.push_str(&format!("class {}:\n", s.name));
@@ -1500,7 +1498,7 @@ fn render_pyi_struct(out: &mut String, s: &StructDef) {
 fn render_pyi_function(
     out: &mut String,
     module_name: &str,
-    f: &Function,
+    f: &FnBinding,
     strip_module_prefix: bool,
 ) {
     let func_name = wrapper_name(module_name, &f.name, strip_module_prefix);
@@ -1510,11 +1508,11 @@ fn render_pyi_function(
         .map(|p| format!("{}: {}", p.name, py_type_hint(&p.ty)))
         .collect();
     let ret = f
-        .returns
+        .ret
         .as_ref()
         .map(py_type_hint)
         .unwrap_or_else(|| "None".into());
-    let async_kw = if f.r#async { "async " } else { "" };
+    let async_kw = if f.is_async { "async " } else { "" };
     out.push('\n');
     emit_doc(out, &f.doc, "");
     out.push_str(&format!(
@@ -1632,7 +1630,7 @@ mod tests {
     #[test]
     fn preamble_has_load_library() {
         let api = make_api(vec![]);
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(py.contains("def _load_library()"), "missing _load_library");
         assert!(
             py.contains("libweaveffi.dylib"),
@@ -1646,7 +1644,7 @@ mod tests {
     #[test]
     fn preamble_has_error_handling() {
         let api = make_api(vec![]);
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
             py.contains("class WeaveffiError(Exception):"),
             "missing error class"
@@ -1688,7 +1686,7 @@ mod tests {
             since: None,
         }])]);
 
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
             py.contains("def add(a: int, b: int) -> int:"),
             "missing function signature: {py}"
@@ -1739,7 +1737,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
             py.contains("def echo(msg: str) -> str:"),
             "missing signature: {py}"
@@ -1768,7 +1766,7 @@ mod tests {
             since: None,
         }])]);
 
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
             py.contains("def reset() -> None:"),
             "missing void signature: {py}"
@@ -1816,7 +1814,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
             py.contains("class Color(IntEnum):"),
             "missing IntEnum class: {py}"
@@ -1857,7 +1855,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(py.contains("a: \"Color\""), "missing enum param hint: {py}");
         assert!(
             py.contains("-> \"Color\":"),
@@ -1901,7 +1899,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(py.contains("class Contact:"), "missing class: {py}");
         assert!(
             py.contains("def __init__(self, _ptr: int)"),
@@ -2014,7 +2012,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
             py.contains("-> \"Contact\":"),
             "missing struct return hint: {py}"
@@ -2047,7 +2045,7 @@ mod tests {
             since: None,
         }])]);
 
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(py.contains("flag: bool"), "missing bool param: {py}");
         assert!(py.contains("-> bool:"), "missing bool return: {py}");
         assert!(
@@ -2077,7 +2075,7 @@ mod tests {
             since: None,
         }])]);
 
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
             py.contains("ctypes.c_uint64"),
             "missing c_uint64 for Handle: {py}"
@@ -2111,7 +2109,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(py.contains("data: bytes"), "missing bytes param: {py}");
         assert!(py.contains("-> bytes:"), "missing bytes return: {py}");
         assert!(
@@ -2149,7 +2147,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
             py.contains("id: Optional[int]"),
             "missing optional param: {py}"
@@ -2195,7 +2193,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
             py.contains("-> Optional[str]:"),
             "missing optional str return: {py}"
@@ -2245,7 +2243,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(py.contains("ids: List[int]"), "missing list param: {py}");
         assert!(py.contains("-> List[int]:"), "missing list return: {py}");
         assert!(
@@ -2304,7 +2302,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
             py.contains("scores: Dict[str, int]"),
             "missing map param: {py}"
@@ -2344,7 +2342,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
             py.contains("def email(self) -> Optional[str]:"),
             "missing optional getter: {py}"
@@ -2378,7 +2376,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
             py.contains("def role(self) -> \"Role\":"),
             "missing enum getter: {py}"
@@ -2622,7 +2620,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
             py.contains("-> List[\"Item\"]:"),
             "missing list struct return: {py}"
@@ -2656,7 +2654,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
             py.contains("def data(self) -> bytes:"),
             "missing bytes getter: {py}"
@@ -2972,7 +2970,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
 
         assert!(py.contains("class Contact:"), "missing class decl");
         assert!(
@@ -3045,7 +3043,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
 
         assert!(py.contains("class ContactType(IntEnum):"));
         assert!(py.contains("\"\"\"Type of contact\"\"\""));
@@ -3135,7 +3133,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
 
         assert!(
             py.contains("key: Optional[int]"),
@@ -3235,7 +3233,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
 
         assert!(py.contains("ids: List[int]"), "missing List[int] param");
         assert!(
@@ -3309,7 +3307,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
 
         assert!(
             py.contains("settings: Dict[str, int]"),
@@ -3833,7 +3831,7 @@ mod tests {
     #[test]
     fn python_has_memory_helpers() {
         let api = make_api(vec![]);
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
             py.contains("import contextlib"),
             "missing contextlib import"
@@ -4192,7 +4190,7 @@ mod tests {
             }],
             generators: None,
         };
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
             py.contains("contact: \"Contact\""),
             "TypedHandle should use class type not int: {py}"
@@ -4244,7 +4242,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
 
         assert!(
             py.contains("_string_to_bytes(name)"),
@@ -4340,7 +4338,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
 
         assert!(
             py.contains("if _result is None:\n        return None"),
@@ -4375,7 +4373,7 @@ mod tests {
             deprecated: None,
             since: None,
         }])]);
-        let code = render_python_module(&api, true, "weaveffi.yml");
+        let code = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
             code.contains("import asyncio"),
             "should import asyncio: {code}"
@@ -4420,7 +4418,7 @@ mod tests {
             deprecated: None,
             since: None,
         }])]);
-        let code = render_python_module(&api, true, "weaveffi.yml");
+        let code = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         let pin_count = code.matches("_cb = _cb_type(_cb_impl)").count();
         let wait_count = code.matches("_ev.wait()").count();
         let set_count = code.matches("_ev.set()").count();
@@ -4511,7 +4509,7 @@ mod tests {
             },
         ]);
 
-        let code = render_python_module(&api, true, "weaveffi.yml");
+        let code = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         let stubs = render_pyi_module(&api, true, "weaveffi.yml");
 
         assert!(
@@ -4571,7 +4569,7 @@ mod tests {
                 modules: vec![],
             }],
         }]);
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
             py.contains("# === Module: parent ==="),
             "parent module section missing: {py}"
@@ -4630,7 +4628,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
             py.contains("ListItemsIterator"),
             "should reference iterator type name: {py}"
@@ -4670,7 +4668,7 @@ mod tests {
             deprecated: Some("Use add_v2 instead".into()),
             since: Some("0.1.0".into()),
         }])]);
-        let py = render_python_module(&api, true, "weaveffi.yml");
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
             py.contains("warnings.warn(\"Use add_v2 instead\", DeprecationWarning, stacklevel=2)"),
             "missing deprecation warning: {py}"
@@ -4724,33 +4722,82 @@ mod tests {
 
     #[test]
     fn python_emits_doc_on_function() {
-        let py = render_python_module(&doc_api(), true, "weaveffi.yml");
+        let py = render_python_module(&doc_api(), true, "weaveffi", "weaveffi.yml");
         assert!(py.contains("\"\"\"Performs a thing."), "{py}");
     }
 
     #[test]
     fn python_emits_doc_on_struct() {
-        let py = render_python_module(&doc_api(), true, "weaveffi.yml");
+        let py = render_python_module(&doc_api(), true, "weaveffi", "weaveffi.yml");
         assert!(py.contains("\"\"\"An item we track.\"\"\""), "{py}");
     }
 
     #[test]
     fn python_emits_doc_on_enum_variant() {
-        let py = render_python_module(&doc_api(), true, "weaveffi.yml");
+        let py = render_python_module(&doc_api(), true, "weaveffi", "weaveffi.yml");
         assert!(py.contains("\"\"\"Kind of item.\"\"\""), "{py}");
         assert!(py.contains("# A small one"), "{py}");
     }
 
     #[test]
     fn python_emits_doc_on_field() {
-        let py = render_python_module(&doc_api(), true, "weaveffi.yml");
+        let py = render_python_module(&doc_api(), true, "weaveffi", "weaveffi.yml");
         assert!(py.contains("\"\"\"Stable id\"\"\""), "{py}");
     }
 
     #[test]
     fn python_emits_doc_on_param() {
-        let py = render_python_module(&doc_api(), true, "weaveffi.yml");
+        let py = render_python_module(&doc_api(), true, "weaveffi", "weaveffi.yml");
         assert!(py.contains("Parameters"), "{py}");
         assert!(py.contains("x : the input value"), "{py}");
+    }
+
+    #[test]
+    fn python_custom_prefix_threads_to_user_symbols() {
+        let api = make_api(vec![simple_module(vec![Function {
+            name: "add".into(),
+            params: vec![
+                Param {
+                    name: "a".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: None,
+                },
+                Param {
+                    name: "b".into(),
+                    ty: TypeRef::I32,
+                    mutable: false,
+                    doc: None,
+                },
+            ],
+            returns: Some(TypeRef::I32),
+            doc: None,
+            r#async: false,
+            cancellable: false,
+            deprecated: None,
+            since: None,
+        }])]);
+
+        let py = render_python_module(&api, true, "myffi", "weaveffi.yml");
+
+        // User symbols honor the configured ABI prefix.
+        assert!(
+            py.contains("_lib.myffi_math_add"),
+            "user symbol should use the custom prefix: {py}"
+        );
+        assert!(
+            !py.contains("weaveffi_math_add"),
+            "user symbol must not hard-code the weaveffi_ prefix: {py}"
+        );
+
+        // Runtime ABI helpers stay literal regardless of the user prefix.
+        assert!(
+            py.contains("weaveffi_error_clear"),
+            "runtime ABI helper must remain literal: {py}"
+        );
+        assert!(
+            !py.contains("myffi_error_clear"),
+            "runtime ABI helper must not be prefixed: {py}"
+        );
     }
 }

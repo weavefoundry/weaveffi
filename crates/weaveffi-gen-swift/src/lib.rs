@@ -4,6 +4,7 @@
 //! including module map, `Package.swift`, and Swift `async/await` shims for
 //! functions marked `async: true`. Implements the [`Generator`] trait.
 
+use std::collections::HashMap;
 use std::fmt::Write;
 
 use anyhow::Result;
@@ -12,10 +13,14 @@ use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use serde::{Deserialize, Serialize};
 use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, walk_modules, DocCommentStyle};
 use weaveffi_core::codegen::Generator;
-use weaveffi_core::utils::{
-    c_symbol_name, local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
+use weaveffi_core::model::{
+    BindingModel, CallShape, EnumBinding, FieldBinding, FnBinding, ModuleBinding, ParamBinding,
+    StructBinding,
 };
-use weaveffi_ir::ir::{Api, EnumDef, Function, Module, Param, StructDef, StructField, TypeRef};
+use weaveffi_core::utils::{
+    local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
+};
+use weaveffi_ir::ir::{Api, Module, TypeRef};
 
 /// Per-target configuration for [`SwiftGenerator`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -26,6 +31,10 @@ pub struct SwiftConfig {
     /// When `true`, strip the IR module name prefix from emitted function
     /// names (e.g. `add` instead of `math_add`).
     pub strip_module_prefix: bool,
+    /// C ABI symbol prefix (default `"weaveffi"`). Normally set once globally
+    /// via `[global] c_prefix`; honored so the Swift wrappers call the same
+    /// exported symbols the producer emits.
+    pub prefix: Option<String>,
     /// Basename of the IDL the CLI was invoked with.
     /// Populated by the CLI; not user-configurable via `[swift]`.
     #[serde(skip)]
@@ -35,6 +44,10 @@ pub struct SwiftConfig {
 impl SwiftConfig {
     pub fn module_name(&self) -> &str {
         self.module_name.as_deref().unwrap_or("WeaveFFI")
+    }
+
+    pub fn prefix(&self) -> &str {
+        self.prefix.as_deref().unwrap_or("weaveffi")
     }
 
     pub fn input_basename(&self) -> &str {
@@ -81,6 +94,7 @@ impl SwiftGenerator {
         api: &Api,
         out_dir: &Utf8Path,
         module_name: &str,
+        prefix: &str,
         strip_module_prefix: bool,
         input_basename: &str,
     ) -> Result<()> {
@@ -111,7 +125,7 @@ let package = Package(\n    \
         std::fs::write(dir.join("Package.swift"), package)?;
 
         let modulemap = format!(
-            "{prelude}module {} [system] {{\n  header \"../../c/weaveffi.h\"\n  link \"weaveffi\"\n  export *\n}}\n\n{trailer}",
+            "{prelude}module {} [system] {{\n  header \"../../c/{prefix}.h\"\n  link \"weaveffi\"\n  export *\n}}\n\n{trailer}",
             c_module,
             trailer = render_trailer(CommentStyle::DoubleSlash, "module.modulemap"),
         );
@@ -122,7 +136,13 @@ let package = Package(\n    \
         let swift_filename = format!("{}.swift", module_name);
         std::fs::write(
             src_dir.join(&swift_filename),
-            render_swift_wrapper(api, strip_module_prefix, input_basename, &swift_filename),
+            render_swift_wrapper(
+                api,
+                prefix,
+                strip_module_prefix,
+                input_basename,
+                &swift_filename,
+            ),
         )?;
         Ok(())
     }
@@ -140,6 +160,7 @@ impl Generator for SwiftGenerator {
             api,
             out_dir,
             config.module_name(),
+            config.prefix(),
             config.strip_module_prefix,
             config.input_basename(),
         )
@@ -170,7 +191,7 @@ fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
 
 /// Emits Swift doc comments for a function: the function's own doc followed by
 /// `/// - Parameter name: ...` lines for each documented parameter.
-fn emit_fn_doc(out: &mut String, doc: &Option<String>, params: &[Param], indent: &str) {
+fn emit_fn_doc(out: &mut String, doc: &Option<String>, params: &[ParamBinding], indent: &str) {
     let has_param_docs = params.iter().any(|p| p.doc.is_some());
     if doc.is_none() && !has_param_docs {
         return;
@@ -263,11 +284,11 @@ fn needs_closure(ty: &TypeRef) -> bool {
     }
 }
 
-fn has_buffer_params(params: &[Param]) -> bool {
+fn has_buffer_params(params: &[ParamBinding]) -> bool {
     params.iter().any(|p| needs_closure(&p.ty))
 }
 
-fn render_swift_enum(out: &mut String, e: &EnumDef) {
+fn render_swift_enum(out: &mut String, e: &EnumBinding) {
     emit_doc(out, &e.doc, "");
     // Match how Swift imports the generated C enum: a C enum with only
     // non-negative discriminants is imported with a `UInt32` raw value,
@@ -293,6 +314,7 @@ fn render_swift_enum(out: &mut String, e: &EnumDef) {
 
 fn render_swift_wrapper(
     api: &Api,
+    c_prefix: &str,
     strip_module_prefix: bool,
     input_basename: &str,
     filename: &str,
@@ -300,6 +322,13 @@ fn render_swift_wrapper(
     let mut out = String::with_capacity(estimate_swift_capacity(&api.modules));
     out.push_str(&render_prelude(CommentStyle::DoubleSlash, input_basename));
     out.push_str("import CWeaveFFI\nimport Foundation\n\n");
+
+    let model = BindingModel::build(api, c_prefix);
+    // Index the flat, pre-order model by its underscore-joined symbol path so
+    // the recursive IR walk below can pull each module's precomputed C symbols
+    // while still emitting the nested Swift `enum` structure the IR tree drives.
+    let by_path: HashMap<&str, &ModuleBinding> =
+        model.modules.iter().map(|m| (m.path.as_str(), m)).collect();
 
     let all_mods = walk_modules(&api.modules).collect::<Vec<_>>();
     let error_codes: Vec<_> = all_mods
@@ -383,46 +412,64 @@ fn render_swift_wrapper(
     }
 
     for m in &api.modules {
-        render_swift_module_types(&mut out, m, &m.name);
+        render_swift_module_types(&mut out, c_prefix, &by_path, m, &m.name);
         let type_name = m.name.to_upper_camel_case();
         out.push_str(&format!("public enum {} {{\n", type_name));
-        render_swift_module_body(&mut out, m, &m.name, 1, strip_module_prefix);
+        render_swift_module_body(
+            &mut out,
+            c_prefix,
+            &by_path,
+            m,
+            &m.name,
+            1,
+            strip_module_prefix,
+        );
         out.push_str("}\n\n");
     }
     out.push_str(&render_trailer(CommentStyle::DoubleSlash, filename));
     out
 }
 
-fn render_swift_module_types(out: &mut String, m: &Module, module_path: &str) {
-    for e in &m.enums {
+fn render_swift_module_types(
+    out: &mut String,
+    c_prefix: &str,
+    by_path: &HashMap<&str, &ModuleBinding>,
+    m: &Module,
+    module_path: &str,
+) {
+    let mb = by_path[module_path];
+    for e in &mb.enums {
         render_swift_enum(out, e);
     }
-    for s in &m.structs {
-        render_swift_struct(out, module_path, s);
-        if s.builder {
-            render_swift_builder(out, module_path, s);
+    for s in &mb.structs {
+        render_swift_struct(out, s);
+        if s.builder.is_some() {
+            render_swift_builder(out, c_prefix, module_path, s);
         }
     }
     for sub in &m.modules {
         let sub_path = format!("{module_path}_{}", sub.name);
-        render_swift_module_types(out, sub, &sub_path);
+        render_swift_module_types(out, c_prefix, by_path, sub, &sub_path);
     }
 }
 
 fn render_swift_module_body(
     out: &mut String,
+    c_prefix: &str,
+    by_path: &HashMap<&str, &ModuleBinding>,
     m: &Module,
     module_path: &str,
     depth: usize,
     strip_module_prefix: bool,
 ) {
     let indent = "    ".repeat(depth);
-    for f in &m.functions {
+    let mb = by_path[module_path];
+    for f in &mb.functions {
         let mut buf = String::new();
-        if f.r#async {
-            render_swift_async_function(&mut buf, module_path, f, strip_module_prefix);
+        if f.is_async {
+            render_swift_async_function(&mut buf, c_prefix, module_path, f, strip_module_prefix);
         } else {
-            render_swift_function(&mut buf, module_path, f, strip_module_prefix);
+            render_swift_function(&mut buf, c_prefix, module_path, f, strip_module_prefix);
         }
         if depth > 1 {
             let extra = "    ".repeat(depth - 1);
@@ -443,13 +490,21 @@ fn render_swift_module_body(
         let sub_path = format!("{module_path}_{}", sub.name);
         let sub_name = sub.name.to_upper_camel_case();
         out.push_str(&format!("{indent}public enum {sub_name} {{\n"));
-        render_swift_module_body(out, sub, &sub_path, depth + 1, strip_module_prefix);
+        render_swift_module_body(
+            out,
+            c_prefix,
+            by_path,
+            sub,
+            &sub_path,
+            depth + 1,
+            strip_module_prefix,
+        );
         out.push_str(&format!("{indent}}}\n"));
     }
 }
 
-fn render_swift_struct(out: &mut String, module_name: &str, s: &StructDef) {
-    let prefix = format!("weaveffi_{}_{}", module_name, s.name);
+fn render_swift_struct(out: &mut String, s: &StructBinding) {
+    let prefix = &s.c_tag;
 
     emit_doc(out, &s.doc, "");
     out.push_str(&format!("public class {} {{\n", s.name));
@@ -463,26 +518,27 @@ fn render_swift_struct(out: &mut String, module_name: &str, s: &StructDef) {
     ));
 
     for field in &s.fields {
-        render_swift_getter(out, &prefix, field);
+        render_swift_getter(out, field);
     }
 
     out.push_str("}\n\n");
 }
 
-fn struct_fields_as_params(fields: &[StructField]) -> Vec<Param> {
+fn struct_fields_as_params(fields: &[FieldBinding]) -> Vec<ParamBinding> {
     fields
         .iter()
-        .map(|f| Param {
+        .map(|f| ParamBinding {
             name: f.name.clone(),
             ty: f.ty.clone(),
             mutable: false,
             doc: f.doc.clone(),
+            abi: vec![],
         })
         .collect()
 }
 
-fn render_swift_builder(out: &mut String, module_name: &str, s: &StructDef) {
-    let prefix = format!("weaveffi_{}_{}", module_name, s.name);
+fn render_swift_builder(out: &mut String, c_prefix: &str, module_name: &str, s: &StructBinding) {
+    let prefix = &s.c_tag;
     let class_name = local_type_name(&s.name);
     let builder_name = format!("{class_name}Builder");
 
@@ -520,7 +576,7 @@ fn render_swift_builder(out: &mut String, module_name: &str, s: &StructDef) {
 
     if !has_buffer_params(&params) {
         let create_sym = format!("{}_create", prefix);
-        let call_args = build_c_call_args(&params, module_name);
+        let call_args = build_c_call_args(&params, c_prefix, module_name);
         if call_args.is_empty() {
             out.push_str(&format!("        let ptr = {}(&err)\n", create_sym));
         } else {
@@ -535,14 +591,14 @@ fn render_swift_builder(out: &mut String, module_name: &str, s: &StructDef) {
         );
         out.push_str(&format!("        return {}(ptr: ptr)\n", class_name));
     } else {
-        render_buffered_struct_create(out, module_name, &prefix, &params, class_name);
+        render_buffered_struct_create(out, c_prefix, module_name, prefix, &params, class_name);
     }
 
     out.push_str("    }\n}\n\n");
 }
 
-fn render_swift_getter(out: &mut String, prefix: &str, field: &StructField) {
-    let getter = format!("{}_get_{}", prefix, field.name);
+fn render_swift_getter(out: &mut String, field: &FieldBinding) {
+    let getter = &field.getter_symbol;
     let swift_ty = swift_type_for(&field.ty);
 
     out.push('\n');
@@ -655,8 +711,9 @@ fn render_swift_getter(out: &mut String, prefix: &str, field: &StructField) {
 
 fn render_swift_function(
     out: &mut String,
+    c_prefix: &str,
     module_name: &str,
-    f: &Function,
+    f: &FnBinding,
     strip_module_prefix: bool,
 ) {
     emit_fn_doc(out, &f.doc, &f.params, "    ");
@@ -669,7 +726,7 @@ fn render_swift_function(
     }
     let func_name = wrapper_name(module_name, &f.name, strip_module_prefix);
     let ret_swift = f
-        .returns
+        .ret
         .as_ref()
         .map(swift_type_for)
         .unwrap_or_else(|| "Void".to_string());
@@ -678,8 +735,8 @@ fn render_swift_function(
     let _ = writeln!(out, ") throws -> {} {{", ret_swift);
     out.push_str("        var err = weaveffi_error(code: 0, message: nil)\n");
 
-    let c_sym = c_symbol_name(module_name, &f.name);
-    let call_args = build_c_call_args(&f.params, module_name);
+    let c_sym = &f.c_base;
+    let call_args = build_c_call_args(&f.params, c_prefix, module_name);
     let call_with_err = if call_args.is_empty() {
         format!("{}(&err)", c_sym)
     } else {
@@ -687,9 +744,9 @@ fn render_swift_function(
     };
 
     if !has_buffer_params(&f.params) {
-        render_direct_call(out, f, &call_with_err, module_name);
+        render_direct_call(out, f, &call_with_err);
     } else {
-        render_buffered_call(out, f, &f.params, module_name);
+        render_buffered_call(out, c_prefix, f, &f.params, module_name);
     }
 
     out.push_str("    }\n");
@@ -699,7 +756,7 @@ fn render_swift_function(
 /// avoiding the per-call `format!` and intermediate `Vec<String>` allocations
 /// that `params.iter().map(format!).collect::<Vec<_>>().join(", ")` would
 /// require.
-fn write_swift_params_sig(out: &mut String, params: &[Param]) {
+fn write_swift_params_sig(out: &mut String, params: &[ParamBinding]) {
     for (i, p) in params.iter().enumerate() {
         if i > 0 {
             out.push_str(", ");
@@ -710,8 +767,9 @@ fn write_swift_params_sig(out: &mut String, params: &[Param]) {
 
 fn render_swift_async_function(
     out: &mut String,
+    c_prefix: &str,
     module_name: &str,
-    f: &Function,
+    f: &FnBinding,
     strip_module_prefix: bool,
 ) {
     emit_fn_doc(out, &f.doc, &f.params, "    ");
@@ -724,7 +782,7 @@ fn render_swift_async_function(
     }
     let func_name = wrapper_name(module_name, &f.name, strip_module_prefix);
     let ret_swift = f
-        .returns
+        .ret
         .as_ref()
         .map(swift_type_for)
         .unwrap_or_else(|| "Void".to_string());
@@ -751,7 +809,7 @@ fn render_swift_async_function(
             TypeRef::Optional(inner) => {
                 if let TypeRef::Enum(enum_name) = inner.as_ref() {
                     out.push_str(&format!(
-                        "{}let {n}_c: weaveffi_{m}_{e}? = {n}.map {{ weaveffi_{m}_{e}($0.rawValue) }}\n",
+                        "{}let {n}_c: {c_prefix}_{m}_{e}? = {n}.map {{ {c_prefix}_{m}_{e}($0.rawValue) }}\n",
                         base,
                         n = p.name,
                         m = module_name,
@@ -762,7 +820,7 @@ fn render_swift_async_function(
             TypeRef::List(inner) => match inner.as_ref() {
                 TypeRef::Enum(enum_name) => {
                     out.push_str(&format!(
-                        "{}let {n}_raw = {n}.map {{ weaveffi_{m}_{e}($0.rawValue) }}\n",
+                        "{}let {n}_raw = {n}.map {{ {c_prefix}_{m}_{e}($0.rawValue) }}\n",
                         base,
                         n = p.name,
                         m = module_name,
@@ -791,7 +849,7 @@ fn render_swift_async_function(
                 ));
                 if let TypeRef::Enum(e) = k.as_ref() {
                     out.push_str(&format!(
-                        "{}let {n}_keysRaw = {n}_keys.map {{ weaveffi_{m}_{e}($0.rawValue) }}\n",
+                        "{}let {n}_keysRaw = {n}_keys.map {{ {c_prefix}_{m}_{e}($0.rawValue) }}\n",
                         base,
                         n = p.name,
                         m = module_name,
@@ -806,7 +864,7 @@ fn render_swift_async_function(
                 }
                 if let TypeRef::Enum(e) = v.as_ref() {
                     out.push_str(&format!(
-                        "{}let {n}_valuesRaw = {n}_values.map {{ weaveffi_{m}_{e}($0.rawValue) }}\n",
+                        "{}let {n}_valuesRaw = {n}_values.map {{ {c_prefix}_{m}_{e}($0.rawValue) }}\n",
                         base,
                         n = p.name,
                         m = module_name,
@@ -824,7 +882,8 @@ fn render_swift_async_function(
         }
     }
 
-    let closure_params: Vec<&Param> = f.params.iter().filter(|p| needs_closure(&p.ty)).collect();
+    let closure_params: Vec<&ParamBinding> =
+        f.params.iter().filter(|p| needs_closure(&p.ty)).collect();
     let mut closure_depth: usize = 0;
 
     for p in &closure_params {
@@ -925,9 +984,9 @@ fn render_swift_async_function(
     }
 
     let inner_indent = format!("{}{}", base, "    ".repeat(closure_depth));
-    let c_sym = format!("{}_async", c_symbol_name(module_name, &f.name));
-    let call_args = build_c_call_args(&f.params, module_name);
-    let cb_param_names = async_callback_param_names(&f.returns);
+    let c_sym = format!("{}_async", f.c_base);
+    let call_args = build_c_call_args(&f.params, c_prefix, module_name);
+    let cb_param_names = async_callback_param_names(&f.ret);
 
     if f.cancellable {
         if call_args.is_empty() {
@@ -974,7 +1033,7 @@ fn render_swift_async_function(
     out.push_str(&format!("{}}} else {{\n", cb_indent));
 
     let success_indent = format!("{}    ", cb_indent);
-    render_async_resume_result(out, &f.returns, &success_indent, module_name, &f.name);
+    render_async_resume_result(out, c_prefix, &f.ret, &success_indent, module_name, &f.name);
 
     out.push_str(&format!("{}}}\n", cb_indent));
     out.push_str(&format!("{}}}, ctx)\n", inner_indent));
@@ -1001,6 +1060,7 @@ fn async_callback_param_names(returns: &Option<TypeRef>) -> &'static str {
 
 fn render_async_resume_result(
     out: &mut String,
+    c_prefix: &str,
     returns: &Option<TypeRef>,
     indent: &str,
     module_name: &str,
@@ -1195,7 +1255,7 @@ fn render_async_resume_result(
         }
         Some(TypeRef::Iterator(inner)) => {
             let pascal_func = func_name.to_upper_camel_case();
-            let iter_prefix = format!("weaveffi_{module_name}_{pascal_func}Iterator");
+            let iter_prefix = format!("{c_prefix}_{module_name}_{pascal_func}Iterator");
             let next_fn = format!("{iter_prefix}_next");
             let destroy_fn = format!("{iter_prefix}_destroy");
             let inner_swift = swift_type_for(inner);
@@ -1270,7 +1330,7 @@ fn render_async_resume_result(
     }
 }
 
-fn build_c_call_args(params: &[Param], module_name: &str) -> String {
+fn build_c_call_args(params: &[ParamBinding], c_prefix: &str, module_name: &str) -> String {
     let mut args: Vec<String> = Vec::new();
     for p in params {
         match &p.ty {
@@ -1283,7 +1343,7 @@ fn build_c_call_args(params: &[Param], module_name: &str) -> String {
             }
             TypeRef::Struct(_) | TypeRef::TypedHandle(_) => args.push(format!("{}.ptr", p.name)),
             TypeRef::Enum(enum_name) => args.push(format!(
-                "weaveffi_{}_{}({}.rawValue)",
+                "{c_prefix}_{}_{}({}.rawValue)",
                 module_name, enum_name, p.name
             )),
             TypeRef::Optional(inner) => match inner.as_ref() {
@@ -1312,8 +1372,8 @@ fn build_c_call_args(params: &[Param], module_name: &str) -> String {
     args.join(", ")
 }
 
-fn render_direct_call(out: &mut String, f: &Function, call_with_err: &str, module_name: &str) {
-    match &f.returns {
+fn render_direct_call(out: &mut String, f: &FnBinding, call_with_err: &str) {
+    match &f.ret {
         None => {
             out.push_str(&format!("        {}\n", call_with_err));
             out.push_str("        try check(&err)\n");
@@ -1366,8 +1426,8 @@ fn render_direct_call(out: &mut String, f: &Function, call_with_err: &str, modul
         Some(TypeRef::Map(k, v)) => {
             render_map_return(out, call_with_err, k, v);
         }
-        Some(TypeRef::Iterator(inner)) => {
-            render_iterator_return(out, module_name, &f.name, inner, call_with_err, "        ");
+        Some(TypeRef::Iterator(_)) => {
+            render_iterator_return(out, f, call_with_err, "        ");
         }
         Some(_) => {
             out.push_str(&format!("        let rv = {}\n", call_with_err));
@@ -1629,18 +1689,14 @@ fn render_map_return_inner(out: &mut String, call: &str, k: &TypeRef, v: &TypeRe
     out.push_str(&format!("{}    return result\n", indent));
 }
 
-fn render_iterator_return(
-    out: &mut String,
-    module_name: &str,
-    func_name: &str,
-    inner: &TypeRef,
-    call_with_err: &str,
-    indent: &str,
-) {
-    let pascal_func = func_name.to_upper_camel_case();
-    let iter_prefix = format!("weaveffi_{module_name}_{pascal_func}Iterator");
-    let next_fn = format!("{iter_prefix}_next");
-    let destroy_fn = format!("{iter_prefix}_destroy");
+fn render_iterator_return(out: &mut String, f: &FnBinding, call_with_err: &str, indent: &str) {
+    let it = match &f.shape {
+        CallShape::Iterator(it) => it,
+        _ => unreachable!("render_iterator_return on non-iterator function"),
+    };
+    let next_fn = &it.next.symbol;
+    let destroy_fn = &it.destroy_symbol;
+    let inner = &it.elem;
     let inner_swift = swift_type_for(inner);
 
     out.push_str(&format!("{indent}let iter = {call_with_err}\n"));
@@ -1689,7 +1745,13 @@ fn map_array_source(ty: &TypeRef, name: &str, suffix: &str) -> String {
     }
 }
 
-fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module_name: &str) {
+fn render_buffered_call(
+    out: &mut String,
+    c_prefix: &str,
+    f: &FnBinding,
+    params: &[ParamBinding],
+    module_name: &str,
+) {
     for p in params {
         match &p.ty {
             TypeRef::Bytes | TypeRef::BorrowedBytes => {
@@ -1698,7 +1760,7 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
             TypeRef::Optional(inner) => {
                 if let TypeRef::Enum(enum_name) = inner.as_ref() {
                     out.push_str(&format!(
-                        "        let {n}_c: weaveffi_{m}_{e}? = {n}.map {{ weaveffi_{m}_{e}($0.rawValue) }}\n",
+                        "        let {n}_c: {c_prefix}_{m}_{e}? = {n}.map {{ {c_prefix}_{m}_{e}($0.rawValue) }}\n",
                         n = p.name, m = module_name, e = enum_name
                     ));
                 }
@@ -1706,7 +1768,7 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
             TypeRef::List(inner) => match inner.as_ref() {
                 TypeRef::Enum(enum_name) => {
                     out.push_str(&format!(
-                        "        let {n}_raw = {n}.map {{ weaveffi_{m}_{e}($0.rawValue) }}\n",
+                        "        let {n}_raw = {n}.map {{ {c_prefix}_{m}_{e}($0.rawValue) }}\n",
                         n = p.name,
                         m = module_name,
                         e = enum_name
@@ -1732,7 +1794,7 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
                 match k.as_ref() {
                     TypeRef::Enum(e) => {
                         out.push_str(&format!(
-                            "        let {n}_keysRaw = {n}_keys.map {{ weaveffi_{m}_{e}($0.rawValue) }}\n",
+                            "        let {n}_keysRaw = {n}_keys.map {{ {c_prefix}_{m}_{e}($0.rawValue) }}\n",
                             n = p.name, m = module_name, e = e
                         ));
                     }
@@ -1747,7 +1809,7 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
                 match v.as_ref() {
                     TypeRef::Enum(e) => {
                         out.push_str(&format!(
-                            "        let {n}_valuesRaw = {n}_values.map {{ weaveffi_{m}_{e}($0.rawValue) }}\n",
+                            "        let {n}_valuesRaw = {n}_values.map {{ {c_prefix}_{m}_{e}($0.rawValue) }}\n",
                             n = p.name, m = module_name, e = e
                         ));
                     }
@@ -1764,14 +1826,15 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
         }
     }
 
-    let closure_params: Vec<&Param> = params.iter().filter(|p| needs_closure(&p.ty)).collect();
+    let closure_params: Vec<&ParamBinding> =
+        params.iter().filter(|p| needs_closure(&p.ty)).collect();
 
-    let is_list_return = matches!(f.returns.as_ref(), Some(TypeRef::List(_)));
-    let is_map_return = matches!(f.returns.as_ref(), Some(TypeRef::Map(_, _)));
+    let is_list_return = matches!(f.ret.as_ref(), Some(TypeRef::List(_)));
+    let is_map_return = matches!(f.ret.as_ref(), Some(TypeRef::Map(_, _)));
     if is_list_return || is_map_return {
         out.push_str("        var outLen: Int = 0\n");
     }
-    if let Some(TypeRef::Map(k, v)) = &f.returns {
+    if let Some(TypeRef::Map(k, v)) = &f.ret {
         let key_elem = swift_c_ptr_element(k);
         let val_elem = swift_c_ptr_element(v);
         out.push_str(&format!(
@@ -1785,7 +1848,7 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
     }
 
     let handles_return_inside = matches!(
-        f.returns.as_ref(),
+        f.ret.as_ref(),
         Some(TypeRef::StringUtf8)
             | Some(TypeRef::Enum(_))
             | Some(TypeRef::Optional(_))
@@ -1794,12 +1857,12 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
             | Some(TypeRef::Iterator(_))
     );
 
-    let ret_type = match &f.returns {
+    let ret_type = match &f.ret {
         Some(TypeRef::Struct(_) | TypeRef::TypedHandle(_)) => "OpaquePointer?".to_string(),
         Some(ty) => swift_type_for(ty),
         None => "Void".to_string(),
     };
-    let needs_return = f.returns.is_some();
+    let needs_return = f.ret.is_some();
 
     let mut closure_depth: usize = 0;
     for p in &closure_params {
@@ -1943,8 +2006,8 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
     }
 
     let inner_indent = "        ".to_string() + &"    ".repeat(closure_depth);
-    let c_sym = c_symbol_name(module_name, &f.name);
-    let call_args = build_c_call_args(params, module_name);
+    let c_sym = &f.c_base;
+    let call_args = build_c_call_args(params, c_prefix, module_name);
     let call_with_err = if is_map_return {
         if call_args.is_empty() {
             format!("{}(&outKeysPtr, &outValuesPtr, &outLen, &err)", c_sym)
@@ -1966,7 +2029,7 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
         format!("{}({}, &err)", c_sym, call_args)
     };
 
-    match &f.returns {
+    match &f.ret {
         None => {
             out.push_str(&format!("{}    {}\n", inner_indent, call_with_err));
         }
@@ -1997,9 +2060,9 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
         Some(TypeRef::Map(k, v)) => {
             render_map_return_inner(out, &call_with_err, k, v, &inner_indent);
         }
-        Some(TypeRef::Iterator(inner)) => {
+        Some(TypeRef::Iterator(_)) => {
             let ind = format!("{}    ", inner_indent);
-            render_iterator_return(out, module_name, &f.name, inner, &call_with_err, &ind);
+            render_iterator_return(out, f, &call_with_err, &ind);
         }
         Some(_) => {
             out.push_str(&format!("{}    return {}\n", inner_indent, call_with_err));
@@ -2011,14 +2074,14 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
         out.push_str(&format!("{}}}\n", indent));
     }
 
-    if f.returns.is_none() {
+    if f.ret.is_none() {
         out.push_str("        try check(&err)\n");
-    } else if let Some(TypeRef::Struct(name)) = &f.returns {
+    } else if let Some(TypeRef::Struct(name)) = &f.ret {
         let name = local_type_name(name);
         out.push_str("        try check(&err)\n");
         out.push_str("        guard let result = result else { throw WeaveFFIError.error(code: -1, message: \"null pointer\") }\n");
         out.push_str(&format!("        return {}(ptr: result)\n", name));
-    } else if let Some(TypeRef::TypedHandle(name)) = &f.returns {
+    } else if let Some(TypeRef::TypedHandle(name)) = &f.ret {
         out.push_str("        try check(&err)\n");
         out.push_str("        guard let result = result else { throw WeaveFFIError.error(code: -1, message: \"null pointer\") }\n");
         out.push_str(&format!("        return {}(ptr: result)\n", name));
@@ -2033,9 +2096,10 @@ fn render_buffered_call(out: &mut String, f: &Function, params: &[Param], module
 /// Like `render_buffered_call`, but calls `{struct_prefix}_create` and always returns a struct pointer.
 fn render_buffered_struct_create(
     out: &mut String,
+    c_prefix: &str,
     module_name: &str,
     struct_prefix: &str,
-    params: &[Param],
+    params: &[ParamBinding],
     struct_class_name: &str,
 ) {
     for p in params {
@@ -2046,7 +2110,7 @@ fn render_buffered_struct_create(
             TypeRef::Optional(inner) => {
                 if let TypeRef::Enum(enum_name) = inner.as_ref() {
                     out.push_str(&format!(
-                        "        let {n}_c: weaveffi_{m}_{e}? = {n}.map {{ weaveffi_{m}_{e}($0.rawValue) }}\n",
+                        "        let {n}_c: {c_prefix}_{m}_{e}? = {n}.map {{ {c_prefix}_{m}_{e}($0.rawValue) }}\n",
                         n = p.name,
                         m = module_name,
                         e = enum_name
@@ -2056,7 +2120,7 @@ fn render_buffered_struct_create(
             TypeRef::List(inner) => match inner.as_ref() {
                 TypeRef::Enum(enum_name) => {
                     out.push_str(&format!(
-                        "        let {n}_raw = {n}.map {{ weaveffi_{m}_{e}($0.rawValue) }}\n",
+                        "        let {n}_raw = {n}.map {{ {c_prefix}_{m}_{e}($0.rawValue) }}\n",
                         n = p.name,
                         m = module_name,
                         e = enum_name
@@ -2082,7 +2146,7 @@ fn render_buffered_struct_create(
                 match k.as_ref() {
                     TypeRef::Enum(e) => {
                         out.push_str(&format!(
-                            "        let {n}_keysRaw = {n}_keys.map {{ weaveffi_{m}_{e}($0.rawValue) }}\n",
+                            "        let {n}_keysRaw = {n}_keys.map {{ {c_prefix}_{m}_{e}($0.rawValue) }}\n",
                             n = p.name,
                             m = module_name,
                             e = e
@@ -2099,7 +2163,7 @@ fn render_buffered_struct_create(
                 match v.as_ref() {
                     TypeRef::Enum(e) => {
                         out.push_str(&format!(
-                            "        let {n}_valuesRaw = {n}_values.map {{ weaveffi_{m}_{e}($0.rawValue) }}\n",
+                            "        let {n}_valuesRaw = {n}_values.map {{ {c_prefix}_{m}_{e}($0.rawValue) }}\n",
                             n = p.name,
                             m = module_name,
                             e = e
@@ -2118,7 +2182,8 @@ fn render_buffered_struct_create(
         }
     }
 
-    let closure_params: Vec<&Param> = params.iter().filter(|p| needs_closure(&p.ty)).collect();
+    let closure_params: Vec<&ParamBinding> =
+        params.iter().filter(|p| needs_closure(&p.ty)).collect();
 
     let ret_type = "OpaquePointer?";
     let needs_return = true;
@@ -2266,7 +2331,7 @@ fn render_buffered_struct_create(
 
     let inner_indent = "        ".to_string() + &"    ".repeat(closure_depth);
     let create_sym = format!("{struct_prefix}_create");
-    let call_args = build_c_call_args(params, module_name);
+    let call_args = build_c_call_args(params, c_prefix, module_name);
     let call_with_err = if call_args.is_empty() {
         format!("{}(&err)", create_sym)
     } else {
@@ -2378,7 +2443,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("public enum Color: UInt32 {"),
             "missing enum declaration: {out}"
@@ -2419,7 +2484,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("case inProgress = 0"),
             "missing camelCase variant: {out}"
@@ -2457,7 +2522,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(out.contains("_ a: Color"), "missing enum param type: {out}");
         assert!(
             out.contains("-> Color {"),
@@ -2500,7 +2565,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("_ id: Int32?"),
             "missing optional param type: {out}"
@@ -2539,7 +2604,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("_ person: Contact?"),
             "missing optional struct param: {out}"
@@ -2577,7 +2642,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("-> Int32? {"),
             "missing optional return type: {out}"
@@ -2610,7 +2675,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("-> String? {"),
             "missing optional string return type: {out}"
@@ -2652,7 +2717,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("_ ids: [Int32]"),
             "missing list param type: {out}"
@@ -2687,7 +2752,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("-> [Int32] {"),
             "missing list return type: {out}"
@@ -2732,7 +2797,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("-> Contact? {"),
             "missing optional struct return: {out}"
@@ -2746,7 +2811,7 @@ mod tests {
     #[test]
     fn render_with_optional_pointer_helper() {
         let api = make_api(vec![]);
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("func withOptionalPointer<T, R>"),
             "missing withOptionalPointer helper: {out}"
@@ -2788,7 +2853,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("public class Contact {"),
             "missing class declaration: {out}"
@@ -2893,6 +2958,119 @@ mod tests {
     }
 
     #[test]
+    fn swift_custom_prefix_threads_to_user_symbols() {
+        let api = make_api(vec![Module {
+            name: "demo".to_string(),
+            functions: vec![Function {
+                name: "paint".to_string(),
+                params: vec![Param {
+                    name: "c".to_string(),
+                    ty: TypeRef::Enum("Color".into()),
+                    mutable: false,
+                    doc: None,
+                }],
+                returns: Some(TypeRef::Enum("Color".into())),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![StructDef {
+                name: "Point".to_string(),
+                doc: None,
+                fields: vec![
+                    StructField {
+                        name: "x".to_string(),
+                        ty: TypeRef::I32,
+                        doc: None,
+                        default: None,
+                    },
+                    StructField {
+                        name: "y".to_string(),
+                        ty: TypeRef::I32,
+                        doc: None,
+                        default: None,
+                    },
+                ],
+                builder: false,
+            }],
+            enums: vec![EnumDef {
+                name: "Color".to_string(),
+                doc: None,
+                variants: vec![
+                    EnumVariant {
+                        name: "Red".to_string(),
+                        value: 0,
+                        doc: None,
+                    },
+                    EnumVariant {
+                        name: "Green".to_string(),
+                        value: 1,
+                        doc: None,
+                    },
+                ],
+            }],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_swift_custom_prefix");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("temp dir is valid UTF-8");
+        let config = SwiftConfig {
+            prefix: Some("myffi".to_string()),
+            ..Default::default()
+        };
+        SwiftGenerator.generate(&api, out_dir, &config).unwrap();
+
+        let swift = std::fs::read_to_string(
+            tmp.join("swift")
+                .join("Sources")
+                .join("WeaveFFI")
+                .join("WeaveFFI.swift"),
+        )
+        .unwrap();
+        let modulemap =
+            std::fs::read_to_string(tmp.join("swift").join("CWeaveFFI").join("module.modulemap"))
+                .unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        // User symbols honor the configured ABI prefix: the function symbol,
+        // the enum-to-C cast, and the struct getter all carry `myffi_`.
+        assert!(
+            swift.contains("myffi_demo_paint"),
+            "function user symbol should use custom prefix: {swift}"
+        );
+        assert!(
+            swift.contains("myffi_demo_Color("),
+            "enum-cast user symbol should use custom prefix: {swift}"
+        );
+        assert!(
+            swift.contains("myffi_demo_Point_get_x"),
+            "struct getter user symbol should use custom prefix: {swift}"
+        );
+        // No user symbol falls back to the hard-coded `weaveffi_` prefix.
+        assert!(
+            !swift.contains("weaveffi_demo_"),
+            "no user symbol should keep the default prefix: {swift}"
+        );
+        // The system module map points at the prefixed C header.
+        assert!(
+            modulemap.contains("header \"../../c/myffi.h\""),
+            "module map should reference the prefixed C header: {modulemap}"
+        );
+        // Runtime ABI helpers stay literal regardless of the prefix.
+        assert!(
+            swift.contains("weaveffi_error_clear(&err)"),
+            "runtime helper must remain literal: {swift}"
+        );
+    }
+
+    #[test]
     fn render_function_returning_struct() {
         let api = make_api(vec![Module {
             name: "contacts".to_string(),
@@ -2919,7 +3097,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("-> Contact {"),
             "missing struct return type: {out}"
@@ -2957,7 +3135,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("_ contact: Contact"),
             "missing struct param type: {out}"
@@ -2991,7 +3169,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("public var data: Data {"),
             "missing bytes getter: {out}"
@@ -3025,7 +3203,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("public var start: Point {"),
             "missing nested struct getter: {out}"
@@ -3063,7 +3241,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("-> Contact {"),
             "missing struct return type with buffer params: {out}"
@@ -3261,7 +3439,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("_ scores: [Int32: Double]"),
             "missing map param type: {out}"
@@ -3311,7 +3489,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("-> [Int32: Double] {"),
             "missing map return type: {out}"
@@ -3369,7 +3547,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
 
         assert!(
             out.contains("public var email: String? {"),
@@ -3535,7 +3713,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
 
         assert!(
             out.contains("public enum WeaveFFIError: Error, LocalizedError {"),
@@ -3618,7 +3796,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
 
         assert!(
             out.contains("public var item_ids: [Int32] {"),
@@ -3769,7 +3947,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let swift = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let swift = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             swift.contains("[Contact?]?"),
             "should contain deeply nested optional type: {swift}"
@@ -3805,7 +3983,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let swift = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let swift = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             swift.contains("[String: [Int32]]"),
             "should contain map of lists type: {swift}"
@@ -3871,7 +4049,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let swift = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let swift = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             swift.contains("[Color: Contact]"),
             "should contain enum-keyed map type: {swift}"
@@ -3915,7 +4093,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("_ msg: String"),
             "BorrowedStr param should use String type: {out}"
@@ -3953,7 +4131,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("_ data: Data"),
             "BorrowedBytes param should use Data type: {out}"
@@ -4000,7 +4178,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let swift = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let swift = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             swift.contains("_ contact: Contact"),
             "TypedHandle should use class type not UInt64: {swift}"
@@ -4048,7 +4226,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
 
         assert!(
             !out.contains("weaveffi_free_string(name"),
@@ -4105,7 +4283,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("rv.map { Contact(ptr: $0) }"),
             "optional struct return should map null before wrapping: {out}"
@@ -4139,7 +4317,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("async throws"),
             "missing async throws in signature: {out}"
@@ -4177,7 +4355,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("withCheckedThrowingContinuation"),
             "missing withCheckedThrowingContinuation: {out}"
@@ -4227,7 +4405,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         let pin_count = out.matches("Unmanaged.passRetained").count();
         let unpin_count = out.matches("takeRetainedValue()").count();
         assert_eq!(
@@ -4289,7 +4467,7 @@ mod tests {
             },
         ]);
 
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
 
         assert!(
             out.contains("-> Name"),
@@ -4344,7 +4522,7 @@ mod tests {
                 modules: vec![],
             }],
         }]);
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("public enum Parent {"),
             "top-level module enum missing: {out}"
@@ -4398,7 +4576,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("ListItemsIterator"),
             "should reference iterator type: {out}"
@@ -4447,7 +4625,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let out = render_swift_wrapper(&api, true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
             out.contains("@available(*, deprecated, message: \"Use addV2 instead\")"),
             "missing deprecation annotation: {out}"
@@ -4513,32 +4691,62 @@ mod tests {
 
     #[test]
     fn swift_emits_doc_on_function() {
-        let out = render_swift_wrapper(&doc_api(), true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(
+            &doc_api(),
+            "weaveffi",
+            true,
+            "weaveffi.yml",
+            "WeaveFFI.swift",
+        );
         assert!(out.contains("/// Performs a thing."), "{out}");
     }
 
     #[test]
     fn swift_emits_doc_on_struct() {
-        let out = render_swift_wrapper(&doc_api(), true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(
+            &doc_api(),
+            "weaveffi",
+            true,
+            "weaveffi.yml",
+            "WeaveFFI.swift",
+        );
         assert!(out.contains("/// An item we track."), "{out}");
     }
 
     #[test]
     fn swift_emits_doc_on_enum_variant() {
-        let out = render_swift_wrapper(&doc_api(), true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(
+            &doc_api(),
+            "weaveffi",
+            true,
+            "weaveffi.yml",
+            "WeaveFFI.swift",
+        );
         assert!(out.contains("/// Kind of item."), "{out}");
         assert!(out.contains("/// A small one"), "{out}");
     }
 
     #[test]
     fn swift_emits_doc_on_field() {
-        let out = render_swift_wrapper(&doc_api(), true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(
+            &doc_api(),
+            "weaveffi",
+            true,
+            "weaveffi.yml",
+            "WeaveFFI.swift",
+        );
         assert!(out.contains("/// Stable id"), "{out}");
     }
 
     #[test]
     fn swift_emits_doc_on_param() {
-        let out = render_swift_wrapper(&doc_api(), true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render_swift_wrapper(
+            &doc_api(),
+            "weaveffi",
+            true,
+            "weaveffi.yml",
+            "WeaveFFI.swift",
+        );
         assert!(out.contains("/// - Parameter x: the input value"), "{out}");
     }
 }

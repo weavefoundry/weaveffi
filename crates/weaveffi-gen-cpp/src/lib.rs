@@ -37,7 +37,7 @@ pub struct CppConfig {
     pub standard: Option<String>,
     /// C ABI symbol prefix that the C++ wrappers call into. Must match the
     /// configured C generator prefix. Defaults to `"weaveffi"`.
-    pub c_prefix: Option<String>,
+    pub prefix: Option<String>,
     /// Basename of the IDL the CLI was invoked with.
     #[serde(skip)]
     pub input_basename: Option<String>,
@@ -56,8 +56,8 @@ impl CppConfig {
         self.standard.as_deref().unwrap_or("17")
     }
 
-    pub fn c_prefix(&self) -> &str {
-        self.c_prefix.as_deref().unwrap_or("weaveffi")
+    pub fn prefix(&self) -> &str {
+        self.prefix.as_deref().unwrap_or("weaveffi")
     }
 
     pub fn input_basename(&self) -> &str {
@@ -108,7 +108,7 @@ impl Generator for CppGenerator {
             config.namespace(),
             config.header_name(),
             config.standard(),
-            config.c_prefix(),
+            config.prefix(),
             config.input_basename(),
         )
     }

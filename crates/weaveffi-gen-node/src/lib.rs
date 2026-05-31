@@ -10,15 +10,14 @@ use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
 use serde::{Deserialize, Serialize};
-use weaveffi_core::codegen::common::{
-    emit_doc as common_emit_doc, walk_modules, walk_modules_with_path, DocCommentStyle,
-};
+use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
 use weaveffi_core::codegen::Generator;
+use weaveffi_core::model::{BindingModel, FnBinding, ParamBinding, StructBinding};
 use weaveffi_core::utils::{
     c_abi_struct_name, local_type_name, render_json_prelude, render_prelude, render_trailer,
     wrapper_name, CommentStyle,
 };
-use weaveffi_ir::ir::{Api, Function, StructDef, TypeRef};
+use weaveffi_ir::ir::{Api, TypeRef};
 
 /// Per-target configuration for [`NodeGenerator`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -29,6 +28,10 @@ pub struct NodeConfig {
     /// When `true`, strip the IR module name prefix from emitted
     /// JS/TS function names.
     pub strip_module_prefix: bool,
+    /// C ABI symbol prefix (default `"weaveffi"`). Normally set once globally
+    /// via `[global] c_prefix`; honored so the native addon calls the same
+    /// exported symbols the producer emits.
+    pub prefix: Option<String>,
     /// Basename of the IDL the CLI was invoked with.
     #[serde(skip)]
     pub input_basename: Option<String>,
@@ -37,6 +40,10 @@ pub struct NodeConfig {
 impl NodeConfig {
     pub fn package_name(&self) -> &str {
         self.package_name.as_deref().unwrap_or("weaveffi")
+    }
+
+    pub fn prefix(&self) -> &str {
+        self.prefix.as_deref().unwrap_or("weaveffi")
     }
 
     pub fn input_basename(&self) -> &str {
@@ -52,6 +59,7 @@ impl NodeGenerator {
         api: &Api,
         out_dir: &Utf8Path,
         package_name: &str,
+        prefix: &str,
         strip_module_prefix: bool,
         input_basename: &str,
     ) -> Result<()> {
@@ -68,7 +76,7 @@ impl NodeGenerator {
         )?;
         std::fs::write(
             dir.join("types.d.ts"),
-            render_node_dts(api, strip_module_prefix, input_basename),
+            render_node_dts(api, prefix, strip_module_prefix, input_basename),
         )?;
         std::fs::write(
             dir.join("package.json"),
@@ -77,7 +85,7 @@ impl NodeGenerator {
         std::fs::write(dir.join("binding.gyp"), render_binding_gyp(input_basename))?;
         std::fs::write(
             dir.join("weaveffi_addon.c"),
-            render_addon_c(api, strip_module_prefix, input_basename),
+            render_addon_c(api, prefix, strip_module_prefix, input_basename),
         )?;
         Ok(())
     }
@@ -95,6 +103,7 @@ impl Generator for NodeGenerator {
             api,
             out_dir,
             config.package_name(),
+            config.prefix(),
             config.strip_module_prefix,
             config.input_basename(),
         )
@@ -140,7 +149,7 @@ fn is_c_ptr_type(ty: &TypeRef) -> bool {
     )
 }
 
-fn c_elem_type(ty: &TypeRef, module: &str) -> String {
+fn c_elem_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
     match ty {
         TypeRef::I32 => "int32_t".into(),
         TypeRef::U32 => "uint32_t".into(),
@@ -150,16 +159,16 @@ fn c_elem_type(ty: &TypeRef, module: &str) -> String {
         TypeRef::TypedHandle(_) | TypeRef::Handle => "weaveffi_handle_t".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "const uint8_t*".into(),
-        TypeRef::Struct(s) => format!("{}*", c_abi_struct_name(s, module, "weaveffi")),
-        TypeRef::Enum(e) => format!("weaveffi_{module}_{e}"),
+        TypeRef::Struct(s) => format!("{}*", c_abi_struct_name(s, module, prefix)),
+        TypeRef::Enum(e) => format!("{prefix}_{module}_{e}"),
         TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
-            c_elem_type(inner, module)
+            c_elem_type(inner, module, prefix)
         }
         TypeRef::Map(_, _) => "void*".into(),
     }
 }
 
-fn c_ret_type_str(ty: &TypeRef, module: &str) -> String {
+fn c_ret_type_str(ty: &TypeRef, module: &str, prefix: &str) -> String {
     match ty {
         TypeRef::I32 => "int32_t".into(),
         TypeRef::U32 => "uint32_t".into(),
@@ -169,16 +178,16 @@ fn c_ret_type_str(ty: &TypeRef, module: &str) -> String {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "const uint8_t*".into(),
         TypeRef::TypedHandle(_) | TypeRef::Handle => "weaveffi_handle_t".into(),
-        TypeRef::Struct(s) => format!("{}*", c_abi_struct_name(s, module, "weaveffi")),
-        TypeRef::Enum(e) => format!("weaveffi_{module}_{e}"),
+        TypeRef::Struct(s) => format!("{}*", c_abi_struct_name(s, module, prefix)),
+        TypeRef::Enum(e) => format!("{prefix}_{module}_{e}"),
         TypeRef::Optional(inner) => {
             if is_c_ptr_type(inner) {
-                c_ret_type_str(inner, module)
+                c_ret_type_str(inner, module, prefix)
             } else {
-                format!("{}*", c_elem_type(inner, module))
+                format!("{}*", c_elem_type(inner, module, prefix))
             }
         }
-        TypeRef::List(inner) => format!("{}*", c_elem_type(inner, module)),
+        TypeRef::List(inner) => format!("{}*", c_elem_type(inner, module, prefix)),
         TypeRef::Map(_, _) => "void".into(),
         TypeRef::Iterator(_) => "void*".into(),
     }
@@ -197,13 +206,19 @@ fn napi_getter(ty: &TypeRef) -> &'static str {
     }
 }
 
-fn render_addon_c(api: &Api, strip_module_prefix: bool, input_basename: &str) -> String {
+fn render_addon_c(
+    api: &Api,
+    prefix: &str,
+    strip_module_prefix: bool,
+    input_basename: &str,
+) -> String {
     let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
-    out.push_str(
-        "#include <node_api.h>\n#include \"weaveffi.h\"\n#include <stdlib.h>\n#include <string.h>\n\n",
-    );
+    out.push_str(&format!(
+        "#include <node_api.h>\n#include \"{prefix}.h\"\n#include <stdlib.h>\n#include <string.h>\n\n"
+    ));
 
-    let has_async = walk_modules(&api.modules).any(|m| m.functions.iter().any(|f| f.r#async));
+    let model = BindingModel::build(api, prefix);
+    let has_async = model.functions().any(|(_, f)| f.is_async);
     if has_async {
         out.push_str("typedef struct {\n");
         out.push_str("    napi_env env;\n");
@@ -212,26 +227,26 @@ fn render_addon_c(api: &Api, strip_module_prefix: bool, input_basename: &str) ->
     }
 
     let mut all_exports: Vec<(String, String)> = Vec::new();
-    let structs = struct_registry(api);
+    let structs = struct_registry(&model);
 
-    for (m, path) in walk_modules_with_path(&api.modules) {
+    for m in &model.modules {
         for f in &m.functions {
-            let c_name = format!("weaveffi_{}_{}", path, f.name);
+            let c_name = &f.c_base;
             let napi_name = format!("Napi_{c_name}");
-            let js_name = wrapper_name(&path, &f.name, strip_module_prefix);
+            let js_name = wrapper_name(&m.path, &f.name, strip_module_prefix);
             all_exports.push((js_name, napi_name.clone()));
 
-            if f.r#async {
-                render_async_callback(&mut out, f, &c_name, &path, &structs);
+            if f.is_async {
+                render_async_callback(&mut out, f, c_name, &m.path, prefix, &structs);
             }
 
             out.push_str(&format!(
                 "static napi_value {napi_name}(napi_env env, napi_callback_info info) {{\n"
             ));
-            if f.r#async {
-                render_async_napi_body(&mut out, f, &c_name, &path);
+            if f.is_async {
+                render_async_napi_body(&mut out, f, c_name, &m.path, prefix);
             } else {
-                render_napi_body(&mut out, f, &c_name, &path, &structs);
+                render_napi_body(&mut out, f, c_name, &m.path, prefix, &structs);
             }
             out.push_str("}\n\n");
         }
@@ -261,7 +276,7 @@ fn render_addon_c(api: &Api, strip_module_prefix: bool, input_basename: &str) ->
     out
 }
 
-fn async_cb_result_params_node(ret: Option<&TypeRef>, module: &str) -> String {
+fn async_cb_result_params_node(ret: Option<&TypeRef>, module: &str, prefix: &str) -> String {
     match ret {
         None => String::new(),
         Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => ", const char* result".into(),
@@ -269,15 +284,15 @@ fn async_cb_result_params_node(ret: Option<&TypeRef>, module: &str) -> String {
             ", const uint8_t* result, size_t result_len".into()
         }
         Some(TypeRef::List(inner)) => {
-            let et = c_elem_type(inner, module);
+            let et = c_elem_type(inner, module, prefix);
             format!(", {et}* result, size_t result_len")
         }
         Some(TypeRef::Map(k, v)) => {
-            let kt = c_elem_type(k, module);
-            let vt = c_elem_type(v, module);
+            let kt = c_elem_type(k, module, prefix);
+            let vt = c_elem_type(v, module, prefix);
             format!(", {kt}* result_keys, {vt}* result_values, size_t result_len")
         }
-        Some(t) => format!(", {} result", c_ret_type_str(t, module)),
+        Some(t) => format!(", {} result", c_ret_type_str(t, module, prefix)),
     }
 }
 
@@ -285,7 +300,8 @@ fn emit_async_resolve_value(
     out: &mut String,
     ret: Option<&TypeRef>,
     module: &str,
-    structs: &HashMap<String, StructDef>,
+    prefix: &str,
+    structs: &HashMap<String, StructBinding>,
 ) {
     out.push_str("        napi_value val;\n");
     match ret {
@@ -305,7 +321,7 @@ fn emit_async_resolve_value(
         }
         Some(TypeRef::Struct(name)) => {
             emit_struct_to_object(
-                out, "ctx->env", name, "result", "val", module, structs, "        ", true,
+                out, "ctx->env", name, "result", "val", module, prefix, structs, "        ", true,
             );
         }
         Some(TypeRef::Enum(_)) => {
@@ -321,13 +337,14 @@ fn emit_async_resolve_value(
 
 fn render_async_callback(
     out: &mut String,
-    f: &Function,
+    f: &FnBinding,
     c_name: &str,
     module: &str,
-    structs: &HashMap<String, StructDef>,
+    prefix: &str,
+    structs: &HashMap<String, StructBinding>,
 ) {
     let cb_name = format!("{c_name}_napi_cb");
-    let cb_result = async_cb_result_params_node(f.returns.as_ref(), module);
+    let cb_result = async_cb_result_params_node(f.ret.as_ref(), module, prefix);
 
     out.push_str(&format!(
         "static void {cb_name}(void* context, weaveffi_error* err{cb_result}) {{\n"
@@ -340,13 +357,19 @@ fn render_async_callback(
     );
     out.push_str("        napi_reject_deferred(ctx->env, ctx->deferred, err_msg);\n");
     out.push_str("    } else {\n");
-    emit_async_resolve_value(out, f.returns.as_ref(), module, structs);
+    emit_async_resolve_value(out, f.ret.as_ref(), module, prefix, structs);
     out.push_str("    }\n");
     out.push_str("    free(ctx);\n");
     out.push_str("}\n\n");
 }
 
-fn render_async_napi_body(out: &mut String, f: &Function, c_name: &str, module: &str) {
+fn render_async_napi_body(
+    out: &mut String,
+    f: &FnBinding,
+    c_name: &str,
+    module: &str,
+    prefix: &str,
+) {
     let n = f.params.len();
     if n > 0 {
         out.push_str(&format!("  size_t argc = {n};\n"));
@@ -360,7 +383,16 @@ fn render_async_napi_body(out: &mut String, f: &Function, c_name: &str, module: 
     let mut c_args: Vec<String> = Vec::new();
     let mut cleanups: Vec<String> = Vec::new();
     for (i, p) in f.params.iter().enumerate() {
-        emit_param(out, &mut c_args, &mut cleanups, &p.ty, &p.name, i, module);
+        emit_param(
+            out,
+            &mut c_args,
+            &mut cleanups,
+            &p.ty,
+            &p.name,
+            i,
+            module,
+            prefix,
+        );
     }
 
     out.push_str(
@@ -389,10 +421,11 @@ fn render_async_napi_body(out: &mut String, f: &Function, c_name: &str, module: 
 
 fn render_napi_body(
     out: &mut String,
-    f: &Function,
+    f: &FnBinding,
     c_name: &str,
     module: &str,
-    structs: &HashMap<String, StructDef>,
+    prefix: &str,
+    structs: &HashMap<String, StructBinding>,
 ) {
     let n = f.params.len();
     if n > 0 {
@@ -407,18 +440,27 @@ fn render_napi_body(
     let mut c_args: Vec<String> = Vec::new();
     let mut cleanups: Vec<String> = Vec::new();
     for (i, p) in f.params.iter().enumerate() {
-        emit_param(out, &mut c_args, &mut cleanups, &p.ty, &p.name, i, module);
+        emit_param(
+            out,
+            &mut c_args,
+            &mut cleanups,
+            &p.ty,
+            &p.name,
+            i,
+            module,
+            prefix,
+        );
     }
 
     out.push_str("  weaveffi_error err = {0};\n");
 
-    if let Some(ret) = &f.returns {
-        emit_ret_out_params(out, &mut c_args, ret, module);
+    if let Some(ret) = &f.ret {
+        emit_ret_out_params(out, &mut c_args, ret, module, prefix);
     }
     c_args.push("&err".to_string());
 
     let args_str = c_args.join(", ");
-    let ret_type = f.returns.as_ref().map(|r| c_ret_type_str(r, module));
+    let ret_type = f.ret.as_ref().map(|r| c_ret_type_str(r, module, prefix));
     match &ret_type {
         Some(rt) if rt != "void" => {
             out.push_str(&format!("  {rt} result = {c_name}({args_str});\n"));
@@ -438,8 +480,8 @@ fn render_napi_body(
     out.push_str("    return NULL;\n");
     out.push_str("  }\n");
 
-    match &f.returns {
-        Some(ret) => emit_ret_to_napi(out, ret, module, &f.name, structs),
+    match &f.ret {
+        Some(ret) => emit_ret_to_napi(out, ret, module, prefix, &f.name, structs),
         None => {
             out.push_str("  napi_value ret;\n");
             out.push_str("  napi_get_undefined(env, &ret);\n");
@@ -448,6 +490,7 @@ fn render_napi_body(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_param(
     out: &mut String,
     c_args: &mut Vec<String>,
@@ -456,10 +499,11 @@ fn emit_param(
     name: &str,
     idx: usize,
     module: &str,
+    prefix: &str,
 ) {
     match ty {
         TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Bool => {
-            let ct = c_elem_type(ty, module);
+            let ct = c_elem_type(ty, module, prefix);
             let getter = napi_getter(ty);
             out.push_str(&format!("  {ct} {name};\n"));
             out.push_str(&format!("  {getter}(env, args[{idx}], &{name});\n"));
@@ -491,10 +535,10 @@ fn emit_param(
             out.push_str(&format!(
                 "  napi_get_value_int32(env, args[{idx}], &{name});\n"
             ));
-            c_args.push(format!("(weaveffi_{module}_{e}){name}"));
+            c_args.push(format!("({prefix}_{module}_{e}){name}"));
         }
         TypeRef::Struct(s) => {
-            let abi = c_abi_struct_name(s, module, "weaveffi");
+            let abi = c_abi_struct_name(s, module, prefix);
             out.push_str(&format!("  int64_t {name}_raw;\n"));
             out.push_str(&format!(
                 "  napi_get_value_int64(env, args[{idx}], &{name}_raw);\n"
@@ -504,10 +548,10 @@ fn emit_param(
         TypeRef::Optional(inner) => {
             out.push_str(&format!("  napi_valuetype {name}_type;\n"));
             out.push_str(&format!("  napi_typeof(env, args[{idx}], &{name}_type);\n"));
-            emit_optional_param(out, c_args, cleanups, inner, name, idx, module);
+            emit_optional_param(out, c_args, cleanups, inner, name, idx, module, prefix);
         }
         TypeRef::List(inner) => {
-            emit_list_param(out, c_args, cleanups, inner, name, idx, module);
+            emit_list_param(out, c_args, cleanups, inner, name, idx, module, prefix);
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             out.push_str(&format!("  void* {name}_raw;\n"));
@@ -519,7 +563,7 @@ fn emit_param(
             c_args.push(format!("{name}_len"));
         }
         TypeRef::Map(k, v) => {
-            emit_map_param(out, c_args, cleanups, k, v, name, idx, module);
+            emit_map_param(out, c_args, cleanups, k, v, name, idx, module, prefix);
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
     }
@@ -544,6 +588,7 @@ fn emit_opt_val(
     c_args.push(format!("{name}_ptr"));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_optional_param(
     out: &mut String,
     c_args: &mut Vec<String>,
@@ -552,6 +597,7 @@ fn emit_optional_param(
     name: &str,
     idx: usize,
     module: &str,
+    prefix: &str,
 ) {
     match inner {
         TypeRef::I32 => {
@@ -587,7 +633,7 @@ fn emit_optional_param(
             c_args.push(format!("{name}_ptr"));
         }
         TypeRef::Enum(e) => {
-            let etype = format!("weaveffi_{module}_{e}");
+            let etype = format!("{prefix}_{module}_{e}");
             out.push_str(&format!("  int32_t {name}_raw;\n"));
             out.push_str(&format!("  {etype} {name}_val;\n"));
             out.push_str(&format!("  const {etype}* {name}_ptr = NULL;\n"));
@@ -620,7 +666,7 @@ fn emit_optional_param(
             cleanups.push(format!("  free({name});\n"));
         }
         TypeRef::Struct(s) => {
-            let abi = c_abi_struct_name(s, module, "weaveffi");
+            let abi = c_abi_struct_name(s, module, prefix);
             out.push_str(&format!("  int64_t {name}_raw = 0;\n"));
             out.push_str(&format!(
                 "  if ({name}_type != napi_null && {name}_type != napi_undefined) {{\n"
@@ -634,11 +680,12 @@ fn emit_optional_param(
             ));
         }
         _ => {
-            emit_param(out, c_args, cleanups, inner, name, idx, module);
+            emit_param(out, c_args, cleanups, inner, name, idx, module, prefix);
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_list_param(
     out: &mut String,
     c_args: &mut Vec<String>,
@@ -647,8 +694,9 @@ fn emit_list_param(
     name: &str,
     idx: usize,
     module: &str,
+    prefix: &str,
 ) {
-    let et = c_elem_type(inner, module);
+    let et = c_elem_type(inner, module, prefix);
     out.push_str(&format!("  uint32_t {name}_count;\n"));
     out.push_str(&format!(
         "  napi_get_array_length(env, args[{idx}], &{name}_count);\n"
@@ -739,9 +787,10 @@ fn emit_map_param(
     name: &str,
     idx: usize,
     module: &str,
+    prefix: &str,
 ) {
-    let kt = c_elem_type(k, module);
-    let vt = c_elem_type(v, module);
+    let kt = c_elem_type(k, module, prefix);
+    let vt = c_elem_type(v, module, prefix);
     out.push_str(&format!("  napi_value {name}_keys_napi;\n"));
     out.push_str(&format!(
         "  napi_get_property_names(env, args[{idx}], &{name}_keys_napi);\n"
@@ -830,15 +879,21 @@ fn emit_map_param(
     cleanups.push(format!("  free({name}_values);\n"));
 }
 
-fn emit_ret_out_params(out: &mut String, c_args: &mut Vec<String>, ty: &TypeRef, module: &str) {
+fn emit_ret_out_params(
+    out: &mut String,
+    c_args: &mut Vec<String>,
+    ty: &TypeRef,
+    module: &str,
+    prefix: &str,
+) {
     match ty {
         TypeRef::Bytes | TypeRef::List(_) => {
             out.push_str("  size_t out_len;\n");
             c_args.push("&out_len".into());
         }
         TypeRef::Map(k, v) => {
-            let kt = c_elem_type(k, module);
-            let vt = c_elem_type(v, module);
+            let kt = c_elem_type(k, module, prefix);
+            let vt = c_elem_type(v, module, prefix);
             out.push_str(&format!("  {kt}* out_keys = NULL;\n"));
             out.push_str(&format!("  {vt}* out_values = NULL;\n"));
             out.push_str("  size_t out_len = 0;\n");
@@ -847,7 +902,7 @@ fn emit_ret_out_params(out: &mut String, c_args: &mut Vec<String>, ty: &TypeRef,
             c_args.push("&out_len".into());
         }
         TypeRef::Optional(inner) if is_c_ptr_type(inner) => {
-            emit_ret_out_params(out, c_args, inner, module);
+            emit_ret_out_params(out, c_args, inner, module, prefix);
         }
         _ => {}
     }
@@ -856,8 +911,10 @@ fn emit_ret_out_params(out: &mut String, c_args: &mut Vec<String>, ty: &TypeRef,
 /// Build a `name -> StructDef` registry over every (possibly nested) module so
 /// that struct-returning functions can materialize a real JS object (matching
 /// the shape declared in `types.d.ts`) instead of leaking a raw handle number.
-fn struct_registry(api: &Api) -> HashMap<String, StructDef> {
-    walk_modules(&api.modules)
+fn struct_registry(model: &BindingModel) -> HashMap<String, StructBinding> {
+    model
+        .modules
+        .iter()
         .flat_map(|m| m.structs.iter())
         .map(|s| (s.name.clone(), s.clone()))
         .collect()
@@ -875,11 +932,11 @@ fn emit_struct_to_object(
     ptr_expr: &str,
     obj_var: &str,
     module: &str,
-    structs: &HashMap<String, StructDef>,
+    prefix: &str,
+    structs: &HashMap<String, StructBinding>,
     indent: &str,
     destroy: bool,
 ) {
-    let abi = c_abi_struct_name(struct_name, module, "weaveffi");
     let Some(def) = structs.get(local_type_name(struct_name)).cloned() else {
         // Unknown struct: fall back to the raw handle rather than emit broken C.
         out.push_str(&format!(
@@ -887,6 +944,7 @@ fn emit_struct_to_object(
         ));
         return;
     };
+    let abi = &def.c_tag;
     let p = format!("{obj_var}_p");
     out.push_str(&format!("{indent}{{\n"));
     out.push_str(&format!("{indent}  {abi}* {p} = ({abi}*){ptr_expr};\n"));
@@ -894,17 +952,18 @@ fn emit_struct_to_object(
         "{indent}  napi_create_object({env}, &{obj_var});\n"
     ));
     for field in &def.fields {
-        let getter = format!("{abi}_get_{}", field.name);
+        let getter = &field.getter_symbol;
         let fv = format!("{obj_var}_{}", field.name);
         out.push_str(&format!("{indent}  napi_value {fv};\n"));
         emit_struct_field_to_napi(
             out,
             env,
             &field.ty,
-            &getter,
+            getter,
             &p,
             &fv,
             module,
+            prefix,
             structs,
             &format!("{indent}  "),
         );
@@ -914,7 +973,7 @@ fn emit_struct_to_object(
         ));
     }
     if destroy {
-        out.push_str(&format!("{indent}  {abi}_destroy({p});\n"));
+        out.push_str(&format!("{indent}  {}({p});\n", def.destroy_symbol));
     }
     out.push_str(&format!("{indent}}}\n"));
 }
@@ -932,7 +991,8 @@ fn emit_struct_field_to_napi(
     pv: &str,
     fv: &str,
     module: &str,
-    structs: &HashMap<String, StructDef>,
+    prefix: &str,
+    structs: &HashMap<String, StructBinding>,
     indent: &str,
 ) {
     match ty {
@@ -979,6 +1039,7 @@ fn emit_struct_field_to_napi(
                 &format!("{getter}({pv})"),
                 fv,
                 module,
+                prefix,
                 structs,
                 indent,
                 true,
@@ -1008,7 +1069,7 @@ fn emit_struct_field_to_napi(
             let TypeRef::Struct(name) = inner.as_ref() else {
                 unreachable!()
             };
-            let abi = c_abi_struct_name(name, module, "weaveffi");
+            let abi = c_abi_struct_name(name, module, prefix);
             out.push_str(&format!("{indent}{{\n"));
             out.push_str(&format!("{indent}  {abi}* {fv}_sp = {getter}({pv});\n"));
             out.push_str(&format!(
@@ -1022,6 +1083,7 @@ fn emit_struct_field_to_napi(
                 &format!("{fv}_sp"),
                 fv,
                 module,
+                prefix,
                 structs,
                 &format!("{indent}    "),
                 true,
@@ -1037,8 +1099,9 @@ fn emit_ret_to_napi(
     out: &mut String,
     ty: &TypeRef,
     module: &str,
+    prefix: &str,
     fn_name: &str,
-    structs: &HashMap<String, StructDef>,
+    structs: &HashMap<String, StructBinding>,
 ) {
     out.push_str("  napi_value ret;\n");
     match ty {
@@ -1059,7 +1122,7 @@ fn emit_ret_to_napi(
         }
         TypeRef::Struct(name) => {
             emit_struct_to_object(
-                out, "env", name, "result", "ret", module, structs, "  ", true,
+                out, "env", name, "result", "ret", module, prefix, structs, "  ", true,
             );
         }
         TypeRef::Enum(_) => {
@@ -1076,17 +1139,17 @@ fn emit_ret_to_napi(
             out.push_str("  if (result == NULL) {\n");
             out.push_str("    napi_get_null(env, &ret);\n");
             out.push_str("  } else {\n");
-            emit_optional_ret_inner(out, inner, module, structs);
+            emit_optional_ret_inner(out, inner, module, prefix, structs);
             out.push_str("  }\n");
         }
-        TypeRef::List(inner) => emit_list_ret(out, inner, module, "  ", structs),
+        TypeRef::List(inner) => emit_list_ret(out, inner, module, prefix, "  ", structs),
         TypeRef::Map(_, _) => {
             out.push_str("  napi_create_object(env, &ret);\n");
         }
         TypeRef::Iterator(inner) => {
             let fn_pascal = fn_name.to_upper_camel_case();
-            let iter_type = format!("weaveffi_{module}_{fn_pascal}Iterator");
-            let et = c_elem_type(inner, module);
+            let iter_type = format!("{prefix}_{module}_{fn_pascal}Iterator");
+            let et = c_elem_type(inner, module, prefix);
             out.push_str("  napi_create_array(env, &ret);\n");
             out.push_str("  uint32_t iter_idx = 0;\n");
             out.push_str(&format!("  {et} iter_item;\n"));
@@ -1140,7 +1203,8 @@ fn emit_optional_ret_inner(
     out: &mut String,
     inner: &TypeRef,
     module: &str,
-    structs: &HashMap<String, StructDef>,
+    prefix: &str,
+    structs: &HashMap<String, StructBinding>,
 ) {
     match inner {
         TypeRef::I32 => {
@@ -1177,10 +1241,10 @@ fn emit_optional_ret_inner(
         }
         TypeRef::Struct(name) => {
             emit_struct_to_object(
-                out, "env", name, "result", "ret", module, structs, "    ", true,
+                out, "env", name, "result", "ret", module, prefix, structs, "    ", true,
             );
         }
-        TypeRef::List(li) => emit_list_ret(out, li, module, "    ", structs),
+        TypeRef::List(li) => emit_list_ret(out, li, module, prefix, "    ", structs),
         _ => out.push_str("    napi_get_null(env, &ret);\n"),
     }
 }
@@ -1189,8 +1253,9 @@ fn emit_list_ret(
     out: &mut String,
     inner: &TypeRef,
     module: &str,
+    prefix: &str,
     ind: &str,
-    structs: &HashMap<String, StructDef>,
+    structs: &HashMap<String, StructBinding>,
 ) {
     out.push_str(&format!(
         "{ind}napi_create_array_with_length(env, out_len, &ret);\n"
@@ -1236,6 +1301,7 @@ fn emit_list_ret(
                 "result[ret_i]",
                 "elem",
                 module,
+                prefix,
                 structs,
                 &elem_indent,
                 true,
@@ -1290,7 +1356,7 @@ fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
 fn emit_fn_doc(
     out: &mut String,
     doc: &Option<String>,
-    params: &[weaveffi_ir::ir::Param],
+    params: &[ParamBinding],
     indent: &str,
     extra_tags: &[String],
 ) {
@@ -1346,7 +1412,7 @@ fn emit_fn_doc(
     out.push_str(" */\n");
 }
 
-fn render_struct_builder_dts(out: &mut String, s: &StructDef) {
+fn render_struct_builder_dts(out: &mut String, s: &StructBinding) {
     let name = &s.name;
     emit_doc(out, &s.doc, "");
     out.push_str(&format!("export interface {}Builder {{\n", s.name));
@@ -1360,10 +1426,16 @@ fn render_struct_builder_dts(out: &mut String, s: &StructDef) {
     out.push_str("}\n");
 }
 
-fn render_node_dts(api: &Api, strip_module_prefix: bool, input_basename: &str) -> String {
+fn render_node_dts(
+    api: &Api,
+    prefix: &str,
+    strip_module_prefix: bool,
+    input_basename: &str,
+) -> String {
+    let model = BindingModel::build(api, prefix);
     let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
     out.push_str("// Generated types for WeaveFFI functions\n");
-    for (m, path) in walk_modules_with_path(&api.modules) {
+    for m in &model.modules {
         for s in &m.structs {
             emit_doc(&mut out, &s.doc, "");
             out.push_str(&format!("export interface {} {{\n", s.name));
@@ -1372,7 +1444,7 @@ fn render_node_dts(api: &Api, strip_module_prefix: bool, input_basename: &str) -
                 out.push_str(&format!("  {}: {};\n", field.name, ts_type_for(&field.ty)));
             }
             out.push_str("}\n");
-            if s.builder {
+            if s.builder.is_some() {
                 render_struct_builder_dts(&mut out, s);
             }
         }
@@ -1385,24 +1457,24 @@ fn render_node_dts(api: &Api, strip_module_prefix: bool, input_basename: &str) -
             }
             out.push_str("}\n");
         }
-        out.push_str(&format!("// module {}\n", path));
+        out.push_str(&format!("// module {}\n", m.path));
         for f in &m.functions {
             let params: Vec<String> = f
                 .params
                 .iter()
                 .map(|p| format!("{}: {}", p.name, ts_type_for(&p.ty)))
                 .collect();
-            let base_ret = match &f.returns {
+            let base_ret = match &f.ret {
                 Some(ty) => ts_type_for(ty),
                 None => "void".into(),
             };
-            let ret = if f.r#async {
+            let ret = if f.is_async {
                 format!("Promise<{base_ret}>")
             } else {
                 base_ret
             };
-            let ts_name = wrapper_name(&path, &f.name, strip_module_prefix);
-            let mut tags = vec![format!("Maps to C function: weaveffi_{}_{}", path, f.name)];
+            let ts_name = wrapper_name(&m.path, &f.name, strip_module_prefix);
+            let mut tags = vec![format!("Maps to C function: {}", f.c_base)];
             if let Some(msg) = &f.deprecated {
                 tags.push(format!("@deprecated {}", msg));
             }
@@ -1568,7 +1640,7 @@ mod tests {
             since: None,
         });
 
-        let dts = render_node_dts(&make_api(vec![m]), true, "weaveffi.yml");
+        let dts = render_node_dts(&make_api(vec![m]), "weaveffi", true, "weaveffi.yml");
 
         assert!(dts.contains("export interface Contact {"));
         assert!(dts.contains("  name: string;"));
@@ -1939,7 +2011,7 @@ mod tests {
             m
         }]);
 
-        let dts = render_node_dts(&api, true, "weaveffi.yml");
+        let dts = render_node_dts(&api, "weaveffi", true, "weaveffi.yml");
 
         assert!(
             dts.contains("Maps to C function: weaveffi_math_add"),
@@ -1980,7 +2052,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true, "weaveffi.yml");
+        let addon = render_addon_c(&api, "weaveffi", true, "weaveffi.yml");
         assert!(
             !addon.contains("// TODO: implement"),
             "generated addon.c should not contain TODO comments: {addon}"
@@ -2016,7 +2088,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true, "weaveffi.yml");
+        let addon = render_addon_c(&api, "weaveffi", true, "weaveffi.yml");
         assert!(
             addon.contains("napi_get_cb_info"),
             "generated addon.c should call napi_get_cb_info: {addon}"
@@ -2044,7 +2116,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true, "weaveffi.yml");
+        let addon = render_addon_c(&api, "weaveffi", true, "weaveffi.yml");
         assert!(
             addon.contains("weaveffi_free_string(result)"),
             "generated addon should free returned strings: {addon}"
@@ -2061,6 +2133,71 @@ mod tests {
             addon.contains("weaveffi_error_clear(&err)"),
             "generated addon should clear errors: {addon}"
         );
+    }
+
+    #[test]
+    fn node_custom_prefix_threads_to_user_symbols() {
+        let api = make_api(vec![{
+            let mut m = make_module("greet");
+            m.functions.push(Function {
+                name: "hello".into(),
+                params: vec![Param {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                    doc: None,
+                }],
+                returns: Some(TypeRef::StringUtf8),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            });
+            m
+        }]);
+
+        let config = NodeConfig {
+            prefix: Some("myffi".into()),
+            ..NodeConfig::default()
+        };
+
+        let tmp = std::env::temp_dir().join("weaveffi_test_node_custom_prefix");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
+
+        NodeGenerator.generate(&api, out_dir, &config).unwrap();
+
+        // The output file name is a fixed library artifact name, not the ABI
+        // prefix, so it stays `weaveffi_addon.c` regardless of `prefix`.
+        let addon = std::fs::read_to_string(tmp.join("node/weaveffi_addon.c")).unwrap();
+
+        // User symbols pick up the configured ABI prefix.
+        assert!(
+            addon.contains("myffi_greet_hello"),
+            "addon should call the prefixed user symbol myffi_greet_hello: {addon}"
+        );
+        assert!(
+            !addon.contains("weaveffi_greet_hello"),
+            "addon must not emit the hard-coded weaveffi_ user symbol: {addon}"
+        );
+        assert!(
+            addon.contains("#include \"myffi.h\""),
+            "addon should include the prefixed header myffi.h: {addon}"
+        );
+
+        // Runtime ABI helpers are supplied by weaveffi-abi and stay literal.
+        assert!(
+            addon.contains("weaveffi_error"),
+            "runtime weaveffi_error must remain literal: {addon}"
+        );
+        assert!(
+            addon.contains("weaveffi_free_string"),
+            "runtime weaveffi_free_string must remain literal: {addon}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -2092,7 +2229,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true, "weaveffi.yml");
+        let addon = render_addon_c(&api, "weaveffi", true, "weaveffi.yml");
         assert!(
             addon.contains("err.code"),
             "generated addon.c should check err.code: {addon}"
@@ -2203,7 +2340,7 @@ mod tests {
             });
             m
         }]);
-        let dts = render_node_dts(&api, true, "weaveffi.yml");
+        let dts = render_node_dts(&api, "weaveffi", true, "weaveffi.yml");
         assert!(
             dts.contains("contact: Contact"),
             "TypedHandle should use class type not bigint: {dts}"
@@ -2248,7 +2385,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let dts = render_node_dts(&api, true, "weaveffi.yml");
+        let dts = render_node_dts(&api, "weaveffi", true, "weaveffi.yml");
         assert!(
             dts.contains("(Contact | null)[] | null"),
             "should contain deeply nested optional type: {dts}"
@@ -2284,7 +2421,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let dts = render_node_dts(&api, true, "weaveffi.yml");
+        let dts = render_node_dts(&api, "weaveffi", true, "weaveffi.yml");
         assert!(
             dts.contains("Record<string, number[]>"),
             "should contain map of lists type: {dts}"
@@ -2350,7 +2487,7 @@ mod tests {
             errors: None,
             modules: vec![],
         }]);
-        let dts = render_node_dts(&api, true, "weaveffi.yml");
+        let dts = render_node_dts(&api, "weaveffi", true, "weaveffi.yml");
         assert!(
             dts.contains("Record<Color, Contact>"),
             "should contain enum-keyed map type: {dts}"
@@ -2389,7 +2526,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true, "weaveffi.yml");
+        let addon = render_addon_c(&api, "weaveffi", true, "weaveffi.yml");
         assert!(
             addon.contains("free(name)"),
             "malloc'd JS string copy should be freed after the C call: {addon}"
@@ -2456,7 +2593,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true, "weaveffi.yml");
+        let addon = render_addon_c(&api, "weaveffi", true, "weaveffi.yml");
         assert!(
             addon.contains("if (result == NULL)"),
             "optional struct return should null-check before wrapping: {addon}"
@@ -2498,7 +2635,7 @@ mod tests {
             });
             m
         }]);
-        let dts = render_node_dts(&api, true, "weaveffi.yml");
+        let dts = render_node_dts(&api, "weaveffi", true, "weaveffi.yml");
         assert!(
             dts.contains("Promise<"),
             "async function should return Promise in .d.ts: {dts}"
@@ -2534,7 +2671,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true, "weaveffi.yml");
+        let addon = render_addon_c(&api, "weaveffi", true, "weaveffi.yml");
         assert!(
             addon.contains("napi_create_promise"),
             "async addon should call napi_create_promise: {addon}"
@@ -2587,7 +2724,7 @@ mod tests {
             });
             m
         }]);
-        let addon = render_addon_c(&api, true, "weaveffi.yml");
+        let addon = render_addon_c(&api, "weaveffi", true, "weaveffi.yml");
         let create_count = addon.matches("napi_create_promise").count();
         let resolve_count = addon.matches("napi_resolve_deferred").count();
         let reject_count = addon.matches("napi_reject_deferred").count();
@@ -2660,32 +2797,57 @@ mod tests {
 
     #[test]
     fn node_emits_doc_on_function() {
-        let dts = render_node_dts(&make_api(vec![doc_module()]), true, "weaveffi.yml");
+        let dts = render_node_dts(
+            &make_api(vec![doc_module()]),
+            "weaveffi",
+            true,
+            "weaveffi.yml",
+        );
         assert!(dts.contains("Performs a thing."), "{dts}");
     }
 
     #[test]
     fn node_emits_doc_on_struct() {
-        let dts = render_node_dts(&make_api(vec![doc_module()]), true, "weaveffi.yml");
+        let dts = render_node_dts(
+            &make_api(vec![doc_module()]),
+            "weaveffi",
+            true,
+            "weaveffi.yml",
+        );
         assert!(dts.contains("/** An item we track. */"), "{dts}");
     }
 
     #[test]
     fn node_emits_doc_on_enum_variant() {
-        let dts = render_node_dts(&make_api(vec![doc_module()]), true, "weaveffi.yml");
+        let dts = render_node_dts(
+            &make_api(vec![doc_module()]),
+            "weaveffi",
+            true,
+            "weaveffi.yml",
+        );
         assert!(dts.contains("/** Kind of item. */"), "{dts}");
         assert!(dts.contains("/** A small one */"), "{dts}");
     }
 
     #[test]
     fn node_emits_doc_on_field() {
-        let dts = render_node_dts(&make_api(vec![doc_module()]), true, "weaveffi.yml");
+        let dts = render_node_dts(
+            &make_api(vec![doc_module()]),
+            "weaveffi",
+            true,
+            "weaveffi.yml",
+        );
         assert!(dts.contains("/** Stable id */"), "{dts}");
     }
 
     #[test]
     fn node_emits_doc_on_param() {
-        let dts = render_node_dts(&make_api(vec![doc_module()]), true, "weaveffi.yml");
+        let dts = render_node_dts(
+            &make_api(vec![doc_module()]),
+            "weaveffi",
+            true,
+            "weaveffi.yml",
+        );
         assert!(dts.contains("@param x the input value"), "{dts}");
     }
 }
