@@ -9,7 +9,7 @@
 //!
 //! [`LanguageBackend`] captures the common structure as a trait whose hooks a
 //! backend implements, and the free [`run`]/[`output_files`] functions plus the
-//! [`impl_generator_via_backend!`] macro provide the shared driver. A backend
+//! [`impl_generator_via_backend!`](crate::impl_generator_via_backend) macro provide the shared driver. A backend
 //! now owns *only* language-specific rendering: type mapping, marshalling, and
 //! the exact text of each declaration. The traversal order, the call-shape
 //! dispatch, the model construction, and the bridge to the object-safe
@@ -50,7 +50,7 @@ impl OutputFile {
 /// An idiomatic language backend over the shared [`BindingModel`].
 ///
 /// The single required method is [`files`](Self::files), which assembles the
-/// complete output set; pair it with [`impl_generator_via_backend!`] to wire
+/// complete output set; pair it with [`impl_generator_via_backend!`](crate::impl_generator_via_backend) to wire
 /// the type into the [`Generator`](crate::codegen::Generator) trait the CLI and
 /// orchestrator consume. That alone gives every backend the shared driver, the
 /// [`OutputFile`] model (rendering is pure; the driver does the I/O), an
@@ -183,7 +183,7 @@ pub trait LanguageBackend: Send + Sync {
 /// Build the model and write every file a backend produces.
 ///
 /// This is the body of the [`Generator::generate`](crate::codegen::Generator)
-/// impl that [`impl_generator_via_backend!`] generates.
+/// impl that [`impl_generator_via_backend!`](crate::impl_generator_via_backend) generates.
 pub fn run<B: LanguageBackend>(
     backend: &B,
     api: &Api,
@@ -200,10 +200,27 @@ pub fn run<B: LanguageBackend>(
     Ok(())
 }
 
+/// Render a path for listing with `/` separators on every platform.
+///
+/// `Utf8Path::join` emits the platform separator, so on Windows a backend's
+/// `out_dir.join("c").join("weaveffi.h")` yields `c\weaveffi.h`. The listing
+/// surfaced by `--dry-run` and `weaveffi diff` (and asserted by the snapshot
+/// and unit suites) must be OS-independent, so fold `\` back to `/`. A no-op
+/// off Windows, where `\` is a legal filename byte we must not rewrite.
+fn forward_slashes(path: Utf8PathBuf) -> String {
+    let s = path.into_string();
+    if cfg!(windows) {
+        s.replace('\\', "/")
+    } else {
+        s
+    }
+}
+
 /// The sorted list of paths a backend would write — the body of the
 /// [`Generator::output_files`](crate::codegen::Generator::output_files) impl
-/// that [`impl_generator_via_backend!`] generates. Used by `--dry-run` and
-/// `weaveffi diff`.
+/// that [`impl_generator_via_backend!`](crate::impl_generator_via_backend) generates. Used by `--dry-run` and
+/// `weaveffi diff`. Paths are normalised to `/` separators so the listing is
+/// identical across operating systems.
 pub fn output_files<B: LanguageBackend>(
     backend: &B,
     api: &Api,
@@ -214,11 +231,18 @@ pub fn output_files<B: LanguageBackend>(
     let mut paths: Vec<String> = backend
         .files(api, &model, out_dir, config)
         .into_iter()
-        .map(|f| f.path.into_string())
+        .map(|f| forward_slashes(f.path))
         .collect();
     paths.sort();
     paths
 }
+
+/// Re-export of `anyhow` so [`impl_generator_via_backend!`](crate::impl_generator_via_backend)
+/// can name the `Generator::generate` return type in its expansion without
+/// forcing every backend crate to declare a direct `anyhow` dependency it never
+/// references in its own source. Not part of the public API.
+#[doc(hidden)]
+pub use anyhow as __anyhow;
 
 /// Implement the object-safe [`Generator`](crate::codegen::Generator) trait for
 /// a type that implements [`LanguageBackend`], delegating to the shared driver.
@@ -243,7 +267,7 @@ macro_rules! impl_generator_via_backend {
                 api: &::weaveffi_ir::ir::Api,
                 out_dir: &::camino::Utf8Path,
                 config: &Self::Config,
-            ) -> ::anyhow::Result<()> {
+            ) -> $crate::backend::__anyhow::Result<()> {
                 $crate::backend::run(self, api, out_dir, config)
             }
 

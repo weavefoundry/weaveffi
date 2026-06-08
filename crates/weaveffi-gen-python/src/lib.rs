@@ -1627,12 +1627,12 @@ mod tests {
         assert_eq!(
             files,
             vec![
-                out.join("python/README.md").to_string(),
-                out.join("python/pyproject.toml").to_string(),
-                out.join("python/setup.py").to_string(),
-                out.join("python/weaveffi/__init__.py").to_string(),
-                out.join("python/weaveffi/weaveffi.py").to_string(),
-                out.join("python/weaveffi/weaveffi.pyi").to_string(),
+                format!("{out}/python/README.md"),
+                format!("{out}/python/pyproject.toml"),
+                format!("{out}/python/setup.py"),
+                format!("{out}/python/weaveffi/__init__.py"),
+                format!("{out}/python/weaveffi/weaveffi.py"),
+                format!("{out}/python/weaveffi/weaveffi.pyi"),
             ]
         );
     }

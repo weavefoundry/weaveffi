@@ -977,9 +977,9 @@ mod tests {
         assert_eq!(
             files,
             vec![
-                out.join("dart/README.md").to_string(),
-                out.join("dart/lib/weaveffi.dart").to_string(),
-                out.join("dart/pubspec.yaml").to_string(),
+                format!("{out}/dart/README.md"),
+                format!("{out}/dart/lib/weaveffi.dart"),
+                format!("{out}/dart/pubspec.yaml"),
             ]
         );
     }

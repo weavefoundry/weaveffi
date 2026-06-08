@@ -1078,9 +1078,9 @@ mod tests {
         assert_eq!(
             files,
             vec![
-                out.join("go/README.md").to_string(),
-                out.join("go/go.mod").to_string(),
-                out.join("go/weaveffi.go").to_string(),
+                format!("{out}/go/README.md"),
+                format!("{out}/go/go.mod"),
+                format!("{out}/go/weaveffi.go"),
             ]
         );
     }

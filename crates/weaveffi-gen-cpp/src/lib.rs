@@ -1530,9 +1530,9 @@ mod tests {
         assert_eq!(
             files,
             vec![
-                out_dir.join("cpp/CMakeLists.txt").to_string(),
-                out_dir.join("cpp/README.md").to_string(),
-                out_dir.join("cpp/weaveffi.hpp").to_string(),
+                format!("{out_dir}/cpp/CMakeLists.txt"),
+                format!("{out_dir}/cpp/README.md"),
+                format!("{out_dir}/cpp/weaveffi.hpp"),
             ]
         );
     }

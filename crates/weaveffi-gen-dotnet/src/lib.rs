@@ -1716,10 +1716,10 @@ mod tests {
         assert_eq!(
             files,
             vec![
-                out.join("dotnet/README.md").to_string(),
-                out.join("dotnet/WeaveFFI.cs").to_string(),
-                out.join("dotnet/WeaveFFI.csproj").to_string(),
-                out.join("dotnet/WeaveFFI.nuspec").to_string(),
+                format!("{out}/dotnet/README.md"),
+                format!("{out}/dotnet/WeaveFFI.cs"),
+                format!("{out}/dotnet/WeaveFFI.csproj"),
+                format!("{out}/dotnet/WeaveFFI.nuspec"),
             ]
         );
     }

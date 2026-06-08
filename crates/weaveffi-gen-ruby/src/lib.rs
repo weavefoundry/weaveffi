@@ -1016,9 +1016,9 @@ mod tests {
         assert_eq!(
             files,
             vec![
-                out_dir.join("ruby/README.md").to_string(),
-                out_dir.join("ruby/lib/weaveffi.rb").to_string(),
-                out_dir.join("ruby/weaveffi.gemspec").to_string(),
+                format!("{out_dir}/ruby/README.md"),
+                format!("{out_dir}/ruby/lib/weaveffi.rb"),
+                format!("{out_dir}/ruby/weaveffi.gemspec"),
             ]
         );
     }
