@@ -2,14 +2,14 @@
 //!
 //! Emits a Dart package (`pubspec.yaml` + library) with `dart:ffi`
 //! bindings over the C ABI for use in Flutter and Dart projects.
-//! Implements the [`Generator`] trait.
+//! Implements [`LanguageBackend`]; the shared driver bridges it into the
+//! generator pipeline.
 
-use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use serde::{Deserialize, Serialize};
+use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
-use weaveffi_core::codegen::Generator;
 use weaveffi_core::model::{BindingModel, EnumBinding, FnBinding, StructBinding};
 use weaveffi_core::utils::{local_type_name, render_prelude, render_trailer, CommentStyle};
 use weaveffi_ir::ir::{Api, TypeRef};
@@ -46,58 +46,42 @@ impl DartConfig {
 
 pub struct DartGenerator;
 
-impl DartGenerator {
-    fn generate_impl(
-        &self,
-        api: &Api,
-        out_dir: &Utf8Path,
-        package_name: &str,
-        prefix: &str,
-        input_basename: &str,
-    ) -> Result<()> {
-        let dart_dir = out_dir.join("dart");
-        let lib_dir = dart_dir.join("lib");
-        std::fs::create_dir_all(&lib_dir)?;
-        std::fs::write(
-            lib_dir.join("weaveffi.dart"),
-            render_dart_module(api, prefix, input_basename),
-        )?;
-        std::fs::write(
-            dart_dir.join("pubspec.yaml"),
-            render_pubspec(package_name, input_basename),
-        )?;
-        std::fs::write(dart_dir.join("README.md"), render_readme(input_basename))?;
-        Ok(())
-    }
-}
-
-impl Generator for DartGenerator {
+impl LanguageBackend for DartGenerator {
     type Config = DartConfig;
 
     fn name(&self) -> &'static str {
         "dart"
     }
 
-    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()> {
-        self.generate_impl(
-            api,
-            out_dir,
-            config.package_name(),
-            config.prefix(),
-            config.input_basename(),
-        )
+    fn prefix<'a>(&self, config: &'a Self::Config) -> &'a str {
+        config.prefix()
     }
 
-    fn output_files(&self, _api: &Api, out_dir: &Utf8Path, _config: &Self::Config) -> Vec<String> {
-        let mut files = vec![
-            out_dir.join("dart/README.md").to_string(),
-            out_dir.join("dart/lib/weaveffi.dart").to_string(),
-            out_dir.join("dart/pubspec.yaml").to_string(),
-        ];
-        files.sort();
-        files
+    fn files(
+        &self,
+        api: &Api,
+        _model: &BindingModel,
+        out_dir: &Utf8Path,
+        config: &Self::Config,
+    ) -> Vec<OutputFile> {
+        let dart_dir = out_dir.join("dart");
+        let lib_dir = dart_dir.join("lib");
+        let input_basename = config.input_basename();
+        vec![
+            OutputFile::new(
+                lib_dir.join("weaveffi.dart"),
+                render_dart_module(api, config.prefix(), input_basename),
+            ),
+            OutputFile::new(
+                dart_dir.join("pubspec.yaml"),
+                render_pubspec(config.package_name(), input_basename),
+            ),
+            OutputFile::new(dart_dir.join("README.md"), render_readme(input_basename)),
+        ]
     }
 }
+
+weaveffi_core::impl_generator_via_backend!(DartGenerator);
 
 fn dart_type(ty: &TypeRef) -> String {
     match ty {
@@ -954,6 +938,7 @@ fn emit_result_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
 mod tests {
     use super::*;
     use camino::Utf8Path;
+    use weaveffi_core::codegen::Generator;
     use weaveffi_ir::ir::{
         Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
     };
@@ -981,7 +966,7 @@ mod tests {
 
     #[test]
     fn generator_name_is_dart() {
-        assert_eq!(DartGenerator.name(), "dart");
+        assert_eq!(Generator::name(&DartGenerator), "dart");
     }
 
     #[test]

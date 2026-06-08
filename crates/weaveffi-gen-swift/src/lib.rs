@@ -2,17 +2,17 @@
 //!
 //! Emits a SwiftPM package containing a thin Swift wrapper over the C ABI,
 //! including module map, `Package.swift`, and Swift `async/await` shims for
-//! functions marked `async: true`. Implements the [`Generator`] trait.
+//! functions marked `async: true`. Implements [`LanguageBackend`]; the shared
+//! driver bridges it into the generator pipeline.
 
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use serde::{Deserialize, Serialize};
+use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, walk_modules, DocCommentStyle};
-use weaveffi_core::codegen::Generator;
 use weaveffi_core::model::{
     BindingModel, CallShape, EnumBinding, FieldBinding, FnBinding, ModuleBinding, ParamBinding,
     StructBinding,
@@ -88,20 +88,30 @@ fn estimate_swift_capacity(modules: &[Module]) -> usize {
 
 pub struct SwiftGenerator;
 
-impl SwiftGenerator {
-    fn generate_impl(
+impl LanguageBackend for SwiftGenerator {
+    type Config = SwiftConfig;
+
+    fn name(&self) -> &'static str {
+        "swift"
+    }
+
+    fn prefix<'a>(&self, config: &'a Self::Config) -> &'a str {
+        config.prefix()
+    }
+
+    fn files(
         &self,
         api: &Api,
+        _model: &BindingModel,
         out_dir: &Utf8Path,
-        module_name: &str,
-        prefix: &str,
-        strip_module_prefix: bool,
-        input_basename: &str,
-    ) -> Result<()> {
+        config: &Self::Config,
+    ) -> Vec<OutputFile> {
+        let module_name = config.module_name();
+        let prefix = config.prefix();
+        let input_basename = config.input_basename();
         let dir = out_dir.join("swift");
-        let c_module = format!("C{}", module_name);
+        let c_module = format!("C{module_name}");
         let module_dir = dir.join(&c_module);
-        std::fs::create_dir_all(&module_dir)?;
 
         let prelude = render_prelude(CommentStyle::DoubleSlash, input_basename);
         let package = format!(
@@ -122,66 +132,33 @@ let package = Package(\n    \
             c_name = c_module,
             trailer = render_trailer(CommentStyle::DoubleSlash, "Package.swift"),
         );
-        std::fs::write(dir.join("Package.swift"), package)?;
 
         let modulemap = format!(
             "{prelude}module {} [system] {{\n  header \"../../c/{prefix}.h\"\n  link \"weaveffi\"\n  export *\n}}\n\n{trailer}",
             c_module,
             trailer = render_trailer(CommentStyle::DoubleSlash, "module.modulemap"),
         );
-        std::fs::write(module_dir.join("module.modulemap"), modulemap)?;
 
         let src_dir = dir.join("Sources").join(module_name);
-        std::fs::create_dir_all(&src_dir)?;
-        let swift_filename = format!("{}.swift", module_name);
-        std::fs::write(
-            src_dir.join(&swift_filename),
-            render_swift_wrapper(
-                api,
-                prefix,
-                strip_module_prefix,
-                input_basename,
-                &swift_filename,
+        let swift_filename = format!("{module_name}.swift");
+        vec![
+            OutputFile::new(dir.join("Package.swift"), package),
+            OutputFile::new(module_dir.join("module.modulemap"), modulemap),
+            OutputFile::new(
+                src_dir.join(&swift_filename),
+                render_swift_wrapper(
+                    api,
+                    prefix,
+                    config.strip_module_prefix,
+                    input_basename,
+                    &swift_filename,
+                ),
             ),
-        )?;
-        Ok(())
+        ]
     }
 }
 
-impl Generator for SwiftGenerator {
-    type Config = SwiftConfig;
-
-    fn name(&self) -> &'static str {
-        "swift"
-    }
-
-    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()> {
-        self.generate_impl(
-            api,
-            out_dir,
-            config.module_name(),
-            config.prefix(),
-            config.strip_module_prefix,
-            config.input_basename(),
-        )
-    }
-
-    fn output_files(&self, _api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Vec<String> {
-        let module_name = config.module_name();
-        let c_module = format!("C{module_name}");
-        let mut files = vec![
-            out_dir.join("swift/Package.swift").to_string(),
-            out_dir
-                .join(format!("swift/{c_module}/module.modulemap"))
-                .to_string(),
-            out_dir
-                .join(format!("swift/Sources/{module_name}/{module_name}.swift"))
-                .to_string(),
-        ];
-        files.sort();
-        files
-    }
-}
+weaveffi_core::impl_generator_via_backend!(SwiftGenerator);
 
 /// Emits a `///`-prefixed Swift doc comment at `indent`. Each line of the
 /// (possibly multi-line) doc gets its own `///` prefix.
@@ -2358,6 +2335,7 @@ fn render_buffered_struct_create(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weaveffi_core::codegen::Generator;
     use weaveffi_ir::ir::{
         Api, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param, StructDef,
         StructField,

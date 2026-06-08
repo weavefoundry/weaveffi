@@ -1,15 +1,14 @@
 //! Go (CGo) binding generator for WeaveFFI.
 //!
 //! Emits a Go module (`go.mod` + package) with CGo bindings over the C
-//! ABI exposed by the underlying cdylib. Implements the [`Generator`]
-//! trait.
+//! ABI exposed by the underlying cdylib. Implements [`LanguageBackend`];
+//! the shared driver bridges it into the generator pipeline.
 
-use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use serde::{Deserialize, Serialize};
+use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, walk_modules, DocCommentStyle};
-use weaveffi_core::codegen::Generator;
 use weaveffi_core::model::{
     BindingModel, EnumBinding, FieldBinding, FnBinding, ParamBinding, StructBinding,
 };
@@ -47,57 +46,41 @@ impl GoConfig {
 
 pub struct GoGenerator;
 
-impl GoGenerator {
-    fn generate_impl(
-        &self,
-        api: &Api,
-        out_dir: &Utf8Path,
-        module_path: &str,
-        prefix: &str,
-        input_basename: &str,
-    ) -> Result<()> {
-        let dir = out_dir.join("go");
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(
-            dir.join("weaveffi.go"),
-            render_go(api, prefix, input_basename),
-        )?;
-        std::fs::write(
-            dir.join("go.mod"),
-            render_go_mod(module_path, input_basename),
-        )?;
-        std::fs::write(dir.join("README.md"), render_readme(input_basename))?;
-        Ok(())
-    }
-}
-
-impl Generator for GoGenerator {
+impl LanguageBackend for GoGenerator {
     type Config = GoConfig;
 
     fn name(&self) -> &'static str {
         "go"
     }
 
-    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()> {
-        self.generate_impl(
-            api,
-            out_dir,
-            config.module_path(),
-            config.prefix(),
-            config.input_basename(),
-        )
+    fn prefix<'a>(&self, config: &'a Self::Config) -> &'a str {
+        config.prefix()
     }
 
-    fn output_files(&self, _api: &Api, out_dir: &Utf8Path, _config: &Self::Config) -> Vec<String> {
-        let mut files = vec![
-            out_dir.join("go/README.md").to_string(),
-            out_dir.join("go/go.mod").to_string(),
-            out_dir.join("go/weaveffi.go").to_string(),
-        ];
-        files.sort();
-        files
+    fn files(
+        &self,
+        api: &Api,
+        _model: &BindingModel,
+        out_dir: &Utf8Path,
+        config: &Self::Config,
+    ) -> Vec<OutputFile> {
+        let dir = out_dir.join("go");
+        let input_basename = config.input_basename();
+        vec![
+            OutputFile::new(
+                dir.join("weaveffi.go"),
+                render_go(api, config.prefix(), input_basename),
+            ),
+            OutputFile::new(
+                dir.join("go.mod"),
+                render_go_mod(config.module_path(), input_basename),
+            ),
+            OutputFile::new(dir.join("README.md"), render_readme(input_basename)),
+        ]
     }
 }
+
+weaveffi_core::impl_generator_via_backend!(GoGenerator);
 
 // ── Type mapping ──
 
@@ -1084,7 +1067,7 @@ mod tests {
 
     #[test]
     fn name_returns_go() {
-        assert_eq!(GoGenerator.name(), "go");
+        assert_eq!(Generator::name(&GoGenerator), "go");
     }
 
     #[test]

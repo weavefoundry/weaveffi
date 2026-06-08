@@ -2,16 +2,16 @@
 //!
 //! Generates a Gradle project skeleton with a Kotlin wrapper plus a JNI
 //! bridge layer that calls into the C ABI. `suspend fun` shims are emitted
-//! for async functions. Implements the [`Generator`] trait.
+//! for async functions. Implements [`LanguageBackend`]; the shared driver
+//! bridges it into the generator pipeline.
 
-use anyhow::Result;
 use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
+use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, pascal_case, walk_modules, DocCommentStyle,
 };
-use weaveffi_core::codegen::Generator;
 use weaveffi_core::model::{BindingModel, EnumBinding, FnBinding, ParamBinding, StructBinding};
 use weaveffi_core::utils::{
     local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
@@ -53,93 +53,67 @@ impl AndroidConfig {
 
 pub struct AndroidGenerator;
 
-impl AndroidGenerator {
-    fn generate_impl(
-        &self,
-        api: &Api,
-        out_dir: &Utf8Path,
-        package: &str,
-        strip_module_prefix: bool,
-        input_basename: &str,
-        c_prefix: &str,
-    ) -> Result<()> {
-        let dir = out_dir.join("android");
-        std::fs::create_dir_all(&dir)?;
-
-        let dbl = CommentStyle::DoubleSlash;
-        std::fs::write(
-            dir.join("settings.gradle"),
-            format!(
-                "{}rootProject.name = 'weaveffi'\n\n{}",
-                render_prelude(dbl, input_basename),
-                render_trailer(dbl, "settings.gradle"),
-            ),
-        )?;
-        std::fs::write(
-            dir.join("build.gradle"),
-            build_gradle(package, input_basename),
-        )?;
-
-        let pkg_path = package.replace('.', "/");
-        let src_dir = dir.join(format!("src/main/kotlin/{pkg_path}"));
-        std::fs::create_dir_all(&src_dir)?;
-        let kotlin = render_kotlin(api, package, strip_module_prefix, input_basename);
-        std::fs::write(src_dir.join("WeaveFFI.kt"), kotlin)?;
-
-        let jni_dir = dir.join("src/main/cpp");
-        std::fs::create_dir_all(&jni_dir)?;
-        std::fs::write(
-            jni_dir.join("CMakeLists.txt"),
-            format!(
-                "{}{CMAKE}\n{}",
-                render_prelude(CommentStyle::Hash, input_basename),
-                render_trailer(CommentStyle::Hash, "CMakeLists.txt"),
-            ),
-        )?;
-        let jni_c = render_jni_c(api, package, strip_module_prefix, input_basename, c_prefix);
-        std::fs::write(jni_dir.join("weaveffi_jni.c"), jni_c)?;
-
-        Ok(())
-    }
-}
-
-impl Generator for AndroidGenerator {
+impl LanguageBackend for AndroidGenerator {
     type Config = AndroidConfig;
 
     fn name(&self) -> &'static str {
         "android"
     }
 
-    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()> {
-        self.generate_impl(
-            api,
-            out_dir,
-            config.package(),
-            config.strip_module_prefix,
-            config.input_basename(),
-            config.prefix(),
-        )
+    fn prefix<'a>(&self, config: &'a Self::Config) -> &'a str {
+        config.prefix()
     }
 
-    fn output_files(&self, _api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Vec<String> {
-        let pkg_path = config.package().replace('.', "/");
-        let mut files = vec![
-            out_dir.join("android/build.gradle").to_string(),
-            out_dir.join("android/settings.gradle").to_string(),
-            out_dir
-                .join("android/src/main/cpp/CMakeLists.txt")
-                .to_string(),
-            out_dir
-                .join("android/src/main/cpp/weaveffi_jni.c")
-                .to_string(),
-            out_dir
-                .join(format!("android/src/main/kotlin/{pkg_path}/WeaveFFI.kt"))
-                .to_string(),
-        ];
-        files.sort();
-        files
+    fn files(
+        &self,
+        api: &Api,
+        _model: &BindingModel,
+        out_dir: &Utf8Path,
+        config: &Self::Config,
+    ) -> Vec<OutputFile> {
+        let package = config.package();
+        let strip = config.strip_module_prefix;
+        let input_basename = config.input_basename();
+        let c_prefix = config.prefix();
+        let dir = out_dir.join("android");
+        let dbl = CommentStyle::DoubleSlash;
+        let pkg_path = package.replace('.', "/");
+        let src_dir = dir.join(format!("src/main/kotlin/{pkg_path}"));
+        let jni_dir = dir.join("src/main/cpp");
+        vec![
+            OutputFile::new(
+                dir.join("settings.gradle"),
+                format!(
+                    "{}rootProject.name = 'weaveffi'\n\n{}",
+                    render_prelude(dbl, input_basename),
+                    render_trailer(dbl, "settings.gradle"),
+                ),
+            ),
+            OutputFile::new(
+                dir.join("build.gradle"),
+                build_gradle(package, input_basename),
+            ),
+            OutputFile::new(
+                src_dir.join("WeaveFFI.kt"),
+                render_kotlin(api, package, strip, input_basename),
+            ),
+            OutputFile::new(
+                jni_dir.join("CMakeLists.txt"),
+                format!(
+                    "{}{CMAKE}\n{}",
+                    render_prelude(CommentStyle::Hash, input_basename),
+                    render_trailer(CommentStyle::Hash, "CMakeLists.txt"),
+                ),
+            ),
+            OutputFile::new(
+                jni_dir.join("weaveffi_jni.c"),
+                render_jni_c(api, package, strip, input_basename, c_prefix),
+            ),
+        ]
     }
 }
+
+weaveffi_core::impl_generator_via_backend!(AndroidGenerator);
 
 /// Emits a Kotlin KDoc comment at `indent`. Single-line docs collapse to
 /// `/** text */`; multi-line docs expand to a block with ` * ` prefixed lines.
@@ -2515,6 +2489,7 @@ fn release_jni_resources_single(out: &mut String, name: &str, ty: &TypeRef) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weaveffi_core::codegen::Generator;
     use weaveffi_ir::ir::{
         Api, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param, StructDef,
         StructField, TypeRef,

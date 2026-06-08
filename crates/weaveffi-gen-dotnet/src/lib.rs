@@ -2,15 +2,15 @@
 //!
 //! Emits a C# project (`.csproj` + `.nuspec`) with P/Invoke declarations
 //! and idiomatic wrappers over the C ABI. Async functions surface as
-//! `Task<T>`-returning methods. Implements the [`Generator`] trait.
+//! `Task<T>`-returning methods. Implements [`LanguageBackend`]; the shared
+//! driver bridges it into the generator pipeline.
 
-use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use weaveffi_core::abi::{self, AbiParam, CType};
-use weaveffi_core::codegen::Generator;
+use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::model::{
     BindingModel, EnumBinding, FieldBinding, FnBinding, ModuleBinding, ParamBinding, StructBinding,
 };
@@ -54,75 +54,56 @@ impl DotnetConfig {
 
 pub struct DotnetGenerator;
 
-impl DotnetGenerator {
-    fn generate_impl(
-        &self,
-        api: &Api,
-        out_dir: &Utf8Path,
-        namespace: &str,
-        strip_module_prefix: bool,
-        prefix: &str,
-        input_basename: &str,
-    ) -> Result<()> {
-        let dir = out_dir.join("dotnet");
-        std::fs::create_dir_all(&dir)?;
-        let cs_filename = format!("{namespace}.cs");
-        let csproj_filename = format!("{namespace}.csproj");
-        let nuspec_filename = format!("{namespace}.nuspec");
-        std::fs::write(
-            dir.join(&cs_filename),
-            render_csharp(
-                api,
-                namespace,
-                strip_module_prefix,
-                prefix,
-                input_basename,
-                &cs_filename,
-            ),
-        )?;
-        std::fs::write(
-            dir.join(&csproj_filename),
-            render_csproj(namespace, input_basename, &csproj_filename),
-        )?;
-        std::fs::write(
-            dir.join(&nuspec_filename),
-            render_nuspec(namespace, input_basename, &nuspec_filename),
-        )?;
-        std::fs::write(dir.join("README.md"), render_readme(input_basename))?;
-        Ok(())
-    }
-}
-
-impl Generator for DotnetGenerator {
+impl LanguageBackend for DotnetGenerator {
     type Config = DotnetConfig;
 
     fn name(&self) -> &'static str {
         "dotnet"
     }
 
-    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()> {
-        self.generate_impl(
-            api,
-            out_dir,
-            config.namespace(),
-            config.strip_module_prefix,
-            config.prefix(),
-            config.input_basename(),
-        )
+    fn prefix<'a>(&self, config: &'a Self::Config) -> &'a str {
+        config.prefix()
     }
 
-    fn output_files(&self, _api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Vec<String> {
-        let ns = config.namespace();
-        let mut files = vec![
-            out_dir.join("dotnet/README.md").to_string(),
-            out_dir.join(format!("dotnet/{ns}.cs")).to_string(),
-            out_dir.join(format!("dotnet/{ns}.csproj")).to_string(),
-            out_dir.join(format!("dotnet/{ns}.nuspec")).to_string(),
-        ];
-        files.sort();
-        files
+    fn files(
+        &self,
+        api: &Api,
+        _model: &BindingModel,
+        out_dir: &Utf8Path,
+        config: &Self::Config,
+    ) -> Vec<OutputFile> {
+        let namespace = config.namespace();
+        let input_basename = config.input_basename();
+        let dir = out_dir.join("dotnet");
+        let cs_filename = format!("{namespace}.cs");
+        let csproj_filename = format!("{namespace}.csproj");
+        let nuspec_filename = format!("{namespace}.nuspec");
+        vec![
+            OutputFile::new(
+                dir.join(&cs_filename),
+                render_csharp(
+                    api,
+                    namespace,
+                    config.strip_module_prefix,
+                    config.prefix(),
+                    input_basename,
+                    &cs_filename,
+                ),
+            ),
+            OutputFile::new(
+                dir.join(&csproj_filename),
+                render_csproj(namespace, input_basename, &csproj_filename),
+            ),
+            OutputFile::new(
+                dir.join(&nuspec_filename),
+                render_nuspec(namespace, input_basename, &nuspec_filename),
+            ),
+            OutputFile::new(dir.join("README.md"), render_readme(input_basename)),
+        ]
     }
 }
+
+weaveffi_core::impl_generator_via_backend!(DotnetGenerator);
 
 fn cs_type(ty: &TypeRef) -> String {
     match ty {
@@ -1698,6 +1679,7 @@ fn safe_cs_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weaveffi_core::codegen::Generator;
     use weaveffi_ir::ir::{EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField};
 
     fn make_api(modules: Vec<Module>) -> Api {
@@ -1723,7 +1705,7 @@ mod tests {
 
     #[test]
     fn generator_name_is_dotnet() {
-        assert_eq!(DotnetGenerator.name(), "dotnet");
+        assert_eq!(Generator::name(&DotnetGenerator), "dotnet");
     }
 
     #[test]

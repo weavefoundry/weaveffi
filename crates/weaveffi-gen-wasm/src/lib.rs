@@ -2,18 +2,18 @@
 //!
 //! Emits a JavaScript loader stub and TypeScript declarations targeting a
 //! `wasm32-unknown-unknown` cdylib build of the same Rust source.
-//! Implements the [`Generator`] trait.
+//! Implements [`LanguageBackend`]; the shared driver bridges it into the
+//! generator pipeline.
 
 use std::collections::HashMap;
 
-use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
 use serde::{Deserialize, Serialize};
+use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, walk_modules, walk_modules_with_path, DocCommentStyle,
 };
-use weaveffi_core::codegen::Generator;
 use weaveffi_core::model::{BindingModel, EnumBinding, FnBinding, ModuleBinding, StructBinding};
 use weaveffi_core::utils::{local_type_name, render_prelude, render_trailer, CommentStyle};
 use weaveffi_ir::ir::{Api, Module, TypeRef};
@@ -52,66 +52,48 @@ impl WasmConfig {
     }
 }
 
-impl WasmGenerator {
-    fn generate_impl(
-        &self,
-        api: &Api,
-        out_dir: &Utf8Path,
-        module_name: &str,
-        prefix: &str,
-        input_basename: &str,
-    ) -> Result<()> {
-        let wasm_dir = out_dir.join("wasm");
-        std::fs::create_dir_all(&wasm_dir)?;
-        std::fs::write(
-            wasm_dir.join("README.md"),
-            render_wasm_readme(api, prefix, input_basename),
-        )?;
-        let js_filename = format!("{module_name}.js");
-        let dts_filename = format!("{module_name}.d.ts");
-        std::fs::write(
-            wasm_dir.join(&js_filename),
-            render_wasm_js_stub(api, module_name, prefix, input_basename, &js_filename),
-        )?;
-        std::fs::write(
-            wasm_dir.join(&dts_filename),
-            render_wasm_dts(api, module_name, input_basename, &dts_filename),
-        )?;
-        Ok(())
-    }
-}
-
-impl Generator for WasmGenerator {
+impl LanguageBackend for WasmGenerator {
     type Config = WasmConfig;
 
     fn name(&self) -> &'static str {
         "wasm"
     }
 
-    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()> {
-        self.generate_impl(
-            api,
-            out_dir,
-            config.module_name(),
-            config.prefix(),
-            config.input_basename(),
-        )
+    fn prefix<'a>(&self, config: &'a Self::Config) -> &'a str {
+        config.prefix()
     }
 
-    fn output_files(&self, _api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Vec<String> {
-        output_file_list(out_dir, config.module_name())
+    fn files(
+        &self,
+        api: &Api,
+        _model: &BindingModel,
+        out_dir: &Utf8Path,
+        config: &Self::Config,
+    ) -> Vec<OutputFile> {
+        let wasm_dir = out_dir.join("wasm");
+        let module_name = config.module_name();
+        let prefix = config.prefix();
+        let input_basename = config.input_basename();
+        let js_filename = format!("{module_name}.js");
+        let dts_filename = format!("{module_name}.d.ts");
+        vec![
+            OutputFile::new(
+                wasm_dir.join("README.md"),
+                render_wasm_readme(api, prefix, input_basename),
+            ),
+            OutputFile::new(
+                wasm_dir.join(&js_filename),
+                render_wasm_js_stub(api, module_name, prefix, input_basename, &js_filename),
+            ),
+            OutputFile::new(
+                wasm_dir.join(&dts_filename),
+                render_wasm_dts(api, module_name, input_basename, &dts_filename),
+            ),
+        ]
     }
 }
 
-fn output_file_list(out_dir: &Utf8Path, module_name: &str) -> Vec<String> {
-    let mut files = vec![
-        out_dir.join("wasm/README.md").to_string(),
-        out_dir.join(format!("wasm/{module_name}.d.ts")).to_string(),
-        out_dir.join(format!("wasm/{module_name}.js")).to_string(),
-    ];
-    files.sort();
-    files
-}
+weaveffi_core::impl_generator_via_backend!(WasmGenerator);
 
 fn wasm_type(ty: &TypeRef) -> &'static str {
     match ty {
