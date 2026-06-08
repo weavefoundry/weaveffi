@@ -2047,7 +2047,6 @@ dependencies = [
 name = "weaveffi-gen-android"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "camino",
  "serde",
  "tempfile",
@@ -2059,7 +2058,6 @@ dependencies = [
 name = "weaveffi-gen-c"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "camino",
  "serde",
  "weaveffi-core",
@@ -2070,7 +2068,6 @@ dependencies = [
 name = "weaveffi-gen-cpp"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "camino",
  "heck",
  "serde",
@@ -2082,7 +2079,6 @@ dependencies = [
 name = "weaveffi-gen-dart"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "camino",
  "heck",
  "serde",
@@ -2094,7 +2090,6 @@ dependencies = [
 name = "weaveffi-gen-dotnet"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "camino",
  "heck",
  "serde",
@@ -2107,7 +2102,6 @@ dependencies = [
 name = "weaveffi-gen-go"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "camino",
  "heck",
  "serde",
@@ -2119,7 +2113,6 @@ dependencies = [
 name = "weaveffi-gen-node"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "camino",
  "heck",
  "serde",
@@ -2131,7 +2124,6 @@ dependencies = [
 name = "weaveffi-gen-python"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "camino",
  "serde",
  "tempfile",
@@ -2143,7 +2135,6 @@ dependencies = [
 name = "weaveffi-gen-ruby"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "camino",
  "heck",
  "serde",
@@ -2156,7 +2147,6 @@ dependencies = [
 name = "weaveffi-gen-swift"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "camino",
  "heck",
  "serde",
@@ -2168,7 +2158,6 @@ dependencies = [
 name = "weaveffi-gen-wasm"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "camino",
  "heck",
  "serde",

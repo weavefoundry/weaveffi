@@ -26,9 +26,10 @@ The workspace is split into small crates:
 
 - `weaveffi-ir` owns the IR and parsers.
 - `weaveffi-abi` owns the stable C ABI runtime.
-- `weaveffi-core` owns validation, generator orchestration, configuration,
-  templates, and caching.
-- `weaveffi-gen-*` crates own target-specific code generation.
+- `weaveffi-core` owns validation, the ABI/binding model, the language-backend
+  framework, generator orchestration, configuration, and caching.
+- `weaveffi-gen-*` crates own target-specific code generation, each implemented
+  as a `LanguageBackend` over the shared driver.
 - `weaveffi-cli` wires the pipeline into the `weaveffi` command.
 - `weaveffi-fuzz` contains unpublished fuzz harnesses.
 

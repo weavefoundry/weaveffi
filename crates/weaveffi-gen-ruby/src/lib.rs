@@ -1,18 +1,18 @@
 //! Ruby (FFI gem) binding generator for WeaveFFI.
 //!
 //! Emits a Ruby gem (`.gemspec` + library) using the `ffi` gem to call
-//! into the C ABI exposed by the underlying cdylib. Implements the
-//! [`Generator`] trait.
+//! into the C ABI exposed by the underlying cdylib. Implements
+//! [`LanguageBackend`]; the shared driver bridges it into the generator
+//! pipeline.
 
-use anyhow::Result;
 use camino::Utf8Path;
 use heck::{ToShoutySnakeCase, ToSnakeCase};
 use serde::{Deserialize, Serialize};
 use weaveffi_core::abi::{self, CType};
+use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, is_c_pointer_type, DocCommentStyle,
 };
-use weaveffi_core::codegen::Generator;
 use weaveffi_core::model::{BindingModel, EnumBinding, FieldBinding, FnBinding, StructBinding};
 use weaveffi_core::utils::{local_type_name, render_prelude, render_trailer, CommentStyle};
 use weaveffi_ir::ir::{Api, TypeRef};
@@ -54,60 +54,42 @@ impl RubyConfig {
 
 pub struct RubyGenerator;
 
-impl RubyGenerator {
-    fn generate_impl(
-        &self,
-        api: &Api,
-        out_dir: &Utf8Path,
-        module_name: &str,
-        gem_name: &str,
-        prefix: &str,
-        input_basename: &str,
-    ) -> Result<()> {
-        let dir = out_dir.join("ruby");
-        let lib_dir = dir.join("lib");
-        std::fs::create_dir_all(&lib_dir)?;
-        std::fs::write(
-            lib_dir.join("weaveffi.rb"),
-            render_ruby_module(api, module_name, prefix, input_basename),
-        )?;
-        std::fs::write(
-            dir.join("weaveffi.gemspec"),
-            render_gemspec(gem_name, input_basename),
-        )?;
-        std::fs::write(dir.join("README.md"), render_readme(input_basename))?;
-        Ok(())
-    }
-}
-
-impl Generator for RubyGenerator {
+impl LanguageBackend for RubyGenerator {
     type Config = RubyConfig;
 
     fn name(&self) -> &'static str {
         "ruby"
     }
 
-    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()> {
-        self.generate_impl(
-            api,
-            out_dir,
-            config.module_name(),
-            config.gem_name(),
-            config.prefix(),
-            config.input_basename(),
-        )
+    fn prefix<'a>(&self, config: &'a Self::Config) -> &'a str {
+        config.prefix()
     }
 
-    fn output_files(&self, _api: &Api, out_dir: &Utf8Path, _config: &Self::Config) -> Vec<String> {
-        let mut files = vec![
-            out_dir.join("ruby/README.md").to_string(),
-            out_dir.join("ruby/lib/weaveffi.rb").to_string(),
-            out_dir.join("ruby/weaveffi.gemspec").to_string(),
-        ];
-        files.sort();
-        files
+    fn files(
+        &self,
+        api: &Api,
+        _model: &BindingModel,
+        out_dir: &Utf8Path,
+        config: &Self::Config,
+    ) -> Vec<OutputFile> {
+        let dir = out_dir.join("ruby");
+        let lib_dir = dir.join("lib");
+        let input_basename = config.input_basename();
+        vec![
+            OutputFile::new(
+                lib_dir.join("weaveffi.rb"),
+                render_ruby_module(api, config.module_name(), config.prefix(), input_basename),
+            ),
+            OutputFile::new(
+                dir.join("weaveffi.gemspec"),
+                render_gemspec(config.gem_name(), input_basename),
+            ),
+            OutputFile::new(dir.join("README.md"), render_readme(input_basename)),
+        ]
     }
 }
+
+weaveffi_core::impl_generator_via_backend!(RubyGenerator);
 
 // ── Type helpers ──
 
@@ -951,6 +933,7 @@ require 'weaveffi'
 mod tests {
     use super::*;
     use camino::Utf8Path;
+    use weaveffi_core::codegen::Generator;
     use weaveffi_ir::ir::{
         Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
     };
@@ -978,7 +961,7 @@ mod tests {
 
     #[test]
     fn name_returns_ruby() {
-        assert_eq!(RubyGenerator.name(), "ruby");
+        assert_eq!(Generator::name(&RubyGenerator), "ruby");
     }
 
     #[test]
@@ -1033,9 +1016,9 @@ mod tests {
         assert_eq!(
             files,
             vec![
-                out_dir.join("ruby/README.md").to_string(),
-                out_dir.join("ruby/lib/weaveffi.rb").to_string(),
-                out_dir.join("ruby/weaveffi.gemspec").to_string(),
+                format!("{out_dir}/ruby/README.md"),
+                format!("{out_dir}/ruby/lib/weaveffi.rb"),
+                format!("{out_dir}/ruby/weaveffi.gemspec"),
             ]
         );
     }

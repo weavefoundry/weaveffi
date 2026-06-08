@@ -64,8 +64,8 @@ weaveffi-fuzz ──► weaveffi-ir, weaveffi-core (workspace-private; unpublish
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `weaveffi-ir`        | The IR types (`Api`, `Module`, `Function`, `TypeRef`, …), the `parse_api_str` parser, the `parse_type_ref` mini-grammar, and `CURRENT_SCHEMA_VERSION`. |
 | `weaveffi-abi`       | Stable C ABI runtime symbols: `weaveffi_error`, `weaveffi_error_clear`, `weaveffi_free_string`, `weaveffi_free_bytes`, the arena, cancel tokens. |
-| `weaveffi-core`      | The `Generator` trait, the `Orchestrator`, the `abi` C-ABI lowering model, validation rules, generator config resolution, and the per-generator hash cache. |
-| `weaveffi-gen-*`     | Eleven generator crates. Each implements `Generator` and produces target-specific output (header, wrapper, package metadata).                    |
+| `weaveffi-core`      | The `Generator` trait, the `LanguageBackend` framework + driver, the `Orchestrator`, the `abi` C-ABI lowering model, the `BindingModel`, validation rules, generator config resolution, and the per-generator hash cache. |
+| `weaveffi-gen-*`     | Eleven generator crates. Each implements `LanguageBackend` (bridged to `Generator` by `impl_generator_via_backend!`) and produces target-specific output (header, wrapper, package metadata).                    |
 | `weaveffi-cli`       | The `weaveffi` binary. Parses the IDL, applies validation, instantiates every generator (via the `cli_targets!` registry), and dispatches the `Orchestrator`. Self-contained subcommands live in their own modules (`doctor.rs`, `upgrade.rs`, `extract.rs`, `scaffold.rs`). |
 | `weaveffi-fuzz`      | `cargo-fuzz` harnesses for the parsers, the validator, and `parse_type_ref`. Workspace-private (not published to crates.io).                     |
 
@@ -250,9 +250,9 @@ This per-generator caching is what lets `weaveffi generate` skip every
 target whose IR has not changed since the last run; see the
 [Generator Configuration guide](guides/config.md#per-generator-incremental-cache).
 
-## The `Generator` trait
+## The `Generator` trait and the language-backend framework
 
-Every target implements the `Generator` trait
+The orchestrator consumes the object-safe `Generator` trait
 (`weaveffi_core::codegen::Generator`). Each generator owns a typed,
 serializable `Config`; the orchestrator stays config-agnostic by working
 through the object-safe `DynGenerator` view:
@@ -271,11 +271,7 @@ pub trait Generator: Send + Sync {
     fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()>;
 
     /// Files `generate` would write (used by `--dry-run` and `diff`).
-    /// Defaults to empty; override when the list depends on IR or config.
-    fn output_files(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Vec<String> {
-        let _ = (api, out_dir, config);
-        vec![]
-    }
+    fn output_files(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Vec<String>;
 }
 ```
 
@@ -285,33 +281,78 @@ implements the object-safe `DynGenerator` trait the `Orchestrator`
 stores. The CLI builds one `ConfiguredGenerator` per selected target
 from the resolved `CliConfig`.
 
+### `LanguageBackend` and the shared driver
+
+Generators are **not** written against `Generator` directly. Each target
+implements `weaveffi_core::backend::LanguageBackend` and is bridged to
+`Generator` by the `impl_generator_via_backend!` macro, so the model
+construction, the file I/O, and the `output_files` derivation live in one
+place instead of being re-implemented eleven times:
+
+```rust,ignore
+pub trait LanguageBackend: Send + Sync {
+    type Config: Serialize + Default + Clone + Send + Sync;
+    fn name(&self) -> &'static str;
+
+    /// C ABI symbol prefix; the driver builds the `BindingModel` with it.
+    fn prefix<'a>(&self, config: &'a Self::Config) -> &'a str { "weaveffi" }
+
+    /// The single required hook: assemble every output file. Rendering is
+    /// pure — the driver performs the actual writes.
+    fn files(&self, api: &Api, model: &BindingModel,
+             out_dir: &Utf8Path, config: &Self::Config) -> Vec<OutputFile>;
+
+    /// Canonical per-module walk (enums → structs → callbacks → listeners
+    /// → functions) with call-shape dispatch. Single-pass backends override
+    /// the `render_enum`/`render_struct`/`render_function` hooks and call
+    /// this; multi-pass backends build their layout in `files` directly.
+    fn emit_members(&self, out: &mut String, module: &ModuleBinding, config: &Self::Config) { /* … */ }
+    // render_enum / render_struct / render_callback / render_listener /
+    // render_function — all default to no-op.
+}
+```
+
+The free `backend::run` builds the `BindingModel` once (with the
+backend's `prefix`), calls `files`, and writes each `OutputFile`
+(creating parent directories). `backend::output_files` calls the same
+`files` and returns the sorted path list — so `generate` and
+`output_files` are derived from a single source and **cannot drift**.
+Python is the reference single-pass backend (it overrides the per-entity
+hooks and composes `emit_members`); Ruby, .NET, Node, and Android are
+multi-pass (their FFI declarations, wrapper classes, and secondary
+surfaces such as the JNI C shim are emitted in their own passes inside
+`files`).
+
 Generators emit code by direct string construction — there is no
 template-engine layer (an early Tera prototype intended for user
 template overrides was removed in 0.4.0 because nothing read from it).
-Shared rendering infrastructure instead lives in
-`weaveffi_core::codegen`:
+Shared rendering infrastructure lives in `weaveffi_core`:
 
-- `common` — module-tree traversal (`walk_modules`,
+- `backend` — the `LanguageBackend` trait, the `run`/`output_files`
+  driver, the `OutputFile` type, and the `impl_generator_via_backend!`
+  bridge macro.
+- `model::BindingModel` — the normalized, fully-lowered view every
+  backend renders from (precomputed C symbol names and ABI signatures).
+- `codegen::common` — module-tree traversal (`walk_modules`,
   `walk_modules_with_path`), the `is_c_pointer_type` ABI classifier,
-  doc-comment emission (`emit_doc`), and `pascal_case` naming. These are
-  the single source of truth for helpers each generator used to define
-  locally.
-- `writer::CodeWriter` — an indentation-aware string builder so a
+  doc-comment emission (`emit_doc`), and `pascal_case` naming.
+- `codegen::writer::CodeWriter` — an indentation-aware string builder so a
   generator declares *what* to emit at *what nesting level* instead of
   threading literal indent strings through every `push_str`.
 
-The signature reference above uses `Result<T>` from `anyhow` and the IR
-types from `weaveffi_ir`; consult those crates for the precise import set.
+The signatures above use `Result<T>` from `anyhow` and IR types from
+`weaveffi_ir`; consult those crates for the precise import set.
 
 Implementation notes:
 
-- Always implement `name()` (returns the `--target` flag value, e.g.
-  `"swift"`) and the associated `Config` type (use a `Default`-only
-  config struct if the target has no options).
-- Override `output_files` whenever your generator's file list depends on
-  the IR or config (most do); `--dry-run` and `weaveffi diff` query it.
-- All file writes go inside `out_dir`; do not write outside the
-  passed directory or you will break the per-generator cache.
+- Implement `name()` (the `--target` flag value, e.g. `"swift"`), the
+  associated `Config` type, and `files()`; override `prefix()` when the
+  config carries a configurable `c_prefix`.
+- Return every emitted file from `files()` — `--dry-run` and
+  `weaveffi diff` read the derived `output_files`, so there is no separate
+  list to keep in sync.
+- All paths are joined under `out_dir`; do not write outside the passed
+  directory or you will break the per-generator cache.
 - Generators run in parallel — share no mutable state across calls.
 
 ## C ABI naming convention
@@ -428,11 +469,16 @@ A condensed checklist (the long version lives in
 1. Create `crates/weaveffi-gen-<lang>/` mirroring the layout of
    `weaveffi-gen-c`. Add it to `members` in the root `Cargo.toml` and
    depend on `weaveffi-core` and `weaveffi-ir`.
-2. Implement `Generator`: define the associated `Config` type, then
-   `name`, `generate`, and `output_files` (so `--dry-run` and
-   `weaveffi diff` work). Reuse `weaveffi_core::codegen::common` and
-   `writer::CodeWriter` instead of re-deriving traversal, ABI
-   classification, or indentation.
+2. Implement `weaveffi_core::backend::LanguageBackend`: define the
+   associated `Config` type, then `name`, `prefix` (if the config carries
+   a `c_prefix`), and `files` (returning every `OutputFile`). For a
+   single-pass layout, override the `render_enum`/`render_struct`/
+   `render_function` hooks and compose `emit_members`; otherwise build the
+   layout directly in `files`. Then add
+   `weaveffi_core::impl_generator_via_backend!(<Generator>);` to bridge it
+   to `Generator` (this derives `generate` and `output_files`). Reuse
+   `BindingModel`, `weaveffi_core::codegen::common`, and `writer::CodeWriter`
+   instead of re-deriving traversal, ABI classification, or indentation.
 3. Wire the generator into the `cli_targets!` registry macro in
    `crates/weaveffi-cli/src/main.rs` — add one line
    (`"<name>" => <field>: <Config> via <Generator>`, plus `strip` if the

@@ -2,16 +2,16 @@
 //!
 //! Emits a pip-installable package containing `ctypes`-based bindings and
 //! `.pyi` type stubs over the C ABI. Async functions surface as
-//! `async def` wrappers. Implements the [`Generator`] trait.
+//! `async def` wrappers. Implements [`LanguageBackend`]; the shared driver
+//! bridges it into the generator pipeline.
 
-use anyhow::Result;
 use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
 use weaveffi_core::abi::{self, CType};
+use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, is_c_pointer_type, pascal_case, DocCommentStyle,
 };
-use weaveffi_core::codegen::Generator;
 use weaveffi_core::model::{
     BindingModel, CallShape, EnumBinding, FieldBinding, FnBinding, ModuleBinding, ParamBinding,
     StructBinding,
@@ -57,86 +57,120 @@ impl PythonConfig {
 pub struct PythonGenerator;
 
 impl PythonGenerator {
-    fn generate_impl(
+    /// Render the primary `weaveffi.py` source by composing the shared
+    /// [`LanguageBackend::emit_members`] walk over every module. Shared by the
+    /// [`LanguageBackend::files`] hook and the test-facing
+    /// [`render_python_module`] wrapper so there is one assembly path.
+    fn render_py_source(
         &self,
-        api: &Api,
-        out_dir: &Utf8Path,
-        package_name: &str,
+        model: &BindingModel,
         strip_module_prefix: bool,
-        prefix: &str,
         input_basename: &str,
-    ) -> Result<()> {
-        let dir = out_dir.join("python");
-        let pkg_dir = dir.join(package_name);
-        std::fs::create_dir_all(&pkg_dir)?;
-        let hash = CommentStyle::Hash;
-        std::fs::write(
-            pkg_dir.join("__init__.py"),
-            format!(
-                "{}from .weaveffi import *  # noqa: F401,F403\n\n{}",
-                render_prelude(hash, input_basename),
-                render_trailer(hash, "__init__.py"),
-            ),
-        )?;
-        std::fs::write(
-            pkg_dir.join("weaveffi.py"),
-            render_python_module(api, strip_module_prefix, prefix, input_basename),
-        )?;
-        std::fs::write(
-            pkg_dir.join("weaveffi.pyi"),
-            render_pyi_module(api, strip_module_prefix, input_basename),
-        )?;
-        std::fs::write(
-            dir.join("pyproject.toml"),
-            render_pyproject_toml(package_name, input_basename),
-        )?;
-        std::fs::write(
-            dir.join("setup.py"),
-            render_setup_py(package_name, input_basename),
-        )?;
-        std::fs::write(dir.join("README.md"), render_readme(input_basename))?;
-        Ok(())
+    ) -> String {
+        let config = PythonConfig {
+            strip_module_prefix,
+            ..PythonConfig::default()
+        };
+        let mut out = render_prelude(CommentStyle::Hash, input_basename);
+        render_preamble(&mut out);
+        let has_async = model.functions().any(|(_, f)| f.is_async);
+        if has_async {
+            out.push_str("\nimport asyncio\nimport threading\n");
+        }
+        // The model is a flat, pre-order list of modules, each carrying its
+        // joined symbol path — the same traversal order the recursive walk
+        // produced.
+        for m in &model.modules {
+            out.push_str(&format!("\n\n# === Module: {} ===", m.path));
+            self.emit_members(&mut out, m, &config);
+        }
+        out.push('\n');
+        out.push_str(&render_trailer(CommentStyle::Hash, "weaveffi.py"));
+        out
     }
 }
 
-impl Generator for PythonGenerator {
+impl LanguageBackend for PythonGenerator {
     type Config = PythonConfig;
 
     fn name(&self) -> &'static str {
         "python"
     }
 
-    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()> {
-        self.generate_impl(
-            api,
-            out_dir,
-            config.package_name(),
-            config.strip_module_prefix,
-            config.prefix(),
-            config.input_basename(),
-        )
+    fn prefix<'a>(&self, config: &'a Self::Config) -> &'a str {
+        config.prefix()
     }
 
-    fn output_files(&self, _api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Vec<String> {
-        let pkg = config.package_name();
-        let mut files = vec![
-            out_dir.join("python/README.md").to_string(),
-            out_dir.join("python/pyproject.toml").to_string(),
-            out_dir.join("python/setup.py").to_string(),
-            out_dir
-                .join(format!("python/{pkg}/__init__.py"))
-                .to_string(),
-            out_dir
-                .join(format!("python/{pkg}/weaveffi.py"))
-                .to_string(),
-            out_dir
-                .join(format!("python/{pkg}/weaveffi.pyi"))
-                .to_string(),
-        ];
-        files.sort();
-        files
+    fn render_enum(&self, out: &mut String, e: &EnumBinding, _config: &Self::Config) {
+        render_enum(out, e);
+    }
+
+    fn render_struct(
+        &self,
+        out: &mut String,
+        _module: &ModuleBinding,
+        s: &StructBinding,
+        _config: &Self::Config,
+    ) {
+        render_struct(out, s);
+        if s.builder.is_some() {
+            render_builder(out, s);
+        }
+    }
+
+    fn render_function(
+        &self,
+        out: &mut String,
+        module: &ModuleBinding,
+        f: &FnBinding,
+        config: &Self::Config,
+    ) {
+        render_function(out, &module.path, f, config.strip_module_prefix);
+    }
+
+    fn files(
+        &self,
+        api: &Api,
+        model: &BindingModel,
+        out_dir: &Utf8Path,
+        config: &Self::Config,
+    ) -> Vec<OutputFile> {
+        let package_name = config.package_name();
+        let input_basename = config.input_basename();
+        let dir = out_dir.join("python");
+        let pkg_dir = dir.join(package_name);
+        let hash = CommentStyle::Hash;
+        vec![
+            OutputFile::new(
+                pkg_dir.join("__init__.py"),
+                format!(
+                    "{}from .weaveffi import *  # noqa: F401,F403\n\n{}",
+                    render_prelude(hash, input_basename),
+                    render_trailer(hash, "__init__.py"),
+                ),
+            ),
+            OutputFile::new(
+                pkg_dir.join("weaveffi.py"),
+                self.render_py_source(model, config.strip_module_prefix, input_basename),
+            ),
+            OutputFile::new(
+                pkg_dir.join("weaveffi.pyi"),
+                render_pyi_module(api, config.strip_module_prefix, input_basename),
+            ),
+            OutputFile::new(
+                dir.join("pyproject.toml"),
+                render_pyproject_toml(package_name, input_basename),
+            ),
+            OutputFile::new(
+                dir.join("setup.py"),
+                render_setup_py(package_name, input_basename),
+            ),
+            OutputFile::new(dir.join("README.md"), render_readme(input_basename)),
+        ]
     }
 }
+
+weaveffi_core::impl_generator_via_backend!(PythonGenerator);
 
 // ── Type helpers ──
 
@@ -504,6 +538,10 @@ fn render_async_ffi_call_body(out: &mut String, f: &FnBinding) {
 
 // ── Rendering ──
 
+/// Render the `weaveffi.py` module source. Thin wrapper over the shared
+/// [`LanguageBackend::emit_members`] walk (via
+/// [`PythonGenerator::render_py_source`]); retained for direct use in tests.
+#[cfg(test)]
 fn render_python_module(
     api: &Api,
     strip_module_prefix: bool,
@@ -511,36 +549,7 @@ fn render_python_module(
     input_basename: &str,
 ) -> String {
     let model = BindingModel::build(api, prefix);
-    let mut out = render_prelude(CommentStyle::Hash, input_basename);
-    render_preamble(&mut out);
-    let has_async = model.functions().any(|(_, f)| f.is_async);
-    if has_async {
-        out.push_str("\nimport asyncio\nimport threading\n");
-    }
-    // The model is a flat, pre-order list of modules, each carrying its joined
-    // symbol path — the same traversal order the recursive walk produced.
-    for m in &model.modules {
-        render_python_module_content(&mut out, m, strip_module_prefix);
-    }
-    out.push('\n');
-    out.push_str(&render_trailer(CommentStyle::Hash, "weaveffi.py"));
-    out
-}
-
-fn render_python_module_content(out: &mut String, m: &ModuleBinding, strip_module_prefix: bool) {
-    out.push_str(&format!("\n\n# === Module: {} ===", m.path));
-    for e in &m.enums {
-        render_enum(out, e);
-    }
-    for s in &m.structs {
-        render_struct(out, s);
-        if s.builder.is_some() {
-            render_builder(out, s);
-        }
-    }
-    for f in &m.functions {
-        render_function(out, &m.path, f, strip_module_prefix);
-    }
+    PythonGenerator.render_py_source(&model, strip_module_prefix, input_basename)
 }
 
 /// Emits a Python `# ...` line comment at `indent`. Used above C ABI binding
@@ -1527,6 +1536,7 @@ fn render_pyi_function(
 mod tests {
     use super::*;
     use camino::Utf8Path;
+    use weaveffi_core::codegen::Generator;
     use weaveffi_ir::ir::{
         Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
     };
@@ -1554,7 +1564,7 @@ mod tests {
 
     #[test]
     fn generator_name_is_python() {
-        assert_eq!(PythonGenerator.name(), "python");
+        assert_eq!(Generator::name(&PythonGenerator), "python");
     }
 
     #[test]
@@ -1617,12 +1627,12 @@ mod tests {
         assert_eq!(
             files,
             vec![
-                out.join("python/README.md").to_string(),
-                out.join("python/pyproject.toml").to_string(),
-                out.join("python/setup.py").to_string(),
-                out.join("python/weaveffi/__init__.py").to_string(),
-                out.join("python/weaveffi/weaveffi.py").to_string(),
-                out.join("python/weaveffi/weaveffi.pyi").to_string(),
+                format!("{out}/python/README.md"),
+                format!("{out}/python/pyproject.toml"),
+                format!("{out}/python/setup.py"),
+                format!("{out}/python/weaveffi/__init__.py"),
+                format!("{out}/python/weaveffi/weaveffi.py"),
+                format!("{out}/python/weaveffi/weaveffi.pyi"),
             ]
         );
     }

@@ -3,20 +3,20 @@
 //! Produces an idiomatic `weaveffi.hpp` header (with move semantics,
 //! `std::optional`, `std::vector`, exception-based error handling) plus a
 //! `CMakeLists.txt` skeleton on top of the C ABI emitted by
-//! [`weaveffi-gen-c`](../weaveffi_gen_c/index.html). Implements the
-//! [`Generator`] trait.
+//! [`weaveffi-gen-c`](../weaveffi_gen_c/index.html). Implements
+//! [`LanguageBackend`]; the shared driver bridges it into the generator
+//! pipeline.
 
-use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
 use serde::{Deserialize, Serialize};
 use weaveffi_core::abi::{self, AbiParam};
+use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::cabi;
 use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, is_c_pointer_type, walk_modules, walk_modules_with_path,
     DocCommentStyle,
 };
-use weaveffi_core::codegen::Generator;
 use weaveffi_core::model::BindingModel;
 use weaveffi_core::utils::{
     c_abi_struct_name, local_type_name, render_abi_prefix_aliases, render_prelude, render_trailer,
@@ -67,63 +67,48 @@ impl CppConfig {
 
 pub struct CppGenerator;
 
-impl CppGenerator {
-    #[allow(clippy::too_many_arguments)]
-    fn generate_impl(
-        &self,
-        api: &Api,
-        out_dir: &Utf8Path,
-        namespace: &str,
-        header_name: &str,
-        cpp_std: &str,
-        c_prefix: &str,
-        input_basename: &str,
-    ) -> Result<()> {
-        let dir = out_dir.join("cpp");
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(
-            dir.join(header_name),
-            render_cpp_header(api, namespace, c_prefix, input_basename, header_name),
-        )?;
-        std::fs::write(
-            dir.join("CMakeLists.txt"),
-            render_cmake(cpp_std, input_basename),
-        )?;
-        std::fs::write(dir.join("README.md"), render_readme(input_basename))?;
-        Ok(())
-    }
-}
-
-impl Generator for CppGenerator {
+impl LanguageBackend for CppGenerator {
     type Config = CppConfig;
 
     fn name(&self) -> &'static str {
         "cpp"
     }
 
-    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()> {
-        self.generate_impl(
-            api,
-            out_dir,
-            config.namespace(),
-            config.header_name(),
-            config.standard(),
-            config.prefix(),
-            config.input_basename(),
-        )
+    fn prefix<'a>(&self, config: &'a Self::Config) -> &'a str {
+        config.prefix()
     }
 
-    fn output_files(&self, _api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Vec<String> {
+    fn files(
+        &self,
+        api: &Api,
+        _model: &BindingModel,
+        out_dir: &Utf8Path,
+        config: &Self::Config,
+    ) -> Vec<OutputFile> {
+        let dir = out_dir.join("cpp");
         let header_name = config.header_name();
-        let mut files = vec![
-            out_dir.join("cpp/CMakeLists.txt").to_string(),
-            out_dir.join("cpp/README.md").to_string(),
-            out_dir.join(format!("cpp/{header_name}")).to_string(),
-        ];
-        files.sort();
-        files
+        let input_basename = config.input_basename();
+        vec![
+            OutputFile::new(
+                dir.join(header_name),
+                render_cpp_header(
+                    api,
+                    config.namespace(),
+                    config.prefix(),
+                    input_basename,
+                    header_name,
+                ),
+            ),
+            OutputFile::new(
+                dir.join("CMakeLists.txt"),
+                render_cmake(config.standard(), input_basename),
+            ),
+            OutputFile::new(dir.join("README.md"), render_readme(input_basename)),
+        ]
     }
 }
+
+weaveffi_core::impl_generator_via_backend!(CppGenerator);
 
 fn render_cmake(cpp_std: &str, input_basename: &str) -> String {
     let mut out = render_prelude(CommentStyle::Hash, input_basename);
@@ -1534,7 +1519,7 @@ mod tests {
 
     #[test]
     fn name_returns_cpp() {
-        assert_eq!(CppGenerator.name(), "cpp");
+        assert_eq!(Generator::name(&CppGenerator), "cpp");
     }
 
     #[test]
@@ -1545,9 +1530,9 @@ mod tests {
         assert_eq!(
             files,
             vec![
-                out_dir.join("cpp/CMakeLists.txt").to_string(),
-                out_dir.join("cpp/README.md").to_string(),
-                out_dir.join("cpp/weaveffi.hpp").to_string(),
+                format!("{out_dir}/cpp/CMakeLists.txt"),
+                format!("{out_dir}/cpp/README.md"),
+                format!("{out_dir}/cpp/weaveffi.hpp"),
             ]
         );
     }

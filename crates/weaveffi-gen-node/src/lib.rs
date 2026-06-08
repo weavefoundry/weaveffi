@@ -2,16 +2,16 @@
 //!
 //! Emits a JavaScript loader plus TypeScript type definitions for the
 //! companion N-API addon. Async functions surface as `Promise`-returning
-//! methods. Implements the [`Generator`] trait.
+//! methods. Implements [`LanguageBackend`]; the shared driver bridges it into
+//! the generator pipeline.
 
 use std::collections::HashMap;
 
-use anyhow::Result;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
 use serde::{Deserialize, Serialize};
+use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
-use weaveffi_core::codegen::Generator;
 use weaveffi_core::model::{BindingModel, FnBinding, ParamBinding, StructBinding};
 use weaveffi_core::utils::{
     c_abi_struct_name, local_type_name, render_json_prelude, render_prelude, render_trailer,
@@ -53,74 +53,56 @@ impl NodeConfig {
 
 pub struct NodeGenerator;
 
-impl NodeGenerator {
-    fn generate_impl(
-        &self,
-        api: &Api,
-        out_dir: &Utf8Path,
-        package_name: &str,
-        prefix: &str,
-        strip_module_prefix: bool,
-        input_basename: &str,
-    ) -> Result<()> {
-        let dir = out_dir.join("node");
-        std::fs::create_dir_all(&dir)?;
-        let dbl = CommentStyle::DoubleSlash;
-        std::fs::write(
-            dir.join("index.js"),
-            format!(
-                "{}module.exports = require('./index.node')\n\n{}",
-                render_prelude(dbl, input_basename),
-                render_trailer(dbl, "index.js"),
-            ),
-        )?;
-        std::fs::write(
-            dir.join("types.d.ts"),
-            render_node_dts(api, prefix, strip_module_prefix, input_basename),
-        )?;
-        std::fs::write(
-            dir.join("package.json"),
-            render_package_json(package_name, input_basename),
-        )?;
-        std::fs::write(dir.join("binding.gyp"), render_binding_gyp(input_basename))?;
-        std::fs::write(
-            dir.join("weaveffi_addon.c"),
-            render_addon_c(api, prefix, strip_module_prefix, input_basename),
-        )?;
-        Ok(())
-    }
-}
-
-impl Generator for NodeGenerator {
+impl LanguageBackend for NodeGenerator {
     type Config = NodeConfig;
 
     fn name(&self) -> &'static str {
         "node"
     }
 
-    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()> {
-        self.generate_impl(
-            api,
-            out_dir,
-            config.package_name(),
-            config.prefix(),
-            config.strip_module_prefix,
-            config.input_basename(),
-        )
+    fn prefix<'a>(&self, config: &'a Self::Config) -> &'a str {
+        config.prefix()
     }
 
-    fn output_files(&self, _api: &Api, out_dir: &Utf8Path, _config: &Self::Config) -> Vec<String> {
-        let mut files = vec![
-            out_dir.join("node/binding.gyp").to_string(),
-            out_dir.join("node/index.js").to_string(),
-            out_dir.join("node/package.json").to_string(),
-            out_dir.join("node/types.d.ts").to_string(),
-            out_dir.join("node/weaveffi_addon.c").to_string(),
-        ];
-        files.sort();
-        files
+    fn files(
+        &self,
+        api: &Api,
+        _model: &BindingModel,
+        out_dir: &Utf8Path,
+        config: &Self::Config,
+    ) -> Vec<OutputFile> {
+        let dir = out_dir.join("node");
+        let input_basename = config.input_basename();
+        let prefix = config.prefix();
+        let strip = config.strip_module_prefix;
+        let dbl = CommentStyle::DoubleSlash;
+        vec![
+            OutputFile::new(
+                dir.join("index.js"),
+                format!(
+                    "{}module.exports = require('./index.node')\n\n{}",
+                    render_prelude(dbl, input_basename),
+                    render_trailer(dbl, "index.js"),
+                ),
+            ),
+            OutputFile::new(
+                dir.join("types.d.ts"),
+                render_node_dts(api, prefix, strip, input_basename),
+            ),
+            OutputFile::new(
+                dir.join("package.json"),
+                render_package_json(config.package_name(), input_basename),
+            ),
+            OutputFile::new(dir.join("binding.gyp"), render_binding_gyp(input_basename)),
+            OutputFile::new(
+                dir.join("weaveffi_addon.c"),
+                render_addon_c(api, prefix, strip, input_basename),
+            ),
+        ]
     }
 }
+
+weaveffi_core::impl_generator_via_backend!(NodeGenerator);
 
 fn render_package_json(name: &str, input_basename: &str) -> String {
     let prelude = render_json_prelude(input_basename);
@@ -1495,6 +1477,7 @@ fn render_node_dts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weaveffi_core::codegen::Generator;
     use weaveffi_ir::ir::{EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField};
 
     fn make_api(modules: Vec<Module>) -> Api {

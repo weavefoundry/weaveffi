@@ -12,7 +12,6 @@ categories = ["development-tools::ffi"]
 [dependencies]
 weaveffi-core = { path = "../weaveffi-core", version = "0.7.0" }
 weaveffi-ir = { path = "../weaveffi-ir", version = "0.7.0" }
-anyhow = { workspace = true }
 camino = { workspace = true }
 heck = { workspace = true }
 serde = { workspace = true }

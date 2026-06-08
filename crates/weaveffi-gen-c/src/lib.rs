@@ -11,11 +11,10 @@
 
 use std::fmt::Write;
 
-use anyhow::Result;
 use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
+use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::cabi;
-use weaveffi_core::codegen::Generator;
 use weaveffi_core::model::BindingModel;
 use weaveffi_core::utils::{
     render_abi_prefix_aliases, render_prelude, render_trailer, CommentStyle,
@@ -49,41 +48,43 @@ impl CConfig {
 
 pub struct CGenerator;
 
-impl Generator for CGenerator {
+impl LanguageBackend for CGenerator {
     type Config = CConfig;
 
     fn name(&self) -> &'static str {
         "c"
     }
 
-    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()> {
+    fn prefix<'a>(&self, config: &'a Self::Config) -> &'a str {
+        config.prefix()
+    }
+
+    fn files(
+        &self,
+        api: &Api,
+        _model: &BindingModel,
+        out_dir: &Utf8Path,
+        config: &Self::Config,
+    ) -> Vec<OutputFile> {
         let prefix = config.prefix();
         let input_basename = config.input_basename();
         let dir = out_dir.join("c");
-        std::fs::create_dir_all(&dir)?;
         let header_name = format!("{prefix}.h");
         let source_name = format!("{prefix}.c");
-        std::fs::write(
-            dir.join(&header_name),
-            render_c_header(api, prefix, input_basename, &header_name),
-        )?;
-        std::fs::write(
-            dir.join(&source_name),
-            render_c_convenience_c(prefix, input_basename, &source_name),
-        )?;
-        Ok(())
-    }
-
-    fn output_files(&self, _api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Vec<String> {
-        let prefix = config.prefix();
-        let mut files = vec![
-            out_dir.join(format!("c/{prefix}.c")).to_string(),
-            out_dir.join(format!("c/{prefix}.h")).to_string(),
-        ];
-        files.sort();
-        files
+        vec![
+            OutputFile::new(
+                dir.join(&header_name),
+                render_c_header(api, prefix, input_basename, &header_name),
+            ),
+            OutputFile::new(
+                dir.join(&source_name),
+                render_c_convenience_c(prefix, input_basename, &source_name),
+            ),
+        ]
     }
 }
+
+weaveffi_core::impl_generator_via_backend!(CGenerator);
 
 /// Render the complete `{prefix}.h` for `api` using `prefix` for every symbol.
 ///
@@ -135,6 +136,7 @@ fn render_c_convenience_c(prefix: &str, input_basename: &str, filename: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weaveffi_core::codegen::Generator;
     use weaveffi_ir::ir::{
         CallbackDef, EnumDef, EnumVariant, Function, ListenerDef, Module, Param, StructDef,
         StructField, TypeRef,
