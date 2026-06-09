@@ -365,7 +365,9 @@ fn render_cpp_class(out: &mut String, s: &StructDef, abi_module: &str, prefix: &
     out.push_str(&format!("class {name} {{\n"));
     out.push_str("    void* handle_;\n\n");
     out.push_str("public:\n");
-    out.push_str(&format!("    explicit {name}(void* h) : handle_(h) {{}}\n\n"));
+    out.push_str(&format!(
+        "    explicit {name}(void* h) : handle_(h) {{}}\n\n"
+    ));
 
     // Destructor
     out.push_str(&format!("    ~{name}() {{\n"));
@@ -376,7 +378,9 @@ fn render_cpp_class(out: &mut String, s: &StructDef, abi_module: &str, prefix: &
 
     // Deleted copy
     out.push_str(&format!("    {name}(const {name}&) = delete;\n"));
-    out.push_str(&format!("    {name}& operator=(const {name}&) = delete;\n\n"));
+    out.push_str(&format!(
+        "    {name}& operator=(const {name}&) = delete;\n\n"
+    ));
 
     // Move constructor
     out.push_str(&format!(
@@ -1478,7 +1482,9 @@ fn render_async_set_value(out: &mut String, ty: &TypeRef, prefix: &str) {
                 TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                     "std::string(result_values[i])".into()
                 }
-                TypeRef::Enum(n) => format!("static_cast<{}>(result_values[i])", local_type_name(n)),
+                TypeRef::Enum(n) => {
+                    format!("static_cast<{}>(result_values[i])", local_type_name(n))
+                }
                 TypeRef::Struct(n) => format!("{}(result_values[i])", local_type_name(n)),
                 _ => "result_values[i]".into(),
             };

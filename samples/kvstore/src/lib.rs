@@ -451,57 +451,57 @@ pub extern "C" fn weaveffi_kv_compact_async_async(
 
     #[cfg(not(target_arch = "wasm32"))]
     {
-    let store_addr = store as usize;
-    let token_addr = cancel_token as usize;
-    let ctx_addr = context as usize;
-    std::thread::spawn(move || {
-        let store_ptr = store_addr as *mut Store;
-        let token_ptr = token_addr as *mut weaveffi_cancel_token;
-        let ctx_ptr = ctx_addr as *mut c_void;
+        let store_addr = store as usize;
+        let token_addr = cancel_token as usize;
+        let ctx_addr = context as usize;
+        std::thread::spawn(move || {
+            let store_ptr = store_addr as *mut Store;
+            let token_ptr = token_addr as *mut weaveffi_cancel_token;
+            let ctx_ptr = ctx_addr as *mut c_void;
 
-        let mut elapsed = Duration::from_millis(0);
-        let total = Duration::from_millis(50);
-        let step = Duration::from_millis(5);
-        let mut cancelled = false;
-        while elapsed < total {
-            if abi::cancel_token_is_cancelled(token_ptr as *const _) {
-                cancelled = true;
-                break;
-            }
-            std::thread::sleep(step);
-            elapsed += step;
-        }
-
-        if cancelled {
-            let mut err = weaveffi_error::default();
-            abi::error_set(&mut err, KV_IO_ERROR, "compaction cancelled");
-            callback(ctx_ptr, &mut err, 0);
-            abi::error_clear(&mut err);
-            return;
-        }
-
-        let bytes_reclaimed = if store_ptr.is_null() {
-            0
-        } else {
-            let s = unsafe { &*store_ptr };
-            let mut entries = s.entries.lock();
-            let now = now_unix_seconds();
-            let expired_keys: Vec<String> = entries
-                .iter()
-                .filter(|(_, e)| e.is_expired(now))
-                .map(|(k, _)| k.clone())
-                .collect();
-            let mut total_bytes = 0i64;
-            for k in expired_keys {
-                if let Some(e) = entries.remove(&k) {
-                    total_bytes += e.value.len() as i64;
+            let mut elapsed = Duration::from_millis(0);
+            let total = Duration::from_millis(50);
+            let step = Duration::from_millis(5);
+            let mut cancelled = false;
+            while elapsed < total {
+                if abi::cancel_token_is_cancelled(token_ptr as *const _) {
+                    cancelled = true;
+                    break;
                 }
+                std::thread::sleep(step);
+                elapsed += step;
             }
-            total_bytes
-        };
 
-        callback(ctx_ptr, std::ptr::null_mut(), bytes_reclaimed);
-    });
+            if cancelled {
+                let mut err = weaveffi_error::default();
+                abi::error_set(&mut err, KV_IO_ERROR, "compaction cancelled");
+                callback(ctx_ptr, &mut err, 0);
+                abi::error_clear(&mut err);
+                return;
+            }
+
+            let bytes_reclaimed = if store_ptr.is_null() {
+                0
+            } else {
+                let s = unsafe { &*store_ptr };
+                let mut entries = s.entries.lock();
+                let now = now_unix_seconds();
+                let expired_keys: Vec<String> = entries
+                    .iter()
+                    .filter(|(_, e)| e.is_expired(now))
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                let mut total_bytes = 0i64;
+                for k in expired_keys {
+                    if let Some(e) = entries.remove(&k) {
+                        total_bytes += e.value.len() as i64;
+                    }
+                }
+                total_bytes
+            };
+
+            callback(ctx_ptr, std::ptr::null_mut(), bytes_reclaimed);
+        });
     }
 }
 

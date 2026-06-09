@@ -249,7 +249,12 @@ pub fn render_module_fn_decls(out: &mut String, module: &ModuleBinding, prefix: 
 /// The runtime decls (`handle_t`, `error`, `free_*`, cancel token) are *not*
 /// emitted here; callers render those first (the C generator inserts its map
 /// convention comment in between).
-pub fn render_decls(out: &mut String, modules: &[ModuleBinding], prefix: &str, module_comments: bool) {
+pub fn render_decls(
+    out: &mut String,
+    modules: &[ModuleBinding],
+    prefix: &str,
+    module_comments: bool,
+) {
     for m in modules {
         render_module_enum_defs(out, m);
     }

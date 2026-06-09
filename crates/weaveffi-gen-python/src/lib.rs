@@ -2589,10 +2589,7 @@ mod tests {
         assert_eq!(py_type_hint(&TypeRef::Handle), "int");
         assert_eq!(py_type_hint(&TypeRef::Struct("Foo".into())), "\"Foo\"");
         assert_eq!(py_type_hint(&TypeRef::Enum("Bar".into())), "\"Bar\"");
-        assert_eq!(
-            py_type_hint(&TypeRef::TypedHandle("Foo".into())),
-            "\"Foo\""
-        );
+        assert_eq!(py_type_hint(&TypeRef::TypedHandle("Foo".into())), "\"Foo\"");
         // Cross-module references (resolved to a qualified IR name) must still
         // annotate the bare *local* class, which is the only symbol that exists
         // in the generated module.
@@ -2605,10 +2602,7 @@ mod tests {
             py_type_hint(&TypeRef::Struct("kv.Store".into())),
             "\"Store\""
         );
-        assert_eq!(
-            py_type_hint(&TypeRef::Enum("kv.Kind".into())),
-            "\"Kind\""
-        );
+        assert_eq!(py_type_hint(&TypeRef::Enum("kv.Kind".into())), "\"Kind\"");
         assert_eq!(
             py_type_hint(&TypeRef::Optional(Box::new(TypeRef::I32))),
             "Optional[int]"

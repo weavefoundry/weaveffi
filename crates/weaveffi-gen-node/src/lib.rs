@@ -330,9 +330,7 @@ fn emit_async_resolve_value(
             );
         }
         Some(TypeRef::TypedHandle(_) | TypeRef::Handle) => {
-            out.push_str(
-                "        napi_create_int64(ctx->env, (int64_t)(intptr_t)result, &val);\n",
-            );
+            out.push_str("        napi_create_int64(ctx->env, (int64_t)(intptr_t)result, &val);\n");
         }
         Some(TypeRef::Struct(name)) => {
             emit_struct_to_object(
@@ -667,9 +665,7 @@ fn emit_optional_param(
                 "    napi_get_value_int64(env, args[{idx}], &{name}_raw);\n"
             ));
             out.push_str("  }\n");
-            c_args.push(format!(
-                "{name}_raw ? ({abi}*)(intptr_t){name}_raw : NULL"
-            ));
+            c_args.push(format!("{name}_raw ? ({abi}*)(intptr_t){name}_raw : NULL"));
         }
         TypeRef::Enum(e) => {
             let etype = format!("{prefix}_{module}_{e}");
@@ -1074,7 +1070,10 @@ fn emit_elem_to_napi(
                 out, env, name, expr, target, module, prefix, structs, indent, false,
             );
         }
-        _ => out.push_str(&format!("{indent}{}\n", napi_create_leaf(env, ty, expr, target))),
+        _ => out.push_str(&format!(
+            "{indent}{}\n",
+            napi_create_leaf(env, ty, expr, target)
+        )),
     }
 }
 
@@ -1241,7 +1240,9 @@ fn emit_struct_field_to_napi(
             let et = c_elem_type(inner, module, prefix);
             out.push_str(&format!("{indent}{{\n"));
             out.push_str(&format!("{indent}  size_t {fv}_len;\n"));
-            out.push_str(&format!("{indent}  {et}* {fv}_arr = {getter}({pv}, &{fv}_len);\n"));
+            out.push_str(&format!(
+                "{indent}  {et}* {fv}_arr = {getter}({pv}, &{fv}_len);\n"
+            ));
             out.push_str(&format!("{indent}  napi_create_array({env}, &{fv});\n"));
             out.push_str(&format!("{indent}  if ({fv}_arr != NULL) {{\n"));
             out.push_str(&format!(
@@ -1310,7 +1311,12 @@ fn emit_struct_field_to_napi(
                     out.push_str(&format!("{indent}      napi_value {fv}_k;\n"));
                     out.push_str(&format!(
                         "{indent}      {}\n",
-                        napi_create_leaf(env, other, &format!("{fv}_keys[{fv}_i]"), &format!("{fv}_k"))
+                        napi_create_leaf(
+                            env,
+                            other,
+                            &format!("{fv}_keys[{fv}_i]"),
+                            &format!("{fv}_k")
+                        )
                     ));
                     out.push_str(&format!(
                         "{indent}      napi_set_property({env}, {fv}, {fv}_k, {fv}_v);\n"
@@ -1773,7 +1779,10 @@ mod tests {
     fn ts_type_for_struct_and_enum() {
         assert_eq!(ts_type_for(&TypeRef::Struct("Contact".into())), "Contact");
         assert_eq!(ts_type_for(&TypeRef::Enum("Color".into())), "Color");
-        assert_eq!(ts_type_for(&TypeRef::TypedHandle("Contact".into())), "Contact");
+        assert_eq!(
+            ts_type_for(&TypeRef::TypedHandle("Contact".into())),
+            "Contact"
+        );
     }
 
     #[test]

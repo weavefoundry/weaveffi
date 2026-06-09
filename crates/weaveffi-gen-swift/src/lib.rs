@@ -510,6 +510,7 @@ fn render_swift_module_types(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_swift_module_body(
     out: &mut String,
     c_prefix: &str,
@@ -525,7 +526,14 @@ fn render_swift_module_body(
     for f in &mb.functions {
         let mut buf = String::new();
         if f.is_async {
-            render_swift_async_function(&mut buf, c_prefix, module_path, f, strip_module_prefix, ctx);
+            render_swift_async_function(
+                &mut buf,
+                c_prefix,
+                module_path,
+                f,
+                strip_module_prefix,
+                ctx,
+            );
         } else {
             render_swift_function(&mut buf, c_prefix, module_path, f, strip_module_prefix, ctx);
         }
@@ -737,9 +745,7 @@ fn render_swift_getter(out: &mut String, field: &FieldBinding, ctx: SwiftCtx) {
                     ));
                 }
                 TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                    out.push_str(
-                        "        return (0..<outLen).map { String(cString: rv[$0]!) }\n",
-                    );
+                    out.push_str("        return (0..<outLen).map { String(cString: rv[$0]!) }\n");
                 }
                 _ => {
                     out.push_str(
@@ -776,7 +782,10 @@ fn render_swift_getter(out: &mut String, field: &FieldBinding, ctx: SwiftCtx) {
             out.push_str("        for i in 0..<outLen {\n");
             let key_expr = map_element_read(k, "outKeys[i]", ctx);
             let val_expr = map_element_read(v, "outValues[i]", ctx);
-            out.push_str(&format!("            result[{}] = {}\n", key_expr, val_expr));
+            out.push_str(&format!(
+                "            result[{}] = {}\n",
+                key_expr, val_expr
+            ));
             out.push_str("        }\n");
             out.push_str("        return result\n");
         }
@@ -1648,7 +1657,11 @@ fn map_element_read(ty: &TypeRef, expr: &str, ctx: SwiftCtx) -> String {
     match ty {
         TypeRef::StringUtf8 => format!("String(cString: {}!)", expr),
         TypeRef::Enum(name) => {
-            format!("{}(rawValue: {}.rawValue)!", ctx.ty_name(local_type_name(name)), expr)
+            format!(
+                "{}(rawValue: {}.rawValue)!",
+                ctx.ty_name(local_type_name(name)),
+                expr
+            )
         }
         TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
             format!("{}(ptr: {}!)", ctx.ty_name(local_type_name(name)), expr)
@@ -1657,7 +1670,13 @@ fn map_element_read(ty: &TypeRef, expr: &str, ctx: SwiftCtx) -> String {
     }
 }
 
-fn render_map_return(out: &mut String, call_with_err: &str, k: &TypeRef, v: &TypeRef, ctx: SwiftCtx) {
+fn render_map_return(
+    out: &mut String,
+    call_with_err: &str,
+    k: &TypeRef,
+    v: &TypeRef,
+    ctx: SwiftCtx,
+) {
     let key_elem = swift_c_ptr_element(k);
     let val_elem = swift_c_ptr_element(v);
     let key_swift = swift_type_ctx(k, ctx);
@@ -1816,7 +1835,12 @@ fn render_iterator_return(
         .next
         .params
         .get(1)
-        .map(|p| p.ty.render_c(ctx.c_prefix).trim_end_matches('*').trim().to_string())
+        .map(|p| {
+            p.ty.render_c(ctx.c_prefix)
+                .trim_end_matches('*')
+                .trim()
+                .to_string()
+        })
         .unwrap_or_default();
 
     out.push_str(&format!("{indent}let iter = {call_with_err}\n"));
@@ -2099,7 +2123,8 @@ fn render_buffered_call(
             TypeRef::Map(k, v) => {
                 let keys_source = map_array_source(k, &p.name, "keys");
                 let values_source = map_array_source(v, &p.name, "values");
-                let keys_open = closure_open(is_first, needs_return, handles_return_inside, &ret_type);
+                let keys_open =
+                    closure_open(is_first, needs_return, handles_return_inside, &ret_type);
                 out.push_str(&format!(
                     "{}{}{}.withUnsafeBufferPointer {{ {}_keys_buf in\n",
                     indent, keys_open, keys_source, p.name
@@ -2384,7 +2409,8 @@ fn render_buffered_struct_create(
             TypeRef::Map(k, v) => {
                 let keys_source = map_array_source(k, &p.name, "keys");
                 let values_source = map_array_source(v, &p.name, "values");
-                let keys_open = closure_open(is_first, needs_return, handles_return_inside, &ret_type);
+                let keys_open =
+                    closure_open(is_first, needs_return, handles_return_inside, &ret_type);
                 out.push_str(&format!(
                     "{}{}{}.withUnsafeBufferPointer {{ {}_keys_buf in\n",
                     indent, keys_open, keys_source, p.name

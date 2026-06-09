@@ -222,12 +222,7 @@ fn input_slots(ty: &TypeRef) -> Vec<(String, String)> {
 /// Emit pre-call staging for one input (`name`), returning the call-argument
 /// expressions it contributes (in ABI order) and appending any cleanup
 /// statements to `frees`. Mirrors the `(ptr, len)` / `(keys, vals, len)` ABI.
-fn emit_input(
-    out: &mut String,
-    name: &str,
-    ty: &TypeRef,
-    frees: &mut Vec<String>,
-) -> Vec<String> {
+fn emit_input(out: &mut String, name: &str, ty: &TypeRef, frees: &mut Vec<String>) -> Vec<String> {
     match ty {
         TypeRef::Bool => vec![format!("{name} ? 1 : 0")],
         TypeRef::Enum(_) => vec![format!("{name}.value")],
@@ -253,9 +248,7 @@ fn emit_input(
             vec![p, format!("{name}.length")]
         }
         TypeRef::Optional(inner) => emit_optional_input(out, name, inner, frees),
-        TypeRef::List(inner) | TypeRef::Iterator(inner) => {
-            emit_list_input(out, name, inner, frees)
-        }
+        TypeRef::List(inner) | TypeRef::Iterator(inner) => emit_list_input(out, name, inner, frees),
         TypeRef::Map(k, v) => emit_map_input(out, name, k, v, frees),
     }
 }
@@ -349,14 +342,18 @@ fn emit_map_input(
         .and_then(|s| s.strip_suffix('>'))
         .unwrap_or("Pointer<Void>")
         .to_string();
-    out.push_str(&format!("  final {name}Entries = {name}.entries.toList();\n"));
+    out.push_str(&format!(
+        "  final {name}Entries = {name}.entries.toList();\n"
+    ));
     out.push_str(&format!(
         "  final {kp} = {name}.isEmpty ? nullptr : calloc<{ki}>({name}.length);\n"
     ));
     out.push_str(&format!(
         "  final {vp} = {name}.isEmpty ? nullptr : calloc<{vi}>({name}.length);\n"
     ));
-    out.push_str(&format!("  for (var i = 0; i < {name}Entries.length; i++) {{\n"));
+    out.push_str(&format!(
+        "  for (var i = 0; i < {name}Entries.length; i++) {{\n"
+    ));
     out.push_str(&format!(
         "    {kp}[i] = {};\n",
         elem_to_native(&format!("{name}Entries[i].key"), k)
@@ -442,7 +439,10 @@ fn map_elem_read(arr: &str, idx: &str, ty: &TypeRef) -> String {
         ),
         TypeRef::Bool => format!("{arr}[{idx}] != 0"),
         TypeRef::Struct(n) | TypeRef::TypedHandle(n) => {
-            format!("{}._({arr}[{idx}])", local_type_name(n).to_upper_camel_case())
+            format!(
+                "{}._({arr}[{idx}])",
+                local_type_name(n).to_upper_camel_case()
+            )
         }
         _ => format!("{arr}[{idx}]"),
     }
@@ -483,8 +483,14 @@ fn emit_return_alloc(
             let kf = map_out_ffi(k);
             let vf = map_out_ffi(v);
             // `outKeys`/`outValues` hold the array pointer the callee writes.
-            let ki = kf.strip_prefix("Pointer<").and_then(|s| s.strip_suffix('>')).unwrap();
-            let vi = vf.strip_prefix("Pointer<").and_then(|s| s.strip_suffix('>')).unwrap();
+            let ki = kf
+                .strip_prefix("Pointer<")
+                .and_then(|s| s.strip_suffix('>'))
+                .unwrap();
+            let vi = vf
+                .strip_prefix("Pointer<")
+                .and_then(|s| s.strip_suffix('>'))
+                .unwrap();
             out.push_str(&format!("{indent}final outKeys = calloc<{ki}>();\n"));
             out.push_str(&format!("{indent}final outValues = calloc<{vi}>();\n"));
             out.push_str(&format!("{indent}final outLen = calloc<Size>();\n"));
@@ -911,7 +917,12 @@ fn render_dart_builder(out: &mut String, s: &StructBinding) {
     let mut frees: Vec<String> = Vec::new();
     let mut call_args: Vec<String> = Vec::new();
     for field in &s.fields {
-        let args = emit_input(out, &field.name.to_lower_camel_case(), &field.ty, &mut frees);
+        let args = emit_input(
+            out,
+            &field.name.to_lower_camel_case(),
+            &field.ty,
+            &mut frees,
+        );
         call_args.extend(args);
     }
     out.push_str("    final err = calloc<_WeaveFFIError>();\n");
@@ -1341,7 +1352,10 @@ fn emit_iterator_body(out: &mut String, f: &FnBinding, c_sym: &str, ib: &Iterato
 
     out.push_str("  try {\n");
     let var = c_sym.to_lower_camel_case();
-    out.push_str(&format!("    final iter = _{var}({});\n", call_args.join(", ")));
+    out.push_str(&format!(
+        "    final iter = _{var}({});\n",
+        call_args.join(", ")
+    ));
     out.push_str("    _checkError(err);\n");
     let elem = &ib.elem;
     let dt = dart_type(elem);
@@ -1355,7 +1369,10 @@ fn emit_iterator_body(out: &mut String, f: &FnBinding, c_sym: &str, ib: &Iterato
         ib.next.symbol.to_lower_camel_case()
     ));
     out.push_str("      _checkError(err);\n");
-    out.push_str(&format!("      items.add({});\n", read_value("outItem.value", elem)));
+    out.push_str(&format!(
+        "      items.add({});\n",
+        read_value("outItem.value", elem)
+    ));
     out.push_str("    }\n");
     out.push_str("    _checkError(err);\n");
     out.push_str("    calloc.free(outItem);\n");
@@ -1825,10 +1842,7 @@ mod tests {
             dart.contains("PointBuilder withX(double value)"),
             "fluent setter: {dart}"
         );
-        assert!(
-            dart.contains("Point build() {"),
-            "build method: {dart}"
-        );
+        assert!(dart.contains("Point build() {"), "build method: {dart}");
         assert!(
             dart.contains("_checkError(err);") && dart.contains("return Point._(result);"),
             "build calls FFI create and wraps the result: {dart}"

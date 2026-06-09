@@ -1699,7 +1699,10 @@ fn iter_item_c_type(elem: &TypeRef, module: &str, c_prefix: &str) -> String {
     match elem {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*".to_string(),
         TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
-            format!("{}*", weaveffi_core::utils::c_abi_struct_name(name, module, c_prefix))
+            format!(
+                "{}*",
+                weaveffi_core::utils::c_abi_struct_name(name, module, c_prefix)
+            )
         }
         other => c_type_for_return(other).to_string(),
     }
@@ -1717,27 +1720,58 @@ fn write_boxed_scalar(out: &mut String, ty: &TypeRef, var: &str, src: &str, inde
             );
         }
         TypeRef::I32 | TypeRef::Enum(_) => {
-            let _ = writeln!(out, "{i}jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Integer\");", i = indent, v = var);
+            let _ = writeln!(
+                out,
+                "{i}jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Integer\");",
+                i = indent,
+                v = var
+            );
             let _ = writeln!(out, "{i}jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(I)Ljava/lang/Integer;\"), (jint){s});", i = indent, v = var, s = src);
         }
         TypeRef::U32 | TypeRef::I64 => {
-            let _ = writeln!(out, "{i}jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Long\");", i = indent, v = var);
+            let _ = writeln!(
+                out,
+                "{i}jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Long\");",
+                i = indent,
+                v = var
+            );
             let _ = writeln!(out, "{i}jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(J)Ljava/lang/Long;\"), (jlong){s});", i = indent, v = var, s = src);
         }
         TypeRef::TypedHandle(_) | TypeRef::Handle | TypeRef::Struct(_) => {
-            let _ = writeln!(out, "{i}jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Long\");", i = indent, v = var);
+            let _ = writeln!(
+                out,
+                "{i}jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Long\");",
+                i = indent,
+                v = var
+            );
             let _ = writeln!(out, "{i}jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(J)Ljava/lang/Long;\"), (jlong)(intptr_t){s});", i = indent, v = var, s = src);
         }
         TypeRef::F64 => {
-            let _ = writeln!(out, "{i}jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Double\");", i = indent, v = var);
+            let _ = writeln!(
+                out,
+                "{i}jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Double\");",
+                i = indent,
+                v = var
+            );
             let _ = writeln!(out, "{i}jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(D)Ljava/lang/Double;\"), (jdouble){s});", i = indent, v = var, s = src);
         }
         TypeRef::Bool => {
-            let _ = writeln!(out, "{i}jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Boolean\");", i = indent, v = var);
+            let _ = writeln!(
+                out,
+                "{i}jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Boolean\");",
+                i = indent,
+                v = var
+            );
             let _ = writeln!(out, "{i}jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(Z)Ljava/lang/Boolean;\"), {s} ? JNI_TRUE : JNI_FALSE);", i = indent, v = var, s = src);
         }
         _ => {
-            let _ = writeln!(out, "{i}jobject {v} = (jobject)(intptr_t){s};", i = indent, v = var, s = src);
+            let _ = writeln!(
+                out,
+                "{i}jobject {v} = (jobject)(intptr_t){s};",
+                i = indent,
+                v = var,
+                s = src
+            );
         }
     }
 }
@@ -1768,7 +1802,10 @@ fn write_iterator_return(
     write_error_check(out, Some(&iter_ret));
     release_jni_resources(out, params);
 
-    let _ = writeln!(out, "    jclass _al_cls = (*env)->FindClass(env, \"java/util/ArrayList\");");
+    let _ = writeln!(
+        out,
+        "    jclass _al_cls = (*env)->FindClass(env, \"java/util/ArrayList\");"
+    );
     let _ = writeln!(out, "    jobject _list = (*env)->NewObject(env, _al_cls, (*env)->GetMethodID(env, _al_cls, \"<init>\", \"()V\"));");
     let _ = writeln!(out, "    jmethodID _al_add = (*env)->GetMethodID(env, _al_cls, \"add\", \"(Ljava/lang/Object;)Z\");");
 
@@ -1781,7 +1818,10 @@ fn write_iterator_return(
         next = it.next.symbol
     );
     write_boxed_scalar(out, &it.elem, "_jitem", "_item", "        ");
-    let _ = writeln!(out, "        (*env)->CallBooleanMethod(env, _list, _al_add, _jitem);");
+    let _ = writeln!(
+        out,
+        "        (*env)->CallBooleanMethod(env, _list, _al_add, _jitem);"
+    );
     let _ = writeln!(out, "        (*env)->DeleteLocalRef(env, _jitem);");
     if is_string {
         let _ = writeln!(out, "        weaveffi_free_string(_item);");
@@ -2700,7 +2740,10 @@ fn write_struct_list_getter(out: &mut String, inner: &TypeRef, getter_c: &str, p
             let _ = writeln!(out, "    if (jout && rv) {{");
             let _ = writeln!(out, "        for (size_t i = 0; i < out_len; i++) {{");
             let _ = writeln!(out, "            jstring s = rv[i] ? (*env)->NewStringUTF(env, rv[i]) : (*env)->NewStringUTF(env, \"\");");
-            let _ = writeln!(out, "            (*env)->SetObjectArrayElement(env, jout, (jsize)i, s);");
+            let _ = writeln!(
+                out,
+                "            (*env)->SetObjectArrayElement(env, jout, (jsize)i, s);"
+            );
             let _ = writeln!(out, "            (*env)->DeleteLocalRef(env, s);");
             let _ = writeln!(out, "            weaveffi_free_string(rv[i]);");
             let _ = writeln!(out, "        }}");

@@ -769,7 +769,9 @@ fn emit_iter_elem_append(out: &mut String, dst: &str, inner: &TypeRef, item: &st
         }
         TypeRef::TypedHandle(n) | TypeRef::Struct(n) => {
             let gs = local_type_name(n).to_upper_camel_case();
-            out.push_str(&format!("\t\t{dst} = append({dst}, &{gs}{{ptr: {item}}})\n"));
+            out.push_str(&format!(
+                "\t\t{dst} = append({dst}, &{gs}{{ptr: {item}}})\n"
+            ));
         }
         TypeRef::Bool => {
             out.push_str(&format!("\t\t{dst} = append({dst}, cToBool({item}))\n"));
@@ -798,7 +800,11 @@ fn emit_iterator_body(
 
     let elem = &ib.elem;
     let item_ty = iter_out_item_type(elem, prefix, module);
-    out.push_str(&format!("\tit := C.{}({})\n", ib.launch.symbol, c_args.join(", ")));
+    out.push_str(&format!(
+        "\tit := C.{}({})\n",
+        ib.launch.symbol,
+        c_args.join(", ")
+    ));
     out.push_str("\tif cErr.code != 0 {\n");
     out.push_str("\t\tgoErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(cErr.message), int(cErr.code))\n");
     out.push_str("\t\tC.weaveffi_error_clear(&cErr)\n");
@@ -1229,6 +1235,7 @@ fn decode_list(
 
 /// Emit Go that materializes parallel C key/value arrays (`keys`/`vals`, already
 /// typed per [`go_cmap_ptr_type`]) into a fresh map bound to `dst`.
+#[allow(clippy::too_many_arguments)]
 fn decode_map(
     out: &mut String,
     dst: &str,
