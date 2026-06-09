@@ -7,43 +7,81 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 // WeaveFFI WASM bindings (auto-generated)
 //
-// Complex type conventions at the WASM boundary:
+// Boundary conventions for a wasm32-unknown-unknown build:
 //
-//   Structs   -> i64 opaque handle (pointer into linear memory)
+//   Handles   -> i32 pointer into linear memory (0 = null/absent)
 //   Enums     -> i32 discriminant value
-//   Optionals -> 0/null for absent; for numerics a separate _is_present i32 flag
-//   Lists     -> (i32 pointer, i32 length) pair into linear memory
+//   i64/u64   -> JavaScript BigInt
+//   Strings   -> NUL-terminated UTF-8 (const char*); a single i32 pointer
+//   Bytes     -> i32 data pointer + i32 length (out_len for returns)
+//   Optionals -> null handle / null pointer (0); scalars boxed by pointer
 
-const _encoder = new TextEncoder();
-const _decoder = new TextDecoder();
+const _enc = new TextEncoder();
+const _dec = new TextDecoder();
 
-function _encodeString(wasm, str) {
-  const bytes = _encoder.encode(str);
-  const ptr = wasm.weaveffi_alloc(bytes.length);
-  new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);
-  return [ptr, bytes.length];
+// Stage a JS string as a NUL-terminated C string in linear memory.
+// Returns [ptr, size] (size includes the NUL); release with _free.
+function _cstr(wasm, str) {
+  const bytes = _enc.encode(str);
+  const size = bytes.length + 1;
+  const ptr = wasm.weaveffi_alloc(size);
+  const mem = new Uint8Array(wasm.memory.buffer, ptr, size);
+  mem.set(bytes);
+  mem[bytes.length] = 0;
+  return [ptr, size];
 }
 
-function _decodeString(wasm, ptr, len) {
-  return _decoder.decode(new Uint8Array(wasm.memory.buffer, ptr, len));
+// Read a NUL-terminated C string (0 => null). Does not free.
+function _readCStr(wasm, ptr) {
+  if (ptr === 0) return null;
+  const mem = new Uint8Array(wasm.memory.buffer);
+  let end = ptr;
+  while (mem[end] !== 0) end++;
+  return _dec.decode(mem.subarray(ptr, end));
 }
 
-function _allocError(wasm) {
-  return wasm.weaveffi_alloc(8);
+// Read then free a producer-owned C string.
+function _takeCStr(wasm, ptr) {
+  const s = _readCStr(wasm, ptr);
+  if (ptr !== 0) wasm.weaveffi_free_string(ptr);
+  return s;
 }
 
-function _checkError(wasm, errPtr) {
-  const buffer = wasm.memory.buffer;
-  const code = new Int32Array(buffer, errPtr, 1)[0];
+// Decode a producer-owned array of `len` C strings at `base` (each
+// freed); the array container itself is owned by the producer.
+function _takeStrArray(wasm, base, len) {
+  const out = [];
+  if (base === 0) return out;
+  const dv = new DataView(wasm.memory.buffer);
+  const ptrs = [];
+  for (let i = 0; i < len; i++) ptrs.push(dv.getUint32(base + i * 4, true));
+  for (const p of ptrs) out.push(_takeCStr(wasm, p));
+  return out;
+}
+
+// Allocate a zeroed {i32 code, i32 message} error slot.
+function _allocErr(wasm) {
+  const ptr = wasm.weaveffi_alloc(8);
+  new Uint8Array(wasm.memory.buffer, ptr, 8).fill(0);
+  return ptr;
+}
+
+// Throw (and free the slot) if the error slot carries a non-zero code.
+function _checkErr(wasm, errPtr) {
+  const dv = new DataView(wasm.memory.buffer);
+  const code = dv.getInt32(errPtr, true);
   if (code !== 0) {
-    const msgPtr = new Uint32Array(buffer, errPtr + 4, 1)[0];
-    const bytes = new Uint8Array(buffer, msgPtr);
-    let end = 0;
-    while (bytes[end] !== 0) end++;
-    const msg = new TextDecoder().decode(new Uint8Array(buffer, msgPtr, end));
+    const msgPtr = dv.getUint32(errPtr + 4, true);
+    const msg = _readCStr(wasm, msgPtr) || '';
     wasm.weaveffi_error_clear(errPtr);
+    wasm.weaveffi_dealloc(errPtr, 8);
     throw new Error(`WeaveFFI error ${code}: ${msg}`);
   }
+}
+
+// Release an error slot on the success path.
+function _freeErr(wasm, errPtr) {
+  wasm.weaveffi_dealloc(errPtr, 8);
 }
 
 /**
@@ -58,21 +96,22 @@ function _checkError(wasm, errPtr) {
  * @example
  * const api = await loadWeaveffiWasm('lib.wasm');
  *
- * // Primitive: (i32, i32) -> i32
+ * // Primitive: plain numbers in, number out.
  * const sum = api.math.add(1, 2);
  *
- * // Struct handle: () -> i64 (opaque pointer)
- * const handle = api.contacts.create();
+ * // Struct: returns a wrapper instance exposing field getters.
+ * const person = api.contacts.create();
+ * console.log(person.name);
  *
- * // Enum: (i32 discriminant) -> void
+ * // Enum: pass the integer discriminant.
  * api.ui.set_color(0); // 0 = first variant
  *
- * // Optional: (i32 is_present, i32 value) -> void
- * api.config.set_timeout(1, 5000); // present
- * api.config.set_timeout(0, 0);    // absent
+ * // Optional: pass null to omit, a value to provide.
+ * api.config.set_timeout(5000); // present
+ * api.config.set_timeout(null); // absent
  *
- * // List: (i32 pointer, i32 length) -> void
- * api.data.process(ptr, len);
+ * // List/Map: pass arrays/objects; receive arrays/objects.
+ * const names = api.data.all_names();
  */
 export async function loadWeaveffiWasm(url) {
   const response = await fetch(url);
@@ -84,16 +123,31 @@ export async function loadWeaveffiWasm(url) {
     _raw: wasm,
     events: {
       send_message(text) {
-        const _err = _allocError(wasm);
-        const [text_ptr, text_len] = _encodeString(wasm, text);
-        wasm.weaveffi_events_send_message(text_ptr, text_len, _err);
-        _checkError(wasm, _err);
+        const [a0_p, a0_s] = _cstr(wasm, text);
+        const _err = _allocErr(wasm);
+        wasm.weaveffi_events_send_message(a0_p, _err);
+        wasm.weaveffi_dealloc(a0_p, a0_s);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
       },
       get_messages() {
-        const _err = _allocError(wasm);
-        const _result = wasm.weaveffi_events_get_messages(_err);
-        _checkError(wasm, _err);
-        return _result;
+        const _err = _allocErr(wasm);
+        const _it = wasm.weaveffi_events_get_messages(_err);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        const _out = [];
+        const _ip = wasm.weaveffi_alloc(4);
+        const _ierr = _allocErr(wasm);
+        while (wasm.weaveffi_events_GetMessagesIterator_next(_it, _ip, _ierr) !== 0) {
+          _checkErr(wasm, _ierr);
+          const _dv = new DataView(wasm.memory.buffer);
+          _out.push(_takeCStr(wasm, _dv.getUint32(_ip, true)));
+        }
+        _checkErr(wasm, _ierr);
+        _freeErr(wasm, _ierr);
+        wasm.weaveffi_dealloc(_ip, 4);
+        wasm.weaveffi_events_GetMessagesIterator_destroy(_it);
+        return _out;
       },
     },
   };

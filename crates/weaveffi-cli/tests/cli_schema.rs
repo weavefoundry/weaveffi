@@ -30,6 +30,7 @@ fn schema_emits_valid_json_schema() {
         .and_then(|v| v.as_object())
         .expect("schema output should include 'definitions'");
     for ty in [
+        "Package",
         "Module",
         "Function",
         "Param",

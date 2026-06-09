@@ -12,7 +12,7 @@ import (
 	"os"
 	"sort"
 
-	wv "weaveffi"
+	wv "__MODPATH__"
 )
 
 func expect(cond bool, msg string) {

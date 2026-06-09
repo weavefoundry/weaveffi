@@ -112,13 +112,11 @@ func ContactsListContacts() ([]*Contact, error) {
 		return nil, goErr
 	}
 	count := int(cOutLen)
-	if count == 0 || result == nil {
-		return nil, nil
-	}
 	goResult := make([]*Contact, count)
-	cSlice := unsafe.Slice((**C.weaveffi_contacts_Contact)(unsafe.Pointer(result)), count)
-	for i, v := range cSlice {
-		goResult[i] = &Contact{ptr: v}
+	if count > 0 && result != nil {
+		for i, v := range unsafe.Slice((**C.weaveffi_contacts_Contact)(unsafe.Pointer(result)), count) {
+			goResult[i] = &Contact{ptr: v}
+		}
 	}
 	return goResult, nil
 }

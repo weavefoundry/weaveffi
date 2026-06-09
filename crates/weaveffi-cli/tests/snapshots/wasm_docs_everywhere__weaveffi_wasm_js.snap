@@ -7,43 +7,93 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 // WeaveFFI WASM bindings (auto-generated)
 //
-// Complex type conventions at the WASM boundary:
+// Boundary conventions for a wasm32-unknown-unknown build:
 //
-//   Structs   -> i64 opaque handle (pointer into linear memory)
+//   Handles   -> i32 pointer into linear memory (0 = null/absent)
 //   Enums     -> i32 discriminant value
-//   Optionals -> 0/null for absent; for numerics a separate _is_present i32 flag
-//   Lists     -> (i32 pointer, i32 length) pair into linear memory
+//   i64/u64   -> JavaScript BigInt
+//   Strings   -> NUL-terminated UTF-8 (const char*); a single i32 pointer
+//   Bytes     -> i32 data pointer + i32 length (out_len for returns)
+//   Optionals -> null handle / null pointer (0); scalars boxed by pointer
 
-const _encoder = new TextEncoder();
-const _decoder = new TextDecoder();
+const _enc = new TextEncoder();
+const _dec = new TextDecoder();
 
-function _encodeString(wasm, str) {
-  const bytes = _encoder.encode(str);
-  const ptr = wasm.weaveffi_alloc(bytes.length);
-  new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);
-  return [ptr, bytes.length];
+// Stage a JS string as a NUL-terminated C string in linear memory.
+// Returns [ptr, size] (size includes the NUL); release with _free.
+function _cstr(wasm, str) {
+  const bytes = _enc.encode(str);
+  const size = bytes.length + 1;
+  const ptr = wasm.weaveffi_alloc(size);
+  const mem = new Uint8Array(wasm.memory.buffer, ptr, size);
+  mem.set(bytes);
+  mem[bytes.length] = 0;
+  return [ptr, size];
 }
 
-function _decodeString(wasm, ptr, len) {
-  return _decoder.decode(new Uint8Array(wasm.memory.buffer, ptr, len));
+// Read a NUL-terminated C string (0 => null). Does not free.
+function _readCStr(wasm, ptr) {
+  if (ptr === 0) return null;
+  const mem = new Uint8Array(wasm.memory.buffer);
+  let end = ptr;
+  while (mem[end] !== 0) end++;
+  return _dec.decode(mem.subarray(ptr, end));
 }
 
-function _allocError(wasm) {
-  return wasm.weaveffi_alloc(8);
+// Read then free a producer-owned C string.
+function _takeCStr(wasm, ptr) {
+  const s = _readCStr(wasm, ptr);
+  if (ptr !== 0) wasm.weaveffi_free_string(ptr);
+  return s;
 }
 
-function _checkError(wasm, errPtr) {
-  const buffer = wasm.memory.buffer;
-  const code = new Int32Array(buffer, errPtr, 1)[0];
+// Decode a producer-owned array of `len` C strings at `base` (each
+// freed); the array container itself is owned by the producer.
+function _takeStrArray(wasm, base, len) {
+  const out = [];
+  if (base === 0) return out;
+  const dv = new DataView(wasm.memory.buffer);
+  const ptrs = [];
+  for (let i = 0; i < len; i++) ptrs.push(dv.getUint32(base + i * 4, true));
+  for (const p of ptrs) out.push(_takeCStr(wasm, p));
+  return out;
+}
+
+// Allocate a zeroed {i32 code, i32 message} error slot.
+function _allocErr(wasm) {
+  const ptr = wasm.weaveffi_alloc(8);
+  new Uint8Array(wasm.memory.buffer, ptr, 8).fill(0);
+  return ptr;
+}
+
+// Throw (and free the slot) if the error slot carries a non-zero code.
+function _checkErr(wasm, errPtr) {
+  const dv = new DataView(wasm.memory.buffer);
+  const code = dv.getInt32(errPtr, true);
   if (code !== 0) {
-    const msgPtr = new Uint32Array(buffer, errPtr + 4, 1)[0];
-    const bytes = new Uint8Array(buffer, msgPtr);
-    let end = 0;
-    while (bytes[end] !== 0) end++;
-    const msg = new TextDecoder().decode(new Uint8Array(buffer, msgPtr, end));
+    const msgPtr = dv.getUint32(errPtr + 4, true);
+    const msg = _readCStr(wasm, msgPtr) || '';
     wasm.weaveffi_error_clear(errPtr);
+    wasm.weaveffi_dealloc(errPtr, 8);
     throw new Error(`WeaveFFI error ${code}: ${msg}`);
   }
+}
+
+// Release an error slot on the success path.
+function _freeErr(wasm, errPtr) {
+  wasm.weaveffi_dealloc(errPtr, 8);
+}
+
+// Throw if a borrowed (producer-owned) error carries a non-zero
+// code. Used by async callbacks: the producer owns and frees the
+// error struct, so the slot is read but never deallocated here.
+function _checkErrRef(wasm, errPtr) {
+  const dv = new DataView(wasm.memory.buffer);
+  const code = dv.getInt32(errPtr, true);
+  if (code === 0) return;
+  const msgPtr = dv.getUint32(errPtr + 4, true);
+  const msg = _readCStr(wasm, msgPtr) || '';
+  throw new Error(`WeaveFFI error ${code}: ${msg}`);
 }
 
 function _registerTrampoline(table, paramTypes, handler) {
@@ -67,19 +117,97 @@ class Document {
     this._handle = handle;
   }
   get id() {
-    return this._wasm.weaveffi_docs_Document_get_id(this._handle);
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_docs_Document_get_id(this._handle);
+    return _r;
   }
   get title() {
-    const retptr = this._wasm.weaveffi_alloc(8);
-    this._wasm.weaveffi_docs_Document_get_title(retptr, this._handle);
-    const view = new DataView(this._wasm.memory.buffer);
-    return _decodeString(this._wasm, view.getInt32(retptr, true), view.getInt32(retptr + 4, true));
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_docs_Document_get_title(this._handle);
+    return _takeCStr(wasm, _r);
   }
   get status() {
-    return this._wasm.weaveffi_docs_Document_get_status(this._handle);
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_docs_Document_get_status(this._handle);
+    return _r;
   }
   get tags() {
-    return this._wasm.weaveffi_docs_Document_get_tags(this._handle);
+    const wasm = this._wasm;
+    const _lp = wasm.weaveffi_alloc(4);
+    const _r = wasm.weaveffi_docs_Document_get_tags(this._handle, _lp);
+    const _dv = new DataView(wasm.memory.buffer);
+    const _len = _dv.getUint32(_lp, true);
+    wasm.weaveffi_dealloc(_lp, 4);
+    const _out = _takeStrArray(wasm, _r, _len);
+    return _out;
+  }
+  static create(wasm, id, title, status, tags) {
+    const [a1_p, a1_s] = _cstr(wasm, title);
+    const a3_arr = tags || [];
+    const a3_n = a3_arr.length;
+    const a3_base = wasm.weaveffi_alloc(a3_n ? a3_n * 4 : 1);
+    const a3_ep = [];
+    for (let i = 0; i < a3_n; i++) a3_ep.push(_cstr(wasm, a3_arr[i]));
+    {
+      const dv = new DataView(wasm.memory.buffer);
+      for (let i = 0; i < a3_n; i++) dv.setUint32(a3_base + i * 4, a3_ep[i][0], true);
+    }
+    const _err = _allocErr(wasm);
+    const _r = wasm.weaveffi_docs_Document_create(BigInt(id), a1_p, status, a3_base, a3_n, _err);
+    wasm.weaveffi_dealloc(a1_p, a1_s);
+    for (const [ep, es] of a3_ep) wasm.weaveffi_dealloc(ep, es);
+    wasm.weaveffi_dealloc(a3_base, a3_n ? a3_n * 4 : 1);
+    _checkErr(wasm, _err);
+    _freeErr(wasm, _err);
+    return new Document(wasm, _r);
+  }
+}
+
+class DocumentBuilder {
+  constructor(wasm) {
+    this._wasm = wasm;
+    this._b = wasm.weaveffi_docs_Document_Builder_new();
+  }
+  id(value) {
+    const wasm = this._wasm;
+    wasm.weaveffi_docs_Document_Builder_set_id(this._b, BigInt(value));
+    return this;
+  }
+  title(value) {
+    const wasm = this._wasm;
+    const [a0_p, a0_s] = _cstr(wasm, value);
+    wasm.weaveffi_docs_Document_Builder_set_title(this._b, a0_p);
+    wasm.weaveffi_dealloc(a0_p, a0_s);
+    return this;
+  }
+  status(value) {
+    const wasm = this._wasm;
+    wasm.weaveffi_docs_Document_Builder_set_status(this._b, value);
+    return this;
+  }
+  tags(value) {
+    const wasm = this._wasm;
+    const a0_arr = value || [];
+    const a0_n = a0_arr.length;
+    const a0_base = wasm.weaveffi_alloc(a0_n ? a0_n * 4 : 1);
+    const a0_ep = [];
+    for (let i = 0; i < a0_n; i++) a0_ep.push(_cstr(wasm, a0_arr[i]));
+    {
+      const dv = new DataView(wasm.memory.buffer);
+      for (let i = 0; i < a0_n; i++) dv.setUint32(a0_base + i * 4, a0_ep[i][0], true);
+    }
+    wasm.weaveffi_docs_Document_Builder_set_tags(this._b, a0_base, a0_n);
+    for (const [ep, es] of a0_ep) wasm.weaveffi_dealloc(ep, es);
+    wasm.weaveffi_dealloc(a0_base, a0_n ? a0_n * 4 : 1);
+    return this;
+  }
+  build() {
+    const wasm = this._wasm;
+    const _err = _allocErr(wasm);
+    const _r = wasm.weaveffi_docs_Document_Builder_build(this._b, _err);
+    _checkErr(wasm, _err);
+    _freeErr(wasm, _err);
+    return new Document(wasm, _r);
   }
 }
 
@@ -95,21 +223,22 @@ class Document {
  * @example
  * const api = await loadWeaveffiWasm('lib.wasm');
  *
- * // Primitive: (i32, i32) -> i32
+ * // Primitive: plain numbers in, number out.
  * const sum = api.math.add(1, 2);
  *
- * // Struct handle: () -> i64 (opaque pointer)
- * const handle = api.contacts.create();
+ * // Struct: returns a wrapper instance exposing field getters.
+ * const person = api.contacts.create();
+ * console.log(person.name);
  *
- * // Enum: (i32 discriminant) -> void
+ * // Enum: pass the integer discriminant.
  * api.ui.set_color(0); // 0 = first variant
  *
- * // Optional: (i32 is_present, i32 value) -> void
- * api.config.set_timeout(1, 5000); // present
- * api.config.set_timeout(0, 0);    // absent
+ * // Optional: pass null to omit, a value to provide.
+ * api.config.set_timeout(5000); // present
+ * api.config.set_timeout(null); // absent
  *
- * // List: (i32 pointer, i32 length) -> void
- * api.data.process(ptr, len);
+ * // List/Map: pass arrays/objects; receive arrays/objects.
+ * const names = api.data.all_names();
  */
 export async function loadWeaveffiWasm(url) {
   const response = await fetch(url);
@@ -126,7 +255,7 @@ export async function loadWeaveffiWasm(url) {
     if (!ctx) return;
     _asyncContexts.delete(ctxId);
     try {
-      if (errPtr !== 0) _checkError(wasm, errPtr);
+      if (errPtr !== 0) _checkErrRef(wasm, errPtr);
       ctx.resolve(ctx.unwrap ? ctx.unwrap(wasm, ...results) : results[0]);
     } catch (e) {
       ctx.reject(e);
@@ -139,24 +268,42 @@ export async function loadWeaveffiWasm(url) {
     _raw: wasm,
     docs: {
       create_document(title, tags) {
-        const _err = _allocError(wasm);
-        const [title_ptr, title_len] = _encodeString(wasm, title);
-        const _result = wasm.weaveffi_docs_create_document(title_ptr, title_len, tags, _err);
-        _checkError(wasm, _err);
-        return new Document(wasm, _result);
+        const [a0_p, a0_s] = _cstr(wasm, title);
+        const a1_arr = tags || [];
+        const a1_n = a1_arr.length;
+        const a1_base = wasm.weaveffi_alloc(a1_n ? a1_n * 4 : 1);
+        const a1_ep = [];
+        for (let i = 0; i < a1_n; i++) a1_ep.push(_cstr(wasm, a1_arr[i]));
+        {
+          const dv = new DataView(wasm.memory.buffer);
+          for (let i = 0; i < a1_n; i++) dv.setUint32(a1_base + i * 4, a1_ep[i][0], true);
+        }
+        const _err = _allocErr(wasm);
+        const _r = wasm.weaveffi_docs_create_document(a0_p, a1_base, a1_n, _err);
+        wasm.weaveffi_dealloc(a0_p, a0_s);
+        for (const [ep, es] of a1_ep) wasm.weaveffi_dealloc(ep, es);
+        wasm.weaveffi_dealloc(a1_base, a1_n ? a1_n * 4 : 1);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        return new Document(wasm, _r);
       },
       get_document(id) {
-        const _err = _allocError(wasm);
-        const result = wasm.weaveffi_docs_get_document(id, _err);
-        _checkError(wasm, _err);
-        return result === 0n ? null : new Document(wasm, result);
+        const _err = _allocErr(wasm);
+        const _r = wasm.weaveffi_docs_get_document(BigInt(id), _err);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        return _r === 0 ? null : new Document(wasm, _r);
       },
       publish_async(id) {
         return new Promise((resolve, reject) => {
           const ctxId = _nextCtxId++;
           _asyncContexts.set(ctxId, { resolve, reject, unwrap: (w, r) => r !== 0 });
-          wasm.weaveffi_docs_publish_async_async(id, _cbPtr_i32_i32_i32, ctxId);
-        }));
+          wasm.weaveffi_docs_publish_async_async(BigInt(id), _cbPtr_i32_i32_i32, ctxId);
+        });
+      },
+      Document: {
+        create: (...args) => Document.create(wasm, ...args),
+        builder: () => new DocumentBuilder(wasm),
       },
     },
   };

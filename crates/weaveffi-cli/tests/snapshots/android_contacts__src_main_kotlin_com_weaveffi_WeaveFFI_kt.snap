@@ -30,7 +30,7 @@ enum class ContactType(val value: Int) {
     }
 }
 
-class Contact internal constructor(private var handle: Long) : java.io.Closeable {
+class Contact internal constructor(internal var handle: Long) : java.io.Closeable {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
@@ -49,7 +49,7 @@ class Contact internal constructor(private var handle: Long) : java.io.Closeable
     val first_name: String get() = nativeGetFirstName(handle)
     val last_name: String get() = nativeGetLastName(handle)
     val email: String? get() = nativeGetEmail(handle)
-    val contact_type: ContactType get() = nativeGetContactType(handle)
+    val contact_type: ContactType get() = ContactType.fromValue(nativeGetContactType(handle))
 
     override fun close() {
         if (handle != 0L) {

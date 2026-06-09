@@ -168,14 +168,14 @@ directory and update `weaveffi.py`'s loader path.
 Save as `demo.py`:
 
 ```python
-from weaveffi import hello, greeting, WeaveffiError
+from weaveffi import hello, greeting, WeaveFFIError
 
 print(hello("Python"))
 
 try:
     g = greeting("Python", "en")
     print(f"{g.message} ({g.lang})")
-except WeaveffiError as e:
+except WeaveFFIError as e:
     print(f"Error {e.code}: {e.message}")
 ```
 
@@ -194,7 +194,7 @@ deterministic cleanup, `del g` after you are done with the object.
   | Symptom                                                   | Likely cause                                                                  |
   |-----------------------------------------------------------|-------------------------------------------------------------------------------|
   | `OSError: dlopen ... not found`                           | Cdylib not on the loader path; set `DYLD_LIBRARY_PATH` / `LD_LIBRARY_PATH`.    |
-  | `WeaveffiError: ...` at runtime                            | Rust returned a non-zero error code; inspect `e.code` and `e.message`.        |
+  | `WeaveFFIError: ...` at runtime                            | Rust returned a non-zero error code; inspect `e.code` and `e.message`.        |
   | `ModuleNotFoundError: No module named 'weaveffi'`          | Package not installed; rerun `pip install .` from `generated/python/`.        |
   | mypy complains about `weaveffi`                           | Make sure `weaveffi.pyi` ships next to `weaveffi.py` in the package.          |
 

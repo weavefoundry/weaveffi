@@ -1,0 +1,16 @@
+# WASM linker flags for WeaveFFI producers.
+#
+# The generated JS bindings need two things from a `wasm32-unknown-unknown`
+# cdylib that the default rust-lld settings do not provide:
+#
+#   --export-table     exposes the call-indirect table as the
+#                      `__indirect_function_table` export, which the async
+#                      trampoline registration in `weaveffi_wasm.js` grows.
+#   --growable-table   drops the table's fixed maximum so `table.grow()` works
+#                      at runtime (without it the table max == initial and the
+#                      first trampoline registration traps).
+#
+# These flags are scoped to the wasm target only and have no effect on the
+# native cdylib builds used by the rest of the conformance harness.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=--export-table", "-C", "link-arg=--growable-table"]

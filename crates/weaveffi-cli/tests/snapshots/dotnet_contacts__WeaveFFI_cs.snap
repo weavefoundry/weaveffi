@@ -13,28 +13,28 @@ using System.Runtime.InteropServices;
 
 namespace WeaveFFI
 {
-    public class WeaveffiException : Exception
+    public class WeaveFFIException : Exception
     {
         public int Code { get; }
 
-        public WeaveffiException(int code, string message) : base(message)
+        public WeaveFFIException(int code, string message) : base(message)
         {
             Code = code;
         }
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    internal struct WeaveffiError
+    internal struct WeaveFFIError
     {
         public int Code;
         public IntPtr Message;
 
-        internal static void Check(WeaveffiError err)
+        internal static void Check(WeaveFFIError err)
         {
             if (err.Code != 0)
             {
                 var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
-                throw new WeaveffiException(err.Code, msg);
+                throw new WeaveFFIException(err.Code, msg);
             }
         }
     }
@@ -153,7 +153,7 @@ namespace WeaveFFI
         internal static extern void weaveffi_free_bytes(IntPtr ptr, UIntPtr len);
 
         [DllImport(LibName, EntryPoint = "weaveffi_contacts_Contact_create", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_contacts_Contact_create(long id, IntPtr first_name, IntPtr last_name, IntPtr email, int contact_type, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_contacts_Contact_create(long id, IntPtr first_name, IntPtr last_name, IntPtr email, int contact_type, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_contacts_Contact_destroy", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_contacts_Contact_destroy(IntPtr ptr);
@@ -174,19 +174,19 @@ namespace WeaveFFI
         internal static extern int weaveffi_contacts_Contact_get_contact_type(IntPtr ptr);
 
         [DllImport(LibName, EntryPoint = "weaveffi_contacts_create_contact", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern ulong weaveffi_contacts_create_contact(IntPtr first_name, IntPtr last_name, IntPtr email, int contact_type, ref WeaveffiError err);
+        internal static extern ulong weaveffi_contacts_create_contact(IntPtr first_name, IntPtr last_name, IntPtr email, int contact_type, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_contacts_get_contact", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_contacts_get_contact(ulong id, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_contacts_get_contact(ulong id, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_contacts_list_contacts", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_contacts_list_contacts(out UIntPtr out_len, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_contacts_list_contacts(out UIntPtr out_len, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_contacts_delete_contact", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_contacts_delete_contact(ulong id, ref WeaveffiError err);
+        internal static extern int weaveffi_contacts_delete_contact(ulong id, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_contacts_count_contacts", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_contacts_count_contacts(ref WeaveffiError err);
+        internal static extern int weaveffi_contacts_count_contacts(ref WeaveFFIError err);
 
     }
 
@@ -194,14 +194,14 @@ namespace WeaveFFI
     {
         public static ulong ContactsCreateContact(string first_name, string last_name, string? email, ContactType contact_type)
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var first_namePtr = Marshal.StringToCoTaskMemUTF8(first_name);
             var last_namePtr = Marshal.StringToCoTaskMemUTF8(last_name);
             var emailPtr = email != null ? Marshal.StringToCoTaskMemUTF8(email) : IntPtr.Zero;
             try
             {
                 var result = NativeMethods.weaveffi_contacts_create_contact(first_namePtr, last_namePtr, emailPtr, (int)contact_type, ref err);
-                WeaveffiError.Check(err);
+                WeaveFFIError.Check(err);
                 return result;
             }
             finally
@@ -214,17 +214,17 @@ namespace WeaveFFI
 
         public static Contact ContactsGetContact(ulong id)
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_contacts_get_contact(id, ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             return new Contact(result);
         }
 
         public static Contact[] ContactsListContacts()
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_contacts_list_contacts(out var outLen, ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             if (result == IntPtr.Zero) return Array.Empty<Contact>();
             var arr = new Contact[(int)outLen];
             for (int i = 0; i < (int)outLen; i++)
@@ -236,17 +236,17 @@ namespace WeaveFFI
 
         public static bool ContactsDeleteContact(ulong id)
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_contacts_delete_contact(id, ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             return result != 0;
         }
 
         public static int ContactsCountContacts()
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_contacts_count_contacts(ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             return result;
         }
 

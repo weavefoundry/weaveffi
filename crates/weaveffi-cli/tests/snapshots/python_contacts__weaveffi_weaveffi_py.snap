@@ -14,14 +14,14 @@ from enum import IntEnum
 from typing import Dict, Iterator, List, Optional
 
 
-class WeaveffiError(Exception):
+class WeaveFFIError(Exception):
     def __init__(self, code: int, message: str) -> None:
         self.code = code
         self.message = message
         super().__init__(f"({code}) {message}")
 
 
-class _WeaveffiErrorStruct(ctypes.Structure):
+class _WeaveFFIErrorStruct(ctypes.Structure):
     _fields_ = [
         ("code", ctypes.c_int32),
         ("message", ctypes.c_char_p),
@@ -45,7 +45,7 @@ def _load_library() -> ctypes.CDLL:
 
 
 _lib = _load_library()
-_lib.weaveffi_error_clear.argtypes = [ctypes.POINTER(_WeaveffiErrorStruct)]
+_lib.weaveffi_error_clear.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
 _lib.weaveffi_error_clear.restype = None
 _lib.weaveffi_free_string.argtypes = [ctypes.c_char_p]
 _lib.weaveffi_free_string.restype = None
@@ -53,12 +53,12 @@ _lib.weaveffi_free_bytes.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_si
 _lib.weaveffi_free_bytes.restype = None
 
 
-def _check_error(err: _WeaveffiErrorStruct) -> None:
+def _check_error(err: _WeaveFFIErrorStruct) -> None:
     if err.code != 0:
         code = err.code
         message = err.message.decode("utf-8") if err.message else ""
         _lib.weaveffi_error_clear(ctypes.byref(err))
-        raise WeaveffiError(code, message)
+        raise WeaveFFIError(code, message)
 
 
 class _PointerGuard(contextlib.AbstractContextManager):
@@ -153,10 +153,10 @@ class Contact:
 
 def contacts_create_contact(first_name: str, last_name: str, email: Optional[str], contact_type: "ContactType") -> int:
     _fn = _lib.weaveffi_contacts_create_contact
-    _fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int32, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int32, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_uint64
     _email_c = _string_to_bytes(email)
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(_string_to_bytes(first_name), _string_to_bytes(last_name), _email_c, contact_type.value, ctypes.byref(_err))
     _check_error(_err)
     return _result
@@ -164,21 +164,21 @@ def contacts_create_contact(first_name: str, last_name: str, email: Optional[str
 
 def contacts_get_contact(id: int) -> "Contact":
     _fn = _lib.weaveffi_contacts_get_contact
-    _fn.argtypes = [ctypes.c_uint64, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.c_uint64, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_void_p
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(id, ctypes.byref(_err))
     _check_error(_err)
     if _result is None:
-        raise WeaveffiError(-1, "null pointer")
+        raise WeaveFFIError(-1, "null pointer")
     return Contact(_result)
 
 
 def contacts_list_contacts() -> List["Contact"]:
     _fn = _lib.weaveffi_contacts_list_contacts
-    _fn.argtypes = [ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.POINTER(ctypes.c_void_p)
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _out_len = ctypes.c_size_t(0)
     _result = _fn(ctypes.byref(_out_len), ctypes.byref(_err))
     _check_error(_err)
@@ -189,9 +189,9 @@ def contacts_list_contacts() -> List["Contact"]:
 
 def contacts_delete_contact(id: int) -> bool:
     _fn = _lib.weaveffi_contacts_delete_contact
-    _fn.argtypes = [ctypes.c_uint64, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.c_uint64, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_int32
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(id, ctypes.byref(_err))
     _check_error(_err)
     return bool(_result)
@@ -199,9 +199,9 @@ def contacts_delete_contact(id: int) -> bool:
 
 def contacts_count_contacts() -> int:
     _fn = _lib.weaveffi_contacts_count_contacts
-    _fn.argtypes = [ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_int32
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(ctypes.byref(_err))
     _check_error(_err)
     return _result

@@ -10,9 +10,12 @@ use serde::{Deserialize, Serialize};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, walk_modules, DocCommentStyle};
 use weaveffi_core::model::{
-    BindingModel, EnumBinding, FieldBinding, FnBinding, ParamBinding, StructBinding,
+    BindingModel, CallShape, EnumBinding, FieldBinding, FnBinding, ParamBinding, StructBinding,
 };
-use weaveffi_core::utils::{local_type_name, render_prelude, render_trailer, CommentStyle};
+use weaveffi_core::pkg;
+use weaveffi_core::utils::{
+    c_abi_struct_name, local_type_name, render_prelude, render_trailer, CommentStyle,
+};
 use weaveffi_ir::ir::{Api, TypeRef};
 
 /// Per-target configuration for [`GoGenerator`].
@@ -73,7 +76,15 @@ impl LanguageBackend for GoGenerator {
             ),
             OutputFile::new(
                 dir.join("go.mod"),
-                render_go_mod(config.module_path(), input_basename),
+                render_go_mod(
+                    &pkg::resolve(
+                        api,
+                        config.module_path.as_deref(),
+                        config.input_basename.as_deref(),
+                    )
+                    .name,
+                    input_basename,
+                ),
             ),
             OutputFile::new(dir.join("README.md"), render_readme(input_basename)),
         ]
@@ -93,9 +104,12 @@ fn go_type(ty: &TypeRef) -> String {
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "[]byte".into(),
-        TypeRef::TypedHandle(n) => format!("*{}", n.to_upper_camel_case()),
+        // Structs, enums, and typed handles surface as bare local Go types; a
+        // cross-module typed handle (resolved to e.g. `kv.Store`) must name the
+        // local `Store` type rather than the qualified `KvStore`.
+        TypeRef::TypedHandle(n) => format!("*{}", local_type_name(n).to_upper_camel_case()),
         TypeRef::Struct(n) => format!("*{}", local_type_name(n).to_upper_camel_case()),
-        TypeRef::Enum(n) => n.to_upper_camel_case(),
+        TypeRef::Enum(n) => local_type_name(n).to_upper_camel_case(),
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::Struct(_) | TypeRef::TypedHandle(_) => go_type(inner),
             TypeRef::List(_) | TypeRef::Map(_, _) => go_type(inner),
@@ -124,7 +138,7 @@ fn c_scalar_type(ty: &TypeRef, prefix: &str, module: &str) -> Option<String> {
         TypeRef::I64 | TypeRef::Handle => Some("C.int64_t".into()),
         TypeRef::F64 => Some("C.double".into()),
         TypeRef::Bool => Some("C._Bool".into()),
-        TypeRef::Enum(n) => Some(format!("C.{prefix}_{module}_{n}")),
+        TypeRef::Enum(n) => Some(format!("C.{}", c_abi_struct_name(n, module, prefix))),
         _ => None,
     }
 }
@@ -149,14 +163,14 @@ fn go_scalar_conv(expr: &str, ty: &TypeRef) -> String {
         TypeRef::I64 | TypeRef::Handle => format!("int64({expr})"),
         TypeRef::F64 => format!("float64({expr})"),
         TypeRef::Bool => format!("cToBool({expr})"),
-        TypeRef::Enum(n) => format!("{}({expr})", n.to_upper_camel_case()),
+        TypeRef::Enum(n) => format!("{}({expr})", local_type_name(n).to_upper_camel_case()),
         _ => expr.to_string(),
     }
 }
 
 fn c_opaque_type(ty: &TypeRef, prefix: &str, module: &str) -> String {
     match ty {
-        TypeRef::Struct(n) | TypeRef::TypedHandle(n) => format!("{prefix}_{module}_{n}"),
+        TypeRef::Struct(n) | TypeRef::TypedHandle(n) => c_abi_struct_name(n, module, prefix),
         _ => String::new(),
     }
 }
@@ -192,13 +206,21 @@ fn type_has_bool(ty: &TypeRef) -> bool {
 
 fn scan_imports(api: &Api) -> (bool, bool, bool) {
     let has_sync_funcs = walk_modules(&api.modules).any(|m| m.functions.iter().any(|f| !f.r#async));
+    // A builder's `Build` calls the C `create` symbol and returns `(*T, error)`,
+    // so it pulls in `fmt` (error formatting) just like a fallible function.
+    let has_builder = walk_modules(&api.modules).any(|m| m.structs.iter().any(|s| s.builder));
 
-    let needs_fmt = has_sync_funcs;
+    let needs_fmt = has_sync_funcs || has_builder;
 
     let needs_unsafe = walk_modules(&api.modules).any(|m| {
         m.functions.iter().filter(|f| !f.r#async).any(|f| {
             f.params.iter().any(|p| param_uses_unsafe(&p.ty))
                 || f.returns.as_ref().is_some_and(return_uses_unsafe)
+        }) || m.structs.iter().any(|s| {
+            // Getters can materialize bytes/list/map; a builder additionally
+            // marshals every field *in* (strings stage through unsafe.Pointer).
+            s.fields.iter().any(|fld| return_uses_unsafe(&fld.ty))
+                || (s.builder && s.fields.iter().any(|fld| param_uses_unsafe(&fld.ty)))
         })
     });
 
@@ -373,10 +395,18 @@ fn render_go(api: &Api, prefix: &str, input_basename: &str) -> String {
     let (needs_fmt, needs_unsafe, needs_bool) = scan_imports(api);
     let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
 
-    out.push_str("package weaveffi\n\n");
+    // The Go package clause and the linked library name follow the resolved
+    // package identity (e.g. `package kvstore` / `-lkvstore`) rather than the
+    // `weaveffi` brand, so the bindings link the shared library the producer
+    // emits for this package. The C header keeps the ABI-prefix name.
+    let resolved = pkg::resolve(api, None, Some(input_basename));
+    let go_pkg = resolved.ident_name();
+    let link_name = resolved.ident_name();
+
+    out.push_str(&format!("package {go_pkg}\n\n"));
 
     out.push_str("/*\n");
-    out.push_str("#cgo LDFLAGS: -lweaveffi\n");
+    out.push_str(&format!("#cgo LDFLAGS: -l{link_name}\n"));
     out.push_str(&format!("#include \"{prefix}.h\"\n"));
     out.push_str("#include <stdlib.h>\n");
     out.push_str("*/\n");
@@ -410,9 +440,9 @@ fn render_go(api: &Api, prefix: &str, input_basename: &str) -> String {
             render_enum(&mut out, e);
         }
         for s in &m.structs {
-            render_struct(&mut out, s);
+            render_struct(&mut out, prefix, &m.path, s);
             if s.builder.is_some() {
-                render_go_builder(&mut out, s);
+                render_go_builder(&mut out, prefix, &m.path, s);
             }
         }
         for f in &m.functions {
@@ -444,7 +474,7 @@ fn render_enum(out: &mut String, e: &EnumBinding) {
 
 // ── Structs ──
 
-fn render_struct(out: &mut String, s: &StructBinding) {
+fn render_struct(out: &mut String, prefix: &str, module: &str, s: &StructBinding) {
     let name = s.name.to_upper_camel_case();
     // The opaque C tag and destroy symbol are precomputed in the shared model.
     let c_tag = &s.c_tag;
@@ -455,7 +485,7 @@ fn render_struct(out: &mut String, s: &StructBinding) {
     out.push_str("}\n\n");
 
     for field in &s.fields {
-        render_getter(out, &name, field);
+        render_getter(out, prefix, module, &name, field);
     }
 
     out.push_str(&format!("func (s *{name}) Close() {{\n"));
@@ -466,34 +496,73 @@ fn render_struct(out: &mut String, s: &StructBinding) {
     out.push_str("}\n\n");
 }
 
-fn render_go_builder(out: &mut String, s: &StructBinding) {
+fn render_go_builder(out: &mut String, prefix: &str, module: &str, s: &StructBinding) {
     let name = s.name.to_upper_camel_case();
     let builder_name = format!("{name}Builder");
+    // Typed fields (one per struct field) so `Build` can marshal each value into
+    // the C `create` call with the same lowering used for function parameters.
+    // Optionals/lists/maps default to nil (the C side reads that as "unset").
     emit_doc(out, &s.doc, "", Some(&builder_name));
     out.push_str(&format!("type {name}Builder struct {{\n"));
-    out.push_str("\tfields map[string]interface{}\n");
+    for field in &s.fields {
+        let fld = field.name.to_lower_camel_case();
+        out.push_str(&format!("\t{fld} {}\n", go_type(&field.ty)));
+    }
     out.push_str("}\n\n");
     out.push_str(&format!("func New{name}Builder() *{name}Builder {{\n"));
-    out.push_str(&format!(
-        "\treturn &{name}Builder{{fields: make(map[string]interface{{}})}}\n"
-    ));
+    out.push_str(&format!("\treturn &{name}Builder{{}}\n"));
     out.push_str("}\n\n");
 
     for field in &s.fields {
         let method = field.name.to_upper_camel_case();
+        let fld = field.name.to_lower_camel_case();
         let gt = go_type(&field.ty);
         let with_name = format!("With{method}");
         emit_doc(out, &field.doc, "", Some(&with_name));
         out.push_str(&format!(
             "func (b *{name}Builder) With{method}(value {gt}) *{name}Builder {{\n"
         ));
-        out.push_str(&format!("\tb.fields[\"{}\"] = value\n", field.name));
+        out.push_str(&format!("\tb.{fld} = value\n"));
         out.push_str("\treturn b\n");
         out.push_str("}\n\n");
     }
+
+    // Build: marshal every field into the struct's `create` call.
+    emit_doc(out, &None, "", Some("Build"));
+    out.push_str(&format!(
+        "func (b *{name}Builder) Build() (*{name}, error) {{\n"
+    ));
+    let mut pre = String::new();
+    let mut c_args: Vec<String> = Vec::new();
+    for field in &s.fields {
+        let fld = field.name.to_lower_camel_case();
+        pre.push_str(&format!("\t{fld} := b.{fld}\n"));
+        emit_param(&mut pre, &mut c_args, &fld, &field.ty, prefix, module);
+    }
+    pre.push_str("\tvar cErr C.weaveffi_error\n");
+    c_args.push("&cErr".into());
+    out.push_str(&pre);
+    out.push_str(&format!(
+        "\tresult := C.{}({})\n",
+        s.create.symbol,
+        c_args.join(", ")
+    ));
+    out.push_str("\tif cErr.code != 0 {\n");
+    out.push_str("\t\tgoErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(cErr.message), int(cErr.code))\n");
+    out.push_str("\t\tC.weaveffi_error_clear(&cErr)\n");
+    out.push_str("\t\treturn nil, goErr\n");
+    out.push_str("\t}\n");
+    out.push_str(&format!("\treturn &{name}{{ptr: result}}, nil\n"));
+    out.push_str("}\n\n");
 }
 
-fn render_getter(out: &mut String, go_struct: &str, field: &FieldBinding) {
+fn render_getter(
+    out: &mut String,
+    prefix: &str,
+    module: &str,
+    go_struct: &str,
+    field: &FieldBinding,
+) {
     let method = field.name.to_upper_camel_case();
     let ret = go_type(&field.ty);
     let getter = format!("C.{}", field.getter_symbol);
@@ -516,7 +585,7 @@ fn render_getter(out: &mut String, go_struct: &str, field: &FieldBinding) {
             out.push_str(&format!("\treturn {ret}({getter}(s.ptr))\n"));
         }
         TypeRef::TypedHandle(n) => {
-            let inner = n.to_upper_camel_case();
+            let inner = local_type_name(n).to_upper_camel_case();
             out.push_str(&format!("\treturn &{inner}{{ptr: {getter}(s.ptr)}}\n"));
         }
         TypeRef::Struct(n) => {
@@ -531,7 +600,7 @@ fn render_getter(out: &mut String, go_struct: &str, field: &FieldBinding) {
                 out.push_str("\treturn &v\n");
             }
             TypeRef::TypedHandle(n) => {
-                let inner_go = n.to_upper_camel_case();
+                let inner_go = local_type_name(n).to_upper_camel_case();
                 out.push_str(&format!("\tcPtr := {getter}(s.ptr)\n"));
                 out.push_str("\tif cPtr == nil {\n\t\treturn nil\n\t}\n");
                 out.push_str(&format!("\treturn &{inner_go}{{ptr: cPtr}}\n"));
@@ -556,6 +625,34 @@ fn render_getter(out: &mut String, go_struct: &str, field: &FieldBinding) {
                 out.push_str("\treturn &v\n");
             }
         },
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            out.push_str("\tvar cOutLen C.size_t\n");
+            out.push_str(&format!("\tresult := {getter}(s.ptr, &cOutLen)\n"));
+            out.push_str("\tif result == nil {\n\t\treturn nil\n\t}\n");
+            out.push_str("\treturn C.GoBytes(unsafe.Pointer(result), C.int(cOutLen))\n");
+        }
+        TypeRef::List(inner) => {
+            out.push_str("\tvar cOutLen C.size_t\n");
+            out.push_str(&format!("\tresult := {getter}(s.ptr, &cOutLen)\n"));
+            out.push_str("\tcount := int(cOutLen)\n");
+            decode_list(out, "goResult", inner, "result", "count", prefix, module);
+            out.push_str("\treturn goResult\n");
+        }
+        TypeRef::Map(k, v) => {
+            let kt = go_cmap_ptr_type(k, prefix, module);
+            let vt = go_cmap_ptr_type(v, prefix, module);
+            out.push_str(&format!("\tvar cMapKeys {kt}\n"));
+            out.push_str(&format!("\tvar cMapVals {vt}\n"));
+            out.push_str("\tvar cOutLen C.size_t\n");
+            out.push_str(&format!(
+                "\t{getter}(s.ptr, &cMapKeys, &cMapVals, &cOutLen)\n"
+            ));
+            out.push_str("\tcount := int(cOutLen)\n");
+            decode_map(
+                out, "goResult", k, v, "cMapKeys", "cMapVals", "count", prefix, module,
+            );
+            out.push_str("\treturn goResult\n");
+        }
         _ => {
             out.push_str(&format!("\treturn {ret}({getter}(s.ptr))\n"));
         }
@@ -605,8 +702,16 @@ fn render_function(out: &mut String, prefix: &str, module: &str, f: &FnBinding) 
         );
     }
 
+    // An iterator-returning function launches an opaque iterator (no out_len),
+    // then this wrapper drains it via the `next`/`destroy` symbols into a slice.
+    if let CallShape::Iterator(ib) = &f.shape {
+        emit_iterator_body(out, &mut pre, &mut c_args, ib, prefix, module);
+        out.push_str("}\n\n");
+        return;
+    }
+
     if let Some(ref ret) = f.ret {
-        emit_return_out_params(&mut pre, &mut c_args, ret);
+        emit_return_out_params(&mut pre, &mut c_args, ret, prefix, module);
     }
 
     pre.push_str("\tvar cErr C.weaveffi_error\n");
@@ -642,6 +747,84 @@ fn render_function(out: &mut String, prefix: &str, module: &str, f: &FnBinding) 
     out.push_str("}\n\n");
 }
 
+/// Go type of the `out_item` local whose address is passed to an iterator's
+/// `next` (the C slot is `T*`, so the local is one indirection less).
+fn iter_out_item_type(inner: &TypeRef, prefix: &str, module: &str) -> String {
+    match inner {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "*C.char".into(),
+        TypeRef::TypedHandle(n) | TypeRef::Struct(n) => {
+            format!("*C.{}", c_abi_struct_name(n, module, prefix))
+        }
+        _ => c_scalar_type(inner, prefix, module).unwrap_or_else(|| "C.int64_t".into()),
+    }
+}
+
+/// Append one freshly-pulled iterator element (`item`) to the result slice,
+/// converting to the Go type and releasing any callee-allocated string.
+fn emit_iter_elem_append(out: &mut String, dst: &str, inner: &TypeRef, item: &str) {
+    match inner {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            out.push_str(&format!("\t\t{dst} = append({dst}, C.GoString({item}))\n"));
+            out.push_str(&format!("\t\tC.weaveffi_free_string({item})\n"));
+        }
+        TypeRef::TypedHandle(n) | TypeRef::Struct(n) => {
+            let gs = local_type_name(n).to_upper_camel_case();
+            out.push_str(&format!("\t\t{dst} = append({dst}, &{gs}{{ptr: {item}}})\n"));
+        }
+        TypeRef::Bool => {
+            out.push_str(&format!("\t\t{dst} = append({dst}, cToBool({item}))\n"));
+        }
+        _ => {
+            let conv = go_scalar_conv(item, inner);
+            out.push_str(&format!("\t\t{dst} = append({dst}, {conv})\n"));
+        }
+    }
+}
+
+/// Emit the launch + drain + destroy body of an iterator-returning function.
+/// `pre` already holds the input-parameter staging and `c_args` the launch
+/// arguments (before `out_err`).
+fn emit_iterator_body(
+    out: &mut String,
+    pre: &mut String,
+    c_args: &mut Vec<String>,
+    ib: &weaveffi_core::model::IteratorBinding,
+    prefix: &str,
+    module: &str,
+) {
+    pre.push_str("\tvar cErr C.weaveffi_error\n");
+    c_args.push("&cErr".into());
+    out.push_str(pre);
+
+    let elem = &ib.elem;
+    let item_ty = iter_out_item_type(elem, prefix, module);
+    out.push_str(&format!("\tit := C.{}({})\n", ib.launch.symbol, c_args.join(", ")));
+    out.push_str("\tif cErr.code != 0 {\n");
+    out.push_str("\t\tgoErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(cErr.message), int(cErr.code))\n");
+    out.push_str("\t\tC.weaveffi_error_clear(&cErr)\n");
+    out.push_str("\t\treturn nil, goErr\n");
+    out.push_str("\t}\n");
+    out.push_str(&format!("\tdefer C.{}(it)\n", ib.destroy_symbol));
+    out.push_str(&format!("\tgoResult := []{}{{}}\n", go_type(elem)));
+    out.push_str("\tfor {\n");
+    out.push_str(&format!("\t\tvar outItem {item_ty}\n"));
+    out.push_str("\t\tvar iterErr C.weaveffi_error\n");
+    out.push_str(&format!(
+        "\t\tif C.{}(it, &outItem, &iterErr) == 0 {{\n",
+        ib.next.symbol
+    ));
+    out.push_str("\t\t\tbreak\n");
+    out.push_str("\t\t}\n");
+    out.push_str("\t\tif iterErr.code != 0 {\n");
+    out.push_str("\t\t\tgoErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(iterErr.message), int(iterErr.code))\n");
+    out.push_str("\t\t\tC.weaveffi_error_clear(&iterErr)\n");
+    out.push_str("\t\t\treturn nil, goErr\n");
+    out.push_str("\t\t}\n");
+    emit_iter_elem_append(out, "goResult", elem, "outItem");
+    out.push_str("\t}\n");
+    out.push_str("\treturn goResult, nil\n");
+}
+
 // ── Parameter conversion ──
 
 fn emit_param(
@@ -658,7 +841,10 @@ fn emit_param(
         }
         TypeRef::Bool => args.push(format!("boolToC({name})")),
         TypeRef::Handle => args.push(format!("C.weaveffi_handle_t({name})")),
-        TypeRef::Enum(n) => args.push(format!("C.{prefix}_{module}_{n}({name})")),
+        TypeRef::Enum(n) => args.push(format!(
+            "C.{}({name})",
+            c_abi_struct_name(n, module, prefix)
+        )),
         TypeRef::TypedHandle(_) | TypeRef::Struct(_) => args.push(format!("{name}.ptr")),
 
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
@@ -782,7 +968,7 @@ fn emit_list_param(
         ));
         pre.push_str("\t}\n");
     } else if let TypeRef::Struct(n) | TypeRef::TypedHandle(n) = inner {
-        let ct = format!("C.{prefix}_{module}_{n}");
+        let ct = format!("C.{}", c_abi_struct_name(n, module, prefix));
         let arr = format!("c{cn}Arr");
         pre.push_str(&format!("\t{arr} := make([]*{ct}, len({name}))\n"));
         pre.push_str(&format!("\tfor i, item := range {name} {{\n"));
@@ -872,13 +1058,29 @@ fn emit_map_array(
 
 // ── Return out-params ──
 
-fn emit_return_out_params(pre: &mut String, args: &mut Vec<String>, ty: &TypeRef) {
+fn emit_return_out_params(
+    pre: &mut String,
+    args: &mut Vec<String>,
+    ty: &TypeRef,
+    prefix: &str,
+    module: &str,
+) {
     match ty {
         TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Bytes | TypeRef::BorrowedBytes => {
             pre.push_str("\tvar cOutLen C.size_t\n");
             args.push("&cOutLen".into());
         }
-        TypeRef::Optional(inner) => emit_return_out_params(pre, args, inner),
+        TypeRef::Map(k, v) => {
+            let kt = go_cmap_ptr_type(k, prefix, module);
+            let vt = go_cmap_ptr_type(v, prefix, module);
+            pre.push_str(&format!("\tvar cMapKeys {kt}\n"));
+            pre.push_str(&format!("\tvar cMapVals {vt}\n"));
+            pre.push_str("\tvar cOutLen C.size_t\n");
+            args.push("&cMapKeys".into());
+            args.push("&cMapVals".into());
+            args.push("&cOutLen".into());
+        }
+        TypeRef::Optional(inner) => emit_return_out_params(pre, args, inner, prefix, module),
         _ => {}
     }
 }
@@ -902,7 +1104,7 @@ fn emit_return(out: &mut String, ty: &TypeRef, prefix: &str, module: &str) {
             out.push_str(&format!("\treturn {conv}, nil\n"));
         }
         TypeRef::TypedHandle(n) => {
-            let g = n.to_upper_camel_case();
+            let g = local_type_name(n).to_upper_camel_case();
             out.push_str(&format!("\treturn &{g}{{ptr: result}}, nil\n"));
         }
         TypeRef::Struct(n) => {
@@ -917,7 +1119,7 @@ fn emit_return(out: &mut String, ty: &TypeRef, prefix: &str, module: &str) {
             out.push_str("\tC.weaveffi_free_bytes(result, cOutLen)\n");
             out.push_str("\treturn goResult, nil\n");
         }
-        TypeRef::Map(k, v) => emit_map_return(out, k, v),
+        TypeRef::Map(k, v) => emit_map_return(out, k, v, prefix, module),
         TypeRef::Iterator(inner) => emit_list_return(out, inner, prefix, module),
     }
 }
@@ -931,7 +1133,7 @@ fn emit_optional_return(out: &mut String, inner: &TypeRef, _module: &str) {
             out.push_str("\treturn &v, nil\n");
         }
         TypeRef::TypedHandle(n) => {
-            let g = n.to_upper_camel_case();
+            let g = local_type_name(n).to_upper_camel_case();
             out.push_str(&format!("\treturn &{g}{{ptr: result}}, nil\n"));
         }
         TypeRef::Struct(n) => {
@@ -952,52 +1154,106 @@ fn emit_optional_return(out: &mut String, inner: &TypeRef, _module: &str) {
 
 fn emit_list_return(out: &mut String, inner: &TypeRef, prefix: &str, module: &str) {
     out.push_str("\tcount := int(cOutLen)\n");
-    out.push_str("\tif count == 0 || result == nil {\n\t\treturn nil, nil\n\t}\n");
-
-    let gi = go_type(inner);
-    out.push_str(&format!("\tgoResult := make([]{gi}, count)\n"));
-
-    if let Some(ct) = c_scalar_type(inner, prefix, module) {
-        out.push_str(&format!(
-            "\tcSlice := unsafe.Slice((*{ct})(unsafe.Pointer(result)), count)\n"
-        ));
-        out.push_str("\tfor i, v := range cSlice {\n");
-        let conv = go_scalar_conv("v", inner);
-        out.push_str(&format!("\t\tgoResult[i] = {conv}\n"));
-        out.push_str("\t}\n");
-    } else if matches!(inner, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
-        out.push_str("\tcSlice := unsafe.Slice((**C.char)(unsafe.Pointer(result)), count)\n");
-        out.push_str("\tfor i, v := range cSlice {\n");
-        out.push_str("\t\tgoResult[i] = C.GoString(v)\n");
-        out.push_str("\t}\n");
-    } else if let TypeRef::TypedHandle(n) = inner {
-        let ct = format!("C.{prefix}_{module}_{n}");
-        let gs = n.to_upper_camel_case();
-        out.push_str(&format!(
-            "\tcSlice := unsafe.Slice((**{ct})(unsafe.Pointer(result)), count)\n"
-        ));
-        out.push_str("\tfor i, v := range cSlice {\n");
-        out.push_str(&format!("\t\tgoResult[i] = &{gs}{{ptr: v}}\n"));
-        out.push_str("\t}\n");
-    } else if let TypeRef::Struct(n) = inner {
-        let ct = format!("C.{prefix}_{module}_{n}");
-        let gs = local_type_name(n).to_upper_camel_case();
-        out.push_str(&format!(
-            "\tcSlice := unsafe.Slice((**{ct})(unsafe.Pointer(result)), count)\n"
-        ));
-        out.push_str("\tfor i, v := range cSlice {\n");
-        out.push_str(&format!("\t\tgoResult[i] = &{gs}{{ptr: v}}\n"));
-        out.push_str("\t}\n");
-    }
-
+    decode_list(out, "goResult", inner, "result", "count", prefix, module);
     out.push_str("\treturn goResult, nil\n");
 }
 
-fn emit_map_return(out: &mut String, k: &TypeRef, v: &TypeRef) {
+fn emit_map_return(out: &mut String, k: &TypeRef, v: &TypeRef, prefix: &str, module: &str) {
+    out.push_str("\tcount := int(cOutLen)\n");
+    decode_map(
+        out, "goResult", k, v, "cMapKeys", "cMapVals", "count", prefix, module,
+    );
+    out.push_str("\treturn goResult, nil\n");
+}
+
+/// Go type of the local variable whose address is passed for an
+/// `out_keys`/`out_values` map out-parameter. The C parameter is `K**`/`V**`
+/// (e.g. `const char***` for string keys), so the variable is one indirection
+/// less because we pass its address.
+fn go_cmap_ptr_type(ty: &TypeRef, prefix: &str, module: &str) -> String {
+    match ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "**C.char".into(),
+        _ => format!(
+            "*{}",
+            c_scalar_type(ty, prefix, module).unwrap_or_else(|| "C.int64_t".into())
+        ),
+    }
+}
+
+/// Read one map key/value from a typed cgo slice index expression.
+fn map_elem_read(expr: &str, ty: &TypeRef) -> String {
+    match ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("C.GoString({expr})"),
+        _ => go_scalar_conv(expr, ty),
+    }
+}
+
+/// Emit Go that materializes a C array (`src`, `count` elements of `inner`) into
+/// a fresh slice bound to `dst`. Shared by struct getters and function returns.
+fn decode_list(
+    out: &mut String,
+    dst: &str,
+    inner: &TypeRef,
+    src: &str,
+    count: &str,
+    prefix: &str,
+    module: &str,
+) {
+    let gi = go_type(inner);
+    out.push_str(&format!("\t{dst} := make([]{gi}, {count})\n"));
+    out.push_str(&format!("\tif {count} > 0 && {src} != nil {{\n"));
+    if let Some(ct) = c_scalar_type(inner, prefix, module) {
+        out.push_str(&format!(
+            "\t\tfor i, v := range unsafe.Slice((*{ct})(unsafe.Pointer({src})), {count}) {{\n"
+        ));
+        let conv = go_scalar_conv("v", inner);
+        out.push_str(&format!("\t\t\t{dst}[i] = {conv}\n"));
+        out.push_str("\t\t}\n");
+    } else if matches!(inner, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
+        out.push_str(&format!(
+            "\t\tfor i, v := range unsafe.Slice((**C.char)(unsafe.Pointer({src})), {count}) {{\n"
+        ));
+        out.push_str(&format!("\t\t\t{dst}[i] = C.GoString(v)\n"));
+        out.push_str("\t\t}\n");
+    } else if let TypeRef::TypedHandle(n) | TypeRef::Struct(n) = inner {
+        let ct = format!("C.{}", c_abi_struct_name(n, module, prefix));
+        let gs = local_type_name(n).to_upper_camel_case();
+        out.push_str(&format!(
+            "\t\tfor i, v := range unsafe.Slice((**{ct})(unsafe.Pointer({src})), {count}) {{\n"
+        ));
+        out.push_str(&format!("\t\t\t{dst}[i] = &{gs}{{ptr: v}}\n"));
+        out.push_str("\t\t}\n");
+    }
+    out.push_str("\t}\n");
+}
+
+/// Emit Go that materializes parallel C key/value arrays (`keys`/`vals`, already
+/// typed per [`go_cmap_ptr_type`]) into a fresh map bound to `dst`.
+fn decode_map(
+    out: &mut String,
+    dst: &str,
+    k: &TypeRef,
+    v: &TypeRef,
+    keys: &str,
+    vals: &str,
+    count: &str,
+    _prefix: &str,
+    _module: &str,
+) {
     let gk = go_type(k);
     let gv = go_type(v);
-    out.push_str(&format!("\tgoResult := make(map[{gk}]{gv})\n"));
-    out.push_str("\treturn goResult, nil\n");
+    out.push_str(&format!("\t{dst} := make(map[{gk}]{gv}, {count})\n"));
+    out.push_str(&format!(
+        "\tif {count} > 0 && {keys} != nil && {vals} != nil {{\n"
+    ));
+    out.push_str(&format!("\t\tkeySlice := unsafe.Slice({keys}, {count})\n"));
+    out.push_str(&format!("\t\tvalSlice := unsafe.Slice({vals}, {count})\n"));
+    out.push_str(&format!("\t\tfor i := 0; i < {count}; i++ {{\n"));
+    let kr = map_elem_read("keySlice[i]", k);
+    let vr = map_elem_read("valSlice[i]", v);
+    out.push_str(&format!("\t\t\t{dst}[{kr}] = {vr}\n"));
+    out.push_str("\t\t}\n");
+    out.push_str("\t}\n");
 }
 
 #[cfg(test)]
@@ -1062,6 +1318,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         }
     }
 
@@ -1141,6 +1398,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let go = render_go(&api, "weaveffi", "weaveffi.yml");
         assert!(
@@ -1254,6 +1512,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let go = render_go(&api, "weaveffi", "weaveffi.yml");
         assert!(
@@ -1307,6 +1566,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let go = render_go(&api, "weaveffi", "weaveffi.yml");
         assert!(go.contains("type Contact struct {"), "missing struct: {go}");
@@ -1361,25 +1621,31 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let go = render_go(&api, "weaveffi", "weaveffi.yml");
         assert!(
             go.contains("type PointBuilder struct {"),
             "builder type: {go}"
         );
-        assert!(
-            go.contains("fields map[string]interface{}"),
-            "fields map: {go}"
-        );
+        assert!(go.contains("\tx float64\n"), "typed builder field: {go}");
         assert!(
             go.contains("func NewPointBuilder() *PointBuilder"),
             "constructor: {go}"
         );
         assert!(
+            go.contains("return &PointBuilder{}"),
+            "constructor body: {go}"
+        );
+        assert!(
             go.contains("func (b *PointBuilder) WithX(value float64) *PointBuilder"),
             "WithX: {go}"
         );
-        assert!(go.contains("b.fields[\"x\"] = value"), "field assign: {go}");
+        assert!(go.contains("b.x = value"), "field assign: {go}");
+        assert!(
+            go.contains("func (b *PointBuilder) Build() (*Point, error)"),
+            "Build returns (*Point, error): {go}"
+        );
     }
 
     #[test]
@@ -1406,6 +1672,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let go = render_go(&api, "weaveffi", "weaveffi.yml");
         assert!(
@@ -1447,6 +1714,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let go = render_go(&api, "weaveffi", "weaveffi.yml");
         assert!(
@@ -1488,6 +1756,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let go = render_go(&api, "weaveffi", "weaveffi.yml");
         assert!(go.contains("func boolToC("), "missing boolToC: {go}");
@@ -1539,6 +1808,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let go = render_go(&api, "weaveffi", "weaveffi.yml");
         assert!(
@@ -1594,6 +1864,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let go = render_go(&api, "weaveffi", "weaveffi.yml");
         assert!(
@@ -1635,6 +1906,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let go = render_go(&api, "weaveffi", "weaveffi.yml");
         assert!(
@@ -1682,6 +1954,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let go = render_go(&api, "weaveffi", "weaveffi.yml");
         assert!(
@@ -1715,6 +1988,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let go = render_go(&api, "weaveffi", "weaveffi.yml");
         assert!(
@@ -1762,6 +2036,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let go = render_go(&api, "weaveffi", "weaveffi.yml");
         assert!(
@@ -1798,6 +2073,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let go = render_go(&api, "weaveffi", "weaveffi.yml");
         assert!(
@@ -1894,6 +2170,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let go = render_go(&api, "weaveffi", "weaveffi.yml");
         assert!(
@@ -1931,6 +2208,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let go = render_go(&api, "weaveffi", "weaveffi.yml");
         assert!(
@@ -1980,6 +2258,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let go = render_go(&api, "weaveffi", "weaveffi.yml");
         assert!(
@@ -2021,6 +2300,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let go = render_go(&api, "weaveffi", "weaveffi.yml");
         assert!(
@@ -2114,6 +2394,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let tmp = std::env::temp_dir().join("weaveffi_test_go_structs");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2203,6 +2484,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let tmp = std::env::temp_dir().join("weaveffi_test_go_enums");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2279,6 +2561,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let tmp = std::env::temp_dir().join("weaveffi_test_go_errors");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2479,6 +2762,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let tmp = std::env::temp_dir().join("weaveffi_test_go_full_contacts");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2619,6 +2903,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
 
         let go = render_go(&api, "weaveffi", "weaveffi.yml");
@@ -2684,6 +2969,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
 
         let go = render_go(&api, "weaveffi", "weaveffi.yml");
@@ -2753,6 +3039,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         }
     }
 

@@ -22,8 +22,8 @@ fn generate_ruby_contacts() {
         .assert()
         .success();
 
-    let rb = std::fs::read_to_string(out_path.join("ruby/lib/weaveffi.rb"))
-        .expect("missing ruby/lib/weaveffi.rb");
+    let rb = std::fs::read_to_string(out_path.join("ruby/lib/contacts.rb"))
+        .expect("missing ruby/lib/contacts.rb");
     assert!(
         rb.contains("module WeaveFFI"),
         "weaveffi.rb should contain module WeaveFFI"
@@ -42,8 +42,8 @@ fn generate_ruby_contacts() {
     );
 
     assert!(
-        out_path.join("ruby/weaveffi.gemspec").exists(),
-        "missing ruby/weaveffi.gemspec"
+        out_path.join("ruby/contacts.gemspec").exists(),
+        "missing ruby/contacts.gemspec"
     );
     assert!(
         out_path.join("ruby/README.md").exists(),

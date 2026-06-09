@@ -14,6 +14,7 @@ use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, is_c_pointer_type, DocCommentStyle,
 };
 use weaveffi_core::model::{BindingModel, EnumBinding, FieldBinding, FnBinding, StructBinding};
+use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::utils::{local_type_name, render_prelude, render_trailer, CommentStyle};
 use weaveffi_ir::ir::{Api, TypeRef};
 
@@ -75,16 +76,32 @@ impl LanguageBackend for RubyGenerator {
         let dir = out_dir.join("ruby");
         let lib_dir = dir.join("lib");
         let input_basename = config.input_basename();
+        let package = pkg::resolve(
+            api,
+            config.gem_name.as_deref(),
+            config.input_basename.as_deref(),
+        );
+        let lib_file = format!("{}.rb", package.ident_name());
+        let gem_file = format!("{}.gemspec", package.name);
         vec![
             OutputFile::new(
-                lib_dir.join("weaveffi.rb"),
-                render_ruby_module(api, config.module_name(), config.prefix(), input_basename),
+                lib_dir.join(&lib_file),
+                render_ruby_module(
+                    api,
+                    config.module_name(),
+                    config.prefix(),
+                    &lib_file,
+                    input_basename,
+                ),
             ),
             OutputFile::new(
-                dir.join("weaveffi.gemspec"),
-                render_gemspec(config.gem_name(), input_basename),
+                dir.join(&gem_file),
+                render_gemspec(&package, &gem_file, input_basename),
             ),
-            OutputFile::new(dir.join("README.md"), render_readme(input_basename)),
+            OutputFile::new(
+                dir.join("README.md"),
+                render_readme(&package, input_basename),
+            ),
         ]
     }
 }
@@ -266,7 +283,13 @@ fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
     common_emit_doc(out, doc, indent, DocCommentStyle::Hash);
 }
 
-fn render_ruby_module(api: &Api, module_name: &str, prefix: &str, input_basename: &str) -> String {
+fn render_ruby_module(
+    api: &Api,
+    module_name: &str,
+    prefix: &str,
+    lib_filename: &str,
+    input_basename: &str,
+) -> String {
     let model = BindingModel::build(api, prefix);
     let mut out = render_prelude(CommentStyle::Hash, input_basename);
     render_preamble(&mut out, module_name);
@@ -296,7 +319,7 @@ fn render_ruby_module(api: &Api, module_name: &str, prefix: &str, input_basename
         }
     }
     out.push_str("end\n\n");
-    out.push_str(&render_trailer(CommentStyle::Hash, "weaveffi.rb"));
+    out.push_str(&render_trailer(CommentStyle::Hash, lib_filename));
     out
 }
 
@@ -881,15 +904,34 @@ fn render_map_return_code(out: &mut String, k: &TypeRef, v: &TypeRef, ind: &str,
     ));
 }
 
-fn render_gemspec(gem_name: &str, input_basename: &str) -> String {
+fn render_gemspec(package: &ResolvedPackage, gem_file: &str, input_basename: &str) -> String {
     let prelude = render_prelude(CommentStyle::Hash, input_basename);
-    let trailer = render_trailer(CommentStyle::Hash, "weaveffi.gemspec");
+    let trailer = render_trailer(CommentStyle::Hash, gem_file);
+    let name = &package.name;
+    let version = &package.version;
+    let summary = package.description_or_default().replace('\'', "\\'");
+    let mut extra = String::new();
+    if !package.authors.is_empty() {
+        let authors = package
+            .authors
+            .iter()
+            .map(|a| format!("'{}'", a.replace('\'', "\\'")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        extra.push_str(&format!("  s.authors     = [{authors}]\n"));
+    }
+    if let Some(license) = &package.license {
+        extra.push_str(&format!("  s.license     = '{license}'\n"));
+    }
+    if let Some(homepage) = package.homepage.as_ref().or(package.repository.as_ref()) {
+        extra.push_str(&format!("  s.homepage    = '{homepage}'\n"));
+    }
     format!(
         "{prelude}Gem::Specification.new do |s|
-  s.name        = '{gem_name}'
-  s.version     = '0.1.0'
-  s.summary     = 'Ruby FFI bindings for {gem_name} (auto-generated)'
-  s.files       = Dir['lib/**/*.rb']
+  s.name        = '{name}'
+  s.version     = '{version}'
+  s.summary     = '{summary}'
+{extra}  s.files       = Dir['lib/**/*.rb']
   s.require_paths = ['lib']
 
   s.add_dependency 'ffi', '~> 1.15'
@@ -899,11 +941,14 @@ end
     )
 }
 
-fn render_readme(input_basename: &str) -> String {
+fn render_readme(package: &ResolvedPackage, input_basename: &str) -> String {
     let prelude = render_prelude(CommentStyle::Xml, input_basename);
     let trailer = render_trailer(CommentStyle::Xml, "README.md");
+    let name = &package.name;
+    let version = &package.version;
+    let require_name = package.ident_name();
     format!(
-        r#"{prelude}# WeaveFFI Ruby Bindings
+        r#"{prelude}# {name} (Ruby)
 
 Auto-generated Ruby bindings using the [ffi](https://github.com/ffi/ffi) gem.
 
@@ -915,14 +960,14 @@ Auto-generated Ruby bindings using the [ffi](https://github.com/ffi/ffi) gem.
 ## Install
 
 ```bash
-gem build weaveffi.gemspec
-gem install weaveffi-0.1.0.gem
+gem build {name}.gemspec
+gem install {name}-{version}.gem
 ```
 
 ## Usage
 
 ```ruby
-require 'weaveffi'
+require '{require_name}'
 ```
 
 {trailer}"#
@@ -943,6 +988,7 @@ mod tests {
             version: "0.1.0".to_string(),
             modules,
             generators: None,
+            package: None,
         }
     }
 
@@ -1089,7 +1135,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.yml");
+        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
         assert!(code.contains("module Color"), "enum module: {code}");
         assert!(code.contains("RED = 0"), "RED: {code}");
         assert!(code.contains("DARK_BLUE = 1"), "DARK_BLUE: {code}");
@@ -1126,7 +1172,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.yml");
+        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
         assert!(
             code.contains("class ContactPtr < FFI::AutoPointer"),
             "AutoPointer: {code}"
@@ -1170,7 +1216,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.yml");
+        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
         assert!(code.contains("class PointBuilder"), "builder class: {code}");
         assert!(code.contains("def with_x(value)"), "with_x: {code}");
         assert!(
@@ -1202,7 +1248,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.yml");
+        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
         assert!(
             code.contains("WeaveFFI.weaveffi_free_string(result)"),
             "free_string in getter: {code}"
@@ -1238,7 +1284,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.yml");
+        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
         assert!(code.contains("err = ErrorStruct.new"), "err alloc: {code}");
         assert!(code.contains("check_error!(err)"), "check_error: {code}");
     }
@@ -1259,7 +1305,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.yml");
+        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
         assert!(code.contains("result.read_string"), "read_string: {code}");
         assert!(
             code.contains("weaveffi_free_string(result)"),
@@ -1292,7 +1338,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.yml");
+        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
         assert!(
             code.contains("value_c = value ? 1 : 0"),
             "bool param: {code}"
@@ -1316,7 +1362,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.yml");
+        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
         assert!(
             code.contains("return nil if result.null?"),
             "optional nil: {code}"
@@ -1339,7 +1385,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.yml");
+        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
         assert!(
             code.contains("return [] if result.null?"),
             "empty array: {code}"
@@ -1366,7 +1412,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.yml");
+        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
         assert!(code.contains("out_keys"), "out_keys: {code}");
         assert!(code.contains("out_values"), "out_values: {code}");
         assert!(code.contains("each_with_object"), "hash build: {code}");
@@ -1409,7 +1455,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.yml");
+        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
         assert!(code.contains("Item.new(result)"), "struct wrap: {code}");
         assert!(
             code.contains("raise Error.new(-1, 'null pointer') if result.null?"),
@@ -1433,7 +1479,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.yml");
+        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
         assert!(
             !code.contains("def self.read"),
             "async should be skipped: {code}"
@@ -1476,7 +1522,7 @@ mod tests {
                 },
             ],
         )]);
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.yml");
+        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
         assert!(
             !code.contains("rb_global_variable"),
             "async is unsupported, no global ref pinning expected: {code}"
@@ -1493,7 +1539,13 @@ mod tests {
 
     #[test]
     fn preamble_has_platform_detection() {
-        let code = render_ruby_module(&make_api(vec![]), "WeaveFFI", "weaveffi", "weaveffi.yml");
+        let code = render_ruby_module(
+            &make_api(vec![]),
+            "WeaveFFI",
+            "weaveffi",
+            "weaveffi.rb",
+            "weaveffi.yml",
+        );
         assert!(code.contains("FFI::Platform::OS"), "platform: {code}");
         assert!(code.contains("libweaveffi.dylib"), "darwin: {code}");
         assert!(code.contains("weaveffi.dll"), "windows: {code}");
@@ -1502,7 +1554,13 @@ mod tests {
 
     #[test]
     fn error_class_structure() {
-        let code = render_ruby_module(&make_api(vec![]), "WeaveFFI", "weaveffi", "weaveffi.yml");
+        let code = render_ruby_module(
+            &make_api(vec![]),
+            "WeaveFFI",
+            "weaveffi",
+            "weaveffi.rb",
+            "weaveffi.yml",
+        );
         assert!(
             code.contains("class Error < StandardError"),
             "Error class: {code}"
@@ -1526,7 +1584,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.yml");
+        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
         assert!(code.contains(":uint64"), "handle type: {code}");
     }
 
@@ -1586,7 +1644,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.yml");
+        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
         assert!(code.contains(":int32"), "enum type: {code}");
     }
 
@@ -1606,7 +1664,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.yml");
+        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
         assert!(code.contains(":void"), "void return: {code}");
         assert!(
             !code.contains("result = weaveffi_store_clear"),
@@ -1646,7 +1704,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.yml");
+        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
         assert!(code.contains("Item.new(p)"), "struct list element: {code}");
     }
 
@@ -1671,7 +1729,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.yml");
+        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
         assert!(
             code.contains("return nil if result.null?"),
             "optional struct nil: {code}"
@@ -1840,6 +1898,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         }
     }
 
@@ -2211,14 +2270,14 @@ mod tests {
         };
         RubyGenerator.generate(&api, out_dir, &config).unwrap();
 
-        let rb = std::fs::read_to_string(tmp.path().join("ruby/lib/weaveffi.rb")).unwrap();
+        let rb = std::fs::read_to_string(tmp.path().join("ruby/lib/my_bindings.rb")).unwrap();
         assert!(rb.contains("module MyBindings"), "custom module name: {rb}");
         assert!(
             !rb.contains("module WeaveFFI"),
             "should not contain default module name: {rb}"
         );
 
-        let gemspec = std::fs::read_to_string(tmp.path().join("ruby/weaveffi.gemspec")).unwrap();
+        let gemspec = std::fs::read_to_string(tmp.path().join("ruby/my_bindings.gemspec")).unwrap();
         assert!(
             gemspec.contains("s.name        = 'my_bindings'"),
             "custom gem name: {gemspec}"
@@ -2266,7 +2325,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let rb = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.yml");
+        let rb = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
 
         let fn_start = rb
             .find("def self.find_contact(name)")
@@ -2327,7 +2386,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let rb = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.yml");
+        let rb = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
 
         let fn_start = rb
             .find("def self.find_contact(id)")
@@ -2395,32 +2454,62 @@ mod tests {
 
     #[test]
     fn ruby_emits_doc_on_function() {
-        let rb = render_ruby_module(&doc_api(), "Weaveffi", "weaveffi", "weaveffi.yml");
+        let rb = render_ruby_module(
+            &doc_api(),
+            "Weaveffi",
+            "weaveffi",
+            "weaveffi.rb",
+            "weaveffi.yml",
+        );
         assert!(rb.contains("# Performs a thing."), "{rb}");
     }
 
     #[test]
     fn ruby_emits_doc_on_struct() {
-        let rb = render_ruby_module(&doc_api(), "Weaveffi", "weaveffi", "weaveffi.yml");
+        let rb = render_ruby_module(
+            &doc_api(),
+            "Weaveffi",
+            "weaveffi",
+            "weaveffi.rb",
+            "weaveffi.yml",
+        );
         assert!(rb.contains("# An item we track."), "{rb}");
     }
 
     #[test]
     fn ruby_emits_doc_on_enum_variant() {
-        let rb = render_ruby_module(&doc_api(), "Weaveffi", "weaveffi", "weaveffi.yml");
+        let rb = render_ruby_module(
+            &doc_api(),
+            "Weaveffi",
+            "weaveffi",
+            "weaveffi.rb",
+            "weaveffi.yml",
+        );
         assert!(rb.contains("# Kind of item."), "{rb}");
         assert!(rb.contains("# A small one"), "{rb}");
     }
 
     #[test]
     fn ruby_emits_doc_on_field() {
-        let rb = render_ruby_module(&doc_api(), "Weaveffi", "weaveffi", "weaveffi.yml");
+        let rb = render_ruby_module(
+            &doc_api(),
+            "Weaveffi",
+            "weaveffi",
+            "weaveffi.rb",
+            "weaveffi.yml",
+        );
         assert!(rb.contains("# Stable id"), "{rb}");
     }
 
     #[test]
     fn ruby_emits_doc_on_param() {
-        let rb = render_ruby_module(&doc_api(), "Weaveffi", "weaveffi", "weaveffi.yml");
+        let rb = render_ruby_module(
+            &doc_api(),
+            "Weaveffi",
+            "weaveffi",
+            "weaveffi.rb",
+            "weaveffi.yml",
+        );
         assert!(rb.contains("# @param x [Object] the input value"), "{rb}");
     }
 
@@ -2453,7 +2542,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "myffi", "weaveffi.yml");
+        let code = render_ruby_module(&api, "WeaveFFI", "myffi", "weaveffi.rb", "weaveffi.yml");
 
         assert!(
             code.contains("attach_function :myffi_math_add"),

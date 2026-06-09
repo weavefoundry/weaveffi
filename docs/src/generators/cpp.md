@@ -144,12 +144,24 @@ inline Contact contacts_create_contact(
 ```
 
 `WeaveFFIError` extends `std::runtime_error`. When the IDL declares
-custom error codes the generator also emits typed subclasses that the
-exception dispatcher uses to throw the most specific exception:
+custom error codes the generator also emits typed subclasses, each named in
+PascalCase with an `Error` suffix (`not_found` → `NotFoundError`,
+`KEY_NOT_FOUND` → `KeyNotFoundError`):
+
+```cpp
+namespace weaveffi {
+class NotFoundError : public WeaveFFIError { /* ... */ };
+} // namespace weaveffi
+```
+
+The exception dispatcher throws the most specific subclass, so you can catch
+a single code or fall back to the base `WeaveFFIError`:
 
 ```cpp
 try {
     auto contact = weaveffi::contacts_find_contact(42);
+} catch (const weaveffi::NotFoundError& e) {
+    std::cerr << "Not found: " << e.what() << '\n';
 } catch (const weaveffi::WeaveFFIError& e) {
     std::cerr << "Error " << e.code() << ": " << e.what() << '\n';
 }

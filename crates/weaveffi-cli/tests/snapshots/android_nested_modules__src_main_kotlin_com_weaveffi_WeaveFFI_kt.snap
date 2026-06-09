@@ -41,7 +41,7 @@ enum class Unit(val value: Int) {
 }
 
 /** Top-level struct that references a struct defined one level deeper. */
-class Canvas internal constructor(private var handle: Long) : java.io.Closeable {
+class Canvas internal constructor(internal var handle: Long) : java.io.Closeable {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
@@ -70,7 +70,7 @@ class Canvas internal constructor(private var handle: Long) : java.io.Closeable 
 }
 
 /** A struct one level deep that references both an ancestor enum and a deeper struct. */
-class Shape internal constructor(private var handle: Long) : java.io.Closeable {
+class Shape internal constructor(internal var handle: Long) : java.io.Closeable {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
@@ -85,7 +85,7 @@ class Shape internal constructor(private var handle: Long) : java.io.Closeable {
 
     val sides: Int get() = nativeGetSides(handle)
     /** Reference up to the parent module's enum */
-    val unit: graphics.Unit get() = nativeGetUnit(handle)
+    val unit: Unit get() = Unit.fromValue(nativeGetUnit(handle))
     /** Reference down into a deeper module */
     val detail: Detail get() = Detail(nativeGetDetail(handle))
 
@@ -102,7 +102,7 @@ class Shape internal constructor(private var handle: Long) : java.io.Closeable {
 }
 
 /** A struct two levels deep. */
-class Detail internal constructor(private var handle: Long) : java.io.Closeable {
+class Detail internal constructor(internal var handle: Long) : java.io.Closeable {
     companion object {
         init { System.loadLibrary("weaveffi") }
 

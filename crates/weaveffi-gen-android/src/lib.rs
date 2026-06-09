@@ -12,7 +12,11 @@ use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, pascal_case, walk_modules, DocCommentStyle,
 };
-use weaveffi_core::model::{BindingModel, EnumBinding, FnBinding, ParamBinding, StructBinding};
+use weaveffi_core::errors;
+use weaveffi_core::model::{
+    BindingModel, CallShape, EnumBinding, FnBinding, IteratorBinding, ParamBinding, StructBinding,
+};
+use weaveffi_core::pkg;
 use weaveffi_core::utils::{
     local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
 };
@@ -80,11 +84,12 @@ impl LanguageBackend for AndroidGenerator {
         let pkg_path = package.replace('.', "/");
         let src_dir = dir.join(format!("src/main/kotlin/{pkg_path}"));
         let jni_dir = dir.join("src/main/cpp");
+        let project_name = pkg::resolve(api, None, config.input_basename.as_deref()).name;
         vec![
             OutputFile::new(
                 dir.join("settings.gradle"),
                 format!(
-                    "{}rootProject.name = 'weaveffi'\n\n{}",
+                    "{}rootProject.name = '{project_name}'\n\n{}",
                     render_prelude(dbl, input_basename),
                     render_trailer(dbl, "settings.gradle"),
                 ),
@@ -218,7 +223,9 @@ fn kotlin_type(t: &TypeRef) -> String {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "String".to_string(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "ByteArray".to_string(),
         TypeRef::Handle => "Long".to_string(),
-        TypeRef::TypedHandle(name) => name.clone(),
+        // A cross-module typed handle (resolved to e.g. `kv.Store`) must name the
+        // bare local Kotlin class `Store`, not the qualified IR name.
+        TypeRef::TypedHandle(name) => local_type_name(name).to_string(),
         TypeRef::Struct(_) => "Long".to_string(),
         TypeRef::Enum(_) => "Int".to_string(),
         TypeRef::Optional(inner) => format!("{}?", kotlin_type(inner)),
@@ -231,6 +238,11 @@ fn kotlin_type(t: &TypeRef) -> String {
 fn kotlin_jni_type(t: &TypeRef) -> String {
     match t {
         TypeRef::TypedHandle(_) => "Long".to_string(),
+        // The JNI layer carries a typed handle as a raw `Long` even when nullable;
+        // the public wrapper re-wraps it into the owning class.
+        TypeRef::Optional(inner) if matches!(inner.as_ref(), TypeRef::TypedHandle(_)) => {
+            "Long?".to_string()
+        }
         other => kotlin_type(other),
     }
 }
@@ -344,16 +356,52 @@ fn jni_cast_for(t: &TypeRef) -> &'static str {
 
 fn kotlin_public_type(t: &TypeRef) -> String {
     match t {
-        TypeRef::Enum(name) => name.clone(),
+        // Cross-module enums (e.g. `graphics.Unit`) surface as the bare local
+        // Kotlin enum class `Unit`, never the dot-qualified IR name.
+        TypeRef::Enum(name) => local_type_name(name).to_string(),
         other => kotlin_type(other),
     }
 }
 
+/// JNI exports map a Java identifier to a C symbol by escaping `_` to `_1`
+/// (plus `;`->`_2`, `[`->`_3`, and non-ASCII to `_0xxxx`). Our function names
+/// are snake_case, so the runtime lookup of `Java_<pkg>_<Class>_<method>` only
+/// resolves when the `<method>` component is mangled this way.
+fn jni_mangle(ident: &str) -> String {
+    let mut out = String::with_capacity(ident.len());
+    for c in ident.chars() {
+        match c {
+            '_' => out.push_str("_1"),
+            ';' => out.push_str("_2"),
+            '[' => out.push_str("_3"),
+            c if c.is_ascii_alphanumeric() => out.push(c),
+            c => {
+                let _ = write!(out, "_0{:04x}", c as u32);
+            }
+        }
+    }
+    out
+}
+
+/// True if `t` is a typed handle, or an optional wrapping a typed handle.
+fn is_typed_handle_return(t: &TypeRef) -> bool {
+    match t {
+        TypeRef::TypedHandle(_) => true,
+        TypeRef::Optional(inner) => matches!(inner.as_ref(), TypeRef::TypedHandle(_)),
+        _ => false,
+    }
+}
+
+/// Whether a function needs the private-`Jni` + public-wrapper split rather than
+/// a bare `external fun`. This is required when any param or the return crosses
+/// the JNI boundary as a *different* type than its public Kotlin type: enums
+/// (`.value`/`fromValue`) and typed handles (`.handle` / re-wrap into the class).
 fn has_enum_involvement(f: &FnBinding) -> bool {
     f.params
         .iter()
         .any(|p| matches!(&p.ty, TypeRef::Enum(_) | TypeRef::TypedHandle(_)))
         || matches!(&f.ret, Some(TypeRef::Enum(_)))
+        || f.ret.as_ref().is_some_and(is_typed_handle_return)
 }
 
 fn render_kotlin(
@@ -442,9 +490,42 @@ fn render_kotlin(
                         func_name,
                         public_params.join(", "),
                         public_ret,
-                        name,
+                        local_type_name(name),
                         call
                     );
+                } else if let Some(TypeRef::TypedHandle(name)) = &f.ret {
+                    // The JNI returns a raw `Long` handle; re-wrap it into the
+                    // owning class so the public surface is the object type.
+                    let _ = writeln!(
+                        kotlin,
+                        "        @JvmStatic fun {}({}): {} = {}({})",
+                        func_name,
+                        public_params.join(", "),
+                        public_ret,
+                        local_type_name(name),
+                        call
+                    );
+                } else if let Some(TypeRef::Optional(inner)) = &f.ret {
+                    if let TypeRef::TypedHandle(name) = inner.as_ref() {
+                        let _ = writeln!(
+                            kotlin,
+                            "        @JvmStatic fun {}({}): {} = {}?.let {{ {}(it) }}",
+                            func_name,
+                            public_params.join(", "),
+                            public_ret,
+                            call,
+                            local_type_name(name)
+                        );
+                    } else {
+                        let _ = writeln!(
+                            kotlin,
+                            "        @JvmStatic fun {}({}): {} = {}",
+                            func_name,
+                            public_params.join(", "),
+                            public_ret,
+                            call
+                        );
+                    }
                 } else if f.ret.is_some() {
                     let _ = writeln!(
                         kotlin,
@@ -604,7 +685,9 @@ fn render_kotlin_error_types(out: &mut String, api: &Api) {
             let _ = writeln!(
                 out,
                 "    class {}(message: String = \"{}\") : WeaveFFIException({}, message)",
-                ec.name, ec.message, ec.code
+                errors::pascal(&ec.name),
+                ec.message,
+                ec.code
             );
         }
         let _ = writeln!(out, "}}");
@@ -646,7 +729,8 @@ fn render_jni_c(
             let _ = writeln!(
                 jni_c,
                 "        exClass = (*env)->FindClass(env, \"{}/WeaveFFIException${}\");",
-                jni_pkg_path, ec.name
+                jni_pkg_path,
+                errors::pascal(&ec.name)
             );
             jni_c.push_str("        break;\n");
         }
@@ -701,7 +785,7 @@ fn render_jni_c(
                 "JNIEXPORT {} JNICALL Java_{}_WeaveFFI_{}({}) {{",
                 jret,
                 jni_prefix,
-                jni_name,
+                jni_mangle(&jni_name),
                 jparams.join(", ")
             );
             let _ = writeln!(jni_c, "    weaveffi_error err = {{0, NULL}};");
@@ -714,6 +798,17 @@ fn render_jni_c(
             let mut call_args: Vec<String> = Vec::new();
             for p in &f.params {
                 build_c_call_args(&mut call_args, &p.name, &p.ty, &m.path, c_prefix);
+            }
+
+            // Iterator-returning functions drain the C iterator into a
+            // `java.util.ArrayList` and hand back its `Iterator` (the Kotlin
+            // surface declares `Iterator<T>`). This needs the launcher/next/
+            // destroy symbols carried by the iterator shape, so it is handled
+            // here rather than in the `TypeRef`-only return dispatcher.
+            if let CallShape::Iterator(it) = &f.shape {
+                write_iterator_return(&mut jni_c, it, &call_args, &f.params, &m.path, c_prefix);
+                let _ = writeln!(jni_c, "}}\n");
+                continue;
             }
 
             let needs_out_len = matches!(
@@ -865,7 +960,7 @@ fn render_jni_async_function(
         out,
         "JNIEXPORT void JNICALL Java_{}_WeaveFFI_{}({}) {{",
         jni_prefix,
-        jni_name,
+        jni_mangle(&jni_name),
         jparams.join(", ")
     );
 
@@ -1412,8 +1507,13 @@ fn build_c_call_args(
         TypeRef::U32 => args.push(format!("(uint32_t){}", name)),
         TypeRef::I64 => args.push(format!("(int64_t){}", name)),
         TypeRef::F64 => args.push(format!("(double){}", name)),
-        TypeRef::TypedHandle(_) | TypeRef::Handle => {
-            args.push(format!("(weaveffi_handle_t){}", name))
+        TypeRef::Handle => args.push(format!("(weaveffi_handle_t){}", name)),
+        // A typed handle lowers to the owner-qualified C struct pointer (mutable
+        // receiver), so the cross-module JNI shim must cast through that pointer
+        // rather than the generic integer handle, mirroring the struct arm below.
+        TypeRef::TypedHandle(sname) => {
+            let c_struct = weaveffi_core::utils::c_abi_struct_name(sname, module, c_prefix);
+            args.push(format!("({}*)(intptr_t){}", c_struct, name));
         }
         TypeRef::Struct(sname) => {
             let c_struct = weaveffi_core::utils::c_abi_struct_name(sname, module, c_prefix);
@@ -1544,6 +1644,17 @@ fn write_return_handling(
             release_jni_resources(jni_c, params);
             let _ = writeln!(jni_c, "    return (jlong)(intptr_t)rv;");
         }
+        // A typed handle lowers to the owner-qualified C struct pointer, so the
+        // return variable must be that pointer (not the generic integer handle)
+        // and round-trip through `intptr_t`, mirroring the struct arm above. The
+        // untyped `Handle` case stays in the scalar fallthrough below.
+        TypeRef::TypedHandle(name) => {
+            let c_ty = weaveffi_core::utils::c_abi_struct_name(name, module, c_prefix);
+            let _ = writeln!(jni_c, "    {}* rv = {}({});", c_ty, c_sym, call_with_err);
+            write_error_check(jni_c, returns);
+            release_jni_resources(jni_c, params);
+            let _ = writeln!(jni_c, "    return (jlong)(intptr_t)rv;");
+        }
         TypeRef::Optional(inner) => {
             write_optional_return(jni_c, inner, c_sym, &args_str, returns, params, module);
         }
@@ -1580,6 +1691,108 @@ fn write_return_handling(
             let _ = writeln!(jni_c, "    return {} rv;", jcast);
         }
     }
+}
+
+/// The C declaration type of an iterator's `out_item` pointee for the element
+/// types we materialize (strings, scalars, struct/handle pointers).
+fn iter_item_c_type(elem: &TypeRef, module: &str, c_prefix: &str) -> String {
+    match elem {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*".to_string(),
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+            format!("{}*", weaveffi_core::utils::c_abi_struct_name(name, module, c_prefix))
+        }
+        other => c_type_for_return(other).to_string(),
+    }
+}
+
+/// Box one iterator/collection scalar `src` into a JVM reference `var`. Unlike
+/// [`write_map_box_elem`] the source is a plain lvalue (not `arr[i]`).
+fn write_boxed_scalar(out: &mut String, ty: &TypeRef, var: &str, src: &str, indent: &str) {
+    match ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            let _ = writeln!(
+                out,
+                "{i}jstring {v} = {s} ? (*env)->NewStringUTF(env, {s}) : (*env)->NewStringUTF(env, \"\");",
+                i = indent, v = var, s = src
+            );
+        }
+        TypeRef::I32 | TypeRef::Enum(_) => {
+            let _ = writeln!(out, "{i}jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Integer\");", i = indent, v = var);
+            let _ = writeln!(out, "{i}jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(I)Ljava/lang/Integer;\"), (jint){s});", i = indent, v = var, s = src);
+        }
+        TypeRef::U32 | TypeRef::I64 => {
+            let _ = writeln!(out, "{i}jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Long\");", i = indent, v = var);
+            let _ = writeln!(out, "{i}jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(J)Ljava/lang/Long;\"), (jlong){s});", i = indent, v = var, s = src);
+        }
+        TypeRef::TypedHandle(_) | TypeRef::Handle | TypeRef::Struct(_) => {
+            let _ = writeln!(out, "{i}jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Long\");", i = indent, v = var);
+            let _ = writeln!(out, "{i}jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(J)Ljava/lang/Long;\"), (jlong)(intptr_t){s});", i = indent, v = var, s = src);
+        }
+        TypeRef::F64 => {
+            let _ = writeln!(out, "{i}jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Double\");", i = indent, v = var);
+            let _ = writeln!(out, "{i}jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(D)Ljava/lang/Double;\"), (jdouble){s});", i = indent, v = var, s = src);
+        }
+        TypeRef::Bool => {
+            let _ = writeln!(out, "{i}jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Boolean\");", i = indent, v = var);
+            let _ = writeln!(out, "{i}jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(Z)Ljava/lang/Boolean;\"), {s} ? JNI_TRUE : JNI_FALSE);", i = indent, v = var, s = src);
+        }
+        _ => {
+            let _ = writeln!(out, "{i}jobject {v} = (jobject)(intptr_t){s};", i = indent, v = var, s = src);
+        }
+    }
+}
+
+/// Drain an `iter<T>` into a `java.util.ArrayList<T>` and return its `Iterator`.
+/// The C surface is the launcher (returns an opaque iterator handle), a `next`
+/// that writes one element per call and returns 1/0, and a `destroy`.
+fn write_iterator_return(
+    out: &mut String,
+    it: &IteratorBinding,
+    call_args: &[String],
+    params: &[ParamBinding],
+    module: &str,
+    c_prefix: &str,
+) {
+    let args_str = call_args.join(", ");
+    let launch_call = join_call_args(&args_str, "&err");
+    let iter_ret = TypeRef::Iterator(Box::new(it.elem.clone()));
+    let is_string = matches!(it.elem, TypeRef::StringUtf8 | TypeRef::BorrowedStr);
+
+    let _ = writeln!(
+        out,
+        "    {tag}* _iter = {sym}({call});",
+        tag = it.iter_tag,
+        sym = it.launch.symbol,
+        call = launch_call
+    );
+    write_error_check(out, Some(&iter_ret));
+    release_jni_resources(out, params);
+
+    let _ = writeln!(out, "    jclass _al_cls = (*env)->FindClass(env, \"java/util/ArrayList\");");
+    let _ = writeln!(out, "    jobject _list = (*env)->NewObject(env, _al_cls, (*env)->GetMethodID(env, _al_cls, \"<init>\", \"()V\"));");
+    let _ = writeln!(out, "    jmethodID _al_add = (*env)->GetMethodID(env, _al_cls, \"add\", \"(Ljava/lang/Object;)Z\");");
+
+    let item_c = iter_item_c_type(&it.elem, module, c_prefix);
+    let _ = writeln!(out, "    {ty} _item = ({ty})0;", ty = item_c);
+    let _ = writeln!(out, "    weaveffi_error _iter_err = {{0, NULL}};");
+    let _ = writeln!(
+        out,
+        "    while ({next}(_iter, &_item, &_iter_err) != 0) {{",
+        next = it.next.symbol
+    );
+    write_boxed_scalar(out, &it.elem, "_jitem", "_item", "        ");
+    let _ = writeln!(out, "        (*env)->CallBooleanMethod(env, _list, _al_add, _jitem);");
+    let _ = writeln!(out, "        (*env)->DeleteLocalRef(env, _jitem);");
+    if is_string {
+        let _ = writeln!(out, "        weaveffi_free_string(_item);");
+    }
+    let _ = writeln!(out, "    }}");
+    let _ = writeln!(out, "    {}(_iter);", it.destroy_symbol);
+    let _ = writeln!(out, "    if (_iter_err.code != 0) {{");
+    let _ = writeln!(out, "        throw_weaveffi_error(env, &_iter_err);");
+    let _ = writeln!(out, "        return NULL;");
+    let _ = writeln!(out, "    }}");
+    let _ = writeln!(out, "    return (*env)->CallObjectMethod(env, _list, (*env)->GetMethodID(env, _al_cls, \"iterator\", \"()Ljava/util/Iterator;\"));");
 }
 
 fn write_optional_return(
@@ -1620,11 +1833,28 @@ fn write_optional_return(
                 "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jint)*rv);"
             );
         }
-        TypeRef::U32
-        | TypeRef::I64
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Handle
-        | TypeRef::Struct(_) => {
+        // An optional struct/handle return is a *nullable handle pointer*: box
+        // the pointer value itself (do not dereference it as an integer).
+        TypeRef::TypedHandle(_) | TypeRef::Handle | TypeRef::Struct(_) => {
+            let _ = writeln!(out, "    const void* rv = {}({});", c_sym, call);
+            write_error_check(out, returns);
+            release_jni_resources(out, params);
+            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
+            let _ = writeln!(
+                out,
+                "    jclass cls = (*env)->FindClass(env, \"java/lang/Long\");"
+            );
+            let _ = writeln!(
+                out,
+                "    jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(J)Ljava/lang/Long;\");"
+            );
+            let _ = writeln!(
+                out,
+                "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jlong)(intptr_t)rv);"
+            );
+        }
+        // Optional scalar return: a nullable pointer to the value; dereference.
+        TypeRef::U32 | TypeRef::I64 => {
             let _ = writeln!(
                 out,
                 "    const int64_t* rv = (const int64_t*){}({});",
@@ -2014,7 +2244,7 @@ fn write_map_release(out: &mut String, name: &str, key: &TypeRef, val: &TypeRef)
 fn kotlin_getter_type(t: &TypeRef) -> String {
     match t {
         TypeRef::Struct(name) => local_type_name(name).to_string(),
-        TypeRef::Enum(name) => name.clone(),
+        TypeRef::Enum(name) => local_type_name(name).to_string(),
         other => kotlin_type(other),
     }
 }
@@ -2024,7 +2254,10 @@ fn render_kotlin_struct(out: &mut String, s: &StructBinding) {
     emit_doc(out, &s.doc, "");
     let _ = writeln!(
         out,
-        "class {} internal constructor(private var handle: Long) : java.io.Closeable {{",
+        // `handle` is `internal` (not `private`) so the `WeaveFFI` companion
+        // wrappers and builders in this module can unwrap `store.handle`; it
+        // stays hidden from external consumers.
+        "class {} internal constructor(internal var handle: Long) : java.io.Closeable {{",
         s.name
     );
     let _ = writeln!(out, "    companion object {{");
@@ -2081,6 +2314,16 @@ fn render_kotlin_struct(out: &mut String, s: &StructBinding) {
                     f.name, kt_type, local, pascal
                 );
             }
+            // The native getter returns the raw `Int` value, so an enum field
+            // must round-trip through the generated `fromValue` factory to yield
+            // the typed enum (the declared `kt_type` is the bare local class).
+            TypeRef::Enum(_) => {
+                let _ = writeln!(
+                    out,
+                    "    val {}: {} get() = {}.fromValue(nativeGet{}(handle))",
+                    f.name, kt_type, kt_type, pascal
+                );
+            }
             _ => {
                 let _ = writeln!(
                     out,
@@ -2113,8 +2356,15 @@ fn render_kotlin_builder(out: &mut String, s: &StructBinding) {
     emit_doc(out, &s.doc, "");
     let _ = writeln!(out, "class {}Builder {{", s.name);
     for f in &s.fields {
-        let kt_getter = kotlin_getter_type(&f.ty);
-        let _ = writeln!(out, "    private var {}: {}? = null", f.name, kt_getter);
+        // Optional fields are already nullable; using a single nullable slot lets
+        // "unset" and "explicitly null" both mean "absent" (a legal value), and
+        // avoids a `T??` double-optional that `build()` could never satisfy.
+        let decl_ty = if matches!(&f.ty, TypeRef::Optional(_)) {
+            kotlin_getter_type(&f.ty)
+        } else {
+            format!("{}?", kotlin_getter_type(&f.ty))
+        };
+        let _ = writeln!(out, "    private var {}: {} = null", f.name, decl_ty);
     }
     for f in &s.fields {
         let pascal = pascal_case(&f.name);
@@ -2136,10 +2386,16 @@ fn render_kotlin_builder(out: &mut String, s: &StructBinding) {
         let _ = writeln!(out, "        return {}.create(", s.name);
         let n = s.fields.len();
         for (i, f) in s.fields.iter().enumerate() {
-            let arg = format!(
-                "{} ?: throw IllegalStateException(\"missing field: {}\")",
-                f.name, f.name
-            );
+            // Optional fields pass through as-is (null = absent); required fields
+            // are asserted present.
+            let arg = if matches!(&f.ty, TypeRef::Optional(_)) {
+                f.name.clone()
+            } else {
+                format!(
+                    "{} ?: throw IllegalStateException(\"missing field: {}\")",
+                    f.name, f.name
+                )
+            };
             let suffix = if i + 1 < n { "," } else { "" };
             let _ = writeln!(out, "            {}{}", arg, suffix);
         }
@@ -2291,6 +2547,9 @@ fn render_jni_struct(
             TypeRef::List(inner) => {
                 write_struct_list_getter(out, inner, getter_c, prefix);
             }
+            TypeRef::Map(k, v) => {
+                write_struct_map_getter(out, k, v, getter_c, prefix);
+            }
             other => {
                 let c_ty = c_type_for_return(other);
                 let jcast = jni_cast_for(other);
@@ -2340,6 +2599,66 @@ fn write_struct_optional_getter(out: &mut String, inner: &TypeRef, getter_c: &st
                 "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jint)*rv);"
             );
         }
+        TypeRef::U32 | TypeRef::I64 => {
+            let _ = writeln!(
+                out,
+                "    const int64_t* rv = (const int64_t*){}((const {}*)(intptr_t)handle);",
+                getter_c, prefix
+            );
+            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
+            let _ = writeln!(
+                out,
+                "    jclass cls = (*env)->FindClass(env, \"java/lang/Long\");"
+            );
+            let _ = writeln!(
+                out,
+                "    jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(J)Ljava/lang/Long;\");"
+            );
+            let _ = writeln!(
+                out,
+                "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jlong)*rv);"
+            );
+        }
+        TypeRef::F64 => {
+            let _ = writeln!(
+                out,
+                "    const double* rv = (const double*){}((const {}*)(intptr_t)handle);",
+                getter_c, prefix
+            );
+            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
+            let _ = writeln!(
+                out,
+                "    jclass cls = (*env)->FindClass(env, \"java/lang/Double\");"
+            );
+            let _ = writeln!(
+                out,
+                "    jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(D)Ljava/lang/Double;\");"
+            );
+            let _ = writeln!(
+                out,
+                "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jdouble)*rv);"
+            );
+        }
+        TypeRef::Bool => {
+            let _ = writeln!(
+                out,
+                "    const bool* rv = (const bool*){}((const {}*)(intptr_t)handle);",
+                getter_c, prefix
+            );
+            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
+            let _ = writeln!(
+                out,
+                "    jclass cls = (*env)->FindClass(env, \"java/lang/Boolean\");"
+            );
+            let _ = writeln!(
+                out,
+                "    jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(Z)Ljava/lang/Boolean;\");"
+            );
+            let _ = writeln!(
+                out,
+                "    return (*env)->CallStaticObjectMethod(env, cls, mid, *rv ? JNI_TRUE : JNI_FALSE);"
+            );
+        }
         TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Handle => {
             let _ = writeln!(
                 out,
@@ -2363,6 +2682,31 @@ fn write_struct_optional_getter(out: &mut String, inner: &TypeRef, getter_c: &st
 
 fn write_struct_list_getter(out: &mut String, inner: &TypeRef, getter_c: &str, prefix: &str) {
     match inner {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            let _ = writeln!(out, "    size_t out_len = 0;");
+            let _ = writeln!(
+                out,
+                "    const char** rv = (const char**){}((const {}*)(intptr_t)handle, &out_len);",
+                getter_c, prefix
+            );
+            let _ = writeln!(
+                out,
+                "    jclass scls = (*env)->FindClass(env, \"java/lang/String\");"
+            );
+            let _ = writeln!(
+                out,
+                "    jobjectArray jout = (*env)->NewObjectArray(env, (jsize)out_len, scls, NULL);"
+            );
+            let _ = writeln!(out, "    if (jout && rv) {{");
+            let _ = writeln!(out, "        for (size_t i = 0; i < out_len; i++) {{");
+            let _ = writeln!(out, "            jstring s = rv[i] ? (*env)->NewStringUTF(env, rv[i]) : (*env)->NewStringUTF(env, \"\");");
+            let _ = writeln!(out, "            (*env)->SetObjectArrayElement(env, jout, (jsize)i, s);");
+            let _ = writeln!(out, "            (*env)->DeleteLocalRef(env, s);");
+            let _ = writeln!(out, "            weaveffi_free_string(rv[i]);");
+            let _ = writeln!(out, "        }}");
+            let _ = writeln!(out, "    }}");
+            let _ = writeln!(out, "    return jout;");
+        }
         TypeRef::I32 | TypeRef::Enum(_) => {
             let _ = writeln!(out, "    size_t out_len = 0;");
             let _ = writeln!(
@@ -2447,6 +2791,54 @@ fn write_struct_list_getter(out: &mut String, inner: &TypeRef, getter_c: &str, p
     }
 }
 
+/// Materialize a struct map getter into a `java.util.HashMap`. The C surface is
+/// the triple-pointer out-param form
+/// `void get(const T* ptr, K*** out_keys, V*** out_values, size_t* out_len)`.
+fn write_struct_map_getter(
+    out: &mut String,
+    key: &TypeRef,
+    val: &TypeRef,
+    getter_c: &str,
+    prefix: &str,
+) {
+    let key_c = map_elem_c_type(key);
+    let val_c = map_elem_c_type(val);
+    let key_is_string = matches!(key, TypeRef::StringUtf8 | TypeRef::BorrowedStr);
+    let val_is_string = matches!(val, TypeRef::StringUtf8 | TypeRef::BorrowedStr);
+    let _ = writeln!(out, "    {kc}* out_keys = NULL;", kc = key_c);
+    let _ = writeln!(out, "    {vc}* out_vals = NULL;", vc = val_c);
+    let _ = writeln!(out, "    size_t out_len = 0;");
+    let _ = writeln!(
+        out,
+        "    {getter}((const {prefix}*)(intptr_t)handle, &out_keys, &out_vals, &out_len);",
+        getter = getter_c,
+        prefix = prefix
+    );
+    let _ = writeln!(
+        out,
+        "    jclass hm_cls = (*env)->FindClass(env, \"java/util/HashMap\");"
+    );
+    let _ = writeln!(out, "    jobject result = (*env)->NewObject(env, hm_cls, (*env)->GetMethodID(env, hm_cls, \"<init>\", \"(I)V\"), (jint)out_len);");
+    let _ = writeln!(out, "    jmethodID hm_put = (*env)->GetMethodID(env, hm_cls, \"put\", \"(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;\");");
+    let _ = writeln!(out, "    for (size_t i = 0; i < out_len; i++) {{");
+    write_map_box_elem(out, key, "jkey", "out_keys");
+    write_map_box_elem(out, val, "jval", "out_vals");
+    let _ = writeln!(
+        out,
+        "        (*env)->CallObjectMethod(env, result, hm_put, jkey, jval);"
+    );
+    let _ = writeln!(out, "        (*env)->DeleteLocalRef(env, jkey);");
+    let _ = writeln!(out, "        (*env)->DeleteLocalRef(env, jval);");
+    if key_is_string {
+        let _ = writeln!(out, "        weaveffi_free_string(out_keys[i]);");
+    }
+    if val_is_string {
+        let _ = writeln!(out, "        weaveffi_free_string(out_vals[i]);");
+    }
+    let _ = writeln!(out, "    }}");
+    let _ = writeln!(out, "    return result;");
+}
+
 fn release_jni_resources_single(out: &mut String, name: &str, ty: &TypeRef) {
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
@@ -2500,6 +2892,7 @@ mod tests {
             version: "0.1.0".to_string(),
             modules,
             generators: None,
+            package: None,
         }
     }
 
@@ -2539,7 +2932,7 @@ mod tests {
         let api = make_struct_api();
         let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
-            kt.contains("class Contact internal constructor(private var handle: Long) : java.io.Closeable {"),
+            kt.contains("class Contact internal constructor(internal var handle: Long) : java.io.Closeable {"),
             "missing struct class declaration: {kt}"
         );
     }
@@ -2673,6 +3066,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let dir = tempfile::tempdir().unwrap();
         let out = Utf8Path::from_path(dir.path()).unwrap();
@@ -3163,8 +3557,8 @@ mod tests {
             "missing int32_t cast: {jni}"
         );
         assert!(
-            jni.contains("WeaveFFI_set_colorJni("),
-            "JNI function name should have Jni suffix for enum functions: {jni}"
+            jni.contains("WeaveFFI_set_1colorJni("),
+            "JNI function name should have Jni suffix and underscore mangling: {jni}"
         );
     }
 
@@ -3197,8 +3591,8 @@ mod tests {
         );
         assert!(jni.contains("(jint)"), "missing jint cast: {jni}");
         assert!(
-            jni.contains("WeaveFFI_get_colorJni("),
-            "JNI function name should have Jni suffix for enum functions: {jni}"
+            jni.contains("WeaveFFI_get_1colorJni("),
+            "JNI function name should have Jni suffix and underscore mangling: {jni}"
         );
     }
 
@@ -3679,7 +4073,7 @@ mod tests {
 
         assert!(
             kotlin.contains(
-                "class Contact internal constructor(private var handle: Long) : java.io.Closeable {"
+                "class Contact internal constructor(internal var handle: Long) : java.io.Closeable {"
             ),
             "missing struct class: {kotlin}"
         );
@@ -3992,8 +4386,8 @@ mod tests {
 
         let jni = std::fs::read_to_string(tmp.join("android/src/main/cpp/weaveffi_jni.c")).unwrap();
         assert!(
-            jni.contains("Java_com_mycompany_ffi_WeaveFFI_math_add"),
-            "missing custom JNI prefix: {jni}"
+            jni.contains("Java_com_mycompany_ffi_WeaveFFI_math_1add"),
+            "missing custom JNI prefix (with underscore mangling): {jni}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -4403,7 +4797,7 @@ mod tests {
         );
 
         let start = jni
-            .find("Java_com_weaveffi_WeaveFFI_find_contact")
+            .find("Java_com_weaveffi_WeaveFFI_find_1contact")
             .expect("find_contact JNI symbol");
         let rest = &jni[start..];
         let end = rest.find("\nJNIEXPORT ").unwrap_or(rest.len());

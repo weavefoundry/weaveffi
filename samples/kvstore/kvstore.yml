@@ -1,4 +1,13 @@
 version: "0.3.0"
+package:
+  name: kvstore
+  version: "1.0.0"
+  description: An embedded key-value store API with TTLs, iteration, and async compaction.
+  license: MIT
+  authors:
+    - WeaveFoundry <hello@weavefoundry.dev>
+  homepage: https://github.com/weavefoundry/weaveffi
+  repository: https://github.com/weavefoundry/weaveffi
 modules:
   - name: kv
     structs:

@@ -105,6 +105,7 @@ fn calculator_api() -> Api {
             modules: vec![],
         }],
         generators: None,
+        package: None,
     }
 }
 
@@ -215,6 +216,7 @@ fn large_api() -> Api {
         version: "0.1.0".to_string(),
         modules,
         generators: None,
+        package: None,
     }
 }
 

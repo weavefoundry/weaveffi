@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
@@ -99,11 +100,20 @@ unsafe impl Send for ListenerSlot {}
 static LISTENER: Mutex<Option<ListenerSlot>> = Mutex::new(None);
 static NEXT_LISTENER_ID: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(not(target_arch = "wasm32"))]
 fn now_unix_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+// `wasm32-unknown-unknown` has no wall clock; `SystemTime::now()` traps. Use a
+// fixed epoch so TTL arithmetic stays deterministic and entries never appear
+// spuriously expired when the bindings are exercised from JavaScript.
+#[cfg(target_arch = "wasm32")]
+fn now_unix_seconds() -> i64 {
+    1_700_000_000
 }
 
 fn fire_eviction(key: &str) {
@@ -405,6 +415,42 @@ pub extern "C" fn weaveffi_kv_compact_async_async(
     callback: weaveffi_kv_compact_async_callback,
     context: *mut c_void,
 ) {
+    // Single-threaded wasm has no `std::thread`; run the compaction inline and
+    // invoke the callback synchronously. The JS Promise still resolves on its
+    // microtask queue, so the async surface behaves identically to callers.
+    #[cfg(target_arch = "wasm32")]
+    {
+        if abi::cancel_token_is_cancelled(cancel_token as *const _) {
+            let mut err = weaveffi_error::default();
+            abi::error_set(&mut err, KV_IO_ERROR, "compaction cancelled");
+            callback(context, &mut err, 0);
+            abi::error_clear(&mut err);
+            return;
+        }
+        let bytes_reclaimed = if store.is_null() {
+            0
+        } else {
+            let s = unsafe { &*store };
+            let mut entries = s.entries.lock();
+            let now = now_unix_seconds();
+            let expired_keys: Vec<String> = entries
+                .iter()
+                .filter(|(_, e)| e.is_expired(now))
+                .map(|(k, _)| k.clone())
+                .collect();
+            let mut total_bytes = 0i64;
+            for k in expired_keys {
+                if let Some(e) = entries.remove(&k) {
+                    total_bytes += e.value.len() as i64;
+                }
+            }
+            total_bytes
+        };
+        callback(context, std::ptr::null_mut(), bytes_reclaimed);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
     let store_addr = store as usize;
     let token_addr = cancel_token as usize;
     let ctx_addr = context as usize;
@@ -456,6 +502,7 @@ pub extern "C" fn weaveffi_kv_compact_async_async(
 
         callback(ctx_ptr, std::ptr::null_mut(), bytes_reclaimed);
     });
+    }
 }
 
 // ── legacy_put (deprecated) ─────────────────────────────────
@@ -664,14 +711,16 @@ pub extern "C" fn weaveffi_kv_Entry_get_tags(
     p
 }
 
-/// Map getter: writes the heap-allocated key/value array start addresses
-/// into `*out_keys` and `*out_values`. The C ABI return type encodes maps
-/// as parallel arrays; callers free them by walking the pointers.
+/// Map getter: a returned map lowers to two producer-allocated parallel
+/// arrays, so the out-params are pointers to the array base
+/// (`const char*** out_keys` / `const char*** out_values`). We write the base
+/// of each `[*const c_char]` array into `*out_keys` / `*out_values`; the caller
+/// reads `keys[i]` / `vals[i]` for `out_len` entries.
 #[no_mangle]
 pub extern "C" fn weaveffi_kv_Entry_get_metadata(
     ptr: *const Entry,
-    out_keys: *mut *const c_char,
-    out_values: *mut *const c_char,
+    out_keys: *mut *mut *const c_char,
+    out_values: *mut *mut *const c_char,
     out_len: *mut usize,
 ) {
     assert!(!ptr.is_null());
@@ -681,10 +730,10 @@ pub extern "C" fn weaveffi_kv_Entry_get_metadata(
     }
     if map.is_empty() {
         if !out_keys.is_null() {
-            unsafe { *out_keys = std::ptr::null() };
+            unsafe { *out_keys = std::ptr::null_mut() };
         }
         if !out_values.is_null() {
-            unsafe { *out_values = std::ptr::null() };
+            unsafe { *out_values = std::ptr::null_mut() };
         }
         return;
     }
@@ -699,10 +748,10 @@ pub extern "C" fn weaveffi_kv_Entry_get_metadata(
     std::mem::forget(keys);
     std::mem::forget(vals);
     if !out_keys.is_null() {
-        unsafe { *out_keys = kp as *const c_char };
+        unsafe { *out_keys = kp };
     }
     if !out_values.is_null() {
-        unsafe { *out_values = vp as *const c_char };
+        unsafe { *out_values = vp };
     }
 }
 
@@ -1305,12 +1354,12 @@ mod tests {
         unsafe { drop(Vec::from_raw_parts(tp, tlen, tlen)) };
 
         let mut mlen: usize = 0;
-        let mut keys_out: *const c_char = std::ptr::null();
-        let mut vals_out: *const c_char = std::ptr::null();
+        let mut keys_out: *mut *const c_char = std::ptr::null_mut();
+        let mut vals_out: *mut *const c_char = std::ptr::null_mut();
         weaveffi_kv_Entry_get_metadata(entry, &mut keys_out, &mut vals_out, &mut mlen);
         assert_eq!(mlen, 1);
-        let keys_arr = keys_out as *mut *const c_char;
-        let vals_arr = vals_out as *mut *const c_char;
+        let keys_arr = keys_out;
+        let vals_arr = vals_out;
         let k0 = unsafe { *keys_arr };
         let v0 = unsafe { *vals_arr };
         assert_eq!(abi::c_ptr_to_string(k0).unwrap(), "source");

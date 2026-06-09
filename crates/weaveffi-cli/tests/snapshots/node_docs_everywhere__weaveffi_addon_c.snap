@@ -63,7 +63,19 @@ static napi_value Napi_weaveffi_docs_create_document(napi_env env, napi_callback
     napi_create_int32(env, (int32_t)weaveffi_docs_Document_get_status(ret_p), &ret_status);
     napi_set_named_property(env, ret, "status", ret_status);
     napi_value ret_tags;
-    napi_get_null(env, &ret_tags);
+    {
+      size_t ret_tags_len;
+      const char** ret_tags_arr = weaveffi_docs_Document_get_tags(ret_p, &ret_tags_len);
+      napi_create_array(env, &ret_tags);
+      if (ret_tags_arr != NULL) {
+        for (size_t ret_tags_i = 0; ret_tags_i < ret_tags_len; ret_tags_i++) {
+          napi_value ret_tags_e;
+          napi_create_string_utf8(env, ret_tags_arr[ret_tags_i], NAPI_AUTO_LENGTH, &ret_tags_e);
+          weaveffi_free_string((char*)(ret_tags_arr[ret_tags_i]));
+          napi_set_element(env, ret_tags, (uint32_t)ret_tags_i, ret_tags_e);
+        }
+      }
+    }
     napi_set_named_property(env, ret, "tags", ret_tags);
     weaveffi_docs_Document_destroy(ret_p);
   }
@@ -104,7 +116,19 @@ static napi_value Napi_weaveffi_docs_get_document(napi_env env, napi_callback_in
       napi_create_int32(env, (int32_t)weaveffi_docs_Document_get_status(ret_p), &ret_status);
       napi_set_named_property(env, ret, "status", ret_status);
       napi_value ret_tags;
-      napi_get_null(env, &ret_tags);
+      {
+        size_t ret_tags_len;
+        const char** ret_tags_arr = weaveffi_docs_Document_get_tags(ret_p, &ret_tags_len);
+        napi_create_array(env, &ret_tags);
+        if (ret_tags_arr != NULL) {
+          for (size_t ret_tags_i = 0; ret_tags_i < ret_tags_len; ret_tags_i++) {
+            napi_value ret_tags_e;
+            napi_create_string_utf8(env, ret_tags_arr[ret_tags_i], NAPI_AUTO_LENGTH, &ret_tags_e);
+            weaveffi_free_string((char*)(ret_tags_arr[ret_tags_i]));
+            napi_set_element(env, ret_tags, (uint32_t)ret_tags_i, ret_tags_e);
+          }
+        }
+      }
       napi_set_named_property(env, ret, "tags", ret_tags);
       weaveffi_docs_Document_destroy(ret_p);
     }

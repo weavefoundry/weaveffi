@@ -7,43 +7,109 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 // WeaveFFI WASM bindings (auto-generated)
 //
-// Complex type conventions at the WASM boundary:
+// Boundary conventions for a wasm32-unknown-unknown build:
 //
-//   Structs   -> i64 opaque handle (pointer into linear memory)
+//   Handles   -> i32 pointer into linear memory (0 = null/absent)
 //   Enums     -> i32 discriminant value
-//   Optionals -> 0/null for absent; for numerics a separate _is_present i32 flag
-//   Lists     -> (i32 pointer, i32 length) pair into linear memory
+//   i64/u64   -> JavaScript BigInt
+//   Strings   -> NUL-terminated UTF-8 (const char*); a single i32 pointer
+//   Bytes     -> i32 data pointer + i32 length (out_len for returns)
+//   Optionals -> null handle / null pointer (0); scalars boxed by pointer
 
-const _encoder = new TextEncoder();
-const _decoder = new TextDecoder();
+const _enc = new TextEncoder();
+const _dec = new TextDecoder();
 
-function _encodeString(wasm, str) {
-  const bytes = _encoder.encode(str);
-  const ptr = wasm.weaveffi_alloc(bytes.length);
-  new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);
-  return [ptr, bytes.length];
+// Stage a JS string as a NUL-terminated C string in linear memory.
+// Returns [ptr, size] (size includes the NUL); release with _free.
+function _cstr(wasm, str) {
+  const bytes = _enc.encode(str);
+  const size = bytes.length + 1;
+  const ptr = wasm.weaveffi_alloc(size);
+  const mem = new Uint8Array(wasm.memory.buffer, ptr, size);
+  mem.set(bytes);
+  mem[bytes.length] = 0;
+  return [ptr, size];
 }
 
-function _decodeString(wasm, ptr, len) {
-  return _decoder.decode(new Uint8Array(wasm.memory.buffer, ptr, len));
+// Read a NUL-terminated C string (0 => null). Does not free.
+function _readCStr(wasm, ptr) {
+  if (ptr === 0) return null;
+  const mem = new Uint8Array(wasm.memory.buffer);
+  let end = ptr;
+  while (mem[end] !== 0) end++;
+  return _dec.decode(mem.subarray(ptr, end));
 }
 
-function _allocError(wasm) {
-  return wasm.weaveffi_alloc(8);
+// Read then free a producer-owned C string.
+function _takeCStr(wasm, ptr) {
+  const s = _readCStr(wasm, ptr);
+  if (ptr !== 0) wasm.weaveffi_free_string(ptr);
+  return s;
 }
 
-function _checkError(wasm, errPtr) {
-  const buffer = wasm.memory.buffer;
-  const code = new Int32Array(buffer, errPtr, 1)[0];
+// Stage a byte buffer; returns [ptr, len]; release with _free(ptr, len).
+function _bytes(wasm, data) {
+  const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
+  const ptr = wasm.weaveffi_alloc(u8.length);
+  if (u8.length) new Uint8Array(wasm.memory.buffer, ptr, u8.length).set(u8);
+  return [ptr, u8.length];
+}
+
+// Copy then free a producer-owned byte buffer.
+function _takeBytes(wasm, ptr, len) {
+  if (ptr === 0 || len === 0) return new Uint8Array(0);
+  const copy = new Uint8Array(wasm.memory.buffer, ptr, len).slice();
+  wasm.weaveffi_free_bytes(ptr, len);
+  return copy;
+}
+
+// Decode a producer-owned array of `len` C strings at `base` (each
+// freed); the array container itself is owned by the producer.
+function _takeStrArray(wasm, base, len) {
+  const out = [];
+  if (base === 0) return out;
+  const dv = new DataView(wasm.memory.buffer);
+  const ptrs = [];
+  for (let i = 0; i < len; i++) ptrs.push(dv.getUint32(base + i * 4, true));
+  for (const p of ptrs) out.push(_takeCStr(wasm, p));
+  return out;
+}
+
+// Allocate a zeroed {i32 code, i32 message} error slot.
+function _allocErr(wasm) {
+  const ptr = wasm.weaveffi_alloc(8);
+  new Uint8Array(wasm.memory.buffer, ptr, 8).fill(0);
+  return ptr;
+}
+
+// Throw (and free the slot) if the error slot carries a non-zero code.
+function _checkErr(wasm, errPtr) {
+  const dv = new DataView(wasm.memory.buffer);
+  const code = dv.getInt32(errPtr, true);
   if (code !== 0) {
-    const msgPtr = new Uint32Array(buffer, errPtr + 4, 1)[0];
-    const bytes = new Uint8Array(buffer, msgPtr);
-    let end = 0;
-    while (bytes[end] !== 0) end++;
-    const msg = new TextDecoder().decode(new Uint8Array(buffer, msgPtr, end));
+    const msgPtr = dv.getUint32(errPtr + 4, true);
+    const msg = _readCStr(wasm, msgPtr) || '';
     wasm.weaveffi_error_clear(errPtr);
+    wasm.weaveffi_dealloc(errPtr, 8);
     throw new Error(`WeaveFFI error ${code}: ${msg}`);
   }
+}
+
+// Release an error slot on the success path.
+function _freeErr(wasm, errPtr) {
+  wasm.weaveffi_dealloc(errPtr, 8);
+}
+
+// Throw if a borrowed (producer-owned) error carries a non-zero
+// code. Used by async callbacks: the producer owns and frees the
+// error struct, so the slot is read but never deallocated here.
+function _checkErrRef(wasm, errPtr) {
+  const dv = new DataView(wasm.memory.buffer);
+  const code = dv.getInt32(errPtr, true);
+  if (code === 0) return;
+  const msgPtr = dv.getUint32(errPtr + 4, true);
+  const msg = _readCStr(wasm, msgPtr) || '';
+  throw new Error(`WeaveFFI error ${code}: ${msg}`);
 }
 
 function _registerTrampoline(table, paramTypes, handler) {
@@ -67,13 +133,23 @@ class Token {
     this._handle = handle;
   }
   get id() {
-    return this._wasm.weaveffi_shared_Token_get_id(this._handle);
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_shared_Token_get_id(this._handle);
+    return _r;
   }
   get label() {
-    const retptr = this._wasm.weaveffi_alloc(8);
-    this._wasm.weaveffi_shared_Token_get_label(retptr, this._handle);
-    const view = new DataView(this._wasm.memory.buffer);
-    return _decodeString(this._wasm, view.getInt32(retptr, true), view.getInt32(retptr + 4, true));
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_shared_Token_get_label(this._handle);
+    return _takeCStr(wasm, _r);
+  }
+  static create(wasm, id, label) {
+    const [a1_p, a1_s] = _cstr(wasm, label);
+    const _err = _allocErr(wasm);
+    const _r = wasm.weaveffi_shared_Token_create(BigInt(id), a1_p, _err);
+    wasm.weaveffi_dealloc(a1_p, a1_s);
+    _checkErr(wasm, _err);
+    _freeErr(wasm, _err);
+    return new Token(wasm, _r);
   }
 }
 
@@ -83,43 +159,265 @@ class Item {
     this._handle = handle;
   }
   get id() {
-    return this._wasm.weaveffi_kitchen_Item_get_id(this._handle);
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_kitchen_Item_get_id(this._handle);
+    return _r;
   }
   get name() {
-    const retptr = this._wasm.weaveffi_alloc(8);
-    this._wasm.weaveffi_kitchen_Item_get_name(retptr, this._handle);
-    const view = new DataView(this._wasm.memory.buffer);
-    return _decodeString(this._wasm, view.getInt32(retptr, true), view.getInt32(retptr + 4, true));
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_kitchen_Item_get_name(this._handle);
+    return _takeCStr(wasm, _r);
   }
   get count() {
-    return this._wasm.weaveffi_kitchen_Item_get_count(this._handle);
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_kitchen_Item_get_count(this._handle);
+    return _r;
   }
   get enabled() {
-    return this._wasm.weaveffi_kitchen_Item_get_enabled(this._handle) !== 0;
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_kitchen_Item_get_enabled(this._handle);
+    return _r !== 0;
   }
   get ratio() {
-    return this._wasm.weaveffi_kitchen_Item_get_ratio(this._handle);
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_kitchen_Item_get_ratio(this._handle);
+    return _r;
   }
   get nick() {
-    return this._wasm.weaveffi_kitchen_Item_get_nick(this._handle);
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_kitchen_Item_get_nick(this._handle);
+    return _r;
   }
   get payload() {
-    return this._wasm.weaveffi_kitchen_Item_get_payload(this._handle);
+    const wasm = this._wasm;
+    const _lp = wasm.weaveffi_alloc(4);
+    const _r = wasm.weaveffi_kitchen_Item_get_payload(this._handle, _lp);
+    const _dv = new DataView(wasm.memory.buffer);
+    const _len = _dv.getUint32(_lp, true);
+    wasm.weaveffi_dealloc(_lp, 4);
+    return _takeBytes(wasm, _r, _len);
   }
   get tags() {
-    return this._wasm.weaveffi_kitchen_Item_get_tags(this._handle);
+    const wasm = this._wasm;
+    const _lp = wasm.weaveffi_alloc(4);
+    const _r = wasm.weaveffi_kitchen_Item_get_tags(this._handle, _lp);
+    const _dv = new DataView(wasm.memory.buffer);
+    const _len = _dv.getUint32(_lp, true);
+    wasm.weaveffi_dealloc(_lp, 4);
+    const _out = _takeStrArray(wasm, _r, _len);
+    return _out;
   }
   get attrs() {
-    return this._wasm.weaveffi_kitchen_Item_get_attrs(this._handle);
+    const wasm = this._wasm;
+    const _kp = wasm.weaveffi_alloc(4);
+    const _vp = wasm.weaveffi_alloc(4);
+    const _lp = wasm.weaveffi_alloc(4);
+    wasm.weaveffi_kitchen_Item_get_attrs(this._handle, _kp, _vp, _lp);
+    const _dv = new DataView(wasm.memory.buffer);
+    const _ka = _dv.getUint32(_kp, true);
+    const _va = _dv.getUint32(_vp, true);
+    const _len = _dv.getUint32(_lp, true);
+    wasm.weaveffi_dealloc(_kp, 4);
+    wasm.weaveffi_dealloc(_vp, 4);
+    wasm.weaveffi_dealloc(_lp, 4);
+    const _out_k = _takeStrArray(wasm, _ka, _len);
+    const _out_v = _takeStrArray(wasm, _va, _len);
+    const _out = {};
+    for (let i = 0; i < _len; i++) _out[_out_k[i]] = _out_v[i];
+    return _out;
   }
   get parent() {
-    return this._wasm.weaveffi_kitchen_Item_get_parent(this._handle);
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_kitchen_Item_get_parent(this._handle);
+    if (_r === 0) return null;
+    const _dv = new DataView(wasm.memory.buffer);
+    return _dv.getBigInt64(_r, true);
   }
   get token() {
-    return this._wasm.weaveffi_kitchen_Item_get_token(this._handle);
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_kitchen_Item_get_token(this._handle);
+    return new Token(wasm, _r);
   }
   get priority() {
-    return this._wasm.weaveffi_kitchen_Item_get_priority(this._handle);
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_kitchen_Item_get_priority(this._handle);
+    return _r;
+  }
+  static create(wasm, id, name, count, enabled, ratio, nick, payload, tags, attrs, parent, token, priority) {
+    const [a1_p, a1_s] = _cstr(wasm, name);
+    const [a6_p, a6_l] = _bytes(wasm, payload);
+    const a7_arr = tags || [];
+    const a7_n = a7_arr.length;
+    const a7_base = wasm.weaveffi_alloc(a7_n ? a7_n * 4 : 1);
+    const a7_ep = [];
+    for (let i = 0; i < a7_n; i++) a7_ep.push(_cstr(wasm, a7_arr[i]));
+    {
+      const dv = new DataView(wasm.memory.buffer);
+      for (let i = 0; i < a7_n; i++) dv.setUint32(a7_base + i * 4, a7_ep[i][0], true);
+    }
+    const a8_m = attrs || {};
+    const a8_ks = (a8_m instanceof Map) ? [...a8_m.keys()] : Object.keys(a8_m);
+    const a8_vs = (a8_m instanceof Map) ? [...a8_m.values()] : Object.values(a8_m);
+    const a8_k_arr = a8_ks || [];
+    const a8_k_n = a8_k_arr.length;
+    const a8_k_base = wasm.weaveffi_alloc(a8_k_n ? a8_k_n * 4 : 1);
+    const a8_k_ep = [];
+    for (let i = 0; i < a8_k_n; i++) a8_k_ep.push(_cstr(wasm, a8_k_arr[i]));
+    {
+      const dv = new DataView(wasm.memory.buffer);
+      for (let i = 0; i < a8_k_n; i++) dv.setUint32(a8_k_base + i * 4, a8_k_ep[i][0], true);
+    }
+    const a8_v_arr = a8_vs || [];
+    const a8_v_n = a8_v_arr.length;
+    const a8_v_base = wasm.weaveffi_alloc(a8_v_n ? a8_v_n * 4 : 1);
+    const a8_v_ep = [];
+    for (let i = 0; i < a8_v_n; i++) a8_v_ep.push(_cstr(wasm, a8_v_arr[i]));
+    {
+      const dv = new DataView(wasm.memory.buffer);
+      for (let i = 0; i < a8_v_n; i++) dv.setUint32(a8_v_base + i * 4, a8_v_ep[i][0], true);
+    }
+    let a9_p = 0;
+    if (parent !== null && parent !== undefined) {
+      a9_p = wasm.weaveffi_alloc(8);
+      const a9_dv = new DataView(wasm.memory.buffer);
+      a9_dv.setBigInt64(a9_p, BigInt(parent), true);
+    }
+    const _err = _allocErr(wasm);
+    const _r = wasm.weaveffi_kitchen_Item_create(BigInt(id), a1_p, count, enabled ? 1 : 0, ratio, nick, a6_p, a6_l, a7_base, a7_n, a8_k_base, a8_v_base, a8_k_n, a9_p, token._handle, priority, _err);
+    wasm.weaveffi_dealloc(a1_p, a1_s);
+    wasm.weaveffi_dealloc(a6_p, a6_l);
+    for (const [ep, es] of a7_ep) wasm.weaveffi_dealloc(ep, es);
+    wasm.weaveffi_dealloc(a7_base, a7_n ? a7_n * 4 : 1);
+    for (const [ep, es] of a8_k_ep) wasm.weaveffi_dealloc(ep, es);
+    wasm.weaveffi_dealloc(a8_k_base, a8_k_n ? a8_k_n * 4 : 1);
+    for (const [ep, es] of a8_v_ep) wasm.weaveffi_dealloc(ep, es);
+    wasm.weaveffi_dealloc(a8_v_base, a8_v_n ? a8_v_n * 4 : 1);
+    if (a9_p !== 0) wasm.weaveffi_dealloc(a9_p, 8);
+    _checkErr(wasm, _err);
+    _freeErr(wasm, _err);
+    return new Item(wasm, _r);
+  }
+}
+
+class ItemBuilder {
+  constructor(wasm) {
+    this._wasm = wasm;
+    this._b = wasm.weaveffi_kitchen_Item_Builder_new();
+  }
+  id(value) {
+    const wasm = this._wasm;
+    wasm.weaveffi_kitchen_Item_Builder_set_id(this._b, BigInt(value));
+    return this;
+  }
+  name(value) {
+    const wasm = this._wasm;
+    const [a0_p, a0_s] = _cstr(wasm, value);
+    wasm.weaveffi_kitchen_Item_Builder_set_name(this._b, a0_p);
+    wasm.weaveffi_dealloc(a0_p, a0_s);
+    return this;
+  }
+  count(value) {
+    const wasm = this._wasm;
+    wasm.weaveffi_kitchen_Item_Builder_set_count(this._b, value);
+    return this;
+  }
+  enabled(value) {
+    const wasm = this._wasm;
+    wasm.weaveffi_kitchen_Item_Builder_set_enabled(this._b, value ? 1 : 0);
+    return this;
+  }
+  ratio(value) {
+    const wasm = this._wasm;
+    wasm.weaveffi_kitchen_Item_Builder_set_ratio(this._b, value);
+    return this;
+  }
+  nick(value) {
+    const wasm = this._wasm;
+    wasm.weaveffi_kitchen_Item_Builder_set_nick(this._b, value);
+    return this;
+  }
+  payload(value) {
+    const wasm = this._wasm;
+    const [a0_p, a0_l] = _bytes(wasm, value);
+    wasm.weaveffi_kitchen_Item_Builder_set_payload(this._b, a0_p, a0_l);
+    wasm.weaveffi_dealloc(a0_p, a0_l);
+    return this;
+  }
+  tags(value) {
+    const wasm = this._wasm;
+    const a0_arr = value || [];
+    const a0_n = a0_arr.length;
+    const a0_base = wasm.weaveffi_alloc(a0_n ? a0_n * 4 : 1);
+    const a0_ep = [];
+    for (let i = 0; i < a0_n; i++) a0_ep.push(_cstr(wasm, a0_arr[i]));
+    {
+      const dv = new DataView(wasm.memory.buffer);
+      for (let i = 0; i < a0_n; i++) dv.setUint32(a0_base + i * 4, a0_ep[i][0], true);
+    }
+    wasm.weaveffi_kitchen_Item_Builder_set_tags(this._b, a0_base, a0_n);
+    for (const [ep, es] of a0_ep) wasm.weaveffi_dealloc(ep, es);
+    wasm.weaveffi_dealloc(a0_base, a0_n ? a0_n * 4 : 1);
+    return this;
+  }
+  attrs(value) {
+    const wasm = this._wasm;
+    const a0_m = value || {};
+    const a0_ks = (a0_m instanceof Map) ? [...a0_m.keys()] : Object.keys(a0_m);
+    const a0_vs = (a0_m instanceof Map) ? [...a0_m.values()] : Object.values(a0_m);
+    const a0_k_arr = a0_ks || [];
+    const a0_k_n = a0_k_arr.length;
+    const a0_k_base = wasm.weaveffi_alloc(a0_k_n ? a0_k_n * 4 : 1);
+    const a0_k_ep = [];
+    for (let i = 0; i < a0_k_n; i++) a0_k_ep.push(_cstr(wasm, a0_k_arr[i]));
+    {
+      const dv = new DataView(wasm.memory.buffer);
+      for (let i = 0; i < a0_k_n; i++) dv.setUint32(a0_k_base + i * 4, a0_k_ep[i][0], true);
+    }
+    const a0_v_arr = a0_vs || [];
+    const a0_v_n = a0_v_arr.length;
+    const a0_v_base = wasm.weaveffi_alloc(a0_v_n ? a0_v_n * 4 : 1);
+    const a0_v_ep = [];
+    for (let i = 0; i < a0_v_n; i++) a0_v_ep.push(_cstr(wasm, a0_v_arr[i]));
+    {
+      const dv = new DataView(wasm.memory.buffer);
+      for (let i = 0; i < a0_v_n; i++) dv.setUint32(a0_v_base + i * 4, a0_v_ep[i][0], true);
+    }
+    wasm.weaveffi_kitchen_Item_Builder_set_attrs(this._b, a0_k_base, a0_v_base, a0_k_n);
+    for (const [ep, es] of a0_k_ep) wasm.weaveffi_dealloc(ep, es);
+    wasm.weaveffi_dealloc(a0_k_base, a0_k_n ? a0_k_n * 4 : 1);
+    for (const [ep, es] of a0_v_ep) wasm.weaveffi_dealloc(ep, es);
+    wasm.weaveffi_dealloc(a0_v_base, a0_v_n ? a0_v_n * 4 : 1);
+    return this;
+  }
+  parent(value) {
+    const wasm = this._wasm;
+    let a0_p = 0;
+    if (value !== null && value !== undefined) {
+      a0_p = wasm.weaveffi_alloc(8);
+      const a0_dv = new DataView(wasm.memory.buffer);
+      a0_dv.setBigInt64(a0_p, BigInt(value), true);
+    }
+    wasm.weaveffi_kitchen_Item_Builder_set_parent(this._b, a0_p);
+    if (a0_p !== 0) wasm.weaveffi_dealloc(a0_p, 8);
+    return this;
+  }
+  token(value) {
+    const wasm = this._wasm;
+    wasm.weaveffi_kitchen_Item_Builder_set_token(this._b, value._handle);
+    return this;
+  }
+  priority(value) {
+    const wasm = this._wasm;
+    wasm.weaveffi_kitchen_Item_Builder_set_priority(this._b, value);
+    return this;
+  }
+  build() {
+    const wasm = this._wasm;
+    const _err = _allocErr(wasm);
+    const _r = wasm.weaveffi_kitchen_Item_Builder_build(this._b, _err);
+    _checkErr(wasm, _err);
+    _freeErr(wasm, _err);
+    return new Item(wasm, _r);
   }
 }
 
@@ -135,21 +433,22 @@ class Item {
  * @example
  * const api = await loadWeaveffiWasm('lib.wasm');
  *
- * // Primitive: (i32, i32) -> i32
+ * // Primitive: plain numbers in, number out.
  * const sum = api.math.add(1, 2);
  *
- * // Struct handle: () -> i64 (opaque pointer)
- * const handle = api.contacts.create();
+ * // Struct: returns a wrapper instance exposing field getters.
+ * const person = api.contacts.create();
+ * console.log(person.name);
  *
- * // Enum: (i32 discriminant) -> void
+ * // Enum: pass the integer discriminant.
  * api.ui.set_color(0); // 0 = first variant
  *
- * // Optional: (i32 is_present, i32 value) -> void
- * api.config.set_timeout(1, 5000); // present
- * api.config.set_timeout(0, 0);    // absent
+ * // Optional: pass null to omit, a value to provide.
+ * api.config.set_timeout(5000); // present
+ * api.config.set_timeout(null); // absent
  *
- * // List: (i32 pointer, i32 length) -> void
- * api.data.process(ptr, len);
+ * // List/Map: pass arrays/objects; receive arrays/objects.
+ * const names = api.data.all_names();
  */
 export async function loadWeaveffiWasm(url) {
   const response = await fetch(url);
@@ -166,7 +465,7 @@ export async function loadWeaveffiWasm(url) {
     if (!ctx) return;
     _asyncContexts.delete(ctxId);
     try {
-      if (errPtr !== 0) _checkError(wasm, errPtr);
+      if (errPtr !== 0) _checkErrRef(wasm, errPtr);
       ctx.resolve(ctx.unwrap ? ctx.unwrap(wasm, ...results) : results[0]);
     } catch (e) {
       ctx.reject(e);
@@ -179,161 +478,228 @@ export async function loadWeaveffiWasm(url) {
     _raw: wasm,
     shared: {
       ping() {
-        const _err = _allocError(wasm);
-        const retptr = wasm.weaveffi_alloc(8);
-        wasm.weaveffi_shared_ping(retptr, _err);
-        _checkError(wasm, _err);
-        const view = new DataView(wasm.memory.buffer);
-        return _decodeString(wasm, view.getInt32(retptr, true), view.getInt32(retptr + 4, true));
+        const _err = _allocErr(wasm);
+        const _r = wasm.weaveffi_shared_ping(_err);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        return _takeCStr(wasm, _r);
+      },
+      Token: {
+        create: (...args) => Token.create(wasm, ...args),
       },
     },
     kitchen: {
       bool_id(x) {
-        const _err = _allocError(wasm);
-        const _result = wasm.weaveffi_kitchen_bool_id(x, _err);
-        _checkError(wasm, _err);
-        return _result !== 0;
+        const _err = _allocErr(wasm);
+        const _r = wasm.weaveffi_kitchen_bool_id(x ? 1 : 0, _err);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        return _r !== 0;
       },
       i32_id(x) {
-        const _err = _allocError(wasm);
-        const _result = wasm.weaveffi_kitchen_i32_id(x, _err);
-        _checkError(wasm, _err);
-        return _result;
+        const _err = _allocErr(wasm);
+        const _r = wasm.weaveffi_kitchen_i32_id(x, _err);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        return _r;
       },
       u32_id(x) {
-        const _err = _allocError(wasm);
-        const _result = wasm.weaveffi_kitchen_u32_id(x, _err);
-        _checkError(wasm, _err);
-        return _result;
+        const _err = _allocErr(wasm);
+        const _r = wasm.weaveffi_kitchen_u32_id(x, _err);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        return _r;
       },
       i64_id(x) {
-        const _err = _allocError(wasm);
-        const _result = wasm.weaveffi_kitchen_i64_id(x, _err);
-        _checkError(wasm, _err);
-        return _result;
+        const _err = _allocErr(wasm);
+        const _r = wasm.weaveffi_kitchen_i64_id(BigInt(x), _err);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        return _r;
       },
       f64_id(x) {
-        const _err = _allocError(wasm);
-        const _result = wasm.weaveffi_kitchen_f64_id(x, _err);
-        _checkError(wasm, _err);
-        return _result;
+        const _err = _allocErr(wasm);
+        const _r = wasm.weaveffi_kitchen_f64_id(x, _err);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        return _r;
       },
       echo_string(s) {
-        const _err = _allocError(wasm);
-        const retptr = wasm.weaveffi_alloc(8);
-        const [s_ptr, s_len] = _encodeString(wasm, s);
-        wasm.weaveffi_kitchen_echo_string(retptr, s_ptr, s_len, _err);
-        _checkError(wasm, _err);
-        const view = new DataView(wasm.memory.buffer);
-        return _decodeString(wasm, view.getInt32(retptr, true), view.getInt32(retptr + 4, true));
+        const [a0_p, a0_s] = _cstr(wasm, s);
+        const _err = _allocErr(wasm);
+        const _r = wasm.weaveffi_kitchen_echo_string(a0_p, _err);
+        wasm.weaveffi_dealloc(a0_p, a0_s);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        return _takeCStr(wasm, _r);
       },
       echo_bytes(b) {
-        const _err = _allocError(wasm);
-        const _result = wasm.weaveffi_kitchen_echo_bytes(b, _err);
-        _checkError(wasm, _err);
-        return _result;
+        const [a0_p, a0_l] = _bytes(wasm, b);
+        const _lp = wasm.weaveffi_alloc(4);
+        const _err = _allocErr(wasm);
+        const _r = wasm.weaveffi_kitchen_echo_bytes(a0_p, a0_l, _lp, _err);
+        wasm.weaveffi_dealloc(a0_p, a0_l);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        const _dv = new DataView(wasm.memory.buffer);
+        const _len = _dv.getUint32(_lp, true);
+        wasm.weaveffi_dealloc(_lp, 4);
+        return _takeBytes(wasm, _r, _len);
       },
       echo_borrowed_str(s) {
-        const _err = _allocError(wasm);
-        const retptr = wasm.weaveffi_alloc(8);
-        wasm.weaveffi_kitchen_echo_borrowed_str(retptr, s, _err);
-        _checkError(wasm, _err);
-        const view = new DataView(wasm.memory.buffer);
-        return _decodeString(wasm, view.getInt32(retptr, true), view.getInt32(retptr + 4, true));
+        const [a0_p, a0_s] = _cstr(wasm, s);
+        const _err = _allocErr(wasm);
+        const _r = wasm.weaveffi_kitchen_echo_borrowed_str(a0_p, _err);
+        wasm.weaveffi_dealloc(a0_p, a0_s);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        return _takeCStr(wasm, _r);
       },
       echo_borrowed_bytes(b) {
-        const _err = _allocError(wasm);
-        const _result = wasm.weaveffi_kitchen_echo_borrowed_bytes(b, _err);
-        _checkError(wasm, _err);
-        return _result;
+        const [a0_p, a0_l] = _bytes(wasm, b);
+        const _lp = wasm.weaveffi_alloc(4);
+        const _err = _allocErr(wasm);
+        const _r = wasm.weaveffi_kitchen_echo_borrowed_bytes(a0_p, a0_l, _lp, _err);
+        wasm.weaveffi_dealloc(a0_p, a0_l);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        const _dv = new DataView(wasm.memory.buffer);
+        const _len = _dv.getUint32(_lp, true);
+        wasm.weaveffi_dealloc(_lp, 4);
+        return _takeBytes(wasm, _r, _len);
       },
       open_handle() {
-        const _err = _allocError(wasm);
-        const _result = wasm.weaveffi_kitchen_open_handle(_err);
-        _checkError(wasm, _err);
-        return _result;
+        const _err = _allocErr(wasm);
+        const _r = wasm.weaveffi_kitchen_open_handle(_err);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        return _r;
       },
       open_typed_handle() {
-        const _err = _allocError(wasm);
-        const _result = wasm.weaveffi_kitchen_open_typed_handle(_err);
-        _checkError(wasm, _err);
-        return _result;
+        const _err = _allocErr(wasm);
+        const _r = wasm.weaveffi_kitchen_open_typed_handle(_err);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        return new Token(wasm, _r);
       },
       maybe_item(id) {
-        const _err = _allocError(wasm);
-        const result = wasm.weaveffi_kitchen_maybe_item(id, _err);
-        _checkError(wasm, _err);
-        return result === 0n ? null : new Item(wasm, result);
+        const _err = _allocErr(wasm);
+        const _r = wasm.weaveffi_kitchen_maybe_item(BigInt(id), _err);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        return _r === 0 ? null : new Item(wasm, _r);
       },
       list_items() {
-        const _err = _allocError(wasm);
-        const _result = wasm.weaveffi_kitchen_list_items(_err);
-        _checkError(wasm, _err);
-        return _result;
+        const _lp = wasm.weaveffi_alloc(4);
+        const _err = _allocErr(wasm);
+        const _r = wasm.weaveffi_kitchen_list_items(_lp, _err);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        const _dv = new DataView(wasm.memory.buffer);
+        const _len = _dv.getUint32(_lp, true);
+        wasm.weaveffi_dealloc(_lp, 4);
+        const _out = [];
+        {
+          const dv = new DataView(wasm.memory.buffer);
+          for (let i = 0; i < _len; i++) _out.push(new Item(wasm, dv.getInt32(_r + i * 4, true)));
+        }
+        return _out;
       },
       get_attrs() {
-        const _err = _allocError(wasm);
-        const _result = wasm.weaveffi_kitchen_get_attrs(_err);
-        _checkError(wasm, _err);
-        return _result;
+        const _kp = wasm.weaveffi_alloc(4);
+        const _vp = wasm.weaveffi_alloc(4);
+        const _lp = wasm.weaveffi_alloc(4);
+        const _err = _allocErr(wasm);
+        wasm.weaveffi_kitchen_get_attrs(_kp, _vp, _lp, _err);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        const _dv = new DataView(wasm.memory.buffer);
+        const _ka = _dv.getUint32(_kp, true);
+        const _va = _dv.getUint32(_vp, true);
+        const _len = _dv.getUint32(_lp, true);
+        wasm.weaveffi_dealloc(_kp, 4);
+        wasm.weaveffi_dealloc(_vp, 4);
+        wasm.weaveffi_dealloc(_lp, 4);
+        const _out_k = _takeStrArray(wasm, _ka, _len);
+        const _out_v = [];
+        {
+          const dv = new DataView(wasm.memory.buffer);
+          for (let i = 0; i < _len; i++) _out_v.push(dv.getInt32(_va + i * 4, true));
+        }
+        const _out = {};
+        for (let i = 0; i < _len; i++) _out[_out_k[i]] = _out_v[i];
+        return _out;
       },
       stream_items() {
-        const _err = _allocError(wasm);
-        const _result = wasm.weaveffi_kitchen_stream_items(_err);
-        _checkError(wasm, _err);
-        return _result;
+        const _err = _allocErr(wasm);
+        const _it = wasm.weaveffi_kitchen_stream_items(_err);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        const _out = [];
+        const _ip = wasm.weaveffi_alloc(4);
+        const _ierr = _allocErr(wasm);
+        while (wasm.weaveffi_kitchen_StreamItemsIterator_next(_it, _ip, _ierr) !== 0) {
+          _checkErr(wasm, _ierr);
+          const _dv = new DataView(wasm.memory.buffer);
+          _out.push(new Item(wasm, _dv.getInt32(_ip, true)));
+        }
+        _checkErr(wasm, _ierr);
+        _freeErr(wasm, _ierr);
+        wasm.weaveffi_dealloc(_ip, 4);
+        wasm.weaveffi_kitchen_StreamItemsIterator_destroy(_it);
+        return _out;
       },
       cross_module_token() {
-        const _err = _allocError(wasm);
-        const _result = wasm.weaveffi_kitchen_cross_module_token(_err);
-        _checkError(wasm, _err);
-        return new Token(wasm, _result);
+        const _err = _allocErr(wasm);
+        const _r = wasm.weaveffi_kitchen_cross_module_token(_err);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        return new Token(wasm, _r);
       },
       do_async(input) {
         return new Promise((resolve, reject) => {
           const ctxId = _nextCtxId++;
-          _asyncContexts.set(ctxId, { resolve, reject, unwrap: (w, ptr) => {
-            const b = new Uint8Array(w.memory.buffer, ptr);
-            let e = 0; while (b[e] !== 0) e++;
-            return new TextDecoder().decode(new Uint8Array(w.memory.buffer, ptr, e));
-          } });
-          const [input_ptr, input_len] = _encodeString(wasm, input);
-          wasm.weaveffi_kitchen_do_async_async(input_ptr, input_len, _cbPtr_i32_i32_i32, ctxId);
-        }));
+          _asyncContexts.set(ctxId, { resolve, reject, unwrap: (w, p) => _takeCStr(w, p) });
+          const [a0_p, a0_s] = _cstr(wasm, input);
+          wasm.weaveffi_kitchen_do_async_async(a0_p, _cbPtr_i32_i32_i32, ctxId);
+          wasm.weaveffi_dealloc(a0_p, a0_s);
+        });
       },
       do_cancellable(input) {
         return new Promise((resolve, reject) => {
           const ctxId = _nextCtxId++;
-          _asyncContexts.set(ctxId, { resolve, reject, unwrap: (w, ptr) => {
-            const b = new Uint8Array(w.memory.buffer, ptr);
-            let e = 0; while (b[e] !== 0) e++;
-            return new TextDecoder().decode(new Uint8Array(w.memory.buffer, ptr, e));
-          } });
-          const [input_ptr, input_len] = _encodeString(wasm, input);
-          wasm.weaveffi_kitchen_do_cancellable_async(input_ptr, input_len, 0, _cbPtr_i32_i32_i32, ctxId);
-        }));
+          _asyncContexts.set(ctxId, { resolve, reject, unwrap: (w, p) => _takeCStr(w, p) });
+          const [a0_p, a0_s] = _cstr(wasm, input);
+          wasm.weaveffi_kitchen_do_cancellable_async(a0_p, 0, _cbPtr_i32_i32_i32, ctxId);
+          wasm.weaveffi_dealloc(a0_p, a0_s);
+        });
       },
       /** @deprecated Use new_op instead */
       legacy_op() {
-        const _err = _allocError(wasm);
-        const _result = wasm.weaveffi_kitchen_legacy_op(_err);
-        _checkError(wasm, _err);
-        return _result;
+        const _err = _allocErr(wasm);
+        const _r = wasm.weaveffi_kitchen_legacy_op(_err);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        return _r;
       },
       new_op() {
-        const _err = _allocError(wasm);
-        const _result = wasm.weaveffi_kitchen_new_op(_err);
-        _checkError(wasm, _err);
-        return _result;
+        const _err = _allocErr(wasm);
+        const _r = wasm.weaveffi_kitchen_new_op(_err);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        return _r;
+      },
+      Item: {
+        create: (...args) => Item.create(wasm, ...args),
+        builder: () => new ItemBuilder(wasm),
       },
       nested: {
         hello() {
-          const _err = _allocError(wasm);
-          const retptr = wasm.weaveffi_alloc(8);
-          wasm.weaveffi_kitchen_nested_hello(retptr, _err);
-          _checkError(wasm, _err);
-          const view = new DataView(wasm.memory.buffer);
-          return _decodeString(wasm, view.getInt32(retptr, true), view.getInt32(retptr + 4, true));
+          const _err = _allocErr(wasm);
+          const _r = wasm.weaveffi_kitchen_nested_hello(_err);
+          _checkErr(wasm, _err);
+          _freeErr(wasm, _err);
+          return _takeCStr(wasm, _r);
         },
       },
     },

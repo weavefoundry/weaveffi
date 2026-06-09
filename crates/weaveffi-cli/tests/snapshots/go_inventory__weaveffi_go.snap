@@ -66,7 +66,16 @@ func (s *Product) Category() Category {
 }
 
 func (s *Product) Tags() []string {
-	return []string(C.weaveffi_products_Product_get_tags(s.ptr))
+	var cOutLen C.size_t
+	result := C.weaveffi_products_Product_get_tags(s.ptr, &cOutLen)
+	count := int(cOutLen)
+	goResult := make([]string, count)
+	if count > 0 && result != nil {
+		for i, v := range unsafe.Slice((**C.char)(unsafe.Pointer(result)), count) {
+			goResult[i] = C.GoString(v)
+		}
+	}
+	return goResult
 }
 
 func (s *Product) Close() {
@@ -110,13 +119,11 @@ func ProductsSearchProducts(category Category) ([]*Product, error) {
 		return nil, goErr
 	}
 	count := int(cOutLen)
-	if count == 0 || result == nil {
-		return nil, nil
-	}
 	goResult := make([]*Product, count)
-	cSlice := unsafe.Slice((**C.weaveffi_products_Product)(unsafe.Pointer(result)), count)
-	for i, v := range cSlice {
-		goResult[i] = &Product{ptr: v}
+	if count > 0 && result != nil {
+		for i, v := range unsafe.Slice((**C.weaveffi_products_Product)(unsafe.Pointer(result)), count) {
+			goResult[i] = &Product{ptr: v}
+		}
 	}
 	return goResult, nil
 }
@@ -175,7 +182,16 @@ func (s *Order) Id() int64 {
 }
 
 func (s *Order) Items() []*OrderItem {
-	return []*OrderItem(C.weaveffi_orders_Order_get_items(s.ptr))
+	var cOutLen C.size_t
+	result := C.weaveffi_orders_Order_get_items(s.ptr, &cOutLen)
+	count := int(cOutLen)
+	goResult := make([]*OrderItem, count)
+	if count > 0 && result != nil {
+		for i, v := range unsafe.Slice((**C.weaveffi_orders_OrderItem)(unsafe.Pointer(result)), count) {
+			goResult[i] = &OrderItem{ptr: v}
+		}
+	}
+	return goResult
 }
 
 func (s *Order) Total() float64 {

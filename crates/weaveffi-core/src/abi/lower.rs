@@ -237,11 +237,19 @@ pub fn lower_return(ty: &TypeRef, module: &str) -> AbiReturn {
             ret: CType::ptr(element_ctype(inner, module)),
             out_params: vec![AbiParam::new("out_len", CType::ptr(CType::Size))],
         },
+        // A returned map is two producer-allocated parallel arrays. The
+        // function must hand back the *base* of each array, so the out-param is
+        // a pointer to the array pointer: `K** out_keys` / `V** out_values`
+        // (e.g. `const char*** out_keys`, `int32_t** out_values`). The caller
+        // declares `K* keys = NULL; fn(&keys, ...)` and indexes `keys[i]`.
         TypeRef::Map(k, v) => AbiReturn {
             ret: CType::Void,
             out_params: vec![
-                AbiParam::new("out_keys", CType::ptr(element_ctype(k, module))),
-                AbiParam::new("out_values", CType::ptr(element_ctype(v, module))),
+                AbiParam::new("out_keys", CType::ptr(CType::ptr(element_ctype(k, module)))),
+                AbiParam::new(
+                    "out_values",
+                    CType::ptr(CType::ptr(element_ctype(v, module))),
+                ),
                 AbiParam::new("out_len", CType::ptr(CType::Size)),
             ],
         },
@@ -375,8 +383,8 @@ mod tests {
         assert_eq!(
             render(&r.out_params),
             [
-                "const char** out_keys",
-                "int32_t* out_values",
+                "const char*** out_keys",
+                "int32_t** out_values",
                 "size_t* out_len"
             ]
         );

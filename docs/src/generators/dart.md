@@ -118,7 +118,7 @@ class Contact {
   void dispose() { _weaveffiContactsContactDestroy(_handle); }
 
   String get name {
-    final err = calloc<_WeaveffiError>();
+    final err = calloc<_WeaveFFIError>();
     try {
       final result = _weaveffiContactsContactGetName(_handle, err);
       _checkError(err);
@@ -135,15 +135,15 @@ top-level wrapper:
 
 ```dart
 typedef _NativeWeaveffiContactsCreateContact =
-    Int64 Function(Pointer<Utf8>, Pointer<Utf8>, Int32, Pointer<_WeaveffiError>);
+    Int64 Function(Pointer<Utf8>, Pointer<Utf8>, Int32, Pointer<_WeaveFFIError>);
 typedef _DartWeaveffiContactsCreateContact =
-    int Function(Pointer<Utf8>, Pointer<Utf8>, int, Pointer<_WeaveffiError>);
+    int Function(Pointer<Utf8>, Pointer<Utf8>, int, Pointer<_WeaveFFIError>);
 final _weaveffiContactsCreateContact = _lib.lookupFunction<
     _NativeWeaveffiContactsCreateContact,
     _DartWeaveffiContactsCreateContact>('weaveffi_contacts_create_contact');
 
 int createContact(String name, String? email, ContactType contactType) {
-  final err = calloc<_WeaveffiError>();
+  final err = calloc<_WeaveFFIError>();
   final namePtr = name.toNativeUtf8();
   try {
     final result = _weaveffiContactsCreateContact(
@@ -231,7 +231,7 @@ isolate via `Isolate.run`:
 
 ```dart
 String _fetchData(int id) {
-  final err = calloc<_WeaveffiError>();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiMathFetchData(id, err);
     _checkError(err);

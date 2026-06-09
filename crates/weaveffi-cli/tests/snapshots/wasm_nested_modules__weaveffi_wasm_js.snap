@@ -7,29 +7,69 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 // WeaveFFI WASM bindings (auto-generated)
 //
-// Complex type conventions at the WASM boundary:
+// Boundary conventions for a wasm32-unknown-unknown build:
 //
-//   Structs   -> i64 opaque handle (pointer into linear memory)
+//   Handles   -> i32 pointer into linear memory (0 = null/absent)
 //   Enums     -> i32 discriminant value
-//   Optionals -> 0/null for absent; for numerics a separate _is_present i32 flag
-//   Lists     -> (i32 pointer, i32 length) pair into linear memory
+//   i64/u64   -> JavaScript BigInt
+//   Strings   -> NUL-terminated UTF-8 (const char*); a single i32 pointer
+//   Bytes     -> i32 data pointer + i32 length (out_len for returns)
+//   Optionals -> null handle / null pointer (0); scalars boxed by pointer
 
-function _allocError(wasm) {
-  return wasm.weaveffi_alloc(8);
+const _enc = new TextEncoder();
+const _dec = new TextDecoder();
+
+// Stage a JS string as a NUL-terminated C string in linear memory.
+// Returns [ptr, size] (size includes the NUL); release with _free.
+function _cstr(wasm, str) {
+  const bytes = _enc.encode(str);
+  const size = bytes.length + 1;
+  const ptr = wasm.weaveffi_alloc(size);
+  const mem = new Uint8Array(wasm.memory.buffer, ptr, size);
+  mem.set(bytes);
+  mem[bytes.length] = 0;
+  return [ptr, size];
 }
 
-function _checkError(wasm, errPtr) {
-  const buffer = wasm.memory.buffer;
-  const code = new Int32Array(buffer, errPtr, 1)[0];
+// Read a NUL-terminated C string (0 => null). Does not free.
+function _readCStr(wasm, ptr) {
+  if (ptr === 0) return null;
+  const mem = new Uint8Array(wasm.memory.buffer);
+  let end = ptr;
+  while (mem[end] !== 0) end++;
+  return _dec.decode(mem.subarray(ptr, end));
+}
+
+// Read then free a producer-owned C string.
+function _takeCStr(wasm, ptr) {
+  const s = _readCStr(wasm, ptr);
+  if (ptr !== 0) wasm.weaveffi_free_string(ptr);
+  return s;
+}
+
+// Allocate a zeroed {i32 code, i32 message} error slot.
+function _allocErr(wasm) {
+  const ptr = wasm.weaveffi_alloc(8);
+  new Uint8Array(wasm.memory.buffer, ptr, 8).fill(0);
+  return ptr;
+}
+
+// Throw (and free the slot) if the error slot carries a non-zero code.
+function _checkErr(wasm, errPtr) {
+  const dv = new DataView(wasm.memory.buffer);
+  const code = dv.getInt32(errPtr, true);
   if (code !== 0) {
-    const msgPtr = new Uint32Array(buffer, errPtr + 4, 1)[0];
-    const bytes = new Uint8Array(buffer, msgPtr);
-    let end = 0;
-    while (bytes[end] !== 0) end++;
-    const msg = new TextDecoder().decode(new Uint8Array(buffer, msgPtr, end));
+    const msgPtr = dv.getUint32(errPtr + 4, true);
+    const msg = _readCStr(wasm, msgPtr) || '';
     wasm.weaveffi_error_clear(errPtr);
+    wasm.weaveffi_dealloc(errPtr, 8);
     throw new Error(`WeaveFFI error ${code}: ${msg}`);
   }
+}
+
+// Release an error slot on the success path.
+function _freeErr(wasm, errPtr) {
+  wasm.weaveffi_dealloc(errPtr, 8);
 }
 
 export const Unit = Object.freeze({
@@ -43,10 +83,21 @@ class Canvas {
     this._handle = handle;
   }
   get width() {
-    return this._wasm.weaveffi_graphics_Canvas_get_width(this._handle);
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_graphics_Canvas_get_width(this._handle);
+    return _r;
   }
   get root() {
-    return this._wasm.weaveffi_graphics_Canvas_get_root(this._handle);
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_graphics_Canvas_get_root(this._handle);
+    return new Shape(wasm, _r);
+  }
+  static create(wasm, width, root) {
+    const _err = _allocErr(wasm);
+    const _r = wasm.weaveffi_graphics_Canvas_create(width, root._handle, _err);
+    _checkErr(wasm, _err);
+    _freeErr(wasm, _err);
+    return new Canvas(wasm, _r);
   }
 }
 
@@ -56,13 +107,26 @@ class Shape {
     this._handle = handle;
   }
   get sides() {
-    return this._wasm.weaveffi_graphics_shapes_Shape_get_sides(this._handle);
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_graphics_shapes_Shape_get_sides(this._handle);
+    return _r;
   }
   get unit() {
-    return this._wasm.weaveffi_graphics_shapes_Shape_get_unit(this._handle);
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_graphics_shapes_Shape_get_unit(this._handle);
+    return _r;
   }
   get detail() {
-    return this._wasm.weaveffi_graphics_shapes_Shape_get_detail(this._handle);
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_graphics_shapes_Shape_get_detail(this._handle);
+    return new Detail(wasm, _r);
+  }
+  static create(wasm, sides, unit, detail) {
+    const _err = _allocErr(wasm);
+    const _r = wasm.weaveffi_graphics_shapes_Shape_create(sides, unit, detail._handle, _err);
+    _checkErr(wasm, _err);
+    _freeErr(wasm, _err);
+    return new Shape(wasm, _r);
   }
 }
 
@@ -72,7 +136,16 @@ class Detail {
     this._handle = handle;
   }
   get area() {
-    return this._wasm.weaveffi_graphics_shapes_geometry_Detail_get_area(this._handle);
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_graphics_shapes_geometry_Detail_get_area(this._handle);
+    return _r;
+  }
+  static create(wasm, area) {
+    const _err = _allocErr(wasm);
+    const _r = wasm.weaveffi_graphics_shapes_geometry_Detail_create(area, _err);
+    _checkErr(wasm, _err);
+    _freeErr(wasm, _err);
+    return new Detail(wasm, _r);
   }
 }
 
@@ -88,21 +161,22 @@ class Detail {
  * @example
  * const api = await loadWeaveffiWasm('lib.wasm');
  *
- * // Primitive: (i32, i32) -> i32
+ * // Primitive: plain numbers in, number out.
  * const sum = api.math.add(1, 2);
  *
- * // Struct handle: () -> i64 (opaque pointer)
- * const handle = api.contacts.create();
+ * // Struct: returns a wrapper instance exposing field getters.
+ * const person = api.contacts.create();
+ * console.log(person.name);
  *
- * // Enum: (i32 discriminant) -> void
+ * // Enum: pass the integer discriminant.
  * api.ui.set_color(0); // 0 = first variant
  *
- * // Optional: (i32 is_present, i32 value) -> void
- * api.config.set_timeout(1, 5000); // present
- * api.config.set_timeout(0, 0);    // absent
+ * // Optional: pass null to omit, a value to provide.
+ * api.config.set_timeout(5000); // present
+ * api.config.set_timeout(null); // absent
  *
- * // List: (i32 pointer, i32 length) -> void
- * api.data.process(ptr, len);
+ * // List/Map: pass arrays/objects; receive arrays/objects.
+ * const names = api.data.all_names();
  */
 export async function loadWeaveffiWasm(url) {
   const response = await fetch(url);
@@ -114,30 +188,43 @@ export async function loadWeaveffiWasm(url) {
     _raw: wasm,
     graphics: {
       new_canvas(width) {
-        const _err = _allocError(wasm);
-        const _result = wasm.weaveffi_graphics_new_canvas(width, _err);
-        _checkError(wasm, _err);
-        return new Canvas(wasm, _result);
+        const _err = _allocErr(wasm);
+        const _r = wasm.weaveffi_graphics_new_canvas(width, _err);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        return new Canvas(wasm, _r);
+      },
+      Canvas: {
+        create: (...args) => Canvas.create(wasm, ...args),
       },
       shapes: {
         make_shape(sides) {
-          const _err = _allocError(wasm);
-          const _result = wasm.weaveffi_graphics_shapes_make_shape(sides, _err);
-          _checkError(wasm, _err);
-          return new Shape(wasm, _result);
+          const _err = _allocErr(wasm);
+          const _r = wasm.weaveffi_graphics_shapes_make_shape(sides, _err);
+          _checkErr(wasm, _err);
+          _freeErr(wasm, _err);
+          return new Shape(wasm, _r);
         },
         describe() {
-          const _err = _allocError(wasm);
-          const _result = wasm.weaveffi_graphics_shapes_describe(_err);
-          _checkError(wasm, _err);
-          return new Canvas(wasm, _result);
+          const _err = _allocErr(wasm);
+          const _r = wasm.weaveffi_graphics_shapes_describe(_err);
+          _checkErr(wasm, _err);
+          _freeErr(wasm, _err);
+          return new Canvas(wasm, _r);
+        },
+        Shape: {
+          create: (...args) => Shape.create(wasm, ...args),
         },
         geometry: {
           compute(shape) {
-            const _err = _allocError(wasm);
-            const _result = wasm.weaveffi_graphics_shapes_geometry_compute(shape._handle, _err);
-            _checkError(wasm, _err);
-            return new Detail(wasm, _result);
+            const _err = _allocErr(wasm);
+            const _r = wasm.weaveffi_graphics_shapes_geometry_compute(shape._handle, _err);
+            _checkErr(wasm, _err);
+            _freeErr(wasm, _err);
+            return new Detail(wasm, _r);
+          },
+          Detail: {
+            create: (...args) => Detail.create(wasm, ...args),
           },
         },
       },

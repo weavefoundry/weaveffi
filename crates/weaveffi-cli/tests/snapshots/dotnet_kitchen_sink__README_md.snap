@@ -5,7 +5,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 <!-- DO NOT EDIT — your changes will be overwritten. -->
 <!-- To regenerate: weaveffi generate weaveffi.yml -o <out> -->
 
-# WeaveFFI .NET Bindings
+# WeaveFFI (.NET)
 
 Auto-generated P/Invoke bindings for the WeaveFFI native library.
 

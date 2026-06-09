@@ -10,7 +10,7 @@ import sys
 
 sys.path.insert(0, os.environ["WV_PY"])
 
-import weaveffi as wv  # noqa: E402
+import contacts as wv  # noqa: E402
 
 
 def main() -> None:
@@ -42,8 +42,8 @@ def main() -> None:
     # Error path raises a typed exception with a non-zero code.
     try:
         wv.contacts_get_contact(9999)
-        raise AssertionError("expected WeaveffiError for missing contact")
-    except wv.WeaveffiError as exc:
+        raise AssertionError("expected WeaveFFIError for missing contact")
+    except wv.WeaveFFIError as exc:
         assert exc.code != 0
 
     print("python/contacts: OK")

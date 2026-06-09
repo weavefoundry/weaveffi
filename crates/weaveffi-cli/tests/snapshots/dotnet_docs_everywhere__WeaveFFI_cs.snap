@@ -14,28 +14,28 @@ using System.Threading.Tasks;
 
 namespace WeaveFFI
 {
-    public class WeaveffiException : Exception
+    public class WeaveFFIException : Exception
     {
         public int Code { get; }
 
-        public WeaveffiException(int code, string message) : base(message)
+        public WeaveFFIException(int code, string message) : base(message)
         {
             Code = code;
         }
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    internal struct WeaveffiError
+    internal struct WeaveFFIError
     {
         public int Code;
         public IntPtr Message;
 
-        internal static void Check(WeaveffiError err)
+        internal static void Check(WeaveFFIError err)
         {
             if (err.Code != 0)
             {
                 var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
-                throw new WeaveffiException(err.Code, msg);
+                throw new WeaveFFIException(err.Code, msg);
             }
         }
     }
@@ -208,7 +208,7 @@ namespace WeaveFFI
         internal static extern void weaveffi_free_bytes(IntPtr ptr, UIntPtr len);
 
         [DllImport(LibName, EntryPoint = "weaveffi_docs_Document_create", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_docs_Document_create(long id, IntPtr title, int status, IntPtr tags, UIntPtr tags_len, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_docs_Document_create(long id, IntPtr title, int status, IntPtr tags, UIntPtr tags_len, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_docs_Document_destroy", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_docs_Document_destroy(IntPtr ptr);
@@ -226,13 +226,13 @@ namespace WeaveFFI
         internal static extern IntPtr weaveffi_docs_Document_get_tags(IntPtr ptr, out UIntPtr out_len);
 
         [DllImport(LibName, EntryPoint = "weaveffi_docs_create_document", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_docs_create_document(IntPtr title, IntPtr tags, UIntPtr tags_len, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_docs_create_document(IntPtr title, IntPtr tags, UIntPtr tags_len, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_docs_get_document", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_docs_get_document(long id, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_docs_get_document(long id, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_docs_publish_async", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_docs_publish_async(long id, ref WeaveffiError err);
+        internal static extern int weaveffi_docs_publish_async(long id, ref WeaveFFIError err);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         internal delegate void AsyncCb_weaveffi_docs_publish_async(IntPtr context, IntPtr err, int result);
@@ -254,12 +254,12 @@ namespace WeaveFFI
         /// <param name="tags">Initial set of tags (may be empty)</param>
         public static Document DocsCreateDocument(string title, string[] tags)
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var titlePtr = Marshal.StringToCoTaskMemUTF8(title);
             try
             {
                 var result = NativeMethods.weaveffi_docs_create_document(titlePtr, tags, ref err);
-                WeaveffiError.Check(err);
+                WeaveFFIError.Check(err);
                 return new Document(result);
             }
             finally
@@ -272,9 +272,9 @@ namespace WeaveFFI
         /// <param name="id">Identifier returned from create_document</param>
         public static Document? DocsGetDocument(long id)
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_docs_get_document(id, ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             return result == IntPtr.Zero ? null : new Document(result);
         }
 
@@ -289,11 +289,11 @@ namespace WeaveFFI
                 {
                     if (err != IntPtr.Zero)
                     {
-                        var wErr = Marshal.PtrToStructure<WeaveffiError>(err);
+                        var wErr = Marshal.PtrToStructure<WeaveFFIError>(err);
                         if (wErr.Code != 0)
                         {
                             var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? "";
-                            tcs.SetException(new WeaveffiException(wErr.Code, msg));
+                            tcs.SetException(new WeaveFFIException(wErr.Code, msg));
                             return;
                         }
                     }

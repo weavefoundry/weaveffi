@@ -14,6 +14,7 @@ use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::model::{
     BindingModel, EnumBinding, FieldBinding, FnBinding, ModuleBinding, ParamBinding, StructBinding,
 };
+use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::utils::{
     local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
 };
@@ -74,6 +75,23 @@ impl LanguageBackend for DotnetGenerator {
     ) -> Vec<OutputFile> {
         let namespace = config.namespace();
         let input_basename = config.input_basename();
+        let package = {
+            let mut p = pkg::resolve(
+                api,
+                config.namespace.as_deref(),
+                config.input_basename.as_deref(),
+            );
+            // The C# namespace doubles as the file basename; when nothing
+            // identifies the package, keep the PascalCase brand as the NuGet
+            // id so `WeaveFFI.csproj` and `<PackageId>` stay consistent.
+            if api.package.is_none()
+                && config.namespace.is_none()
+                && config.input_basename.is_none()
+            {
+                p.name = namespace.to_string();
+            }
+            p
+        };
         let dir = out_dir.join("dotnet");
         let cs_filename = format!("{namespace}.cs");
         let csproj_filename = format!("{namespace}.csproj");
@@ -92,13 +110,16 @@ impl LanguageBackend for DotnetGenerator {
             ),
             OutputFile::new(
                 dir.join(&csproj_filename),
-                render_csproj(namespace, input_basename, &csproj_filename),
+                render_csproj(&package, input_basename, &csproj_filename),
             ),
             OutputFile::new(
                 dir.join(&nuspec_filename),
-                render_nuspec(namespace, input_basename, &nuspec_filename),
+                render_nuspec(&package, input_basename, &nuspec_filename),
             ),
-            OutputFile::new(dir.join("README.md"), render_readme(input_basename)),
+            OutputFile::new(
+                dir.join("README.md"),
+                render_readme(&package, input_basename),
+            ),
         ]
     }
 }
@@ -114,10 +135,12 @@ fn cs_type(ty: &TypeRef) -> String {
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string".into(),
         TypeRef::Handle => "ulong".into(),
-        TypeRef::TypedHandle(name) => name.clone(),
+        // Cross-module typed handles/enums (e.g. `kv.Store`) must surface as the
+        // bare local class; the qualified IR name is not a C# type here.
+        TypeRef::TypedHandle(name) => local_type_name(name).into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "byte[]".into(),
         TypeRef::Struct(name) => local_type_name(name).into(),
-        TypeRef::Enum(name) => name.clone(),
+        TypeRef::Enum(name) => local_type_name(name).into(),
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::I32 => "int?".into(),
             TypeRef::U32 => "uint?".into(),
@@ -125,8 +148,8 @@ fn cs_type(ty: &TypeRef) -> String {
             TypeRef::F64 => "double?".into(),
             TypeRef::Bool => "bool?".into(),
             TypeRef::Handle => "ulong?".into(),
-            TypeRef::TypedHandle(name) => format!("{name}?"),
-            TypeRef::Enum(name) => format!("{name}?"),
+            TypeRef::TypedHandle(name) => format!("{}?", local_type_name(name)),
+            TypeRef::Enum(name) => format!("{}?", local_type_name(name)),
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string?".into(),
             TypeRef::Struct(name) => format!("{}?", local_type_name(name)),
             _ => format!("{}?", cs_type(inner)),
@@ -228,17 +251,45 @@ fn pinvoke_return_info(ty: &TypeRef) -> (String, Vec<String>) {
     }
 }
 
-fn render_csproj(namespace: &str, input_basename: &str, filename: &str) -> String {
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn render_csproj(package: &ResolvedPackage, input_basename: &str, filename: &str) -> String {
     let prelude = render_prelude(CommentStyle::Xml, input_basename);
     let trailer = render_trailer(CommentStyle::Xml, filename);
+    let id = &package.name;
+    let version = &package.version;
+    let description = xml_escape(&package.description_or_default());
+    let mut extra = format!("    <Description>{description}</Description>\n");
+    if !package.authors.is_empty() {
+        extra.push_str(&format!(
+            "    <Authors>{}</Authors>\n",
+            xml_escape(&package.authors.join(", "))
+        ));
+    }
+    if let Some(license) = &package.license {
+        extra.push_str(&format!(
+            "    <PackageLicenseExpression>{}</PackageLicenseExpression>\n",
+            xml_escape(license)
+        ));
+    }
+    if let Some(url) = package.homepage.as_ref().or(package.repository.as_ref()) {
+        extra.push_str(&format!(
+            "    <PackageProjectUrl>{}</PackageProjectUrl>\n",
+            xml_escape(url)
+        ));
+    }
     format!(
         r#"{prelude}<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
-    <PackageId>{namespace}</PackageId>
-    <Version>0.1.0</Version>
-    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <PackageId>{id}</PackageId>
+    <Version>{version}</Version>
+{extra}    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
 </Project>
@@ -247,19 +298,33 @@ fn render_csproj(namespace: &str, input_basename: &str, filename: &str) -> Strin
     )
 }
 
-fn render_nuspec(namespace: &str, input_basename: &str, filename: &str) -> String {
+fn render_nuspec(package: &ResolvedPackage, input_basename: &str, filename: &str) -> String {
     let prelude = render_prelude(CommentStyle::Xml, input_basename);
     let trailer = render_trailer(CommentStyle::Xml, filename);
+    let id = &package.name;
+    let version = &package.version;
+    let authors = if package.authors.is_empty() {
+        "WeaveFFI Contributors".to_string()
+    } else {
+        xml_escape(&package.authors.join(", "))
+    };
+    let description = xml_escape(&package.description_or_default());
+    let license = package.license.clone().unwrap_or_else(|| "MIT".into());
+    let project_url = package
+        .homepage
+        .clone()
+        .or_else(|| package.repository.clone())
+        .unwrap_or_else(|| "https://github.com/weavefoundry/weaveffi".into());
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 {prelude}<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
   <metadata>
-    <id>{namespace}</id>
-    <version>0.1.0</version>
-    <authors>WeaveFFI Contributors</authors>
-    <description>Auto-generated .NET bindings for a WeaveFFI native library.</description>
-    <license type="expression">MIT</license>
-    <projectUrl>https://github.com/AstroForge-Incorporated/weaveffi</projectUrl>
+    <id>{id}</id>
+    <version>{version}</version>
+    <authors>{authors}</authors>
+    <description>{description}</description>
+    <license type="expression">{license}</license>
+    <projectUrl>{project_url}</projectUrl>
     <tags>ffi interop native pinvoke</tags>
   </metadata>
 </package>
@@ -268,11 +333,12 @@ fn render_nuspec(namespace: &str, input_basename: &str, filename: &str) -> Strin
     )
 }
 
-fn render_readme(input_basename: &str) -> String {
+fn render_readme(package: &ResolvedPackage, input_basename: &str) -> String {
     let prelude = render_prelude(CommentStyle::Xml, input_basename);
     let trailer = render_trailer(CommentStyle::Xml, "README.md");
+    let name = &package.name;
     format!(
-        r#"{prelude}# WeaveFFI .NET Bindings
+        r#"{prelude}# {name} (.NET)
 
 Auto-generated P/Invoke bindings for the WeaveFFI native library.
 
@@ -431,9 +497,9 @@ fn render_csharp(
 }
 
 fn render_exception_class(out: &mut String) {
-    out.push_str("    public class WeaveffiException : Exception\n    {\n");
+    out.push_str("    public class WeaveFFIException : Exception\n    {\n");
     out.push_str("        public int Code { get; }\n\n");
-    out.push_str("        public WeaveffiException(int code, string message) : base(message)\n");
+    out.push_str("        public WeaveFFIException(int code, string message) : base(message)\n");
     out.push_str("        {\n");
     out.push_str("            Code = code;\n");
     out.push_str("        }\n");
@@ -442,15 +508,15 @@ fn render_exception_class(out: &mut String) {
 
 fn render_error_struct(out: &mut String) {
     out.push_str("    [StructLayout(LayoutKind.Sequential)]\n");
-    out.push_str("    internal struct WeaveffiError\n    {\n");
+    out.push_str("    internal struct WeaveFFIError\n    {\n");
     out.push_str("        public int Code;\n");
     out.push_str("        public IntPtr Message;\n\n");
-    out.push_str("        internal static void Check(WeaveffiError err)\n");
+    out.push_str("        internal static void Check(WeaveFFIError err)\n");
     out.push_str("        {\n");
     out.push_str("            if (err.Code != 0)\n");
     out.push_str("            {\n");
     out.push_str("                var msg = Marshal.PtrToStringUTF8(err.Message) ?? \"\";\n");
-    out.push_str("                throw new WeaveffiException(err.Code, msg);\n");
+    out.push_str("                throw new WeaveFFIException(err.Code, msg);\n");
     out.push_str("            }\n");
     out.push_str("        }\n");
     out.push_str("    }\n\n");
@@ -581,8 +647,9 @@ fn render_struct_getter(out: &mut String, field: &FieldBinding) {
             ));
         }
         TypeRef::TypedHandle(name) => {
+            let cn = local_type_name(name);
             out.push_str(&format!(
-                "                return new {name}(NativeMethods.{getter_sym}(_handle));\n"
+                "                return new {cn}(NativeMethods.{getter_sym}(_handle));\n"
             ));
         }
         TypeRef::Bool => {
@@ -609,8 +676,12 @@ fn render_struct_getter(out: &mut String, field: &FieldBinding) {
             out.push_str("                return arr;\n");
         }
         TypeRef::Enum(name) => {
+            // A cross-module enum (e.g. `graphics.Unit`) is emitted as the bare
+            // top-level C# type `Unit`; the cast must use that local name, not
+            // the qualified IR name (there is no `graphics` namespace).
+            let cn = local_type_name(name);
             out.push_str(&format!(
-                "                return ({name})NativeMethods.{getter_sym}(_handle);\n"
+                "                return ({cn})NativeMethods.{getter_sym}(_handle);\n"
             ));
         }
         TypeRef::Struct(name) => {
@@ -673,14 +744,16 @@ fn render_struct_getter(out: &mut String, field: &FieldBinding) {
                     out.push_str("                return (ulong)Marshal.ReadInt64(ptr);\n");
                 }
                 TypeRef::TypedHandle(name) => {
+                    let cn = local_type_name(name);
                     out.push_str(&format!(
-                        "                return ptr == IntPtr.Zero ? null : new {name}(ptr);\n"
+                        "                return ptr == IntPtr.Zero ? null : new {cn}(ptr);\n"
                     ));
                 }
                 TypeRef::Enum(name) => {
+                    let cn = local_type_name(name);
                     out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
                     out.push_str(&format!(
-                        "                return ({name})Marshal.ReadInt32(ptr);\n"
+                        "                return ({cn})Marshal.ReadInt32(ptr);\n"
                     ));
                 }
                 _ => {
@@ -754,12 +827,13 @@ fn render_list_unmarshal(out: &mut String, inner: &TypeRef, indent: &str) {
             out.push_str(&format!("{indent}return arr;\n"));
         }
         TypeRef::Enum(name) => {
-            out.push_str(&format!("{indent}var arr = new {name}[(int)len];\n"));
+            let cn = local_type_name(name);
+            out.push_str(&format!("{indent}var arr = new {cn}[(int)len];\n"));
             out.push_str(&format!(
                 "{indent}for (int i = 0; i < (int)len; i++)\n{indent}{{\n"
             ));
             out.push_str(&format!(
-                "{indent}    arr[i] = ({name})Marshal.ReadInt32(ptr + i * sizeof(int));\n"
+                "{indent}    arr[i] = ({cn})Marshal.ReadInt32(ptr + i * sizeof(int));\n"
             ));
             out.push_str(&format!("{indent}}}\n"));
             out.push_str(&format!("{indent}return arr;\n"));
@@ -814,7 +888,7 @@ fn render_struct_pinvoke(out: &mut String, s: &StructBinding) {
             pinvoke_param_list(&p)
         })
         .collect();
-    create_params.push("ref WeaveffiError err".into());
+    create_params.push("ref WeaveFFIError err".into());
 
     out.push_str(&format!(
         "        [DllImport(LibName, EntryPoint = \"{create_sym}\", CallingConvention = CallingConvention.Cdecl)]\n"
@@ -864,7 +938,7 @@ fn render_function_pinvoke(out: &mut String, f: &FnBinding) {
         "void".into()
     };
 
-    params.push("ref WeaveffiError err".into());
+    params.push("ref WeaveFFIError err".into());
 
     out.push_str(&format!(
         "        internal static extern {ret_type} {c_sym}({});\n\n",
@@ -1030,7 +1104,7 @@ fn render_wrapper_method(
         params_sig.join(", ")
     ));
 
-    out.push_str("            var err = new WeaveffiError();\n");
+    out.push_str("            var err = new WeaveFFIError();\n");
 
     let needs_try = f.params.iter().any(|p| param_needs_marshal(&p.ty));
 
@@ -1101,14 +1175,14 @@ fn render_async_wrapper_method(
     out.push_str("                try\n                {\n");
     out.push_str("                    if (err != IntPtr.Zero)\n                    {\n");
     out.push_str(
-        "                        var wErr = Marshal.PtrToStructure<WeaveffiError>(err);\n",
+        "                        var wErr = Marshal.PtrToStructure<WeaveFFIError>(err);\n",
     );
     out.push_str("                        if (wErr.Code != 0)\n                        {\n");
     out.push_str(
         "                            var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? \"\";\n",
     );
     out.push_str(
-        "                            tcs.SetException(new WeaveffiException(wErr.Code, msg));\n",
+        "                            tcs.SetException(new WeaveFFIException(wErr.Code, msg));\n",
     );
     out.push_str("                            return;\n");
     out.push_str("                        }\n");
@@ -1195,14 +1269,16 @@ fn render_async_set_result(out: &mut String, ret: &Option<TypeRef>, indent: &str
             out.push_str(&format!("{indent}tcs.SetResult(str);\n"));
         }
         Some(TypeRef::Enum(name)) => {
-            out.push_str(&format!("{indent}tcs.SetResult(({name})result);\n"));
+            let cn = local_type_name(name);
+            out.push_str(&format!("{indent}tcs.SetResult(({cn})result);\n"));
         }
         Some(TypeRef::Struct(name)) => {
             let cn = local_type_name(name);
             out.push_str(&format!("{indent}tcs.SetResult(new {cn}(result));\n"));
         }
         Some(TypeRef::TypedHandle(name)) => {
-            out.push_str(&format!("{indent}tcs.SetResult(new {name}(result));\n"));
+            let cn = local_type_name(name);
+            out.push_str(&format!("{indent}tcs.SetResult(new {cn}(result));\n"));
         }
         _ => {
             out.push_str(&format!("{indent}tcs.SetResult(result);\n"));
@@ -1351,7 +1427,7 @@ fn render_pinvoke_call_and_return(out: &mut String, f: &FnBinding, indent: &str)
         ));
     }
 
-    out.push_str(&format!("{indent}WeaveffiError.Check(err);\n"));
+    out.push_str(&format!("{indent}WeaveFFIError.Check(err);\n"));
 
     if let Some(ret_ty) = &f.ret {
         render_return_conversion(out, ret_ty, indent);
@@ -1413,14 +1489,16 @@ fn render_return_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
             out.push_str(&format!("{indent}return str;\n"));
         }
         TypeRef::Enum(name) => {
-            out.push_str(&format!("{indent}return ({name})result;\n"));
+            let cn = local_type_name(name);
+            out.push_str(&format!("{indent}return ({cn})result;\n"));
         }
         TypeRef::Struct(name) => {
             let cn = local_type_name(name);
             out.push_str(&format!("{indent}return new {cn}(result);\n"));
         }
         TypeRef::TypedHandle(name) => {
-            out.push_str(&format!("{indent}return new {name}(result);\n"));
+            let cn = local_type_name(name);
+            out.push_str(&format!("{indent}return new {cn}(result);\n"));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             out.push_str(&format!(
@@ -1524,16 +1602,18 @@ fn render_optional_return_conversion(out: &mut String, inner: &TypeRef, indent: 
             ));
         }
         TypeRef::TypedHandle(name) => {
+            let cn = local_type_name(name);
             out.push_str(&format!(
-                "{indent}return result == IntPtr.Zero ? null : new {name}(result);\n"
+                "{indent}return result == IntPtr.Zero ? null : new {cn}(result);\n"
             ));
         }
         TypeRef::Enum(name) => {
+            let cn = local_type_name(name);
             out.push_str(&format!(
                 "{indent}if (result == IntPtr.Zero) return null;\n"
             ));
             out.push_str(&format!(
-                "{indent}return ({name})Marshal.ReadInt32(result);\n"
+                "{indent}return ({cn})Marshal.ReadInt32(result);\n"
             ));
         }
         _ => {
@@ -1582,12 +1662,13 @@ fn render_list_return(out: &mut String, inner: &TypeRef, indent: &str) {
             out.push_str(&format!("{indent}return arr;\n"));
         }
         TypeRef::Enum(name) => {
-            out.push_str(&format!("{indent}var arr = new {name}[(int)outLen];\n"));
+            let cn = local_type_name(name);
+            out.push_str(&format!("{indent}var arr = new {cn}[(int)outLen];\n"));
             out.push_str(&format!(
                 "{indent}for (int i = 0; i < (int)outLen; i++)\n{indent}{{\n"
             ));
             out.push_str(&format!(
-                "{indent}    arr[i] = ({name})Marshal.ReadInt32(result + i * sizeof(int));\n"
+                "{indent}    arr[i] = ({cn})Marshal.ReadInt32(result + i * sizeof(int));\n"
             ));
             out.push_str(&format!("{indent}}}\n"));
             out.push_str(&format!("{indent}return arr;\n"));
@@ -1616,7 +1697,7 @@ fn render_map_return_call(
     out.push_str(&format!(
         "{indent}NativeMethods.{c_sym}({args_part}out var outKeys, out var outValues, out var outLen, ref err);\n"
     ));
-    out.push_str(&format!("{indent}WeaveffiError.Check(err);\n"));
+    out.push_str(&format!("{indent}WeaveFFIError.Check(err);\n"));
     out.push_str(&format!(
         "{indent}var dict = new Dictionary<{k_cs}, {v_cs}>();\n"
     ));
@@ -1647,13 +1728,15 @@ fn marshal_read_element(ty: &TypeRef, arr: &str, idx: &str) -> String {
             format!("(ulong)Marshal.ReadInt64({arr} + {idx} * sizeof(long))")
         }
         TypeRef::TypedHandle(name) => {
-            format!("new {name}(Marshal.ReadIntPtr({arr}, {idx} * IntPtr.Size))")
+            let cn = local_type_name(name);
+            format!("new {cn}(Marshal.ReadIntPtr({arr}, {idx} * IntPtr.Size))")
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             format!("Marshal.PtrToStringUTF8(Marshal.ReadIntPtr({arr}, {idx} * IntPtr.Size))")
         }
         TypeRef::Enum(name) => {
-            format!("({name})Marshal.ReadInt32({arr} + {idx} * sizeof(int))")
+            let cn = local_type_name(name);
+            format!("({cn})Marshal.ReadInt32({arr} + {idx} * sizeof(int))")
         }
         TypeRef::Struct(name) => {
             let cn = local_type_name(name);
@@ -1687,6 +1770,7 @@ mod tests {
             version: "0.1.0".into(),
             modules,
             generators: None,
+            package: None,
         }
     }
 
@@ -1800,6 +1884,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let dir = tempfile::tempdir().unwrap();
         let out = Utf8Path::from_path(dir.path()).unwrap();
@@ -1971,7 +2056,7 @@ mod tests {
             "missing wrapper method: {cs}"
         );
         assert!(
-            cs.contains("WeaveffiError.Check(err)"),
+            cs.contains("WeaveFFIError.Check(err)"),
             "missing error check: {cs}"
         );
     }
@@ -2493,7 +2578,7 @@ mod tests {
             "WeaveFFI.cs",
         );
         assert!(
-            cs.contains("ref WeaveffiError err"),
+            cs.contains("ref WeaveFFIError err"),
             "missing error param in P/Invoke: {cs}"
         );
     }
@@ -2988,7 +3073,7 @@ mod tests {
         );
         assert!(
             cs.contains(
-                "internal static extern int weaveffi_math_add(int a, int b, ref WeaveffiError err)"
+                "internal static extern int weaveffi_math_add(int a, int b, ref WeaveFFIError err)"
             ),
             "missing P/Invoke declaration: {cs}"
         );
@@ -3001,7 +3086,7 @@ mod tests {
             "missing P/Invoke call in wrapper: {cs}"
         );
         assert!(
-            cs.contains("WeaveffiError.Check(err)"),
+            cs.contains("WeaveFFIError.Check(err)"),
             "missing error check in wrapper: {cs}"
         );
         assert!(
@@ -4124,6 +4209,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let cs = render_csharp(
             &api,
@@ -4194,8 +4280,8 @@ mod tests {
         let find = cs.find("FindContact").expect("FindContact wrapper");
         let slice = &cs[find..];
         let check_rel = slice
-            .find("WeaveffiError.Check(err)")
-            .expect("WeaveffiError.Check in FindContact");
+            .find("WeaveFFIError.Check(err)")
+            .expect("WeaveFFIError.Check in FindContact");
         let ret_rel = slice
             .find("return new Contact(result)")
             .expect("return new Contact(result) in FindContact");

@@ -1,4 +1,13 @@
 version: "0.3.0"
+package:
+  name: inventory
+  version: "1.0.0"
+  description: Product and order inventory API spanning multiple modules.
+  license: MIT
+  authors:
+    - WeaveFoundry <hello@weavefoundry.dev>
+  homepage: https://github.com/weavefoundry/weaveffi
+  repository: https://github.com/weavefoundry/weaveffi
 modules:
   - name: products
     enums:

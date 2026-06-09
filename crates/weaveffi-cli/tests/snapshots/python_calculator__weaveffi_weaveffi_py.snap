@@ -14,14 +14,14 @@ from enum import IntEnum
 from typing import Dict, Iterator, List, Optional
 
 
-class WeaveffiError(Exception):
+class WeaveFFIError(Exception):
     def __init__(self, code: int, message: str) -> None:
         self.code = code
         self.message = message
         super().__init__(f"({code}) {message}")
 
 
-class _WeaveffiErrorStruct(ctypes.Structure):
+class _WeaveFFIErrorStruct(ctypes.Structure):
     _fields_ = [
         ("code", ctypes.c_int32),
         ("message", ctypes.c_char_p),
@@ -45,7 +45,7 @@ def _load_library() -> ctypes.CDLL:
 
 
 _lib = _load_library()
-_lib.weaveffi_error_clear.argtypes = [ctypes.POINTER(_WeaveffiErrorStruct)]
+_lib.weaveffi_error_clear.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
 _lib.weaveffi_error_clear.restype = None
 _lib.weaveffi_free_string.argtypes = [ctypes.c_char_p]
 _lib.weaveffi_free_string.restype = None
@@ -53,12 +53,12 @@ _lib.weaveffi_free_bytes.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_si
 _lib.weaveffi_free_bytes.restype = None
 
 
-def _check_error(err: _WeaveffiErrorStruct) -> None:
+def _check_error(err: _WeaveFFIErrorStruct) -> None:
     if err.code != 0:
         code = err.code
         message = err.message.decode("utf-8") if err.message else ""
         _lib.weaveffi_error_clear(ctypes.byref(err))
-        raise WeaveffiError(code, message)
+        raise WeaveFFIError(code, message)
 
 
 class _PointerGuard(contextlib.AbstractContextManager):
@@ -91,9 +91,9 @@ def calculator_add(a: int, b: int) -> int:
     """Add two integers
     """
     _fn = _lib.weaveffi_calculator_add
-    _fn.argtypes = [ctypes.c_int32, ctypes.c_int32, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.c_int32, ctypes.c_int32, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_int32
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(a, b, ctypes.byref(_err))
     _check_error(_err)
     return _result
@@ -103,9 +103,9 @@ def calculator_mul(a: int, b: int) -> int:
     """Multiply two integers
     """
     _fn = _lib.weaveffi_calculator_mul
-    _fn.argtypes = [ctypes.c_int32, ctypes.c_int32, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.c_int32, ctypes.c_int32, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_int32
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(a, b, ctypes.byref(_err))
     _check_error(_err)
     return _result
@@ -115,9 +115,9 @@ def calculator_div(a: int, b: int) -> int:
     """Divide two integers
     """
     _fn = _lib.weaveffi_calculator_div
-    _fn.argtypes = [ctypes.c_int32, ctypes.c_int32, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.c_int32, ctypes.c_int32, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_int32
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(a, b, ctypes.byref(_err))
     _check_error(_err)
     return _result
@@ -127,9 +127,9 @@ def calculator_echo(s: str) -> str:
     """Echo a string back
     """
     _fn = _lib.weaveffi_calculator_echo
-    _fn.argtypes = [ctypes.c_char_p, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.c_char_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_char_p
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(_string_to_bytes(s), ctypes.byref(_err))
     _check_error(_err)
     return _bytes_to_string(_result) or ""

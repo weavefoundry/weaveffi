@@ -487,7 +487,7 @@ module WeaveFFI
     result = weaveffi_kitchen_open_typed_handle(err)
     check_error!(err)
     raise Error.new(-1, 'null pointer') if result.null?
-    Token.new(result)
+    shared.Token.new(result)
   end
 
   # Optional struct return

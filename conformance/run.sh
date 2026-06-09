@@ -81,6 +81,10 @@ build_producer() {
 generate() {
     local sample=$1 idl=$2
     echo "--- generating bindings: $sample"
+    # Clean first so files renamed across generator versions (e.g. an old
+    # identity-named lib left beside the current one) can't shadow fresh output;
+    # whole-package compilers like `dart run` otherwise pick up the stale copy.
+    rm -rf "$GENROOT/$sample"
     cargo run -q -p weaveffi-cli -- generate "$idl" -o "$GENROOT/$sample" --force
 }
 
@@ -105,6 +109,18 @@ cpp_events() {
     clang++ -std=c++17 -I "$GENROOT/events/cpp" "$ROOT/conformance/cpp/events.cpp" \
         -L "$LIBDIR" -levents -o "$OUT/cpp_events" \
         && "$OUT/cpp_events"
+}
+
+c_kvstore() {
+    clang -I "$GENROOT/kvstore/c" "$ROOT/conformance/c/kvstore.c" \
+        -L "$LIBDIR" -lkvstore -o "$OUT/c_kvstore" \
+        && "$OUT/c_kvstore"
+}
+
+cpp_kvstore() {
+    clang++ -std=c++17 -I "$GENROOT/kvstore/cpp" "$ROOT/conformance/cpp/kvstore.cpp" \
+        -L "$LIBDIR" -lkvstore -o "$OUT/cpp_kvstore" \
+        && "$OUT/cpp_kvstore"
 }
 
 # Resolve the platform-specific cdylib path for a sample crate.
@@ -144,12 +160,19 @@ dart_consumer() {
     local sample="$1" script="$2"
     local pkgdir="$GENROOT/$sample/dart"
     mkdir -p "$pkgdir/bin"
-    cp "$ROOT/conformance/dart/$script" "$pkgdir/bin/conformance.dart"
+    # The package name and library file follow the resolved identity; discover
+    # both from the generated tree and substitute the consumer's import.
+    local pkg lib
+    pkg=$(sed -n 's/^name: //p' "$pkgdir/pubspec.yaml" | head -1)
+    lib=$(basename "$(ls "$pkgdir/lib"/*.dart | head -1)" .dart)
+    sed -e "s#__PKG__#$pkg#g" -e "s#__LIB__#$lib#g" \
+        "$ROOT/conformance/dart/$script" > "$pkgdir/bin/conformance.dart"
     ( cd "$pkgdir" && dart pub get >/dev/null 2>&1 ) || { echo "dart pub get failed" >&2; return 1; }
     ( cd "$pkgdir" && WEAVEFFI_LIBRARY="$(sample_lib "$sample")" dart run bin/conformance.dart )
 }
 
 dart_contacts() { dart_consumer contacts contacts.dart; }
+dart_kvstore() { dart_consumer kvstore kvstore.dart; }
 
 # A directory containing `libweaveffi.<ext>` symlinked to the sample cdylib, so
 # build-time `-lweaveffi` / `#cgo -lweaveffi` resolve. On Linux the consumer then
@@ -165,28 +188,34 @@ weaveffi_linkdir() {
 }
 
 # Run a Go consumer in a throwaway module that `replace`s the generated package.
+# The generated module path follows the package identity (e.g. `contacts` or
+# `github.com/example/kvstore`), so discover it from the generated go.mod and
+# substitute it into the consumer's `__MODPATH__` import sentinel. cgo now emits
+# `-l<package>` matching the producer cdylib, so link straight against $LIBDIR.
 go_consumer() {
     local sample="$1" src="$2"
-    local linkdir moddir
-    linkdir="$(weaveffi_linkdir "$sample")"
+    local moddir modpath
+    modpath=$(sed -n 's/^module //p' "$GENROOT/$sample/go/go.mod" | head -1)
     moddir="$OUT/go-$sample"
+    rm -rf "$moddir"
     mkdir -p "$moddir"
-    cp "$ROOT/conformance/go/$src" "$moddir/main.go"
+    sed "s#__MODPATH__#$modpath#g" "$ROOT/conformance/go/$src" > "$moddir/main.go"
     cat > "$moddir/go.mod" <<EOF
 module conformance
 go 1.21
-require weaveffi v0.0.0
-replace weaveffi => $GENROOT/$sample/go
+require $modpath v0.0.0
+replace $modpath => $GENROOT/$sample/go
 EOF
     ( cd "$moddir" \
         && GOPROXY=off GOSUMDB=off GOFLAGS=-mod=mod \
-           CGO_CFLAGS="-I$GENROOT/$sample/c" CGO_LDFLAGS="-L$linkdir" \
-           LD_LIBRARY_PATH="$linkdir:${LD_LIBRARY_PATH:-}" \
-           DYLD_LIBRARY_PATH="$linkdir:${DYLD_LIBRARY_PATH:-}" \
+           CGO_CFLAGS="-I$GENROOT/$sample/c" CGO_LDFLAGS="-L$LIBDIR" \
+           LD_LIBRARY_PATH="$LIBDIR:${LD_LIBRARY_PATH:-}" \
+           DYLD_LIBRARY_PATH="$LIBDIR:${DYLD_LIBRARY_PATH:-}" \
            go run . )
 }
 
 go_contacts() { go_consumer contacts contacts.go; }
+go_kvstore()  { go_consumer kvstore kvstore.go; }
 
 # Swift: assemble a throwaway SwiftPM package that vendors the generated
 # WeaveFFI module plus a C shim whose module map points at the generated header
@@ -198,25 +227,34 @@ swift_consumer() {
     local sample="$1" src="$2"
     local pkg="$OUT/swift-$sample"
     rm -rf "$pkg"
-    mkdir -p "$pkg/Sources/CWeaveFFI" "$pkg/Sources/WeaveFFI" "$pkg/Sources/conformance"
-    cp "$GENROOT/$sample/swift/Sources/WeaveFFI/WeaveFFI.swift" "$pkg/Sources/WeaveFFI/"
-    cat > "$pkg/Sources/CWeaveFFI/module.modulemap" <<EOF
-module CWeaveFFI [system] {
+    # The generated Swift module name is derived from the IDL package name
+    # (e.g. contacts -> Contacts), with a parallel C shim module named C<Module>.
+    # Discover it from the generated tree rather than hard-coding "WeaveFFI".
+    local gen_swift mod
+    gen_swift=$(ls "$GENROOT/$sample/swift/Sources"/*/*.swift | head -1)
+    mod=$(basename "$gen_swift" .swift)
+    mkdir -p "$pkg/Sources/C$mod" "$pkg/Sources/$mod" "$pkg/Sources/conformance"
+    cp "$gen_swift" "$pkg/Sources/$mod/"
+    cat > "$pkg/Sources/C$mod/module.modulemap" <<EOF
+module C$mod [system] {
   header "$GENROOT/$sample/c/weaveffi.h"
   link "$sample"
   export *
 }
 EOF
     cp "$ROOT/conformance/swift/$src" "$pkg/Sources/conformance/main.swift"
-    cat > "$pkg/Package.swift" <<'EOF'
+    # Mirror the platform floor the generator puts in its own Package.swift so
+    # async wrappers (CheckedContinuation / #isolation) compile.
+    cat > "$pkg/Package.swift" <<EOF
 // swift-tools-version:5.7
 import PackageDescription
 let package = Package(
     name: "conformance",
+    platforms: [.macOS(.v10_15), .iOS(.v13), .tvOS(.v13), .watchOS(.v6)],
     targets: [
-        .systemLibrary(name: "CWeaveFFI"),
-        .target(name: "WeaveFFI", dependencies: ["CWeaveFFI"]),
-        .executableTarget(name: "conformance", dependencies: ["WeaveFFI"]),
+        .systemLibrary(name: "C$mod"),
+        .target(name: "$mod", dependencies: ["C$mod"]),
+        .executableTarget(name: "conformance", dependencies: ["$mod"]),
     ]
 )
 EOF
@@ -224,6 +262,7 @@ EOF
 }
 
 swift_contacts() { swift_consumer contacts contacts.swift; }
+swift_kvstore()  { swift_consumer kvstore kvstore.swift; }
 
 # .NET: compile the generated P/Invoke source (WeaveFFI.cs) together with the
 # consumer into one console app. The producer cdylib is resolved at runtime by
@@ -285,6 +324,73 @@ EOF
 }
 
 node_contacts() { node_consumer contacts contacts.js; }
+node_kvstore() { node_consumer kvstore kvstore.js; }
+
+# Kotlin/Android: compile the generated JNI bridge into `libweaveffi.<ext>` (what
+# `System.loadLibrary("weaveffi")` expects), linked against the producer cdylib;
+# then compile the generated WeaveFFI.kt together with the consumer in one module
+# (so the `internal` Entry/Stats constructors are reachable) against the
+# coroutines jar bundled with kotlinc; then run on the JVM with the bridge on
+# java.library.path. The producer cdylib resolves via its absolute install name
+# (macOS) or LD_LIBRARY_PATH (Linux). The consumer's `main` lives in class `Main`
+# (`@file:JvmName("Main")`).
+kotlin_consumer() {
+    local sample="$1" src="$2"
+    local b="$OUT/kotlin-$sample"
+    rm -rf "$b"; mkdir -p "$b"
+    local jh jni_os_inc
+    jh="${JAVA_HOME:-$(/usr/libexec/java_home 2>/dev/null)}"
+    [ -n "$jh" ] && [ -f "$jh/include/jni.h" ] || { echo "jni.h not found (set JAVA_HOME)" >&2; return 1; }
+    case "$(uname -s)" in
+        Darwin) jni_os_inc="$jh/include/darwin" ;;
+        *)      jni_os_inc="$jh/include/linux" ;;
+    esac
+    # Locate the coroutines runtime shipped inside the kotlinc distribution.
+    local kc real coro
+    kc=$(command -v kotlinc) || { echo "kotlinc not found" >&2; return 1; }
+    real=$(readlink -f "$kc" 2>/dev/null || echo "$kc")
+    coro=$(ls "$(dirname "$real")/../libexec/lib/kotlinx-coroutines-core-jvm.jar" \
+              "$(dirname "$real")/../lib/kotlinx-coroutines-core-jvm.jar" 2>/dev/null | head -1)
+    [ -n "$coro" ] || coro=$(ls /usr/local/Cellar/kotlin/*/libexec/lib/kotlinx-coroutines-core-jvm.jar \
+                                /opt/homebrew/Cellar/kotlin/*/libexec/lib/kotlinx-coroutines-core-jvm.jar 2>/dev/null | head -1)
+    [ -n "$coro" ] || { echo "kotlinx-coroutines-core-jvm.jar not found" >&2; return 1; }
+    cc -shared -fPIC "$GENROOT/$sample/android/src/main/cpp/weaveffi_jni.c" \
+        -I"$jh/include" -I"$jni_os_inc" -I"$GENROOT/$sample/c" \
+        -L"$LIBDIR" -l"$sample" -Wl,-rpath,"$LIBDIR" \
+        -o "$b/libweaveffi.$EXT" || { echo "JNI bridge compile failed" >&2; return 1; }
+    kotlinc "$GENROOT/$sample/android/src/main/kotlin/com/weaveffi/WeaveFFI.kt" \
+        "$ROOT/conformance/kotlin/$src" -cp "$coro" -include-runtime -d "$b/app.jar" \
+        >/dev/null 2>&1 || { echo "kotlinc failed" >&2; return 1; }
+    DYLD_LIBRARY_PATH="$LIBDIR:${DYLD_LIBRARY_PATH:-}" \
+    LD_LIBRARY_PATH="$LIBDIR:${LD_LIBRARY_PATH:-}" \
+        java -Djava.library.path="$b" -cp "$b/app.jar:$coro" Main
+}
+
+kotlin_kvstore() { kotlin_consumer kvstore kvstore.kt; }
+
+# WASM: compile the producer to wasm32-unknown-unknown and drive the generated
+# ESM bindings from Node. The generated JS glue expects weaveffi_alloc/dealloc
+# plus an exported, growable __indirect_function_table — wired by the workspace
+# .cargo/config.toml (--export-table/--growable-table). Async wrappers build host
+# trampolines with WebAssembly.Function, which needs the type-reflection flag.
+# Unlike the cdylib lanes there is no FFI library to load: the .wasm is fully
+# self-contained and the consumer reads it via WV_WASM, with WV_JS pointing at
+# the generated module.
+wasm_consumer() {
+    local sample="$1" src="$2"
+    command -v node >/dev/null 2>&1 || { echo "node not found" >&2; return 1; }
+    rustup target list --installed 2>/dev/null | grep -qx 'wasm32-unknown-unknown' \
+        || { echo "wasm32-unknown-unknown target missing (rustup target add wasm32-unknown-unknown)" >&2; return 1; }
+    echo "--- building wasm producer: $sample"
+    cargo build -q -p "$sample" --release --target wasm32-unknown-unknown \
+        || { echo "wasm32 build failed" >&2; return 1; }
+    local wasm="$TARGET_DIR/wasm32-unknown-unknown/release/$sample.wasm"
+    [ -f "$wasm" ] || { echo "wasm artifact not found: $wasm" >&2; return 1; }
+    WV_WASM="$wasm" WV_JS="$GENROOT/$sample/wasm/weaveffi_wasm.js" \
+        node --experimental-wasm-type-reflection "$ROOT/conformance/wasm/$src"
+}
+
+wasm_kvstore() { wasm_consumer kvstore kvstore.mjs; }
 
 # ---------------------------------------------------------------------------
 # Producers + generation
@@ -293,6 +399,8 @@ build_producer contacts
 generate contacts samples/contacts/contacts.yml
 build_producer events
 generate events samples/events/events.yml
+build_producer kvstore
+generate kvstore samples/kvstore/kvstore.yml
 
 # ---------------------------------------------------------------------------
 # Run matrix
@@ -300,21 +408,22 @@ generate events samples/events/events.yml
 check c-contacts c_contacts
 check c-events c_events
 check cpp-events cpp_events
+check c-kvstore c_kvstore
+check cpp-kvstore cpp_kvstore
+check swift-kvstore swift_kvstore
 check python-contacts python_contacts
 check python-events python_events
 check ruby-contacts ruby_contacts
 check dart-contacts dart_contacts
+check dart-kvstore dart_kvstore
 check go-contacts go_contacts
+check go-kvstore go_kvstore
 check swift-contacts swift_contacts
 check dotnet-contacts dotnet_contacts
 check node-contacts node_contacts
-
-# ---------------------------------------------------------------------------
-# Remaining backends (not wired here). Status as of this harness:
-#   wasm   — requires the producer compiled to wasm32 (wasm-pack/emscripten);
-#            no cdylib path, so out of scope for this dylib-based harness.
-#   kotlin — requires `kotlinc` (only `java` is installed here).
-# ---------------------------------------------------------------------------
+check node-kvstore node_kvstore
+check kotlin-kvstore kotlin_kvstore
+check wasm-kvstore wasm_kvstore
 
 echo
 echo "conformance: $PASS passed, $FAIL failed"

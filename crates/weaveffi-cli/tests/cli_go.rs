@@ -24,9 +24,11 @@ fn generate_go_contacts() {
 
     let go =
         std::fs::read_to_string(out_path.join("go/weaveffi.go")).expect("missing go/weaveffi.go");
+    // The Go package clause follows the resolved package identity (contacts.yml
+    // declares `package.name: contacts`), not the `weaveffi` brand.
     assert!(
-        go.contains("package weaveffi"),
-        "weaveffi.go should contain package declaration"
+        go.contains("package contacts"),
+        "weaveffi.go should contain identity-derived package declaration"
     );
     assert!(
         go.contains("type ContactType int32"),

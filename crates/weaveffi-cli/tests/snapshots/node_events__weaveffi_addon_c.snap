@@ -45,7 +45,8 @@ static napi_value Napi_weaveffi_events_get_messages(napi_env env, napi_callback_
   napi_create_array(env, &ret);
   uint32_t iter_idx = 0;
   const char* iter_item;
-  while (weaveffi_events_GetMessagesIterator_next(result, &iter_item)) {
+  weaveffi_error iter_err = {0};
+  while (weaveffi_events_GetMessagesIterator_next(result, &iter_item, &iter_err)) {
     napi_value elem;
     napi_create_string_utf8(env, iter_item, NAPI_AUTO_LENGTH, &elem);
     weaveffi_free_string(iter_item);

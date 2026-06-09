@@ -14,28 +14,28 @@ using System.Threading.Tasks;
 
 namespace WeaveFFI
 {
-    public class WeaveffiException : Exception
+    public class WeaveFFIException : Exception
     {
         public int Code { get; }
 
-        public WeaveffiException(int code, string message) : base(message)
+        public WeaveFFIException(int code, string message) : base(message)
         {
             Code = code;
         }
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    internal struct WeaveffiError
+    internal struct WeaveFFIError
     {
         public int Code;
         public IntPtr Message;
 
-        internal static void Check(WeaveffiError err)
+        internal static void Check(WeaveFFIError err)
         {
             if (err.Code != 0)
             {
                 var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
-                throw new WeaveffiException(err.Code, msg);
+                throw new WeaveFFIException(err.Code, msg);
             }
         }
     }
@@ -124,7 +124,7 @@ namespace WeaveFFI
         internal static extern void weaveffi_free_bytes(IntPtr ptr, UIntPtr len);
 
         [DllImport(LibName, EntryPoint = "weaveffi_tasks_TaskResult_create", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_tasks_TaskResult_create(long id, IntPtr value, int success, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_tasks_TaskResult_create(long id, IntPtr value, int success, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_tasks_TaskResult_destroy", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_tasks_TaskResult_destroy(IntPtr ptr);
@@ -139,7 +139,7 @@ namespace WeaveFFI
         internal static extern int weaveffi_tasks_TaskResult_get_success(IntPtr ptr);
 
         [DllImport(LibName, EntryPoint = "weaveffi_tasks_run_task", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_tasks_run_task(IntPtr name, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_tasks_run_task(IntPtr name, ref WeaveFFIError err);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         internal delegate void AsyncCb_weaveffi_tasks_run_task(IntPtr context, IntPtr err, IntPtr result);
@@ -148,7 +148,7 @@ namespace WeaveFFI
         internal static extern void weaveffi_tasks_run_task_async(IntPtr name, AsyncCb_weaveffi_tasks_run_task callback, IntPtr context);
 
         [DllImport(LibName, EntryPoint = "weaveffi_tasks_run_batch", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_tasks_run_batch(IntPtr names, UIntPtr names_len, out UIntPtr out_len, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_tasks_run_batch(IntPtr names, UIntPtr names_len, out UIntPtr out_len, ref WeaveFFIError err);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         internal delegate void AsyncCb_weaveffi_tasks_run_batch(IntPtr context, IntPtr err, IntPtr result, UIntPtr resultLen);
@@ -157,10 +157,10 @@ namespace WeaveFFI
         internal static extern void weaveffi_tasks_run_batch_async(IntPtr names, UIntPtr names_len, AsyncCb_weaveffi_tasks_run_batch callback, IntPtr context);
 
         [DllImport(LibName, EntryPoint = "weaveffi_tasks_cancel_task", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_tasks_cancel_task(long id, ref WeaveffiError err);
+        internal static extern int weaveffi_tasks_cancel_task(long id, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_tasks_run_n_tasks", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_tasks_run_n_tasks(int n, ref WeaveffiError err);
+        internal static extern int weaveffi_tasks_run_n_tasks(int n, ref WeaveFFIError err);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         internal delegate void AsyncCb_weaveffi_tasks_run_n_tasks(IntPtr context, IntPtr err, int result);
@@ -169,7 +169,7 @@ namespace WeaveFFI
         internal static extern void weaveffi_tasks_run_n_tasks_async(int n, AsyncCb_weaveffi_tasks_run_n_tasks callback, IntPtr context);
 
         [DllImport(LibName, EntryPoint = "weaveffi_tasks_active_callbacks", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern long weaveffi_tasks_active_callbacks(ref WeaveffiError err);
+        internal static extern long weaveffi_tasks_active_callbacks(ref WeaveFFIError err);
 
     }
 
@@ -184,11 +184,11 @@ namespace WeaveFFI
                 {
                     if (err != IntPtr.Zero)
                     {
-                        var wErr = Marshal.PtrToStructure<WeaveffiError>(err);
+                        var wErr = Marshal.PtrToStructure<WeaveFFIError>(err);
                         if (wErr.Code != 0)
                         {
                             var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? "";
-                            tcs.SetException(new WeaveffiException(wErr.Code, msg));
+                            tcs.SetException(new WeaveFFIException(wErr.Code, msg));
                             return;
                         }
                     }
@@ -233,11 +233,11 @@ namespace WeaveFFI
                 {
                     if (err != IntPtr.Zero)
                     {
-                        var wErr = Marshal.PtrToStructure<WeaveffiError>(err);
+                        var wErr = Marshal.PtrToStructure<WeaveFFIError>(err);
                         if (wErr.Code != 0)
                         {
                             var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? "";
-                            tcs.SetException(new WeaveffiException(wErr.Code, msg));
+                            tcs.SetException(new WeaveFFIException(wErr.Code, msg));
                             return;
                         }
                     }
@@ -267,9 +267,9 @@ namespace WeaveFFI
 
         public static bool TasksCancelTask(long id)
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_tasks_cancel_task(id, ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             return result != 0;
         }
 
@@ -282,11 +282,11 @@ namespace WeaveFFI
                 {
                     if (err != IntPtr.Zero)
                     {
-                        var wErr = Marshal.PtrToStructure<WeaveffiError>(err);
+                        var wErr = Marshal.PtrToStructure<WeaveFFIError>(err);
                         if (wErr.Code != 0)
                         {
                             var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? "";
-                            tcs.SetException(new WeaveffiException(wErr.Code, msg));
+                            tcs.SetException(new WeaveFFIException(wErr.Code, msg));
                             return;
                         }
                     }
@@ -316,9 +316,9 @@ namespace WeaveFFI
 
         public static long TasksActiveCallbacks()
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_tasks_active_callbacks(ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             return result;
         }
 

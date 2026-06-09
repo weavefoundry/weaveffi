@@ -66,9 +66,9 @@ internal static class Program
         try
         {
             Contacts.ContactsGetContact(9999);
-            Expect(false, "expected WeaveffiException for missing contact");
+            Expect(false, "expected WeaveFFIException for missing contact");
         }
-        catch (WeaveffiException e)
+        catch (WeaveFFIException e)
         {
             Expect(e.Code != 0, "error code non-zero");
         }

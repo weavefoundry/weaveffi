@@ -84,12 +84,27 @@ pub fn render_enum_decl(out: &mut String, e: &EnumBinding) {
     }
 }
 
-/// Render the opaque struct typedef plus create/destroy/getters, then any
-/// fluent builder.
-pub fn render_struct_decls(out: &mut String, s: &StructBinding, prefix: &str) {
+/// Render the opaque struct/builder *tags* (forward typedefs) for one struct.
+///
+/// These reference no other types, so emitting every struct's tags before any
+/// function declaration lets a function in one module accept or return a struct
+/// declared in *another* module (a parent module referencing a child's type).
+fn render_struct_tags(out: &mut String, s: &StructBinding) {
+    let tag = &s.c_tag;
+    let _ = writeln!(out, "typedef struct {tag} {tag};");
+    if let Some(b) = &s.builder {
+        let bt = &b.builder_tag;
+        let _ = writeln!(out, "typedef struct {bt} {bt};");
+    }
+}
+
+/// Render the function declarations for one struct: create/destroy/getters and,
+/// if present, the fluent builder's new/setters/build/destroy. Assumes the
+/// struct (and every other struct it may reference) already has a forward
+/// typedef emitted via [`render_struct_tags`].
+fn render_struct_fn_decls(out: &mut String, s: &StructBinding, prefix: &str) {
     let tag = &s.c_tag;
     emit_doc(out, &s.doc, "");
-    let _ = writeln!(out, "typedef struct {tag} {tag};");
     fn_decl(out, &s.create, prefix);
     let _ = writeln!(out, "void {}({tag}* ptr);", s.destroy_symbol);
     for field in &s.fields {
@@ -113,7 +128,6 @@ pub fn render_struct_decls(out: &mut String, s: &StructBinding, prefix: &str) {
 
     if let Some(b) = &s.builder {
         let bt = &b.builder_tag;
-        let _ = writeln!(out, "typedef struct {bt} {bt};");
         let _ = writeln!(out, "{bt}* {}(void);", b.new_symbol);
         for (field, (_, setter)) in s.fields.iter().zip(&b.setters) {
             emit_doc(out, &field.doc, "");
@@ -133,16 +147,33 @@ pub fn render_struct_decls(out: &mut String, s: &StructBinding, prefix: &str) {
     }
 }
 
-/// Render every declaration for one module: enums, structs, callbacks,
-/// listeners, then functions (sync/async/iterator). Caller controls the
-/// leading `// Module:` comment and any framing.
-pub fn render_module_decls(out: &mut String, module: &ModuleBinding, prefix: &str) {
+/// Phase 1a — enum definitions for one module. Enums reference no other types,
+/// so they are emitted first across all modules.
+pub fn render_module_enum_defs(out: &mut String, module: &ModuleBinding) {
     for e in &module.enums {
         render_enum_decl(out, e);
     }
+}
+
+/// Phase 1b — opaque struct/builder/iterator forward typedefs for one module.
+/// Pointers to these are all the C ABI ever uses, so a forward typedef is
+/// sufficient and lets declarations in any module reference any struct.
+pub fn render_module_type_tags(out: &mut String, module: &ModuleBinding) {
     for s in &module.structs {
-        render_struct_decls(out, s, prefix);
+        render_struct_tags(out, s);
     }
+    for f in &module.functions {
+        if let CallShape::Iterator(it) = &f.shape {
+            let t = &it.iter_tag;
+            let _ = writeln!(out, "typedef struct {t} {t};");
+        }
+    }
+}
+
+/// Phase 1c — callback / async-callback function-pointer typedefs for one
+/// module. These may reference enums (by value) and structs (by pointer), so
+/// they are emitted after every module's enums and type tags.
+pub fn render_module_callback_types(out: &mut String, module: &ModuleBinding, prefix: &str) {
     for cb in &module.callbacks {
         emit_doc(out, &cb.doc, "");
         let _ = writeln!(
@@ -151,6 +182,26 @@ pub fn render_module_decls(out: &mut String, module: &ModuleBinding, prefix: &st
             cb.c_fn_type,
             params_str(&cb.abi_params, prefix)
         );
+    }
+    for f in &module.functions {
+        if let CallShape::Async(a) = &f.shape {
+            let _ = writeln!(
+                out,
+                "typedef void (*{})({});",
+                a.callback_type,
+                params_str(&a.callback_params, prefix)
+            );
+        }
+    }
+}
+
+/// Phase 2 — every function prototype for one module: struct create/destroy/
+/// getters and builders, listeners, then sync/async/iterator functions. All
+/// type tags and callback typedefs are assumed already emitted (phases 1a–1c).
+/// Caller controls the leading `// Module:` comment and any framing.
+pub fn render_module_fn_decls(out: &mut String, module: &ModuleBinding, prefix: &str) {
+    for s in &module.structs {
+        render_struct_fn_decls(out, s, prefix);
     }
     for l in &module.listeners {
         emit_doc(out, &l.doc, "");
@@ -174,23 +225,46 @@ pub fn render_module_decls(out: &mut String, module: &ModuleBinding, prefix: &st
         match &f.shape {
             CallShape::Iterator(it) => {
                 let t = &it.iter_tag;
-                let _ = writeln!(out, "typedef struct {t} {t};");
                 fn_decl(out, &it.launch, prefix);
                 fn_decl(out, &it.next, prefix);
                 let _ = writeln!(out, "void {}({t}* iter);", it.destroy_symbol);
             }
             CallShape::Async(a) => {
-                let _ = writeln!(
-                    out,
-                    "typedef void (*{})({});",
-                    a.callback_type,
-                    params_str(&a.callback_params, prefix)
-                );
                 fn_decl(out, &a.launch, prefix);
             }
             CallShape::Sync(abi) => {
                 fn_decl(out, abi, prefix);
             }
         }
+    }
+}
+
+/// Render the complete C ABI declaration surface for `modules` in
+/// dependency-safe order: all enum definitions, then all opaque type tags, then
+/// all callback typedefs, then per-module function prototypes. Emitting every
+/// type tag before any function lets a parent module's function reference a
+/// child module's struct — cross-module forward references the previous
+/// per-module interleaving could not express.
+///
+/// The runtime decls (`handle_t`, `error`, `free_*`, cancel token) are *not*
+/// emitted here; callers render those first (the C generator inserts its map
+/// convention comment in between).
+pub fn render_decls(out: &mut String, modules: &[ModuleBinding], prefix: &str, module_comments: bool) {
+    for m in modules {
+        render_module_enum_defs(out, m);
+    }
+    for m in modules {
+        render_module_type_tags(out, m);
+    }
+    for m in modules {
+        render_module_callback_types(out, m, prefix);
+    }
+    out.push('\n');
+    for m in modules {
+        if module_comments {
+            let _ = writeln!(out, "// Module: {}", m.path);
+        }
+        render_module_fn_decls(out, m, prefix);
+        out.push('\n');
     }
 }

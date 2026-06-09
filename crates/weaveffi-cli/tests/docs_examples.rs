@@ -219,7 +219,7 @@ fn doc_android_kotlin_wrapper() {
         "enum class missing: {kt}"
     );
     assert!(
-        kt.contains("class Contact internal constructor(private var handle: Long)"),
+        kt.contains("class Contact internal constructor(internal var handle: Long)"),
         "struct class missing: {kt}"
     );
 }
@@ -695,8 +695,8 @@ fn readme_quickstart_command_emits_all_advertised_targets() {
         "missing swift/Sources/WeaveFFI/WeaveFFI.swift"
     );
     assert!(
-        gen.join("python/weaveffi/weaveffi.pyi").exists(),
-        "missing python/weaveffi/weaveffi.pyi"
+        gen.join("python/contacts/weaveffi.pyi").exists(),
+        "missing python/contacts/weaveffi.pyi"
     );
     assert!(
         gen.join("node/types.d.ts").exists(),
@@ -764,7 +764,7 @@ fn readme_quickstart_snippets_match_actual_output() {
         );
     }
 
-    let pyi = std::fs::read_to_string(gen.join("python/weaveffi/weaveffi.pyi")).unwrap();
+    let pyi = std::fs::read_to_string(gen.join("python/contacts/weaveffi.pyi")).unwrap();
     for needle in [
         "class Contact:",
         "def contacts_create_contact(name: str, email: Optional[str]) -> \"Contact\": ...",

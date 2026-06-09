@@ -14,14 +14,14 @@ from enum import IntEnum
 from typing import Dict, Iterator, List, Optional
 
 
-class WeaveffiError(Exception):
+class WeaveFFIError(Exception):
     def __init__(self, code: int, message: str) -> None:
         self.code = code
         self.message = message
         super().__init__(f"({code}) {message}")
 
 
-class _WeaveffiErrorStruct(ctypes.Structure):
+class _WeaveFFIErrorStruct(ctypes.Structure):
     _fields_ = [
         ("code", ctypes.c_int32),
         ("message", ctypes.c_char_p),
@@ -45,7 +45,7 @@ def _load_library() -> ctypes.CDLL:
 
 
 _lib = _load_library()
-_lib.weaveffi_error_clear.argtypes = [ctypes.POINTER(_WeaveffiErrorStruct)]
+_lib.weaveffi_error_clear.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
 _lib.weaveffi_error_clear.restype = None
 _lib.weaveffi_free_string.argtypes = [ctypes.c_char_p]
 _lib.weaveffi_free_string.restype = None
@@ -53,12 +53,12 @@ _lib.weaveffi_free_bytes.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_si
 _lib.weaveffi_free_bytes.restype = None
 
 
-def _check_error(err: _WeaveffiErrorStruct) -> None:
+def _check_error(err: _WeaveFFIErrorStruct) -> None:
     if err.code != 0:
         code = err.code
         message = err.message.decode("utf-8") if err.message else ""
         _lib.weaveffi_error_clear(ctypes.byref(err))
-        raise WeaveffiError(code, message)
+        raise WeaveFFIError(code, message)
 
 
 class _PointerGuard(contextlib.AbstractContextManager):
@@ -126,9 +126,9 @@ def shared_ping() -> str:
     """Trivial cross-module helper
     """
     _fn = _lib.weaveffi_shared_ping
-    _fn.argtypes = [ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_char_p
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(ctypes.byref(_err))
     _check_error(_err)
     return _bytes_to_string(_result) or ""
@@ -275,7 +275,7 @@ class Item:
         _fn.restype = ctypes.c_void_p
         _result = _fn(self._ptr)
         if _result is None:
-            raise WeaveffiError(-1, "null pointer")
+            raise WeaveFFIError(-1, "null pointer")
         return Token(_result)
 
 
@@ -391,9 +391,9 @@ def kitchen_bool_id(x: bool) -> bool:
     """Identity for bool
     """
     _fn = _lib.weaveffi_kitchen_bool_id
-    _fn.argtypes = [ctypes.c_int32, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.c_int32, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_int32
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(1 if x else 0, ctypes.byref(_err))
     _check_error(_err)
     return bool(_result)
@@ -401,9 +401,9 @@ def kitchen_bool_id(x: bool) -> bool:
 
 def kitchen_i32_id(x: int) -> int:
     _fn = _lib.weaveffi_kitchen_i32_id
-    _fn.argtypes = [ctypes.c_int32, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.c_int32, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_int32
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(x, ctypes.byref(_err))
     _check_error(_err)
     return _result
@@ -411,9 +411,9 @@ def kitchen_i32_id(x: int) -> int:
 
 def kitchen_u32_id(x: int) -> int:
     _fn = _lib.weaveffi_kitchen_u32_id
-    _fn.argtypes = [ctypes.c_uint32, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.c_uint32, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_uint32
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(x, ctypes.byref(_err))
     _check_error(_err)
     return _result
@@ -421,9 +421,9 @@ def kitchen_u32_id(x: int) -> int:
 
 def kitchen_i64_id(x: int) -> int:
     _fn = _lib.weaveffi_kitchen_i64_id
-    _fn.argtypes = [ctypes.c_int64, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.c_int64, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_int64
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(x, ctypes.byref(_err))
     _check_error(_err)
     return _result
@@ -431,9 +431,9 @@ def kitchen_i64_id(x: int) -> int:
 
 def kitchen_f64_id(x: float) -> float:
     _fn = _lib.weaveffi_kitchen_f64_id
-    _fn.argtypes = [ctypes.c_double, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.c_double, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_double
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(x, ctypes.byref(_err))
     _check_error(_err)
     return _result
@@ -441,9 +441,9 @@ def kitchen_f64_id(x: float) -> float:
 
 def kitchen_echo_string(s: str) -> str:
     _fn = _lib.weaveffi_kitchen_echo_string
-    _fn.argtypes = [ctypes.c_char_p, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.c_char_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_char_p
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(_string_to_bytes(s), ctypes.byref(_err))
     _check_error(_err)
     return _bytes_to_string(_result) or ""
@@ -451,10 +451,10 @@ def kitchen_echo_string(s: str) -> str:
 
 def kitchen_echo_bytes(b: bytes) -> bytes:
     _fn = _lib.weaveffi_kitchen_echo_bytes
-    _fn.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.POINTER(ctypes.c_uint8)
     _b_arr = (ctypes.c_uint8 * len(b))(*b)
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _out_len = ctypes.c_size_t(0)
     _result = _fn(_b_arr, len(b), ctypes.byref(_out_len), ctypes.byref(_err))
     _check_error(_err)
@@ -467,9 +467,9 @@ def kitchen_echo_borrowed_str(s: str) -> str:
     """Borrowed string parameter
     """
     _fn = _lib.weaveffi_kitchen_echo_borrowed_str
-    _fn.argtypes = [ctypes.c_char_p, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.c_char_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_char_p
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(_string_to_bytes(s), ctypes.byref(_err))
     _check_error(_err)
     return _bytes_to_string(_result) or ""
@@ -479,10 +479,10 @@ def kitchen_echo_borrowed_bytes(b: bytes) -> bytes:
     """Borrowed bytes parameter
     """
     _fn = _lib.weaveffi_kitchen_echo_borrowed_bytes
-    _fn.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.POINTER(ctypes.c_uint8)
     _b_arr = (ctypes.c_uint8 * len(b))(*b)
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _out_len = ctypes.c_size_t(0)
     _result = _fn(_b_arr, len(b), ctypes.byref(_out_len), ctypes.byref(_err))
     _check_error(_err)
@@ -495,9 +495,9 @@ def kitchen_open_handle() -> int:
     """Returns an opaque handle
     """
     _fn = _lib.weaveffi_kitchen_open_handle
-    _fn.argtypes = [ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_uint64
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(ctypes.byref(_err))
     _check_error(_err)
     return _result
@@ -507,13 +507,13 @@ def kitchen_open_typed_handle() -> "Token":
     """Returns a typed handle
     """
     _fn = _lib.weaveffi_kitchen_open_typed_handle
-    _fn.argtypes = [ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_void_p
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(ctypes.byref(_err))
     _check_error(_err)
     if _result is None:
-        raise WeaveffiError(-1, "null pointer")
+        raise WeaveFFIError(-1, "null pointer")
     return Token(_result)
 
 
@@ -521,9 +521,9 @@ def kitchen_maybe_item(id: int) -> Optional["Item"]:
     """Optional struct return
     """
     _fn = _lib.weaveffi_kitchen_maybe_item
-    _fn.argtypes = [ctypes.c_int64, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.c_int64, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_void_p
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(id, ctypes.byref(_err))
     _check_error(_err)
     if _result is None:
@@ -535,9 +535,9 @@ def kitchen_list_items() -> List["Item"]:
     """List of structs
     """
     _fn = _lib.weaveffi_kitchen_list_items
-    _fn.argtypes = [ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.POINTER(ctypes.c_void_p)
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _out_len = ctypes.c_size_t(0)
     _result = _fn(ctypes.byref(_out_len), ctypes.byref(_err))
     _check_error(_err)
@@ -550,9 +550,9 @@ def kitchen_get_attrs() -> Dict[str, int]:
     """Map return type
     """
     _fn = _lib.weaveffi_kitchen_get_attrs
-    _fn.argtypes = [ctypes.POINTER(ctypes.POINTER(ctypes.c_char_p)), ctypes.POINTER(ctypes.POINTER(ctypes.c_int32)), ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.POINTER(ctypes.POINTER(ctypes.c_char_p)), ctypes.POINTER(ctypes.POINTER(ctypes.c_int32)), ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = None
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _out_keys = ctypes.POINTER(ctypes.c_char_p)()
     _out_values = ctypes.POINTER(ctypes.c_int32)()
     _out_len = ctypes.c_size_t(0)
@@ -575,10 +575,10 @@ class _StreamItemsIterator:
         if self._done:
             raise StopIteration
         _next_fn = _lib.weaveffi_kitchen_StreamItemsIterator_next
-        _next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(_WeaveffiErrorStruct)]
+        _next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(_WeaveFFIErrorStruct)]
         _next_fn.restype = ctypes.c_int32
         _out_item = ctypes.c_void_p()
-        _err = _WeaveffiErrorStruct()
+        _err = _WeaveFFIErrorStruct()
         _has = _next_fn(self._ptr, ctypes.byref(_out_item), ctypes.byref(_err))
         _check_error(_err)
         if not _has:
@@ -603,13 +603,13 @@ def kitchen_stream_items() -> Iterator["Item"]:
     """Iterator return type
     """
     _fn = _lib.weaveffi_kitchen_stream_items
-    _fn.argtypes = [ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_void_p
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(ctypes.byref(_err))
     _check_error(_err)
     _next_fn = _lib.weaveffi_kitchen_StreamItemsIterator_next
-    _next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(_WeaveffiErrorStruct)]
+    _next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(_WeaveFFIErrorStruct)]
     _next_fn.restype = ctypes.c_int32
     _destroy_fn = _lib.weaveffi_kitchen_StreamItemsIterator_destroy
     _destroy_fn.argtypes = [ctypes.c_void_p]
@@ -617,7 +617,7 @@ def kitchen_stream_items() -> Iterator["Item"]:
     _items = []
     while True:
         _out_item = ctypes.c_void_p()
-        _item_err = _WeaveffiErrorStruct()
+        _item_err = _WeaveFFIErrorStruct()
         _has = _next_fn(_result, ctypes.byref(_out_item), ctypes.byref(_item_err))
         _check_error(_item_err)
         if not _has:
@@ -631,13 +631,13 @@ def kitchen_cross_module_token() -> "Token":
     """Returns the shared Token type from another module
     """
     _fn = _lib.weaveffi_kitchen_cross_module_token
-    _fn.argtypes = [ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_void_p
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(ctypes.byref(_err))
     _check_error(_err)
     if _result is None:
-        raise WeaveffiError(-1, "null pointer")
+        raise WeaveFFIError(-1, "null pointer")
     return Token(_result)
 
 
@@ -653,7 +653,7 @@ def _kitchen_do_async_sync(input: str) -> str:
                 _code = err.contents.code
                 _msg = err.contents.message.decode("utf-8") if err.contents.message else ""
                 _lib.weaveffi_error_clear(ctypes.byref(err.contents))
-                _state["err"] = WeaveffiError(_code, _msg)
+                _state["err"] = WeaveFFIError(_code, _msg)
             else:
                 _s = _bytes_to_string(result) or "" if result else ""
                 if result:
@@ -661,7 +661,7 @@ def _kitchen_do_async_sync(input: str) -> str:
                 _state["val"] = _s
         finally:
             _ev.set()
-    _cb_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(_WeaveffiErrorStruct), ctypes.c_char_p)
+    _cb_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct), ctypes.c_char_p)
     _cb = _cb_type(_cb_impl)
     _fn.argtypes = [ctypes.c_char_p, _cb_type, ctypes.c_void_p]
     _fn.restype = None
@@ -691,7 +691,7 @@ def _kitchen_do_cancellable_sync(input: str) -> str:
                 _code = err.contents.code
                 _msg = err.contents.message.decode("utf-8") if err.contents.message else ""
                 _lib.weaveffi_error_clear(ctypes.byref(err.contents))
-                _state["err"] = WeaveffiError(_code, _msg)
+                _state["err"] = WeaveFFIError(_code, _msg)
             else:
                 _s = _bytes_to_string(result) or "" if result else ""
                 if result:
@@ -699,7 +699,7 @@ def _kitchen_do_cancellable_sync(input: str) -> str:
                 _state["val"] = _s
         finally:
             _ev.set()
-    _cb_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(_WeaveffiErrorStruct), ctypes.c_char_p)
+    _cb_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct), ctypes.c_char_p)
     _cb = _cb_type(_cb_impl)
     _fn.argtypes = [ctypes.c_char_p, ctypes.c_void_p, _cb_type, ctypes.c_void_p]
     _fn.restype = None
@@ -723,9 +723,9 @@ def kitchen_legacy_op() -> int:
     import warnings
     warnings.warn("Use new_op instead", DeprecationWarning, stacklevel=2)
     _fn = _lib.weaveffi_kitchen_legacy_op
-    _fn.argtypes = [ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_int32
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(ctypes.byref(_err))
     _check_error(_err)
     return _result
@@ -735,9 +735,9 @@ def kitchen_new_op() -> int:
     """Replacement for legacy_op
     """
     _fn = _lib.weaveffi_kitchen_new_op
-    _fn.argtypes = [ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_int32
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(ctypes.byref(_err))
     _check_error(_err)
     return _result
@@ -749,9 +749,9 @@ def kitchen_nested_hello() -> str:
     """Trivial nested-module function
     """
     _fn = _lib.weaveffi_kitchen_nested_hello
-    _fn.argtypes = [ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_char_p
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(ctypes.byref(_err))
     _check_error(_err)
     return _bytes_to_string(_result) or ""

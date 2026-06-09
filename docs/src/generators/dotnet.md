@@ -120,20 +120,20 @@ public class Contact : IDisposable
 ```
 
 Functions live as static methods on a class named after the module
-and throw `WeaveffiException` on failure:
+and throw `WeaveFFIException` on failure:
 
 ```csharp
 public static class Contacts
 {
     public static ulong CreateContact(string name, string? email, int age)
     {
-        var err = new WeaveffiError();
+        var err = new WeaveFFIError();
         var namePtr = Marshal.StringToCoTaskMemUTF8(name);
         var emailPtr = email != null ? Marshal.StringToCoTaskMemUTF8(email) : IntPtr.Zero;
         try {
             var result = NativeMethods.weaveffi_contacts_create_contact(
                 namePtr, emailPtr, age, ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             return result;
         } finally {
             Marshal.FreeCoTaskMem(namePtr);
@@ -156,7 +156,7 @@ internal static class NativeMethods
     [DllImport(LibName, EntryPoint = "weaveffi_contacts_create_contact",
                CallingConvention = CallingConvention.Cdecl)]
     internal static extern ulong weaveffi_contacts_create_contact(
-        IntPtr name, IntPtr email, int age, ref WeaveffiError err);
+        IntPtr name, IntPtr email, int age, ref WeaveFFIError err);
 }
 ```
 

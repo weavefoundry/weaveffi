@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
 use weaveffi_core::model::{BindingModel, FnBinding, ParamBinding, StructBinding};
+use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::utils::{
     c_abi_struct_name, local_type_name, render_json_prelude, render_prelude, render_trailer,
     wrapper_name, CommentStyle,
@@ -91,7 +92,14 @@ impl LanguageBackend for NodeGenerator {
             ),
             OutputFile::new(
                 dir.join("package.json"),
-                render_package_json(config.package_name(), input_basename),
+                render_package_json(
+                    &pkg::resolve(
+                        api,
+                        config.package_name.as_deref(),
+                        config.input_basename.as_deref(),
+                    ),
+                    input_basename,
+                ),
             ),
             OutputFile::new(dir.join("binding.gyp"), render_binding_gyp(input_basename)),
             OutputFile::new(
@@ -104,10 +112,28 @@ impl LanguageBackend for NodeGenerator {
 
 weaveffi_core::impl_generator_via_backend!(NodeGenerator);
 
-fn render_package_json(name: &str, input_basename: &str) -> String {
+fn render_package_json(package: &ResolvedPackage, input_basename: &str) -> String {
     let prelude = render_json_prelude(input_basename);
+    let name = &package.name;
+    let version = &package.version;
+    let description = package.description_or_default();
+    let mut optional = String::new();
+    if let Some(license) = &package.license {
+        optional.push_str(&format!("  \"license\": \"{license}\",\n"));
+    }
+    if let Some(author) = package.authors.first() {
+        optional.push_str(&format!("  \"author\": \"{author}\",\n"));
+    }
+    if let Some(homepage) = &package.homepage {
+        optional.push_str(&format!("  \"homepage\": \"{homepage}\",\n"));
+    }
+    if let Some(repository) = &package.repository {
+        optional.push_str(&format!(
+            "  \"repository\": {{ \"type\": \"git\", \"url\": \"{repository}\" }},\n"
+        ));
+    }
     format!(
-        "{{\n{prelude}  \"name\": \"{name}\",\n  \"version\": \"0.1.0\",\n  \"main\": \"index.js\",\n  \"types\": \"types.d.ts\",\n  \"gypfile\": true,\n  \"scripts\": {{\n    \"install\": \"node-gyp rebuild\"\n  }}\n}}\n"
+        "{{\n{prelude}  \"name\": \"{name}\",\n  \"version\": \"{version}\",\n  \"description\": \"{description}\",\n{optional}  \"main\": \"index.js\",\n  \"types\": \"types.d.ts\",\n  \"gypfile\": true,\n  \"scripts\": {{\n    \"install\": \"node-gyp rebuild\"\n  }}\n}}\n"
     )
 }
 
@@ -138,7 +164,11 @@ fn c_elem_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
         TypeRef::I64 => "int64_t".into(),
         TypeRef::F64 => "double".into(),
         TypeRef::Bool => "bool".into(),
-        TypeRef::TypedHandle(_) | TypeRef::Handle => "weaveffi_handle_t".into(),
+        // A generic `handle` is an opaque integer; a typed `handle<T>` is the C
+        // ABI struct pointer for T (same lowering as a struct value), so it must
+        // carry T's owner-qualified symbol, not the generic integer type.
+        TypeRef::Handle => "weaveffi_handle_t".into(),
+        TypeRef::TypedHandle(s) => format!("{}*", c_abi_struct_name(s, module, prefix)),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "const uint8_t*".into(),
         TypeRef::Struct(s) => format!("{}*", c_abi_struct_name(s, module, prefix)),
@@ -159,7 +189,8 @@ fn c_ret_type_str(ty: &TypeRef, module: &str, prefix: &str) -> String {
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "const uint8_t*".into(),
-        TypeRef::TypedHandle(_) | TypeRef::Handle => "weaveffi_handle_t".into(),
+        TypeRef::Handle => "weaveffi_handle_t".into(),
+        TypeRef::TypedHandle(s) => format!("{}*", c_abi_struct_name(s, module, prefix)),
         TypeRef::Struct(s) => format!("{}*", c_abi_struct_name(s, module, prefix)),
         TypeRef::Enum(e) => format!("{prefix}_{module}_{e}"),
         TypeRef::Optional(inner) => {
@@ -299,7 +330,9 @@ fn emit_async_resolve_value(
             );
         }
         Some(TypeRef::TypedHandle(_) | TypeRef::Handle) => {
-            out.push_str("        napi_create_int64(ctx->env, (int64_t)result, &val);\n");
+            out.push_str(
+                "        napi_create_int64(ctx->env, (int64_t)(intptr_t)result, &val);\n",
+            );
         }
         Some(TypeRef::Struct(name)) => {
             emit_struct_to_object(
@@ -505,12 +538,20 @@ fn emit_param(
             c_args.push(name.into());
             cleanups.push(format!("  free({name});\n"));
         }
-        TypeRef::TypedHandle(_) | TypeRef::Handle => {
+        TypeRef::Handle => {
             out.push_str(&format!("  int64_t {name}_raw;\n"));
             out.push_str(&format!(
                 "  napi_get_value_int64(env, args[{idx}], &{name}_raw);\n"
             ));
             c_args.push(format!("(weaveffi_handle_t){name}_raw"));
+        }
+        TypeRef::TypedHandle(s) => {
+            let abi = c_abi_struct_name(s, module, prefix);
+            out.push_str(&format!("  int64_t {name}_raw;\n"));
+            out.push_str(&format!(
+                "  napi_get_value_int64(env, args[{idx}], &{name}_raw);\n"
+            ));
+            c_args.push(format!("({abi}*)(intptr_t){name}_raw"));
         }
         TypeRef::Enum(e) => {
             out.push_str(&format!("  int32_t {name};\n"));
@@ -597,7 +638,7 @@ fn emit_optional_param(
         TypeRef::Bool => {
             emit_opt_val(out, c_args, "bool", "napi_get_value_bool", name, idx);
         }
-        TypeRef::TypedHandle(_) | TypeRef::Handle => {
+        TypeRef::Handle => {
             out.push_str(&format!("  int64_t {name}_raw = 0;\n"));
             out.push_str(&format!("  weaveffi_handle_t {name}_val;\n"));
             out.push_str(&format!("  const weaveffi_handle_t* {name}_ptr = NULL;\n"));
@@ -613,6 +654,22 @@ fn emit_optional_param(
             out.push_str(&format!("    {name}_ptr = &{name}_val;\n"));
             out.push_str("  }\n");
             c_args.push(format!("{name}_ptr"));
+        }
+        // A typed handle is a nullable opaque pointer, so an optional one maps to
+        // the same pointer with NULL standing in for absence — mirroring structs.
+        TypeRef::TypedHandle(s) => {
+            let abi = c_abi_struct_name(s, module, prefix);
+            out.push_str(&format!("  int64_t {name}_raw = 0;\n"));
+            out.push_str(&format!(
+                "  if ({name}_type != napi_null && {name}_type != napi_undefined) {{\n"
+            ));
+            out.push_str(&format!(
+                "    napi_get_value_int64(env, args[{idx}], &{name}_raw);\n"
+            ));
+            out.push_str("  }\n");
+            c_args.push(format!(
+                "{name}_raw ? ({abi}*)(intptr_t){name}_raw : NULL"
+            ));
         }
         TypeRef::Enum(e) => {
             let etype = format!("{prefix}_{module}_{e}");
@@ -701,13 +758,23 @@ fn emit_list_param(
                 "    {getter}(env, {name}_el, &{name}_arr[{name}_i]);\n"
             ));
         }
-        TypeRef::TypedHandle(_) | TypeRef::Handle => {
+        TypeRef::Handle => {
             out.push_str(&format!("    int64_t {name}_h;\n"));
             out.push_str(&format!(
                 "    napi_get_value_int64(env, {name}_el, &{name}_h);\n"
             ));
             out.push_str(&format!(
                 "    {name}_arr[{name}_i] = (weaveffi_handle_t){name}_h;\n"
+            ));
+        }
+        TypeRef::TypedHandle(s) => {
+            let abi = c_abi_struct_name(s, module, prefix);
+            out.push_str(&format!("    int64_t {name}_h;\n"));
+            out.push_str(&format!(
+                "    napi_get_value_int64(env, {name}_el, &{name}_h);\n"
+            ));
+            out.push_str(&format!(
+                "    {name}_arr[{name}_i] = ({abi}*)(intptr_t){name}_h;\n"
             ));
         }
         TypeRef::Enum(_) => {
@@ -960,10 +1027,60 @@ fn emit_struct_to_object(
     out.push_str(&format!("{indent}}}\n"));
 }
 
+/// The C statement that creates a napi value `target` from a leaf C expression
+/// `expr` (scalars, bools, enums, handles). Strings/structs are handled by
+/// [`emit_elem_to_napi`], which needs surrounding context.
+fn napi_create_leaf(env: &str, ty: &TypeRef, expr: &str, target: &str) -> String {
+    match ty {
+        TypeRef::I32 => format!("napi_create_int32({env}, {expr}, &{target});"),
+        TypeRef::U32 => format!("napi_create_uint32({env}, {expr}, &{target});"),
+        TypeRef::I64 => format!("napi_create_int64({env}, {expr}, &{target});"),
+        TypeRef::F64 => format!("napi_create_double({env}, {expr}, &{target});"),
+        TypeRef::Bool => format!("napi_get_boolean({env}, {expr}, &{target});"),
+        TypeRef::Enum(_) => format!("napi_create_int32({env}, (int32_t)({expr}), &{target});"),
+        TypeRef::Handle | TypeRef::TypedHandle(_) => {
+            format!("napi_create_int64({env}, (int64_t)(intptr_t)({expr}), &{target});")
+        }
+        _ => format!("napi_get_null({env}, &{target});"),
+    }
+}
+
+/// Convert a single collection *element* C expression `expr` (a list item or map
+/// value) into the napi value `target`. Owned element strings are freed after
+/// the copy, matching the C ABI's transfer-on-return contract.
+#[allow(clippy::too_many_arguments)]
+fn emit_elem_to_napi(
+    out: &mut String,
+    env: &str,
+    ty: &TypeRef,
+    expr: &str,
+    target: &str,
+    module: &str,
+    prefix: &str,
+    structs: &HashMap<String, StructBinding>,
+    indent: &str,
+) {
+    match ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            out.push_str(&format!(
+                "{indent}napi_create_string_utf8({env}, {expr}, NAPI_AUTO_LENGTH, &{target});\n"
+            ));
+            if matches!(ty, TypeRef::StringUtf8) {
+                out.push_str(&format!("{indent}weaveffi_free_string((char*)({expr}));\n"));
+            }
+        }
+        TypeRef::Struct(name) => {
+            emit_struct_to_object(
+                out, env, name, expr, target, module, prefix, structs, indent, false,
+            );
+        }
+        _ => out.push_str(&format!("{indent}{}\n", napi_create_leaf(env, ty, expr, target))),
+    }
+}
+
 /// Marshal one struct field, read via `getter(pv)`, into the JS value `fv`.
-/// Scalars, enums, handles, owned strings, optional strings and nested structs
-/// are fully materialized; collection- and optional-scalar-typed fields fall
-/// back to `null` (the getter ABIs differ and no conformance sample needs them).
+/// Scalars, enums, handles, owned strings, optional strings, nested structs,
+/// byte buffers, lists, maps, and optional scalars are all materialized.
 #[allow(clippy::too_many_arguments)]
 fn emit_struct_field_to_napi(
     out: &mut String,
@@ -997,7 +1114,7 @@ fn emit_struct_field_to_napi(
             "{indent}napi_create_int32({env}, (int32_t){getter}({pv}), &{fv});\n"
         )),
         TypeRef::Handle | TypeRef::TypedHandle(_) => out.push_str(&format!(
-            "{indent}napi_create_int64({env}, (int64_t){getter}({pv}), &{fv});\n"
+            "{indent}napi_create_int64({env}, (int64_t)(intptr_t){getter}({pv}), &{fv});\n"
         )),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             let owned = matches!(ty, TypeRef::StringUtf8);
@@ -1073,6 +1190,137 @@ fn emit_struct_field_to_napi(
             out.push_str(&format!("{indent}  }}\n"));
             out.push_str(&format!("{indent}}}\n"));
         }
+        // An optional typed handle lowers to a nullable opaque pointer that the
+        // field surfaces as the integer handle (or null), like the non-optional
+        // case but guarded on NULL.
+        TypeRef::Optional(inner) if matches!(inner.as_ref(), TypeRef::TypedHandle(_)) => {
+            let TypeRef::TypedHandle(name) = inner.as_ref() else {
+                unreachable!()
+            };
+            let abi = c_abi_struct_name(name, module, prefix);
+            out.push_str(&format!("{indent}{{\n"));
+            out.push_str(&format!("{indent}  {abi}* {fv}_h = {getter}({pv});\n"));
+            out.push_str(&format!(
+                "{indent}  if ({fv}_h == NULL) {{ napi_get_null({env}, &{fv}); }}\n"
+            ));
+            out.push_str(&format!(
+                "{indent}  else {{ napi_create_int64({env}, (int64_t)(intptr_t){fv}_h, &{fv}); }}\n"
+            ));
+            out.push_str(&format!("{indent}}}\n"));
+        }
+        // Remaining optionals (scalar/bool/enum/handle) lower to a nullable
+        // pointer-to-value the getter returns directly.
+        TypeRef::Optional(inner) => {
+            let ct = c_elem_type(inner, module, prefix);
+            out.push_str(&format!("{indent}{{\n"));
+            out.push_str(&format!("{indent}  {ct}* {fv}_p = {getter}({pv});\n"));
+            out.push_str(&format!(
+                "{indent}  if ({fv}_p == NULL) {{ napi_get_null({env}, &{fv}); }}\n"
+            ));
+            out.push_str(&format!(
+                "{indent}  else {{ {} }}\n",
+                napi_create_leaf(env, inner, &format!("*{fv}_p"), fv)
+            ));
+            out.push_str(&format!("{indent}}}\n"));
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            out.push_str(&format!("{indent}{{\n"));
+            out.push_str(&format!("{indent}  size_t {fv}_len;\n"));
+            out.push_str(&format!(
+                "{indent}  const uint8_t* {fv}_data = (const uint8_t*){getter}({pv}, &{fv}_len);\n"
+            ));
+            out.push_str(&format!(
+                "{indent}  if ({fv}_data == NULL) {{ napi_get_null({env}, &{fv}); }}\n"
+            ));
+            out.push_str(&format!(
+                "{indent}  else {{ void* {fv}_buf; napi_create_buffer_copy({env}, {fv}_len, {fv}_data, &{fv}_buf, &{fv}); }}\n"
+            ));
+            out.push_str(&format!("{indent}}}\n"));
+        }
+        TypeRef::List(inner) => {
+            let et = c_elem_type(inner, module, prefix);
+            out.push_str(&format!("{indent}{{\n"));
+            out.push_str(&format!("{indent}  size_t {fv}_len;\n"));
+            out.push_str(&format!("{indent}  {et}* {fv}_arr = {getter}({pv}, &{fv}_len);\n"));
+            out.push_str(&format!("{indent}  napi_create_array({env}, &{fv});\n"));
+            out.push_str(&format!("{indent}  if ({fv}_arr != NULL) {{\n"));
+            out.push_str(&format!(
+                "{indent}    for (size_t {fv}_i = 0; {fv}_i < {fv}_len; {fv}_i++) {{\n"
+            ));
+            out.push_str(&format!("{indent}      napi_value {fv}_e;\n"));
+            emit_elem_to_napi(
+                out,
+                env,
+                inner,
+                &format!("{fv}_arr[{fv}_i]"),
+                &format!("{fv}_e"),
+                module,
+                prefix,
+                structs,
+                &format!("{indent}      "),
+            );
+            out.push_str(&format!(
+                "{indent}      napi_set_element({env}, {fv}, (uint32_t){fv}_i, {fv}_e);\n"
+            ));
+            out.push_str(&format!("{indent}    }}\n"));
+            out.push_str(&format!("{indent}  }}\n"));
+            out.push_str(&format!("{indent}}}\n"));
+        }
+        TypeRef::Map(k, v) => {
+            let kt = c_elem_type(k, module, prefix);
+            let vt = c_elem_type(v, module, prefix);
+            out.push_str(&format!("{indent}{{\n"));
+            out.push_str(&format!("{indent}  {kt}* {fv}_keys = NULL;\n"));
+            out.push_str(&format!("{indent}  {vt}* {fv}_vals = NULL;\n"));
+            out.push_str(&format!("{indent}  size_t {fv}_len;\n"));
+            out.push_str(&format!(
+                "{indent}  {getter}({pv}, &{fv}_keys, &{fv}_vals, &{fv}_len);\n"
+            ));
+            out.push_str(&format!("{indent}  napi_create_object({env}, &{fv});\n"));
+            out.push_str(&format!(
+                "{indent}  if ({fv}_keys != NULL && {fv}_vals != NULL) {{\n"
+            ));
+            out.push_str(&format!(
+                "{indent}    for (size_t {fv}_i = 0; {fv}_i < {fv}_len; {fv}_i++) {{\n"
+            ));
+            out.push_str(&format!("{indent}      napi_value {fv}_v;\n"));
+            emit_elem_to_napi(
+                out,
+                env,
+                v,
+                &format!("{fv}_vals[{fv}_i]"),
+                &format!("{fv}_v"),
+                module,
+                prefix,
+                structs,
+                &format!("{indent}      "),
+            );
+            match k.as_ref() {
+                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                    out.push_str(&format!(
+                        "{indent}      napi_set_named_property({env}, {fv}, {fv}_keys[{fv}_i], {fv}_v);\n"
+                    ));
+                    if matches!(k.as_ref(), TypeRef::StringUtf8) {
+                        out.push_str(&format!(
+                            "{indent}      weaveffi_free_string((char*){fv}_keys[{fv}_i]);\n"
+                        ));
+                    }
+                }
+                other => {
+                    out.push_str(&format!("{indent}      napi_value {fv}_k;\n"));
+                    out.push_str(&format!(
+                        "{indent}      {}\n",
+                        napi_create_leaf(env, other, &format!("{fv}_keys[{fv}_i]"), &format!("{fv}_k"))
+                    ));
+                    out.push_str(&format!(
+                        "{indent}      napi_set_property({env}, {fv}, {fv}_k, {fv}_v);\n"
+                    ));
+                }
+            }
+            out.push_str(&format!("{indent}    }}\n"));
+            out.push_str(&format!("{indent}  }}\n"));
+            out.push_str(&format!("{indent}}}\n"));
+        }
         _ => out.push_str(&format!("{indent}napi_get_null({env}, &{fv});\n")),
     }
 }
@@ -1100,7 +1348,7 @@ fn emit_ret_to_napi(
             out.push_str("  napi_create_string_utf8(env, result, NAPI_AUTO_LENGTH, &ret);\n");
         }
         TypeRef::TypedHandle(_) | TypeRef::Handle => {
-            out.push_str("  napi_create_int64(env, (int64_t)result, &ret);\n");
+            out.push_str("  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);\n");
         }
         TypeRef::Struct(name) => {
             emit_struct_to_object(
@@ -1135,8 +1383,12 @@ fn emit_ret_to_napi(
             out.push_str("  napi_create_array(env, &ret);\n");
             out.push_str("  uint32_t iter_idx = 0;\n");
             out.push_str(&format!("  {et} iter_item;\n"));
+            // The iterator's `_next` reports per-step faults through a trailing
+            // error out-param; it is part of the C ABI signature and must be
+            // threaded through even when we surface drained items as an array.
+            out.push_str("  weaveffi_error iter_err = {0};\n");
             out.push_str(&format!(
-                "  while ({iter_type}_next(result, &iter_item)) {{\n"
+                "  while ({iter_type}_next(result, &iter_item, &iter_err)) {{\n"
             ));
             out.push_str("    napi_value elem;\n");
             match inner.as_ref() {
@@ -1156,7 +1408,9 @@ fn emit_ret_to_napi(
                     out.push_str("    napi_get_boolean(env, iter_item, &elem);\n");
                 }
                 TypeRef::TypedHandle(_) | TypeRef::Handle => {
-                    out.push_str("    napi_create_int64(env, (int64_t)iter_item, &elem);\n");
+                    out.push_str(
+                        "    napi_create_int64(env, (int64_t)(intptr_t)iter_item, &elem);\n",
+                    );
                 }
                 TypeRef::StringUtf8 => {
                     out.push_str(
@@ -1210,7 +1464,7 @@ fn emit_optional_ret_inner(
             out.push_str("    free(result);\n");
         }
         TypeRef::TypedHandle(_) | TypeRef::Handle => {
-            out.push_str("    napi_create_int64(env, (int64_t)*result, &ret);\n");
+            out.push_str("    napi_create_int64(env, (int64_t)(intptr_t)*result, &ret);\n");
             out.push_str("    free(result);\n");
         }
         TypeRef::Enum(_) => {
@@ -1263,7 +1517,7 @@ fn emit_list_ret(
             "{ind}  napi_get_boolean(env, result[ret_i], &elem);\n"
         )),
         TypeRef::TypedHandle(_) | TypeRef::Handle => out.push_str(&format!(
-            "{ind}  napi_create_int64(env, (int64_t)result[ret_i], &elem);\n"
+            "{ind}  napi_create_int64(env, (int64_t)(intptr_t)result[ret_i], &elem);\n"
         )),
         TypeRef::StringUtf8 => {
             out.push_str(&format!(
@@ -1307,9 +1561,13 @@ fn ts_type_for(ty: &TypeRef) -> String {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "Buffer".into(),
         TypeRef::Handle => "bigint".into(),
-        TypeRef::TypedHandle(name) => name.clone(),
+        // Structs, enums, and typed handles surface as bare local TS names. A
+        // cross-module reference (e.g. `handle<Store>` resolved to `kv.Store`)
+        // must annotate the *local* interface `Store`; the qualified IR name is
+        // not a declared TS type in this module.
+        TypeRef::TypedHandle(name) => local_type_name(name).to_string(),
         TypeRef::Struct(name) => local_type_name(name).to_string(),
-        TypeRef::Enum(name) => name.clone(),
+        TypeRef::Enum(name) => local_type_name(name).to_string(),
         TypeRef::Optional(inner) => format!("{} | null", ts_type_for(inner)),
         TypeRef::List(inner) => {
             let inner_ts = ts_type_for(inner);
@@ -1485,6 +1743,7 @@ mod tests {
             version: "0.1.0".into(),
             modules,
             generators: None,
+            package: None,
         }
     }
 
@@ -1514,6 +1773,19 @@ mod tests {
     fn ts_type_for_struct_and_enum() {
         assert_eq!(ts_type_for(&TypeRef::Struct("Contact".into())), "Contact");
         assert_eq!(ts_type_for(&TypeRef::Enum("Color".into())), "Color");
+        assert_eq!(ts_type_for(&TypeRef::TypedHandle("Contact".into())), "Contact");
+    }
+
+    #[test]
+    fn ts_type_for_cross_module_uses_local_name() {
+        // A typed handle resolved to a parent-module struct (`kv.Store`) must
+        // emit the bare local interface name, the only TS type in this module.
+        assert_eq!(
+            ts_type_for(&TypeRef::TypedHandle("kv.Store".into())),
+            "Store"
+        );
+        assert_eq!(ts_type_for(&TypeRef::Struct("kv.Store".into())), "Store");
+        assert_eq!(ts_type_for(&TypeRef::Enum("kv.Kind".into())), "Kind");
     }
 
     #[test]

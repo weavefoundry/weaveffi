@@ -32,7 +32,7 @@ class WeaveFFI {
     }
 }
 
-class TaskResult internal constructor(private var handle: Long) : java.io.Closeable {
+class TaskResult internal constructor(internal var handle: Long) : java.io.Closeable {
     companion object {
         init { System.loadLibrary("weaveffi") }
 

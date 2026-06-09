@@ -53,8 +53,8 @@ fn generate_inventory_all_targets() {
     }
 
     // Python weaveffi.py contains functions from both modules
-    let weaveffi_py = std::fs::read_to_string(out_path.join("python/weaveffi/weaveffi.py"))
-        .expect("missing python/weaveffi/weaveffi.py");
+    let weaveffi_py = std::fs::read_to_string(out_path.join("python/inventory/weaveffi.py"))
+        .expect("missing python/inventory/weaveffi.py");
     assert!(
         weaveffi_py.contains("def products_create_product"),
         "weaveffi.py should contain products module function"

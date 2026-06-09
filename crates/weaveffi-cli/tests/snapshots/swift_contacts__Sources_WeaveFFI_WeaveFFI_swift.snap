@@ -95,8 +95,8 @@ public enum Contacts {
     public static func contacts_create_contact(_ first_name: String, _ last_name: String, _ email: String?, _ contact_type: ContactType) throws -> UInt64 {
         var err = weaveffi_error(code: 0, message: nil)
         let result: UInt64 = first_name.withCString { first_name_ptr in
-            last_name.withCString { last_name_ptr in
-                withOptionalCString(email) { email_ptr in
+            return last_name.withCString { last_name_ptr in
+                return withOptionalCString(email) { email_ptr in
                         return weaveffi_contacts_create_contact(first_name_ptr, last_name_ptr, email_ptr, weaveffi_contacts_ContactType(contact_type.rawValue), &err)
                 }
             }

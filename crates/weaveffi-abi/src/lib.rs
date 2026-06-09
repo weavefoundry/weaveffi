@@ -118,6 +118,43 @@ pub fn free_bytes(ptr: *mut u8, len: usize) {
     unsafe { drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len))) };
 }
 
+/// Fixed alignment used for every WASM linear-memory allocation handed to JS.
+///
+/// 8 bytes over-aligns scalar/byte buffers but is required for the `{i32 ptr,
+/// i32 len}` and wider return slots that JS reads back through `DataView`.
+#[cfg(target_arch = "wasm32")]
+const WASM_ALLOC_ALIGN: usize = 8;
+
+/// Allocate `size` bytes in this module's WASM linear memory.
+///
+/// The WASM backend has no host-provided allocator, so generated JS glue calls
+/// the `weaveffi_alloc` thunk (emitted by [`export_runtime!`]) to stage input
+/// strings/byte buffers and to reserve struct-return (`sret`) slots. The caller
+/// must release the block with [`wasm_dealloc`] using the *same* `size`.
+#[cfg(target_arch = "wasm32")]
+pub fn wasm_alloc(size: usize) -> *mut u8 {
+    let size = size.max(1);
+    let layout = std::alloc::Layout::from_size_align(size, WASM_ALLOC_ALIGN)
+        .expect("weaveffi_alloc: invalid layout");
+    // SAFETY: `size >= 1` and the alignment is a non-zero power of two.
+    unsafe { std::alloc::alloc(layout) }
+}
+
+/// Release a block previously returned by [`wasm_alloc`].
+///
+/// `size` must match the original allocation request (JS retains it).
+#[cfg(target_arch = "wasm32")]
+pub fn wasm_dealloc(ptr: *mut u8, size: usize) {
+    if ptr.is_null() {
+        return;
+    }
+    let size = size.max(1);
+    let layout = std::alloc::Layout::from_size_align(size, WASM_ALLOC_ALIGN)
+        .expect("weaveffi_dealloc: invalid layout");
+    // SAFETY: `ptr` came from `wasm_alloc` with this exact layout.
+    unsafe { std::alloc::dealloc(ptr, layout) };
+}
+
 /// Clear an error by freeing any message and zeroing fields.
 pub fn error_clear(err: *mut weaveffi_error) {
     error_set_ok(err);

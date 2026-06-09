@@ -18,7 +18,8 @@ class WeaveFFI {
         /**
          * Open (or create) a store backed by the given filesystem path
          */
-        @JvmStatic external fun kv_open_store(path: String): Store
+        @JvmStatic private external fun kv_open_storeJni(path: String): Long
+        @JvmStatic fun kv_open_store(path: String): Store = Store(kv_open_storeJni(path))
         /**
          * Close the store and release all in-memory resources
          */
@@ -90,7 +91,7 @@ enum class EntryKind(val value: Int) {
 }
 
 /** Opaque key-value store handle target type */
-class Store internal constructor(private var handle: Long) : java.io.Closeable {
+class Store internal constructor(internal var handle: Long) : java.io.Closeable {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
@@ -117,7 +118,7 @@ class Store internal constructor(private var handle: Long) : java.io.Closeable {
 }
 
 /** A single key-value entry persisted in the store */
-class Entry internal constructor(private var handle: Long) : java.io.Closeable {
+class Entry internal constructor(internal var handle: Long) : java.io.Closeable {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
@@ -167,7 +168,7 @@ class EntryBuilder {
     private var key: String? = null
     private var value: ByteArray? = null
     private var created_at: Long? = null
-    private var expires_at: Long?? = null
+    private var expires_at: Long? = null
     private var tags: Array<String>? = null
     private var metadata: Map<String, String>? = null
     /** Stable monotonic identifier assigned on insert */
@@ -211,7 +212,7 @@ class EntryBuilder {
             key ?: throw IllegalStateException("missing field: key"),
             value ?: throw IllegalStateException("missing field: value"),
             created_at ?: throw IllegalStateException("missing field: created_at"),
-            expires_at ?: throw IllegalStateException("missing field: expires_at"),
+            expires_at,
             tags ?: throw IllegalStateException("missing field: tags"),
             metadata ?: throw IllegalStateException("missing field: metadata")
         )
@@ -219,7 +220,7 @@ class EntryBuilder {
 }
 
 /** Aggregate store statistics */
-class Stats internal constructor(private var handle: Long) : java.io.Closeable {
+class Stats internal constructor(internal var handle: Long) : java.io.Closeable {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
@@ -253,13 +254,13 @@ class Stats internal constructor(private var handle: Long) : java.io.Closeable {
 
 sealed class WeaveFFIException(val code: Int, message: String) : Exception(message) {
     /** No entry exists for the requested key */
-    class KEY_NOT_FOUND(message: String = "Key not found") : WeaveFFIException(1001, message)
+    class KeyNotFound(message: String = "Key not found") : WeaveFFIException(1001, message)
     /** The entry exists but its TTL has elapsed */
-    class EXPIRED(message: String = "Entry expired") : WeaveFFIException(1002, message)
+    class Expired(message: String = "Entry expired") : WeaveFFIException(1002, message)
     /** The store has reached its capacity limit */
-    class STORE_FULL(message: String = "Store is full") : WeaveFFIException(1003, message)
+    class StoreFull(message: String = "Store is full") : WeaveFFIException(1003, message)
     /** Underlying storage reported an I/O failure */
-    class IO_ERROR(message: String = "I/O error") : WeaveFFIException(1004, message)
+    class IoError(message: String = "I/O error") : WeaveFFIException(1004, message)
 }
 
 internal class WeaveContinuation<T>(private val cont: kotlinx.coroutines.CancellableContinuation<T>) {

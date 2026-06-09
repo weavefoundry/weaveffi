@@ -27,7 +27,7 @@ export function graphics_new_canvas(width: number): Canvas
 export interface Shape {
   sides: number;
   /** Reference up to the parent module's enum */
-  unit: graphics.Unit;
+  unit: Unit;
   /** Reference down into a deeper module */
   detail: Detail;
 }

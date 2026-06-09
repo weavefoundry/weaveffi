@@ -5,7 +5,7 @@
 // optional strings (null email), list-of-struct returns (the `out_len` +
 // `T**` lowering), boolean returns, and the thrown-exception error path.
 
-import 'package:weaveffi/weaveffi.dart' as wv;
+import 'package:__PKG__/__LIB__.dart' as wv;
 
 void expect(bool cond, String msg) {
   if (!cond) throw StateError('assertion failed: $msg');
@@ -39,8 +39,8 @@ void main() {
 
   try {
     wv.getContact(9999);
-    throw StateError('expected WeaveffiException for missing contact');
-  } on wv.WeaveffiException catch (e) {
+    throw StateError('expected WeaveFFIException for missing contact');
+  } on wv.WeaveFFIException catch (e) {
     expect(e.code != 0, 'error code non-zero');
   }
 

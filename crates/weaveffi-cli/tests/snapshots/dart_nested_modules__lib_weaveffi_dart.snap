@@ -24,31 +24,31 @@ DynamicLibrary _openLibrary() {
 
 final DynamicLibrary _lib = _openLibrary();
 
-final class _WeaveffiError extends Struct {
+final class _WeaveFFIError extends Struct {
   @Int32()
   external int code;
   external Pointer<Utf8> message;
 }
 
-typedef _NativeWeaveffiErrorClear = Void Function(Pointer<_WeaveffiError>);
-typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiErrorClear = Void Function(Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveFFIError>);
 final _weaveffiErrorClear = _lib.lookupFunction<
     _NativeWeaveffiErrorClear, _DartWeaveffiErrorClear>('weaveffi_error_clear');
 
-class WeaveffiException implements Exception {
+class WeaveFFIException implements Exception {
   final int code;
   final String message;
-  WeaveffiException(this.code, this.message);
+  WeaveFFIException(this.code, this.message);
   @override
-  String toString() => 'WeaveffiException($code): $message';
+  String toString() => 'WeaveFFIException($code): $message';
 }
 
-void _checkError(Pointer<_WeaveffiError> err) {
+void _checkError(Pointer<_WeaveFFIError> err) {
   if (err.ref.code != 0) {
     final code = err.ref.code;
     final msg = err.ref.message.toDartString();
     _weaveffiErrorClear(err);
-    throw WeaveffiException(code, msg);
+    throw WeaveFFIException(code, msg);
   }
 }
 
@@ -100,14 +100,14 @@ class Canvas {
   }
 }
 
-typedef _NativeWeaveffiGraphicsNewCanvas = Pointer<Void> Function(Int32, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiGraphicsNewCanvas = Pointer<Void> Function(int, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiGraphicsNewCanvas = Pointer<Void> Function(Int32, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiGraphicsNewCanvas = Pointer<Void> Function(int, Pointer<_WeaveFFIError>);
 final _weaveffiGraphicsNewCanvas = _lib.lookupFunction<
     _NativeWeaveffiGraphicsNewCanvas, _DartWeaveffiGraphicsNewCanvas>('weaveffi_graphics_new_canvas');
 
 /// Construct a Canvas.
 Canvas newCanvas(int width) {
-  final err = calloc<_WeaveffiError>();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiGraphicsNewCanvas(width, err);
     _checkError(err);
@@ -152,9 +152,9 @@ class Shape {
   }
 
   /// Reference up to the parent module's enum
-  GraphicsUnit get unit {
+  Unit get unit {
     final result = _weaveffiGraphicsShapesShapeGetUnit(_handle);
-    return GraphicsUnit.fromValue(result);
+    return Unit.fromValue(result);
   }
 
   /// Reference down into a deeper module
@@ -164,14 +164,14 @@ class Shape {
   }
 }
 
-typedef _NativeWeaveffiGraphicsShapesMakeShape = Pointer<Void> Function(Int32, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiGraphicsShapesMakeShape = Pointer<Void> Function(int, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiGraphicsShapesMakeShape = Pointer<Void> Function(Int32, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiGraphicsShapesMakeShape = Pointer<Void> Function(int, Pointer<_WeaveFFIError>);
 final _weaveffiGraphicsShapesMakeShape = _lib.lookupFunction<
     _NativeWeaveffiGraphicsShapesMakeShape, _DartWeaveffiGraphicsShapesMakeShape>('weaveffi_graphics_shapes_make_shape');
 
 /// Construct a Shape.
 Shape makeShape(int sides) {
-  final err = calloc<_WeaveffiError>();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiGraphicsShapesMakeShape(sides, err);
     _checkError(err);
@@ -181,14 +181,14 @@ Shape makeShape(int sides) {
   }
 }
 
-typedef _NativeWeaveffiGraphicsShapesDescribe = Pointer<Void> Function(Pointer<_WeaveffiError>);
-typedef _DartWeaveffiGraphicsShapesDescribe = Pointer<Void> Function(Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiGraphicsShapesDescribe = Pointer<Void> Function(Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiGraphicsShapesDescribe = Pointer<Void> Function(Pointer<_WeaveFFIError>);
 final _weaveffiGraphicsShapesDescribe = _lib.lookupFunction<
     _NativeWeaveffiGraphicsShapesDescribe, _DartWeaveffiGraphicsShapesDescribe>('weaveffi_graphics_shapes_describe');
 
 /// Nested function returning a struct owned by an ancestor module.
 Canvas describe() {
-  final err = calloc<_WeaveffiError>();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiGraphicsShapesDescribe(err);
     _checkError(err);
@@ -223,14 +223,14 @@ class Detail {
   }
 }
 
-typedef _NativeWeaveffiGraphicsShapesGeometryCompute = Pointer<Void> Function(Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiGraphicsShapesGeometryCompute = Pointer<Void> Function(Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiGraphicsShapesGeometryCompute = Pointer<Void> Function(Pointer<Void>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiGraphicsShapesGeometryCompute = Pointer<Void> Function(Pointer<Void>, Pointer<_WeaveFFIError>);
 final _weaveffiGraphicsShapesGeometryCompute = _lib.lookupFunction<
     _NativeWeaveffiGraphicsShapesGeometryCompute, _DartWeaveffiGraphicsShapesGeometryCompute>('weaveffi_graphics_shapes_geometry_compute');
 
 /// Deeper function taking an ancestor-module struct.
 Detail compute(Shape shape) {
-  final err = calloc<_WeaveffiError>();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiGraphicsShapesGeometryCompute(shape._handle, err);
     _checkError(err);

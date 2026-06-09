@@ -24,43 +24,43 @@ DynamicLibrary _openLibrary() {
 
 final DynamicLibrary _lib = _openLibrary();
 
-final class _WeaveffiError extends Struct {
+final class _WeaveFFIError extends Struct {
   @Int32()
   external int code;
   external Pointer<Utf8> message;
 }
 
-typedef _NativeWeaveffiErrorClear = Void Function(Pointer<_WeaveffiError>);
-typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiErrorClear = Void Function(Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveFFIError>);
 final _weaveffiErrorClear = _lib.lookupFunction<
     _NativeWeaveffiErrorClear, _DartWeaveffiErrorClear>('weaveffi_error_clear');
 
-class WeaveffiException implements Exception {
+class WeaveFFIException implements Exception {
   final int code;
   final String message;
-  WeaveffiException(this.code, this.message);
+  WeaveFFIException(this.code, this.message);
   @override
-  String toString() => 'WeaveffiException($code): $message';
+  String toString() => 'WeaveFFIException($code): $message';
 }
 
-void _checkError(Pointer<_WeaveffiError> err) {
+void _checkError(Pointer<_WeaveFFIError> err) {
   if (err.ref.code != 0) {
     final code = err.ref.code;
     final msg = err.ref.message.toDartString();
     _weaveffiErrorClear(err);
-    throw WeaveffiException(code, msg);
+    throw WeaveFFIException(code, msg);
   }
 }
 
-typedef _NativeWeaveffiEventsSendMessage = Void Function(Pointer<Utf8>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiEventsSendMessage = void Function(Pointer<Utf8>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiEventsSendMessage = Void Function(Pointer<Utf8>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiEventsSendMessage = void Function(Pointer<Utf8>, Pointer<_WeaveFFIError>);
 final _weaveffiEventsSendMessage = _lib.lookupFunction<
     _NativeWeaveffiEventsSendMessage, _DartWeaveffiEventsSendMessage>('weaveffi_events_send_message');
 
 /// Send a message, triggering the OnMessage callback
 void sendMessage(String text) {
-  final err = calloc<_WeaveffiError>();
   final textPtr = text.toNativeUtf8();
+  final err = calloc<_WeaveFFIError>();
   try {
     _weaveffiEventsSendMessage(textPtr, err);
     _checkError(err);
@@ -70,18 +70,37 @@ void sendMessage(String text) {
   }
 }
 
-typedef _NativeWeaveffiEventsGetMessages = Pointer<Void> Function(Pointer<_WeaveffiError>);
-typedef _DartWeaveffiEventsGetMessages = Pointer<Void> Function(Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiEventsGetMessages = Pointer<Void> Function(Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiEventsGetMessages = Pointer<Void> Function(Pointer<_WeaveFFIError>);
 final _weaveffiEventsGetMessages = _lib.lookupFunction<
     _NativeWeaveffiEventsGetMessages, _DartWeaveffiEventsGetMessages>('weaveffi_events_get_messages');
 
+typedef _NativeWeaveffiEventsGetMessagesIteratorNext = Int32 Function(Pointer<Void>, Pointer<Pointer<Utf8>>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiEventsGetMessagesIteratorNext = int Function(Pointer<Void>, Pointer<Pointer<Utf8>>, Pointer<_WeaveFFIError>);
+final _weaveffiEventsGetMessagesIteratorNext = _lib.lookupFunction<
+    _NativeWeaveffiEventsGetMessagesIteratorNext, _DartWeaveffiEventsGetMessagesIteratorNext>('weaveffi_events_GetMessagesIterator_next');
+
+typedef _NativeWeaveffiEventsGetMessagesIteratorDestroy = Void Function(Pointer<Void>);
+typedef _DartWeaveffiEventsGetMessagesIteratorDestroy = void Function(Pointer<Void>);
+final _weaveffiEventsGetMessagesIteratorDestroy = _lib.lookupFunction<
+    _NativeWeaveffiEventsGetMessagesIteratorDestroy, _DartWeaveffiEventsGetMessagesIteratorDestroy>('weaveffi_events_GetMessagesIterator_destroy');
+
 /// Return an iterator over all sent messages
 Iterable<String> getMessages() {
-  final err = calloc<_WeaveffiError>();
+  final err = calloc<_WeaveFFIError>();
   try {
-    final result = _weaveffiEventsGetMessages(err);
+    final iter = _weaveffiEventsGetMessages(err);
     _checkError(err);
-    return result;
+    final items = <String>[];
+    final outItem = calloc<Pointer<Utf8>>();
+    while (_weaveffiEventsGetMessagesIteratorNext(iter, outItem, err) != 0) {
+      _checkError(err);
+      items.add(outItem.value.toDartString());
+    }
+    _checkError(err);
+    calloc.free(outItem);
+    _weaveffiEventsGetMessagesIteratorDestroy(iter);
+    return items;
   } finally {
     calloc.free(err);
   }

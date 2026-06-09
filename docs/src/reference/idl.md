@@ -27,6 +27,9 @@ and objects:
 ```text
 # yaml-language-server: $schema=./weaveffi.schema.json
 version: "0.3.0"
+package:
+  name: my_app
+  version: "1.0.0"
 modules:
   - name: my_module
     structs: [...]
@@ -47,6 +50,7 @@ A complete, validating example lives at the bottom of this page in the
 | Field        | Type                        | Required | Description                              |
 |--------------|-----------------------------|----------|------------------------------------------|
 | `version`    | string                      | yes      | Schema version (`"0.1.0"`, `"0.2.0"`, or `"0.3.0"`) |
+| `package`    | Package                     | no       | Publishable identity stamped into every generated manifest (see [Package metadata](#package-metadata)) |
 | `modules`    | array of Module             | yes      | One or more modules                      |
 | `generators` | map of string to object     | no       | Per-generator configuration (see [generators section](#generators-section)) |
 
@@ -84,6 +88,76 @@ A complete, validating example lives at the bottom of this page in the
 | `type`    | TypeRef | yes      | Parameter type                           |
 | `mutable` | bool    | no       | Mark as mutable (default `false`). Indicates the callee may modify the value in-place. |
 | `doc`     | string  | no       | Documentation string (see [Documentation comments](#documentation-comments)) |
+
+---
+
+## Package metadata
+
+The optional top-level `package` block is the single source of truth for the
+publishable identity stamped into every generated ecosystem manifest —
+`package.json` (Node/WASM), `pyproject.toml`/`setup.py` (Python),
+`*.gemspec` (Ruby), `*.csproj`/`*.nuspec` (.NET), `pubspec.yaml` (Dart),
+`Package.swift` (Swift), `go.mod` (Go), `settings.gradle` (Android), and
+`CMakeLists.txt` (C++). Declaring it once keeps the name, version, and
+metadata consistent across all eleven targets instead of every generator
+hardcoding `weaveffi` / `0.1.0`.
+
+### Package schema
+
+| Field         | Type            | Required | Description                                         |
+|---------------|-----------------|----------|-----------------------------------------------------|
+| `name`        | string          | yes      | Distribution name (npm/PyPI/gem/NuGet/pub/...)      |
+| `version`     | string          | yes      | Semantic version stamped into each manifest         |
+| `description` | string          | no       | One-line package description                        |
+| `license`     | string          | no       | SPDX license expression (e.g. `MIT`, `Apache-2.0`)  |
+| `authors`     | array of string | no       | Author entries (`Name <email>`)                     |
+| `homepage`    | string          | no       | Project homepage URL                                |
+| `repository`  | string          | no       | Source repository URL                               |
+
+### Name and version resolution
+
+Each target resolves its package name with the following precedence (first
+non-empty wins):
+
+1. an explicit per-target override (e.g. `python.package_name`,
+   `dart.package_name`, `ruby.gem_name`),
+2. `package.name`,
+3. the IDL file stem (e.g. `kvstore.yml` → `kvstore`),
+4. the built-in default `weaveffi`.
+
+The version resolves from `package.version`, falling back to `0.1.0`. Names
+are normalized per ecosystem — e.g. a Python import package or Ruby `require`
+path lowercases and replaces non-alphanumerics with `_` (`my-kv.store` →
+`my_kv_store`), while the published distribution name keeps the original
+spelling.
+
+> Code-level identity that has no manifest of its own still follows the
+> package where it is unambiguous: the Swift module name defaults to the
+> PascalCased `package.name` (`async-demo` → `AsyncDemo`). The stable C ABI
+> symbol prefix is **not** affected — it stays `weaveffi` (or your global
+> `c_prefix`) so the generated bindings keep calling the symbols the producer
+> exports.
+
+### Package example
+
+```yaml
+version: "0.3.0"
+package:
+  name: kvstore
+  version: "1.0.0"
+  description: An embedded key-value store API.
+  license: MIT
+  authors:
+    - WeaveFoundry <hello@weavefoundry.dev>
+  homepage: https://github.com/weavefoundry/weaveffi
+  repository: https://github.com/weavefoundry/weaveffi
+modules:
+  - name: kv
+    functions:
+      - name: count
+        params: []
+        return: i64
+```
 
 ---
 

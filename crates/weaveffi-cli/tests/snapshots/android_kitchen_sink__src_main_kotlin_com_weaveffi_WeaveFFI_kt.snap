@@ -44,7 +44,8 @@ class WeaveFFI {
         /**
          * Returns a typed handle
          */
-        @JvmStatic external fun kitchen_open_typed_handle(): Token
+        @JvmStatic private external fun kitchen_open_typed_handleJni(): Long
+        @JvmStatic fun kitchen_open_typed_handle(): Token = Token(kitchen_open_typed_handleJni())
         /**
          * Optional struct return
          */
@@ -96,7 +97,7 @@ class WeaveFFI {
 }
 
 /** A reusable token referenced across modules */
-class Token internal constructor(private var handle: Long) : java.io.Closeable {
+class Token internal constructor(internal var handle: Long) : java.io.Closeable {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
@@ -138,7 +139,7 @@ enum class Priority(val value: Int) {
 }
 
 /** Kitchen sink struct exercising every field feature */
-class Item internal constructor(private var handle: Long) : java.io.Closeable {
+class Item internal constructor(internal var handle: Long) : java.io.Closeable {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
@@ -177,7 +178,7 @@ class Item internal constructor(private var handle: Long) : java.io.Closeable {
     val parent: Long? get() = nativeGetParent(handle)
     /** Cross-module struct reference */
     val token: Token get() = Token(nativeGetToken(handle))
-    val priority: Priority get() = nativeGetPriority(handle)
+    val priority: Priority get() = Priority.fromValue(nativeGetPriority(handle))
 
     override fun close() {
         if (handle != 0L) {
@@ -202,7 +203,7 @@ class ItemBuilder {
     private var payload: ByteArray? = null
     private var tags: Array<String>? = null
     private var attrs: Map<String, String>? = null
-    private var parent: Long?? = null
+    private var parent: Long? = null
     private var token: Token? = null
     private var priority: Priority? = null
     /** Stable identifier */
@@ -270,7 +271,7 @@ class ItemBuilder {
             payload ?: throw IllegalStateException("missing field: payload"),
             tags ?: throw IllegalStateException("missing field: tags"),
             attrs ?: throw IllegalStateException("missing field: attrs"),
-            parent ?: throw IllegalStateException("missing field: parent"),
+            parent,
             token ?: throw IllegalStateException("missing field: token"),
             priority ?: throw IllegalStateException("missing field: priority")
         )
@@ -278,8 +279,8 @@ class ItemBuilder {
 }
 
 sealed class WeaveFFIException(val code: Int, message: String) : Exception(message) {
-    class not_found(message: String = "Item not found") : WeaveFFIException(1, message)
-    class invalid_input(message: String = "Invalid input") : WeaveFFIException(2, message)
+    class NotFound(message: String = "Item not found") : WeaveFFIException(1, message)
+    class InvalidInput(message: String = "Invalid input") : WeaveFFIException(2, message)
 }
 
 internal class WeaveContinuation<T>(private val cont: kotlinx.coroutines.CancellableContinuation<T>) {

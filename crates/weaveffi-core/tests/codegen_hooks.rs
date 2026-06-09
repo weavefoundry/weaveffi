@@ -87,6 +87,7 @@ fn test_api() -> Api {
             modules: vec![],
         }],
         generators: None,
+        package: None,
     }
 }
 

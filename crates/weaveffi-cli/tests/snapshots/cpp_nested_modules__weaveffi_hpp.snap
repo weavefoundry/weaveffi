@@ -33,8 +33,11 @@ void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
 
 /** A measurement unit shared with nested submodules. */
 typedef enum { weaveffi_graphics_Unit_pixels = 0, weaveffi_graphics_Unit_points = 1 } weaveffi_graphics_Unit;
-/** Top-level struct that references a struct defined one level deeper. */
 typedef struct weaveffi_graphics_Canvas weaveffi_graphics_Canvas;
+typedef struct weaveffi_graphics_shapes_Shape weaveffi_graphics_shapes_Shape;
+typedef struct weaveffi_graphics_shapes_geometry_Detail weaveffi_graphics_shapes_geometry_Detail;
+
+/** Top-level struct that references a struct defined one level deeper. */
 weaveffi_graphics_Canvas* weaveffi_graphics_Canvas_create(int32_t width, const weaveffi_graphics_shapes_Shape* root, weaveffi_error* out_err);
 void weaveffi_graphics_Canvas_destroy(weaveffi_graphics_Canvas* ptr);
 int32_t weaveffi_graphics_Canvas_get_width(const weaveffi_graphics_Canvas* ptr);
@@ -45,7 +48,6 @@ weaveffi_graphics_shapes_Shape* weaveffi_graphics_Canvas_get_root(const weaveffi
 weaveffi_graphics_Canvas* weaveffi_graphics_new_canvas(int32_t width, weaveffi_error* out_err);
 
 /** A struct one level deep that references both an ancestor enum and a deeper struct. */
-typedef struct weaveffi_graphics_shapes_Shape weaveffi_graphics_shapes_Shape;
 weaveffi_graphics_shapes_Shape* weaveffi_graphics_shapes_Shape_create(int32_t sides, weaveffi_graphics_Unit unit, const weaveffi_graphics_shapes_geometry_Detail* detail, weaveffi_error* out_err);
 void weaveffi_graphics_shapes_Shape_destroy(weaveffi_graphics_shapes_Shape* ptr);
 int32_t weaveffi_graphics_shapes_Shape_get_sides(const weaveffi_graphics_shapes_Shape* ptr);
@@ -60,7 +62,6 @@ weaveffi_graphics_shapes_Shape* weaveffi_graphics_shapes_make_shape(int32_t side
 weaveffi_graphics_Canvas* weaveffi_graphics_shapes_describe(weaveffi_error* out_err);
 
 /** A struct two levels deep. */
-typedef struct weaveffi_graphics_shapes_geometry_Detail weaveffi_graphics_shapes_geometry_Detail;
 weaveffi_graphics_shapes_geometry_Detail* weaveffi_graphics_shapes_geometry_Detail_create(double area, weaveffi_error* out_err);
 void weaveffi_graphics_shapes_geometry_Detail_destroy(weaveffi_graphics_shapes_geometry_Detail* ptr);
 double weaveffi_graphics_shapes_geometry_Detail_get_area(const weaveffi_graphics_shapes_geometry_Detail* ptr);
@@ -84,6 +85,86 @@ public:
 enum class Unit : int32_t {
     pixels = 0,
     points = 1
+};
+
+/** A struct two levels deep. */
+class Detail {
+    void* handle_;
+
+public:
+    explicit Detail(void* h) : handle_(h) {}
+
+    ~Detail() {
+        if (handle_) weaveffi_graphics_shapes_geometry_Detail_destroy(static_cast<weaveffi_graphics_shapes_geometry_Detail*>(handle_));
+    }
+
+    Detail(const Detail&) = delete;
+    Detail& operator=(const Detail&) = delete;
+
+    Detail(Detail&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+
+    Detail& operator=(Detail&& other) noexcept {
+        if (this != &other) {
+            if (handle_) weaveffi_graphics_shapes_geometry_Detail_destroy(static_cast<weaveffi_graphics_shapes_geometry_Detail*>(handle_));
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    void* handle() const { return handle_; }
+
+    double area() const {
+        return weaveffi_graphics_shapes_geometry_Detail_get_area(static_cast<const weaveffi_graphics_shapes_geometry_Detail*>(handle_));
+    }
+
+};
+
+/** A struct one level deep that references both an ancestor enum and a deeper struct. */
+class Shape {
+    void* handle_;
+
+public:
+    explicit Shape(void* h) : handle_(h) {}
+
+    ~Shape() {
+        if (handle_) weaveffi_graphics_shapes_Shape_destroy(static_cast<weaveffi_graphics_shapes_Shape*>(handle_));
+    }
+
+    Shape(const Shape&) = delete;
+    Shape& operator=(const Shape&) = delete;
+
+    Shape(Shape&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+
+    Shape& operator=(Shape&& other) noexcept {
+        if (this != &other) {
+            if (handle_) weaveffi_graphics_shapes_Shape_destroy(static_cast<weaveffi_graphics_shapes_Shape*>(handle_));
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    void* handle() const { return handle_; }
+
+    int32_t sides() const {
+        return weaveffi_graphics_shapes_Shape_get_sides(static_cast<const weaveffi_graphics_shapes_Shape*>(handle_));
+    }
+
+    /** Reference up to the parent module's enum */
+    Unit unit() const {
+        return static_cast<Unit>(weaveffi_graphics_shapes_Shape_get_unit(static_cast<const weaveffi_graphics_shapes_Shape*>(handle_)));
+    }
+
+    /** Reference down into a deeper module */
+    Detail detail() const {
+        return Detail(weaveffi_graphics_shapes_Shape_get_detail(static_cast<const weaveffi_graphics_shapes_Shape*>(handle_)));
+    }
+
 };
 
 /** Top-level struct that references a struct defined one level deeper. */
@@ -139,51 +220,6 @@ inline Canvas graphics_new_canvas(int32_t width) {
     return Canvas(result);
 }
 
-/** A struct one level deep that references both an ancestor enum and a deeper struct. */
-class Shape {
-    void* handle_;
-
-public:
-    explicit Shape(void* h) : handle_(h) {}
-
-    ~Shape() {
-        if (handle_) weaveffi_graphics_shapes_Shape_destroy(static_cast<weaveffi_graphics_shapes_Shape*>(handle_));
-    }
-
-    Shape(const Shape&) = delete;
-    Shape& operator=(const Shape&) = delete;
-
-    Shape(Shape&& other) noexcept : handle_(other.handle_) {
-        other.handle_ = nullptr;
-    }
-
-    Shape& operator=(Shape&& other) noexcept {
-        if (this != &other) {
-            if (handle_) weaveffi_graphics_shapes_Shape_destroy(static_cast<weaveffi_graphics_shapes_Shape*>(handle_));
-            handle_ = other.handle_;
-            other.handle_ = nullptr;
-        }
-        return *this;
-    }
-
-    void* handle() const { return handle_; }
-
-    int32_t sides() const {
-        return weaveffi_graphics_shapes_Shape_get_sides(static_cast<const weaveffi_graphics_shapes_Shape*>(handle_));
-    }
-
-    /** Reference up to the parent module's enum */
-    graphics.Unit unit() const {
-        return static_cast<graphics.Unit>(weaveffi_graphics_shapes_Shape_get_unit(static_cast<const weaveffi_graphics_shapes_Shape*>(handle_)));
-    }
-
-    /** Reference down into a deeper module */
-    Detail detail() const {
-        return Detail(weaveffi_graphics_shapes_Shape_get_detail(static_cast<const weaveffi_graphics_shapes_Shape*>(handle_)));
-    }
-
-};
-
 /** Construct a Shape. */
 inline Shape graphics_shapes_make_shape(int32_t sides) {
     weaveffi_error err{};
@@ -209,41 +245,6 @@ inline Canvas graphics_shapes_describe() {
     }
     return Canvas(result);
 }
-
-/** A struct two levels deep. */
-class Detail {
-    void* handle_;
-
-public:
-    explicit Detail(void* h) : handle_(h) {}
-
-    ~Detail() {
-        if (handle_) weaveffi_graphics_shapes_geometry_Detail_destroy(static_cast<weaveffi_graphics_shapes_geometry_Detail*>(handle_));
-    }
-
-    Detail(const Detail&) = delete;
-    Detail& operator=(const Detail&) = delete;
-
-    Detail(Detail&& other) noexcept : handle_(other.handle_) {
-        other.handle_ = nullptr;
-    }
-
-    Detail& operator=(Detail&& other) noexcept {
-        if (this != &other) {
-            if (handle_) weaveffi_graphics_shapes_geometry_Detail_destroy(static_cast<weaveffi_graphics_shapes_geometry_Detail*>(handle_));
-            handle_ = other.handle_;
-            other.handle_ = nullptr;
-        }
-        return *this;
-    }
-
-    void* handle() const { return handle_; }
-
-    double area() const {
-        return weaveffi_graphics_shapes_geometry_Detail_get_area(static_cast<const weaveffi_graphics_shapes_geometry_Detail*>(handle_));
-    }
-
-};
 
 /** Deeper function taking an ancestor-module struct. */
 inline Detail graphics_shapes_geometry_compute(const Shape& shape) {

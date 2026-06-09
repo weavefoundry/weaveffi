@@ -6,7 +6,7 @@
 # the raised-exception error path. The cdylib is selected via WEAVEFFI_LIBRARY.
 
 $LOAD_PATH.unshift(File.join(ENV.fetch("WV_RB"), "lib"))
-require "weaveffi"
+require "contacts"
 
 def expect(cond, msg)
   raise "assertion failed: #{msg}" unless cond

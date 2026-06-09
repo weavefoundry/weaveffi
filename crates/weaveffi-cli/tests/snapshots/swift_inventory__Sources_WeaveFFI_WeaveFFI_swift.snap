@@ -92,7 +92,7 @@ public class Product {
         var outLen: Int = 0
         let rv = weaveffi_products_Product_get_tags(ptr, &outLen)
         guard let rv = rv else { return [] }
-        return Array(UnsafeBufferPointer(start: rv, count: outLen))
+        return (0..<outLen).map { String(cString: rv[$0]!) }
     }
 }
 

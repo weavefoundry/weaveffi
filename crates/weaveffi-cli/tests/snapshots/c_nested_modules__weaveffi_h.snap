@@ -34,15 +34,19 @@ void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
  * Map convention: Maps are passed as parallel arrays of keys and values.
  * A map parameter {K:V} named "m" expands to:
  *   const K* m_keys, const V* m_values, size_t m_len
- * A map return value expands to out-parameters:
- *   K* out_keys, V* out_values, size_t* out_len
+ * A map return value expands to out-parameters that receive callee-
+ * allocated arrays; the caller passes the address of its own pointers:
+ *   K** out_keys, V** out_values, size_t* out_len
  */
 
-// Module: graphics
 /** A measurement unit shared with nested submodules. */
 typedef enum { weaveffi_graphics_Unit_pixels = 0, weaveffi_graphics_Unit_points = 1 } weaveffi_graphics_Unit;
-/** Top-level struct that references a struct defined one level deeper. */
 typedef struct weaveffi_graphics_Canvas weaveffi_graphics_Canvas;
+typedef struct weaveffi_graphics_shapes_Shape weaveffi_graphics_shapes_Shape;
+typedef struct weaveffi_graphics_shapes_geometry_Detail weaveffi_graphics_shapes_geometry_Detail;
+
+// Module: graphics
+/** Top-level struct that references a struct defined one level deeper. */
 weaveffi_graphics_Canvas* weaveffi_graphics_Canvas_create(int32_t width, const weaveffi_graphics_shapes_Shape* root, weaveffi_error* out_err);
 void weaveffi_graphics_Canvas_destroy(weaveffi_graphics_Canvas* ptr);
 int32_t weaveffi_graphics_Canvas_get_width(const weaveffi_graphics_Canvas* ptr);
@@ -54,7 +58,6 @@ weaveffi_graphics_Canvas* weaveffi_graphics_new_canvas(int32_t width, weaveffi_e
 
 // Module: graphics_shapes
 /** A struct one level deep that references both an ancestor enum and a deeper struct. */
-typedef struct weaveffi_graphics_shapes_Shape weaveffi_graphics_shapes_Shape;
 weaveffi_graphics_shapes_Shape* weaveffi_graphics_shapes_Shape_create(int32_t sides, weaveffi_graphics_Unit unit, const weaveffi_graphics_shapes_geometry_Detail* detail, weaveffi_error* out_err);
 void weaveffi_graphics_shapes_Shape_destroy(weaveffi_graphics_shapes_Shape* ptr);
 int32_t weaveffi_graphics_shapes_Shape_get_sides(const weaveffi_graphics_shapes_Shape* ptr);
@@ -70,7 +73,6 @@ weaveffi_graphics_Canvas* weaveffi_graphics_shapes_describe(weaveffi_error* out_
 
 // Module: graphics_shapes_geometry
 /** A struct two levels deep. */
-typedef struct weaveffi_graphics_shapes_geometry_Detail weaveffi_graphics_shapes_geometry_Detail;
 weaveffi_graphics_shapes_geometry_Detail* weaveffi_graphics_shapes_geometry_Detail_create(double area, weaveffi_error* out_err);
 void weaveffi_graphics_shapes_geometry_Detail_destroy(weaveffi_graphics_shapes_geometry_Detail* ptr);
 double weaveffi_graphics_shapes_geometry_Detail_get_area(const weaveffi_graphics_shapes_geometry_Detail* ptr);

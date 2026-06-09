@@ -191,7 +191,7 @@ fn audit_kotlin_closeable() {
 #[test]
 fn audit_python_context_manager() {
     let out = generate_target("python");
-    let py = read_generated(&out, "python/weaveffi/weaveffi.py");
+    let py = read_generated(&out, "python/api/weaveffi.py");
 
     assert!(
         py.contains("class _PointerGuard"),
@@ -348,7 +348,7 @@ fn audit_no_raw_pointer_leaks() {
 
     // Python: free_string bound in preamble, struct __del__ calls destroy
     {
-        let py = read_generated(&out, "python/weaveffi/weaveffi.py");
+        let py = read_generated(&out, "python/api/weaveffi.py");
         assert!(
             py.contains("weaveffi_free_string"),
             "Python: missing weaveffi_free_string binding"
