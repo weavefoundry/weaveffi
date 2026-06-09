@@ -1,3 +1,13 @@
+## [0.8.0](https://github.com/weavefoundry/weaveffi/compare/v0.7.0...v0.8.0) (2026-06-09)
+
+### ⚠ BREAKING CHANGES
+
+* implement list/map returns and builders across all backends (#13)
+
+### Features
+
+* implement list/map returns and builders across all backends ([#13](https://github.com/weavefoundry/weaveffi/issues/13)) ([96c4280](https://github.com/weavefoundry/weaveffi/commit/96c4280259fc96c007870d160d53893afb858bf4))
+
 ## [0.7.0](https://github.com/weavefoundry/weaveffi/compare/v0.6.0...v0.7.0) (2026-05-31)
 
 ### ⚠ BREAKING CHANGES
