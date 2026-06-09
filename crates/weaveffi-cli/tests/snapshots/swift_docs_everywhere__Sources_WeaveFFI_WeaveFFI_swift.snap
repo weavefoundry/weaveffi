@@ -110,7 +110,7 @@ public class Document {
         var outLen: Int = 0
         let rv = weaveffi_docs_Document_get_tags(ptr, &outLen)
         guard let rv = rv else { return [] }
-        return Array(UnsafeBufferPointer(start: rv, count: outLen))
+        return (0..<outLen).map { String(cString: rv[$0]!) }
     }
 }
 
@@ -159,8 +159,10 @@ public class DocumentBuilder {
         guard let status = _status else { fatalError("missing field: status") }
         guard let tags = _tags else { fatalError("missing field: tags") }
         var err = weaveffi_error(code: 0, message: nil)
+        let tags_cstrs: [UnsafePointer<CChar>?] = tags.map { UnsafePointer(strdup($0)) }
+        defer { tags_cstrs.forEach { if let s = $0 { free(UnsafeMutablePointer(mutating: s)) } } }
         let result: OpaquePointer? = title.withCString { title_ptr in
-            tags.withUnsafeBufferPointer { tags_buf in
+            return tags_cstrs.withUnsafeBufferPointer { tags_buf in
                 let tags_ptr = tags_buf.baseAddress
                 let tags_len = tags_buf.count
                     return weaveffi_docs_Document_create(id, title_ptr, weaveffi_docs_Status(status.rawValue), tags_ptr, tags_len, &err)
@@ -181,8 +183,10 @@ public enum Docs {
     /// - Parameter tags: Initial set of tags (may be empty)
     public static func docs_create_document(_ title: String, _ tags: [String]) throws -> Document {
         var err = weaveffi_error(code: 0, message: nil)
+        let tags_cstrs: [UnsafePointer<CChar>?] = tags.map { UnsafePointer(strdup($0)) }
+        defer { tags_cstrs.forEach { if let s = $0 { free(UnsafeMutablePointer(mutating: s)) } } }
         let result: OpaquePointer? = title.withCString { title_ptr in
-            tags.withUnsafeBufferPointer { tags_buf in
+            return tags_cstrs.withUnsafeBufferPointer { tags_buf in
                 let tags_ptr = tags_buf.baseAddress
                 let tags_len = tags_buf.count
                     return weaveffi_docs_create_document(title_ptr, tags_ptr, tags_len, &err)

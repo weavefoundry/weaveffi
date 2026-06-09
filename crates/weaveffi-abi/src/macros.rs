@@ -27,6 +27,12 @@
 /// - `weaveffi_cancel_token_is_cancelled`
 /// - `weaveffi_cancel_token_destroy`
 ///
+/// On `wasm32` targets it additionally emits a linear-memory allocator that the
+/// generated JS bindings call to stage inputs and return slots:
+///
+/// - `weaveffi_alloc`
+/// - `weaveffi_dealloc`
+///
 /// # Example
 ///
 /// ```ignore
@@ -51,6 +57,22 @@ macro_rules! export_runtime {
         #[no_mangle]
         pub extern "C" fn weaveffi_free_bytes(ptr: *mut u8, len: usize) {
             $crate::free_bytes(ptr, len)
+        }
+
+        // WASM has no host allocator, so the generated JS glue stages input
+        // buffers and `sret` slots through these thunks. They are only emitted
+        // for `wasm32` targets; native targets allocate on the foreign side and
+        // never reference them, keeping their ABI surface unchanged.
+        #[cfg(target_arch = "wasm32")]
+        #[no_mangle]
+        pub extern "C" fn weaveffi_alloc(size: u32) -> *mut u8 {
+            $crate::wasm_alloc(size as usize)
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        #[no_mangle]
+        pub extern "C" fn weaveffi_dealloc(ptr: *mut u8, size: u32) {
+            $crate::wasm_dealloc(ptr, size as usize)
         }
 
         #[no_mangle]

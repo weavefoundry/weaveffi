@@ -406,6 +406,18 @@ fn resolve_single_type_ref(
                 }
             }
         }
+        // A typed handle's target is always a struct. When that struct lives in
+        // a different module (e.g. `handle<Store>` in a `kv.stats` submodule
+        // referring to `kv.Store`), qualify it to the owner's path so the C ABI
+        // lowering and every generator emit the owner's symbol prefix rather
+        // than the referrer's. Mirrors the `Struct` arm above.
+        TypeRef::TypedHandle(name) if !local_struct_names.contains(name.as_str()) => {
+            if let Some((mod_name, _is_enum)) = global_types.get(name.as_str()) {
+                if mod_name != current_module {
+                    *name = format!("{mod_name}.{name}");
+                }
+            }
+        }
         TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
             resolve_single_type_ref(
                 inner,
@@ -809,6 +821,7 @@ mod tests {
             version: "0.1.0".to_string(),
             modules: vec![simple_module("mymod")],
             generators: None,
+            package: None,
         }
     }
 
@@ -824,6 +837,7 @@ mod tests {
             version: "0.1.0".to_string(),
             modules: vec![simple_module("dup"), simple_module("dup")],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -846,6 +860,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -869,6 +884,7 @@ mod tests {
                     modules: vec![],
                 }],
                 generators: None,
+                package: None,
             };
             assert!(
                 validate_api(&mut api, None).is_err(),
@@ -893,6 +909,7 @@ mod tests {
                     modules: vec![],
                 }],
                 generators: None,
+                package: None,
             };
             assert!(
                 validate_api(&mut api, None).is_err(),
@@ -925,6 +942,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(validate_api(&mut api, None).is_ok());
     }
@@ -958,6 +976,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(validate_api(&mut api, None).is_ok());
     }
@@ -986,6 +1005,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let warnings = collect_warnings(&api);
         assert!(warnings.iter().any(|w| matches!(
@@ -1019,6 +1039,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let warnings = collect_warnings(&api);
         assert!(!warnings
@@ -1041,6 +1062,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -1124,6 +1146,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(validate_api(&mut api, None).is_ok());
     }
@@ -1151,6 +1174,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -1182,6 +1206,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -1221,6 +1246,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -1260,6 +1286,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -1296,6 +1323,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -1324,6 +1352,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -1365,6 +1394,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -1407,6 +1437,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -1434,6 +1465,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -1472,6 +1504,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -1510,6 +1543,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -1547,6 +1581,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -1583,6 +1618,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(validate_api(&mut api, None).is_ok());
     }
@@ -1616,6 +1652,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -1647,6 +1684,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -1679,6 +1717,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -1725,6 +1764,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(validate_api(&mut api, None).is_ok());
     }
@@ -1758,6 +1798,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(validate_api(&mut api, None).is_ok());
     }
@@ -1798,6 +1839,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(validate_api(&mut api, None).is_ok());
     }
@@ -1832,6 +1874,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(validate_api(&mut api, None).is_ok());
     }
@@ -1860,6 +1903,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(validate_api(&mut api, None).is_ok());
     }
@@ -1893,6 +1937,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         validate_api(&mut api, None).unwrap();
         assert_eq!(
@@ -1930,6 +1975,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         validate_api(&mut api, None).unwrap();
         assert_eq!(
@@ -1967,6 +2013,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         validate_api(&mut api, None).unwrap();
         assert_eq!(
@@ -2002,6 +2049,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(validate_api(&mut api, None).is_ok());
     }
@@ -2033,6 +2081,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -2067,6 +2116,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(validate_api(&mut api, None).is_ok());
     }
@@ -2097,6 +2147,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let warnings = collect_warnings(&api);
         assert!(warnings.iter().any(|w| matches!(
@@ -2132,6 +2183,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let warnings = collect_warnings(&api);
         assert!(!warnings
@@ -2171,6 +2223,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let warnings = collect_warnings(&api);
         assert!(warnings.iter().any(|w| matches!(
@@ -2212,6 +2265,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let warnings = collect_warnings(&api);
         assert!(!warnings
@@ -2247,6 +2301,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let warnings = collect_warnings(&api);
         assert!(warnings.iter().any(|w| matches!(
@@ -2292,6 +2347,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let warnings = collect_warnings(&api);
         assert!(warnings.iter().any(|w| matches!(
@@ -2336,6 +2392,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let warnings = collect_warnings(&api);
         assert!(!warnings
@@ -2358,6 +2415,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let warnings = collect_warnings(&api);
         assert!(!warnings
@@ -2394,6 +2452,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let warnings = collect_warnings(&api);
         assert!(warnings.is_empty());
@@ -2424,6 +2483,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         validate_api(&mut api, None).unwrap();
         assert_eq!(
@@ -2461,6 +2521,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(validate_api(&mut api, None).is_ok());
     }
@@ -2494,6 +2555,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -2530,6 +2592,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(validate_api(&mut api, None).is_ok());
     }
@@ -2563,6 +2626,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(validate_api(&mut api, None).is_ok());
     }
@@ -2591,6 +2655,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -2623,6 +2688,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -2656,6 +2722,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -2689,6 +2756,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -2721,6 +2789,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -2770,6 +2839,7 @@ mod tests {
                 },
             ],
             generators: None,
+            package: None,
         };
         validate_api(&mut api, None).unwrap();
         assert_eq!(
@@ -2814,6 +2884,7 @@ mod tests {
                 },
             ],
             generators: None,
+            package: None,
         };
         validate_api(&mut api, None).unwrap();
         assert_eq!(
@@ -2863,6 +2934,7 @@ mod tests {
                 },
             ],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -2885,6 +2957,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let result = find_type_in_api(&api, "Product");
         assert_eq!(result, Some(("catalog".to_string(), false)));
@@ -2905,6 +2978,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let result = find_type_in_api(&api, "Status");
         assert_eq!(result, Some(("shared".to_string(), true)));
@@ -2916,6 +2990,7 @@ mod tests {
             version: "0.1.0".to_string(),
             modules: vec![simple_module("mymod")],
             generators: None,
+            package: None,
         };
         assert_eq!(find_type_in_api(&api, "Nonexistent"), None);
     }
@@ -2944,6 +3019,7 @@ mod tests {
                 }],
             }],
             generators: None,
+            package: None,
         };
         assert!(validate_api(&mut api, None).is_ok());
     }
@@ -2985,6 +3061,7 @@ mod tests {
                 }],
             }],
             generators: None,
+            package: None,
         };
         // Nested types report their full dot-joined owner path.
         assert_eq!(
@@ -3023,6 +3100,7 @@ mod tests {
                 }],
             }],
             generators: None,
+            package: None,
         };
         validate_api(&mut api, None).unwrap();
         assert_eq!(
@@ -3061,11 +3139,83 @@ mod tests {
                 }],
             }],
             generators: None,
+            package: None,
         };
         validate_api(&mut api, None).unwrap();
         assert_eq!(
             api.modules[0].modules[0].functions[0].returns,
             Some(TypeRef::Struct("lib.Token".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_qualifies_nested_module_typed_handle_to_parent_type() {
+        // Regression: a `handle<T>` inside a submodule whose target struct is
+        // owned by an ancestor module must be qualified to the owner's path.
+        // Previously the resolver had no `TypedHandle` arm, so it stayed bare
+        // and every consumer (C ABI lowering + language wrappers) mis-attributed
+        // it to the *referrer's* prefix (e.g. `weaveffi_kv_stats_Store` instead
+        // of `weaveffi_kv_Store`), producing an undeclared type.
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "kv".to_string(),
+                functions: vec![],
+                structs: vec![simple_struct("Store")],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![Module {
+                    name: "stats".to_string(),
+                    functions: vec![function_returning(
+                        "get_store",
+                        TypeRef::TypedHandle("Store".to_string()),
+                    )],
+                    structs: vec![],
+                    enums: vec![],
+                    callbacks: vec![],
+                    listeners: vec![],
+                    errors: None,
+                    modules: vec![],
+                }],
+            }],
+            generators: None,
+            package: None,
+        };
+        validate_api(&mut api, None).unwrap();
+        assert_eq!(
+            api.modules[0].modules[0].functions[0].returns,
+            Some(TypeRef::TypedHandle("kv.Store".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_keeps_same_module_typed_handle_unqualified() {
+        // A `handle<T>` whose target is defined in the *same* module stays bare
+        // so the lowering keeps using the current module's prefix.
+        let mut api = Api {
+            version: "0.1.0".to_string(),
+            modules: vec![Module {
+                name: "sessions".to_string(),
+                functions: vec![function_returning(
+                    "open",
+                    TypeRef::TypedHandle("Session".to_string()),
+                )],
+                structs: vec![simple_struct("Session")],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+            package: None,
+        };
+        validate_api(&mut api, None).unwrap();
+        assert_eq!(
+            api.modules[0].functions[0].returns,
+            Some(TypeRef::TypedHandle("Session".to_string()))
         );
     }
 
@@ -3102,6 +3252,7 @@ mod tests {
                 },
             ],
             generators: None,
+            package: None,
         };
         validate_api(&mut api, None).unwrap();
         assert_eq!(
@@ -3136,6 +3287,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -3163,6 +3315,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -3199,6 +3352,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(validate_api(&mut api, None).is_ok());
     }
@@ -3233,6 +3387,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -3265,6 +3420,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(validate_api(&mut api, None).is_ok());
     }
@@ -3298,6 +3454,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -3330,6 +3487,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         assert!(matches!(
             validate_api(&mut api, None).unwrap_err().error,
@@ -3357,6 +3515,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let err = validate_api(&mut api, None).unwrap_err();
         assert!(
@@ -3394,6 +3553,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let warnings = collect_warnings(&api);
         assert!(warnings.iter().any(|w| matches!(
@@ -3448,6 +3608,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let warnings = collect_warnings(&api);
         assert!(
@@ -3487,6 +3648,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let warnings = collect_warnings(&api);
         assert!(
@@ -3526,6 +3688,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let warnings = collect_warnings(&api);
         assert!(warnings.iter().any(|w| matches!(
@@ -3558,6 +3721,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let warnings = collect_warnings(&api);
         assert!(warnings.iter().any(|w| matches!(
@@ -3591,6 +3755,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let warnings = collect_warnings(&api);
         assert!(!warnings

@@ -15,6 +15,14 @@ Swift module (`WeaveFFI`) that wraps the C ABI in idiomatic Swift with
 | `generated/swift/Sources/CWeaveFFI/module.modulemap` | C module map pointing at the generated header |
 | `generated/swift/Sources/WeaveFFI/WeaveFFI.swift` | Swift wrapper: enums, struct classes, namespaced module functions |
 
+The module name shown above (`WeaveFFI`) is the default. It is overridden by
+`[swift] module_name`, or — failing that — by the IDL
+[`package:` name](../reference/idl.md#package-metadata) PascalCased
+(`async-demo` → `AsyncDemo`). The Swift wrapper, its `Sources/<Module>/`
+directory, the system-library target, and its `Sources/C<Module>/` module map
+all move together (e.g. `AsyncDemo` + `CAsyncDemo`), so the generated package
+stays buildable under any name.
+
 ## Type mapping
 
 | IDL type     | Swift type                  | Notes                            |

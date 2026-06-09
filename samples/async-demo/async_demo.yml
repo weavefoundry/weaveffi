@@ -1,4 +1,13 @@
 version: "0.3.0"
+package:
+  name: async-demo
+  version: "1.0.0"
+  description: Async/await and cancellation demo across WeaveFFI's async-capable targets.
+  license: MIT
+  authors:
+    - WeaveFoundry <hello@weavefoundry.dev>
+  homepage: https://github.com/weavefoundry/weaveffi
+  repository: https://github.com/weavefoundry/weaveffi
 modules:
   - name: tasks
     structs:

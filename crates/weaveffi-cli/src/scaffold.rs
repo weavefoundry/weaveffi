@@ -369,6 +369,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         }
     }
 
@@ -978,6 +979,7 @@ mod tests {
                 }],
             }],
             generators: None,
+            package: None,
         };
         let out = render_scaffold(&api, "weaveffi");
         assert!(
@@ -1021,6 +1023,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let out = render_scaffold(&api, "weaveffi");
         assert!(
@@ -1082,6 +1085,7 @@ mod tests {
                 },
             ],
             generators: None,
+            package: None,
         };
         let out = render_scaffold(&api, "weaveffi");
         assert!(out.contains("weaveffi_math_add"), "missing math module");

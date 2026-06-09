@@ -107,15 +107,12 @@ pub fn render_c_header(api: &Api, prefix: &str, input_basename: &str, filename: 
     out.push_str(" * Map convention: Maps are passed as parallel arrays of keys and values.\n");
     out.push_str(" * A map parameter {K:V} named \"m\" expands to:\n");
     out.push_str(" *   const K* m_keys, const V* m_values, size_t m_len\n");
-    out.push_str(" * A map return value expands to out-parameters:\n");
-    out.push_str(" *   K* out_keys, V* out_values, size_t* out_len\n");
+    out.push_str(" * A map return value expands to out-parameters that receive callee-\n");
+    out.push_str(" * allocated arrays; the caller passes the address of its own pointers:\n");
+    out.push_str(" *   K** out_keys, V** out_values, size_t* out_len\n");
     out.push_str(" */\n\n");
 
-    for m in &model.modules {
-        let _ = writeln!(out, "// Module: {}", m.path);
-        cabi::render_module_decls(&mut out, m, prefix);
-        out.push('\n');
-    }
+    cabi::render_decls(&mut out, &model.modules, prefix, true);
 
     out.push_str("\n#ifdef __cplusplus\n}\n#endif\n\n");
     let _ = write!(out, "#endif // {guard}\n\n");
@@ -182,6 +179,7 @@ mod tests {
             version: "0.3.0".into(),
             modules,
             generators: None,
+            package: None,
         }
     }
 

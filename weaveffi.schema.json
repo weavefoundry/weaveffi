@@ -11,6 +11,17 @@
     "version": {
       "type": "string"
     },
+    "package": {
+      "description": "Package identity used to name, version, and describe every generated consumer package (npm, PyPI, gem, NuGet, pub.dev, SwiftPM, Gradle, Go). When omitted, generators fall back to the IDL file stem and version `0.1.0`, but publishable artifacts should always set this explicitly.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Package"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "modules": {
       "type": "array",
       "items": {
@@ -26,6 +37,54 @@
     }
   },
   "definitions": {
+    "Package": {
+      "description": "Package identity for the generated consumer artifacts.",
+      "type": "object",
+      "required": [
+        "name",
+        "version"
+      ],
+      "properties": {
+        "name": {
+          "description": "Canonical package name (e.g. `kvstore`). Per-target name overrides in `generators:` (such as `python.package_name`) still take precedence.",
+          "type": "string"
+        },
+        "version": {
+          "description": "Semantic version stamped into every manifest (e.g. `1.2.0`).",
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "license": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "authors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "homepage": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repository": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
     "Module": {
       "description": "A WeaveFFI module: a named group of functions, types, callbacks, listeners, and errors.",
       "type": "object",

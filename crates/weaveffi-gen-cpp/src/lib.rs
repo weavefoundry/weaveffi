@@ -17,12 +17,20 @@ use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, is_c_pointer_type, walk_modules, walk_modules_with_path,
     DocCommentStyle,
 };
+use weaveffi_core::errors;
 use weaveffi_core::model::BindingModel;
 use weaveffi_core::utils::{
     c_abi_struct_name, local_type_name, render_abi_prefix_aliases, render_prelude, render_trailer,
     CommentStyle,
 };
 use weaveffi_ir::ir::{Api, ErrorCode, Function, Module, StructDef, StructField, TypeRef};
+
+/// Idiomatic C++ exception class name for an error code: PascalCase with a
+/// single `Error` suffix (`KEY_NOT_FOUND` → `KeyNotFoundError`), instead of the
+/// raw SCREAMING_SNAKE `KEY_NOT_FOUNDError` spelling.
+fn cpp_error_class(name: &str) -> String {
+    errors::type_name(name, "Error")
+}
 
 /// Per-target configuration for [`CppGenerator`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -101,7 +109,12 @@ impl LanguageBackend for CppGenerator {
             ),
             OutputFile::new(
                 dir.join("CMakeLists.txt"),
-                render_cmake(config.standard(), input_basename),
+                render_cmake(
+                    config.standard(),
+                    &weaveffi_core::pkg::resolve(api, None, config.input_basename.as_deref())
+                        .version,
+                    input_basename,
+                ),
             ),
             OutputFile::new(dir.join("README.md"), render_readme(input_basename)),
         ]
@@ -110,11 +123,11 @@ impl LanguageBackend for CppGenerator {
 
 weaveffi_core::impl_generator_via_backend!(CppGenerator);
 
-fn render_cmake(cpp_std: &str, input_basename: &str) -> String {
+fn render_cmake(cpp_std: &str, version: &str, input_basename: &str) -> String {
     let mut out = render_prelude(CommentStyle::Hash, input_basename);
     out.push_str(&format!(
         "cmake_minimum_required(VERSION 3.14)\n\
-project(weaveffi_cpp)\n\
+project(weaveffi_cpp VERSION {version})\n\
 add_library(weaveffi_cpp INTERFACE)\n\
 target_include_directories(weaveffi_cpp INTERFACE ${{CMAKE_CURRENT_SOURCE_DIR}})\n\
 target_link_libraries(weaveffi_cpp INTERFACE weaveffi)\n\
@@ -200,9 +213,23 @@ fn render_cpp_header(
         .collect();
     render_cpp_error_classes(&mut out, &error_codes);
 
-    for (module, path) in walk_modules_with_path(&api.modules) {
+    // Enums first: they reference no wrapper types and are used by value.
+    for (module, _path) in walk_modules_with_path(&api.modules) {
         render_cpp_enums(&mut out, module);
-        render_cpp_classes(&mut out, module, &path, c_prefix);
+    }
+    // Wrapper classes in dependency order: a getter that returns another wrapper
+    // type constructs it inline, which needs that class complete. Topological
+    // ordering makes parent<->child cross-module references compile.
+    let struct_entries: Vec<(&StructDef, String)> = walk_modules_with_path(&api.modules)
+        .flat_map(|(m, path)| m.structs.iter().map(move |s| (s, path.clone())))
+        .collect();
+    for idx in topo_order_structs(&struct_entries) {
+        let (s, abi_module) = &struct_entries[idx];
+        render_cpp_class(&mut out, s, abi_module, c_prefix);
+    }
+    // Free functions last: every wrapper class is defined, so a function may
+    // accept or return any of them by value.
+    for (module, path) in walk_modules_with_path(&api.modules) {
         render_cpp_functions(&mut out, module, &error_codes, &path, c_prefix);
     }
     out.push_str(&format!("}} // namespace {namespace}\n\n"));
@@ -245,10 +272,7 @@ fn c_callback_result_params(ty: &TypeRef, module: &str, prefix: &str) -> Vec<Str
 fn render_extern_c(out: &mut String, api: &Api, prefix: &str) {
     let model = BindingModel::build(api, prefix);
     cabi::render_runtime_decls(out, prefix);
-    for m in &model.modules {
-        cabi::render_module_decls(out, m, prefix);
-        out.push('\n');
-    }
+    cabi::render_decls(out, &model.modules, prefix, false);
 }
 
 // ── C++ type mapping ──
@@ -263,9 +287,11 @@ fn cpp_type(ty: &TypeRef) -> String {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "std::string".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "std::vector<uint8_t>".into(),
         TypeRef::Handle => "void*".into(),
-        TypeRef::TypedHandle(n) => n.clone(),
+        TypeRef::TypedHandle(n) => local_type_name(n).to_string(),
         TypeRef::Struct(n) => local_type_name(n).to_string(),
-        TypeRef::Enum(n) => n.clone(),
+        // A cross-module enum (e.g. `graphics.Unit`) is emitted as the bare
+        // local C++ type `Unit`; never the dot-qualified IR name (invalid C++).
+        TypeRef::Enum(n) => local_type_name(n).to_string(),
         TypeRef::Optional(inner) => format!("std::optional<{}>", cpp_type(inner)),
         TypeRef::List(inner) | TypeRef::Iterator(inner) => {
             format!("std::vector<{}>", cpp_type(inner))
@@ -282,7 +308,7 @@ fn cpp_param_decl(ty: &TypeRef, name: &str) -> String {
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             format!("const std::vector<uint8_t>& {name}")
         }
-        TypeRef::TypedHandle(n) => format!("{n}& {name}"),
+        TypeRef::TypedHandle(n) => format!("{}& {name}", local_type_name(n)),
         TypeRef::Struct(n) => format!("const {}& {name}", local_type_name(n)),
         TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
             format!("const {}& {name}", cpp_type(ty))
@@ -302,15 +328,13 @@ fn render_cpp_error_classes(out: &mut String, error_codes: &[&ErrorCode]) {
     out.push_str("};\n\n");
 
     for ec in error_codes {
+        let class = cpp_error_class(&ec.name);
         emit_doc(out, &ec.doc, "");
-        out.push_str(&format!(
-            "class {}Error : public WeaveFFIError {{\n",
-            ec.name
-        ));
+        out.push_str(&format!("class {class} : public WeaveFFIError {{\n"));
         out.push_str("public:\n");
         out.push_str(&format!(
-            "    {}Error(const std::string& msg) : WeaveFFIError({}, msg) {{}}\n",
-            ec.name, ec.code
+            "    {class}(const std::string& msg) : WeaveFFIError({}, msg) {{}}\n",
+            ec.code
         ));
         out.push_str("};\n\n");
     }
@@ -333,65 +357,129 @@ fn render_cpp_enums(out: &mut String, module: &Module) {
 
 // ── Namespace: RAII classes ──
 
-fn render_cpp_classes(out: &mut String, module: &Module, abi_module: &str, prefix: &str) {
-    for s in &module.structs {
-        let tag = format!("{prefix}_{}_{}", abi_module, s.name);
-        let name = &s.name;
+fn render_cpp_class(out: &mut String, s: &StructDef, abi_module: &str, prefix: &str) {
+    let tag = format!("{prefix}_{}_{}", abi_module, s.name);
+    let name = &s.name;
 
-        emit_doc(out, &s.doc, "");
-        out.push_str(&format!("class {name} {{\n"));
-        out.push_str("    void* handle_;\n\n");
-        out.push_str("public:\n");
-        out.push_str(&format!(
-            "    explicit {name}(void* h) : handle_(h) {{}}\n\n"
-        ));
+    emit_doc(out, &s.doc, "");
+    out.push_str(&format!("class {name} {{\n"));
+    out.push_str("    void* handle_;\n\n");
+    out.push_str("public:\n");
+    out.push_str(&format!(
+        "    explicit {name}(void* h) : handle_(h) {{}}\n\n"
+    ));
 
-        // Destructor
-        out.push_str(&format!("    ~{name}() {{\n"));
-        out.push_str(&format!(
-            "        if (handle_) {tag}_destroy(static_cast<{tag}*>(handle_));\n"
-        ));
-        out.push_str("    }\n\n");
+    // Destructor
+    out.push_str(&format!("    ~{name}() {{\n"));
+    out.push_str(&format!(
+        "        if (handle_) {tag}_destroy(static_cast<{tag}*>(handle_));\n"
+    ));
+    out.push_str("    }\n\n");
 
-        // Deleted copy
-        out.push_str(&format!("    {name}(const {name}&) = delete;\n"));
-        out.push_str(&format!(
-            "    {name}& operator=(const {name}&) = delete;\n\n"
-        ));
+    // Deleted copy
+    out.push_str(&format!("    {name}(const {name}&) = delete;\n"));
+    out.push_str(&format!(
+        "    {name}& operator=(const {name}&) = delete;\n\n"
+    ));
 
-        // Move constructor
-        out.push_str(&format!(
-            "    {name}({name}&& other) noexcept : handle_(other.handle_) {{\n"
-        ));
-        out.push_str("        other.handle_ = nullptr;\n");
-        out.push_str("    }\n\n");
+    // Move constructor
+    out.push_str(&format!(
+        "    {name}({name}&& other) noexcept : handle_(other.handle_) {{\n"
+    ));
+    out.push_str("        other.handle_ = nullptr;\n");
+    out.push_str("    }\n\n");
 
-        // Move assignment
-        out.push_str(&format!(
-            "    {name}& operator=({name}&& other) noexcept {{\n"
-        ));
-        out.push_str("        if (this != &other) {\n");
-        out.push_str(&format!(
-            "            if (handle_) {tag}_destroy(static_cast<{tag}*>(handle_));\n"
-        ));
-        out.push_str("            handle_ = other.handle_;\n");
-        out.push_str("            other.handle_ = nullptr;\n");
-        out.push_str("        }\n");
-        out.push_str("        return *this;\n");
-        out.push_str("    }\n\n");
+    // Move assignment
+    out.push_str(&format!(
+        "    {name}& operator=({name}&& other) noexcept {{\n"
+    ));
+    out.push_str("        if (this != &other) {\n");
+    out.push_str(&format!(
+        "            if (handle_) {tag}_destroy(static_cast<{tag}*>(handle_));\n"
+    ));
+    out.push_str("            handle_ = other.handle_;\n");
+    out.push_str("            other.handle_ = nullptr;\n");
+    out.push_str("        }\n");
+    out.push_str("        return *this;\n");
+    out.push_str("    }\n\n");
 
-        out.push_str("    void* handle() const { return handle_; }\n\n");
+    out.push_str("    void* handle() const { return handle_; }\n\n");
 
-        for field in &s.fields {
-            render_cpp_getter(out, name, abi_module, field, prefix);
+    for field in &s.fields {
+        render_cpp_getter(out, name, abi_module, field, prefix);
+    }
+
+    out.push_str("};\n\n");
+
+    if s.builder {
+        render_cpp_builder(out, s, abi_module, prefix);
+    }
+}
+
+/// Collect the local class names of any wrapper types (`struct`/`handle<T>`)
+/// reachable from `ty`, recursing through optional/list/map/iterator wrappers.
+///
+/// A C++ wrapper getter that returns one of these constructs it inline (e.g.
+/// `return Shape(...)`), which requires the returned class to be a *complete*
+/// type at that point — so the returned class must be defined first.
+fn collect_struct_deps(ty: &TypeRef, deps: &mut Vec<String>) {
+    match ty {
+        TypeRef::Struct(n) | TypeRef::TypedHandle(n) => deps.push(local_type_name(n).to_string()),
+        TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
+            collect_struct_deps(inner, deps)
         }
+        TypeRef::Map(k, v) => {
+            collect_struct_deps(k, deps);
+            collect_struct_deps(v, deps);
+        }
+        _ => {}
+    }
+}
 
-        out.push_str("};\n\n");
-
-        if s.builder {
-            render_cpp_builder(out, s, abi_module, prefix);
+fn topo_visit(
+    i: usize,
+    entries: &[(&StructDef, String)],
+    name_to_idx: &std::collections::HashMap<String, usize>,
+    state: &mut [u8],
+    order: &mut Vec<usize>,
+) {
+    // 0 = unvisited, 1 = on stack (skip to break any cycle), 2 = emitted.
+    if state[i] != 0 {
+        return;
+    }
+    state[i] = 1;
+    let mut deps = Vec::new();
+    for f in &entries[i].0.fields {
+        collect_struct_deps(&f.ty, &mut deps);
+    }
+    for d in &deps {
+        if let Some(&j) = name_to_idx.get(d) {
+            if j != i {
+                topo_visit(j, entries, name_to_idx, state, order);
+            }
         }
     }
+    state[i] = 2;
+    order.push(i);
+}
+
+/// Order all wrapper structs so that any struct a getter returns by value is
+/// emitted before the struct returning it. This lets a parent module's class
+/// reference a child module's class (and vice versa) regardless of declaration
+/// order. Pure DFS post-order; original walk order is the stable tiebreaker.
+fn topo_order_structs(entries: &[(&StructDef, String)]) -> Vec<usize> {
+    let mut name_to_idx = std::collections::HashMap::new();
+    for (i, (s, _)) in entries.iter().enumerate() {
+        // First definition wins if two modules share a local name (the flattened
+        // C++ namespace can't hold duplicates anyway).
+        name_to_idx.entry(s.name.clone()).or_insert(i);
+    }
+    let mut state = vec![0u8; entries.len()];
+    let mut order = Vec::with_capacity(entries.len());
+    for i in 0..entries.len() {
+        topo_visit(i, entries, &name_to_idx, &mut state, &mut order);
+    }
+    order
 }
 
 fn render_cpp_builder(out: &mut String, s: &StructDef, abi_module: &str, prefix: &str) {
@@ -503,13 +591,15 @@ fn render_cpp_getter(
             ));
         }
         TypeRef::TypedHandle(n) => {
-            out.push_str(&format!("        return {n}({getter}({cast}));\n"));
+            let ln = local_type_name(n);
+            out.push_str(&format!("        return {ln}({getter}({cast}));\n"));
         }
         TypeRef::Struct(n) => {
             let ln = local_type_name(n);
             out.push_str(&format!("        return {ln}({getter}({cast}));\n"));
         }
         TypeRef::Enum(n) => {
+            let n = local_type_name(n);
             out.push_str(&format!(
                 "        return static_cast<{n}>({getter}({cast}));\n"
             ));
@@ -545,13 +635,15 @@ fn render_getter_optional(
             out.push_str("        return ret;\n");
         }
         TypeRef::TypedHandle(n) => {
-            out.push_str(&format!("        return {n}(raw);\n"));
+            let ln = local_type_name(n);
+            out.push_str(&format!("        return {ln}(raw);\n"));
         }
         TypeRef::Struct(n) => {
             let ln = local_type_name(n);
             out.push_str(&format!("        return {ln}(raw);\n"));
         }
         TypeRef::Enum(n) => {
+            let n = local_type_name(n);
             out.push_str(&format!("        return static_cast<{n}>(*raw);\n"));
         }
         _ if !is_c_pointer_type(inner) => {
@@ -583,6 +675,7 @@ fn render_getter_list(out: &mut String, inner: &TypeRef, getter: &str, cast: &st
             out.push_str("        return ret;\n");
         }
         TypeRef::Enum(n) => {
+            let n = local_type_name(n);
             out.push_str(&format!("        std::vector<{n}> ret;\n"));
             out.push_str("        ret.reserve(len);\n");
             out.push_str(&format!(
@@ -614,7 +707,7 @@ fn render_getter_map(
     out.push_str(&format!("        {vc}* out_values = nullptr;\n"));
     out.push_str("        size_t len = 0;\n");
     out.push_str(&format!(
-        "        {getter}({cast}, out_keys, out_values, &len);\n"
+        "        {getter}({cast}, &out_keys, &out_values, &len);\n"
     ));
 
     let cpp_k = cpp_type(k);
@@ -625,12 +718,12 @@ fn render_getter_map(
     out.push_str("        for (size_t i = 0; i < len; ++i) {\n");
     let ke = match k {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "std::string(out_keys[i])".into(),
-        TypeRef::Enum(n) => format!("static_cast<{n}>(out_keys[i])"),
+        TypeRef::Enum(n) => format!("static_cast<{}>(out_keys[i])", local_type_name(n)),
         _ => "out_keys[i]".into(),
     };
     let ve = match v {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "std::string(out_values[i])".into(),
-        TypeRef::Enum(n) => format!("static_cast<{n}>(out_values[i])"),
+        TypeRef::Enum(n) => format!("static_cast<{}>(out_values[i])", local_type_name(n)),
         TypeRef::Struct(n) => format!("{}(out_values[i])", local_type_name(n)),
         _ => "out_values[i]".into(),
     };
@@ -682,7 +775,8 @@ fn param_to_c_args(
         TypeRef::TypedHandle(n) => (
             vec![],
             vec![format!(
-                "static_cast<{prefix}_{module}_{n}*>({name}.handle())"
+                "static_cast<{}*>({name}.handle())",
+                c_abi_struct_name(n, module, prefix)
             )],
         ),
         TypeRef::Struct(s) => (
@@ -695,7 +789,8 @@ fn param_to_c_args(
         TypeRef::Enum(e) => (
             vec![],
             vec![format!(
-                "static_cast<{prefix}_{module}_{e}>(static_cast<int32_t>({name}))"
+                "static_cast<{}>(static_cast<int32_t>({name}))",
+                c_abi_struct_name(e, module, prefix)
             )],
         ),
         TypeRef::Optional(inner) => {
@@ -749,7 +844,10 @@ fn param_to_c_args(
                 ],
             ),
             TypeRef::Struct(s) => {
-                let c_ptr = format!("const {}*", c_abi_struct_name(s, module, prefix));
+                // The C ABI lowers a `[Struct]` parameter to `T* const*` (a const
+                // array of non-const element pointers), so the staging vector must
+                // hold non-const `T*` for `.data()` (`T**`) to convert cleanly.
+                let c_ptr = format!("{}*", c_abi_struct_name(s, module, prefix));
                 (
                     vec![
                         format!("std::vector<{c_ptr}> {name}_ptrs;"),
@@ -775,14 +873,20 @@ fn param_to_c_args(
             let ke = match k.as_ref() {
                 TypeRef::StringUtf8 | TypeRef::BorrowedStr => "kv.first.c_str()".into(),
                 TypeRef::Enum(e) => {
-                    format!("static_cast<{prefix}_{module}_{e}>(static_cast<int32_t>(kv.first))")
+                    format!(
+                        "static_cast<{}>(static_cast<int32_t>(kv.first))",
+                        c_abi_struct_name(e, module, prefix)
+                    )
                 }
                 _ => "kv.first".into(),
             };
             let ve = match v.as_ref() {
                 TypeRef::StringUtf8 | TypeRef::BorrowedStr => "kv.second.c_str()".into(),
                 TypeRef::Enum(e) => {
-                    format!("static_cast<{prefix}_{module}_{e}>(static_cast<int32_t>(kv.second))")
+                    format!(
+                        "static_cast<{}>(static_cast<int32_t>(kv.second))",
+                        c_abi_struct_name(e, module, prefix)
+                    )
                 }
                 TypeRef::Struct(s) => {
                     format!(
@@ -870,8 +974,8 @@ fn render_cpp_function(
                 setup.push(format!("{kc}* out_keys = nullptr;"));
                 setup.push(format!("{vc}* out_values = nullptr;"));
                 setup.push("size_t out_len = 0;".into());
-                c_args.push("out_keys".into());
-                c_args.push("out_values".into());
+                c_args.push("&out_keys".into());
+                c_args.push("&out_values".into());
                 c_args.push("&out_len".into());
             }
             _ => {}
@@ -903,8 +1007,9 @@ fn render_cpp_function(
         out.push_str("        switch (code) {\n");
         for ec in error_codes {
             out.push_str(&format!(
-                "        case {}: throw {}Error(msg);\n",
-                ec.code, ec.name
+                "        case {}: throw {}(msg);\n",
+                ec.code,
+                cpp_error_class(&ec.name)
             ));
         }
         out.push_str("        default: throw WeaveFFIError(code, msg);\n");
@@ -934,8 +1039,9 @@ fn emit_error_throw_body(out: &mut String, error_codes: &[&ErrorCode], prefix: &
         out.push_str(&format!("{indent}switch (code) {{\n"));
         for ec in error_codes {
             out.push_str(&format!(
-                "{indent}case {}: throw {}Error(msg);\n",
-                ec.code, ec.name
+                "{indent}case {}: throw {}(msg);\n",
+                ec.code,
+                cpp_error_class(&ec.name)
             ));
         }
         out.push_str(&format!(
@@ -1042,6 +1148,7 @@ fn render_cpp_iterator_function(
             ));
         }
         TypeRef::Enum(n) => {
+            let n = local_type_name(n);
             out.push_str(&format!(
                 "        ret.emplace_back(static_cast<{n}>(item));\n"
             ));
@@ -1077,13 +1184,15 @@ fn render_cpp_return(out: &mut String, ty: &TypeRef, prefix: &str) {
             out.push_str("    return reinterpret_cast<void*>(static_cast<uintptr_t>(result));\n");
         }
         TypeRef::TypedHandle(n) => {
-            out.push_str(&format!("    return {n}(result);\n"));
+            let ln = local_type_name(n);
+            out.push_str(&format!("    return {ln}(result);\n"));
         }
         TypeRef::Struct(n) => {
             let ln = local_type_name(n);
             out.push_str(&format!("    return {ln}(result);\n"));
         }
         TypeRef::Enum(n) => {
+            let n = local_type_name(n);
             out.push_str(&format!("    return static_cast<{n}>(result);\n"));
         }
         TypeRef::Optional(inner) => {
@@ -1095,13 +1204,15 @@ fn render_cpp_return(out: &mut String, ty: &TypeRef, prefix: &str) {
                     out.push_str("    return ret;\n");
                 }
                 TypeRef::TypedHandle(n) => {
-                    out.push_str(&format!("    return {n}(result);\n"));
+                    let ln = local_type_name(n);
+                    out.push_str(&format!("    return {ln}(result);\n"));
                 }
                 TypeRef::Struct(n) => {
                     let ln = local_type_name(n);
                     out.push_str(&format!("    return {ln}(result);\n"));
                 }
                 TypeRef::Enum(n) => {
+                    let n = local_type_name(n);
                     out.push_str(&format!("    return static_cast<{n}>(*result);\n"));
                 }
                 _ if !is_c_pointer_type(inner) => {
@@ -1131,6 +1242,7 @@ fn render_cpp_return(out: &mut String, ty: &TypeRef, prefix: &str) {
                 out.push_str("    return ret;\n");
             }
             TypeRef::Enum(n) => {
+                let n = local_type_name(n);
                 out.push_str(&format!("    std::vector<{n}> ret;\n"));
                 out.push_str("    ret.reserve(out_len);\n");
                 out.push_str(&format!(
@@ -1152,12 +1264,12 @@ fn render_cpp_return(out: &mut String, ty: &TypeRef, prefix: &str) {
             out.push_str("    for (size_t i = 0; i < out_len; ++i) {\n");
             let ke = match k.as_ref() {
                 TypeRef::StringUtf8 | TypeRef::BorrowedStr => "std::string(out_keys[i])".into(),
-                TypeRef::Enum(n) => format!("static_cast<{n}>(out_keys[i])"),
+                TypeRef::Enum(n) => format!("static_cast<{}>(out_keys[i])", local_type_name(n)),
                 _ => "out_keys[i]".into(),
             };
             let ve = match v.as_ref() {
                 TypeRef::StringUtf8 | TypeRef::BorrowedStr => "std::string(out_values[i])".into(),
-                TypeRef::Enum(n) => format!("static_cast<{n}>(out_values[i])"),
+                TypeRef::Enum(n) => format!("static_cast<{}>(out_values[i])", local_type_name(n)),
                 TypeRef::Struct(n) => format!("{}(out_values[i])", local_type_name(n)),
                 _ => "out_values[i]".into(),
             };
@@ -1271,13 +1383,15 @@ fn render_async_set_value(out: &mut String, ty: &TypeRef, prefix: &str) {
             );
         }
         TypeRef::TypedHandle(n) => {
-            out.push_str(&format!("            p->set_value({n}(result));\n"));
+            let ln = local_type_name(n);
+            out.push_str(&format!("            p->set_value({ln}(result));\n"));
         }
         TypeRef::Struct(n) => {
             let ln = local_type_name(n);
             out.push_str(&format!("            p->set_value({ln}(result));\n"));
         }
         TypeRef::Enum(n) => {
+            let n = local_type_name(n);
             out.push_str(&format!(
                 "            p->set_value(static_cast<{n}>(result));\n"
             ));
@@ -1293,13 +1407,15 @@ fn render_async_set_value(out: &mut String, ty: &TypeRef, prefix: &str) {
                     out.push_str("                p->set_value(std::move(ret));\n");
                 }
                 TypeRef::TypedHandle(n) => {
-                    out.push_str(&format!("                p->set_value({n}(result));\n"));
+                    let ln = local_type_name(n);
+                    out.push_str(&format!("                p->set_value({ln}(result));\n"));
                 }
                 TypeRef::Struct(n) => {
                     let ln = local_type_name(n);
                     out.push_str(&format!("                p->set_value({ln}(result));\n"));
                 }
                 TypeRef::Enum(n) => {
+                    let n = local_type_name(n);
                     out.push_str(&format!(
                         "                p->set_value(static_cast<{n}>(*result));\n"
                     ));
@@ -1335,6 +1451,7 @@ fn render_async_set_value(out: &mut String, ty: &TypeRef, prefix: &str) {
                 out.push_str("            p->set_value(std::move(ret));\n");
             }
             TypeRef::Enum(n) => {
+                let n = local_type_name(n);
                 out.push_str(&format!("            std::vector<{n}> ret;\n"));
                 out.push_str("            ret.reserve(result_len);\n");
                 out.push_str(&format!(
@@ -1358,14 +1475,16 @@ fn render_async_set_value(out: &mut String, ty: &TypeRef, prefix: &str) {
             out.push_str("            for (size_t i = 0; i < result_len; ++i) {\n");
             let ke = match k.as_ref() {
                 TypeRef::StringUtf8 | TypeRef::BorrowedStr => "std::string(result_keys[i])".into(),
-                TypeRef::Enum(n) => format!("static_cast<{n}>(result_keys[i])"),
+                TypeRef::Enum(n) => format!("static_cast<{}>(result_keys[i])", local_type_name(n)),
                 _ => "result_keys[i]".into(),
             };
             let ve = match v.as_ref() {
                 TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                     "std::string(result_values[i])".into()
                 }
-                TypeRef::Enum(n) => format!("static_cast<{n}>(result_values[i])"),
+                TypeRef::Enum(n) => {
+                    format!("static_cast<{}>(result_values[i])", local_type_name(n))
+                }
                 TypeRef::Struct(n) => format!("{}(result_values[i])", local_type_name(n)),
                 _ => "result_values[i]".into(),
             };
@@ -1421,6 +1540,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         }
     }
 
@@ -1514,6 +1634,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         }
     }
 
@@ -1585,8 +1706,8 @@ mod tests {
             "missing cmake_minimum_required"
         );
         assert!(
-            content.contains("project(weaveffi_cpp)"),
-            "missing project declaration"
+            content.contains("project(weaveffi_cpp VERSION 0.1.0)"),
+            "missing project declaration with version"
         );
         assert!(
             content.contains("add_library(weaveffi_cpp INTERFACE)"),
@@ -1993,6 +2114,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let h = render_cpp_header(&api, "weaveffi", "weaveffi", "weaveffi.yml", "weaveffi.hpp");
         assert!(
@@ -2030,6 +2152,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let h = render_cpp_header(&api, "weaveffi", "weaveffi", "weaveffi.yml", "weaveffi.hpp");
         assert!(
@@ -2075,6 +2198,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let h = render_cpp_header(&api, "weaveffi", "weaveffi", "weaveffi.yml", "weaveffi.hpp");
         assert!(
@@ -2132,6 +2256,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let h = render_cpp_header(&api, "weaveffi", "weaveffi", "weaveffi.yml", "weaveffi.hpp");
         assert!(
@@ -2182,6 +2307,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let h = render_cpp_header(&api, "weaveffi", "weaveffi", "weaveffi.yml", "weaveffi.hpp");
         assert!(
@@ -2221,6 +2347,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let h = render_cpp_header(&api, "weaveffi", "weaveffi", "weaveffi.yml", "weaveffi.hpp");
         assert!(
@@ -2258,6 +2385,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let h = render_cpp_header(&api, "weaveffi", "weaveffi", "weaveffi.yml", "weaveffi.hpp");
         assert!(
@@ -2291,6 +2419,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let h = render_cpp_header(&api, "weaveffi", "weaveffi", "weaveffi.yml", "weaveffi.hpp");
         assert!(
@@ -2389,6 +2518,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let h = render_cpp_header(&api, "weaveffi", "weaveffi", "weaveffi.yml", "weaveffi.hpp");
         assert!(
@@ -2432,6 +2562,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let h = render_cpp_header(&api, "weaveffi", "weaveffi", "weaveffi.yml", "weaveffi.hpp");
         assert!(
@@ -2510,6 +2641,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let h = render_cpp_header(&api, "weaveffi", "weaveffi", "weaveffi.yml", "weaveffi.hpp");
         assert!(
@@ -2668,6 +2800,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let h = render_cpp_header(&api, "weaveffi", "weaveffi", "weaveffi.yml", "weaveffi.hpp");
 
@@ -2732,6 +2865,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let h = render_cpp_header(&api, "weaveffi", "weaveffi", "weaveffi.yml", "weaveffi.hpp");
         assert!(
@@ -2792,6 +2926,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let h = render_cpp_header(&api, "weaveffi", "weaveffi", "weaveffi.yml", "weaveffi.hpp");
 
@@ -2852,6 +2987,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let h = render_cpp_header(&api, "weaveffi", "weaveffi", "weaveffi.yml", "weaveffi.hpp");
 
@@ -2908,6 +3044,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let h = render_cpp_header(&api, "weaveffi", "weaveffi", "weaveffi.yml", "weaveffi.hpp");
 
@@ -2968,6 +3105,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let h = render_cpp_header(&api, "weaveffi", "weaveffi", "weaveffi.yml", "weaveffi.hpp");
 
@@ -3019,6 +3157,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let h = render_cpp_header(&api, "weaveffi", "weaveffi", "weaveffi.yml", "weaveffi.hpp");
 
@@ -3142,6 +3281,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let h = render_cpp_header(&api, "weaveffi", "weaveffi", "weaveffi.yml", "weaveffi.hpp");
 
@@ -3209,6 +3349,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let h = render_cpp_header(&api, "weaveffi", "weaveffi", "weaveffi.yml", "weaveffi.hpp");
 
@@ -3271,6 +3412,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let h = render_cpp_header(&api, "weaveffi", "weaveffi", "weaveffi.yml", "weaveffi.hpp");
         let alloc_count = h.matches("new std::promise<int32_t>()").count();
@@ -3324,6 +3466,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
 
         let h = render_cpp_header(&api, "weaveffi", "weaveffi", "weaveffi.yml", "weaveffi.hpp");
@@ -3388,6 +3531,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
 
         let h = render_cpp_header(&api, "weaveffi", "weaveffi", "weaveffi.yml", "weaveffi.hpp");
@@ -3465,6 +3609,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         }
     }
 

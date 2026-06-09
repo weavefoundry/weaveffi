@@ -129,13 +129,17 @@ which throws `WeaveFFIError` and clears the C-side struct.
 try {
     val contact = Contacts.getContact(id)
     println(contact)
-} catch (e: RuntimeException) {
+} catch (e: WeaveFFIException.NotFound) {
+    println("No such contact")
+} catch (e: WeaveFFIException) {
     println("Failed: ${e.message}")
 }
 ```
 
-The JNI shim throws `RuntimeException` with the message and clears the
-C-side struct before returning.
+The JNI shim maps each declared error code to a `WeaveFFIException`
+subclass (e.g. `WeaveFFIException.NotFound`), throws it with the message,
+and clears the C-side struct before returning. Codes outside the declared
+domain fall back to the base `WeaveFFIException`.
 
 ### Handle errors in Node.js
 
@@ -172,15 +176,24 @@ richer error information.
 | Layer        | Error mechanism                          | How a non-zero code surfaces                   |
 |--------------|------------------------------------------|-----------------------------------------------|
 | C ABI        | `weaveffi_error { code, message }`        | Consumer inspects struct after every call      |
-| Swift        | `WeaveFFIError` (`throws`)                | `try` raises a Swift `Error`                   |
-| Kotlin       | `RuntimeException`                        | `try`/`catch` (or rethrown by the JNI shim)    |
+| Swift        | `WeaveFFIError` enum (`throws`)           | `try` raises a Swift `Error`; per-code cases   |
+| C++          | `WeaveFFIError` + per-code subclasses     | `try`/`catch (const WeaveFFIError&)`           |
+| Kotlin       | `WeaveFFIException` + per-code subclasses  | `try`/`catch` (rethrown by the JNI shim)       |
 | Node.js      | JavaScript `Error`                        | N-API addon throws                             |
-| Python       | `WeaveffiError` exception                 | `try`/`except`                                 |
+| Python       | `WeaveFFIError` exception                  | `try`/`except`                                 |
 | Ruby         | `WeaveFFI::Error` (`StandardError`)        | `begin`/`rescue`                              |
-| Dart         | `WeaveffiException`                       | `try`/`on WeaveffiException catch`            |
-| .NET         | `WeaveffiException`                       | `try`/`catch`                                  |
+| Dart         | `WeaveFFIException`                        | `try`/`on WeaveFFIException catch`            |
+| .NET         | `WeaveFFIException`                        | `try`/`catch`                                  |
 | Go           | `error` return value                      | Standard `if err != nil { ... }`               |
-| WASM         | Numeric return code                       | Caller checks the value                        |
+| WASM         | JavaScript `Error`                        | Caller wraps calls in `try`/`catch`            |
+
+All targets share the canonical `WeaveFFI` brand (never the `heck`-derived
+`Weaveffi`). Error type names are derived from a single naming policy:
+ecosystems that suffix with `Error` (Swift, C++, Python, Node, Ruby, Go) use
+`WeaveFFIError`; ecosystems that suffix with `Exception` (Kotlin, .NET, Dart)
+use `WeaveFFIException`. Per-code names are PascalCased from the IDL
+(`KEY_NOT_FOUND` → `KeyNotFound`/`KeyNotFoundError`), never raw
+SCREAMING_SNAKE.
 
 | Field     | Type           | Description                                       |
 |-----------|----------------|---------------------------------------------------|

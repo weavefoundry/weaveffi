@@ -32,10 +32,44 @@ fn is_false(b: &bool) -> bool {
 #[schemars(description = "Top-level WeaveFFI API definition.")]
 pub struct Api {
     pub version: String,
+    /// Package identity used to name, version, and describe every generated
+    /// consumer package (npm, PyPI, gem, NuGet, pub.dev, SwiftPM, Gradle, Go).
+    /// When omitted, generators fall back to the IDL file stem and version
+    /// `0.1.0`, but publishable artifacts should always set this explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<Package>,
     pub modules: Vec<Module>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<BTreeMap<String, serde_json::Value>>")]
     pub generators: Option<BTreeMap<String, toml::Value>>,
+}
+
+/// Package identity for the generated consumer artifacts.
+///
+/// A single `package:` block in the IDL is the source of truth for the
+/// name, version, and metadata stamped into every ecosystem manifest
+/// (`package.json`, `pyproject.toml`, `*.gemspec`, `*.csproj`, `pubspec.yaml`,
+/// `Package.swift`, `build.gradle`, `go.mod`). This is what makes the
+/// generated packages standalone and publishable rather than all sharing a
+/// placeholder identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "Package identity for the generated consumer artifacts.")]
+pub struct Package {
+    /// Canonical package name (e.g. `kvstore`). Per-target name overrides in
+    /// `generators:` (such as `python.package_name`) still take precedence.
+    pub name: String,
+    /// Semantic version stamped into every manifest (e.g. `1.2.0`).
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authors: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homepage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
 }
 
 /// `Eq` is omitted because `StructField::default` contains `serde_yaml::Value`.
@@ -378,6 +412,77 @@ modules:
 "#;
         let api: Api = serde_yaml::from_str(yaml).unwrap();
         assert!(api.modules[0].structs.is_empty());
+    }
+
+    #[test]
+    fn package_block_round_trips_yaml() {
+        let yaml = r#"
+version: "0.3.0"
+package:
+  name: kvstore
+  version: 1.2.0
+  description: "An embedded key/value store"
+  license: MIT
+  authors:
+    - "Ada Lovelace <ada@example.com>"
+  homepage: "https://example.com/kvstore"
+  repository: "https://github.com/example/kvstore"
+modules:
+  - name: kv
+    functions: []
+"#;
+        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        let pkg = api.package.as_ref().expect("package should parse");
+        assert_eq!(pkg.name, "kvstore");
+        assert_eq!(pkg.version, "1.2.0");
+        assert_eq!(
+            pkg.description.as_deref(),
+            Some("An embedded key/value store")
+        );
+        assert_eq!(pkg.license.as_deref(), Some("MIT"));
+        assert_eq!(pkg.authors, vec!["Ada Lovelace <ada@example.com>"]);
+        assert_eq!(pkg.homepage.as_deref(), Some("https://example.com/kvstore"));
+        assert_eq!(
+            pkg.repository.as_deref(),
+            Some("https://github.com/example/kvstore")
+        );
+
+        // Re-serialize and confirm the block survives the round trip.
+        let out = serde_yaml::to_string(&api).unwrap();
+        assert!(out.contains("name: kvstore"));
+        assert!(out.contains("version: 1.2.0"));
+    }
+
+    #[test]
+    fn package_is_optional() {
+        let yaml = r#"
+version: "0.3.0"
+modules:
+  - name: math
+    functions: []
+"#;
+        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        assert!(api.package.is_none());
+        // Absent package must not appear in the canonical serialization.
+        let out = serde_yaml::to_string(&api).unwrap();
+        assert!(!out.contains("package:"));
+    }
+
+    #[test]
+    fn package_minimal_requires_name_and_version() {
+        let yaml = r#"
+version: "0.3.0"
+package:
+  name: tiny
+  version: 0.0.1
+modules: []
+"#;
+        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        let pkg = api.package.as_ref().unwrap();
+        assert_eq!(pkg.name, "tiny");
+        assert_eq!(pkg.version, "0.0.1");
+        assert!(pkg.description.is_none());
+        assert!(pkg.authors.is_empty());
     }
 
     #[test]
@@ -1307,6 +1412,7 @@ modules:
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let yaml = serde_yaml::to_string(&api).unwrap();
         for needle in [

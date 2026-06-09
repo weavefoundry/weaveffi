@@ -13,28 +13,28 @@ using System.Runtime.InteropServices;
 
 namespace WeaveFFI
 {
-    public class WeaveffiException : Exception
+    public class WeaveFFIException : Exception
     {
         public int Code { get; }
 
-        public WeaveffiException(int code, string message) : base(message)
+        public WeaveFFIException(int code, string message) : base(message)
         {
             Code = code;
         }
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    internal struct WeaveffiError
+    internal struct WeaveFFIError
     {
         public int Code;
         public IntPtr Message;
 
-        internal static void Check(WeaveffiError err)
+        internal static void Check(WeaveFFIError err)
         {
             if (err.Code != 0)
             {
                 var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
-                throw new WeaveffiException(err.Code, msg);
+                throw new WeaveFFIException(err.Code, msg);
             }
         }
     }
@@ -68,16 +68,16 @@ namespace WeaveFFI
         internal static extern void weaveffi_free_bytes(IntPtr ptr, UIntPtr len);
 
         [DllImport(LibName, EntryPoint = "weaveffi_calculator_add", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_calculator_add(int a, int b, ref WeaveffiError err);
+        internal static extern int weaveffi_calculator_add(int a, int b, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_calculator_mul", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_calculator_mul(int a, int b, ref WeaveffiError err);
+        internal static extern int weaveffi_calculator_mul(int a, int b, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_calculator_div", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_calculator_div(int a, int b, ref WeaveffiError err);
+        internal static extern int weaveffi_calculator_div(int a, int b, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_calculator_echo", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_calculator_echo(IntPtr s, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_calculator_echo(IntPtr s, ref WeaveFFIError err);
 
     }
 
@@ -86,39 +86,39 @@ namespace WeaveFFI
         /// <summary>Add two integers</summary>
         public static int CalculatorAdd(int a, int b)
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_calculator_add(a, b, ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             return result;
         }
 
         /// <summary>Multiply two integers</summary>
         public static int CalculatorMul(int a, int b)
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_calculator_mul(a, b, ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             return result;
         }
 
         /// <summary>Divide two integers</summary>
         public static int CalculatorDiv(int a, int b)
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_calculator_div(a, b, ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             return result;
         }
 
         /// <summary>Echo a string back</summary>
         public static string CalculatorEcho(string s)
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var sPtr = Marshal.StringToCoTaskMemUTF8(s);
             try
             {
                 var result = NativeMethods.weaveffi_calculator_echo(sPtr, ref err);
-                WeaveffiError.Check(err);
+                WeaveFFIError.Check(err);
                 var str = Marshal.PtrToStringUTF8(result);
                 NativeMethods.weaveffi_free_string(result);
                 return str;

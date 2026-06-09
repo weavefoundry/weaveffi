@@ -149,12 +149,21 @@ public class Entry {
         var outLen: Int = 0
         let rv = weaveffi_kv_Entry_get_tags(ptr, &outLen)
         guard let rv = rv else { return [] }
-        return Array(UnsafeBufferPointer(start: rv, count: outLen))
+        return (0..<outLen).map { String(cString: rv[$0]!) }
     }
 
     /// Arbitrary string-valued metadata pairs
     public var metadata: [String: String] {
-        return weaveffi_kv_Entry_get_metadata(ptr)
+        var outKeysPtr: UnsafeMutablePointer<UnsafePointer<CChar>?>? = nil
+        var outValuesPtr: UnsafeMutablePointer<UnsafePointer<CChar>?>? = nil
+        var outLen: Int = 0
+        weaveffi_kv_Entry_get_metadata(ptr, &outKeysPtr, &outValuesPtr, &outLen)
+        guard let outKeys = outKeysPtr, let outValues = outValuesPtr else { return [:] }
+        var result: [String: String] = [:]
+        for i in 0..<outLen {
+            result[String(cString: outKeys[i]!)] = String(cString: outValues[i]!)
+        }
+        return result
     }
 }
 
@@ -229,19 +238,25 @@ public class EntryBuilder {
         guard let metadata = _metadata else { fatalError("missing field: metadata") }
         var err = weaveffi_error(code: 0, message: nil)
         let value_bytes = Array(value)
+        let tags_cstrs: [UnsafePointer<CChar>?] = tags.map { UnsafePointer(strdup($0)) }
+        defer { tags_cstrs.forEach { if let s = $0 { free(UnsafeMutablePointer(mutating: s)) } } }
         let metadata_keys = Array(metadata.keys)
         let metadata_values = metadata_keys.map { metadata[$0]! }
+        let metadata_keysCstrs: [UnsafePointer<CChar>?] = metadata_keys.map { UnsafePointer(strdup($0)) }
+        defer { metadata_keysCstrs.forEach { if let s = $0 { free(UnsafeMutablePointer(mutating: s)) } } }
+        let metadata_valuesCstrs: [UnsafePointer<CChar>?] = metadata_values.map { UnsafePointer(strdup($0)) }
+        defer { metadata_valuesCstrs.forEach { if let s = $0 { free(UnsafeMutablePointer(mutating: s)) } } }
         let result: OpaquePointer? = key.withCString { key_ptr in
-            value_bytes.withUnsafeBufferPointer { value_buf in
+            return value_bytes.withUnsafeBufferPointer { value_buf in
                 let value_ptr = value_buf.baseAddress!
                 let value_len = value_buf.count
-                withOptionalPointer(to: expires_at) { expires_at_ptr in
-                    tags.withUnsafeBufferPointer { tags_buf in
+                return withOptionalPointer(to: expires_at) { expires_at_ptr in
+                    return tags_cstrs.withUnsafeBufferPointer { tags_buf in
                         let tags_ptr = tags_buf.baseAddress
                         let tags_len = tags_buf.count
-                        metadata_keys.withUnsafeBufferPointer { metadata_keys_buf in
+                        return metadata_keysCstrs.withUnsafeBufferPointer { metadata_keys_buf in
                             let metadata_keys_ptr = metadata_keys_buf.baseAddress
-                            metadata_values.withUnsafeBufferPointer { metadata_values_buf in
+                            return metadata_valuesCstrs.withUnsafeBufferPointer { metadata_values_buf in
                                 let metadata_values_ptr = metadata_values_buf.baseAddress
                                 let metadata_len = metadata_values_buf.count
                                     return weaveffi_kv_Entry_create(id, key_ptr, value_ptr, value_len, created_at, expires_at_ptr, tags_ptr, tags_len, metadata_keys_ptr, metadata_values_ptr, metadata_len, &err)
@@ -307,10 +322,10 @@ public enum Kv {
         var err = weaveffi_error(code: 0, message: nil)
         let value_bytes = Array(value)
         let result: Bool = key.withCString { key_ptr in
-            value_bytes.withUnsafeBufferPointer { value_buf in
+            return value_bytes.withUnsafeBufferPointer { value_buf in
                 let value_ptr = value_buf.baseAddress!
                 let value_len = value_buf.count
-                withOptionalPointer(to: ttl_seconds) { ttl_seconds_ptr in
+                return withOptionalPointer(to: ttl_seconds) { ttl_seconds_ptr in
                         return weaveffi_kv_put(store.ptr, key_ptr, value_ptr, value_len, weaveffi_kv_EntryKind(kind.rawValue), ttl_seconds_ptr, &err)
                 }
             }
@@ -321,7 +336,7 @@ public enum Kv {
     /// Look up an entry by key; returns null if missing or expired
     public static func kv_get(_ store: Store, _ key: String) throws -> Entry? {
         var err = weaveffi_error(code: 0, message: nil)
-        let result: Entry? = key.withCString { key_ptr in
+        let result: Entry? = try key.withCString { key_ptr in
                 let rv = weaveffi_kv_get(store.ptr, key_ptr, &err)
                 try check(&err)
                 return rv.map { Entry(ptr: $0) }
@@ -340,15 +355,19 @@ public enum Kv {
     /// Stream every key, optionally filtered by a prefix
     public static func kv_list_keys(_ store: Store, _ prefix: String?) throws -> [String] {
         var err = weaveffi_error(code: 0, message: nil)
-        let result: [String] = withOptionalCString(prefix) { prefix_ptr in
+        let result: [String] = try withOptionalCString(prefix) { prefix_ptr in
                 let iter = weaveffi_kv_list_keys(store.ptr, prefix_ptr, &err)
                 try check(&err)
                 guard let iter = iter else { return [] }
                 var items: [String] = []
-                while let ptr = weaveffi_kv_ListKeysIterator_next(iter) {
-                    items.append(String(cString: ptr))
+                var iterItem: UnsafePointer<CChar>? = nil
+                var iterErr = weaveffi_error(code: 0, message: nil)
+                while weaveffi_kv_ListKeysIterator_next(iter, &iterItem, &iterErr) != 0 {
+                    items.append(String(cString: iterItem!))
+                    weaveffi_free_string(UnsafeMutablePointer(mutating: iterItem))
                 }
                 weaveffi_kv_ListKeysIterator_destroy(iter)
+                try check(&iterErr)
                 return items
         }
         return result
@@ -388,7 +407,7 @@ public enum Kv {
         var err = weaveffi_error(code: 0, message: nil)
         let value_bytes = Array(value)
         let result: Bool = key.withCString { key_ptr in
-            value_bytes.withUnsafeBufferPointer { value_buf in
+            return value_bytes.withUnsafeBufferPointer { value_buf in
                 let value_ptr = value_buf.baseAddress!
                 let value_len = value_buf.count
                     return weaveffi_kv_legacy_put(store.ptr, key_ptr, value_ptr, value_len, &err)
@@ -399,12 +418,12 @@ public enum Kv {
     }
     public enum Stats {
         /// Snapshot the current store statistics
-        public static func kv_stats_get_stats(_ store: Store) throws -> Stats {
+        public static func kv_stats_get_stats(_ store: Store) throws -> WeaveFFI.Stats {
             var err = weaveffi_error(code: 0, message: nil)
             let rv = weaveffi_kv_stats_get_stats(store.ptr, &err)
             try check(&err)
             guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
-            return Stats(ptr: rv)
+            return WeaveFFI.Stats(ptr: rv)
         }
     }
 }

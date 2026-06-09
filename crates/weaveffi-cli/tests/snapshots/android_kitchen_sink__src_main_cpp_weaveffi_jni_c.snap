@@ -17,10 +17,10 @@ static void throw_weaveffi_error(JNIEnv* env, weaveffi_error* err) {
     jclass exClass;
     switch (err->code) {
     case 1:
-        exClass = (*env)->FindClass(env, "com/weaveffi/WeaveFFIException$not_found");
+        exClass = (*env)->FindClass(env, "com/weaveffi/WeaveFFIException$NotFound");
         break;
     case 2:
-        exClass = (*env)->FindClass(env, "com/weaveffi/WeaveFFIException$invalid_input");
+        exClass = (*env)->FindClass(env, "com/weaveffi/WeaveFFIException$InvalidInput");
         break;
     default:
         exClass = (*env)->FindClass(env, "java/lang/RuntimeException");
@@ -35,7 +35,7 @@ typedef struct {
     jobject callback;
 } weaveffi_jni_async_ctx;
 
-JNIEXPORT jstring JNICALL Java_com_weaveffi_WeaveFFI_shared_ping(JNIEnv* env, jclass clazz) {
+JNIEXPORT jstring JNICALL Java_com_weaveffi_WeaveFFI_shared_1ping(JNIEnv* env, jclass clazz) {
     weaveffi_error err = {0, NULL};
     const char* rv = weaveffi_shared_ping(&err);
     if (err.code != 0) {
@@ -47,7 +47,7 @@ JNIEXPORT jstring JNICALL Java_com_weaveffi_WeaveFFI_shared_ping(JNIEnv* env, jc
     return out;
 }
 
-JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_kitchen_bool_id(JNIEnv* env, jclass clazz, jboolean x) {
+JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_kitchen_1bool_1id(JNIEnv* env, jclass clazz, jboolean x) {
     weaveffi_error err = {0, NULL};
     bool rv = weaveffi_kitchen_bool_id((bool)(x == JNI_TRUE), &err);
     if (err.code != 0) {
@@ -57,7 +57,7 @@ JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_kitchen_bool_id(JNIEnv* en
     return rv ? JNI_TRUE : JNI_FALSE;
 }
 
-JNIEXPORT jint JNICALL Java_com_weaveffi_WeaveFFI_kitchen_i32_id(JNIEnv* env, jclass clazz, jint x) {
+JNIEXPORT jint JNICALL Java_com_weaveffi_WeaveFFI_kitchen_1i32_1id(JNIEnv* env, jclass clazz, jint x) {
     weaveffi_error err = {0, NULL};
     int32_t rv = weaveffi_kitchen_i32_id((int32_t)x, &err);
     if (err.code != 0) {
@@ -67,7 +67,7 @@ JNIEXPORT jint JNICALL Java_com_weaveffi_WeaveFFI_kitchen_i32_id(JNIEnv* env, jc
     return (jint) rv;
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_kitchen_u32_id(JNIEnv* env, jclass clazz, jlong x) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_kitchen_1u32_1id(JNIEnv* env, jclass clazz, jlong x) {
     weaveffi_error err = {0, NULL};
     uint32_t rv = weaveffi_kitchen_u32_id((uint32_t)x, &err);
     if (err.code != 0) {
@@ -77,7 +77,7 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_kitchen_u32_id(JNIEnv* env, j
     return (jlong) rv;
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_kitchen_i64_id(JNIEnv* env, jclass clazz, jlong x) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_kitchen_1i64_1id(JNIEnv* env, jclass clazz, jlong x) {
     weaveffi_error err = {0, NULL};
     int64_t rv = weaveffi_kitchen_i64_id((int64_t)x, &err);
     if (err.code != 0) {
@@ -87,7 +87,7 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_kitchen_i64_id(JNIEnv* env, j
     return (jlong) rv;
 }
 
-JNIEXPORT jdouble JNICALL Java_com_weaveffi_WeaveFFI_kitchen_f64_id(JNIEnv* env, jclass clazz, jdouble x) {
+JNIEXPORT jdouble JNICALL Java_com_weaveffi_WeaveFFI_kitchen_1f64_1id(JNIEnv* env, jclass clazz, jdouble x) {
     weaveffi_error err = {0, NULL};
     double rv = weaveffi_kitchen_f64_id((double)x, &err);
     if (err.code != 0) {
@@ -97,7 +97,7 @@ JNIEXPORT jdouble JNICALL Java_com_weaveffi_WeaveFFI_kitchen_f64_id(JNIEnv* env,
     return (jdouble) rv;
 }
 
-JNIEXPORT jstring JNICALL Java_com_weaveffi_WeaveFFI_kitchen_echo_string(JNIEnv* env, jclass clazz, jstring s) {
+JNIEXPORT jstring JNICALL Java_com_weaveffi_WeaveFFI_kitchen_1echo_1string(JNIEnv* env, jclass clazz, jstring s) {
     weaveffi_error err = {0, NULL};
     const char* s_chars = (*env)->GetStringUTFChars(env, s, NULL);
     const char* rv = weaveffi_kitchen_echo_string(s_chars, &err);
@@ -111,7 +111,7 @@ JNIEXPORT jstring JNICALL Java_com_weaveffi_WeaveFFI_kitchen_echo_string(JNIEnv*
     return out;
 }
 
-JNIEXPORT jbyteArray JNICALL Java_com_weaveffi_WeaveFFI_kitchen_echo_bytes(JNIEnv* env, jclass clazz, jbyteArray b) {
+JNIEXPORT jbyteArray JNICALL Java_com_weaveffi_WeaveFFI_kitchen_1echo_1bytes(JNIEnv* env, jclass clazz, jbyteArray b) {
     weaveffi_error err = {0, NULL};
     jboolean b_is_copy = 0;
     jbyte* b_elems = (*env)->GetByteArrayElements(env, b, &b_is_copy);
@@ -129,7 +129,7 @@ JNIEXPORT jbyteArray JNICALL Java_com_weaveffi_WeaveFFI_kitchen_echo_bytes(JNIEn
     return out;
 }
 
-JNIEXPORT jstring JNICALL Java_com_weaveffi_WeaveFFI_kitchen_echo_borrowed_str(JNIEnv* env, jclass clazz, jstring s) {
+JNIEXPORT jstring JNICALL Java_com_weaveffi_WeaveFFI_kitchen_1echo_1borrowed_1str(JNIEnv* env, jclass clazz, jstring s) {
     weaveffi_error err = {0, NULL};
     const char* s_chars = (*env)->GetStringUTFChars(env, s, NULL);
     const char* rv = weaveffi_kitchen_echo_borrowed_str(s_chars, &err);
@@ -143,7 +143,7 @@ JNIEXPORT jstring JNICALL Java_com_weaveffi_WeaveFFI_kitchen_echo_borrowed_str(J
     return out;
 }
 
-JNIEXPORT jbyteArray JNICALL Java_com_weaveffi_WeaveFFI_kitchen_echo_borrowed_bytes(JNIEnv* env, jclass clazz, jbyteArray b) {
+JNIEXPORT jbyteArray JNICALL Java_com_weaveffi_WeaveFFI_kitchen_1echo_1borrowed_1bytes(JNIEnv* env, jclass clazz, jbyteArray b) {
     weaveffi_error err = {0, NULL};
     jboolean b_is_copy = 0;
     jbyte* b_elems = (*env)->GetByteArrayElements(env, b, &b_is_copy);
@@ -161,7 +161,7 @@ JNIEXPORT jbyteArray JNICALL Java_com_weaveffi_WeaveFFI_kitchen_echo_borrowed_by
     return out;
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_kitchen_open_handle(JNIEnv* env, jclass clazz) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_kitchen_1open_1handle(JNIEnv* env, jclass clazz) {
     weaveffi_error err = {0, NULL};
     weaveffi_handle_t rv = weaveffi_kitchen_open_handle(&err);
     if (err.code != 0) {
@@ -171,19 +171,19 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_kitchen_open_handle(JNIEnv* e
     return (jlong) rv;
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_kitchen_open_typed_handle(JNIEnv* env, jclass clazz) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_kitchen_1open_1typed_1handleJni(JNIEnv* env, jclass clazz) {
     weaveffi_error err = {0, NULL};
-    weaveffi_handle_t rv = weaveffi_kitchen_open_typed_handle(&err);
+    weaveffi_shared_Token* rv = weaveffi_kitchen_open_typed_handle(&err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return 0;
     }
-    return (jlong) rv;
+    return (jlong)(intptr_t)rv;
 }
 
-JNIEXPORT jobject JNICALL Java_com_weaveffi_WeaveFFI_kitchen_maybe_item(JNIEnv* env, jclass clazz, jlong id) {
+JNIEXPORT jobject JNICALL Java_com_weaveffi_WeaveFFI_kitchen_1maybe_1item(JNIEnv* env, jclass clazz, jlong id) {
     weaveffi_error err = {0, NULL};
-    const int64_t* rv = (const int64_t*)weaveffi_kitchen_maybe_item((int64_t)id, &err);
+    const void* rv = weaveffi_kitchen_maybe_item((int64_t)id, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return NULL;
@@ -191,10 +191,10 @@ JNIEXPORT jobject JNICALL Java_com_weaveffi_WeaveFFI_kitchen_maybe_item(JNIEnv* 
     if (rv == NULL) { return NULL; }
     jclass cls = (*env)->FindClass(env, "java/lang/Long");
     jmethodID mid = (*env)->GetStaticMethodID(env, cls, "valueOf", "(J)Ljava/lang/Long;");
-    return (*env)->CallStaticObjectMethod(env, cls, mid, (jlong)*rv);
+    return (*env)->CallStaticObjectMethod(env, cls, mid, (jlong)(intptr_t)rv);
 }
 
-JNIEXPORT jlongArray JNICALL Java_com_weaveffi_WeaveFFI_kitchen_list_items(JNIEnv* env, jclass clazz) {
+JNIEXPORT jlongArray JNICALL Java_com_weaveffi_WeaveFFI_kitchen_1list_1items(JNIEnv* env, jclass clazz) {
     weaveffi_error err = {0, NULL};
     size_t out_len = 0;
     const int64_t* rv = (const int64_t*)weaveffi_kitchen_list_items(&out_len, &err);
@@ -207,7 +207,7 @@ JNIEXPORT jlongArray JNICALL Java_com_weaveffi_WeaveFFI_kitchen_list_items(JNIEn
     return result;
 }
 
-JNIEXPORT jobject JNICALL Java_com_weaveffi_WeaveFFI_kitchen_get_attrs(JNIEnv* env, jclass clazz) {
+JNIEXPORT jobject JNICALL Java_com_weaveffi_WeaveFFI_kitchen_1get_1attrs(JNIEnv* env, jclass clazz) {
     weaveffi_error err = {0, NULL};
     size_t out_map_len = 0;
     const char** out_keys = NULL;
@@ -229,14 +229,33 @@ JNIEXPORT jobject JNICALL Java_com_weaveffi_WeaveFFI_kitchen_get_attrs(JNIEnv* e
     return result;
 }
 
-JNIEXPORT jlongArray JNICALL Java_com_weaveffi_WeaveFFI_kitchen_stream_items(JNIEnv* env, jclass clazz) {
+JNIEXPORT jlongArray JNICALL Java_com_weaveffi_WeaveFFI_kitchen_1stream_1items(JNIEnv* env, jclass clazz) {
     weaveffi_error err = {0, NULL};
-    jclass _ufe = (*env)->FindClass(env, "java/lang/UnsupportedOperationException");
-    if (_ufe) { (*env)->ThrowNew(env, _ufe, "Iterator<T> returns are not yet supported by the WeaveFFI Android generator"); }
-    return NULL;
+    weaveffi_kitchen_StreamItemsIterator* _iter = weaveffi_kitchen_stream_items(&err);
+    if (err.code != 0) {
+        throw_weaveffi_error(env, &err);
+        return NULL;
+    }
+    jclass _al_cls = (*env)->FindClass(env, "java/util/ArrayList");
+    jobject _list = (*env)->NewObject(env, _al_cls, (*env)->GetMethodID(env, _al_cls, "<init>", "()V"));
+    jmethodID _al_add = (*env)->GetMethodID(env, _al_cls, "add", "(Ljava/lang/Object;)Z");
+    weaveffi_kitchen_Item* _item = (weaveffi_kitchen_Item*)0;
+    weaveffi_error _iter_err = {0, NULL};
+    while (weaveffi_kitchen_StreamItemsIterator_next(_iter, &_item, &_iter_err) != 0) {
+        jclass _jitem_cls = (*env)->FindClass(env, "java/lang/Long");
+        jobject _jitem = (*env)->CallStaticObjectMethod(env, _jitem_cls, (*env)->GetStaticMethodID(env, _jitem_cls, "valueOf", "(J)Ljava/lang/Long;"), (jlong)(intptr_t)_item);
+        (*env)->CallBooleanMethod(env, _list, _al_add, _jitem);
+        (*env)->DeleteLocalRef(env, _jitem);
+    }
+    weaveffi_kitchen_StreamItemsIterator_destroy(_iter);
+    if (_iter_err.code != 0) {
+        throw_weaveffi_error(env, &_iter_err);
+        return NULL;
+    }
+    return (*env)->CallObjectMethod(env, _list, (*env)->GetMethodID(env, _al_cls, "iterator", "()Ljava/util/Iterator;"));
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_kitchen_cross_module_token(JNIEnv* env, jclass clazz) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_kitchen_1cross_1module_1token(JNIEnv* env, jclass clazz) {
     weaveffi_error err = {0, NULL};
     weaveffi_shared_Token* rv = weaveffi_kitchen_cross_module_token(&err);
     if (err.code != 0) {
@@ -266,7 +285,7 @@ static void weaveffi_kitchen_do_async_jni_cb(void* context, weaveffi_error* err,
     free(ctx);
 }
 
-JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_kitchen_do_asyncAsync(JNIEnv* env, jclass clazz, jstring input, jobject callback) {
+JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_kitchen_1do_1asyncAsync(JNIEnv* env, jclass clazz, jstring input, jobject callback) {
     weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)malloc(sizeof(weaveffi_jni_async_ctx));
     (*env)->GetJavaVM(env, &ctx->jvm);
     ctx->callback = (*env)->NewGlobalRef(env, callback);
@@ -295,7 +314,7 @@ static void weaveffi_kitchen_do_cancellable_jni_cb(void* context, weaveffi_error
     free(ctx);
 }
 
-JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_kitchen_do_cancellableAsync(JNIEnv* env, jclass clazz, jstring input, jlong cancelToken, jobject callback) {
+JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_kitchen_1do_1cancellableAsync(JNIEnv* env, jclass clazz, jstring input, jlong cancelToken, jobject callback) {
     weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)malloc(sizeof(weaveffi_jni_async_ctx));
     (*env)->GetJavaVM(env, &ctx->jvm);
     ctx->callback = (*env)->NewGlobalRef(env, callback);
@@ -304,7 +323,7 @@ JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_kitchen_do_cancellableAsync(JN
     (*env)->ReleaseStringUTFChars(env, input, input_chars);
 }
 
-JNIEXPORT jint JNICALL Java_com_weaveffi_WeaveFFI_kitchen_legacy_op(JNIEnv* env, jclass clazz) {
+JNIEXPORT jint JNICALL Java_com_weaveffi_WeaveFFI_kitchen_1legacy_1op(JNIEnv* env, jclass clazz) {
     weaveffi_error err = {0, NULL};
     int32_t rv = weaveffi_kitchen_legacy_op(&err);
     if (err.code != 0) {
@@ -314,7 +333,7 @@ JNIEXPORT jint JNICALL Java_com_weaveffi_WeaveFFI_kitchen_legacy_op(JNIEnv* env,
     return (jint) rv;
 }
 
-JNIEXPORT jint JNICALL Java_com_weaveffi_WeaveFFI_kitchen_new_op(JNIEnv* env, jclass clazz) {
+JNIEXPORT jint JNICALL Java_com_weaveffi_WeaveFFI_kitchen_1new_1op(JNIEnv* env, jclass clazz) {
     weaveffi_error err = {0, NULL};
     int32_t rv = weaveffi_kitchen_new_op(&err);
     if (err.code != 0) {
@@ -324,7 +343,7 @@ JNIEXPORT jint JNICALL Java_com_weaveffi_WeaveFFI_kitchen_new_op(JNIEnv* env, jc
     return (jint) rv;
 }
 
-JNIEXPORT jstring JNICALL Java_com_weaveffi_WeaveFFI_kitchen_nested_hello(JNIEnv* env, jclass clazz) {
+JNIEXPORT jstring JNICALL Java_com_weaveffi_WeaveFFI_kitchen_1nested_1hello(JNIEnv* env, jclass clazz) {
     weaveffi_error err = {0, NULL};
     const char* rv = weaveffi_kitchen_nested_hello(&err);
     if (err.code != 0) {
@@ -475,20 +494,46 @@ JNIEXPORT jbyteArray JNICALL Java_com_weaveffi_Item_nativeGetPayload(JNIEnv* env
 
 JNIEXPORT jobjectArray JNICALL Java_com_weaveffi_Item_nativeGetTags(JNIEnv* env, jclass clazz, jlong handle) {
     size_t out_len = 0;
-    const void* rv = weaveffi_kitchen_Item_get_tags((const weaveffi_kitchen_Item*)(intptr_t)handle, &out_len);
-    (void)rv; (void)out_len;
-    return NULL;
+    const char** rv = (const char**)weaveffi_kitchen_Item_get_tags((const weaveffi_kitchen_Item*)(intptr_t)handle, &out_len);
+    jclass scls = (*env)->FindClass(env, "java/lang/String");
+    jobjectArray jout = (*env)->NewObjectArray(env, (jsize)out_len, scls, NULL);
+    if (jout && rv) {
+        for (size_t i = 0; i < out_len; i++) {
+            jstring s = rv[i] ? (*env)->NewStringUTF(env, rv[i]) : (*env)->NewStringUTF(env, "");
+            (*env)->SetObjectArrayElement(env, jout, (jsize)i, s);
+            (*env)->DeleteLocalRef(env, s);
+            weaveffi_free_string(rv[i]);
+        }
+    }
+    return jout;
 }
 
 JNIEXPORT jobject JNICALL Java_com_weaveffi_Item_nativeGetAttrs(JNIEnv* env, jclass clazz, jlong handle) {
-    void* rv = weaveffi_kitchen_Item_get_attrs((const weaveffi_kitchen_Item*)(intptr_t)handle);
-    return rv;
+    const char** out_keys = NULL;
+    const char** out_vals = NULL;
+    size_t out_len = 0;
+    weaveffi_kitchen_Item_get_attrs((const weaveffi_kitchen_Item*)(intptr_t)handle, &out_keys, &out_vals, &out_len);
+    jclass hm_cls = (*env)->FindClass(env, "java/util/HashMap");
+    jobject result = (*env)->NewObject(env, hm_cls, (*env)->GetMethodID(env, hm_cls, "<init>", "(I)V"), (jint)out_len);
+    jmethodID hm_put = (*env)->GetMethodID(env, hm_cls, "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
+    for (size_t i = 0; i < out_len; i++) {
+        jstring jkey = (*env)->NewStringUTF(env, out_keys[i]);
+        jstring jval = (*env)->NewStringUTF(env, out_vals[i]);
+        (*env)->CallObjectMethod(env, result, hm_put, jkey, jval);
+        (*env)->DeleteLocalRef(env, jkey);
+        (*env)->DeleteLocalRef(env, jval);
+        weaveffi_free_string(out_keys[i]);
+        weaveffi_free_string(out_vals[i]);
+    }
+    return result;
 }
 
 JNIEXPORT jobject JNICALL Java_com_weaveffi_Item_nativeGetParent(JNIEnv* env, jclass clazz, jlong handle) {
-    const void* rv = weaveffi_kitchen_Item_get_parent((const weaveffi_kitchen_Item*)(intptr_t)handle);
-    if (!rv) { return 0; }
-    return (jlong)(intptr_t)rv;
+    const int64_t* rv = (const int64_t*)weaveffi_kitchen_Item_get_parent((const weaveffi_kitchen_Item*)(intptr_t)handle);
+    if (rv == NULL) { return NULL; }
+    jclass cls = (*env)->FindClass(env, "java/lang/Long");
+    jmethodID mid = (*env)->GetStaticMethodID(env, cls, "valueOf", "(J)Ljava/lang/Long;");
+    return (*env)->CallStaticObjectMethod(env, cls, mid, (jlong)*rv);
 }
 
 JNIEXPORT jlong JNICALL Java_com_weaveffi_Item_nativeGetToken(JNIEnv* env, jclass clazz, jlong handle) {

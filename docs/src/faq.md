@@ -97,7 +97,7 @@ heap-allocated UTF-8 message that the caller frees via
 Each target language maps this to its native error story:
 
 - **C** — direct `weaveffi_error` struct.
-- **C++** — exceptions (`weaveffi::Exception`).
+- **C++** — exceptions (`WeaveFFIError` + per-code subclasses).
 - **Swift** — `throws` + `WeaveFFIError`.
 - **Kotlin** — checked exceptions (`WeaveFFIException`).
 - **Node.js / TypeScript** — thrown `Error` objects (or
@@ -105,7 +105,7 @@ Each target language maps this to its native error story:
 - **WASM/JS** — thrown `Error`.
 - **Python** — raised `WeaveFFIError`.
 - **.NET** — thrown `WeaveFFIException`.
-- **Dart** — thrown `WeaveffiException`.
+- **Dart** — thrown `WeaveFFIException`.
 - **Go** — second `error` return value.
 - **Ruby** — raised `WeaveFFIError`.
 
@@ -180,6 +180,12 @@ ship it alongside the generated package. Three common patterns:
   into an Android Archive that Gradle resolves like any other
   dependency. The generated `build.gradle` skeleton is compatible
   with this layout.
+
+The name, version, and metadata stamped into every generated manifest
+(`package.json`, `pyproject.toml`, `*.gemspec`, `*.csproj`, `pubspec.yaml`,
+`Package.swift`, `go.mod`, ...) come from a single
+[`package:` block](reference/idl.md#package-metadata) in your IDL, so you set
+your identity once and every ecosystem stays in sync.
 
 There is no opinionated "weaveffi publish" command today — you use
 each ecosystem's normal publish flow. The

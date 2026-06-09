@@ -7,43 +7,69 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 // WeaveFFI WASM bindings (auto-generated)
 //
-// Complex type conventions at the WASM boundary:
+// Boundary conventions for a wasm32-unknown-unknown build:
 //
-//   Structs   -> i64 opaque handle (pointer into linear memory)
+//   Handles   -> i32 pointer into linear memory (0 = null/absent)
 //   Enums     -> i32 discriminant value
-//   Optionals -> 0/null for absent; for numerics a separate _is_present i32 flag
-//   Lists     -> (i32 pointer, i32 length) pair into linear memory
+//   i64/u64   -> JavaScript BigInt
+//   Strings   -> NUL-terminated UTF-8 (const char*); a single i32 pointer
+//   Bytes     -> i32 data pointer + i32 length (out_len for returns)
+//   Optionals -> null handle / null pointer (0); scalars boxed by pointer
 
-const _encoder = new TextEncoder();
-const _decoder = new TextDecoder();
+const _enc = new TextEncoder();
+const _dec = new TextDecoder();
 
-function _encodeString(wasm, str) {
-  const bytes = _encoder.encode(str);
-  const ptr = wasm.weaveffi_alloc(bytes.length);
-  new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);
-  return [ptr, bytes.length];
+// Stage a JS string as a NUL-terminated C string in linear memory.
+// Returns [ptr, size] (size includes the NUL); release with _free.
+function _cstr(wasm, str) {
+  const bytes = _enc.encode(str);
+  const size = bytes.length + 1;
+  const ptr = wasm.weaveffi_alloc(size);
+  const mem = new Uint8Array(wasm.memory.buffer, ptr, size);
+  mem.set(bytes);
+  mem[bytes.length] = 0;
+  return [ptr, size];
 }
 
-function _decodeString(wasm, ptr, len) {
-  return _decoder.decode(new Uint8Array(wasm.memory.buffer, ptr, len));
+// Read a NUL-terminated C string (0 => null). Does not free.
+function _readCStr(wasm, ptr) {
+  if (ptr === 0) return null;
+  const mem = new Uint8Array(wasm.memory.buffer);
+  let end = ptr;
+  while (mem[end] !== 0) end++;
+  return _dec.decode(mem.subarray(ptr, end));
 }
 
-function _allocError(wasm) {
-  return wasm.weaveffi_alloc(8);
+// Read then free a producer-owned C string.
+function _takeCStr(wasm, ptr) {
+  const s = _readCStr(wasm, ptr);
+  if (ptr !== 0) wasm.weaveffi_free_string(ptr);
+  return s;
 }
 
-function _checkError(wasm, errPtr) {
-  const buffer = wasm.memory.buffer;
-  const code = new Int32Array(buffer, errPtr, 1)[0];
+// Allocate a zeroed {i32 code, i32 message} error slot.
+function _allocErr(wasm) {
+  const ptr = wasm.weaveffi_alloc(8);
+  new Uint8Array(wasm.memory.buffer, ptr, 8).fill(0);
+  return ptr;
+}
+
+// Throw (and free the slot) if the error slot carries a non-zero code.
+function _checkErr(wasm, errPtr) {
+  const dv = new DataView(wasm.memory.buffer);
+  const code = dv.getInt32(errPtr, true);
   if (code !== 0) {
-    const msgPtr = new Uint32Array(buffer, errPtr + 4, 1)[0];
-    const bytes = new Uint8Array(buffer, msgPtr);
-    let end = 0;
-    while (bytes[end] !== 0) end++;
-    const msg = new TextDecoder().decode(new Uint8Array(buffer, msgPtr, end));
+    const msgPtr = dv.getUint32(errPtr + 4, true);
+    const msg = _readCStr(wasm, msgPtr) || '';
     wasm.weaveffi_error_clear(errPtr);
+    wasm.weaveffi_dealloc(errPtr, 8);
     throw new Error(`WeaveFFI error ${code}: ${msg}`);
   }
+}
+
+// Release an error slot on the success path.
+function _freeErr(wasm, errPtr) {
+  wasm.weaveffi_dealloc(errPtr, 8);
 }
 
 export const ContactType = Object.freeze({
@@ -58,25 +84,43 @@ class Contact {
     this._handle = handle;
   }
   get id() {
-    return this._wasm.weaveffi_contacts_Contact_get_id(this._handle);
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_contacts_Contact_get_id(this._handle);
+    return _r;
   }
   get first_name() {
-    const retptr = this._wasm.weaveffi_alloc(8);
-    this._wasm.weaveffi_contacts_Contact_get_first_name(retptr, this._handle);
-    const view = new DataView(this._wasm.memory.buffer);
-    return _decodeString(this._wasm, view.getInt32(retptr, true), view.getInt32(retptr + 4, true));
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_contacts_Contact_get_first_name(this._handle);
+    return _takeCStr(wasm, _r);
   }
   get last_name() {
-    const retptr = this._wasm.weaveffi_alloc(8);
-    this._wasm.weaveffi_contacts_Contact_get_last_name(retptr, this._handle);
-    const view = new DataView(this._wasm.memory.buffer);
-    return _decodeString(this._wasm, view.getInt32(retptr, true), view.getInt32(retptr + 4, true));
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_contacts_Contact_get_last_name(this._handle);
+    return _takeCStr(wasm, _r);
   }
   get email() {
-    return this._wasm.weaveffi_contacts_Contact_get_email(this._handle);
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_contacts_Contact_get_email(this._handle);
+    return _takeCStr(wasm, _r);
   }
   get contact_type() {
-    return this._wasm.weaveffi_contacts_Contact_get_contact_type(this._handle);
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_contacts_Contact_get_contact_type(this._handle);
+    return _r;
+  }
+  static create(wasm, id, first_name, last_name, email, contact_type) {
+    const [a1_p, a1_s] = _cstr(wasm, first_name);
+    const [a2_p, a2_s] = _cstr(wasm, last_name);
+    let a3_p = 0, a3_s = 0;
+    if (email !== null && email !== undefined) { [a3_p, a3_s] = _cstr(wasm, email); }
+    const _err = _allocErr(wasm);
+    const _r = wasm.weaveffi_contacts_Contact_create(BigInt(id), a1_p, a2_p, a3_p, contact_type, _err);
+    wasm.weaveffi_dealloc(a1_p, a1_s);
+    wasm.weaveffi_dealloc(a2_p, a2_s);
+    if (a3_p !== 0) wasm.weaveffi_dealloc(a3_p, a3_s);
+    _checkErr(wasm, _err);
+    _freeErr(wasm, _err);
+    return new Contact(wasm, _r);
   }
 }
 
@@ -92,21 +136,22 @@ class Contact {
  * @example
  * const api = await loadWeaveffiWasm('lib.wasm');
  *
- * // Primitive: (i32, i32) -> i32
+ * // Primitive: plain numbers in, number out.
  * const sum = api.math.add(1, 2);
  *
- * // Struct handle: () -> i64 (opaque pointer)
- * const handle = api.contacts.create();
+ * // Struct: returns a wrapper instance exposing field getters.
+ * const person = api.contacts.create();
+ * console.log(person.name);
  *
- * // Enum: (i32 discriminant) -> void
+ * // Enum: pass the integer discriminant.
  * api.ui.set_color(0); // 0 = first variant
  *
- * // Optional: (i32 is_present, i32 value) -> void
- * api.config.set_timeout(1, 5000); // present
- * api.config.set_timeout(0, 0);    // absent
+ * // Optional: pass null to omit, a value to provide.
+ * api.config.set_timeout(5000); // present
+ * api.config.set_timeout(null); // absent
  *
- * // List: (i32 pointer, i32 length) -> void
- * api.data.process(ptr, len);
+ * // List/Map: pass arrays/objects; receive arrays/objects.
+ * const names = api.data.all_names();
  */
 export async function loadWeaveffiWasm(url) {
   const response = await fetch(url);
@@ -118,36 +163,58 @@ export async function loadWeaveffiWasm(url) {
     _raw: wasm,
     contacts: {
       create_contact(first_name, last_name, email, contact_type) {
-        const _err = _allocError(wasm);
-        const [first_name_ptr, first_name_len] = _encodeString(wasm, first_name);
-        const [last_name_ptr, last_name_len] = _encodeString(wasm, last_name);
-        const _result = wasm.weaveffi_contacts_create_contact(first_name_ptr, first_name_len, last_name_ptr, last_name_len, email, contact_type, _err);
-        _checkError(wasm, _err);
-        return _result;
+        const [a0_p, a0_s] = _cstr(wasm, first_name);
+        const [a1_p, a1_s] = _cstr(wasm, last_name);
+        let a2_p = 0, a2_s = 0;
+        if (email !== null && email !== undefined) { [a2_p, a2_s] = _cstr(wasm, email); }
+        const _err = _allocErr(wasm);
+        const _r = wasm.weaveffi_contacts_create_contact(a0_p, a1_p, a2_p, contact_type, _err);
+        wasm.weaveffi_dealloc(a0_p, a0_s);
+        wasm.weaveffi_dealloc(a1_p, a1_s);
+        if (a2_p !== 0) wasm.weaveffi_dealloc(a2_p, a2_s);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        return _r;
       },
       get_contact(id) {
-        const _err = _allocError(wasm);
-        const _result = wasm.weaveffi_contacts_get_contact(id, _err);
-        _checkError(wasm, _err);
-        return new Contact(wasm, _result);
+        const _err = _allocErr(wasm);
+        const _r = wasm.weaveffi_contacts_get_contact(BigInt(id), _err);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        return new Contact(wasm, _r);
       },
       list_contacts() {
-        const _err = _allocError(wasm);
-        const _result = wasm.weaveffi_contacts_list_contacts(_err);
-        _checkError(wasm, _err);
-        return _result;
+        const _lp = wasm.weaveffi_alloc(4);
+        const _err = _allocErr(wasm);
+        const _r = wasm.weaveffi_contacts_list_contacts(_lp, _err);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        const _dv = new DataView(wasm.memory.buffer);
+        const _len = _dv.getUint32(_lp, true);
+        wasm.weaveffi_dealloc(_lp, 4);
+        const _out = [];
+        {
+          const dv = new DataView(wasm.memory.buffer);
+          for (let i = 0; i < _len; i++) _out.push(new Contact(wasm, dv.getInt32(_r + i * 4, true)));
+        }
+        return _out;
       },
       delete_contact(id) {
-        const _err = _allocError(wasm);
-        const _result = wasm.weaveffi_contacts_delete_contact(id, _err);
-        _checkError(wasm, _err);
-        return _result !== 0;
+        const _err = _allocErr(wasm);
+        const _r = wasm.weaveffi_contacts_delete_contact(BigInt(id), _err);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        return _r !== 0;
       },
       count_contacts() {
-        const _err = _allocError(wasm);
-        const _result = wasm.weaveffi_contacts_count_contacts(_err);
-        _checkError(wasm, _err);
-        return _result;
+        const _err = _allocErr(wasm);
+        const _r = wasm.weaveffi_contacts_count_contacts(_err);
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        return _r;
+      },
+      Contact: {
+        create: (...args) => Contact.create(wasm, ...args),
       },
     },
   };

@@ -27,8 +27,8 @@ fn generate_async_demo_all_targets() {
         "node/types.d.ts should contain Promise for async functions"
     );
 
-    let swift = std::fs::read_to_string(out_path.join("swift/Sources/WeaveFFI/WeaveFFI.swift"))
-        .expect("missing swift/Sources/WeaveFFI/WeaveFFI.swift");
+    let swift = std::fs::read_to_string(out_path.join("swift/Sources/AsyncDemo/AsyncDemo.swift"))
+        .expect("missing swift/Sources/AsyncDemo/AsyncDemo.swift");
     assert!(
         swift.contains("async throws"),
         "WeaveFFI.swift should contain async throws for async functions"
@@ -42,8 +42,8 @@ fn generate_async_demo_all_targets() {
         "WeaveFFI.kt should contain suspend for async functions"
     );
 
-    let python = std::fs::read_to_string(out_path.join("python/weaveffi/weaveffi.py"))
-        .expect("missing python/weaveffi/weaveffi.py");
+    let python = std::fs::read_to_string(out_path.join("python/async_demo/weaveffi.py"))
+        .expect("missing python/async_demo/weaveffi.py");
     assert!(
         python.contains("async def"),
         "weaveffi.py should contain async def for async functions"

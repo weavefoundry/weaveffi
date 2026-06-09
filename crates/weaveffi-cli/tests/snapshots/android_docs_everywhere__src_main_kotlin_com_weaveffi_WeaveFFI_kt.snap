@@ -63,7 +63,7 @@ enum class Status(val value: Int) {
  *
  * Documents are persisted to disk and exposed via the public API.
  */
-class Document internal constructor(private var handle: Long) : java.io.Closeable {
+class Document internal constructor(internal var handle: Long) : java.io.Closeable {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
@@ -82,7 +82,7 @@ class Document internal constructor(private var handle: Long) : java.io.Closeabl
     /** Human-readable title shown in lists */
     val title: String get() = nativeGetTitle(handle)
     /** Current lifecycle status */
-    val status: Status get() = nativeGetStatus(handle)
+    val status: Status get() = Status.fromValue(nativeGetStatus(handle))
     /** Free-form tags for grouping */
     val tags: Array<String> get() = nativeGetTags(handle)
 
@@ -140,9 +140,9 @@ class DocumentBuilder {
 
 sealed class WeaveFFIException(val code: Int, message: String) : Exception(message) {
     /** Returned when no document matches the requested id */
-    class not_found(message: String = "Document not found") : WeaveFFIException(1, message)
+    class NotFound(message: String = "Document not found") : WeaveFFIException(1, message)
     /** Raised when attempting to move into a forbidden state */
-    class invalid_status(message: String = "Invalid status transition") : WeaveFFIException(2, message)
+    class InvalidStatus(message: String = "Invalid status transition") : WeaveFFIException(2, message)
 }
 
 internal class WeaveContinuation<T>(private val cont: kotlinx.coroutines.CancellableContinuation<T>) {

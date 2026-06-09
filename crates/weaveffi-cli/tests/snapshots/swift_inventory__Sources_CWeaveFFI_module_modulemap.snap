@@ -6,7 +6,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
 module CWeaveFFI [system] {
-  header "../../c/weaveffi.h"
+  header "../../../c/weaveffi.h"
   link "weaveffi"
   export *
 }

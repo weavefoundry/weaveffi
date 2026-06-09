@@ -209,9 +209,10 @@ jobs:
     # Correctness gate: every consumer binds through the *generated* wrappers and
     # asserts concrete results, so a backend that lowers a type wrong, drifts a
     # symbol, or skips a feature fails here (unlike the examples/ smoke programs
-    # in build-test, which mostly check exit status). Covers contacts + events
-    # across C, C++, Python, Ruby, Dart, Go, Swift, .NET, and Node. Wasm and
-    # Kotlin are out of scope for this dylib-based harness (see conformance/run.sh).
+    # in build-test, which mostly check exit status). Covers contacts + events +
+    # kvstore across C, C++, Python, Ruby, Dart, Go, Swift, .NET, Node, Kotlin,
+    # and WASM (the kvstore lanes exercise list/map/bytes/optional returns,
+    # builders, and iterators; see conformance/run.sh).
     name: Conformance harness
     runs-on: ubuntu-latest
     steps:
@@ -220,6 +221,9 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Add wasm target
+        run: rustup target add wasm32-unknown-unknown
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -285,7 +289,7 @@ jobs:
             "generated/swift/Package.swift",
             "generated/node/types.d.ts",
             "generated/android/build.gradle",
-            "generated/python/weaveffi/weaveffi.py",
+            "generated/python/calculator/weaveffi.py",
             "generated/dotnet/WeaveFFI.cs",
             "generated/wasm/README.md"
           )
@@ -417,11 +421,13 @@ jobs:
           # IDL module ("contacts") unless `strip_module_prefix=true` is set
           # via inline IDL `[generators.weaveffi]` or a config file. The
           # contacts sample takes the default, so the exported symbols
-          # include the `contacts_` segment.
+          # include the `contacts_` segment. Underscores in the Java method
+          # name are escaped to `_1` per the JNI symbol-mangling rules, so e.g.
+          # `contacts_create_contactJni` -> `contacts_1create_1contactJni`.
           for sym in \
-              Java_com_weaveffi_WeaveFFI_contacts_create_contactJni \
-              Java_com_weaveffi_WeaveFFI_contacts_count_contacts \
-              Java_com_weaveffi_WeaveFFI_contacts_delete_contact \
+              Java_com_weaveffi_WeaveFFI_contacts_1create_1contactJni \
+              Java_com_weaveffi_WeaveFFI_contacts_1count_1contacts \
+              Java_com_weaveffi_WeaveFFI_contacts_1delete_1contact \
               Java_com_weaveffi_Contact_nativeGetId; do
             if ! grep -q " T $sym\$" nm.out; then
               echo "missing exported JNI symbol: $sym" >&2

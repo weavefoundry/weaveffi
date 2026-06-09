@@ -596,6 +596,7 @@ mod tests {
             version: "0.3.0".into(),
             modules,
             generators: None,
+            package: None,
         }
     }
 

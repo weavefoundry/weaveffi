@@ -218,7 +218,7 @@ static napi_value Napi_weaveffi_kitchen_open_handle(napi_env env, napi_callback_
     return NULL;
   }
   napi_value ret;
-  napi_create_int64(env, (int64_t)result, &ret);
+  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
   return ret;
 }
 
@@ -226,14 +226,14 @@ static napi_value Napi_weaveffi_kitchen_open_typed_handle(napi_env env, napi_cal
   size_t argc = 0;
   napi_get_cb_info(env, info, &argc, NULL, NULL, NULL);
   weaveffi_error err = {0};
-  weaveffi_handle_t result = weaveffi_kitchen_open_typed_handle(&err);
+  weaveffi_shared_Token* result = weaveffi_kitchen_open_typed_handle(&err);
   if (err.code != 0) {
     napi_throw_error(env, NULL, err.message);
     weaveffi_error_clear(&err);
     return NULL;
   }
   napi_value ret;
-  napi_create_int64(env, (int64_t)result, &ret);
+  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
   return ret;
 }
 
@@ -280,16 +280,52 @@ static napi_value Napi_weaveffi_kitchen_maybe_item(napi_env env, napi_callback_i
       napi_create_uint32(env, weaveffi_kitchen_Item_get_nick(ret_p), &ret_nick);
       napi_set_named_property(env, ret, "nick", ret_nick);
       napi_value ret_payload;
-      napi_get_null(env, &ret_payload);
+      {
+        size_t ret_payload_len;
+        const uint8_t* ret_payload_data = (const uint8_t*)weaveffi_kitchen_Item_get_payload(ret_p, &ret_payload_len);
+        if (ret_payload_data == NULL) { napi_get_null(env, &ret_payload); }
+        else { void* ret_payload_buf; napi_create_buffer_copy(env, ret_payload_len, ret_payload_data, &ret_payload_buf, &ret_payload); }
+      }
       napi_set_named_property(env, ret, "payload", ret_payload);
       napi_value ret_tags;
-      napi_get_null(env, &ret_tags);
+      {
+        size_t ret_tags_len;
+        const char** ret_tags_arr = weaveffi_kitchen_Item_get_tags(ret_p, &ret_tags_len);
+        napi_create_array(env, &ret_tags);
+        if (ret_tags_arr != NULL) {
+          for (size_t ret_tags_i = 0; ret_tags_i < ret_tags_len; ret_tags_i++) {
+            napi_value ret_tags_e;
+            napi_create_string_utf8(env, ret_tags_arr[ret_tags_i], NAPI_AUTO_LENGTH, &ret_tags_e);
+            weaveffi_free_string((char*)(ret_tags_arr[ret_tags_i]));
+            napi_set_element(env, ret_tags, (uint32_t)ret_tags_i, ret_tags_e);
+          }
+        }
+      }
       napi_set_named_property(env, ret, "tags", ret_tags);
       napi_value ret_attrs;
-      napi_get_null(env, &ret_attrs);
+      {
+        const char** ret_attrs_keys = NULL;
+        const char** ret_attrs_vals = NULL;
+        size_t ret_attrs_len;
+        weaveffi_kitchen_Item_get_attrs(ret_p, &ret_attrs_keys, &ret_attrs_vals, &ret_attrs_len);
+        napi_create_object(env, &ret_attrs);
+        if (ret_attrs_keys != NULL && ret_attrs_vals != NULL) {
+          for (size_t ret_attrs_i = 0; ret_attrs_i < ret_attrs_len; ret_attrs_i++) {
+            napi_value ret_attrs_v;
+            napi_create_string_utf8(env, ret_attrs_vals[ret_attrs_i], NAPI_AUTO_LENGTH, &ret_attrs_v);
+            weaveffi_free_string((char*)(ret_attrs_vals[ret_attrs_i]));
+            napi_set_named_property(env, ret_attrs, ret_attrs_keys[ret_attrs_i], ret_attrs_v);
+            weaveffi_free_string((char*)ret_attrs_keys[ret_attrs_i]);
+          }
+        }
+      }
       napi_set_named_property(env, ret, "attrs", ret_attrs);
       napi_value ret_parent;
-      napi_get_null(env, &ret_parent);
+      {
+        int64_t* ret_parent_p = weaveffi_kitchen_Item_get_parent(ret_p);
+        if (ret_parent_p == NULL) { napi_get_null(env, &ret_parent); }
+        else { napi_create_int64(env, *ret_parent_p, &ret_parent); }
+      }
       napi_set_named_property(env, ret, "parent", ret_parent);
       napi_value ret_token;
       {
@@ -358,16 +394,52 @@ static napi_value Napi_weaveffi_kitchen_list_items(napi_env env, napi_callback_i
       napi_create_uint32(env, weaveffi_kitchen_Item_get_nick(elem_p), &elem_nick);
       napi_set_named_property(env, elem, "nick", elem_nick);
       napi_value elem_payload;
-      napi_get_null(env, &elem_payload);
+      {
+        size_t elem_payload_len;
+        const uint8_t* elem_payload_data = (const uint8_t*)weaveffi_kitchen_Item_get_payload(elem_p, &elem_payload_len);
+        if (elem_payload_data == NULL) { napi_get_null(env, &elem_payload); }
+        else { void* elem_payload_buf; napi_create_buffer_copy(env, elem_payload_len, elem_payload_data, &elem_payload_buf, &elem_payload); }
+      }
       napi_set_named_property(env, elem, "payload", elem_payload);
       napi_value elem_tags;
-      napi_get_null(env, &elem_tags);
+      {
+        size_t elem_tags_len;
+        const char** elem_tags_arr = weaveffi_kitchen_Item_get_tags(elem_p, &elem_tags_len);
+        napi_create_array(env, &elem_tags);
+        if (elem_tags_arr != NULL) {
+          for (size_t elem_tags_i = 0; elem_tags_i < elem_tags_len; elem_tags_i++) {
+            napi_value elem_tags_e;
+            napi_create_string_utf8(env, elem_tags_arr[elem_tags_i], NAPI_AUTO_LENGTH, &elem_tags_e);
+            weaveffi_free_string((char*)(elem_tags_arr[elem_tags_i]));
+            napi_set_element(env, elem_tags, (uint32_t)elem_tags_i, elem_tags_e);
+          }
+        }
+      }
       napi_set_named_property(env, elem, "tags", elem_tags);
       napi_value elem_attrs;
-      napi_get_null(env, &elem_attrs);
+      {
+        const char** elem_attrs_keys = NULL;
+        const char** elem_attrs_vals = NULL;
+        size_t elem_attrs_len;
+        weaveffi_kitchen_Item_get_attrs(elem_p, &elem_attrs_keys, &elem_attrs_vals, &elem_attrs_len);
+        napi_create_object(env, &elem_attrs);
+        if (elem_attrs_keys != NULL && elem_attrs_vals != NULL) {
+          for (size_t elem_attrs_i = 0; elem_attrs_i < elem_attrs_len; elem_attrs_i++) {
+            napi_value elem_attrs_v;
+            napi_create_string_utf8(env, elem_attrs_vals[elem_attrs_i], NAPI_AUTO_LENGTH, &elem_attrs_v);
+            weaveffi_free_string((char*)(elem_attrs_vals[elem_attrs_i]));
+            napi_set_named_property(env, elem_attrs, elem_attrs_keys[elem_attrs_i], elem_attrs_v);
+            weaveffi_free_string((char*)elem_attrs_keys[elem_attrs_i]);
+          }
+        }
+      }
       napi_set_named_property(env, elem, "attrs", elem_attrs);
       napi_value elem_parent;
-      napi_get_null(env, &elem_parent);
+      {
+        int64_t* elem_parent_p = weaveffi_kitchen_Item_get_parent(elem_p);
+        if (elem_parent_p == NULL) { napi_get_null(env, &elem_parent); }
+        else { napi_create_int64(env, *elem_parent_p, &elem_parent); }
+      }
       napi_set_named_property(env, elem, "parent", elem_parent);
       napi_value elem_token;
       {
@@ -429,7 +501,8 @@ static napi_value Napi_weaveffi_kitchen_stream_items(napi_env env, napi_callback
   napi_create_array(env, &ret);
   uint32_t iter_idx = 0;
   weaveffi_kitchen_Item* iter_item;
-  while (weaveffi_kitchen_StreamItemsIterator_next(result, &iter_item)) {
+  weaveffi_error iter_err = {0};
+  while (weaveffi_kitchen_StreamItemsIterator_next(result, &iter_item, &iter_err)) {
     napi_value elem;
     napi_create_int64(env, (int64_t)(intptr_t)iter_item, &elem);
     napi_set_element(env, ret, iter_idx++, elem);

@@ -57,7 +57,16 @@ func (s *Document) Status() Status {
 
 // Tags: Free-form tags for grouping
 func (s *Document) Tags() []string {
-	return []string(C.weaveffi_docs_Document_get_tags(s.ptr))
+	var cOutLen C.size_t
+	result := C.weaveffi_docs_Document_get_tags(s.ptr, &cOutLen)
+	count := int(cOutLen)
+	goResult := make([]string, count)
+	if count > 0 && result != nil {
+		for i, v := range unsafe.Slice((**C.char)(unsafe.Pointer(result)), count) {
+			goResult[i] = C.GoString(v)
+		}
+	}
+	return goResult
 }
 
 func (s *Document) Close() {
@@ -71,35 +80,69 @@ func (s *Document) Close() {
 //
 // Documents are persisted to disk and exposed via the public API.
 type DocumentBuilder struct {
-	fields map[string]interface{}
+	id int64
+	title string
+	status Status
+	tags []string
 }
 
 func NewDocumentBuilder() *DocumentBuilder {
-	return &DocumentBuilder{fields: make(map[string]interface{})}
+	return &DocumentBuilder{}
 }
 
 // WithId: Stable opaque identifier
 func (b *DocumentBuilder) WithId(value int64) *DocumentBuilder {
-	b.fields["id"] = value
+	b.id = value
 	return b
 }
 
 // WithTitle: Human-readable title shown in lists
 func (b *DocumentBuilder) WithTitle(value string) *DocumentBuilder {
-	b.fields["title"] = value
+	b.title = value
 	return b
 }
 
 // WithStatus: Current lifecycle status
 func (b *DocumentBuilder) WithStatus(value Status) *DocumentBuilder {
-	b.fields["status"] = value
+	b.status = value
 	return b
 }
 
 // WithTags: Free-form tags for grouping
 func (b *DocumentBuilder) WithTags(value []string) *DocumentBuilder {
-	b.fields["tags"] = value
+	b.tags = value
 	return b
+}
+
+func (b *DocumentBuilder) Build() (*Document, error) {
+	id := b.id
+	title := b.title
+	cTitle := C.CString(title)
+	defer C.free(unsafe.Pointer(cTitle))
+	status := b.status
+	tags := b.tags
+	cTagsLen := C.size_t(len(tags))
+	cTagsArr := make([]*C.char, len(tags))
+	for i, s := range tags {
+		cTagsArr[i] = C.CString(s)
+	}
+	defer func() {
+		for _, p := range cTagsArr {
+			C.free(unsafe.Pointer(p))
+		}
+	}()
+	var cTagsPtr **C.char
+	if len(cTagsArr) > 0 {
+		cTagsPtr = (**C.char)(unsafe.Pointer(&cTagsArr[0]))
+	}
+	var cErr C.weaveffi_error
+	result := C.weaveffi_docs_Document_create(C.int64_t(id), cTitle, C.weaveffi_docs_Status(status), cTagsPtr, cTagsLen, &cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return nil, goErr
+	}
+	return &Document{ptr: result}, nil
 }
 
 // DocsCreateDocument: Create a brand new document.

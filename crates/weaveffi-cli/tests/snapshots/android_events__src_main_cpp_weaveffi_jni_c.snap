@@ -19,7 +19,7 @@ static void throw_weaveffi_error(JNIEnv* env, weaveffi_error* err) {
     weaveffi_error_clear(err);
 }
 
-JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_events_send_message(JNIEnv* env, jclass clazz, jstring text) {
+JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_events_1send_1message(JNIEnv* env, jclass clazz, jstring text) {
     weaveffi_error err = {0, NULL};
     const char* text_chars = (*env)->GetStringUTFChars(env, text, NULL);
     weaveffi_events_send_message(text_chars, &err);
@@ -31,11 +31,30 @@ JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_events_send_message(JNIEnv* en
     return;
 }
 
-JNIEXPORT jobjectArray JNICALL Java_com_weaveffi_WeaveFFI_events_get_messages(JNIEnv* env, jclass clazz) {
+JNIEXPORT jobjectArray JNICALL Java_com_weaveffi_WeaveFFI_events_1get_1messages(JNIEnv* env, jclass clazz) {
     weaveffi_error err = {0, NULL};
-    jclass _ufe = (*env)->FindClass(env, "java/lang/UnsupportedOperationException");
-    if (_ufe) { (*env)->ThrowNew(env, _ufe, "Iterator<T> returns are not yet supported by the WeaveFFI Android generator"); }
-    return NULL;
+    weaveffi_events_GetMessagesIterator* _iter = weaveffi_events_get_messages(&err);
+    if (err.code != 0) {
+        throw_weaveffi_error(env, &err);
+        return NULL;
+    }
+    jclass _al_cls = (*env)->FindClass(env, "java/util/ArrayList");
+    jobject _list = (*env)->NewObject(env, _al_cls, (*env)->GetMethodID(env, _al_cls, "<init>", "()V"));
+    jmethodID _al_add = (*env)->GetMethodID(env, _al_cls, "add", "(Ljava/lang/Object;)Z");
+    const char* _item = (const char*)0;
+    weaveffi_error _iter_err = {0, NULL};
+    while (weaveffi_events_GetMessagesIterator_next(_iter, &_item, &_iter_err) != 0) {
+        jstring _jitem = _item ? (*env)->NewStringUTF(env, _item) : (*env)->NewStringUTF(env, "");
+        (*env)->CallBooleanMethod(env, _list, _al_add, _jitem);
+        (*env)->DeleteLocalRef(env, _jitem);
+        weaveffi_free_string(_item);
+    }
+    weaveffi_events_GetMessagesIterator_destroy(_iter);
+    if (_iter_err.code != 0) {
+        throw_weaveffi_error(env, &_iter_err);
+        return NULL;
+    }
+    return (*env)->CallObjectMethod(env, _list, (*env)->GetMethodID(env, _al_cls, "iterator", "()Ljava/util/Iterator;"));
 }
 
 

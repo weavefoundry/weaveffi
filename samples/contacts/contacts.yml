@@ -1,4 +1,13 @@
 version: "0.3.0"
+package:
+  name: contacts
+  version: "1.0.0"
+  description: A small contacts book API demonstrating structs, enums, and optionals.
+  license: MIT
+  authors:
+    - WeaveFoundry <hello@weavefoundry.dev>
+  homepage: https://github.com/weavefoundry/weaveffi
+  repository: https://github.com/weavefoundry/weaveffi
 modules:
   - name: contacts
     enums:

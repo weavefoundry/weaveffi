@@ -8,7 +8,7 @@
 // exact marshalling the Swift backend was previously generating incorrectly.
 
 import Foundation
-import WeaveFFI
+import Contacts
 
 func fail(_ msg: String) -> Never {
     FileHandle.standardError.write(Data("assertion failed: \(msg)\n".utf8))

@@ -13,28 +13,28 @@ using System.Runtime.InteropServices;
 
 namespace WeaveFFI
 {
-    public class WeaveffiException : Exception
+    public class WeaveFFIException : Exception
     {
         public int Code { get; }
 
-        public WeaveffiException(int code, string message) : base(message)
+        public WeaveFFIException(int code, string message) : base(message)
         {
             Code = code;
         }
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    internal struct WeaveffiError
+    internal struct WeaveFFIError
     {
         public int Code;
         public IntPtr Message;
 
-        internal static void Check(WeaveffiError err)
+        internal static void Check(WeaveFFIError err)
         {
             if (err.Code != 0)
             {
                 var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
-                throw new WeaveffiException(err.Code, msg);
+                throw new WeaveFFIException(err.Code, msg);
             }
         }
     }
@@ -68,10 +68,10 @@ namespace WeaveFFI
         internal static extern void weaveffi_free_bytes(IntPtr ptr, UIntPtr len);
 
         [DllImport(LibName, EntryPoint = "weaveffi_events_send_message", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void weaveffi_events_send_message(IntPtr text, ref WeaveffiError err);
+        internal static extern void weaveffi_events_send_message(IntPtr text, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_events_get_messages", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_events_get_messages(out UIntPtr out_len, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_events_get_messages(out UIntPtr out_len, ref WeaveFFIError err);
 
     }
 
@@ -80,12 +80,12 @@ namespace WeaveFFI
         /// <summary>Send a message, triggering the OnMessage callback</summary>
         public static void EventsSendMessage(string text)
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var textPtr = Marshal.StringToCoTaskMemUTF8(text);
             try
             {
                 NativeMethods.weaveffi_events_send_message(textPtr, ref err);
-                WeaveffiError.Check(err);
+                WeaveFFIError.Check(err);
             }
             finally
             {
@@ -96,9 +96,9 @@ namespace WeaveFFI
         /// <summary>Return an iterator over all sent messages</summary>
         public static IEnumerable<string> EventsGetMessages()
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_events_get_messages(out var outLen, ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             if (result == IntPtr.Zero) return Array.Empty<string>();
             return Array.Empty<string>();
         }

@@ -5,7 +5,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 <!-- DO NOT EDIT — your changes will be overwritten. -->
 <!-- To regenerate: weaveffi generate weaveffi.yml -o <out> -->
 
-# WeaveFFI Ruby Bindings
+# weaveffi (Ruby)
 
 Auto-generated Ruby bindings using the [ffi](https://github.com/ffi/ffi) gem.
 

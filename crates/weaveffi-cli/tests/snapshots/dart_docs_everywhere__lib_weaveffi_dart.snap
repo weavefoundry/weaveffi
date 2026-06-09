@@ -25,31 +25,31 @@ DynamicLibrary _openLibrary() {
 
 final DynamicLibrary _lib = _openLibrary();
 
-final class _WeaveffiError extends Struct {
+final class _WeaveFFIError extends Struct {
   @Int32()
   external int code;
   external Pointer<Utf8> message;
 }
 
-typedef _NativeWeaveffiErrorClear = Void Function(Pointer<_WeaveffiError>);
-typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiErrorClear = Void Function(Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveFFIError>);
 final _weaveffiErrorClear = _lib.lookupFunction<
     _NativeWeaveffiErrorClear, _DartWeaveffiErrorClear>('weaveffi_error_clear');
 
-class WeaveffiException implements Exception {
+class WeaveFFIException implements Exception {
   final int code;
   final String message;
-  WeaveffiException(this.code, this.message);
+  WeaveFFIException(this.code, this.message);
   @override
-  String toString() => 'WeaveffiException($code): $message';
+  String toString() => 'WeaveFFIException($code): $message';
 }
 
-void _checkError(Pointer<_WeaveffiError> err) {
+void _checkError(Pointer<_WeaveFFIError> err) {
   if (err.ref.code != 0) {
     final code = err.ref.code;
     final msg = err.ref.message.toDartString();
     _weaveffiErrorClear(err);
-    throw WeaveffiException(code, msg);
+    throw WeaveFFIException(code, msg);
   }
 }
 
@@ -91,8 +91,8 @@ typedef _DartWeaveffiDocsDocumentGetStatus = int Function(Pointer<Void>);
 final _weaveffiDocsDocumentGetStatus = _lib.lookupFunction<
     _NativeWeaveffiDocsDocumentGetStatus, _DartWeaveffiDocsDocumentGetStatus>('weaveffi_docs_Document_get_status');
 
-typedef _NativeWeaveffiDocsDocumentGetTags = Pointer<Void> Function(Pointer<Void>);
-typedef _DartWeaveffiDocsDocumentGetTags = Pointer<Void> Function(Pointer<Void>);
+typedef _NativeWeaveffiDocsDocumentGetTags = Pointer<Void> Function(Pointer<Void>, Pointer<Size>);
+typedef _DartWeaveffiDocsDocumentGetTags = Pointer<Void> Function(Pointer<Void>, Pointer<Size>);
 final _weaveffiDocsDocumentGetTags = _lib.lookupFunction<
     _NativeWeaveffiDocsDocumentGetTags, _DartWeaveffiDocsDocumentGetTags>('weaveffi_docs_Document_get_tags');
 
@@ -127,10 +127,23 @@ class Document {
 
   /// Free-form tags for grouping
   List<String> get tags {
-    final result = _weaveffiDocsDocumentGetTags(_handle);
-    return result;
+    final outLen = calloc<Size>();
+    try {
+      final result = _weaveffiDocsDocumentGetTags(_handle, outLen);
+      final n = outLen.value;
+      if (result == nullptr || n == 0) return <String>[];
+      final arr = result.cast<Pointer<Utf8>>();
+      return List<String>.generate(n, (i) => arr[i].toDartString());
+    } finally {
+      calloc.free(outLen);
+    }
   }
 }
+
+typedef _NativeWeaveffiDocsDocumentCreate = Pointer<Void> Function(Int64, Pointer<Utf8>, Int32, Pointer<Pointer<Utf8>>, Size, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiDocsDocumentCreate = Pointer<Void> Function(int, Pointer<Utf8>, int, Pointer<Pointer<Utf8>>, int, Pointer<_WeaveFFIError>);
+final _weaveffiDocsDocumentCreate = _lib.lookupFunction<
+    _NativeWeaveffiDocsDocumentCreate, _DartWeaveffiDocsDocumentCreate>('weaveffi_docs_Document_create');
 
 /// Represents a single document tracked by the system.
 ///
@@ -178,12 +191,30 @@ class DocumentBuilder {
     if (_tags == null) {
       throw StateError('missing field: tags');
     }
-    throw UnimplementedError('DocumentBuilder.build requires FFI backing');
+    final id = _id!;
+    final title = _title!;
+    final status = _status!;
+    final tags = _tags!;
+  final titlePtr = title.toNativeUtf8();
+  final tagsPtr = tags.isEmpty ? nullptr : calloc<Pointer<Utf8>>(tags.length);
+  for (var i = 0; i < tags.length; i++) {
+    tagsPtr[i] = tags[i].toNativeUtf8();
+  }
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiDocsDocumentCreate(id, titlePtr, status.value, tagsPtr, tags.length, err);
+      _checkError(err);
+      return Document._(result);
+    } finally {
+      calloc.free(titlePtr);
+      if (tagsPtr != nullptr) { for (var i = 0; i < tags.length; i++) { calloc.free(tagsPtr[i]); } calloc.free(tagsPtr); }
+      calloc.free(err);
+    }
   }
 }
 
-typedef _NativeWeaveffiDocsCreateDocument = Pointer<Void> Function(Pointer<Utf8>, Pointer<Void>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiDocsCreateDocument = Pointer<Void> Function(Pointer<Utf8>, Pointer<Void>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiDocsCreateDocument = Pointer<Void> Function(Pointer<Utf8>, Pointer<Pointer<Utf8>>, Size, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiDocsCreateDocument = Pointer<Void> Function(Pointer<Utf8>, Pointer<Pointer<Utf8>>, int, Pointer<_WeaveFFIError>);
 final _weaveffiDocsCreateDocument = _lib.lookupFunction<
     _NativeWeaveffiDocsCreateDocument, _DartWeaveffiDocsCreateDocument>('weaveffi_docs_create_document');
 
@@ -192,26 +223,31 @@ final _weaveffiDocsCreateDocument = _lib.lookupFunction<
 /// The document starts in `Draft` status; callers must publish
 /// it explicitly to make it visible.
 Document createDocument(String title, List<String> tags) {
-  final err = calloc<_WeaveffiError>();
   final titlePtr = title.toNativeUtf8();
+  final tagsPtr = tags.isEmpty ? nullptr : calloc<Pointer<Utf8>>(tags.length);
+  for (var i = 0; i < tags.length; i++) {
+    tagsPtr[i] = tags[i].toNativeUtf8();
+  }
+  final err = calloc<_WeaveFFIError>();
   try {
-    final result = _weaveffiDocsCreateDocument(titlePtr, tags, err);
+    final result = _weaveffiDocsCreateDocument(titlePtr, tagsPtr, tags.length, err);
     _checkError(err);
     return Document._(result);
   } finally {
     calloc.free(titlePtr);
+    if (tagsPtr != nullptr) { for (var i = 0; i < tags.length; i++) { calloc.free(tagsPtr[i]); } calloc.free(tagsPtr); }
     calloc.free(err);
   }
 }
 
-typedef _NativeWeaveffiDocsGetDocument = Pointer<Void> Function(Int64, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiDocsGetDocument = Pointer<Void> Function(int, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiDocsGetDocument = Pointer<Void> Function(Int64, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiDocsGetDocument = Pointer<Void> Function(int, Pointer<_WeaveFFIError>);
 final _weaveffiDocsGetDocument = _lib.lookupFunction<
     _NativeWeaveffiDocsGetDocument, _DartWeaveffiDocsGetDocument>('weaveffi_docs_get_document');
 
 /// Look up a document by identifier
 Document? getDocument(int id) {
-  final err = calloc<_WeaveffiError>();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiDocsGetDocument(id, err);
     _checkError(err);
@@ -222,7 +258,7 @@ Document? getDocument(int id) {
   }
 }
 
-typedef _NativeAsyncCb_weaveffi_docs_publish_async = Void Function(Pointer<Void>, Pointer<_WeaveffiError>, Int32);
+typedef _NativeAsyncCb_weaveffi_docs_publish_async = Void Function(Pointer<Void>, Pointer<_WeaveFFIError>, Int32);
 
 typedef _NativeWeaveffiDocsPublishAsyncAsync = Void Function(Int64, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_docs_publish_async>>, Pointer<Void>);
 typedef _DartWeaveffiDocsPublishAsyncAsync = void Function(int, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_docs_publish_async>>, Pointer<Void>);
@@ -233,13 +269,13 @@ final _weaveffiDocsPublishAsyncAsync = _lib.lookupFunction<
 Future<bool> publishAsync(int id) {
   final completer = Completer<bool>();
   late NativeCallable<_NativeAsyncCb_weaveffi_docs_publish_async> callable;
-  callable = NativeCallable<_NativeAsyncCb_weaveffi_docs_publish_async>.listener((Pointer<Void> context, Pointer<_WeaveffiError> err, int result) {
+  callable = NativeCallable<_NativeAsyncCb_weaveffi_docs_publish_async>.listener((Pointer<Void> context, Pointer<_WeaveFFIError> err, int result) {
     try {
       if (err.address != 0 && err.ref.code != 0) {
         final code = err.ref.code;
         final msg = err.ref.message.toDartString();
         _weaveffiErrorClear(err);
-        completer.completeError(WeaveffiException(code, msg));
+        completer.completeError(WeaveFFIException(code, msg));
         return;
       }
       completer.complete(result != 0);

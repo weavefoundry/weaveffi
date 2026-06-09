@@ -14,14 +14,14 @@ from enum import IntEnum
 from typing import Dict, Iterator, List, Optional
 
 
-class WeaveffiError(Exception):
+class WeaveFFIError(Exception):
     def __init__(self, code: int, message: str) -> None:
         self.code = code
         self.message = message
         super().__init__(f"({code}) {message}")
 
 
-class _WeaveffiErrorStruct(ctypes.Structure):
+class _WeaveFFIErrorStruct(ctypes.Structure):
     _fields_ = [
         ("code", ctypes.c_int32),
         ("message", ctypes.c_char_p),
@@ -45,7 +45,7 @@ def _load_library() -> ctypes.CDLL:
 
 
 _lib = _load_library()
-_lib.weaveffi_error_clear.argtypes = [ctypes.POINTER(_WeaveffiErrorStruct)]
+_lib.weaveffi_error_clear.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
 _lib.weaveffi_error_clear.restype = None
 _lib.weaveffi_free_string.argtypes = [ctypes.c_char_p]
 _lib.weaveffi_free_string.restype = None
@@ -53,12 +53,12 @@ _lib.weaveffi_free_bytes.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_si
 _lib.weaveffi_free_bytes.restype = None
 
 
-def _check_error(err: _WeaveffiErrorStruct) -> None:
+def _check_error(err: _WeaveFFIErrorStruct) -> None:
     if err.code != 0:
         code = err.code
         message = err.message.decode("utf-8") if err.message else ""
         _lib.weaveffi_error_clear(ctypes.byref(err))
-        raise WeaveffiError(code, message)
+        raise WeaveFFIError(code, message)
 
 
 class _PointerGuard(contextlib.AbstractContextManager):
@@ -91,9 +91,9 @@ def events_send_message(text: str) -> None:
     """Send a message, triggering the OnMessage callback
     """
     _fn = _lib.weaveffi_events_send_message
-    _fn.argtypes = [ctypes.c_char_p, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.c_char_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = None
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _fn(_string_to_bytes(text), ctypes.byref(_err))
     _check_error(_err)
 
@@ -110,10 +110,10 @@ class _GetMessagesIterator:
         if self._done:
             raise StopIteration
         _next_fn = _lib.weaveffi_events_GetMessagesIterator_next
-        _next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(_WeaveffiErrorStruct)]
+        _next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(_WeaveFFIErrorStruct)]
         _next_fn.restype = ctypes.c_int32
         _out_item = ctypes.c_char_p()
-        _err = _WeaveffiErrorStruct()
+        _err = _WeaveFFIErrorStruct()
         _has = _next_fn(self._ptr, ctypes.byref(_out_item), ctypes.byref(_err))
         _check_error(_err)
         if not _has:
@@ -138,13 +138,13 @@ def events_get_messages() -> Iterator[str]:
     """Return an iterator over all sent messages
     """
     _fn = _lib.weaveffi_events_get_messages
-    _fn.argtypes = [ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_void_p
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(ctypes.byref(_err))
     _check_error(_err)
     _next_fn = _lib.weaveffi_events_GetMessagesIterator_next
-    _next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(_WeaveffiErrorStruct)]
+    _next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(_WeaveFFIErrorStruct)]
     _next_fn.restype = ctypes.c_int32
     _destroy_fn = _lib.weaveffi_events_GetMessagesIterator_destroy
     _destroy_fn.argtypes = [ctypes.c_void_p]
@@ -152,7 +152,7 @@ def events_get_messages() -> Iterator[str]:
     _items = []
     while True:
         _out_item = ctypes.c_char_p()
-        _item_err = _WeaveffiErrorStruct()
+        _item_err = _WeaveFFIErrorStruct()
         _has = _next_fn(_result, ctypes.byref(_out_item), ctypes.byref(_item_err))
         _check_error(_item_err)
         if not _has:

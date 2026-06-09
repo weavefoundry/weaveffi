@@ -25,31 +25,31 @@ DynamicLibrary _openLibrary() {
 
 final DynamicLibrary _lib = _openLibrary();
 
-final class _WeaveffiError extends Struct {
+final class _WeaveFFIError extends Struct {
   @Int32()
   external int code;
   external Pointer<Utf8> message;
 }
 
-typedef _NativeWeaveffiErrorClear = Void Function(Pointer<_WeaveffiError>);
-typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiErrorClear = Void Function(Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveFFIError>);
 final _weaveffiErrorClear = _lib.lookupFunction<
     _NativeWeaveffiErrorClear, _DartWeaveffiErrorClear>('weaveffi_error_clear');
 
-class WeaveffiException implements Exception {
+class WeaveFFIException implements Exception {
   final int code;
   final String message;
-  WeaveffiException(this.code, this.message);
+  WeaveFFIException(this.code, this.message);
   @override
-  String toString() => 'WeaveffiException($code): $message';
+  String toString() => 'WeaveFFIException($code): $message';
 }
 
-void _checkError(Pointer<_WeaveffiError> err) {
+void _checkError(Pointer<_WeaveFFIError> err) {
   if (err.ref.code != 0) {
     final code = err.ref.code;
     final msg = err.ref.message.toDartString();
     _weaveffiErrorClear(err);
-    throw WeaveffiException(code, msg);
+    throw WeaveFFIException(code, msg);
   }
 }
 
@@ -88,14 +88,14 @@ class Token {
   }
 }
 
-typedef _NativeWeaveffiSharedPing = Pointer<Utf8> Function(Pointer<_WeaveffiError>);
-typedef _DartWeaveffiSharedPing = Pointer<Utf8> Function(Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiSharedPing = Pointer<Utf8> Function(Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiSharedPing = Pointer<Utf8> Function(Pointer<_WeaveFFIError>);
 final _weaveffiSharedPing = _lib.lookupFunction<
     _NativeWeaveffiSharedPing, _DartWeaveffiSharedPing>('weaveffi_shared_ping');
 
 /// Trivial cross-module helper
 String ping() {
-  final err = calloc<_WeaveffiError>();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiSharedPing(err);
     _checkError(err);
@@ -156,23 +156,23 @@ typedef _DartWeaveffiKitchenItemGetNick = int Function(Pointer<Void>);
 final _weaveffiKitchenItemGetNick = _lib.lookupFunction<
     _NativeWeaveffiKitchenItemGetNick, _DartWeaveffiKitchenItemGetNick>('weaveffi_kitchen_Item_get_nick');
 
-typedef _NativeWeaveffiKitchenItemGetPayload = Pointer<Uint8> Function(Pointer<Void>);
-typedef _DartWeaveffiKitchenItemGetPayload = Pointer<Uint8> Function(Pointer<Void>);
+typedef _NativeWeaveffiKitchenItemGetPayload = Pointer<Uint8> Function(Pointer<Void>, Pointer<Size>);
+typedef _DartWeaveffiKitchenItemGetPayload = Pointer<Uint8> Function(Pointer<Void>, Pointer<Size>);
 final _weaveffiKitchenItemGetPayload = _lib.lookupFunction<
     _NativeWeaveffiKitchenItemGetPayload, _DartWeaveffiKitchenItemGetPayload>('weaveffi_kitchen_Item_get_payload');
 
-typedef _NativeWeaveffiKitchenItemGetTags = Pointer<Void> Function(Pointer<Void>);
-typedef _DartWeaveffiKitchenItemGetTags = Pointer<Void> Function(Pointer<Void>);
+typedef _NativeWeaveffiKitchenItemGetTags = Pointer<Void> Function(Pointer<Void>, Pointer<Size>);
+typedef _DartWeaveffiKitchenItemGetTags = Pointer<Void> Function(Pointer<Void>, Pointer<Size>);
 final _weaveffiKitchenItemGetTags = _lib.lookupFunction<
     _NativeWeaveffiKitchenItemGetTags, _DartWeaveffiKitchenItemGetTags>('weaveffi_kitchen_Item_get_tags');
 
-typedef _NativeWeaveffiKitchenItemGetAttrs = Pointer<Void> Function(Pointer<Void>);
-typedef _DartWeaveffiKitchenItemGetAttrs = Pointer<Void> Function(Pointer<Void>);
+typedef _NativeWeaveffiKitchenItemGetAttrs = Void Function(Pointer<Void>, Pointer<Pointer<Pointer<Utf8>>>, Pointer<Pointer<Pointer<Utf8>>>, Pointer<Size>);
+typedef _DartWeaveffiKitchenItemGetAttrs = void Function(Pointer<Void>, Pointer<Pointer<Pointer<Utf8>>>, Pointer<Pointer<Pointer<Utf8>>>, Pointer<Size>);
 final _weaveffiKitchenItemGetAttrs = _lib.lookupFunction<
     _NativeWeaveffiKitchenItemGetAttrs, _DartWeaveffiKitchenItemGetAttrs>('weaveffi_kitchen_Item_get_attrs');
 
-typedef _NativeWeaveffiKitchenItemGetParent = Int64 Function(Pointer<Void>);
-typedef _DartWeaveffiKitchenItemGetParent = int Function(Pointer<Void>);
+typedef _NativeWeaveffiKitchenItemGetParent = Pointer<Int64> Function(Pointer<Void>);
+typedef _DartWeaveffiKitchenItemGetParent = Pointer<Int64> Function(Pointer<Void>);
 final _weaveffiKitchenItemGetParent = _lib.lookupFunction<
     _NativeWeaveffiKitchenItemGetParent, _DartWeaveffiKitchenItemGetParent>('weaveffi_kitchen_Item_get_parent');
 
@@ -231,23 +231,55 @@ class Item {
   }
 
   List<int> get payload {
-    final result = _weaveffiKitchenItemGetPayload(_handle);
-    return result;
+    final outLen = calloc<Size>();
+    try {
+      final result = _weaveffiKitchenItemGetPayload(_handle, outLen);
+      final n = outLen.value;
+      if (result == nullptr || n == 0) return <int>[];
+      return List<int>.generate(n, (i) => result[i]);
+    } finally {
+      calloc.free(outLen);
+    }
   }
 
   List<String> get tags {
-    final result = _weaveffiKitchenItemGetTags(_handle);
-    return result;
+    final outLen = calloc<Size>();
+    try {
+      final result = _weaveffiKitchenItemGetTags(_handle, outLen);
+      final n = outLen.value;
+      if (result == nullptr || n == 0) return <String>[];
+      final arr = result.cast<Pointer<Utf8>>();
+      return List<String>.generate(n, (i) => arr[i].toDartString());
+    } finally {
+      calloc.free(outLen);
+    }
   }
 
   Map<String, String> get attrs {
-    final result = _weaveffiKitchenItemGetAttrs(_handle);
-    return result;
+    final outKeys = calloc<Pointer<Pointer<Utf8>>>();
+    final outValues = calloc<Pointer<Pointer<Utf8>>>();
+    final outLen = calloc<Size>();
+    try {
+      _weaveffiKitchenItemGetAttrs(_handle, outKeys, outValues, outLen);
+      final n = outLen.value;
+      final m = <String, String>{};
+      final keys = outKeys.value;
+      final vals = outValues.value;
+      for (var i = 0; i < n; i++) {
+        m[keys[i].toDartString()] = vals[i].toDartString();
+      }
+      return m;
+    } finally {
+      calloc.free(outKeys);
+      calloc.free(outValues);
+      calloc.free(outLen);
+    }
   }
 
   int? get parent {
     final result = _weaveffiKitchenItemGetParent(_handle);
-    return result;
+    if (result == nullptr) return null;
+    return result.value;
   }
 
   /// Cross-module struct reference
@@ -261,6 +293,11 @@ class Item {
     return Priority.fromValue(result);
   }
 }
+
+typedef _NativeWeaveffiKitchenItemCreate = Pointer<Void> Function(Int64, Pointer<Utf8>, Int32, Int32, Double, Uint32, Pointer<Uint8>, Size, Pointer<Pointer<Utf8>>, Size, Pointer<Pointer<Utf8>>, Pointer<Pointer<Utf8>>, Size, Pointer<Int64>, Pointer<Void>, Int32, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenItemCreate = Pointer<Void> Function(int, Pointer<Utf8>, int, int, double, int, Pointer<Uint8>, int, Pointer<Pointer<Utf8>>, int, Pointer<Pointer<Utf8>>, Pointer<Pointer<Utf8>>, int, Pointer<Int64>, Pointer<Void>, int, Pointer<_WeaveFFIError>);
+final _weaveffiKitchenItemCreate = _lib.lookupFunction<
+    _NativeWeaveffiKitchenItemCreate, _DartWeaveffiKitchenItemCreate>('weaveffi_kitchen_Item_create');
 
 /// Kitchen sink struct exercising every field feature
 class ItemBuilder {
@@ -377,18 +414,62 @@ class ItemBuilder {
     if (_priority == null) {
       throw StateError('missing field: priority');
     }
-    throw UnimplementedError('ItemBuilder.build requires FFI backing');
+    final id = _id!;
+    final name = _name!;
+    final count = _count!;
+    final enabled = _enabled!;
+    final ratio = _ratio!;
+    final nick = _nick!;
+    final payload = _payload!;
+    final tags = _tags!;
+    final attrs = _attrs!;
+    final parent = _parent;
+    final token = _token!;
+    final priority = _priority!;
+  final namePtr = name.toNativeUtf8();
+  final payloadPtr = payload.isEmpty ? nullptr : calloc<Uint8>(payload.length);
+  for (var i = 0; i < payload.length; i++) { payloadPtr[i] = payload[i]; }
+  final tagsPtr = tags.isEmpty ? nullptr : calloc<Pointer<Utf8>>(tags.length);
+  for (var i = 0; i < tags.length; i++) {
+    tagsPtr[i] = tags[i].toNativeUtf8();
+  }
+  final attrsEntries = attrs.entries.toList();
+  final attrsKeys = attrs.isEmpty ? nullptr : calloc<Pointer<Utf8>>(attrs.length);
+  final attrsVals = attrs.isEmpty ? nullptr : calloc<Pointer<Utf8>>(attrs.length);
+  for (var i = 0; i < attrsEntries.length; i++) {
+    attrsKeys[i] = attrsEntries[i].key.toNativeUtf8();
+    attrsVals[i] = attrsEntries[i].value.toNativeUtf8();
+  }
+  Pointer<Int64> parentPtr = nullptr;
+  if (parent != null) {
+    parentPtr = calloc<Int64>();
+    parentPtr.value = parent;
+  }
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiKitchenItemCreate(id, namePtr, count, enabled ? 1 : 0, ratio, nick, payloadPtr, payload.length, tagsPtr, tags.length, attrsKeys, attrsVals, attrs.length, parentPtr, token._handle, priority.value, err);
+      _checkError(err);
+      return Item._(result);
+    } finally {
+      calloc.free(namePtr);
+      if (payloadPtr != nullptr) calloc.free(payloadPtr);
+      if (tagsPtr != nullptr) { for (var i = 0; i < tags.length; i++) { calloc.free(tagsPtr[i]); } calloc.free(tagsPtr); }
+      if (attrsKeys != nullptr) { for (var i = 0; i < attrs.length; i++) { calloc.free(attrsKeys[i]); } calloc.free(attrsKeys); }
+      if (attrsVals != nullptr) { for (var i = 0; i < attrs.length; i++) { calloc.free(attrsVals[i]); } calloc.free(attrsVals); }
+      if (parentPtr != nullptr) calloc.free(parentPtr);
+      calloc.free(err);
+    }
   }
 }
 
-typedef _NativeWeaveffiKitchenBoolId = Int32 Function(Int32, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKitchenBoolId = int Function(int, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKitchenBoolId = Int32 Function(Int32, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenBoolId = int Function(int, Pointer<_WeaveFFIError>);
 final _weaveffiKitchenBoolId = _lib.lookupFunction<
     _NativeWeaveffiKitchenBoolId, _DartWeaveffiKitchenBoolId>('weaveffi_kitchen_bool_id');
 
 /// Identity for bool
 bool boolId(bool x) {
-  final err = calloc<_WeaveffiError>();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiKitchenBoolId(x ? 1 : 0, err);
     _checkError(err);
@@ -398,13 +479,13 @@ bool boolId(bool x) {
   }
 }
 
-typedef _NativeWeaveffiKitchenI32Id = Int32 Function(Int32, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKitchenI32Id = int Function(int, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKitchenI32Id = Int32 Function(Int32, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenI32Id = int Function(int, Pointer<_WeaveFFIError>);
 final _weaveffiKitchenI32Id = _lib.lookupFunction<
     _NativeWeaveffiKitchenI32Id, _DartWeaveffiKitchenI32Id>('weaveffi_kitchen_i32_id');
 
 int i32Id(int x) {
-  final err = calloc<_WeaveffiError>();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiKitchenI32Id(x, err);
     _checkError(err);
@@ -414,13 +495,13 @@ int i32Id(int x) {
   }
 }
 
-typedef _NativeWeaveffiKitchenU32Id = Uint32 Function(Uint32, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKitchenU32Id = int Function(int, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKitchenU32Id = Uint32 Function(Uint32, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenU32Id = int Function(int, Pointer<_WeaveFFIError>);
 final _weaveffiKitchenU32Id = _lib.lookupFunction<
     _NativeWeaveffiKitchenU32Id, _DartWeaveffiKitchenU32Id>('weaveffi_kitchen_u32_id');
 
 int u32Id(int x) {
-  final err = calloc<_WeaveffiError>();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiKitchenU32Id(x, err);
     _checkError(err);
@@ -430,13 +511,13 @@ int u32Id(int x) {
   }
 }
 
-typedef _NativeWeaveffiKitchenI64Id = Int64 Function(Int64, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKitchenI64Id = int Function(int, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKitchenI64Id = Int64 Function(Int64, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenI64Id = int Function(int, Pointer<_WeaveFFIError>);
 final _weaveffiKitchenI64Id = _lib.lookupFunction<
     _NativeWeaveffiKitchenI64Id, _DartWeaveffiKitchenI64Id>('weaveffi_kitchen_i64_id');
 
 int i64Id(int x) {
-  final err = calloc<_WeaveffiError>();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiKitchenI64Id(x, err);
     _checkError(err);
@@ -446,13 +527,13 @@ int i64Id(int x) {
   }
 }
 
-typedef _NativeWeaveffiKitchenF64Id = Double Function(Double, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKitchenF64Id = double Function(double, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKitchenF64Id = Double Function(Double, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenF64Id = double Function(double, Pointer<_WeaveFFIError>);
 final _weaveffiKitchenF64Id = _lib.lookupFunction<
     _NativeWeaveffiKitchenF64Id, _DartWeaveffiKitchenF64Id>('weaveffi_kitchen_f64_id');
 
 double f64Id(double x) {
-  final err = calloc<_WeaveffiError>();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiKitchenF64Id(x, err);
     _checkError(err);
@@ -462,14 +543,14 @@ double f64Id(double x) {
   }
 }
 
-typedef _NativeWeaveffiKitchenEchoString = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKitchenEchoString = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKitchenEchoString = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenEchoString = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<_WeaveFFIError>);
 final _weaveffiKitchenEchoString = _lib.lookupFunction<
     _NativeWeaveffiKitchenEchoString, _DartWeaveffiKitchenEchoString>('weaveffi_kitchen_echo_string');
 
 String echoString(String s) {
-  final err = calloc<_WeaveffiError>();
   final sPtr = s.toNativeUtf8();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiKitchenEchoString(sPtr, err);
     _checkError(err);
@@ -480,31 +561,38 @@ String echoString(String s) {
   }
 }
 
-typedef _NativeWeaveffiKitchenEchoBytes = Pointer<Uint8> Function(Pointer<Uint8>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKitchenEchoBytes = Pointer<Uint8> Function(Pointer<Uint8>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKitchenEchoBytes = Pointer<Uint8> Function(Pointer<Uint8>, Size, Pointer<Size>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenEchoBytes = Pointer<Uint8> Function(Pointer<Uint8>, int, Pointer<Size>, Pointer<_WeaveFFIError>);
 final _weaveffiKitchenEchoBytes = _lib.lookupFunction<
     _NativeWeaveffiKitchenEchoBytes, _DartWeaveffiKitchenEchoBytes>('weaveffi_kitchen_echo_bytes');
 
 List<int> echoBytes(List<int> b) {
-  final err = calloc<_WeaveffiError>();
+  final bPtr = b.isEmpty ? nullptr : calloc<Uint8>(b.length);
+  for (var i = 0; i < b.length; i++) { bPtr[i] = b[i]; }
+  final outLen = calloc<Size>();
+  final err = calloc<_WeaveFFIError>();
   try {
-    final result = _weaveffiKitchenEchoBytes(b, err);
+    final result = _weaveffiKitchenEchoBytes(bPtr, b.length, outLen, err);
     _checkError(err);
-    return result;
+    final n = outLen.value;
+    if (result == nullptr || n == 0) return <int>[];
+    return List<int>.generate(n, (i) => result[i]);
   } finally {
+    if (bPtr != nullptr) calloc.free(bPtr);
+    calloc.free(outLen);
     calloc.free(err);
   }
 }
 
-typedef _NativeWeaveffiKitchenEchoBorrowedStr = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKitchenEchoBorrowedStr = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKitchenEchoBorrowedStr = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenEchoBorrowedStr = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<_WeaveFFIError>);
 final _weaveffiKitchenEchoBorrowedStr = _lib.lookupFunction<
     _NativeWeaveffiKitchenEchoBorrowedStr, _DartWeaveffiKitchenEchoBorrowedStr>('weaveffi_kitchen_echo_borrowed_str');
 
 /// Borrowed string parameter
 String echoBorrowedStr(String s) {
-  final err = calloc<_WeaveffiError>();
   final sPtr = s.toNativeUtf8();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiKitchenEchoBorrowedStr(sPtr, err);
     _checkError(err);
@@ -515,31 +603,38 @@ String echoBorrowedStr(String s) {
   }
 }
 
-typedef _NativeWeaveffiKitchenEchoBorrowedBytes = Pointer<Uint8> Function(Pointer<Uint8>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKitchenEchoBorrowedBytes = Pointer<Uint8> Function(Pointer<Uint8>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKitchenEchoBorrowedBytes = Pointer<Uint8> Function(Pointer<Uint8>, Size, Pointer<Size>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenEchoBorrowedBytes = Pointer<Uint8> Function(Pointer<Uint8>, int, Pointer<Size>, Pointer<_WeaveFFIError>);
 final _weaveffiKitchenEchoBorrowedBytes = _lib.lookupFunction<
     _NativeWeaveffiKitchenEchoBorrowedBytes, _DartWeaveffiKitchenEchoBorrowedBytes>('weaveffi_kitchen_echo_borrowed_bytes');
 
 /// Borrowed bytes parameter
 List<int> echoBorrowedBytes(List<int> b) {
-  final err = calloc<_WeaveffiError>();
+  final bPtr = b.isEmpty ? nullptr : calloc<Uint8>(b.length);
+  for (var i = 0; i < b.length; i++) { bPtr[i] = b[i]; }
+  final outLen = calloc<Size>();
+  final err = calloc<_WeaveFFIError>();
   try {
-    final result = _weaveffiKitchenEchoBorrowedBytes(b, err);
+    final result = _weaveffiKitchenEchoBorrowedBytes(bPtr, b.length, outLen, err);
     _checkError(err);
-    return result;
+    final n = outLen.value;
+    if (result == nullptr || n == 0) return <int>[];
+    return List<int>.generate(n, (i) => result[i]);
   } finally {
+    if (bPtr != nullptr) calloc.free(bPtr);
+    calloc.free(outLen);
     calloc.free(err);
   }
 }
 
-typedef _NativeWeaveffiKitchenOpenHandle = Int64 Function(Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKitchenOpenHandle = int Function(Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKitchenOpenHandle = Int64 Function(Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenOpenHandle = int Function(Pointer<_WeaveFFIError>);
 final _weaveffiKitchenOpenHandle = _lib.lookupFunction<
     _NativeWeaveffiKitchenOpenHandle, _DartWeaveffiKitchenOpenHandle>('weaveffi_kitchen_open_handle');
 
 /// Returns an opaque handle
 int openHandle() {
-  final err = calloc<_WeaveffiError>();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiKitchenOpenHandle(err);
     _checkError(err);
@@ -549,14 +644,14 @@ int openHandle() {
   }
 }
 
-typedef _NativeWeaveffiKitchenOpenTypedHandle = Pointer<Void> Function(Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKitchenOpenTypedHandle = Pointer<Void> Function(Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKitchenOpenTypedHandle = Pointer<Void> Function(Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenOpenTypedHandle = Pointer<Void> Function(Pointer<_WeaveFFIError>);
 final _weaveffiKitchenOpenTypedHandle = _lib.lookupFunction<
     _NativeWeaveffiKitchenOpenTypedHandle, _DartWeaveffiKitchenOpenTypedHandle>('weaveffi_kitchen_open_typed_handle');
 
 /// Returns a typed handle
 Token openTypedHandle() {
-  final err = calloc<_WeaveffiError>();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiKitchenOpenTypedHandle(err);
     _checkError(err);
@@ -566,14 +661,14 @@ Token openTypedHandle() {
   }
 }
 
-typedef _NativeWeaveffiKitchenMaybeItem = Pointer<Void> Function(Int64, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKitchenMaybeItem = Pointer<Void> Function(int, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKitchenMaybeItem = Pointer<Void> Function(Int64, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenMaybeItem = Pointer<Void> Function(int, Pointer<_WeaveFFIError>);
 final _weaveffiKitchenMaybeItem = _lib.lookupFunction<
     _NativeWeaveffiKitchenMaybeItem, _DartWeaveffiKitchenMaybeItem>('weaveffi_kitchen_maybe_item');
 
 /// Optional struct return
 Item? maybeItem(int id) {
-  final err = calloc<_WeaveffiError>();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiKitchenMaybeItem(id, err);
     _checkError(err);
@@ -584,15 +679,15 @@ Item? maybeItem(int id) {
   }
 }
 
-typedef _NativeWeaveffiKitchenListItems = Pointer<Void> Function(Pointer<Size>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKitchenListItems = Pointer<Void> Function(Pointer<Size>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKitchenListItems = Pointer<Void> Function(Pointer<Size>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenListItems = Pointer<Void> Function(Pointer<Size>, Pointer<_WeaveFFIError>);
 final _weaveffiKitchenListItems = _lib.lookupFunction<
     _NativeWeaveffiKitchenListItems, _DartWeaveffiKitchenListItems>('weaveffi_kitchen_list_items');
 
 /// List of structs
 List<Item> listItems() {
-  final err = calloc<_WeaveffiError>();
   final outLen = calloc<Size>();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiKitchenListItems(outLen, err);
     _checkError(err);
@@ -606,48 +701,80 @@ List<Item> listItems() {
   }
 }
 
-typedef _NativeWeaveffiKitchenGetAttrs = Pointer<Void> Function(Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKitchenGetAttrs = Pointer<Void> Function(Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKitchenGetAttrs = Void Function(Pointer<Pointer<Pointer<Utf8>>>, Pointer<Pointer<Int32>>, Pointer<Size>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenGetAttrs = void Function(Pointer<Pointer<Pointer<Utf8>>>, Pointer<Pointer<Int32>>, Pointer<Size>, Pointer<_WeaveFFIError>);
 final _weaveffiKitchenGetAttrs = _lib.lookupFunction<
     _NativeWeaveffiKitchenGetAttrs, _DartWeaveffiKitchenGetAttrs>('weaveffi_kitchen_get_attrs');
 
 /// Map return type
 Map<String, int> getAttrs() {
-  final err = calloc<_WeaveffiError>();
+  final outKeys = calloc<Pointer<Pointer<Utf8>>>();
+  final outValues = calloc<Pointer<Int32>>();
+  final outLen = calloc<Size>();
+  final err = calloc<_WeaveFFIError>();
   try {
-    final result = _weaveffiKitchenGetAttrs(err);
+    _weaveffiKitchenGetAttrs(outKeys, outValues, outLen, err);
     _checkError(err);
-    return result;
+    final n = outLen.value;
+    final m = <String, int>{};
+    final keys = outKeys.value;
+    final vals = outValues.value;
+    for (var i = 0; i < n; i++) {
+      m[keys[i].toDartString()] = vals[i];
+    }
+    return m;
   } finally {
+    calloc.free(outKeys);
+    calloc.free(outValues);
+    calloc.free(outLen);
     calloc.free(err);
   }
 }
 
-typedef _NativeWeaveffiKitchenStreamItems = Pointer<Void> Function(Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKitchenStreamItems = Pointer<Void> Function(Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKitchenStreamItems = Pointer<Void> Function(Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenStreamItems = Pointer<Void> Function(Pointer<_WeaveFFIError>);
 final _weaveffiKitchenStreamItems = _lib.lookupFunction<
     _NativeWeaveffiKitchenStreamItems, _DartWeaveffiKitchenStreamItems>('weaveffi_kitchen_stream_items');
 
+typedef _NativeWeaveffiKitchenStreamItemsIteratorNext = Int32 Function(Pointer<Void>, Pointer<Pointer<Void>>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenStreamItemsIteratorNext = int Function(Pointer<Void>, Pointer<Pointer<Void>>, Pointer<_WeaveFFIError>);
+final _weaveffiKitchenStreamItemsIteratorNext = _lib.lookupFunction<
+    _NativeWeaveffiKitchenStreamItemsIteratorNext, _DartWeaveffiKitchenStreamItemsIteratorNext>('weaveffi_kitchen_StreamItemsIterator_next');
+
+typedef _NativeWeaveffiKitchenStreamItemsIteratorDestroy = Void Function(Pointer<Void>);
+typedef _DartWeaveffiKitchenStreamItemsIteratorDestroy = void Function(Pointer<Void>);
+final _weaveffiKitchenStreamItemsIteratorDestroy = _lib.lookupFunction<
+    _NativeWeaveffiKitchenStreamItemsIteratorDestroy, _DartWeaveffiKitchenStreamItemsIteratorDestroy>('weaveffi_kitchen_StreamItemsIterator_destroy');
+
 /// Iterator return type
 Iterable<Item> streamItems() {
-  final err = calloc<_WeaveffiError>();
+  final err = calloc<_WeaveFFIError>();
   try {
-    final result = _weaveffiKitchenStreamItems(err);
+    final iter = _weaveffiKitchenStreamItems(err);
     _checkError(err);
-    return result;
+    final items = <Item>[];
+    final outItem = calloc<Pointer<Void>>();
+    while (_weaveffiKitchenStreamItemsIteratorNext(iter, outItem, err) != 0) {
+      _checkError(err);
+      items.add(Item._(outItem.value));
+    }
+    _checkError(err);
+    calloc.free(outItem);
+    _weaveffiKitchenStreamItemsIteratorDestroy(iter);
+    return items;
   } finally {
     calloc.free(err);
   }
 }
 
-typedef _NativeWeaveffiKitchenCrossModuleToken = Pointer<Void> Function(Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKitchenCrossModuleToken = Pointer<Void> Function(Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKitchenCrossModuleToken = Pointer<Void> Function(Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenCrossModuleToken = Pointer<Void> Function(Pointer<_WeaveFFIError>);
 final _weaveffiKitchenCrossModuleToken = _lib.lookupFunction<
     _NativeWeaveffiKitchenCrossModuleToken, _DartWeaveffiKitchenCrossModuleToken>('weaveffi_kitchen_cross_module_token');
 
 /// Returns the shared Token type from another module
 Token crossModuleToken() {
-  final err = calloc<_WeaveffiError>();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiKitchenCrossModuleToken(err);
     _checkError(err);
@@ -657,7 +784,7 @@ Token crossModuleToken() {
   }
 }
 
-typedef _NativeAsyncCb_weaveffi_kitchen_do_async = Void Function(Pointer<Void>, Pointer<_WeaveffiError>, Pointer<Utf8>);
+typedef _NativeAsyncCb_weaveffi_kitchen_do_async = Void Function(Pointer<Void>, Pointer<_WeaveFFIError>, Pointer<Utf8>);
 
 typedef _NativeWeaveffiKitchenDoAsyncAsync = Void Function(Pointer<Utf8>, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_kitchen_do_async>>, Pointer<Void>);
 typedef _DartWeaveffiKitchenDoAsyncAsync = void Function(Pointer<Utf8>, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_kitchen_do_async>>, Pointer<Void>);
@@ -669,13 +796,13 @@ Future<String> doAsync(String input) {
   final completer = Completer<String>();
   final inputPtr = input.toNativeUtf8();
   late NativeCallable<_NativeAsyncCb_weaveffi_kitchen_do_async> callable;
-  callable = NativeCallable<_NativeAsyncCb_weaveffi_kitchen_do_async>.listener((Pointer<Void> context, Pointer<_WeaveffiError> err, Pointer<Utf8> result) {
+  callable = NativeCallable<_NativeAsyncCb_weaveffi_kitchen_do_async>.listener((Pointer<Void> context, Pointer<_WeaveFFIError> err, Pointer<Utf8> result) {
     try {
       if (err.address != 0 && err.ref.code != 0) {
         final code = err.ref.code;
         final msg = err.ref.message.toDartString();
         _weaveffiErrorClear(err);
-        completer.completeError(WeaveffiException(code, msg));
+        completer.completeError(WeaveFFIException(code, msg));
         return;
       }
       completer.complete(result.toDartString());
@@ -697,7 +824,7 @@ Future<String> doAsync(String input) {
   });
 }
 
-typedef _NativeAsyncCb_weaveffi_kitchen_do_cancellable = Void Function(Pointer<Void>, Pointer<_WeaveffiError>, Pointer<Utf8>);
+typedef _NativeAsyncCb_weaveffi_kitchen_do_cancellable = Void Function(Pointer<Void>, Pointer<_WeaveFFIError>, Pointer<Utf8>);
 
 typedef _NativeWeaveffiKitchenDoCancellableAsync = Void Function(Pointer<Utf8>, Pointer<Void>, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_kitchen_do_cancellable>>, Pointer<Void>);
 typedef _DartWeaveffiKitchenDoCancellableAsync = void Function(Pointer<Utf8>, Pointer<Void>, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_kitchen_do_cancellable>>, Pointer<Void>);
@@ -709,13 +836,13 @@ Future<String> doCancellable(String input) {
   final completer = Completer<String>();
   final inputPtr = input.toNativeUtf8();
   late NativeCallable<_NativeAsyncCb_weaveffi_kitchen_do_cancellable> callable;
-  callable = NativeCallable<_NativeAsyncCb_weaveffi_kitchen_do_cancellable>.listener((Pointer<Void> context, Pointer<_WeaveffiError> err, Pointer<Utf8> result) {
+  callable = NativeCallable<_NativeAsyncCb_weaveffi_kitchen_do_cancellable>.listener((Pointer<Void> context, Pointer<_WeaveFFIError> err, Pointer<Utf8> result) {
     try {
       if (err.address != 0 && err.ref.code != 0) {
         final code = err.ref.code;
         final msg = err.ref.message.toDartString();
         _weaveffiErrorClear(err);
-        completer.completeError(WeaveffiException(code, msg));
+        completer.completeError(WeaveFFIException(code, msg));
         return;
       }
       completer.complete(result.toDartString());
@@ -737,15 +864,15 @@ Future<String> doCancellable(String input) {
   });
 }
 
-typedef _NativeWeaveffiKitchenLegacyOp = Int32 Function(Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKitchenLegacyOp = int Function(Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKitchenLegacyOp = Int32 Function(Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenLegacyOp = int Function(Pointer<_WeaveFFIError>);
 final _weaveffiKitchenLegacyOp = _lib.lookupFunction<
     _NativeWeaveffiKitchenLegacyOp, _DartWeaveffiKitchenLegacyOp>('weaveffi_kitchen_legacy_op');
 
 /// Legacy operation kept for compatibility
 @Deprecated('Use new_op instead')
 int legacyOp() {
-  final err = calloc<_WeaveffiError>();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiKitchenLegacyOp(err);
     _checkError(err);
@@ -755,14 +882,14 @@ int legacyOp() {
   }
 }
 
-typedef _NativeWeaveffiKitchenNewOp = Int32 Function(Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKitchenNewOp = int Function(Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKitchenNewOp = Int32 Function(Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenNewOp = int Function(Pointer<_WeaveFFIError>);
 final _weaveffiKitchenNewOp = _lib.lookupFunction<
     _NativeWeaveffiKitchenNewOp, _DartWeaveffiKitchenNewOp>('weaveffi_kitchen_new_op');
 
 /// Replacement for legacy_op
 int newOp() {
-  final err = calloc<_WeaveffiError>();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiKitchenNewOp(err);
     _checkError(err);
@@ -772,14 +899,14 @@ int newOp() {
   }
 }
 
-typedef _NativeWeaveffiKitchenNestedHello = Pointer<Utf8> Function(Pointer<_WeaveffiError>);
-typedef _DartWeaveffiKitchenNestedHello = Pointer<Utf8> Function(Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiKitchenNestedHello = Pointer<Utf8> Function(Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenNestedHello = Pointer<Utf8> Function(Pointer<_WeaveFFIError>);
 final _weaveffiKitchenNestedHello = _lib.lookupFunction<
     _NativeWeaveffiKitchenNestedHello, _DartWeaveffiKitchenNestedHello>('weaveffi_kitchen_nested_hello');
 
 /// Trivial nested-module function
 String hello() {
-  final err = calloc<_WeaveffiError>();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiKitchenNestedHello(err);
     _checkError(err);

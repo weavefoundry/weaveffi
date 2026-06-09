@@ -86,8 +86,8 @@ fn generate_kvstore_all_targets() {
         "wasm/weaveffi_wasm.d.ts should return Promise for async functions"
     );
 
-    let python = std::fs::read_to_string(out_path.join("python/weaveffi/weaveffi.py"))
-        .expect("missing python/weaveffi/weaveffi.py");
+    let python = std::fs::read_to_string(out_path.join("python/kvstore/weaveffi.py"))
+        .expect("missing python/kvstore/weaveffi.py");
     assert!(
         python.contains("async def kv_compact_async"),
         "weaveffi.py should expose compact_async as an async def"
@@ -131,8 +131,8 @@ fn generate_kvstore_all_targets() {
         "go/go.mod should pick up inline go.module_path override"
     );
 
-    let ruby = std::fs::read_to_string(out_path.join("ruby/lib/weaveffi.rb"))
-        .expect("missing ruby/lib/weaveffi.rb");
+    let ruby = std::fs::read_to_string(out_path.join("ruby/lib/kvstore.rb"))
+        .expect("missing ruby/lib/kvstore.rb");
     assert!(
         ruby.contains("module Kvstore"),
         "ruby/lib/weaveffi.rb should pick up inline ruby.module_name override"

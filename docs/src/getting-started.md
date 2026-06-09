@@ -44,6 +44,9 @@ a function:
 
 ```yaml
 version: "0.3.0"
+package:
+  name: my-project
+  version: "0.1.0"
 modules:
   - name: math
     structs:
@@ -59,9 +62,13 @@ modules:
         return: i32
 ```
 
-The IDL supports primitives (`i32`, `f64`, `bool`, `string`, `bytes`, `handle`),
-optionals (`string?`), and lists (`[i32]`). See the
-[IDL Schema](reference/idl.md) reference for the full specification.
+The optional `package:` block sets the name and version stamped into every
+generated package manifest (`package.json`, `pyproject.toml`, `Package.swift`,
+and so on); `weaveffi new` scaffolds one for you. The IDL also supports
+primitives (`i32`, `f64`, `bool`, `string`, `bytes`, `handle`), optionals
+(`string?`), and lists (`[i32]`). See the
+[IDL Schema](reference/idl.md#package-metadata) reference for the full
+specification.
 
 ## 4) Generate bindings
 

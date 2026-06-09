@@ -108,15 +108,42 @@ func (s *Item) Nick() uint32 {
 }
 
 func (s *Item) Payload() []byte {
-	return []byte(C.weaveffi_kitchen_Item_get_payload(s.ptr))
+	var cOutLen C.size_t
+	result := C.weaveffi_kitchen_Item_get_payload(s.ptr, &cOutLen)
+	if result == nil {
+		return nil
+	}
+	return C.GoBytes(unsafe.Pointer(result), C.int(cOutLen))
 }
 
 func (s *Item) Tags() []string {
-	return []string(C.weaveffi_kitchen_Item_get_tags(s.ptr))
+	var cOutLen C.size_t
+	result := C.weaveffi_kitchen_Item_get_tags(s.ptr, &cOutLen)
+	count := int(cOutLen)
+	goResult := make([]string, count)
+	if count > 0 && result != nil {
+		for i, v := range unsafe.Slice((**C.char)(unsafe.Pointer(result)), count) {
+			goResult[i] = C.GoString(v)
+		}
+	}
+	return goResult
 }
 
 func (s *Item) Attrs() map[string]string {
-	return map[string]string(C.weaveffi_kitchen_Item_get_attrs(s.ptr))
+	var cMapKeys **C.char
+	var cMapVals **C.char
+	var cOutLen C.size_t
+	C.weaveffi_kitchen_Item_get_attrs(s.ptr, &cMapKeys, &cMapVals, &cOutLen)
+	count := int(cOutLen)
+	goResult := make(map[string]string, count)
+	if count > 0 && cMapKeys != nil && cMapVals != nil {
+		keySlice := unsafe.Slice(cMapKeys, count)
+		valSlice := unsafe.Slice(cMapVals, count)
+		for i := 0; i < count; i++ {
+			goResult[C.GoString(keySlice[i])] = C.GoString(valSlice[i])
+		}
+	}
+	return goResult
 }
 
 func (s *Item) Parent() *int64 {
@@ -146,77 +173,170 @@ func (s *Item) Close() {
 
 // ItemBuilder: Kitchen sink struct exercising every field feature
 type ItemBuilder struct {
-	fields map[string]interface{}
+	id int64
+	name string
+	count int32
+	enabled bool
+	ratio float64
+	nick uint32
+	payload []byte
+	tags []string
+	attrs map[string]string
+	parent *int64
+	token *Token
+	priority Priority
 }
 
 func NewItemBuilder() *ItemBuilder {
-	return &ItemBuilder{fields: make(map[string]interface{})}
+	return &ItemBuilder{}
 }
 
 // WithId: Stable identifier
 func (b *ItemBuilder) WithId(value int64) *ItemBuilder {
-	b.fields["id"] = value
+	b.id = value
 	return b
 }
 
 // WithName: Display name
 func (b *ItemBuilder) WithName(value string) *ItemBuilder {
-	b.fields["name"] = value
+	b.name = value
 	return b
 }
 
 // WithCount: Initial count
 func (b *ItemBuilder) WithCount(value int32) *ItemBuilder {
-	b.fields["count"] = value
+	b.count = value
 	return b
 }
 
 // WithEnabled: Whether the item is enabled
 func (b *ItemBuilder) WithEnabled(value bool) *ItemBuilder {
-	b.fields["enabled"] = value
+	b.enabled = value
 	return b
 }
 
 // WithRatio: Scaling ratio
 func (b *ItemBuilder) WithRatio(value float64) *ItemBuilder {
-	b.fields["ratio"] = value
+	b.ratio = value
 	return b
 }
 
 func (b *ItemBuilder) WithNick(value uint32) *ItemBuilder {
-	b.fields["nick"] = value
+	b.nick = value
 	return b
 }
 
 func (b *ItemBuilder) WithPayload(value []byte) *ItemBuilder {
-	b.fields["payload"] = value
+	b.payload = value
 	return b
 }
 
 func (b *ItemBuilder) WithTags(value []string) *ItemBuilder {
-	b.fields["tags"] = value
+	b.tags = value
 	return b
 }
 
 func (b *ItemBuilder) WithAttrs(value map[string]string) *ItemBuilder {
-	b.fields["attrs"] = value
+	b.attrs = value
 	return b
 }
 
 func (b *ItemBuilder) WithParent(value *int64) *ItemBuilder {
-	b.fields["parent"] = value
+	b.parent = value
 	return b
 }
 
 // WithToken: Cross-module struct reference
 func (b *ItemBuilder) WithToken(value *Token) *ItemBuilder {
-	b.fields["token"] = value
+	b.token = value
 	return b
 }
 
 func (b *ItemBuilder) WithPriority(value Priority) *ItemBuilder {
-	b.fields["priority"] = value
+	b.priority = value
 	return b
+}
+
+func (b *ItemBuilder) Build() (*Item, error) {
+	id := b.id
+	name := b.name
+	cName := C.CString(name)
+	defer C.free(unsafe.Pointer(cName))
+	count := b.count
+	enabled := b.enabled
+	ratio := b.ratio
+	nick := b.nick
+	payload := b.payload
+	var cPayloadPtr *C.uint8_t
+	cPayloadLen := C.size_t(len(payload))
+	if len(payload) > 0 {
+		cPayloadPtr = (*C.uint8_t)(unsafe.Pointer(&payload[0]))
+	}
+	tags := b.tags
+	cTagsLen := C.size_t(len(tags))
+	cTagsArr := make([]*C.char, len(tags))
+	for i, s := range tags {
+		cTagsArr[i] = C.CString(s)
+	}
+	defer func() {
+		for _, p := range cTagsArr {
+			C.free(unsafe.Pointer(p))
+		}
+	}()
+	var cTagsPtr **C.char
+	if len(cTagsArr) > 0 {
+		cTagsPtr = (**C.char)(unsafe.Pointer(&cTagsArr[0]))
+	}
+	attrs := b.attrs
+	cAttrsLen := C.size_t(len(attrs))
+	keysAttrs := make([]string, 0, len(attrs))
+	valsAttrs := make([]string, 0, len(attrs))
+	for mk, mv := range attrs {
+		keysAttrs = append(keysAttrs, mk)
+		valsAttrs = append(valsAttrs, mv)
+	}
+	cAttrsKeysPtrArr := make([]*C.char, len(keysAttrs))
+	for i, s := range keysAttrs {
+		cAttrsKeysPtrArr[i] = C.CString(s)
+	}
+	defer func() {
+		for _, p := range cAttrsKeysPtrArr {
+			C.free(unsafe.Pointer(p))
+		}
+	}()
+	var cAttrsKeysPtr **C.char
+	if len(cAttrsKeysPtrArr) > 0 {
+		cAttrsKeysPtr = (**C.char)(unsafe.Pointer(&cAttrsKeysPtrArr[0]))
+	}
+	cAttrsValsPtrArr := make([]*C.char, len(valsAttrs))
+	for i, s := range valsAttrs {
+		cAttrsValsPtrArr[i] = C.CString(s)
+	}
+	defer func() {
+		for _, p := range cAttrsValsPtrArr {
+			C.free(unsafe.Pointer(p))
+		}
+	}()
+	var cAttrsValsPtr **C.char
+	if len(cAttrsValsPtrArr) > 0 {
+		cAttrsValsPtr = (**C.char)(unsafe.Pointer(&cAttrsValsPtrArr[0]))
+	}
+	parent := b.parent
+	var cParent *C.int64_t
+	if parent != nil {
+		tmp := C.int64_t(*parent)
+		cParent = &tmp
+	}
+	token := b.token
+	priority := b.priority
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kitchen_Item_create(C.int64_t(id), cName, C.int32_t(count), boolToC(enabled), C.double(ratio), C.uint32_t(nick), cPayloadPtr, cPayloadLen, cTagsPtr, cTagsLen, cAttrsKeysPtr, cAttrsValsPtr, cAttrsLen, cParent, token.ptr, C.weaveffi_kitchen_Priority(priority), &cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return nil, goErr
+	}
+	return &Item{ptr: result}, nil
 }
 
 // KitchenBoolId: Identity for bool
@@ -401,48 +521,62 @@ func KitchenListItems() ([]*Item, error) {
 		return nil, goErr
 	}
 	count := int(cOutLen)
-	if count == 0 || result == nil {
-		return nil, nil
-	}
 	goResult := make([]*Item, count)
-	cSlice := unsafe.Slice((**C.weaveffi_kitchen_Item)(unsafe.Pointer(result)), count)
-	for i, v := range cSlice {
-		goResult[i] = &Item{ptr: v}
+	if count > 0 && result != nil {
+		for i, v := range unsafe.Slice((**C.weaveffi_kitchen_Item)(unsafe.Pointer(result)), count) {
+			goResult[i] = &Item{ptr: v}
+		}
 	}
 	return goResult, nil
 }
 
 // KitchenGetAttrs: Map return type
 func KitchenGetAttrs() (map[string]int32, error) {
-	var cErr C.weaveffi_error
-	C.weaveffi_kitchen_get_attrs(&cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return nil, goErr
-	}
-	goResult := make(map[string]int32)
-	return goResult, nil
-}
-
-// KitchenStreamItems: Iterator return type
-func KitchenStreamItems() ([]*Item, error) {
+	var cMapKeys **C.char
+	var cMapVals *C.int32_t
 	var cOutLen C.size_t
 	var cErr C.weaveffi_error
-	result := C.weaveffi_kitchen_stream_items(&cOutLen, &cErr)
+	C.weaveffi_kitchen_get_attrs(&cMapKeys, &cMapVals, &cOutLen, &cErr)
 	if cErr.code != 0 {
 		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
 		C.weaveffi_error_clear(&cErr)
 		return nil, goErr
 	}
 	count := int(cOutLen)
-	if count == 0 || result == nil {
-		return nil, nil
+	goResult := make(map[string]int32, count)
+	if count > 0 && cMapKeys != nil && cMapVals != nil {
+		keySlice := unsafe.Slice(cMapKeys, count)
+		valSlice := unsafe.Slice(cMapVals, count)
+		for i := 0; i < count; i++ {
+			goResult[C.GoString(keySlice[i])] = int32(valSlice[i])
+		}
 	}
-	goResult := make([]*Item, count)
-	cSlice := unsafe.Slice((**C.weaveffi_kitchen_Item)(unsafe.Pointer(result)), count)
-	for i, v := range cSlice {
-		goResult[i] = &Item{ptr: v}
+	return goResult, nil
+}
+
+// KitchenStreamItems: Iterator return type
+func KitchenStreamItems() ([]*Item, error) {
+	var cErr C.weaveffi_error
+	it := C.weaveffi_kitchen_stream_items(&cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return nil, goErr
+	}
+	defer C.weaveffi_kitchen_StreamItemsIterator_destroy(it)
+	goResult := []*Item{}
+	for {
+		var outItem *C.weaveffi_kitchen_Item
+		var iterErr C.weaveffi_error
+		if C.weaveffi_kitchen_StreamItemsIterator_next(it, &outItem, &iterErr) == 0 {
+			break
+		}
+		if iterErr.code != 0 {
+			goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(iterErr.message), int(iterErr.code))
+			C.weaveffi_error_clear(&iterErr)
+			return nil, goErr
+		}
+		goResult = append(goResult, &Item{ptr: outItem})
 	}
 	return goResult, nil
 }

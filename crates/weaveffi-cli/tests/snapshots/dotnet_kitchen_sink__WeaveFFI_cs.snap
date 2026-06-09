@@ -14,28 +14,28 @@ using System.Threading.Tasks;
 
 namespace WeaveFFI
 {
-    public class WeaveffiException : Exception
+    public class WeaveFFIException : Exception
     {
         public int Code { get; }
 
-        public WeaveffiException(int code, string message) : base(message)
+        public WeaveFFIException(int code, string message) : base(message)
         {
             Code = code;
         }
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    internal struct WeaveffiError
+    internal struct WeaveFFIError
     {
         public int Code;
         public IntPtr Message;
 
-        internal static void Check(WeaveffiError err)
+        internal static void Check(WeaveFFIError err)
         {
             if (err.Code != 0)
             {
                 var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
-                throw new WeaveffiException(err.Code, msg);
+                throw new WeaveFFIException(err.Code, msg);
             }
         }
     }
@@ -389,7 +389,7 @@ namespace WeaveFFI
         internal static extern void weaveffi_free_bytes(IntPtr ptr, UIntPtr len);
 
         [DllImport(LibName, EntryPoint = "weaveffi_shared_Token_create", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_shared_Token_create(long id, IntPtr label, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_shared_Token_create(long id, IntPtr label, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_shared_Token_destroy", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_shared_Token_destroy(IntPtr ptr);
@@ -401,10 +401,10 @@ namespace WeaveFFI
         internal static extern IntPtr weaveffi_shared_Token_get_label(IntPtr ptr);
 
         [DllImport(LibName, EntryPoint = "weaveffi_shared_ping", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_shared_ping(ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_shared_ping(ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_Item_create", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_Item_create(long id, IntPtr name, int count, int enabled, double ratio, uint nick, IntPtr payload_ptr, UIntPtr payload_len, IntPtr tags, UIntPtr tags_len, IntPtr attrs_keys, IntPtr attrs_values, UIntPtr attrs_len, IntPtr parent, IntPtr token, int priority, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_kitchen_Item_create(long id, IntPtr name, int count, int enabled, double ratio, uint nick, IntPtr payload_ptr, UIntPtr payload_len, IntPtr tags, UIntPtr tags_len, IntPtr attrs_keys, IntPtr attrs_values, UIntPtr attrs_len, IntPtr parent, IntPtr token, int priority, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_Item_destroy", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_kitchen_Item_destroy(IntPtr ptr);
@@ -446,55 +446,55 @@ namespace WeaveFFI
         internal static extern int weaveffi_kitchen_Item_get_priority(IntPtr ptr);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_bool_id", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_kitchen_bool_id(int x, ref WeaveffiError err);
+        internal static extern int weaveffi_kitchen_bool_id(int x, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_i32_id", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_kitchen_i32_id(int x, ref WeaveffiError err);
+        internal static extern int weaveffi_kitchen_i32_id(int x, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_u32_id", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern uint weaveffi_kitchen_u32_id(uint x, ref WeaveffiError err);
+        internal static extern uint weaveffi_kitchen_u32_id(uint x, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_i64_id", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern long weaveffi_kitchen_i64_id(long x, ref WeaveffiError err);
+        internal static extern long weaveffi_kitchen_i64_id(long x, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_f64_id", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern double weaveffi_kitchen_f64_id(double x, ref WeaveffiError err);
+        internal static extern double weaveffi_kitchen_f64_id(double x, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_echo_string", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_echo_string(IntPtr s, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_kitchen_echo_string(IntPtr s, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_echo_bytes", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_echo_bytes(IntPtr b_ptr, UIntPtr b_len, out UIntPtr out_len, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_kitchen_echo_bytes(IntPtr b_ptr, UIntPtr b_len, out UIntPtr out_len, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_echo_borrowed_str", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_echo_borrowed_str(IntPtr s, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_kitchen_echo_borrowed_str(IntPtr s, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_echo_borrowed_bytes", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_echo_borrowed_bytes(IntPtr b_ptr, UIntPtr b_len, out UIntPtr out_len, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_kitchen_echo_borrowed_bytes(IntPtr b_ptr, UIntPtr b_len, out UIntPtr out_len, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_open_handle", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern ulong weaveffi_kitchen_open_handle(ref WeaveffiError err);
+        internal static extern ulong weaveffi_kitchen_open_handle(ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_open_typed_handle", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_open_typed_handle(ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_kitchen_open_typed_handle(ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_maybe_item", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_maybe_item(long id, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_kitchen_maybe_item(long id, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_list_items", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_list_items(out UIntPtr out_len, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_kitchen_list_items(out UIntPtr out_len, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_get_attrs", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void weaveffi_kitchen_get_attrs(out IntPtr out_keys, out IntPtr out_values, out UIntPtr out_len, ref WeaveffiError err);
+        internal static extern void weaveffi_kitchen_get_attrs(out IntPtr out_keys, out IntPtr out_values, out UIntPtr out_len, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_stream_items", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_stream_items(out UIntPtr out_len, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_kitchen_stream_items(out UIntPtr out_len, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_cross_module_token", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_cross_module_token(ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_kitchen_cross_module_token(ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_do_async", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_do_async(IntPtr input, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_kitchen_do_async(IntPtr input, ref WeaveFFIError err);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         internal delegate void AsyncCb_weaveffi_kitchen_do_async(IntPtr context, IntPtr err, IntPtr result);
@@ -503,7 +503,7 @@ namespace WeaveFFI
         internal static extern void weaveffi_kitchen_do_async_async(IntPtr input, AsyncCb_weaveffi_kitchen_do_async callback, IntPtr context);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_do_cancellable", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_do_cancellable(IntPtr input, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_kitchen_do_cancellable(IntPtr input, ref WeaveFFIError err);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         internal delegate void AsyncCb_weaveffi_kitchen_do_cancellable(IntPtr context, IntPtr err, IntPtr result);
@@ -512,13 +512,13 @@ namespace WeaveFFI
         internal static extern void weaveffi_kitchen_do_cancellable_async(IntPtr input, IntPtr cancel_token, AsyncCb_weaveffi_kitchen_do_cancellable callback, IntPtr context);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_legacy_op", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_kitchen_legacy_op(ref WeaveffiError err);
+        internal static extern int weaveffi_kitchen_legacy_op(ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_new_op", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_kitchen_new_op(ref WeaveffiError err);
+        internal static extern int weaveffi_kitchen_new_op(ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_nested_hello", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_nested_hello(ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_kitchen_nested_hello(ref WeaveFFIError err);
 
     }
 
@@ -527,9 +527,9 @@ namespace WeaveFFI
         /// <summary>Trivial cross-module helper</summary>
         public static string SharedPing()
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_shared_ping(ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             var str = Marshal.PtrToStringUTF8(result);
             NativeMethods.weaveffi_free_string(result);
             return str;
@@ -542,52 +542,52 @@ namespace WeaveFFI
         /// <summary>Identity for bool</summary>
         public static bool KitchenBoolId(bool x)
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_bool_id(x ? 1 : 0, ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             return result != 0;
         }
 
         public static int KitchenI32Id(int x)
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_i32_id(x, ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             return result;
         }
 
         public static uint KitchenU32Id(uint x)
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_u32_id(x, ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             return result;
         }
 
         public static long KitchenI64Id(long x)
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_i64_id(x, ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             return result;
         }
 
         public static double KitchenF64Id(double x)
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_f64_id(x, ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             return result;
         }
 
         public static string KitchenEchoString(string s)
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var sPtr = Marshal.StringToCoTaskMemUTF8(s);
             try
             {
                 var result = NativeMethods.weaveffi_kitchen_echo_string(sPtr, ref err);
-                WeaveffiError.Check(err);
+                WeaveFFIError.Check(err);
                 var str = Marshal.PtrToStringUTF8(result);
                 NativeMethods.weaveffi_free_string(result);
                 return str;
@@ -600,12 +600,12 @@ namespace WeaveFFI
 
         public static byte[] KitchenEchoBytes(byte[] b)
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var bPin = GCHandle.Alloc(b, GCHandleType.Pinned);
             try
             {
                 var result = NativeMethods.weaveffi_kitchen_echo_bytes(bPin.AddrOfPinnedObject(), (UIntPtr)b.Length, out var outLen, ref err);
-                WeaveffiError.Check(err);
+                WeaveFFIError.Check(err);
                 if (result == IntPtr.Zero) return Array.Empty<byte>();
                 var arr = new byte[(int)outLen];
                 Marshal.Copy(result, arr, 0, (int)outLen);
@@ -621,12 +621,12 @@ namespace WeaveFFI
         /// <summary>Borrowed string parameter</summary>
         public static string KitchenEchoBorrowedStr(string s)
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var sPtr = Marshal.StringToCoTaskMemUTF8(s);
             try
             {
                 var result = NativeMethods.weaveffi_kitchen_echo_borrowed_str(sPtr, ref err);
-                WeaveffiError.Check(err);
+                WeaveFFIError.Check(err);
                 var str = Marshal.PtrToStringUTF8(result);
                 NativeMethods.weaveffi_free_string(result);
                 return str;
@@ -640,12 +640,12 @@ namespace WeaveFFI
         /// <summary>Borrowed bytes parameter</summary>
         public static byte[] KitchenEchoBorrowedBytes(byte[] b)
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var bPin = GCHandle.Alloc(b, GCHandleType.Pinned);
             try
             {
                 var result = NativeMethods.weaveffi_kitchen_echo_borrowed_bytes(bPin.AddrOfPinnedObject(), (UIntPtr)b.Length, out var outLen, ref err);
-                WeaveffiError.Check(err);
+                WeaveFFIError.Check(err);
                 if (result == IntPtr.Zero) return Array.Empty<byte>();
                 var arr = new byte[(int)outLen];
                 Marshal.Copy(result, arr, 0, (int)outLen);
@@ -661,36 +661,36 @@ namespace WeaveFFI
         /// <summary>Returns an opaque handle</summary>
         public static ulong KitchenOpenHandle()
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_open_handle(ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             return result;
         }
 
         /// <summary>Returns a typed handle</summary>
         public static Token KitchenOpenTypedHandle()
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_open_typed_handle(ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             return new Token(result);
         }
 
         /// <summary>Optional struct return</summary>
         public static Item? KitchenMaybeItem(long id)
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_maybe_item(id, ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             return result == IntPtr.Zero ? null : new Item(result);
         }
 
         /// <summary>List of structs</summary>
         public static Item[] KitchenListItems()
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_list_items(out var outLen, ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             if (result == IntPtr.Zero) return Array.Empty<Item>();
             var arr = new Item[(int)outLen];
             for (int i = 0; i < (int)outLen; i++)
@@ -703,9 +703,9 @@ namespace WeaveFFI
         /// <summary>Map return type</summary>
         public static Dictionary<string, int> KitchenGetAttrs()
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             NativeMethods.weaveffi_kitchen_get_attrs(out var outKeys, out var outValues, out var outLen, ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             var dict = new Dictionary<string, int>();
             for (int i = 0; i < (int)outLen; i++)
             {
@@ -717,9 +717,9 @@ namespace WeaveFFI
         /// <summary>Iterator return type</summary>
         public static IEnumerable<Item> KitchenStreamItems()
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_stream_items(out var outLen, ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             if (result == IntPtr.Zero) return Array.Empty<Item>();
             var arr = new Item[(int)outLen];
             for (int i = 0; i < (int)outLen; i++)
@@ -732,9 +732,9 @@ namespace WeaveFFI
         /// <summary>Returns the shared Token type from another module</summary>
         public static Token KitchenCrossModuleToken()
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_cross_module_token(ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             return new Token(result);
         }
 
@@ -748,11 +748,11 @@ namespace WeaveFFI
                 {
                     if (err != IntPtr.Zero)
                     {
-                        var wErr = Marshal.PtrToStructure<WeaveffiError>(err);
+                        var wErr = Marshal.PtrToStructure<WeaveFFIError>(err);
                         if (wErr.Code != 0)
                         {
                             var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? "";
-                            tcs.SetException(new WeaveffiException(wErr.Code, msg));
+                            tcs.SetException(new WeaveFFIException(wErr.Code, msg));
                             return;
                         }
                     }
@@ -800,11 +800,11 @@ namespace WeaveFFI
                 {
                     if (err != IntPtr.Zero)
                     {
-                        var wErr = Marshal.PtrToStructure<WeaveffiError>(err);
+                        var wErr = Marshal.PtrToStructure<WeaveFFIError>(err);
                         if (wErr.Code != 0)
                         {
                             var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? "";
-                            tcs.SetException(new WeaveffiException(wErr.Code, msg));
+                            tcs.SetException(new WeaveFFIException(wErr.Code, msg));
                             return;
                         }
                     }
@@ -846,18 +846,18 @@ namespace WeaveFFI
         [Obsolete("Use new_op instead")]
         public static int KitchenLegacyOp()
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_legacy_op(ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             return result;
         }
 
         /// <summary>Replacement for legacy_op</summary>
         public static int KitchenNewOp()
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_new_op(ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             return result;
         }
 
@@ -866,9 +866,9 @@ namespace WeaveFFI
             /// <summary>Trivial nested-module function</summary>
             public static string KitchenNestedHello()
             {
-                var err = new WeaveffiError();
+                var err = new WeaveFFIError();
                 var result = NativeMethods.weaveffi_kitchen_nested_hello(ref err);
-                WeaveffiError.Check(err);
+                WeaveFFIError.Check(err);
                 var str = Marshal.PtrToStringUTF8(result);
                 NativeMethods.weaveffi_free_string(result);
                 return str;

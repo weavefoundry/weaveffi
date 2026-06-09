@@ -165,6 +165,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         }
     }
 

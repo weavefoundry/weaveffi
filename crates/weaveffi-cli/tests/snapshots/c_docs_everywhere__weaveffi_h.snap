@@ -34,11 +34,11 @@ void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
  * Map convention: Maps are passed as parallel arrays of keys and values.
  * A map parameter {K:V} named "m" expands to:
  *   const K* m_keys, const V* m_values, size_t m_len
- * A map return value expands to out-parameters:
- *   K* out_keys, V* out_values, size_t* out_len
+ * A map return value expands to out-parameters that receive callee-
+ * allocated arrays; the caller passes the address of its own pointers:
+ *   K** out_keys, V** out_values, size_t* out_len
  */
 
-// Module: docs
 /**
  * Lifecycle status of a document.
  *
@@ -52,12 +52,18 @@ typedef enum {
     /** Document is hidden from listings */
     weaveffi_docs_Status_Archived = 2
 } weaveffi_docs_Status;
+typedef struct weaveffi_docs_Document weaveffi_docs_Document;
+typedef struct weaveffi_docs_DocumentBuilder weaveffi_docs_DocumentBuilder;
+/** Fires after a document has been persisted successfully */
+typedef void (*weaveffi_docs_OnSaved_fn)(int64_t doc_id, int32_t revision, void* context);
+typedef void (*weaveffi_docs_publish_async_callback)(void* context, weaveffi_error* err, bool result);
+
+// Module: docs
 /**
  * Represents a single document tracked by the system.
  *
  * Documents are persisted to disk and exposed via the public API.
  */
-typedef struct weaveffi_docs_Document weaveffi_docs_Document;
 weaveffi_docs_Document* weaveffi_docs_Document_create(int64_t id, const char* title, weaveffi_docs_Status status, const char* const* tags, size_t tags_len, weaveffi_error* out_err);
 void weaveffi_docs_Document_destroy(weaveffi_docs_Document* ptr);
 /** Stable opaque identifier */
@@ -69,7 +75,6 @@ weaveffi_docs_Status weaveffi_docs_Document_get_status(const weaveffi_docs_Docum
 /** Free-form tags for grouping */
 const char** weaveffi_docs_Document_get_tags(const weaveffi_docs_Document* ptr, size_t* out_len);
 
-typedef struct weaveffi_docs_DocumentBuilder weaveffi_docs_DocumentBuilder;
 weaveffi_docs_DocumentBuilder* weaveffi_docs_Document_Builder_new(void);
 /** Stable opaque identifier */
 void weaveffi_docs_Document_Builder_set_id(weaveffi_docs_DocumentBuilder* builder, int64_t id);
@@ -82,8 +87,6 @@ void weaveffi_docs_Document_Builder_set_tags(weaveffi_docs_DocumentBuilder* buil
 weaveffi_docs_Document* weaveffi_docs_Document_Builder_build(weaveffi_docs_DocumentBuilder* builder, weaveffi_error* out_err);
 void weaveffi_docs_Document_Builder_destroy(weaveffi_docs_DocumentBuilder* builder);
 
-/** Fires after a document has been persisted successfully */
-typedef void (*weaveffi_docs_OnSaved_fn)(int64_t doc_id, int32_t revision, void* context);
 /** Subscribe to document-saved notifications */
 uint64_t weaveffi_docs_register_saved_listener(weaveffi_docs_OnSaved_fn callback, void* context);
 /** Subscribe to document-saved notifications */
@@ -98,7 +101,6 @@ weaveffi_docs_Document* weaveffi_docs_create_document(const char* title, const c
 /** Look up a document by identifier */
 weaveffi_docs_Document* weaveffi_docs_get_document(int64_t id, weaveffi_error* out_err);
 /** Publish a document in the background */
-typedef void (*weaveffi_docs_publish_async_callback)(void* context, weaveffi_error* err, bool result);
 void weaveffi_docs_publish_async_async(int64_t id, weaveffi_docs_publish_async_callback callback, void* context);
 
 

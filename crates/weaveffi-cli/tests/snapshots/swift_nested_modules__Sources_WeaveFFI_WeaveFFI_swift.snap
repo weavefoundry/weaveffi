@@ -89,8 +89,8 @@ public class Shape {
     }
 
     /// Reference up to the parent module's enum
-    public var unit: graphics.Unit {
-        return graphics.Unit(rawValue: weaveffi_graphics_shapes_Shape_get_unit(ptr).rawValue)!
+    public var unit: Unit {
+        return Unit(rawValue: weaveffi_graphics_shapes_Shape_get_unit(ptr).rawValue)!
     }
 
     /// Reference down into a deeper module

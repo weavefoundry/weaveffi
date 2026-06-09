@@ -161,11 +161,20 @@ public class Item {
         var outLen: Int = 0
         let rv = weaveffi_kitchen_Item_get_tags(ptr, &outLen)
         guard let rv = rv else { return [] }
-        return Array(UnsafeBufferPointer(start: rv, count: outLen))
+        return (0..<outLen).map { String(cString: rv[$0]!) }
     }
 
     public var attrs: [String: String] {
-        return weaveffi_kitchen_Item_get_attrs(ptr)
+        var outKeysPtr: UnsafeMutablePointer<UnsafePointer<CChar>?>? = nil
+        var outValuesPtr: UnsafeMutablePointer<UnsafePointer<CChar>?>? = nil
+        var outLen: Int = 0
+        weaveffi_kitchen_Item_get_attrs(ptr, &outKeysPtr, &outValuesPtr, &outLen)
+        guard let outKeys = outKeysPtr, let outValues = outValuesPtr else { return [:] }
+        var result: [String: String] = [:]
+        for i in 0..<outLen {
+            result[String(cString: outKeys[i]!)] = String(cString: outValues[i]!)
+        }
+        return result
     }
 
     public var parent: Int64? {
@@ -293,21 +302,27 @@ public class ItemBuilder {
         guard let priority = _priority else { fatalError("missing field: priority") }
         var err = weaveffi_error(code: 0, message: nil)
         let payload_bytes = Array(payload)
+        let tags_cstrs: [UnsafePointer<CChar>?] = tags.map { UnsafePointer(strdup($0)) }
+        defer { tags_cstrs.forEach { if let s = $0 { free(UnsafeMutablePointer(mutating: s)) } } }
         let attrs_keys = Array(attrs.keys)
         let attrs_values = attrs_keys.map { attrs[$0]! }
+        let attrs_keysCstrs: [UnsafePointer<CChar>?] = attrs_keys.map { UnsafePointer(strdup($0)) }
+        defer { attrs_keysCstrs.forEach { if let s = $0 { free(UnsafeMutablePointer(mutating: s)) } } }
+        let attrs_valuesCstrs: [UnsafePointer<CChar>?] = attrs_values.map { UnsafePointer(strdup($0)) }
+        defer { attrs_valuesCstrs.forEach { if let s = $0 { free(UnsafeMutablePointer(mutating: s)) } } }
         let result: OpaquePointer? = name.withCString { name_ptr in
-            payload_bytes.withUnsafeBufferPointer { payload_buf in
+            return payload_bytes.withUnsafeBufferPointer { payload_buf in
                 let payload_ptr = payload_buf.baseAddress!
                 let payload_len = payload_buf.count
-                tags.withUnsafeBufferPointer { tags_buf in
+                return tags_cstrs.withUnsafeBufferPointer { tags_buf in
                     let tags_ptr = tags_buf.baseAddress
                     let tags_len = tags_buf.count
-                    attrs_keys.withUnsafeBufferPointer { attrs_keys_buf in
+                    return attrs_keysCstrs.withUnsafeBufferPointer { attrs_keys_buf in
                         let attrs_keys_ptr = attrs_keys_buf.baseAddress
-                        attrs_values.withUnsafeBufferPointer { attrs_values_buf in
+                        return attrs_valuesCstrs.withUnsafeBufferPointer { attrs_values_buf in
                             let attrs_values_ptr = attrs_values_buf.baseAddress
                             let attrs_len = attrs_values_buf.count
-                            withOptionalPointer(to: parent) { parent_ptr in
+                            return withOptionalPointer(to: parent) { parent_ptr in
                                     return weaveffi_kitchen_Item_create(id, name_ptr, count, enabled, ratio, nick, payload_ptr, payload_len, tags_ptr, tags_len, attrs_keys_ptr, attrs_values_ptr, attrs_len, parent_ptr, token.ptr, weaveffi_kitchen_Priority(priority.rawValue), &err)
                             }
                         }
@@ -355,7 +370,7 @@ public enum Kitchen {
     }
     public static func kitchen_echo_string(_ s: String) throws -> String {
         var err = weaveffi_error(code: 0, message: nil)
-        let result: String = s.withCString { s_ptr in
+        let result: String = try s.withCString { s_ptr in
                 let rv = weaveffi_kitchen_echo_string(s_ptr, &err)
                 try check(&err)
                 guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null string") }
@@ -378,7 +393,7 @@ public enum Kitchen {
     /// Borrowed string parameter
     public static func kitchen_echo_borrowed_str(_ s: String) throws -> String {
         var err = weaveffi_error(code: 0, message: nil)
-        let result: String = s.withCString { s_ptr in
+        let result: String = try s.withCString { s_ptr in
                 let rv = weaveffi_kitchen_echo_borrowed_str(s_ptr, &err)
                 try check(&err)
                 guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null string") }
@@ -452,10 +467,13 @@ public enum Kitchen {
         try check(&err)
         guard let iter = iter else { return [] }
         var items: [Item] = []
-        while let ptr = weaveffi_kitchen_StreamItemsIterator_next(iter) {
-            items.append(Item(ptr: ptr))
+        var iterItem: OpaquePointer? = nil
+        var iterErr = weaveffi_error(code: 0, message: nil)
+        while weaveffi_kitchen_StreamItemsIterator_next(iter, &iterItem, &iterErr) != 0 {
+            items.append(Item(ptr: iterItem!))
         }
         weaveffi_kitchen_StreamItemsIterator_destroy(iter)
+        try check(&iterErr)
         return items
     }
     /// Returns the shared Token type from another module

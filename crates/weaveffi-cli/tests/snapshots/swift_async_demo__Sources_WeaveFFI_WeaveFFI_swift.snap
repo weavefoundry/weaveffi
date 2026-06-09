@@ -101,7 +101,9 @@ public enum Tasks {
     public static func tasks_run_batch(_ names: [String]) async throws -> [TaskResult] {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[TaskResult], Error>) in
             let ctx = Unmanaged.passRetained(ContinuationRef(continuation)).toOpaque()
-            names.withUnsafeBufferPointer { names_buf in
+            let names_cstrs: [UnsafePointer<CChar>?] = names.map { UnsafePointer(strdup($0)) }
+            defer { names_cstrs.forEach { if let s = $0 { free(UnsafeMutablePointer(mutating: s)) } } }
+            names_cstrs.withUnsafeBufferPointer { names_buf in
                 let names_ptr = names_buf.baseAddress
                 let names_len = names_buf.count
                 weaveffi_tasks_run_batch_async(names_ptr, names_len, { context, err, result, resultLen in

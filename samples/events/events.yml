@@ -1,4 +1,13 @@
 version: "0.3.0"
+package:
+  name: events
+  version: "1.0.0"
+  description: Callback and listener-based event subscription example.
+  license: MIT
+  authors:
+    - WeaveFoundry <hello@weavefoundry.dev>
+  homepage: https://github.com/weavefoundry/weaveffi
+  repository: https://github.com/weavefoundry/weaveffi
 modules:
   - name: events
     callbacks:

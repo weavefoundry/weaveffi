@@ -417,6 +417,7 @@ pub fn extract_api_from_rust(source: &str) -> Result<Api> {
         version: "0.1.0".to_string(),
         modules,
         generators: None,
+        package: None,
     })
 }
 

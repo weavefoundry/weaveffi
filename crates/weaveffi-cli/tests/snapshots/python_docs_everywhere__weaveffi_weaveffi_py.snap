@@ -14,14 +14,14 @@ from enum import IntEnum
 from typing import Dict, Iterator, List, Optional
 
 
-class WeaveffiError(Exception):
+class WeaveFFIError(Exception):
     def __init__(self, code: int, message: str) -> None:
         self.code = code
         self.message = message
         super().__init__(f"({code}) {message}")
 
 
-class _WeaveffiErrorStruct(ctypes.Structure):
+class _WeaveFFIErrorStruct(ctypes.Structure):
     _fields_ = [
         ("code", ctypes.c_int32),
         ("message", ctypes.c_char_p),
@@ -45,7 +45,7 @@ def _load_library() -> ctypes.CDLL:
 
 
 _lib = _load_library()
-_lib.weaveffi_error_clear.argtypes = [ctypes.POINTER(_WeaveffiErrorStruct)]
+_lib.weaveffi_error_clear.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
 _lib.weaveffi_error_clear.restype = None
 _lib.weaveffi_free_string.argtypes = [ctypes.c_char_p]
 _lib.weaveffi_free_string.restype = None
@@ -53,12 +53,12 @@ _lib.weaveffi_free_bytes.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_si
 _lib.weaveffi_free_bytes.restype = None
 
 
-def _check_error(err: _WeaveffiErrorStruct) -> None:
+def _check_error(err: _WeaveFFIErrorStruct) -> None:
     if err.code != 0:
         code = err.code
         message = err.message.decode("utf-8") if err.message else ""
         _lib.weaveffi_error_clear(ctypes.byref(err))
-        raise WeaveffiError(code, message)
+        raise WeaveFFIError(code, message)
 
 
 class _PointerGuard(contextlib.AbstractContextManager):
@@ -222,14 +222,14 @@ def docs_create_document(title: str, tags: List[str]) -> "Document":
     tags : Initial set of tags (may be empty)
     """
     _fn = _lib.weaveffi_docs_create_document
-    _fn.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_size_t, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_size_t, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_void_p
     _tags_arr = (ctypes.c_char_p * len(tags))(*[_string_to_bytes(v) for v in tags])
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(_string_to_bytes(title), _tags_arr, len(tags), ctypes.byref(_err))
     _check_error(_err)
     if _result is None:
-        raise WeaveffiError(-1, "null pointer")
+        raise WeaveFFIError(-1, "null pointer")
     return Document(_result)
 
 
@@ -241,9 +241,9 @@ def docs_get_document(id: int) -> Optional["Document"]:
     id : Identifier returned from create_document
     """
     _fn = _lib.weaveffi_docs_get_document
-    _fn.argtypes = [ctypes.c_int64, ctypes.POINTER(_WeaveffiErrorStruct)]
+    _fn.argtypes = [ctypes.c_int64, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_void_p
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(id, ctypes.byref(_err))
     _check_error(_err)
     if _result is None:
@@ -267,12 +267,12 @@ def _docs_publish_async_sync(id: int) -> bool:
                 _code = err.contents.code
                 _msg = err.contents.message.decode("utf-8") if err.contents.message else ""
                 _lib.weaveffi_error_clear(ctypes.byref(err.contents))
-                _state["err"] = WeaveffiError(_code, _msg)
+                _state["err"] = WeaveFFIError(_code, _msg)
             else:
                 _state["val"] = bool(result)
         finally:
             _ev.set()
-    _cb_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(_WeaveffiErrorStruct), ctypes.c_int32)
+    _cb_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct), ctypes.c_int32)
     _cb = _cb_type(_cb_impl)
     _fn.argtypes = [ctypes.c_int64, _cb_type, ctypes.c_void_p]
     _fn.restype = None

@@ -31,6 +31,7 @@ void weaveffi_cancel_token_cancel(weaveffi_cancel_token* token);
 bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token* token);
 void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
 
+
 /** Add two integers */
 int32_t weaveffi_calculator_add(int32_t a, int32_t b, weaveffi_error* out_err);
 /** Multiply two integers */

@@ -73,7 +73,12 @@ func (s *Entry) Key() string {
 
 // Value: Opaque binary payload
 func (s *Entry) Value() []byte {
-	return []byte(C.weaveffi_kv_Entry_get_value(s.ptr))
+	var cOutLen C.size_t
+	result := C.weaveffi_kv_Entry_get_value(s.ptr, &cOutLen)
+	if result == nil {
+		return nil
+	}
+	return C.GoBytes(unsafe.Pointer(result), C.int(cOutLen))
 }
 
 // CreatedAt: Unix-timestamp seconds when the entry was created
@@ -93,12 +98,34 @@ func (s *Entry) ExpiresAt() *int64 {
 
 // Tags: Free-form labels attached to the entry
 func (s *Entry) Tags() []string {
-	return []string(C.weaveffi_kv_Entry_get_tags(s.ptr))
+	var cOutLen C.size_t
+	result := C.weaveffi_kv_Entry_get_tags(s.ptr, &cOutLen)
+	count := int(cOutLen)
+	goResult := make([]string, count)
+	if count > 0 && result != nil {
+		for i, v := range unsafe.Slice((**C.char)(unsafe.Pointer(result)), count) {
+			goResult[i] = C.GoString(v)
+		}
+	}
+	return goResult
 }
 
 // Metadata: Arbitrary string-valued metadata pairs
 func (s *Entry) Metadata() map[string]string {
-	return map[string]string(C.weaveffi_kv_Entry_get_metadata(s.ptr))
+	var cMapKeys **C.char
+	var cMapVals **C.char
+	var cOutLen C.size_t
+	C.weaveffi_kv_Entry_get_metadata(s.ptr, &cMapKeys, &cMapVals, &cOutLen)
+	count := int(cOutLen)
+	goResult := make(map[string]string, count)
+	if count > 0 && cMapKeys != nil && cMapVals != nil {
+		keySlice := unsafe.Slice(cMapKeys, count)
+		valSlice := unsafe.Slice(cMapVals, count)
+		for i := 0; i < count; i++ {
+			goResult[C.GoString(keySlice[i])] = C.GoString(valSlice[i])
+		}
+	}
+	return goResult
 }
 
 func (s *Entry) Close() {
@@ -110,53 +137,136 @@ func (s *Entry) Close() {
 
 // EntryBuilder: A single key-value entry persisted in the store
 type EntryBuilder struct {
-	fields map[string]interface{}
+	id int64
+	key string
+	value []byte
+	createdAt int64
+	expiresAt *int64
+	tags []string
+	metadata map[string]string
 }
 
 func NewEntryBuilder() *EntryBuilder {
-	return &EntryBuilder{fields: make(map[string]interface{})}
+	return &EntryBuilder{}
 }
 
 // WithId: Stable monotonic identifier assigned on insert
 func (b *EntryBuilder) WithId(value int64) *EntryBuilder {
-	b.fields["id"] = value
+	b.id = value
 	return b
 }
 
 // WithKey: UTF-8 lookup key
 func (b *EntryBuilder) WithKey(value string) *EntryBuilder {
-	b.fields["key"] = value
+	b.key = value
 	return b
 }
 
 // WithValue: Opaque binary payload
 func (b *EntryBuilder) WithValue(value []byte) *EntryBuilder {
-	b.fields["value"] = value
+	b.value = value
 	return b
 }
 
 // WithCreatedAt: Unix-timestamp seconds when the entry was created
 func (b *EntryBuilder) WithCreatedAt(value int64) *EntryBuilder {
-	b.fields["created_at"] = value
+	b.createdAt = value
 	return b
 }
 
 // WithExpiresAt: Optional unix-timestamp seconds at which the entry expires
 func (b *EntryBuilder) WithExpiresAt(value *int64) *EntryBuilder {
-	b.fields["expires_at"] = value
+	b.expiresAt = value
 	return b
 }
 
 // WithTags: Free-form labels attached to the entry
 func (b *EntryBuilder) WithTags(value []string) *EntryBuilder {
-	b.fields["tags"] = value
+	b.tags = value
 	return b
 }
 
 // WithMetadata: Arbitrary string-valued metadata pairs
 func (b *EntryBuilder) WithMetadata(value map[string]string) *EntryBuilder {
-	b.fields["metadata"] = value
+	b.metadata = value
 	return b
+}
+
+func (b *EntryBuilder) Build() (*Entry, error) {
+	id := b.id
+	key := b.key
+	cKey := C.CString(key)
+	defer C.free(unsafe.Pointer(cKey))
+	value := b.value
+	var cValuePtr *C.uint8_t
+	cValueLen := C.size_t(len(value))
+	if len(value) > 0 {
+		cValuePtr = (*C.uint8_t)(unsafe.Pointer(&value[0]))
+	}
+	createdAt := b.createdAt
+	expiresAt := b.expiresAt
+	var cExpiresAt *C.int64_t
+	if expiresAt != nil {
+		tmp := C.int64_t(*expiresAt)
+		cExpiresAt = &tmp
+	}
+	tags := b.tags
+	cTagsLen := C.size_t(len(tags))
+	cTagsArr := make([]*C.char, len(tags))
+	for i, s := range tags {
+		cTagsArr[i] = C.CString(s)
+	}
+	defer func() {
+		for _, p := range cTagsArr {
+			C.free(unsafe.Pointer(p))
+		}
+	}()
+	var cTagsPtr **C.char
+	if len(cTagsArr) > 0 {
+		cTagsPtr = (**C.char)(unsafe.Pointer(&cTagsArr[0]))
+	}
+	metadata := b.metadata
+	cMetadataLen := C.size_t(len(metadata))
+	keysMetadata := make([]string, 0, len(metadata))
+	valsMetadata := make([]string, 0, len(metadata))
+	for mk, mv := range metadata {
+		keysMetadata = append(keysMetadata, mk)
+		valsMetadata = append(valsMetadata, mv)
+	}
+	cMetadataKeysPtrArr := make([]*C.char, len(keysMetadata))
+	for i, s := range keysMetadata {
+		cMetadataKeysPtrArr[i] = C.CString(s)
+	}
+	defer func() {
+		for _, p := range cMetadataKeysPtrArr {
+			C.free(unsafe.Pointer(p))
+		}
+	}()
+	var cMetadataKeysPtr **C.char
+	if len(cMetadataKeysPtrArr) > 0 {
+		cMetadataKeysPtr = (**C.char)(unsafe.Pointer(&cMetadataKeysPtrArr[0]))
+	}
+	cMetadataValsPtrArr := make([]*C.char, len(valsMetadata))
+	for i, s := range valsMetadata {
+		cMetadataValsPtrArr[i] = C.CString(s)
+	}
+	defer func() {
+		for _, p := range cMetadataValsPtrArr {
+			C.free(unsafe.Pointer(p))
+		}
+	}()
+	var cMetadataValsPtr **C.char
+	if len(cMetadataValsPtrArr) > 0 {
+		cMetadataValsPtr = (**C.char)(unsafe.Pointer(&cMetadataValsPtrArr[0]))
+	}
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kv_Entry_create(C.int64_t(id), cKey, cValuePtr, cValueLen, C.int64_t(createdAt), cExpiresAt, cTagsPtr, cTagsLen, cMetadataKeysPtr, cMetadataValsPtr, cMetadataLen, &cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return nil, goErr
+	}
+	return &Entry{ptr: result}, nil
 }
 
 // KvOpenStore: Open (or create) a store backed by the given filesystem path
@@ -247,22 +357,28 @@ func KvListKeys(store *Store, prefix *string) ([]string, error) {
 		cPrefix = C.CString(*prefix)
 		defer C.free(unsafe.Pointer(cPrefix))
 	}
-	var cOutLen C.size_t
 	var cErr C.weaveffi_error
-	result := C.weaveffi_kv_list_keys(store.ptr, cPrefix, &cOutLen, &cErr)
+	it := C.weaveffi_kv_list_keys(store.ptr, cPrefix, &cErr)
 	if cErr.code != 0 {
 		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
 		C.weaveffi_error_clear(&cErr)
 		return nil, goErr
 	}
-	count := int(cOutLen)
-	if count == 0 || result == nil {
-		return nil, nil
-	}
-	goResult := make([]string, count)
-	cSlice := unsafe.Slice((**C.char)(unsafe.Pointer(result)), count)
-	for i, v := range cSlice {
-		goResult[i] = C.GoString(v)
+	defer C.weaveffi_kv_ListKeysIterator_destroy(it)
+	goResult := []string{}
+	for {
+		var outItem *C.char
+		var iterErr C.weaveffi_error
+		if C.weaveffi_kv_ListKeysIterator_next(it, &outItem, &iterErr) == 0 {
+			break
+		}
+		if iterErr.code != 0 {
+			goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(iterErr.message), int(iterErr.code))
+			C.weaveffi_error_clear(&iterErr)
+			return nil, goErr
+		}
+		goResult = append(goResult, C.GoString(outItem))
+		C.weaveffi_free_string(outItem)
 	}
 	return goResult, nil
 }

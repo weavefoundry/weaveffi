@@ -24,42 +24,42 @@ DynamicLibrary _openLibrary() {
 
 final DynamicLibrary _lib = _openLibrary();
 
-final class _WeaveffiError extends Struct {
+final class _WeaveFFIError extends Struct {
   @Int32()
   external int code;
   external Pointer<Utf8> message;
 }
 
-typedef _NativeWeaveffiErrorClear = Void Function(Pointer<_WeaveffiError>);
-typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiErrorClear = Void Function(Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveFFIError>);
 final _weaveffiErrorClear = _lib.lookupFunction<
     _NativeWeaveffiErrorClear, _DartWeaveffiErrorClear>('weaveffi_error_clear');
 
-class WeaveffiException implements Exception {
+class WeaveFFIException implements Exception {
   final int code;
   final String message;
-  WeaveffiException(this.code, this.message);
+  WeaveFFIException(this.code, this.message);
   @override
-  String toString() => 'WeaveffiException($code): $message';
+  String toString() => 'WeaveFFIException($code): $message';
 }
 
-void _checkError(Pointer<_WeaveffiError> err) {
+void _checkError(Pointer<_WeaveFFIError> err) {
   if (err.ref.code != 0) {
     final code = err.ref.code;
     final msg = err.ref.message.toDartString();
     _weaveffiErrorClear(err);
-    throw WeaveffiException(code, msg);
+    throw WeaveFFIException(code, msg);
   }
 }
 
-typedef _NativeWeaveffiCalculatorAdd = Int32 Function(Int32, Int32, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiCalculatorAdd = int Function(int, int, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiCalculatorAdd = Int32 Function(Int32, Int32, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiCalculatorAdd = int Function(int, int, Pointer<_WeaveFFIError>);
 final _weaveffiCalculatorAdd = _lib.lookupFunction<
     _NativeWeaveffiCalculatorAdd, _DartWeaveffiCalculatorAdd>('weaveffi_calculator_add');
 
 /// Add two integers
 int add(int a, int b) {
-  final err = calloc<_WeaveffiError>();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiCalculatorAdd(a, b, err);
     _checkError(err);
@@ -69,14 +69,14 @@ int add(int a, int b) {
   }
 }
 
-typedef _NativeWeaveffiCalculatorMul = Int32 Function(Int32, Int32, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiCalculatorMul = int Function(int, int, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiCalculatorMul = Int32 Function(Int32, Int32, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiCalculatorMul = int Function(int, int, Pointer<_WeaveFFIError>);
 final _weaveffiCalculatorMul = _lib.lookupFunction<
     _NativeWeaveffiCalculatorMul, _DartWeaveffiCalculatorMul>('weaveffi_calculator_mul');
 
 /// Multiply two integers
 int mul(int a, int b) {
-  final err = calloc<_WeaveffiError>();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiCalculatorMul(a, b, err);
     _checkError(err);
@@ -86,14 +86,14 @@ int mul(int a, int b) {
   }
 }
 
-typedef _NativeWeaveffiCalculatorDiv = Int32 Function(Int32, Int32, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiCalculatorDiv = int Function(int, int, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiCalculatorDiv = Int32 Function(Int32, Int32, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiCalculatorDiv = int Function(int, int, Pointer<_WeaveFFIError>);
 final _weaveffiCalculatorDiv = _lib.lookupFunction<
     _NativeWeaveffiCalculatorDiv, _DartWeaveffiCalculatorDiv>('weaveffi_calculator_div');
 
 /// Divide two integers
 int div(int a, int b) {
-  final err = calloc<_WeaveffiError>();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiCalculatorDiv(a, b, err);
     _checkError(err);
@@ -103,15 +103,15 @@ int div(int a, int b) {
   }
 }
 
-typedef _NativeWeaveffiCalculatorEcho = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<_WeaveffiError>);
-typedef _DartWeaveffiCalculatorEcho = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<_WeaveffiError>);
+typedef _NativeWeaveffiCalculatorEcho = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiCalculatorEcho = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<_WeaveFFIError>);
 final _weaveffiCalculatorEcho = _lib.lookupFunction<
     _NativeWeaveffiCalculatorEcho, _DartWeaveffiCalculatorEcho>('weaveffi_calculator_echo');
 
 /// Echo a string back
 String echo(String s) {
-  final err = calloc<_WeaveffiError>();
   final sPtr = s.toNativeUtf8();
+  final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiCalculatorEcho(sPtr, err);
     _checkError(err);

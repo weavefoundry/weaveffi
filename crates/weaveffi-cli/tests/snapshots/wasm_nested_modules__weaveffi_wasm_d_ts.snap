@@ -24,7 +24,7 @@ export declare const Unit: Readonly<{
 export interface Shape {
   readonly sides: number;
   /** Reference up to the parent module's enum */
-  readonly unit: graphics.Unit;
+  readonly unit: Unit;
   /** Reference down into a deeper module */
   readonly detail: Detail;
 }

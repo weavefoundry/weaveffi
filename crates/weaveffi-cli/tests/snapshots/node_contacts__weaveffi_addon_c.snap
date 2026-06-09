@@ -44,7 +44,7 @@ static napi_value Napi_weaveffi_contacts_create_contact(napi_env env, napi_callb
     return NULL;
   }
   napi_value ret;
-  napi_create_int64(env, (int64_t)result, &ret);
+  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
   return ret;
 }
 

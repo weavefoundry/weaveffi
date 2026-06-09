@@ -60,10 +60,14 @@ public enum Events {
         try check(&err)
         guard let iter = iter else { return [] }
         var items: [String] = []
-        while let ptr = weaveffi_events_GetMessagesIterator_next(iter) {
-            items.append(String(cString: ptr))
+        var iterItem: UnsafePointer<CChar>? = nil
+        var iterErr = weaveffi_error(code: 0, message: nil)
+        while weaveffi_events_GetMessagesIterator_next(iter, &iterItem, &iterErr) != 0 {
+            items.append(String(cString: iterItem!))
+            weaveffi_free_string(UnsafeMutablePointer(mutating: iterItem))
         }
         weaveffi_events_GetMessagesIterator_destroy(iter)
+        try check(&iterErr)
         return items
     }
 }

@@ -36,7 +36,7 @@ enum class Category(val value: Int) {
     }
 }
 
-class Product internal constructor(private var handle: Long) : java.io.Closeable {
+class Product internal constructor(internal var handle: Long) : java.io.Closeable {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
@@ -56,7 +56,7 @@ class Product internal constructor(private var handle: Long) : java.io.Closeable
     val name: String get() = nativeGetName(handle)
     val description: String? get() = nativeGetDescription(handle)
     val price: Double get() = nativeGetPrice(handle)
-    val category: Category get() = nativeGetCategory(handle)
+    val category: Category get() = Category.fromValue(nativeGetCategory(handle))
     val tags: Array<String> get() = nativeGetTags(handle)
 
     override fun close() {
@@ -71,7 +71,7 @@ class Product internal constructor(private var handle: Long) : java.io.Closeable
     }
 }
 
-class OrderItem internal constructor(private var handle: Long) : java.io.Closeable {
+class OrderItem internal constructor(internal var handle: Long) : java.io.Closeable {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
@@ -100,7 +100,7 @@ class OrderItem internal constructor(private var handle: Long) : java.io.Closeab
     }
 }
 
-class Order internal constructor(private var handle: Long) : java.io.Closeable {
+class Order internal constructor(internal var handle: Long) : java.io.Closeable {
     companion object {
         init { System.loadLibrary("weaveffi") }
 

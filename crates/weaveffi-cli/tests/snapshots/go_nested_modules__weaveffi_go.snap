@@ -69,8 +69,8 @@ func (s *Shape) Sides() int32 {
 }
 
 // Unit: Reference up to the parent module's enum
-func (s *Shape) Unit() GraphicsUnit {
-	return GraphicsUnit(C.weaveffi_graphics_shapes_Shape_get_unit(s.ptr))
+func (s *Shape) Unit() Unit {
+	return Unit(C.weaveffi_graphics_shapes_Shape_get_unit(s.ptr))
 }
 
 // Detail: Reference down into a deeper module

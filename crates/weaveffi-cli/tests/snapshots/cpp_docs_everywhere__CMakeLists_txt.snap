@@ -6,7 +6,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 # To regenerate: weaveffi generate weaveffi.yml -o <out>
 
 cmake_minimum_required(VERSION 3.14)
-project(weaveffi_cpp)
+project(weaveffi_cpp VERSION 0.1.0)
 add_library(weaveffi_cpp INTERFACE)
 target_include_directories(weaveffi_cpp INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(weaveffi_cpp INTERFACE weaveffi)

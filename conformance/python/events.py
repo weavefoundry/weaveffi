@@ -10,7 +10,7 @@ import sys
 
 sys.path.insert(0, os.environ["WV_PY"])
 
-import weaveffi as wv  # noqa: E402
+import events as wv  # noqa: E402
 
 
 def main() -> None:

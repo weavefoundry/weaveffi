@@ -396,6 +396,9 @@ fn cmd_new(name: &str, quiet: bool) -> Result<()> {
     let idl_contents = format!(
         concat!(
             "version: \"0.3.0\"\n",
+            "package:\n",
+            "  name: {name}\n",
+            "  version: \"0.1.0\"\n",
             "modules:\n",
             "  - name: {module}\n",
             "    structs:\n",
@@ -422,6 +425,7 @@ fn cmd_new(name: &str, quiet: bool) -> Result<()> {
             "          - {{ name: id, type: handle }}\n",
             "        return: bool\n",
         ),
+        name = name,
         module = module_name
     );
     std::fs::write(idl_path.as_std_path(), &idl_contents)

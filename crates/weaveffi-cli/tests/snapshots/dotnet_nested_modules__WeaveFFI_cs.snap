@@ -13,28 +13,28 @@ using System.Runtime.InteropServices;
 
 namespace WeaveFFI
 {
-    public class WeaveffiException : Exception
+    public class WeaveFFIException : Exception
     {
         public int Code { get; }
 
-        public WeaveffiException(int code, string message) : base(message)
+        public WeaveFFIException(int code, string message) : base(message)
         {
             Code = code;
         }
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    internal struct WeaveffiError
+    internal struct WeaveFFIError
     {
         public int Code;
         public IntPtr Message;
 
-        internal static void Check(WeaveffiError err)
+        internal static void Check(WeaveFFIError err)
         {
             if (err.Code != 0)
             {
                 var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
-                throw new WeaveffiException(err.Code, msg);
+                throw new WeaveFFIException(err.Code, msg);
             }
         }
     }
@@ -132,11 +132,11 @@ namespace WeaveFFI
         }
 
         /// <summary>Reference up to the parent module's enum</summary>
-        public graphics.Unit Unit
+        public Unit Unit
         {
             get
             {
-                return (graphics.Unit)NativeMethods.weaveffi_graphics_shapes_Shape_get_unit(_handle);
+                return (Unit)NativeMethods.weaveffi_graphics_shapes_Shape_get_unit(_handle);
             }
         }
 
@@ -213,7 +213,7 @@ namespace WeaveFFI
         internal static extern void weaveffi_free_bytes(IntPtr ptr, UIntPtr len);
 
         [DllImport(LibName, EntryPoint = "weaveffi_graphics_Canvas_create", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_graphics_Canvas_create(int width, IntPtr root, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_graphics_Canvas_create(int width, IntPtr root, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_graphics_Canvas_destroy", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_graphics_Canvas_destroy(IntPtr ptr);
@@ -225,10 +225,10 @@ namespace WeaveFFI
         internal static extern IntPtr weaveffi_graphics_Canvas_get_root(IntPtr ptr);
 
         [DllImport(LibName, EntryPoint = "weaveffi_graphics_new_canvas", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_graphics_new_canvas(int width, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_graphics_new_canvas(int width, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_graphics_shapes_Shape_create", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_graphics_shapes_Shape_create(int sides, int unit, IntPtr detail, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_graphics_shapes_Shape_create(int sides, int unit, IntPtr detail, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_graphics_shapes_Shape_destroy", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_graphics_shapes_Shape_destroy(IntPtr ptr);
@@ -243,13 +243,13 @@ namespace WeaveFFI
         internal static extern IntPtr weaveffi_graphics_shapes_Shape_get_detail(IntPtr ptr);
 
         [DllImport(LibName, EntryPoint = "weaveffi_graphics_shapes_make_shape", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_graphics_shapes_make_shape(int sides, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_graphics_shapes_make_shape(int sides, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_graphics_shapes_describe", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_graphics_shapes_describe(ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_graphics_shapes_describe(ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_graphics_shapes_geometry_Detail_create", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_graphics_shapes_geometry_Detail_create(double area, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_graphics_shapes_geometry_Detail_create(double area, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_graphics_shapes_geometry_Detail_destroy", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_graphics_shapes_geometry_Detail_destroy(IntPtr ptr);
@@ -258,7 +258,7 @@ namespace WeaveFFI
         internal static extern double weaveffi_graphics_shapes_geometry_Detail_get_area(IntPtr ptr);
 
         [DllImport(LibName, EntryPoint = "weaveffi_graphics_shapes_geometry_compute", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_graphics_shapes_geometry_compute(IntPtr shape, ref WeaveffiError err);
+        internal static extern IntPtr weaveffi_graphics_shapes_geometry_compute(IntPtr shape, ref WeaveFFIError err);
 
     }
 
@@ -267,9 +267,9 @@ namespace WeaveFFI
         /// <summary>Construct a Canvas.</summary>
         public static Canvas GraphicsNewCanvas(int width)
         {
-            var err = new WeaveffiError();
+            var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_graphics_new_canvas(width, ref err);
-            WeaveffiError.Check(err);
+            WeaveFFIError.Check(err);
             return new Canvas(result);
         }
 
@@ -278,18 +278,18 @@ namespace WeaveFFI
             /// <summary>Construct a Shape.</summary>
             public static Shape GraphicsShapesMakeShape(int sides)
             {
-                var err = new WeaveffiError();
+                var err = new WeaveFFIError();
                 var result = NativeMethods.weaveffi_graphics_shapes_make_shape(sides, ref err);
-                WeaveffiError.Check(err);
+                WeaveFFIError.Check(err);
                 return new Shape(result);
             }
 
             /// <summary>Nested function returning a struct owned by an ancestor module.</summary>
             public static Canvas GraphicsShapesDescribe()
             {
-                var err = new WeaveffiError();
+                var err = new WeaveFFIError();
                 var result = NativeMethods.weaveffi_graphics_shapes_describe(ref err);
-                WeaveffiError.Check(err);
+                WeaveFFIError.Check(err);
                 return new Canvas(result);
             }
 
@@ -298,9 +298,9 @@ namespace WeaveFFI
                 /// <summary>Deeper function taking an ancestor-module struct.</summary>
                 public static Detail GraphicsShapesGeometryCompute(Shape shape)
                 {
-                    var err = new WeaveffiError();
+                    var err = new WeaveFFIError();
                     var result = NativeMethods.weaveffi_graphics_shapes_geometry_compute(shape.Handle, ref err);
-                    WeaveffiError.Check(err);
+                    WeaveFFIError.Check(err);
                     return new Detail(result);
                 }
 

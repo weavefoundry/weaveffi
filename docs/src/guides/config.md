@@ -181,6 +181,22 @@ the keys are identical.
 | `[ruby]`    | `module_name`          | string | `"WeaveFFI"`       | Ruby module that wraps the bindings                                         |
 | `[ruby]`    | `gem_name`             | string | `"weaveffi"`       | Ruby gem name                                                               |
 
+> **Package identity.** The name, version, and metadata stamped into every
+> generated manifest are resolved from the IDL
+> [`package:` block](../reference/idl.md#package-metadata) by one shared
+> policy. For an identity value an explicit key below wins; otherwise it falls
+> back to the `package:` name (normalized per ecosystem), then the IDL file
+> stem, then the `"weaveffi"`/`"WeaveFFI"` default shown above. The keys that
+> participate are `[swift] module_name`, `[node] package_name`,
+> `[python] package_name`, `[dart] package_name`, `[go] module_path`,
+> `[ruby] gem_name`, and `[dotnet] namespace` (which also sets the NuGet
+> package id). Manifests with no dedicated key — Android `rootProject.name`,
+> the WASM `package.json`, and the C++ `CMakeLists.txt` version — follow the
+> same identity, and the published version comes from `package.version`
+> (default `0.1.0`). All other keys (e.g. `[c] prefix`, `[cpp] namespace`,
+> `[android] package`, `[ruby] module_name`, `[wasm] module_name`) keep the
+> fixed defaults above.
+
 ### `[global]` section
 
 | Key                    | Type   | Default            | Description                                                                 |

@@ -107,9 +107,9 @@ Functions become Python functions with full type hints; ctypes
 def create_contact(name: str, email: Optional[str], contact_type: "ContactType") -> int:
     _fn = _lib.weaveffi_contacts_create_contact
     _fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int32,
-                    ctypes.POINTER(_WeaveffiErrorStruct)]
+                    ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_uint64
-    _err = _WeaveffiErrorStruct()
+    _err = _WeaveFFIErrorStruct()
     _result = _fn(_string_to_bytes(name), _string_to_bytes(email),
                   contact_type.value, ctypes.byref(_err))
     _check_error(_err)
@@ -253,8 +253,8 @@ asyncio cancellation into a `weaveffi_cancel_token`.
 - **`OSError: cannot find ...`** — the loader could not locate the
   shared library. Set `DYLD_LIBRARY_PATH` / `LD_LIBRARY_PATH` or copy
   the library next to your script.
-- **`WeaveffiError: ...`** — the Rust side returned a non-zero error
-  code. Catch `WeaveffiError` and inspect `.code` / `.message`.
+- **`WeaveFFIError: ...`** — the Rust side returned a non-zero error
+  code. Catch `WeaveFFIError` and inspect `.code` / `.message`.
 - **`AttributeError: ... has no attribute 'argtypes'`** — the wrapper
   sets `argtypes`/`restype` at the call site; ensure you're calling
   the generated function, not reaching into `_lib` directly.

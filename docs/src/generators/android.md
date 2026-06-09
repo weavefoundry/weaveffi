@@ -122,7 +122,7 @@ class Contact internal constructor(private var handle: Long) : java.io.Closeable
 ```
 
 The JNI shims (`weaveffi_jni.c`) bridge each Kotlin `external fun` into
-the C ABI, throwing `RuntimeException` on error:
+the C ABI, throwing a `WeaveFFIException` on error:
 
 ```c
 JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_get_1contact(
@@ -140,6 +140,14 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_get_1contact(
     return (jlong)(intptr_t)rv;
 }
 ```
+
+When the module declares an [error domain](../guides/errors.md), the
+generator emits a `sealed class WeaveFFIException` with one PascalCased
+subclass per code (`KEY_NOT_FOUND` → `WeaveFFIException.KeyNotFound`), and
+the shim resolves the matching subclass by code
+(`FindClass(env, "com/weaveffi/WeaveFFIException$KeyNotFound")`). Modules
+without a declared domain get an `open class WeaveFFIException`, and unknown
+codes fall back to `java.lang.RuntimeException`.
 
 The CMake file links the JNI shim against the generated C header:
 

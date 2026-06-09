@@ -16,6 +16,7 @@ use weaveffi_core::model::{
     BindingModel, CallShape, EnumBinding, FieldBinding, FnBinding, ModuleBinding, ParamBinding,
     StructBinding,
 };
+use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::utils::{
     local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
 };
@@ -135,10 +136,15 @@ impl LanguageBackend for PythonGenerator {
         out_dir: &Utf8Path,
         config: &Self::Config,
     ) -> Vec<OutputFile> {
-        let package_name = config.package_name();
+        let package = pkg::resolve(
+            api,
+            config.package_name.as_deref(),
+            config.input_basename.as_deref(),
+        );
+        let import_name = package.ident_name();
         let input_basename = config.input_basename();
         let dir = out_dir.join("python");
-        let pkg_dir = dir.join(package_name);
+        let pkg_dir = dir.join(&import_name);
         let hash = CommentStyle::Hash;
         vec![
             OutputFile::new(
@@ -159,13 +165,16 @@ impl LanguageBackend for PythonGenerator {
             ),
             OutputFile::new(
                 dir.join("pyproject.toml"),
-                render_pyproject_toml(package_name, input_basename),
+                render_pyproject_toml(&package, &import_name, input_basename),
             ),
             OutputFile::new(
                 dir.join("setup.py"),
-                render_setup_py(package_name, input_basename),
+                render_setup_py(&package, &import_name, input_basename),
             ),
-            OutputFile::new(dir.join("README.md"), render_readme(input_basename)),
+            OutputFile::new(
+                dir.join("README.md"),
+                render_readme(&package, input_basename),
+            ),
         ]
     }
 }
@@ -196,12 +205,16 @@ fn py_ctypes_scalar(ty: &TypeRef) -> &'static str {
 fn py_type_hint(ty: &TypeRef) -> String {
     match ty {
         TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle => "int".into(),
-        TypeRef::TypedHandle(name) => format!("\"{}\"", name),
+        // Structs, enums, and typed handles all surface as bare local class names
+        // in the generated module. A cross-module reference (e.g. `handle<Store>`
+        // resolved to `kv.Store`) must still annotate the *local* `Store`, not the
+        // qualified IR name, which is not a symbol in this module.
+        TypeRef::TypedHandle(name) => format!("\"{}\"", local_type_name(name)),
         TypeRef::F64 => "float".into(),
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "str".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "bytes".into(),
-        TypeRef::Enum(name) => format!("\"{}\"", name),
+        TypeRef::Enum(name) => format!("\"{}\"", local_type_name(name)),
         TypeRef::Struct(name) => format!("\"{}\"", local_type_name(name)),
         TypeRef::Optional(inner) => format!("Optional[{}]", py_type_hint(inner)),
         TypeRef::List(inner) => format!("List[{}]", py_type_hint(inner)),
@@ -318,21 +331,14 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
             out.push_str(&format!("{ind}_state[\"val\"] = _s\n"));
         }
         Some(TypeRef::Enum(name)) => {
+            let name = local_type_name(name);
             out.push_str(&format!("{ind}_state[\"val\"] = {name}(result)\n"));
         }
-        Some(TypeRef::Struct(name)) => {
+        Some(TypeRef::Struct(name)) | Some(TypeRef::TypedHandle(name)) => {
             let name = local_type_name(name);
             out.push_str(&format!("{ind}if result is None:\n"));
             out.push_str(&format!(
-                "{ind}    _state[\"err\"] = WeaveffiError(-1, \"null pointer\")\n"
-            ));
-            out.push_str(&format!("{ind}else:\n"));
-            out.push_str(&format!("{ind}    _state[\"val\"] = {name}(result)\n"));
-        }
-        Some(TypeRef::TypedHandle(name)) => {
-            out.push_str(&format!("{ind}if result is None:\n"));
-            out.push_str(&format!(
-                "{ind}    _state[\"err\"] = WeaveffiError(-1, \"null pointer\")\n"
+                "{ind}    _state[\"err\"] = WeaveFFIError(-1, \"null pointer\")\n"
             ));
             out.push_str(&format!("{ind}else:\n"));
             out.push_str(&format!("{ind}    _state[\"val\"] = {name}(result)\n"));
@@ -379,14 +385,8 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
                         out.push_str(&format!("{ind}    _lib.weaveffi_free_string(result)\n"));
                         out.push_str(&format!("{ind}    _state[\"val\"] = _s\n"));
                     }
-                    TypeRef::Struct(name) => {
+                    TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
                         let name = local_type_name(name);
-                        out.push_str(&format!("{ind}if not result:\n"));
-                        out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
-                        out.push_str(&format!("{ind}else:\n"));
-                        out.push_str(&format!("{ind}    _state[\"val\"] = {name}(result)\n"));
-                    }
-                    TypeRef::TypedHandle(name) => {
                         out.push_str(&format!("{ind}if not result:\n"));
                         out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
                         out.push_str(&format!("{ind}else:\n"));
@@ -435,6 +435,7 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
                         out.push_str(&format!("{ind}    _state[\"val\"] = bool(result[0])\n"));
                     }
                     TypeRef::Enum(name) => {
+                        let name = local_type_name(name);
                         out.push_str(&format!("{ind}if not result:\n"));
                         out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
                         out.push_str(&format!("{ind}else:\n"));
@@ -479,7 +480,7 @@ fn render_async_ffi_call_body(out: &mut String, f: &FnBinding) {
         "{ind}            _lib.weaveffi_error_clear(ctypes.byref(err.contents))\n"
     ));
     out.push_str(&format!(
-        "{ind}            _state[\"err\"] = WeaveffiError(_code, _msg)\n"
+        "{ind}            _state[\"err\"] = WeaveFFIError(_code, _msg)\n"
     ));
     out.push_str(&format!("{ind}        else:\n"));
     append_async_success_handler(out, &f.ret, "                ");
@@ -488,7 +489,7 @@ fn render_async_ffi_call_body(out: &mut String, f: &FnBinding) {
 
     let mut cf_parts: Vec<String> = vec![
         "ctypes.c_void_p".into(),
-        "ctypes.POINTER(_WeaveffiErrorStruct)".into(),
+        "ctypes.POINTER(_WeaveFFIErrorStruct)".into(),
     ];
     cf_parts.extend(trailing.iter().map(|(_, t)| t.clone()));
     out.push_str(&format!(
@@ -672,14 +673,14 @@ from enum import IntEnum
 from typing import Dict, Iterator, List, Optional
 
 
-class WeaveffiError(Exception):
+class WeaveFFIError(Exception):
     def __init__(self, code: int, message: str) -> None:
         self.code = code
         self.message = message
         super().__init__(f"({code}) {message}")
 
 
-class _WeaveffiErrorStruct(ctypes.Structure):
+class _WeaveFFIErrorStruct(ctypes.Structure):
     _fields_ = [
         ("code", ctypes.c_int32),
         ("message", ctypes.c_char_p),
@@ -703,7 +704,7 @@ def _load_library() -> ctypes.CDLL:
 
 
 _lib = _load_library()
-_lib.weaveffi_error_clear.argtypes = [ctypes.POINTER(_WeaveffiErrorStruct)]
+_lib.weaveffi_error_clear.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
 _lib.weaveffi_error_clear.restype = None
 _lib.weaveffi_free_string.argtypes = [ctypes.c_char_p]
 _lib.weaveffi_free_string.restype = None
@@ -711,12 +712,12 @@ _lib.weaveffi_free_bytes.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_si
 _lib.weaveffi_free_bytes.restype = None
 
 
-def _check_error(err: _WeaveffiErrorStruct) -> None:
+def _check_error(err: _WeaveFFIErrorStruct) -> None:
     if err.code != 0:
         code = err.code
         message = err.message.decode("utf-8") if err.message else ""
         _lib.weaveffi_error_clear(ctypes.byref(err))
-        raise WeaveffiError(code, message)
+        raise WeaveFFIError(code, message)
 
 
 class _PointerGuard(contextlib.AbstractContextManager):
@@ -943,7 +944,7 @@ fn render_function(out: &mut String, module_name: &str, f: &FnBinding, strip_mod
         } else {
             restype = "None".to_string();
         }
-        argtypes.push("ctypes.POINTER(_WeaveffiErrorStruct)".into());
+        argtypes.push("ctypes.POINTER(_WeaveFFIErrorStruct)".into());
 
         out.push_str(&format!("{ind}_fn.argtypes = [{}]\n", argtypes.join(", ")));
         out.push_str(&format!("{ind}_fn.restype = {restype}\n"));
@@ -955,7 +956,7 @@ fn render_function(out: &mut String, module_name: &str, f: &FnBinding, strip_mod
             }
         }
 
-        out.push_str(&format!("{ind}_err = _WeaveffiErrorStruct()\n"));
+        out.push_str(&format!("{ind}_err = _WeaveFFIErrorStruct()\n"));
 
         let is_map_ret = f.ret.as_ref().and_then(get_map_kv).is_some();
         let has_out_len = !out_ret_argtypes.is_empty() && !is_map_ret;
@@ -1174,12 +1175,10 @@ fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
 fn py_read_element(expr: &str, ty: &TypeRef) -> String {
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("_bytes_to_string({expr})"),
-        TypeRef::Struct(name) => {
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Enum(name) => {
             let name = local_type_name(name);
             format!("{name}({expr})")
         }
-        TypeRef::TypedHandle(name) => format!("{name}({expr})"),
-        TypeRef::Enum(name) => format!("{name}({expr})"),
         TypeRef::Bool => format!("bool({expr})"),
         _ => expr.to_string(),
     }
@@ -1201,22 +1200,16 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
             out.push_str(&format!("{ind}    return b\"\"\n"));
             out.push_str(&format!("{ind}return bytes(_result[:_out_len.value])\n"));
         }
-        TypeRef::Struct(name) => {
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
             let name = local_type_name(name);
             out.push_str(&format!("{ind}if _result is None:\n"));
             out.push_str(&format!(
-                "{ind}    raise WeaveffiError(-1, \"null pointer\")\n"
-            ));
-            out.push_str(&format!("{ind}return {name}(_result)\n"));
-        }
-        TypeRef::TypedHandle(name) => {
-            out.push_str(&format!("{ind}if _result is None:\n"));
-            out.push_str(&format!(
-                "{ind}    raise WeaveffiError(-1, \"null pointer\")\n"
+                "{ind}    raise WeaveFFIError(-1, \"null pointer\")\n"
             ));
             out.push_str(&format!("{ind}return {name}(_result)\n"));
         }
         TypeRef::Enum(name) => {
+            let name = local_type_name(name);
             out.push_str(&format!("{ind}return {name}(_result)\n"));
         }
         TypeRef::Optional(inner) => render_optional_return(out, inner, ind),
@@ -1236,18 +1229,14 @@ fn render_optional_return(out: &mut String, inner: &TypeRef, ind: &str) {
             out.push_str(&format!("{ind}    return None\n"));
             out.push_str(&format!("{ind}return bytes(_result[:_out_len.value])\n"));
         }
-        TypeRef::Struct(name) => {
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
             let name = local_type_name(name);
             out.push_str(&format!("{ind}if _result is None:\n"));
             out.push_str(&format!("{ind}    return None\n"));
             out.push_str(&format!("{ind}return {name}(_result)\n"));
         }
-        TypeRef::TypedHandle(name) => {
-            out.push_str(&format!("{ind}if _result is None:\n"));
-            out.push_str(&format!("{ind}    return None\n"));
-            out.push_str(&format!("{ind}return {name}(_result)\n"));
-        }
         TypeRef::Enum(name) => {
+            let name = local_type_name(name);
             out.push_str(&format!("{ind}if not _result:\n"));
             out.push_str(&format!("{ind}    return None\n"));
             out.push_str(&format!("{ind}return {name}(_result[0])\n"));
@@ -1292,12 +1281,10 @@ fn render_map_return(out: &mut String, k: &TypeRef, v: &TypeRef, ind: &str) {
 fn py_read_iter_item(inner: &TypeRef) -> String {
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "_bytes_to_string(_out_item.value)".into(),
-        TypeRef::Struct(name) => {
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Enum(name) => {
             let name = local_type_name(name);
             format!("{name}(_out_item.value)")
         }
-        TypeRef::TypedHandle(name) => format!("{name}(_out_item.value)"),
-        TypeRef::Enum(name) => format!("{name}(_out_item.value)"),
         TypeRef::Bool => "bool(_out_item.value)".into(),
         _ => "_out_item.value".into(),
     }
@@ -1322,11 +1309,11 @@ fn render_iterator_class(out: &mut String, iter_tag: &str, func_name: &str, inne
     out.push_str("\n            raise StopIteration");
     out.push_str(&format!("\n        _next_fn = _lib.{iter_tag}_next"));
     out.push_str(&format!(
-        "\n        _next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER({item_scalar}), ctypes.POINTER(_WeaveffiErrorStruct)]"
+        "\n        _next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER({item_scalar}), ctypes.POINTER(_WeaveFFIErrorStruct)]"
     ));
     out.push_str("\n        _next_fn.restype = ctypes.c_int32");
     out.push_str(&format!("\n        _out_item = {item_scalar}()"));
-    out.push_str("\n        _err = _WeaveffiErrorStruct()");
+    out.push_str("\n        _err = _WeaveFFIErrorStruct()");
     out.push_str(
         "\n        _has = _next_fn(self._ptr, ctypes.byref(_out_item), ctypes.byref(_err))",
     );
@@ -1358,7 +1345,7 @@ fn render_iterator_return(out: &mut String, iter_tag: &str, inner: &TypeRef, ind
 
     out.push_str(&format!("{ind}_next_fn = _lib.{iter_tag}_next\n"));
     out.push_str(&format!(
-        "{ind}_next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER({item_scalar}), ctypes.POINTER(_WeaveffiErrorStruct)]\n"
+        "{ind}_next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER({item_scalar}), ctypes.POINTER(_WeaveFFIErrorStruct)]\n"
     ));
     out.push_str(&format!("{ind}_next_fn.restype = ctypes.c_int32\n"));
 
@@ -1369,7 +1356,7 @@ fn render_iterator_return(out: &mut String, iter_tag: &str, inner: &TypeRef, ind
     out.push_str(&format!("{ind}_items = []\n"));
     out.push_str(&format!("{ind}while True:\n"));
     out.push_str(&format!("{ind}    _out_item = {item_scalar}()\n"));
-    out.push_str(&format!("{ind}    _item_err = _WeaveffiErrorStruct()\n"));
+    out.push_str(&format!("{ind}    _item_err = _WeaveFFIErrorStruct()\n"));
     out.push_str(&format!(
         "{ind}    _has = _next_fn(_result, ctypes.byref(_out_item), ctypes.byref(_item_err))\n"
     ));
@@ -1384,48 +1371,77 @@ fn render_iterator_return(out: &mut String, iter_tag: &str, inner: &TypeRef, ind
 
 // ── Packaging ──
 
-fn render_pyproject_toml(package_name: &str, input_basename: &str) -> String {
+fn render_pyproject_toml(
+    package: &ResolvedPackage,
+    import_name: &str,
+    input_basename: &str,
+) -> String {
     let prelude = render_prelude(CommentStyle::Hash, input_basename);
     let trailer = render_trailer(CommentStyle::Hash, "pyproject.toml");
+    let name = &package.name;
+    let version = &package.version;
+    let description = package.description_or_default();
+    let mut extra = String::new();
+    if let Some(license) = &package.license {
+        extra.push_str(&format!("license = {{ text = \"{license}\" }}\n"));
+    }
+    if !package.authors.is_empty() {
+        let authors = package
+            .authors
+            .iter()
+            .map(|a| format!("{{ name = \"{a}\" }}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        extra.push_str(&format!("authors = [{authors}]\n"));
+    }
+    if let Some(homepage) = &package.homepage {
+        extra.push_str(&format!("[project.urls]\nHomepage = \"{homepage}\"\n"));
+    } else if let Some(repository) = &package.repository {
+        extra.push_str(&format!("[project.urls]\nRepository = \"{repository}\"\n"));
+    }
     format!(
         r#"{prelude}[build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "{package_name}"
-version = "0.1.0"
-description = "Python bindings for WeaveFFI (auto-generated)"
+name = "{name}"
+version = "{version}"
+description = "{description}"
 requires-python = ">=3.8"
-
+{extra}
 [tool.setuptools]
-packages = ["{package_name}"]
+packages = ["{import_name}"]
 
 {trailer}"#,
     )
 }
 
-fn render_setup_py(package_name: &str, input_basename: &str) -> String {
+fn render_setup_py(package: &ResolvedPackage, import_name: &str, input_basename: &str) -> String {
     let prelude = render_prelude(CommentStyle::Hash, input_basename);
     let trailer = render_trailer(CommentStyle::Hash, "setup.py");
+    let name = &package.name;
+    let version = &package.version;
     format!(
         r#"{prelude}from setuptools import setup
 
 setup(
-    name="{package_name}",
-    version="0.1.0",
-    packages=["{package_name}"],
+    name="{name}",
+    version="{version}",
+    packages=["{import_name}"],
 )
 
 {trailer}"#,
     )
 }
 
-fn render_readme(input_basename: &str) -> String {
+fn render_readme(package: &ResolvedPackage, input_basename: &str) -> String {
     let prelude = render_prelude(CommentStyle::Xml, input_basename);
     let trailer = render_trailer(CommentStyle::Xml, "README.md");
+    let name = &package.name;
+    let import_name = package.ident_name();
     format!(
-        r#"{prelude}# WeaveFFI Python Bindings
+        r#"{prelude}# {name} (Python)
 
 Auto-generated Python bindings using ctypes.
 
@@ -1449,7 +1465,7 @@ pip install -e .
 ## Usage
 
 ```python
-from weaveffi import *
+from {import_name} import *
 ```
 
 {trailer}"#
@@ -1546,6 +1562,7 @@ mod tests {
             version: "0.1.0".into(),
             modules,
             generators: None,
+            package: None,
         }
     }
 
@@ -1656,11 +1673,11 @@ mod tests {
         let api = make_api(vec![]);
         let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
-            py.contains("class WeaveffiError(Exception):"),
+            py.contains("class WeaveFFIError(Exception):"),
             "missing error class"
         );
         assert!(
-            py.contains("class _WeaveffiErrorStruct(ctypes.Structure):"),
+            py.contains("class _WeaveFFIErrorStruct(ctypes.Structure):"),
             "missing error struct"
         );
         assert!(py.contains("def _check_error("), "missing _check_error");
@@ -1979,6 +1996,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let dir = tempfile::tempdir().unwrap();
         let out = Utf8Path::from_path(dir.path()).unwrap();
@@ -2571,6 +2589,20 @@ mod tests {
         assert_eq!(py_type_hint(&TypeRef::Handle), "int");
         assert_eq!(py_type_hint(&TypeRef::Struct("Foo".into())), "\"Foo\"");
         assert_eq!(py_type_hint(&TypeRef::Enum("Bar".into())), "\"Bar\"");
+        assert_eq!(py_type_hint(&TypeRef::TypedHandle("Foo".into())), "\"Foo\"");
+        // Cross-module references (resolved to a qualified IR name) must still
+        // annotate the bare *local* class, which is the only symbol that exists
+        // in the generated module.
+        assert_eq!(
+            py_type_hint(&TypeRef::TypedHandle("kv.Store".into())),
+            "\"Store\"",
+            "qualified typed handle must annotate the local class name"
+        );
+        assert_eq!(
+            py_type_hint(&TypeRef::Struct("kv.Store".into())),
+            "\"Store\""
+        );
+        assert_eq!(py_type_hint(&TypeRef::Enum("kv.Kind".into())), "\"Kind\"");
         assert_eq!(
             py_type_hint(&TypeRef::Optional(Box::new(TypeRef::I32))),
             "Optional[int]"
@@ -2923,14 +2955,14 @@ mod tests {
         assert!(py.contains("_fn = _lib.weaveffi_math_add"));
         assert!(py.contains("ctypes.c_int32, ctypes.c_int32"));
         assert!(py.contains("_fn.restype = ctypes.c_int32"));
-        assert!(py.contains("_err = _WeaveffiErrorStruct()"));
+        assert!(py.contains("_err = _WeaveFFIErrorStruct()"));
         assert!(py.contains("_check_error(_err)"));
         assert!(py.contains("return _result"));
 
         assert!(py.contains("import ctypes"));
         assert!(py.contains("from enum import IntEnum"));
         assert!(py.contains("from typing import Dict, Iterator, List, Optional"));
-        assert!(py.contains("class WeaveffiError(Exception):"));
+        assert!(py.contains("class WeaveFFIError(Exception):"));
         assert!(py.contains("def _load_library()"));
         assert!(py.contains("_lib = _load_library()"));
 
@@ -4199,6 +4231,7 @@ mod tests {
                 modules: vec![],
             }],
             generators: None,
+            package: None,
         };
         let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
