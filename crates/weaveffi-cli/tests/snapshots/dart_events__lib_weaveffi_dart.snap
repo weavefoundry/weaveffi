@@ -52,6 +52,38 @@ void _checkError(Pointer<_WeaveFFIError> err) {
   }
 }
 
+// Live listener trampolines by subscription id. Holding the
+// NativeCallable here keeps its native thunk alive until unregistered.
+final Map<int, NativeCallable> _listenerCallables = {};
+
+typedef _NativeCb_weaveffi_events_OnMessage_fn = Void Function(Pointer<Utf8>, Pointer<Void>);
+
+typedef _NativeWeaveffiEventsRegisterMessageListener = Uint64 Function(Pointer<NativeFunction<_NativeCb_weaveffi_events_OnMessage_fn>>, Pointer<Void>);
+typedef _DartWeaveffiEventsRegisterMessageListener = int Function(Pointer<NativeFunction<_NativeCb_weaveffi_events_OnMessage_fn>>, Pointer<Void>);
+final _weaveffiEventsRegisterMessageListener = _lib.lookupFunction<
+    _NativeWeaveffiEventsRegisterMessageListener, _DartWeaveffiEventsRegisterMessageListener>('weaveffi_events_register_message_listener');
+
+typedef _NativeWeaveffiEventsUnregisterMessageListener = Void Function(Uint64);
+typedef _DartWeaveffiEventsUnregisterMessageListener = void Function(int);
+final _weaveffiEventsUnregisterMessageListener = _lib.lookupFunction<
+    _NativeWeaveffiEventsUnregisterMessageListener, _DartWeaveffiEventsUnregisterMessageListener>('weaveffi_events_unregister_message_listener');
+
+/// Registers a OnMessage listener. Returns a subscription id for unregisterMessageListener().
+int registerMessageListener(void Function(String message) callback) {
+  final callable = NativeCallable<_NativeCb_weaveffi_events_OnMessage_fn>.isolateLocal((Pointer<Utf8> message, Pointer<Void> context) {
+    callback(message == nullptr ? '' : message.toDartString());
+  });
+  final id = _weaveffiEventsRegisterMessageListener(callable.nativeFunction, nullptr);
+  _listenerCallables[id] = callable;
+  return id;
+}
+
+/// Unregisters a listener previously registered with registerMessageListener().
+void unregisterMessageListener(int id) {
+  _weaveffiEventsUnregisterMessageListener(id);
+  _listenerCallables.remove(id)?.close();
+}
+
 typedef _NativeWeaveffiEventsSendMessage = Void Function(Pointer<Utf8>, Pointer<_WeaveFFIError>);
 typedef _DartWeaveffiEventsSendMessage = void Function(Pointer<Utf8>, Pointer<_WeaveFFIError>);
 final _weaveffiEventsSendMessage = _lib.lookupFunction<

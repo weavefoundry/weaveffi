@@ -30,9 +30,9 @@ Output       ── Each generator writes its files under {out_dir}/{target}/
                 and updates {out_dir}/.weaveffi-cache/{target}.hash
 ```
 
-Subcommands like `validate`, `lint`, `diff`, `format`, `upgrade`, and
-`watch` re-use the parse and validate stages; `generate`, `diff`, and
-`watch` additionally exercise resolve and generate.
+Subcommands like `validate`, `lint`, `diff`, `format`, and `watch` re-use
+the parse and validate stages; `generate`, `diff`, and `watch`
+additionally exercise resolve and generate.
 
 ## Crate layout
 
@@ -66,7 +66,7 @@ weaveffi-fuzz ──► weaveffi-ir, weaveffi-core (workspace-private; unpublish
 | `weaveffi-abi`       | Stable C ABI runtime symbols: `weaveffi_error`, `weaveffi_error_clear`, `weaveffi_free_string`, `weaveffi_free_bytes`, the arena, cancel tokens. |
 | `weaveffi-core`      | The `Generator` trait, the `LanguageBackend` framework + driver, the `Orchestrator`, the `abi` C-ABI lowering model, the `BindingModel`, validation rules, generator config resolution, and the per-generator hash cache. |
 | `weaveffi-gen-*`     | Eleven generator crates. Each implements `LanguageBackend` (bridged to `Generator` by `impl_generator_via_backend!`) and produces target-specific output (header, wrapper, package metadata).                    |
-| `weaveffi-cli`       | The `weaveffi` binary. Parses the IDL, applies validation, instantiates every generator (via the `cli_targets!` registry), and dispatches the `Orchestrator`. Self-contained subcommands live in their own modules (`doctor.rs`, `upgrade.rs`, `extract.rs`, `scaffold.rs`). |
+| `weaveffi-cli`       | The `weaveffi` binary. Parses the IDL, applies validation, instantiates every generator (via the `cli_targets!` registry), and dispatches the `Orchestrator`. Self-contained subcommands live in their own modules (`doctor.rs`, `extract.rs`, `scaffold.rs`). |
 | `weaveffi-fuzz`      | `cargo-fuzz` harnesses for the parsers, the validator, and `parse_type_ref`. Workspace-private (not published to crates.io).                     |
 
 Crates that contain `unsafe` code (`weaveffi-abi`, every `samples/*`
@@ -85,7 +85,6 @@ module:
 | ------------- | --------------------------------------------------------------------- |
 | `main.rs`     | `clap` definitions, the `cli_targets!` registry, and dispatch.        |
 | `doctor.rs`   | `weaveffi doctor` — probes host toolchains per target.                |
-| `upgrade.rs`  | `weaveffi upgrade` — migrates IDLs across schema versions.            |
 | `extract.rs`  | `weaveffi extract` — derives an IDL from annotated Rust source.       |
 | `scaffold.rs` | the Rust producer stubs emitted by `weaveffi generate --scaffold`.    |
 
@@ -155,17 +154,16 @@ JSON Schema export rely on it.
 ### Schema versioning
 
 `CURRENT_SCHEMA_VERSION` (currently `"0.3.0"`) lives in
-[`crates/weaveffi-ir/src/ir.rs`][ir-source]. `SUPPORTED_VERSIONS` lists
-every version the upgrader can read (currently `["0.1.0", "0.2.0",
-"0.3.0"]`). When you change the schema:
+[`crates/weaveffi-ir/src/ir.rs`][ir-source]. Pre-1.0, `SUPPORTED_VERSIONS`
+contains exactly the current version — older schema revisions are rejected
+by validation with an actionable error. When you change the schema:
 
-1. Bump `CURRENT_SCHEMA_VERSION` and append the new version to
-   `SUPPORTED_VERSIONS`.
-2. Add migration code in `cmd_upgrade` (`weaveffi-cli/src/upgrade.rs`).
+1. Bump `CURRENT_SCHEMA_VERSION` (and the `weaveffi-ir` minor version).
+2. Document the changes in `CHANGELOG.md` under a "Migration" section.
 3. Update every sample IDL, the `weaveffi new` template, the README
    quickstart, and the [Getting Started](getting-started.md) doc.
 
-The [stability page](stability.md#ir-schema-migration-policy) is the
+The [stability page](stability.md#ir-schema-version-policy) is the
 external contract; this section is the implementation note.
 
 ## Validation
@@ -209,6 +207,16 @@ iterators (`iter<T>`), typed handles (`handle<T>`), borrowed types
 (`&str`, `&[u8]`), nested modules, and cross-module type references are
 all **first-class**. They pass validation and every generator handles
 them. Do not re-add validator rejections for these features.
+
+The one exception is per-target capability gating: each generator
+declares a `TargetCapabilities` (async, callbacks, listeners,
+iterators), and the orchestrator fails generation — listing the
+offending IDL definitions — when a selected target cannot deliver a
+used feature. Today only WASM declares gaps (callbacks and listeners);
+its `allow_unsupported = true` config opts into generating the rest of
+the surface with explicit throwing stubs in place of the unsupported
+entry points. Capability failures must stay loud: never skip a
+definition silently.
 
 ## Generator configuration resolution
 

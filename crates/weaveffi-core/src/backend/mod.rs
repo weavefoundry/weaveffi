@@ -24,6 +24,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use serde::Serialize;
 use weaveffi_ir::ir::Api;
 
+use crate::capabilities::TargetCapabilities;
 use crate::model::{
     BindingModel, CallbackBinding, EnumBinding, FnBinding, ListenerBinding, ModuleBinding,
     StructBinding,
@@ -77,6 +78,23 @@ pub trait LanguageBackend: Send + Sync {
 
     /// Stable short name (`"swift"`, `"python"`, …): the `--target` token.
     fn name(&self) -> &'static str;
+
+    /// The gated IDL features this backend implements (async functions,
+    /// callbacks, listeners, iterators). Required — declaring capabilities
+    /// explicitly is what lets the orchestrator fail loudly instead of a
+    /// backend silently skipping a feature it never implemented.
+    fn capabilities(&self) -> TargetCapabilities;
+
+    /// Whether the bound config explicitly opted in to generating despite
+    /// unsupported features (see
+    /// [`Generator::allows_unsupported`](crate::codegen::Generator::allows_unsupported)).
+    /// Backends with partial capabilities override this to read their
+    /// `allow_unsupported` config flag; full-capability backends keep the
+    /// `false` default.
+    fn allows_unsupported(&self, config: &Self::Config) -> bool {
+        let _ = config;
+        false
+    }
 
     /// The C ABI symbol prefix the producer used. The driver builds the
     /// [`BindingModel`] with it so every emitted call targets the right
@@ -262,6 +280,14 @@ macro_rules! impl_generator_via_backend {
                 <$backend as $crate::backend::LanguageBackend>::name(self)
             }
 
+            fn capabilities(&self) -> $crate::capabilities::TargetCapabilities {
+                <$backend as $crate::backend::LanguageBackend>::capabilities(self)
+            }
+
+            fn allows_unsupported(&self, config: &Self::Config) -> bool {
+                <$backend as $crate::backend::LanguageBackend>::allows_unsupported(self, config)
+            }
+
             fn generate(
                 &self,
                 api: &::weaveffi_ir::ir::Api,
@@ -303,6 +329,10 @@ mod tests {
 
         fn name(&self) -> &'static str {
             "fake"
+        }
+
+        fn capabilities(&self) -> TargetCapabilities {
+            TargetCapabilities::full()
         }
 
         fn prefix<'a>(&self, config: &'a Self::Config) -> &'a str {

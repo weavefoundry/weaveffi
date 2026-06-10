@@ -4,6 +4,7 @@ pub mod abi;
 pub mod backend;
 pub mod cabi;
 pub mod cache;
+pub mod capabilities;
 pub mod codegen;
 pub mod errors;
 pub mod model;

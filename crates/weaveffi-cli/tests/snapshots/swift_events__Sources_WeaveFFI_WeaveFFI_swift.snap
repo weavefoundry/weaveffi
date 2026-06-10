@@ -44,7 +44,38 @@ func withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CChar>?) th
     return try value.withCString { try body($0) }
 }
 
+final class WvCallbackBox<T> {
+    let value: T
+    init(_ value: T) { self.value = value }
+}
+
+var wvListenerContexts: [UInt64: UnsafeMutableRawPointer] = [:]
+let wvListenerLock = NSLock()
+
 public enum Events {
+    /// - Returns: A subscription id for ``events_unregister_message_listener(_:)``.
+    public static func events_register_message_listener(_ callback: @escaping (String) -> Void) -> UInt64 {
+        let box = WvCallbackBox(callback)
+        let ctx = Unmanaged.passRetained(box).toOpaque()
+        let id = weaveffi_events_register_message_listener({ message, context in
+            let cb = Unmanaged<WvCallbackBox<(String) -> Void>>.fromOpaque(context!).takeUnretainedValue().value
+            cb(String(cString: message!))
+        }, ctx)
+        wvListenerLock.lock()
+        wvListenerContexts[id] = ctx
+        wvListenerLock.unlock()
+        return id
+    }
+    /// Unregisters a listener previously registered with ``events_register_message_listener(_:)``.
+    public static func events_unregister_message_listener(_ id: UInt64) {
+        weaveffi_events_unregister_message_listener(id)
+        wvListenerLock.lock()
+        let ctx = wvListenerContexts.removeValue(forKey: id)
+        wvListenerLock.unlock()
+        if let ctx = ctx {
+            Unmanaged<WvCallbackBox<(String) -> Void>>.fromOpaque(ctx).release()
+        }
+    }
     /// Send a message, triggering the OnMessage callback
     public static func events_send_message(_ text: String) throws -> Void {
         var err = weaveffi_error(code: 0, message: nil)

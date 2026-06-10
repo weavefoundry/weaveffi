@@ -6,7 +6,10 @@
 // (`Entry.metadata`), the nullable-scalar getter (`Entry.expiresAt`), the
 // iterator-backed `listKeys`, and the fluent builder's bytes/optional/list/map
 // *input* marshaling (`build()` -> the C `create` symbol). Also covers the
-// `kv.stats` submodule. Throws (non-zero exit) on any mismatch.
+// `kv.stats` submodule, the NativeCallable.isolateLocal eviction listener
+// (register -> fire synchronously on delete -> unregister), and the
+// Future-returning `compactAsync` settled through a NativeCallable.listener
+// from the producer's worker thread. Throws (non-zero exit) on any mismatch.
 
 import 'package:__PKG__/__LIB__.dart' as wv;
 
@@ -14,7 +17,7 @@ void expect(bool cond, String msg) {
   if (!cond) throw StateError('assertion failed: $msg');
 }
 
-void main() {
+Future<void> main() async {
   final store = wv.openStore('/tmp/conformance-kvstore-dart');
 
   final payload = <int>[1, 2, 3];
@@ -78,6 +81,28 @@ void main() {
   final st = wv.getStats(store);
   expect(st.totalEntries == 2, 'stats total entries == 2');
   st.dispose();
+
+  // Eviction listener: delete fires the isolate-local NativeCallable
+  // synchronously on the calling thread.
+  final evicted = <String>[];
+  final sub = wv.registerEvictionListener(evicted.add);
+  expect(sub > 0, 'listener id positive');
+  expect(wv.delete(store, 'beta'), 'delete beta');
+  expect(evicted.length == 1 && evicted[0] == 'beta',
+      'eviction fired for beta (got $evicted)');
+
+  // Unregister stops delivery.
+  wv.unregisterEvictionListener(sub);
+  expect(wv.delete(store, 'alpha'), 'delete alpha');
+  expect(evicted.length == 1, 'no eviction after unregister (got $evicted)');
+
+  // Async: an immediately-expired entry gives compact 3 bytes to reclaim; the
+  // Future settles via a NativeCallable.listener message from the producer's
+  // worker thread.
+  expect(wv.put(store, 'doomed', payload, wv.EntryKind.volatile, 0), 'put doomed');
+  final reclaimed = await wv.compactAsync(store);
+  expect(reclaimed == 3, 'compact reclaimed 3 bytes (got $reclaimed)');
+  expect(wv.count(store) == 0, 'store empty after deletes + compact');
 
   store.dispose();
   print('dart/kvstore: OK');

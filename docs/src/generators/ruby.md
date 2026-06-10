@@ -20,6 +20,10 @@ to the work done inside the Rust library.
 | `ruby/weaveffi.gemspec` | Gem specification with `ffi ~> 1.15` dependency |
 | `ruby/README.md` | Prerequisites and usage instructions |
 
+The file names follow the gem name (IDL `package.name`): a package
+named `events` produces `lib/events.rb` and `events.gemspec`;
+`weaveffi` is the default.
+
 ## Type mapping
 
 | IDL type     | Ruby type          | FFI type                       |
@@ -37,6 +41,7 @@ to the work done inside the Rust library.
 | `T?`         | `T` or `nil`       | `:pointer` for scalars; same pointer for strings/structs |
 | `[T]`        | `Array`            | `:pointer` + `:size_t`         |
 | `{K: V}`     | `Hash`             | key/value pointer arrays + `:size_t` |
+| `iter<T>`    | `Array`            | `:pointer` iterator handle     |
 
 Booleans cross as `:int32` (`0`/`1`); the wrapper converts both
 directions.
@@ -206,7 +211,7 @@ end
 1. Generate the bindings:
 
    ```bash
-   weaveffi generate --input api.yaml --output generated/ --target ruby
+   weaveffi generate api.yaml -o generated --target ruby
    ```
 
 2. Build the Rust shared library:
@@ -258,28 +263,156 @@ gem_name = "my_bindings"
 
 ## Async support
 
-Async IDL functions are exposed as Ruby methods that return a
-`Concurrent::Promises::Future` (when `concurrent-ruby` is present) or
-a hand-rolled callback wrapper otherwise. The Ruby thread that calls
-the function blocks on a `Queue` to receive the result from the C ABI
-callback:
+Async IDL functions (`async: true`) are exposed as blocking wrapper
+methods. The wrapper creates a `Queue`, builds an `FFI::Function`
+completion callback that pushes either the converted result or an
+`Error` onto it, calls the `_async`-suffixed C launcher, then pops the
+queue and raises if the producer reported an error:
 
 ```ruby
-def self.fetch_contact(id)
-  q = Queue.new
-  context = FFI::Function.new(:void, [:pointer, :pointer]) do |err, result|
-    q << [err, result]
+# Blocks until the async producer completes.
+def self.run_task(name)
+  queue = Queue.new
+  callback = FFI::Function.new(
+    :void, [:pointer, :pointer, :pointer]
+  ) do |_context, err_ptr, result|
+    err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
+    if err && err[:code] != 0
+      # ... read code/message, weaveffi_error_clear ...
+      queue << Error.new(code, msg)
+    else
+      # ... null-pointer guard ...
+      queue << TaskResult.new(result)
+    end
   end
-  weaveffi_contacts_fetch_contact_async(id, context, nil)
-  err, result = q.pop
-  check_error!(ErrorStruct.new(err))
-  Contact.new(result)
+  weaveffi_tasks_run_task_async(name, callback, FFI::Pointer::NULL)
+  value = queue.pop
+  raise value if value.is_a?(Error)
+  value
 end
 ```
 
-When the IDL marks the function `cancel: true`, the wrapper accepts a
-cancellation token and forwards it to the underlying
-`weaveffi_cancel_token`.
+There is no promise/future type and no `concurrent-ruby` dependency:
+the calling thread blocks until the completion callback fires. Wrap
+the call in a `Thread` when you need concurrency:
+
+```ruby
+t = Thread.new { WeaveFFI.run_task('demo') }
+result = t.value  # joins; re-raises a WeaveFFI::Error from the call
+```
+
+The local `callback` reference keeps the `FFI::Function` alive until
+`queue.pop` returns, so the completion callback cannot be collected
+mid-flight.
+
+For functions marked `cancellable: true` the C launcher takes an extra
+cancel-token parameter. The wrapper always passes `FFI::Pointer::NULL`
+for it — the token is not exposed (the generated comment reads
+"cancellation token not exposed; pass-through is NULL"). Cancellation
+tokens are currently surfaced only by the C, C++, and Kotlin targets.
+
+## Callbacks and listeners
+
+IDL `callbacks` declare a C function-pointer type; a `listener` pairs
+one with register/unregister entry points:
+
+```yaml
+callbacks:
+  - name: OnMessage
+    params:
+      - { name: message, type: string }
+listeners:
+  - name: message_listener
+    event_callback: OnMessage
+```
+
+The generated module declares the FFI callback type and exposes a
+register/unregister pair. Registering takes a block, wraps it in an
+`FFI::Function` trampoline, and returns a `uint64` subscription id:
+
+```ruby
+callback :weaveffi_events_OnMessage_fn, [:string, :pointer], :void
+attach_function :weaveffi_events_register_message_listener,
+                [:weaveffi_events_OnMessage_fn, :pointer], :uint64
+attach_function :weaveffi_events_unregister_message_listener, [:uint64], :void
+
+# Registers a OnMessage listener block. Returns a subscription id for
+# unregister_message_listener.
+def self.register_message_listener(&block)
+  trampoline = FFI::Function.new(:void, [:string, :pointer]) do |message, _context|
+    block.call(message)
+  end
+  listener_id = weaveffi_events_register_message_listener(trampoline, FFI::Pointer::NULL)
+  @listener_refs[listener_id] = trampoline
+  listener_id
+end
+
+def self.unregister_message_listener(listener_id)
+  weaveffi_events_unregister_message_listener(listener_id)
+  @listener_refs.delete(listener_id)
+  nil
+end
+```
+
+- **GC safety** — the `FFI::Function` trampoline is pinned in a
+  module-level registry (`@listener_refs`), keyed by subscription id,
+  so it cannot be garbage-collected while the producer may still call
+  it. Unregistering deletes the registry entry.
+- **Subscription ids** — registration returns the `uint64` id produced
+  by `weaveffi_events_register_message_listener(fn, context)`; pass it
+  to `unregister_message_listener` to stop delivery and release the
+  trampoline.
+- **Threading** — the callback fires on the producer's thread, not the
+  thread that registered it. Do not block inside it; marshal results
+  to your own thread or event loop (a `Queue` works well).
+
+Typical round trip:
+
+```ruby
+id = WeaveFFI.register_message_listener { |message| puts message }
+WeaveFFI.send_message('hello')
+WeaveFFI.unregister_message_listener(id)
+```
+
+## Iterators
+
+Functions returning `iter<T>` receive an opaque iterator handle from
+the C ABI. The wrapper drains it eagerly with the generated `_next`
+binding, frees each returned string, destroys the handle, and returns
+a fully materialised `Array` — there is no lazy `Enumerator`:
+
+```ruby
+attach_function :weaveffi_events_get_messages, [:pointer], :pointer
+attach_function :weaveffi_events_GetMessagesIterator_next,
+                [:pointer, :pointer, :pointer], :int32
+attach_function :weaveffi_events_GetMessagesIterator_destroy,
+                [:pointer], :void
+
+def self.get_messages()
+  err = ErrorStruct.new
+  iter = weaveffi_events_get_messages(err)
+  check_error!(err)
+  items = []
+  return items if iter.null?
+  loop do
+    out_item = FFI::MemoryPointer.new(:pointer)
+    item_err = ErrorStruct.new
+    has_item = weaveffi_events_GetMessagesIterator_next(iter, out_item, item_err)
+    # ... destroy the iterator and check_error! if item_err is set ...
+    break if has_item.zero?
+    item_ptr = out_item.read_pointer
+    # ... empty string for NULL ...
+    items << item_ptr.read_string
+    weaveffi_free_string(item_ptr)
+  end
+  weaveffi_events_GetMessagesIterator_destroy(iter)
+  items
+end
+```
+
+If `_next` reports an error the wrapper destroys the handle first and
+then raises `WeaveFFI::Error` via `check_error!`; on success the
+handle is destroyed before the array is returned.
 
 ## Troubleshooting
 
@@ -289,8 +422,11 @@ cancellation token and forwards it to the underlying
 - **`FFI::NotFoundError: Function 'weaveffi_*' not found`** — the
   cdylib does not export the symbol. Rebuild the Rust crate after
   regenerating the IDL.
-- **Segmentation faults on Ruby exit** — keep references to FFI
-  callbacks alive for the lifetime of the call. Letting them be
+- **Segmentation faults on Ruby exit** — the generated wrappers pin
+  listener trampolines in `@listener_refs` and keep async completion
+  callbacks referenced until they fire. If you call the
+  `attach_function` bindings directly, keep your own `FFI::Function`
+  objects alive for the lifetime of the call; letting them be
   garbage-collected mid-call corrupts the C side.
 - **Strings come back as binary garbage** — UTF-8 strings should round
   trip through `read_string`; for binary data use

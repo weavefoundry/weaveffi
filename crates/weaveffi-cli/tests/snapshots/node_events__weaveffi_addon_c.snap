@@ -10,6 +10,81 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <stdlib.h>
 #include <string.h>
 
+typedef struct weaveffi_napi_listener_ctx {
+    napi_threadsafe_function tsfn;
+    uint64_t id;
+    struct weaveffi_napi_listener_ctx* next;
+} weaveffi_napi_listener_ctx;
+
+static weaveffi_napi_listener_ctx* weaveffi_napi_listeners = NULL;
+
+typedef struct {
+    char* message;
+} weaveffi_events_OnMessage_fn_payload;
+
+static void weaveffi_events_OnMessage_fn_napi_tramp(const char* message, void* context) {
+    weaveffi_napi_listener_ctx* ctx = (weaveffi_napi_listener_ctx*)context;
+    weaveffi_events_OnMessage_fn_payload* p = (weaveffi_events_OnMessage_fn_payload*)calloc(1, sizeof(weaveffi_events_OnMessage_fn_payload));
+    p->message = message ? strdup(message) : NULL;
+    napi_call_threadsafe_function(ctx->tsfn, p, napi_tsfn_nonblocking);
+}
+
+static void weaveffi_events_OnMessage_fn_napi_calljs(napi_env env, napi_value js_cb, void* context, void* data) {
+    (void)context;
+    weaveffi_events_OnMessage_fn_payload* p = (weaveffi_events_OnMessage_fn_payload*)data;
+    if (env != NULL) {
+        napi_value undefined;
+        napi_get_undefined(env, &undefined);
+        napi_value argv[1];
+        napi_create_string_utf8(env, p->message ? p->message : "", NAPI_AUTO_LENGTH, &argv[0]);
+        napi_call_function(env, undefined, js_cb, 1, argv, NULL);
+    }
+    free(p->message);
+    free(p);
+}
+
+static napi_value Napi_weaveffi_events_register_message_listener(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  weaveffi_napi_listener_ctx* ctx = (weaveffi_napi_listener_ctx*)calloc(1, sizeof(weaveffi_napi_listener_ctx));
+  napi_value resource_name;
+  napi_create_string_utf8(env, "weaveffi_events_register_message_listener", NAPI_AUTO_LENGTH, &resource_name);
+  napi_create_threadsafe_function(env, args[0], NULL, resource_name, 0, 1, NULL, NULL, NULL, weaveffi_events_OnMessage_fn_napi_calljs, &ctx->tsfn);
+  napi_unref_threadsafe_function(env, ctx->tsfn);
+  uint64_t id = weaveffi_events_register_message_listener(weaveffi_events_OnMessage_fn_napi_tramp, ctx);
+  ctx->id = id;
+  ctx->next = weaveffi_napi_listeners;
+  weaveffi_napi_listeners = ctx;
+  napi_value ret;
+  napi_create_double(env, (double)id, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_events_unregister_message_listener(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  double id_d = 0;
+  napi_get_value_double(env, args[0], &id_d);
+  uint64_t id = (uint64_t)id_d;
+  weaveffi_events_unregister_message_listener(id);
+  weaveffi_napi_listener_ctx** link = &weaveffi_napi_listeners;
+  while (*link != NULL) {
+    if ((*link)->id == id) {
+      weaveffi_napi_listener_ctx* found = *link;
+      *link = found->next;
+      napi_release_threadsafe_function(found->tsfn, napi_tsfn_release);
+      free(found);
+      break;
+    }
+    link = &(*link)->next;
+  }
+  napi_value ret;
+  napi_get_undefined(env, &ret);
+  return ret;
+}
+
 static napi_value Napi_weaveffi_events_send_message(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value args[1];
@@ -58,10 +133,12 @@ static napi_value Napi_weaveffi_events_get_messages(napi_env env, napi_callback_
 
 static napi_value Init(napi_env env, napi_value exports) {
   napi_property_descriptor props[] = {
+    { "events_register_message_listener", NULL, Napi_weaveffi_events_register_message_listener, NULL, NULL, NULL, napi_default, NULL },
+    { "events_unregister_message_listener", NULL, Napi_weaveffi_events_unregister_message_listener, NULL, NULL, NULL, napi_default, NULL },
     { "events_send_message", NULL, Napi_weaveffi_events_send_message, NULL, NULL, NULL, napi_default, NULL },
     { "events_get_messages", NULL, Napi_weaveffi_events_get_messages, NULL, NULL, NULL, napi_default, NULL },
   };
-  napi_define_properties(env, exports, 2, props);
+  napi_define_properties(env, exports, 4, props);
   return exports;
 }
 

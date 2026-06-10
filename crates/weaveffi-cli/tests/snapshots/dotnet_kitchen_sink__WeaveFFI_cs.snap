@@ -86,7 +86,7 @@ namespace WeaveFFI
                 var ptr = NativeMethods.weaveffi_shared_Token_get_label(_handle);
                 var str = WeaveFFIHelpers.PtrToString(ptr);
                 NativeMethods.weaveffi_free_string(ptr);
-                return str;
+                return str ?? "";
             }
         }
 
@@ -147,7 +147,7 @@ namespace WeaveFFI
                 var ptr = NativeMethods.weaveffi_kitchen_Item_get_name(_handle);
                 var str = WeaveFFIHelpers.PtrToString(ptr);
                 NativeMethods.weaveffi_free_string(ptr);
-                return str;
+                return str ?? "";
             }
         }
 
@@ -205,7 +205,12 @@ namespace WeaveFFI
             {
                 var ptr = NativeMethods.weaveffi_kitchen_Item_get_tags(_handle, out var len);
                 if (ptr == IntPtr.Zero) return Array.Empty<string>();
-                return Array.Empty<string>();
+                var arr = new string[(int)len];
+                for (int i = 0; i < (int)len; i++)
+                {
+                    arr[i] = Marshal.PtrToStringUTF8(Marshal.ReadIntPtr(ptr, i * IntPtr.Size)) ?? "";
+                }
+                return arr;
             }
         }
 
@@ -217,7 +222,7 @@ namespace WeaveFFI
                 var dict = new Dictionary<string, string>();
                 for (int i = 0; i < (int)outLen; i++)
                 {
-                    dict[Marshal.PtrToStringUTF8(Marshal.ReadIntPtr(outKeys, i * IntPtr.Size))] = Marshal.PtrToStringUTF8(Marshal.ReadIntPtr(outValues, i * IntPtr.Size));
+                    dict[Marshal.PtrToStringUTF8(Marshal.ReadIntPtr(outKeys, i * IntPtr.Size)) ?? ""] = Marshal.PtrToStringUTF8(Marshal.ReadIntPtr(outValues, i * IntPtr.Size)) ?? "";
                 }
                 return dict;
             }
@@ -269,18 +274,18 @@ namespace WeaveFFI
     /// <summary>Kitchen sink struct exercising every field feature</summary>
     public class ItemBuilder
     {
-        private long? _id;
-        private string? _name;
-        private int? _count;
-        private bool? _enabled;
-        private double? _ratio;
-        private uint? _nick;
-        private byte[]? _payload;
-        private string[]? _tags;
-        private Dictionary<string, string>? _attrs;
-        private long? _parent;
-        private Token? _token;
-        private Priority? _priority;
+        private long _id = 0;
+        private string _name = "";
+        private int _count = 0;
+        private bool _enabled = false;
+        private double _ratio = 0.0;
+        private uint _nick = 0;
+        private byte[] _payload = Array.Empty<byte>();
+        private string[] _tags = Array.Empty<string>();
+        private Dictionary<string, string> _attrs = new Dictionary<string, string>();
+        private long? _parent = null;
+        private Token? _token = null;
+        private Priority _priority = default;
 
         /// <summary>Stable identifier</summary>
         public ItemBuilder WithId(long value)
@@ -362,19 +367,59 @@ namespace WeaveFFI
 
         public Item Build()
         {
-            if (_id == null) throw new InvalidOperationException("missing field: id");
-            if (_name == null) throw new InvalidOperationException("missing field: name");
-            if (_count == null) throw new InvalidOperationException("missing field: count");
-            if (_enabled == null) throw new InvalidOperationException("missing field: enabled");
-            if (_ratio == null) throw new InvalidOperationException("missing field: ratio");
-            if (_nick == null) throw new InvalidOperationException("missing field: nick");
-            if (_payload == null) throw new InvalidOperationException("missing field: payload");
-            if (_tags == null) throw new InvalidOperationException("missing field: tags");
-            if (_attrs == null) throw new InvalidOperationException("missing field: attrs");
-            if (_parent == null) throw new InvalidOperationException("missing field: parent");
-            if (_token == null) throw new InvalidOperationException("missing field: token");
-            if (_priority == null) throw new InvalidOperationException("missing field: priority");
-            throw new NotImplementedException("ItemBuilder.Build requires FFI backing");
+            var err = new WeaveFFIError();
+            var id = _id;
+            var name = _name;
+            var count = _count;
+            var enabled = _enabled;
+            var ratio = _ratio;
+            var nick = _nick;
+            var payload = _payload;
+            var tags = _tags;
+            var attrs = _attrs;
+            var parent = _parent;
+            var token = _token;
+            var priority = _priority;
+            var namePtr = Marshal.StringToCoTaskMemUTF8(name);
+            var payloadPin = GCHandle.Alloc(payload, GCHandleType.Pinned);
+            var tagsArr = new IntPtr[tags.Length];
+            for (var tagsIt = 0; tagsIt < tags.Length; tagsIt++) tagsArr[tagsIt] = Marshal.StringToCoTaskMemUTF8(tags[tagsIt]);
+            var tagsPin = GCHandle.Alloc(tagsArr, GCHandleType.Pinned);
+            var attrsKeysArr = new IntPtr[attrs.Count];
+            var attrsValsArr = new IntPtr[attrs.Count];
+            var attrsI = 0;
+            foreach (var kv in attrs)
+            {
+                attrsKeysArr[attrsI] = Marshal.StringToCoTaskMemUTF8(kv.Key);
+                attrsValsArr[attrsI] = Marshal.StringToCoTaskMemUTF8(kv.Value);
+                attrsI++;
+            }
+            var attrsKeysPin = GCHandle.Alloc(attrsKeysArr, GCHandleType.Pinned);
+            var attrsValsPin = GCHandle.Alloc(attrsValsArr, GCHandleType.Pinned);
+            var parentPtr = IntPtr.Zero;
+            if (parent.HasValue)
+            {
+                parentPtr = Marshal.AllocHGlobal(sizeof(long));
+                Marshal.WriteInt64(parentPtr, parent.Value);
+            }
+            try
+            {
+                var result = NativeMethods.weaveffi_kitchen_Item_create(id, namePtr, count, enabled ? 1 : 0, ratio, nick, payloadPin.AddrOfPinnedObject(), (UIntPtr)payload.Length, tags.Length == 0 ? IntPtr.Zero : tagsPin.AddrOfPinnedObject(), (UIntPtr)tags.Length, attrs.Count == 0 ? IntPtr.Zero : attrsKeysPin.AddrOfPinnedObject(), attrs.Count == 0 ? IntPtr.Zero : attrsValsPin.AddrOfPinnedObject(), (UIntPtr)attrs.Count, parentPtr, token.Handle, (int)priority, ref err);
+                WeaveFFIError.Check(err);
+                return new Item(result);
+            }
+            finally
+            {
+                Marshal.FreeCoTaskMem(namePtr);
+                payloadPin.Free();
+                tagsPin.Free();
+                foreach (var tagsP in tagsArr) Marshal.FreeCoTaskMem(tagsP);
+                attrsKeysPin.Free();
+                attrsValsPin.Free();
+                foreach (var attrsKP in attrsKeysArr) Marshal.FreeCoTaskMem(attrsKP);
+                foreach (var attrsVP in attrsValsArr) Marshal.FreeCoTaskMem(attrsVP);
+                if (parentPtr != IntPtr.Zero) Marshal.FreeHGlobal(parentPtr);
+            }
         }
     }
 
@@ -445,6 +490,15 @@ namespace WeaveFFI
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_Item_get_priority", CallingConvention = CallingConvention.Cdecl)]
         internal static extern int weaveffi_kitchen_Item_get_priority(IntPtr ptr);
 
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        internal delegate void Cb_weaveffi_kitchen_OnReady_fn(int code, IntPtr msg, IntPtr context);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_kitchen_register_ready_listener", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern ulong weaveffi_kitchen_register_ready_listener(Cb_weaveffi_kitchen_OnReady_fn callback, IntPtr context);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_kitchen_unregister_ready_listener", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_kitchen_unregister_ready_listener(ulong id);
+
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_bool_id", CallingConvention = CallingConvention.Cdecl)]
         internal static extern int weaveffi_kitchen_bool_id(int x, ref WeaveFFIError err);
 
@@ -488,7 +542,13 @@ namespace WeaveFFI
         internal static extern void weaveffi_kitchen_get_attrs(out IntPtr out_keys, out IntPtr out_values, out UIntPtr out_len, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_stream_items", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_stream_items(out UIntPtr out_len, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_kitchen_stream_items(ref WeaveFFIError out_err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_kitchen_StreamItemsIterator_next", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int weaveffi_kitchen_StreamItemsIterator_next(IntPtr iter, out IntPtr out_item, ref WeaveFFIError out_err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_kitchen_StreamItemsIterator_destroy", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_kitchen_StreamItemsIterator_destroy(IntPtr iter);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_cross_module_token", CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr weaveffi_kitchen_cross_module_token(ref WeaveFFIError err);
@@ -539,6 +599,39 @@ namespace WeaveFFI
 
     public static class Kitchen
     {
+        private static readonly object _listenerLock = new object();
+        // Live listener delegates by subscription id. Holding the delegate
+        // here keeps its native thunk alive until unregistered; without this
+        // the GC could collect a delegate the producer still calls.
+        private static readonly Dictionary<ulong, Delegate> _listenerRefs = new Dictionary<ulong, Delegate>();
+
+        /// <summary>Subscribe to OnReady events</summary>
+        /// <returns>A subscription id for KitchenUnregisterReadyListener().</returns>
+        public static ulong KitchenRegisterReadyListener(Action<int, string> callback)
+        {
+            NativeMethods.Cb_weaveffi_kitchen_OnReady_fn trampoline = (code, msg, context) =>
+            {
+                callback(code, Marshal.PtrToStringUTF8(msg) ?? "");
+            };
+            ulong id;
+            lock (_listenerLock)
+            {
+                id = NativeMethods.weaveffi_kitchen_register_ready_listener(trampoline, IntPtr.Zero);
+                _listenerRefs[id] = trampoline;
+            }
+            return id;
+        }
+
+        /// <summary>Unregisters a listener previously registered with KitchenRegisterReadyListener().</summary>
+        public static void KitchenUnregisterReadyListener(ulong id)
+        {
+            NativeMethods.weaveffi_kitchen_unregister_ready_listener(id);
+            lock (_listenerLock)
+            {
+                _listenerRefs.Remove(id);
+            }
+        }
+
         /// <summary>Identity for bool</summary>
         public static bool KitchenBoolId(bool x)
         {
@@ -709,7 +802,7 @@ namespace WeaveFFI
             var dict = new Dictionary<string, int>();
             for (int i = 0; i < (int)outLen; i++)
             {
-                dict[Marshal.PtrToStringUTF8(Marshal.ReadIntPtr(outKeys, i * IntPtr.Size))] = Marshal.ReadInt32(outValues + i * sizeof(int));
+                dict[Marshal.PtrToStringUTF8(Marshal.ReadIntPtr(outKeys, i * IntPtr.Size)) ?? ""] = Marshal.ReadInt32(outValues + i * sizeof(int));
             }
             return dict;
         }
@@ -718,15 +811,31 @@ namespace WeaveFFI
         public static IEnumerable<Item> KitchenStreamItems()
         {
             var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_kitchen_stream_items(out var outLen, ref err);
+            var iter = NativeMethods.weaveffi_kitchen_stream_items(ref err);
             WeaveFFIError.Check(err);
-            if (result == IntPtr.Zero) return Array.Empty<Item>();
-            var arr = new Item[(int)outLen];
-            for (int i = 0; i < (int)outLen; i++)
+            return EnumerateKitchenStreamItems(iter);
+        }
+
+        private static IEnumerable<Item> EnumerateKitchenStreamItems(IntPtr iter)
+        {
+            try
             {
-                arr[i] = new Item(Marshal.ReadIntPtr(result, i * IntPtr.Size));
+                while (true)
+                {
+                    var iterErr = new WeaveFFIError();
+                    if (NativeMethods.weaveffi_kitchen_StreamItemsIterator_next(iter, out var out_item, ref iterErr) == 0)
+                    {
+                        WeaveFFIError.Check(iterErr);
+                        yield break;
+                    }
+                    WeaveFFIError.Check(iterErr);
+                    yield return new Item(out_item);
+                }
             }
-            return arr;
+            finally
+            {
+                NativeMethods.weaveffi_kitchen_StreamItemsIterator_destroy(iter);
+            }
         }
 
         /// <summary>Returns the shared Token type from another module</summary>
@@ -861,19 +970,19 @@ namespace WeaveFFI
             return result;
         }
 
-        public static class Nested
-        {
-            /// <summary>Trivial nested-module function</summary>
-            public static string KitchenNestedHello()
-            {
-                var err = new WeaveFFIError();
-                var result = NativeMethods.weaveffi_kitchen_nested_hello(ref err);
-                WeaveFFIError.Check(err);
-                var str = Marshal.PtrToStringUTF8(result);
-                NativeMethods.weaveffi_free_string(result);
-                return str;
-            }
+    }
 
+    public static class KitchenNested
+    {
+        /// <summary>Trivial nested-module function</summary>
+        public static string KitchenNestedHello()
+        {
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_kitchen_nested_hello(ref err);
+            WeaveFFIError.Check(err);
+            var str = Marshal.PtrToStringUTF8(result);
+            NativeMethods.weaveffi_free_string(result);
+            return str;
         }
 
     }

@@ -11,13 +11,87 @@ package weaveffi
 #cgo LDFLAGS: -lweaveffi
 #include "weaveffi.h"
 #include <stdlib.h>
+extern void goWv_weaveffi_events_OnMessage_fn(char* message, void* context);
 */
 import "C"
 
 import (
 	"fmt"
+	"sync"
 	"unsafe"
 )
+
+var (
+	wvCallbackMu  sync.Mutex
+	wvCallbackSeq uint64
+	wvCallbacks   = map[uint64]interface{}{}
+	// Subscription id -> registry id, so unregister can release the Go callback.
+	wvListenerCtx = map[uint64]uint64{}
+)
+
+func wvCallbackStore(v interface{}) uint64 {
+	wvCallbackMu.Lock()
+	defer wvCallbackMu.Unlock()
+	wvCallbackSeq++
+	wvCallbacks[wvCallbackSeq] = v
+	return wvCallbackSeq
+}
+
+func wvCallbackLoad(id uint64) interface{} {
+	wvCallbackMu.Lock()
+	defer wvCallbackMu.Unlock()
+	return wvCallbacks[id]
+}
+
+func wvCallbackTake(id uint64) interface{} {
+	wvCallbackMu.Lock()
+	defer wvCallbackMu.Unlock()
+	v := wvCallbacks[id]
+	delete(wvCallbacks, id)
+	return v
+}
+
+func wvCallbackDelete(id uint64) {
+	wvCallbackMu.Lock()
+	defer wvCallbackMu.Unlock()
+	delete(wvCallbacks, id)
+}
+
+//export goWv_weaveffi_events_OnMessage_fn
+func goWv_weaveffi_events_OnMessage_fn(message *C.char, context unsafe.Pointer) {
+	v := wvCallbackLoad(uint64(uintptr(context)))
+	if v == nil {
+		return
+	}
+	cb := v.(func(message string))
+	arg0 := ""
+	if message != nil {
+		arg0 = C.GoString(message)
+	}
+	cb(arg0)
+}
+
+// Returns a subscription id for EventsUnregisterMessageListener.
+func EventsRegisterMessageListener(callback func(message string)) uint64 {
+	ctxID := wvCallbackStore(callback)
+	id := uint64(C.weaveffi_events_register_message_listener(C.weaveffi_events_OnMessage_fn(unsafe.Pointer(C.goWv_weaveffi_events_OnMessage_fn)), unsafe.Pointer(uintptr(ctxID))))
+	wvCallbackMu.Lock()
+	wvListenerCtx[id] = ctxID
+	wvCallbackMu.Unlock()
+	return id
+}
+
+// EventsUnregisterMessageListener unregisters a listener previously registered with EventsRegisterMessageListener.
+func EventsUnregisterMessageListener(id uint64) {
+	C.weaveffi_events_unregister_message_listener(C.uint64_t(id))
+	wvCallbackMu.Lock()
+	ctxID, ok := wvListenerCtx[id]
+	delete(wvListenerCtx, id)
+	wvCallbackMu.Unlock()
+	if ok {
+		wvCallbackDelete(ctxID)
+	}
+}
 
 // EventsSendMessage: Send a message, triggering the OnMessage callback
 func EventsSendMessage(text string) error {

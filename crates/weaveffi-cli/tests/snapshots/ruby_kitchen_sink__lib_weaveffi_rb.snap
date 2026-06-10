@@ -56,6 +56,11 @@ module WeaveFFI
     raise Error.new(code, msg)
   end
 
+  # Registered listener trampolines, keyed by subscription id. Holding the
+  # FFI::Function objects here keeps them alive until unregistered; without
+  # this the GC could collect a trampoline the producer still calls.
+  @listener_refs = {}
+
   # === Module: shared ===
 
   attach_function :weaveffi_shared_Token_destroy, [:pointer], :void
@@ -126,6 +131,7 @@ module WeaveFFI
   end
 
   attach_function :weaveffi_kitchen_Item_destroy, [:pointer], :void
+  attach_function :weaveffi_kitchen_Item_create, [:int64, :string, :int32, :int32, :double, :uint32, :pointer, :size_t, :pointer, :size_t, :pointer, :pointer, :size_t, :pointer, :pointer, :int32, :pointer], :pointer
   # Stable identifier
   attach_function :weaveffi_kitchen_Item_get_id, [:pointer], :int64
   # Display name
@@ -144,6 +150,10 @@ module WeaveFFI
   # Cross-module struct reference
   attach_function :weaveffi_kitchen_Item_get_token, [:pointer], :pointer
   attach_function :weaveffi_kitchen_Item_get_priority, [:pointer], :int32
+  # Fires when an item is ready
+  callback :weaveffi_kitchen_OnReady_fn, [:int32, :string, :pointer], :void
+  attach_function :weaveffi_kitchen_register_ready_listener, [:weaveffi_kitchen_OnReady_fn, :pointer], :uint64
+  attach_function :weaveffi_kitchen_unregister_ready_listener, [:uint64], :void
   # Identity for bool
   attach_function :weaveffi_kitchen_bool_id, [:int32, :pointer], :int32
   attach_function :weaveffi_kitchen_i32_id, [:int32, :pointer], :int32
@@ -167,9 +177,17 @@ module WeaveFFI
   # Map return type
   attach_function :weaveffi_kitchen_get_attrs, [:pointer, :pointer, :pointer, :pointer], :void
   # Iterator return type
-  attach_function :weaveffi_kitchen_stream_items, [:pointer, :pointer], :pointer
+  attach_function :weaveffi_kitchen_stream_items, [:pointer], :pointer
+  attach_function :weaveffi_kitchen_StreamItemsIterator_next, [:pointer, :pointer, :pointer], :int32
+  attach_function :weaveffi_kitchen_StreamItemsIterator_destroy, [:pointer], :void
   # Returns the shared Token type from another module
   attach_function :weaveffi_kitchen_cross_module_token, [:pointer], :pointer
+  # Async operation
+  callback :weaveffi_kitchen_do_async_callback, [:pointer, :pointer, :pointer], :void
+  attach_function :weaveffi_kitchen_do_async_async, [:string, :weaveffi_kitchen_do_async_callback, :pointer], :void
+  # Cancellable async operation
+  callback :weaveffi_kitchen_do_cancellable_callback, [:pointer, :pointer, :pointer], :void
+  attach_function :weaveffi_kitchen_do_cancellable_async, [:string, :pointer, :weaveffi_kitchen_do_cancellable_callback, :pointer], :void
   # Legacy operation kept for compatibility
   attach_function :weaveffi_kitchen_legacy_op, [:pointer], :int32
   # Replacement for legacy_op
@@ -289,18 +307,18 @@ module WeaveFFI
   # Kitchen sink struct exercising every field feature
   class ItemBuilder
     def initialize
-      @id = nil
-      @name = nil
-      @count = nil
-      @enabled = nil
-      @ratio = nil
-      @nick = nil
-      @payload = nil
-      @tags = nil
-      @attrs = nil
+      @id = 0
+      @name = ""
+      @count = 0
+      @enabled = false
+      @ratio = 0.0
+      @nick = 0
+      @payload = "".b
+      @tags = []
+      @attrs = {}
       @parent = nil
       @token = nil
-      @priority = nil
+      @priority = 0
     end
 
     # Stable identifier
@@ -370,20 +388,57 @@ module WeaveFFI
     end
 
     def build
-      raise "missing field: id" if @id.nil?
-      raise "missing field: name" if @name.nil?
-      raise "missing field: count" if @count.nil?
-      raise "missing field: enabled" if @enabled.nil?
-      raise "missing field: ratio" if @ratio.nil?
-      raise "missing field: nick" if @nick.nil?
-      raise "missing field: payload" if @payload.nil?
-      raise "missing field: tags" if @tags.nil?
-      raise "missing field: attrs" if @attrs.nil?
-      raise "missing field: parent" if @parent.nil?
-      raise "missing field: token" if @token.nil?
-      raise "missing field: priority" if @priority.nil?
-      raise NotImplementedError, "ItemBuilder.build requires FFI backing"
+      err = WeaveFFI::ErrorStruct.new
+      id = @id
+      name = @name
+      count = @count
+      enabled = @enabled
+      enabled_c = enabled ? 1 : 0
+      ratio = @ratio
+      nick = @nick
+      payload = @payload
+      payload_buf = FFI::MemoryPointer.new(:uint8, payload.bytesize)
+      payload_buf.put_bytes(0, payload)
+      tags = @tags
+      tags_buf = FFI::MemoryPointer.new(:pointer, tags.length)
+      tags_ptrs = tags.map { |s| FFI::MemoryPointer.from_string(s) }
+      tags_buf.write_array_of_pointer(tags_ptrs)
+      attrs = @attrs
+      attrs_k = attrs.keys
+      attrs_v = attrs.values
+      attrs_keys_buf = FFI::MemoryPointer.new(:pointer, attrs_k.length)
+      attrs_vals_buf = FFI::MemoryPointer.new(:pointer, attrs_v.length)
+      attrs_keys_ptrs = attrs_k.map { |s| FFI::MemoryPointer.from_string(s) }
+      attrs_keys_buf.write_array_of_pointer(attrs_keys_ptrs)
+      attrs_vals_ptrs = attrs_v.map { |s| FFI::MemoryPointer.from_string(s) }
+      attrs_vals_buf.write_array_of_pointer(attrs_vals_ptrs)
+      parent = @parent
+      parent_c = parent.nil? ? FFI::Pointer::NULL : begin; p = FFI::MemoryPointer.new(:int64); p.write_int64(parent); p; end
+      token = @token
+      priority = @priority
+      result = WeaveFFI.weaveffi_kitchen_Item_create(id, name, count, enabled_c, ratio, nick, payload_buf, payload.bytesize, tags_buf, tags.length, attrs_keys_buf, attrs_vals_buf, attrs.length, parent_c, token.handle, priority, err)
+      WeaveFFI.check_error!(err)
+      Item.new(result)
     end
+  end
+
+  # Subscribe to OnReady events
+  # Registers a OnReady listener block. Returns a subscription id for
+  # unregister_ready_listener.
+  def self.register_ready_listener(&block)
+    trampoline = FFI::Function.new(:void, [:int32, :string, :pointer]) do |code, msg, _context|
+      block.call(code, msg)
+    end
+    listener_id = weaveffi_kitchen_register_ready_listener(trampoline, FFI::Pointer::NULL)
+    @listener_refs[listener_id] = trampoline
+    listener_id
+  end
+
+  # Unregisters a listener previously registered with register_ready_listener.
+  def self.unregister_ready_listener(listener_id)
+    weaveffi_kitchen_unregister_ready_listener(listener_id)
+    @listener_refs.delete(listener_id)
+    nil
   end
 
   # Identity for bool
@@ -528,12 +583,24 @@ module WeaveFFI
   # Iterator return type
   def self.stream_items()
     err = ErrorStruct.new
-    out_len = FFI::MemoryPointer.new(:size_t)
-    result = weaveffi_kitchen_stream_items(out_len, err)
+    iter = weaveffi_kitchen_stream_items(err)
     check_error!(err)
-    return [] if result.null?
-    len = out_len.read(:size_t)
-    result.read_array_of_pointer(len).map { |p| Item.new(p) }
+    items = []
+    return items if iter.null?
+    loop do
+      out_item = FFI::MemoryPointer.new(:pointer)
+      item_err = ErrorStruct.new
+      has_item = weaveffi_kitchen_StreamItemsIterator_next(iter, out_item, item_err)
+      if item_err[:code] != 0
+        weaveffi_kitchen_StreamItemsIterator_destroy(iter)
+        check_error!(item_err)
+      end
+      break if has_item.zero?
+      item_ptr = out_item.read_pointer
+      items << Item.new(item_ptr) unless item_ptr.null?
+    end
+    weaveffi_kitchen_StreamItemsIterator_destroy(iter)
+    items
   end
 
   # Returns the shared Token type from another module
@@ -543,6 +610,60 @@ module WeaveFFI
     check_error!(err)
     raise Error.new(-1, 'null pointer') if result.null?
     Token.new(result)
+  end
+
+  # Async operation
+  # Blocks until the async producer completes.
+  def self.do_async(input)
+    queue = Queue.new
+    callback = FFI::Function.new(:void, [:pointer, :pointer, :pointer]) do |_context, err_ptr, result|
+      err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
+      if err && err[:code] != 0
+        code = err[:code]
+        msg = err[:message].null? ? '' : err[:message].read_string
+        weaveffi_error_clear(err_ptr)
+        queue << Error.new(code, msg)
+      else
+        if result.null?
+          queue << ''
+        else
+          s = result.read_string
+          weaveffi_free_string(result)
+          queue << s
+        end
+      end
+    end
+    weaveffi_kitchen_do_async_async(input, callback, FFI::Pointer::NULL)
+    value = queue.pop
+    raise value if value.is_a?(Error)
+    value
+  end
+
+  # Cancellable async operation
+  # Blocks until the async producer completes (cancellation token not exposed; pass-through is NULL).
+  def self.do_cancellable(input)
+    queue = Queue.new
+    callback = FFI::Function.new(:void, [:pointer, :pointer, :pointer]) do |_context, err_ptr, result|
+      err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
+      if err && err[:code] != 0
+        code = err[:code]
+        msg = err[:message].null? ? '' : err[:message].read_string
+        weaveffi_error_clear(err_ptr)
+        queue << Error.new(code, msg)
+      else
+        if result.null?
+          queue << ''
+        else
+          s = result.read_string
+          weaveffi_free_string(result)
+          queue << s
+        end
+      end
+    end
+    weaveffi_kitchen_do_cancellable_async(input, FFI::Pointer::NULL, callback, FFI::Pointer::NULL)
+    value = queue.pop
+    raise value if value.is_a?(Error)
+    value
   end
 
   # Legacy operation kept for compatibility

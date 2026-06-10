@@ -56,6 +56,11 @@ module WeaveFFI
     raise Error.new(code, msg)
   end
 
+  # Registered listener trampolines, keyed by subscription id. Holding the
+  # FFI::Function objects here keeps them alive until unregistered; without
+  # this the GC could collect a trampoline the producer still calls.
+  @listener_refs = {}
+
   # === Module: kv ===
 
   # Persistence semantics applied to a stored entry
@@ -73,6 +78,7 @@ module WeaveFFI
   attach_function :weaveffi_kv_Store_get_id, [:pointer], :int64
 
   attach_function :weaveffi_kv_Entry_destroy, [:pointer], :void
+  attach_function :weaveffi_kv_Entry_create, [:int64, :string, :pointer, :size_t, :int64, :pointer, :pointer, :size_t, :pointer, :pointer, :size_t, :pointer], :pointer
   # Stable monotonic identifier assigned on insert
   attach_function :weaveffi_kv_Entry_get_id, [:pointer], :int64
   # UTF-8 lookup key
@@ -87,6 +93,10 @@ module WeaveFFI
   attach_function :weaveffi_kv_Entry_get_tags, [:pointer, :pointer], :pointer
   # Arbitrary string-valued metadata pairs
   attach_function :weaveffi_kv_Entry_get_metadata, [:pointer, :pointer, :pointer, :pointer], :void
+  # Fires when an entry is evicted from the store
+  callback :weaveffi_kv_OnEvict_fn, [:string, :pointer], :void
+  attach_function :weaveffi_kv_register_eviction_listener, [:weaveffi_kv_OnEvict_fn, :pointer], :uint64
+  attach_function :weaveffi_kv_unregister_eviction_listener, [:uint64], :void
   # Open (or create) a store backed by the given filesystem path
   attach_function :weaveffi_kv_open_store, [:string, :pointer], :pointer
   # Close the store and release all in-memory resources
@@ -98,11 +108,16 @@ module WeaveFFI
   # Remove the entry for the given key, returning true if it existed
   attach_function :weaveffi_kv_delete, [:pointer, :string, :pointer], :int32
   # Stream every key, optionally filtered by a prefix
-  attach_function :weaveffi_kv_list_keys, [:pointer, :string, :pointer, :pointer], :pointer
+  attach_function :weaveffi_kv_list_keys, [:pointer, :string, :pointer], :pointer
+  attach_function :weaveffi_kv_ListKeysIterator_next, [:pointer, :pointer, :pointer], :int32
+  attach_function :weaveffi_kv_ListKeysIterator_destroy, [:pointer], :void
   # Return the number of live entries in the store
   attach_function :weaveffi_kv_count, [:pointer, :pointer], :int64
   # Drop every entry from the store
   attach_function :weaveffi_kv_clear, [:pointer, :pointer], :void
+  # Reclaim space asynchronously; returns the number of bytes reclaimed
+  callback :weaveffi_kv_compact_async_callback, [:pointer, :pointer, :int64], :void
+  attach_function :weaveffi_kv_compact_async_async, [:pointer, :pointer, :weaveffi_kv_compact_async_callback, :pointer], :void
   # Legacy single-shot put kept for compatibility
   attach_function :weaveffi_kv_legacy_put, [:pointer, :string, :pointer, :size_t, :pointer], :int32
 
@@ -226,13 +241,13 @@ module WeaveFFI
   # A single key-value entry persisted in the store
   class EntryBuilder
     def initialize
-      @id = nil
-      @key = nil
-      @value = nil
-      @created_at = nil
+      @id = 0
+      @key = ""
+      @value = "".b
+      @created_at = 0
       @expires_at = nil
-      @tags = nil
-      @metadata = nil
+      @tags = []
+      @metadata = {}
     end
 
     # Stable monotonic identifier assigned on insert
@@ -278,15 +293,51 @@ module WeaveFFI
     end
 
     def build
-      raise "missing field: id" if @id.nil?
-      raise "missing field: key" if @key.nil?
-      raise "missing field: value" if @value.nil?
-      raise "missing field: created_at" if @created_at.nil?
-      raise "missing field: expires_at" if @expires_at.nil?
-      raise "missing field: tags" if @tags.nil?
-      raise "missing field: metadata" if @metadata.nil?
-      raise NotImplementedError, "EntryBuilder.build requires FFI backing"
+      err = WeaveFFI::ErrorStruct.new
+      id = @id
+      key = @key
+      value = @value
+      value_buf = FFI::MemoryPointer.new(:uint8, value.bytesize)
+      value_buf.put_bytes(0, value)
+      created_at = @created_at
+      expires_at = @expires_at
+      expires_at_c = expires_at.nil? ? FFI::Pointer::NULL : begin; p = FFI::MemoryPointer.new(:int64); p.write_int64(expires_at); p; end
+      tags = @tags
+      tags_buf = FFI::MemoryPointer.new(:pointer, tags.length)
+      tags_ptrs = tags.map { |s| FFI::MemoryPointer.from_string(s) }
+      tags_buf.write_array_of_pointer(tags_ptrs)
+      metadata = @metadata
+      metadata_k = metadata.keys
+      metadata_v = metadata.values
+      metadata_keys_buf = FFI::MemoryPointer.new(:pointer, metadata_k.length)
+      metadata_vals_buf = FFI::MemoryPointer.new(:pointer, metadata_v.length)
+      metadata_keys_ptrs = metadata_k.map { |s| FFI::MemoryPointer.from_string(s) }
+      metadata_keys_buf.write_array_of_pointer(metadata_keys_ptrs)
+      metadata_vals_ptrs = metadata_v.map { |s| FFI::MemoryPointer.from_string(s) }
+      metadata_vals_buf.write_array_of_pointer(metadata_vals_ptrs)
+      result = WeaveFFI.weaveffi_kv_Entry_create(id, key, value_buf, value.bytesize, created_at, expires_at_c, tags_buf, tags.length, metadata_keys_buf, metadata_vals_buf, metadata.length, err)
+      WeaveFFI.check_error!(err)
+      Entry.new(result)
     end
+  end
+
+  # Subscribe to per-key eviction notifications
+  # Registers a OnEvict listener block. Returns a subscription id for
+  # unregister_eviction_listener.
+  def self.register_eviction_listener(&block)
+    trampoline = FFI::Function.new(:void, [:string, :pointer]) do |key, _context|
+      block.call(key)
+    end
+    listener_id = weaveffi_kv_register_eviction_listener(trampoline, FFI::Pointer::NULL)
+    @listener_refs[listener_id] = trampoline
+    listener_id
+  end
+
+  # Unregisters a listener previously registered with register_eviction_listener.
+  def self.unregister_eviction_listener(listener_id)
+    weaveffi_kv_unregister_eviction_listener(listener_id)
+    @listener_refs.delete(listener_id)
+    nil
   end
 
   # Open (or create) a store backed by the given filesystem path
@@ -336,12 +387,29 @@ module WeaveFFI
   # Stream every key, optionally filtered by a prefix
   def self.list_keys(store, prefix)
     err = ErrorStruct.new
-    out_len = FFI::MemoryPointer.new(:size_t)
-    result = weaveffi_kv_list_keys(store.handle, prefix, out_len, err)
+    iter = weaveffi_kv_list_keys(store.handle, prefix, err)
     check_error!(err)
-    return [] if result.null?
-    len = out_len.read(:size_t)
-    result.read_array_of_pointer(len).map { |p| p.null? ? '' : p.read_string }
+    items = []
+    return items if iter.null?
+    loop do
+      out_item = FFI::MemoryPointer.new(:pointer)
+      item_err = ErrorStruct.new
+      has_item = weaveffi_kv_ListKeysIterator_next(iter, out_item, item_err)
+      if item_err[:code] != 0
+        weaveffi_kv_ListKeysIterator_destroy(iter)
+        check_error!(item_err)
+      end
+      break if has_item.zero?
+      item_ptr = out_item.read_pointer
+      if item_ptr.null?
+        items << ''
+      else
+        items << item_ptr.read_string
+        weaveffi_free_string(item_ptr)
+      end
+    end
+    weaveffi_kv_ListKeysIterator_destroy(iter)
+    items
   end
 
   # Return the number of live entries in the store
@@ -357,6 +425,27 @@ module WeaveFFI
     err = ErrorStruct.new
     weaveffi_kv_clear(store.handle, err)
     check_error!(err)
+  end
+
+  # Reclaim space asynchronously; returns the number of bytes reclaimed
+  # Blocks until the async producer completes (cancellation token not exposed; pass-through is NULL).
+  def self.compact_async(store)
+    queue = Queue.new
+    callback = FFI::Function.new(:void, [:pointer, :pointer, :int64]) do |_context, err_ptr, result|
+      err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
+      if err && err[:code] != 0
+        code = err[:code]
+        msg = err[:message].null? ? '' : err[:message].read_string
+        weaveffi_error_clear(err_ptr)
+        queue << Error.new(code, msg)
+      else
+        queue << result
+      end
+    end
+    weaveffi_kv_compact_async_async(store.handle, FFI::Pointer::NULL, callback, FFI::Pointer::NULL)
+    value = queue.pop
+    raise value if value.is_a?(Error)
+    value
   end
 
   # Legacy single-shot put kept for compatibility

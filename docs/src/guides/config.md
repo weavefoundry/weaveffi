@@ -167,6 +167,7 @@ the keys are identical.
 | `[node]`    | `package_name`         | string | `"weaveffi"`       | npm package name in the Node.js loader                                      |
 | `[node]`    | `strip_module_prefix`  | bool   | `false`            | Strip the IR module prefix from emitted JS/TS symbols                       |
 | `[wasm]`    | `module_name`          | string | `"weaveffi_wasm"`  | Module name in the WASM JS loader                                           |
+| `[wasm]`    | `allow_unsupported`    | bool   | `false`            | Generate anyway when the IDL uses features WASM cannot deliver (callbacks, listeners); unsupported entry points become explicit throwing stubs |
 | `[c]`       | `prefix`               | string | `"weaveffi"`       | Prefix prepended to every C ABI symbol (`{prefix}_{module}_{function}`)     |
 | `[cpp]`     | `namespace`            | string | `"weaveffi"`       | C++ namespace for the wrapper                                               |
 | `[cpp]`     | `header_name`          | string | `"weaveffi.hpp"`   | Header file name for the C++ output                                         |

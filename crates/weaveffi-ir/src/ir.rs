@@ -6,18 +6,17 @@ use serde::{Deserialize, Serialize};
 /// The current IR schema version that the parser, validator, and every
 /// generator expect.
 ///
-/// Schema bumps are tied to this crate's minor version: each minor release
-/// of `weaveffi-ir` may introduce at most one new schema version, and
-/// [`SUPPORTED_VERSIONS`] always lists every version the upgrader can
-/// read. The CLI's `weaveffi upgrade` subcommand guarantees an N-1 → N
-/// migration path between consecutive versions.
+/// Pre-1.0 there is exactly one supported schema version: the current one.
+/// Older schema revisions (0.1.0, 0.2.0) are not accepted and have no
+/// automated migration path — update the `version` field and adjust the
+/// document to the current schema by hand. Post-1.0, schema bumps will ship
+/// with a migration tool and [`SUPPORTED_VERSIONS`] will widen accordingly.
 ///
 /// See [`docs/src/stability.md`](https://github.com/weavefoundry/weaveffi/blob/main/docs/src/stability.md)
-/// for the full schema-migration policy and the surfaces covered by
-/// SemVer.
+/// for the full schema policy and the surfaces covered by SemVer.
 pub const CURRENT_SCHEMA_VERSION: &str = "0.3.0";
 
-pub const SUPPORTED_VERSIONS: &[&str] = &["0.1.0", "0.2.0", "0.3.0"];
+pub const SUPPORTED_VERSIONS: &[&str] = &[CURRENT_SCHEMA_VERSION];
 
 /// `skip_serializing_if` predicate for `bool` fields that default to `false`.
 /// Keeps the canonical IDL emitted by `weaveffi format`/`extract` minimal by
@@ -351,7 +350,7 @@ mod tests {
     #[test]
     fn struct_def_round_trip_yaml() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: geometry
     functions: []
@@ -382,7 +381,7 @@ modules:
     #[test]
     fn struct_def_round_trip_json() {
         let json = r#"{
-            "version": "0.1.0",
+            "version": "0.3.0",
             "modules": [{
                 "name": "geo",
                 "functions": [],
@@ -405,7 +404,7 @@ modules:
     #[test]
     fn structs_default_to_empty() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: math
     functions: []
@@ -517,7 +516,7 @@ modules: []
     #[test]
     fn enum_def_round_trip_yaml() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: graphics
     functions: []
@@ -553,7 +552,7 @@ modules:
     #[test]
     fn enum_def_round_trip_json() {
         let json = r#"{
-            "version": "0.1.0",
+            "version": "0.3.0",
             "modules": [{
                 "name": "status",
                 "functions": [],
@@ -577,7 +576,7 @@ modules:
     #[test]
     fn enums_default_to_empty() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: math
     functions: []
@@ -781,7 +780,7 @@ modules:
     #[test]
     fn typeref_optional_yaml_deser() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: contacts
     functions:
@@ -804,7 +803,7 @@ modules:
     #[test]
     fn typeref_list_yaml_deser() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: contacts
     functions:
@@ -897,7 +896,7 @@ modules:
     #[test]
     fn typeref_map_yaml_deser() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: contacts
     functions:
@@ -1046,7 +1045,7 @@ modules:
     #[test]
     fn typeref_borrowed_yaml_deser() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: io
     functions:
@@ -1075,7 +1074,7 @@ modules:
     #[test]
     fn generators_field_parses_from_yaml() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: math
     functions: []
@@ -1096,7 +1095,7 @@ generators:
     #[test]
     fn generators_defaults_to_none() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: math
     functions: []
@@ -1117,7 +1116,7 @@ modules:
     #[test]
     fn callback_def_round_trip_yaml() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: events
     functions: []
@@ -1142,7 +1141,7 @@ modules:
     #[test]
     fn listener_def_round_trip_yaml() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: events
     functions: []
@@ -1166,7 +1165,7 @@ modules:
     #[test]
     fn callbacks_and_listeners_default_to_empty() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: math
     functions: []
@@ -1208,7 +1207,7 @@ modules:
     #[test]
     fn builder_defaults_to_false() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: contacts
     functions: []
@@ -1225,7 +1224,7 @@ modules:
     #[test]
     fn builder_true_round_trip() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: contacts
     functions: []
@@ -1247,7 +1246,7 @@ modules:
     #[test]
     fn builder_false_explicit() {
         let json = r#"{
-            "version": "0.1.0",
+            "version": "0.3.0",
             "modules": [{
                 "name": "geo",
                 "functions": [],
@@ -1265,7 +1264,7 @@ modules:
     #[test]
     fn param_mutable_defaults_to_false() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: io
     functions:
@@ -1281,7 +1280,7 @@ modules:
     #[test]
     fn param_mutable_true_round_trip() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: io
     functions:
@@ -1302,7 +1301,7 @@ modules:
     #[test]
     fn param_mutable_false_explicit() {
         let json = r#"{
-            "version": "0.1.0",
+            "version": "0.3.0",
             "modules": [{
                 "name": "io",
                 "functions": [{
@@ -1318,7 +1317,7 @@ modules:
     #[test]
     fn deprecated_and_since_default_to_none() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: math
     functions:
@@ -1334,7 +1333,7 @@ modules:
     #[test]
     fn deprecated_and_since_round_trip() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: math
     functions:
@@ -1358,7 +1357,7 @@ modules:
     #[test]
     fn struct_field_default_value_round_trip() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: contacts
     functions: []

@@ -19,6 +19,9 @@ class WeaveFFI {
          * Trivial cross-module helper
          */
         @JvmStatic external fun shared_ping(): String
+        /** Subscribe to OnReady events */
+        @JvmStatic external fun kitchen_register_ready_listener(callback: (Int, String) -> Unit): Long
+        @JvmStatic external fun kitchen_unregister_ready_listener(id: Long)
         /**
          * Identity for bool
          */
@@ -49,7 +52,8 @@ class WeaveFFI {
         /**
          * Optional struct return
          */
-        @JvmStatic external fun kitchen_maybe_item(id: Long): Long?
+        @JvmStatic private external fun kitchen_maybe_itemJni(id: Long): Long?
+        @JvmStatic fun kitchen_maybe_item(id: Long): Item? = kitchen_maybe_itemJni(id)?.let { Item(it) }
         /**
          * List of structs
          */
@@ -65,7 +69,8 @@ class WeaveFFI {
         /**
          * Returns the shared Token type from another module
          */
-        @JvmStatic external fun kitchen_cross_module_token(): Long
+        @JvmStatic private external fun kitchen_cross_module_tokenJni(): Long
+        @JvmStatic fun kitchen_cross_module_token(): Token = Token(kitchen_cross_module_tokenJni())
         /**
          * Async operation
          */

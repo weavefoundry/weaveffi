@@ -8,12 +8,16 @@
 use camino::Utf8Path;
 use heck::{ToShoutySnakeCase, ToSnakeCase};
 use serde::{Deserialize, Serialize};
-use weaveffi_core::abi::{self, CType};
+use weaveffi_core::abi::{self, AbiParam, CType};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
+use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, is_c_pointer_type, DocCommentStyle,
 };
-use weaveffi_core::model::{BindingModel, EnumBinding, FieldBinding, FnBinding, StructBinding};
+use weaveffi_core::model::{
+    AsyncBinding, BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
+    IteratorBinding, ListenerBinding, ModuleBinding, StructBinding,
+};
 use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::utils::{local_type_name, render_prelude, render_trailer, CommentStyle};
 use weaveffi_ir::ir::{Api, TypeRef};
@@ -60,6 +64,10 @@ impl LanguageBackend for RubyGenerator {
 
     fn name(&self) -> &'static str {
         "ruby"
+    }
+
+    fn capabilities(&self) -> TargetCapabilities {
+        TargetCapabilities::full()
     }
 
     fn prefix<'a>(&self, config: &'a Self::Config) -> &'a str {
@@ -132,25 +140,11 @@ fn rb_ffi_type(ty: &CType, string_as_pointer: bool) -> &'static str {
     }
 }
 
-fn rb_param_ffi_types(ty: &TypeRef) -> Vec<&'static str> {
-    abi::lower_param("_", ty, "", false)
-        .iter()
-        .map(|p| rb_ffi_type(&p.ty, false))
-        .collect()
-}
-
 fn rb_return_ffi_type(ty: &TypeRef) -> &'static str {
-    // Iterator constructors return the opaque handle; `_next` is emitted apart.
-    if matches!(ty, TypeRef::Iterator(_)) {
-        return ":pointer";
-    }
     rb_ffi_type(&abi::lower_return(ty, "").ret, true)
 }
 
 fn rb_return_out_params(ty: &TypeRef) -> Vec<&'static str> {
-    if matches!(ty, TypeRef::Iterator(_)) {
-        return vec![":pointer"];
-    }
     abi::lower_return(ty, "")
         .out_params
         .iter()
@@ -292,7 +286,8 @@ fn render_ruby_module(
 ) -> String {
     let model = BindingModel::build(api, prefix);
     let mut out = render_prelude(CommentStyle::Hash, input_basename);
-    render_preamble(&mut out, module_name);
+    let has_listeners = model.modules.iter().any(|m| !m.listeners.is_empty());
+    render_preamble(&mut out, module_name, has_listeners);
     for m in &model.modules {
         out.push_str(&format!("\n  # === Module: {} ===\n", m.path));
         for e in &m.enums {
@@ -301,21 +296,26 @@ fn render_ruby_module(
         for s in &m.structs {
             render_struct_ffi(&mut out, s);
         }
+        for c in &m.callbacks {
+            render_callback_decl(&mut out, c);
+        }
+        for l in &m.listeners {
+            render_listener_ffi(&mut out, l);
+        }
         for f in &m.functions {
-            if !f.is_async {
-                render_attach_function(&mut out, f);
-            }
+            render_attach_function(&mut out, f);
         }
         for s in &m.structs {
             render_struct_class(&mut out, s, module_name);
             if s.builder.is_some() {
-                render_ruby_builder_class(&mut out, s);
+                render_ruby_builder_class(&mut out, s, module_name);
             }
         }
+        for l in &m.listeners {
+            render_listener_wrapper(&mut out, m, l);
+        }
         for f in &m.functions {
-            if !f.is_async {
-                render_function_wrapper(&mut out, f);
-            }
+            render_function_wrapper(&mut out, f);
         }
     }
     out.push_str("end\n\n");
@@ -323,7 +323,7 @@ fn render_ruby_module(
     out
 }
 
-fn render_preamble(out: &mut String, module_name: &str) {
+fn render_preamble(out: &mut String, module_name: &str, has_listeners: bool) {
     out.push_str(&format!(
         "# frozen_string_literal: true
 # {module_name} Ruby FFI bindings (auto-generated)
@@ -377,6 +377,16 @@ module {module_name}
   end
 "
     ));
+    if has_listeners {
+        out.push_str(
+            "
+  # Registered listener trampolines, keyed by subscription id. Holding the
+  # FFI::Function objects here keeps them alive until unregistered; without
+  # this the GC could collect a trampoline the producer still calls.
+  @listener_refs = {}
+",
+        );
+    }
 }
 
 fn render_enum(out: &mut String, e: &EnumBinding) {
@@ -400,6 +410,14 @@ fn render_struct_ffi(out: &mut String, s: &StructBinding) {
         "  attach_function :{}, [:pointer], :void\n",
         s.destroy_symbol
     ));
+    // The builder's `build` calls the C `create`; only attach it when needed.
+    if s.builder.is_some() {
+        out.push_str(&format!(
+            "  attach_function :{}, [{}], :pointer\n",
+            s.create.symbol,
+            rb_abi_types(&s.create.params, false).join(", ")
+        ));
+    }
     for field in &s.fields {
         let getter = &field.getter_symbol;
         let mut argtypes = vec![":pointer".to_string()];
@@ -417,26 +435,94 @@ fn render_struct_ffi(out: &mut String, s: &StructBinding) {
     }
 }
 
-fn render_attach_function(out: &mut String, f: &FnBinding) {
-    let c_sym = &f.c_base;
-    let mut argtypes: Vec<String> = Vec::new();
-    for p in &f.params {
-        argtypes.extend(rb_param_ffi_types(&p.ty).iter().map(|s| s.to_string()));
-    }
-    if let Some(ret_ty) = &f.ret {
-        argtypes.extend(rb_return_out_params(ret_ty).iter().map(|s| s.to_string()));
-    }
-    argtypes.push(":pointer".into());
-    let restype = f
-        .ret
-        .as_ref()
-        .map(|ty| rb_return_ffi_type(ty))
-        .unwrap_or(":void");
-    emit_doc(out, &f.doc, "  ");
+/// Map lowered ABI slots onto Ruby FFI type tokens. `string_as_pointer`
+/// applies to top-level `char*` slots (owned returns stay `:pointer` so the
+/// wrapper can free them; borrowed inputs use `:string` auto-marshalling).
+fn rb_abi_types(params: &[AbiParam], string_as_pointer: bool) -> Vec<String> {
+    params
+        .iter()
+        .map(|p| rb_ffi_type(&p.ty, string_as_pointer).to_string())
+        .collect()
+}
+
+/// `callback :{c_fn_type}, [...], :void` declaration for a module callback.
+/// Listener `attach_function`s reference the type by this symbol. Borrowed
+/// string params use `:string` so the ffi gem hands the block a Ruby String.
+fn render_callback_decl(out: &mut String, c: &CallbackBinding) {
+    emit_doc(out, &c.doc, "  ");
     out.push_str(&format!(
-        "  attach_function :{c_sym}, [{}], {restype}\n",
-        argtypes.join(", ")
+        "  callback :{}, [{}], :void\n",
+        c.c_fn_type,
+        rb_abi_types(&c.abi_params, false).join(", ")
     ));
+}
+
+fn render_listener_ffi(out: &mut String, l: &ListenerBinding) {
+    out.push_str(&format!(
+        "  attach_function :{}, [:{}, :pointer], :uint64\n",
+        l.register_symbol, l.callback_c_fn_type
+    ));
+    out.push_str(&format!(
+        "  attach_function :{}, [:uint64], :void\n",
+        l.unregister_symbol
+    ));
+}
+
+fn render_attach_function(out: &mut String, f: &FnBinding) {
+    emit_doc(out, &f.doc, "  ");
+    match &f.shape {
+        CallShape::Sync(abi) => {
+            out.push_str(&format!(
+                "  attach_function :{}, [{}], {}\n",
+                abi.symbol,
+                rb_abi_types(&abi.params, false).join(", "),
+                rb_ffi_type(&abi.ret, true)
+            ));
+        }
+        CallShape::Async(a) => {
+            // Completion callback: result strings/bytes stay `:pointer`
+            // (the wrapper owns and frees them); the launcher takes the
+            // declared callback type plus the opaque context.
+            out.push_str(&format!(
+                "  callback :{}, [{}], :void\n",
+                a.callback_type,
+                rb_abi_types(&a.callback_params, true).join(", ")
+            ));
+            let argtypes: Vec<String> = a
+                .launch
+                .params
+                .iter()
+                .map(|p| match &p.ty {
+                    // The `callback` slot is lowered as a Named C type; bind
+                    // it to the callback symbol declared above.
+                    CType::Named(_) => format!(":{}", a.callback_type),
+                    ty => rb_ffi_type(ty, false).to_string(),
+                })
+                .collect();
+            out.push_str(&format!(
+                "  attach_function :{}, [{}], :void\n",
+                a.launch.symbol,
+                argtypes.join(", ")
+            ));
+        }
+        CallShape::Iterator(it) => {
+            out.push_str(&format!(
+                "  attach_function :{}, [{}], :pointer\n",
+                it.launch.symbol,
+                rb_abi_types(&it.launch.params, false).join(", ")
+            ));
+            out.push_str(&format!(
+                "  attach_function :{}, [{}], :int32\n",
+                it.next.symbol,
+                // Every `next` slot is a pointer (iter, out_item, out lens, err).
+                rb_abi_types(&it.next.params, true).join(", ")
+            ));
+            out.push_str(&format!(
+                "  attach_function :{}, [:pointer], :void\n",
+                it.destroy_symbol
+            ));
+        }
+    }
 }
 
 fn render_struct_class(out: &mut String, s: &StructBinding, rb_module_name: &str) {
@@ -466,14 +552,22 @@ fn render_struct_class(out: &mut String, s: &StructBinding, rb_module_name: &str
     out.push_str("  end\n");
 }
 
-fn render_ruby_builder_class(out: &mut String, s: &StructBinding) {
+fn render_ruby_builder_class(out: &mut String, s: &StructBinding, rb_module_name: &str) {
     let builder = format!("{}Builder", s.name);
+    let ind = "      ";
     out.push('\n');
     emit_doc(out, &s.doc, "  ");
     out.push_str(&format!("  class {builder}\n"));
     out.push_str("    def initialize\n");
+    // Zero-value defaults (the same contract as the other backends): scalars
+    // start at 0/false/""/"".b, collections empty, optionals absent. Unset
+    // fields therefore lower to valid C arguments instead of raising.
     for field in &s.fields {
-        out.push_str(&format!("      @{} = nil\n", field.name));
+        out.push_str(&format!(
+            "      @{} = {}\n",
+            field.name,
+            rb_field_default(&field.ty)
+        ));
     }
     out.push_str("    end\n\n");
 
@@ -485,18 +579,44 @@ fn render_ruby_builder_class(out: &mut String, s: &StructBinding) {
         ));
     }
 
+    // Build: marshal every field into the struct's C `create` call with the
+    // same lowering used for function parameters, then wrap the handle.
     out.push_str("    def build\n");
+    out.push_str(&format!("{ind}err = {rb_module_name}::ErrorStruct.new\n"));
     for field in &s.fields {
-        out.push_str(&format!(
-            "      raise \"missing field: {}\" if @{}.nil?\n",
-            field.name, field.name
-        ));
+        out.push_str(&format!("{ind}{} = @{}\n", field.name, field.name));
+        render_param_conversion(out, &field.name, &field.ty, ind);
     }
+    let mut call_args: Vec<String> = Vec::new();
+    for field in &s.fields {
+        call_args.extend(rb_call_args(&field.name, &field.ty));
+    }
+    call_args.push("err".into());
     out.push_str(&format!(
-        "      raise NotImplementedError, \"{builder}.build requires FFI backing\"\n"
+        "{ind}result = {rb_module_name}.{}({})\n",
+        s.create.symbol,
+        call_args.join(", ")
     ));
+    out.push_str(&format!("{ind}{rb_module_name}.check_error!(err)\n"));
+    out.push_str(&format!("{ind}{}.new(result)\n", s.name));
     out.push_str("    end\n");
     out.push_str("  end\n");
+}
+
+/// The zero-value default for one Ruby builder slot.
+fn rb_field_default(ty: &TypeRef) -> &'static str {
+    match ty {
+        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::Enum(_) => "0",
+        TypeRef::F64 => "0.0",
+        TypeRef::Bool => "false",
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "\"\"",
+        TypeRef::Bytes | TypeRef::BorrowedBytes => "\"\".b",
+        TypeRef::List(_) => "[]",
+        TypeRef::Map(_, _) => "{}",
+        // Optionals are absent by default; struct/handle fields have no
+        // synthesizable zero value, so the with_ setter is the only path.
+        _ => "nil",
+    }
 }
 
 fn render_getter(out: &mut String, field: &FieldBinding, rb_module_name: &str) {
@@ -541,6 +661,139 @@ fn render_getter(out: &mut String, field: &FieldBinding, rb_module_name: &str) {
 }
 
 fn render_function_wrapper(out: &mut String, f: &FnBinding) {
+    match &f.shape {
+        CallShape::Sync(_) => render_sync_function_wrapper(out, f),
+        CallShape::Async(a) => render_async_function_wrapper(out, f, a),
+        CallShape::Iterator(it) => render_iterator_function_wrapper(out, f, it),
+    }
+}
+
+/// Idiomatic register/unregister pair for one listener. The user passes a
+/// block; the trampoline converts each C argument and the `FFI::Function` is
+/// pinned in `@listener_refs` until unregistered.
+fn render_listener_wrapper(out: &mut String, module: &ModuleBinding, l: &ListenerBinding) {
+    let Some(cb) = module.callbacks.iter().find(|c| c.name == l.event_callback) else {
+        unreachable!("listener '{}' references unknown callback", l.name);
+    };
+    let register_name = format!("register_{}", l.name.to_snake_case());
+    let unregister_name = format!("unregister_{}", l.name.to_snake_case());
+    let ind = "    ";
+
+    out.push('\n');
+    emit_doc(out, &l.doc, "  ");
+    out.push_str(&format!(
+        "  # Registers a {} listener block. Returns a subscription id for\n  # {unregister_name}.\n",
+        cb.name
+    ));
+    out.push_str(&format!("  def self.{register_name}(&block)\n"));
+
+    // Trampoline formals: one per ABI slot, plus the ignored context.
+    let tramp_formals: Vec<String> = cb
+        .params
+        .iter()
+        .flat_map(|p| p.abi.iter().map(|s| s.name.to_snake_case()))
+        .chain(std::iter::once("_context".to_string()))
+        .collect();
+    let tramp_types = rb_abi_types(&cb.abi_params, false);
+    let call_args: Vec<String> = cb
+        .params
+        .iter()
+        .map(|p| rb_cb_arg_expr(&p.name.to_snake_case(), &p.ty))
+        .collect();
+    out.push_str(&format!(
+        "{ind}trampoline = FFI::Function.new(:void, [{}]) do |{}|\n",
+        tramp_types.join(", "),
+        tramp_formals.join(", ")
+    ));
+    out.push_str(&format!("{ind}  block.call({})\n", call_args.join(", ")));
+    out.push_str(&format!("{ind}end\n"));
+    out.push_str(&format!(
+        "{ind}listener_id = {}(trampoline, FFI::Pointer::NULL)\n",
+        l.register_symbol
+    ));
+    out.push_str(&format!("{ind}@listener_refs[listener_id] = trampoline\n"));
+    out.push_str(&format!("{ind}listener_id\n"));
+    out.push_str("  end\n");
+
+    out.push('\n');
+    out.push_str(&format!(
+        "  # Unregisters a listener previously registered with {register_name}.\n"
+    ));
+    out.push_str(&format!("  def self.{unregister_name}(listener_id)\n"));
+    out.push_str(&format!("{ind}{}(listener_id)\n", l.unregister_symbol));
+    out.push_str(&format!("{ind}@listener_refs.delete(listener_id)\n"));
+    out.push_str(&format!("{ind}nil\n"));
+    out.push_str("  end\n");
+}
+
+/// The Ruby expression converting one callback parameter's trampoline
+/// arguments into the idiomatic value passed to the user block. Slot names
+/// derive from the parameter name, mirroring [`abi::lower_param`].
+fn rb_cb_arg_expr(n: &str, ty: &TypeRef) -> String {
+    match ty {
+        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => n.into(),
+        TypeRef::Bool => format!("({n} != 0)"),
+        // `:string` slots arrive as Ruby Strings (copied by ffi) or nil.
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => n.into(),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            format!("({n}_ptr.null? ? ''.b : {n}_ptr.read_string({n}_len))")
+        }
+        // Enums surface as their integer constants in Ruby.
+        TypeRef::Enum(_) => n.into(),
+        // Borrowed by contract: the producer owns callback arguments for the
+        // duration of the call, so opaque pointers pass through raw.
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => n.into(),
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => n.into(),
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
+                format!("({n}_ptr.null? ? nil : {n}_ptr.read_string({n}_len))")
+            }
+            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => n.into(),
+            TypeRef::Bool => format!("({n}.null? ? nil : ({n}.read_int32 != 0))"),
+            TypeRef::List(_) | TypeRef::Map(_, _) => {
+                format!("({n}.null? ? nil : {})", rb_cb_list_expr(n, inner))
+            }
+            _ => {
+                let read = rb_read_method(inner);
+                format!("({n}.null? ? nil : {n}.{read})")
+            }
+        },
+        TypeRef::List(_) | TypeRef::Map(_, _) => rb_cb_list_expr(n, ty),
+        TypeRef::Iterator(_) => unreachable!("iterator not valid as callback parameter"),
+    }
+}
+
+/// List/map callback-argument reader: the slots are a base pointer (or
+/// parallel key/value pointers) plus `{n}_len`.
+fn rb_cb_list_expr(n: &str, ty: &TypeRef) -> String {
+    match ty {
+        TypeRef::List(elem) => {
+            let reader = rb_array_reader(elem);
+            let map_suffix = match elem.as_ref() {
+                TypeRef::Bool => ".map { |v| v != 0 }".to_string(),
+                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                    ".map { |p| p.null? ? '' : p.read_string }".to_string()
+                }
+                _ => String::new(),
+            };
+            format!("({n}.null? ? [] : {n}.{reader}({n}_len){map_suffix})")
+        }
+        TypeRef::Map(k, v) => {
+            let k_reader = rb_array_reader(k);
+            let v_reader = rb_array_reader(v);
+            let k_expr = rb_element_expr("k", k);
+            let v_expr = rb_element_expr("v", v);
+            format!(
+                "({n}_keys.null? ? {{}} : {n}_keys.{k_reader}({n}_len)\
+                 .zip({n}_values.{v_reader}({n}_len))\
+                 .each_with_object({{}}) {{ |(k, v), h| h[{k_expr}] = {v_expr} }})"
+            )
+        }
+        _ => unreachable!("rb_cb_list_expr only handles lists and maps"),
+    }
+}
+
+fn render_sync_function_wrapper(out: &mut String, f: &FnBinding) {
     let c_sym = &f.c_base;
     let func_name = f.name.to_snake_case();
     let ind = "    ";
@@ -640,6 +893,302 @@ fn render_function_wrapper(out: &mut String, f: &FnBinding) {
     out.push_str("  end\n");
 }
 
+/// Async wrapper: launches the `_async` C symbol with an `FFI::Function`
+/// completion trampoline and blocks on a `Queue` until it fires (`Queue#pop`
+/// releases the GVL, and the ffi gem delivers cross-thread callbacks safely).
+/// Blocking is the idiomatic Ruby surface; callers needing concurrency wrap
+/// the call in their own Thread or Fiber scheduler.
+fn render_async_function_wrapper(out: &mut String, f: &FnBinding, a: &AsyncBinding) {
+    let func_name = f.name.to_snake_case();
+    let ind = "    ";
+    let params: Vec<String> = f.params.iter().map(|p| p.name.to_snake_case()).collect();
+
+    out.push('\n');
+    emit_doc(out, &f.doc, "  ");
+    out.push_str(&format!(
+        "  # Blocks until the async producer completes{}.\n",
+        if f.cancellable {
+            " (cancellation token not exposed; pass-through is NULL)"
+        } else {
+            ""
+        }
+    ));
+    out.push_str(&format!(
+        "  def self.{}({})\n",
+        func_name,
+        params.join(", ")
+    ));
+    if let Some(msg) = &f.deprecated {
+        let escaped = msg.replace('"', "\\\"");
+        out.push_str(&format!("{ind}warn \"[DEPRECATED] {escaped}\"\n"));
+    }
+
+    out.push_str(&format!("{ind}queue = Queue.new\n"));
+
+    // Completion trampoline: (context, err, <result slots>).
+    let cb_types = rb_abi_types(&a.callback_params, true);
+    let mut cb_formals: Vec<String> = vec!["_context".into(), "err_ptr".into()];
+    cb_formals.extend(a.callback_params.iter().skip(2).map(|p| p.name.clone()));
+    out.push_str(&format!(
+        "{ind}callback = FFI::Function.new(:void, [{}]) do |{}|\n",
+        cb_types.join(", "),
+        cb_formals.join(", ")
+    ));
+    // Producers pass err = NULL on success, so guard before dereferencing.
+    out.push_str(&format!(
+        "{ind}  err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)\n"
+    ));
+    out.push_str(&format!("{ind}  if err && err[:code] != 0\n"));
+    out.push_str(&format!("{ind}    code = err[:code]\n"));
+    out.push_str(&format!(
+        "{ind}    msg = err[:message].null? ? '' : err[:message].read_string\n"
+    ));
+    out.push_str(&format!("{ind}    weaveffi_error_clear(err_ptr)\n"));
+    out.push_str(&format!("{ind}    queue << Error.new(code, msg)\n"));
+    out.push_str(&format!("{ind}  else\n"));
+    render_async_result_push(out, &f.ret, &format!("{ind}    "));
+    out.push_str(&format!("{ind}  end\n"));
+    out.push_str(&format!("{ind}end\n"));
+
+    for p in &f.params {
+        render_param_conversion(out, &p.name.to_snake_case(), &p.ty, ind);
+    }
+    let mut call_args: Vec<String> = Vec::new();
+    for p in &f.params {
+        call_args.extend(rb_call_args(&p.name.to_snake_case(), &p.ty));
+    }
+    if f.cancellable {
+        call_args.push("FFI::Pointer::NULL".into());
+    }
+    call_args.push("callback".into());
+    call_args.push("FFI::Pointer::NULL".into());
+    out.push_str(&format!(
+        "{ind}{}({})\n",
+        a.launch.symbol,
+        call_args.join(", ")
+    ));
+    out.push_str(&format!("{ind}value = queue.pop\n"));
+    out.push_str(&format!("{ind}raise value if value.is_a?(Error)\n"));
+    out.push_str(&format!("{ind}value\n"));
+    out.push_str("  end\n");
+}
+
+/// Push the converted async result onto the queue. Result slots are named by
+/// [`abi::callback_result_params`]: `result` (+ `result_len`, or
+/// `result_keys`/`result_values`/`result_len` for maps).
+fn render_async_result_push(out: &mut String, ret: &Option<TypeRef>, ind: &str) {
+    let Some(ty) = ret else {
+        out.push_str(&format!("{ind}queue << nil\n"));
+        return;
+    };
+    match ty {
+        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => {
+            out.push_str(&format!("{ind}queue << result\n"));
+        }
+        TypeRef::Bool => {
+            out.push_str(&format!("{ind}queue << (result != 0)\n"));
+        }
+        TypeRef::Enum(_) => {
+            out.push_str(&format!("{ind}queue << result\n"));
+        }
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            out.push_str(&format!("{ind}if result.null?\n"));
+            out.push_str(&format!("{ind}  queue << ''\n"));
+            out.push_str(&format!("{ind}else\n"));
+            out.push_str(&format!("{ind}  s = result.read_string\n"));
+            out.push_str(&format!("{ind}  weaveffi_free_string(result)\n"));
+            out.push_str(&format!("{ind}  queue << s\n"));
+            out.push_str(&format!("{ind}end\n"));
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            out.push_str(&format!("{ind}if result.null?\n"));
+            out.push_str(&format!("{ind}  queue << ''.b\n"));
+            out.push_str(&format!("{ind}else\n"));
+            out.push_str(&format!("{ind}  data = result.read_string(result_len)\n"));
+            out.push_str(&format!("{ind}  weaveffi_free_bytes(result, result_len)\n"));
+            out.push_str(&format!("{ind}  queue << data\n"));
+            out.push_str(&format!("{ind}end\n"));
+        }
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+            let local = local_type_name(name);
+            out.push_str(&format!("{ind}if result.null?\n"));
+            out.push_str(&format!("{ind}  queue << Error.new(-1, 'null pointer')\n"));
+            out.push_str(&format!("{ind}else\n"));
+            out.push_str(&format!("{ind}  queue << {local}.new(result)\n"));
+            out.push_str(&format!("{ind}end\n"));
+        }
+        TypeRef::List(elem) => {
+            let reader = rb_array_reader(elem);
+            let map_suffix = match elem.as_ref() {
+                TypeRef::Bool => ".map { |v| v != 0 }".to_string(),
+                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                    ".map { |p| p.null? ? '' : p.read_string }".to_string()
+                }
+                TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+                    format!(".map {{ |p| {}.new(p) }}", local_type_name(name))
+                }
+                _ => String::new(),
+            };
+            out.push_str(&format!(
+                "{ind}queue << (result.null? ? [] : result.{reader}(result_len){map_suffix})\n"
+            ));
+        }
+        TypeRef::Map(k, v) => {
+            let k_reader = rb_array_reader(k);
+            let v_reader = rb_array_reader(v);
+            let k_expr = rb_element_expr("k", k);
+            let v_expr = rb_element_expr("v", v);
+            out.push_str(&format!(
+                "{ind}queue << (result_keys.null? ? {{}} : result_keys.{k_reader}(result_len)\
+                 .zip(result_values.{v_reader}(result_len))\
+                 .each_with_object({{}}) {{ |(k, v), h| h[{k_expr}] = {v_expr} }})\n"
+            ));
+        }
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                out.push_str(&format!("{ind}if result.null?\n"));
+                out.push_str(&format!("{ind}  queue << nil\n"));
+                out.push_str(&format!("{ind}else\n"));
+                out.push_str(&format!("{ind}  s = result.read_string\n"));
+                out.push_str(&format!("{ind}  weaveffi_free_string(result)\n"));
+                out.push_str(&format!("{ind}  queue << s\n"));
+                out.push_str(&format!("{ind}end\n"));
+            }
+            TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+                let local = local_type_name(name);
+                out.push_str(&format!(
+                    "{ind}queue << (result.null? ? nil : {local}.new(result))\n"
+                ));
+            }
+            TypeRef::Bool => {
+                out.push_str(&format!(
+                    "{ind}queue << (result.null? ? nil : (result.read_int32 != 0))\n"
+                ));
+            }
+            _ if !is_c_pointer_type(inner) => {
+                let read = rb_read_method(inner);
+                out.push_str(&format!(
+                    "{ind}queue << (result.null? ? nil : result.{read})\n"
+                ));
+            }
+            _ => {
+                render_async_result_push(out, &Some((**inner).clone()), ind);
+            }
+        },
+        TypeRef::Iterator(_) => unreachable!("async iterator returns are rejected upstream"),
+    }
+}
+
+/// Iterator wrapper: launch, drain `next` into an Array, destroy. Errors
+/// during iteration destroy the handle before raising.
+fn render_iterator_function_wrapper(out: &mut String, f: &FnBinding, it: &IteratorBinding) {
+    let func_name = f.name.to_snake_case();
+    let ind = "    ";
+    let params: Vec<String> = f.params.iter().map(|p| p.name.to_snake_case()).collect();
+
+    out.push('\n');
+    emit_doc(out, &f.doc, "  ");
+    out.push_str(&format!(
+        "  def self.{}({})\n",
+        func_name,
+        params.join(", ")
+    ));
+    if let Some(msg) = &f.deprecated {
+        let escaped = msg.replace('"', "\\\"");
+        out.push_str(&format!("{ind}warn \"[DEPRECATED] {escaped}\"\n"));
+    }
+    out.push_str(&format!("{ind}err = ErrorStruct.new\n"));
+    for p in &f.params {
+        render_param_conversion(out, &p.name.to_snake_case(), &p.ty, ind);
+    }
+    let mut call_args: Vec<String> = Vec::new();
+    for p in &f.params {
+        call_args.extend(rb_call_args(&p.name.to_snake_case(), &p.ty));
+    }
+    call_args.push("err".into());
+    out.push_str(&format!(
+        "{ind}iter = {}({})\n",
+        it.launch.symbol,
+        call_args.join(", ")
+    ));
+    out.push_str(&format!("{ind}check_error!(err)\n"));
+    out.push_str(&format!("{ind}items = []\n"));
+    out.push_str(&format!("{ind}return items if iter.null?\n"));
+    out.push_str(&format!("{ind}loop do\n"));
+
+    // `next` params: (iter, out_item, <extra elem out slots>, out_err).
+    let elem = &it.elem;
+    let needs_len = matches!(elem, TypeRef::Bytes | TypeRef::BorrowedBytes);
+    let item_mem = rb_mem_type(elem);
+    out.push_str(&format!(
+        "{ind}  out_item = FFI::MemoryPointer.new({item_mem})\n"
+    ));
+    if needs_len {
+        out.push_str(&format!(
+            "{ind}  out_item_len = FFI::MemoryPointer.new(:size_t)\n"
+        ));
+    }
+    out.push_str(&format!("{ind}  item_err = ErrorStruct.new\n"));
+    let next_args = if needs_len {
+        "iter, out_item, out_item_len, item_err"
+    } else {
+        "iter, out_item, item_err"
+    };
+    out.push_str(&format!(
+        "{ind}  has_item = {}({next_args})\n",
+        it.next.symbol
+    ));
+    out.push_str(&format!("{ind}  if item_err[:code] != 0\n"));
+    out.push_str(&format!("{ind}    {}(iter)\n", it.destroy_symbol));
+    out.push_str(&format!("{ind}    check_error!(item_err)\n"));
+    out.push_str(&format!("{ind}  end\n"));
+    out.push_str(&format!("{ind}  break if has_item.zero?\n"));
+    render_iterator_item_push(out, elem, &format!("{ind}  "));
+    out.push_str(&format!("{ind}end\n"));
+    out.push_str(&format!("{ind}{}(iter)\n", it.destroy_symbol));
+    out.push_str(&format!("{ind}items\n"));
+    out.push_str("  end\n");
+}
+
+/// Convert the value written into `out_item` and append it to `items`.
+fn render_iterator_item_push(out: &mut String, elem: &TypeRef, ind: &str) {
+    match elem {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            out.push_str(&format!("{ind}item_ptr = out_item.read_pointer\n"));
+            out.push_str(&format!("{ind}if item_ptr.null?\n"));
+            out.push_str(&format!("{ind}  items << ''\n"));
+            out.push_str(&format!("{ind}else\n"));
+            out.push_str(&format!("{ind}  items << item_ptr.read_string\n"));
+            out.push_str(&format!("{ind}  weaveffi_free_string(item_ptr)\n"));
+            out.push_str(&format!("{ind}end\n"));
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            out.push_str(&format!("{ind}item_ptr = out_item.read_pointer\n"));
+            out.push_str(&format!("{ind}item_len = out_item_len.read(:size_t)\n"));
+            out.push_str(&format!("{ind}if item_ptr.null?\n"));
+            out.push_str(&format!("{ind}  items << ''.b\n"));
+            out.push_str(&format!("{ind}else\n"));
+            out.push_str(&format!("{ind}  items << item_ptr.read_string(item_len)\n"));
+            out.push_str(&format!("{ind}  weaveffi_free_bytes(item_ptr, item_len)\n"));
+            out.push_str(&format!("{ind}end\n"));
+        }
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+            let local = local_type_name(name);
+            out.push_str(&format!("{ind}item_ptr = out_item.read_pointer\n"));
+            out.push_str(&format!(
+                "{ind}items << {local}.new(item_ptr) unless item_ptr.null?\n"
+            ));
+        }
+        TypeRef::Bool => {
+            out.push_str(&format!("{ind}items << (out_item.read_int32 != 0)\n"));
+        }
+        _ => {
+            let read = rb_read_method(elem);
+            out.push_str(&format!("{ind}items << out_item.{read}\n"));
+        }
+    }
+}
+
 // ── Parameter conversion ──
 
 fn render_param_conversion(out: &mut String, name: &str, ty: &TypeRef, ind: &str) {
@@ -708,33 +1257,49 @@ fn render_param_conversion(out: &mut String, name: &str, ty: &TypeRef, ind: &str
     }
 }
 
+/// Writes one element list into `{buf_name}_buf`. String/handle elements are
+/// converted to pointers first, and the converted array is kept in a local
+/// (`{buf_name}_ptrs`) so the per-element `MemoryPointer`s stay referenced —
+/// and un-collected — until after the C call.
+fn render_element_array_write(
+    out: &mut String,
+    buf_name: &str,
+    list_expr: &str,
+    elem: &TypeRef,
+    ind: &str,
+) {
+    match elem {
+        TypeRef::Bool => {
+            out.push_str(&format!(
+                "{ind}{buf_name}_buf.write_array_of_int32({list_expr}.map {{ |v| v ? 1 : 0 }})\n"
+            ));
+        }
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+            out.push_str(&format!(
+                "{ind}{buf_name}_buf.write_array_of_pointer({list_expr}.map(&:handle))\n"
+            ));
+        }
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            out.push_str(&format!(
+                "{ind}{buf_name}_ptrs = {list_expr}.map {{ |s| FFI::MemoryPointer.from_string(s) }}\n"
+            ));
+            out.push_str(&format!(
+                "{ind}{buf_name}_buf.write_array_of_pointer({buf_name}_ptrs)\n"
+            ));
+        }
+        _ => {
+            let write = rb_array_writer(elem);
+            out.push_str(&format!("{ind}{buf_name}_buf.{write}({list_expr})\n"));
+        }
+    }
+}
+
 fn render_list_buf(out: &mut String, name: &str, elem: &TypeRef, ind: &str) {
     let mem = rb_mem_type(elem);
     out.push_str(&format!(
         "{ind}{name}_buf = FFI::MemoryPointer.new({mem}, {name}.length)\n"
     ));
-    match elem {
-        TypeRef::Bool => {
-            out.push_str(&format!(
-                "{ind}{name}_buf.write_array_of_int32({name}.map {{ |v| v ? 1 : 0 }})\n"
-            ));
-        }
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
-            out.push_str(&format!(
-                "{ind}{name}_buf.write_array_of_pointer({name}.map(&:handle))\n"
-            ));
-        }
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!(
-                "{ind}{name}_buf.write_array_of_pointer(\
-                 {name}.map {{ |s| FFI::MemoryPointer.from_string(s) }})\n"
-            ));
-        }
-        _ => {
-            let write = rb_array_writer(elem);
-            out.push_str(&format!("{ind}{name}_buf.{write}({name})\n"));
-        }
-    }
+    render_element_array_write(out, name, name, elem, ind);
 }
 
 fn render_map_buf(out: &mut String, name: &str, k: &TypeRef, v: &TypeRef, ind: &str) {
@@ -748,10 +1313,8 @@ fn render_map_buf(out: &mut String, name: &str, k: &TypeRef, v: &TypeRef, ind: &
     out.push_str(&format!(
         "{ind}{name}_vals_buf = FFI::MemoryPointer.new({v_mem}, {name}_v.length)\n"
     ));
-    let k_write = rb_array_writer(k);
-    let v_write = rb_array_writer(v);
-    out.push_str(&format!("{ind}{name}_keys_buf.{k_write}({name}_k)\n"));
-    out.push_str(&format!("{ind}{name}_vals_buf.{v_write}({name}_v)\n"));
+    render_element_array_write(out, &format!("{name}_keys"), &format!("{name}_k"), k, ind);
+    render_element_array_write(out, &format!("{name}_vals"), &format!("{name}_v"), v, ind);
 }
 
 // ── Return value rendering ──
@@ -796,9 +1359,12 @@ fn render_return_code(out: &mut String, ty: &TypeRef, ind: &str, qualifier: Opti
             out.push_str(&format!("{ind}{}.new(result)\n", local_type_name(name)));
         }
         TypeRef::Optional(inner) => render_optional_return_code(out, inner, ind, qualifier),
-        TypeRef::List(inner) | TypeRef::Iterator(inner) => {
+        TypeRef::List(inner) => {
             out.push_str(&format!("{ind}return [] if result.null?\n"));
             render_list_return_body(out, inner, ind);
+        }
+        TypeRef::Iterator(_) => {
+            unreachable!("iterator returns render via render_iterator_function_wrapper")
         }
         TypeRef::Map(_, _) => {
             out.push_str(&format!("{ind}result\n"));
@@ -985,7 +1551,7 @@ mod tests {
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.1.0".to_string(),
+            version: "0.3.0".to_string(),
             modules,
             generators: None,
             package: None,
@@ -1219,9 +1785,26 @@ mod tests {
         let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
         assert!(code.contains("class PointBuilder"), "builder class: {code}");
         assert!(code.contains("def with_x(value)"), "with_x: {code}");
+        // Unset fields default to zero values rather than raising.
+        assert!(code.contains("@x = 0.0"), "zero default: {code}");
+        // Build is FFI-backed: it attaches and calls the C create symbol,
+        // checks the error, and wraps the returned handle.
         assert!(
-            code.contains("NotImplementedError, \"PointBuilder.build requires FFI backing\""),
-            "build stub: {code}"
+            code.contains("attach_function :weaveffi_geo_Point_create"),
+            "create attach: {code}"
+        );
+        assert!(
+            code.contains("result = WeaveFFI.weaveffi_geo_Point_create(x, err)"),
+            "create call: {code}"
+        );
+        assert!(
+            code.contains("WeaveFFI.check_error!(err)"),
+            "error check: {code}"
+        );
+        assert!(code.contains("Point.new(result)"), "wrap handle: {code}");
+        assert!(
+            !code.contains("requires FFI backing"),
+            "stub must be gone: {code}"
         );
     }
 
@@ -1464,7 +2047,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_async_functions() {
+    fn async_function_generates_blocking_wrapper() {
         let api = make_api(vec![simple_module(
             "io",
             vec![Function {
@@ -1480,60 +2063,138 @@ mod tests {
         )]);
 
         let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
+        // Completion callback type + launcher attach.
         assert!(
-            !code.contains("def self.read"),
-            "async should be skipped: {code}"
+            code.contains(
+                "callback :weaveffi_io_read_callback, [:pointer, :pointer, :pointer], :void"
+            ),
+            "async callback decl: {code}"
         );
         assert!(
-            !code.contains("weaveffi_io_read"),
-            "async attach should be skipped: {code}"
+            code.contains(
+                "attach_function :weaveffi_io_read_async, [:weaveffi_io_read_callback, :pointer], :void"
+            ),
+            "async launcher attach: {code}"
+        );
+        // Blocking wrapper: trampoline pinned in a local, Queue rendezvous,
+        // error re-raised on the caller thread.
+        assert!(code.contains("def self.read()"), "wrapper: {code}");
+        assert!(code.contains("queue = Queue.new"), "queue: {code}");
+        assert!(
+            code.contains("callback = FFI::Function.new(:void, [:pointer, :pointer, :pointer])"),
+            "trampoline: {code}"
+        );
+        assert!(
+            code.contains("weaveffi_io_read_async(callback, FFI::Pointer::NULL)"),
+            "launch call: {code}"
+        );
+        assert!(code.contains("value = queue.pop"), "blocking pop: {code}");
+        assert!(
+            code.contains("raise value if value.is_a?(Error)"),
+            "error re-raise: {code}"
+        );
+        // The owned result string is read then freed.
+        assert!(
+            code.contains("weaveffi_free_string(result)"),
+            "result freed: {code}"
         );
     }
 
-    /// Ruby's FFI bindings deliberately skip async-marked functions because
-    /// no idiomatic concurrency primitive exists; there is therefore no
-    /// callback to pin and nothing to free. This test fixes that contract so
-    /// a future change that re-enables async generation has to provide
-    /// matching pin/unpin sites first.
     #[test]
-    fn ruby_async_pins_callback_for_lifetime() {
+    fn iterator_uses_next_destroy_protocol() {
         let api = make_api(vec![simple_module(
-            "io",
-            vec![
-                Function {
-                    name: "read".into(),
-                    params: vec![],
-                    returns: Some(TypeRef::StringUtf8),
-                    doc: None,
-                    r#async: true,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                },
-                Function {
-                    name: "write".into(),
-                    params: vec![],
-                    returns: None,
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                },
-            ],
+            "events",
+            vec![Function {
+                name: "get_messages".into(),
+                params: vec![],
+                returns: Some(TypeRef::Iterator(Box::new(TypeRef::StringUtf8))),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
         )]);
         let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
+        // Launch returns the opaque iterator; next/destroy attached.
         assert!(
-            !code.contains("rb_global_variable"),
-            "async is unsupported, no global ref pinning expected: {code}"
+            code.contains("attach_function :weaveffi_events_get_messages, [:pointer], :pointer"),
+            "launch attach: {code}"
         );
         assert!(
-            !code.contains("weaveffi_io_read"),
-            "async function should be omitted, sync function still emitted: {code}"
+            code.contains(
+                "attach_function :weaveffi_events_GetMessagesIterator_next, [:pointer, :pointer, :pointer], :int32"
+            ),
+            "next attach: {code}"
         );
         assert!(
-            code.contains("weaveffi_io_write"),
-            "sync function should still be emitted: {code}"
+            code.contains(
+                "attach_function :weaveffi_events_GetMessagesIterator_destroy, [:pointer], :void"
+            ),
+            "destroy attach: {code}"
+        );
+        // The wrapper drains via the iterator protocol — not the list ABI
+        // (the old lowering wrongly passed an out_len the symbol lacks).
+        assert!(
+            code.contains(
+                "has_item = weaveffi_events_GetMessagesIterator_next(iter, out_item, item_err)"
+            ),
+            "drain loop: {code}"
+        );
+        assert!(
+            code.contains("weaveffi_events_GetMessagesIterator_destroy(iter)"),
+            "destroy after drain: {code}"
+        );
+        assert!(!code.contains("out_len"), "no stray out_len: {code}");
+    }
+
+    #[test]
+    fn listener_register_unregister_wrappers() {
+        use weaveffi_ir::ir::{CallbackDef, ListenerDef};
+        let api = make_api(vec![Module {
+            callbacks: vec![CallbackDef {
+                name: "OnMessage".into(),
+                params: vec![Param {
+                    name: "message".into(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                    doc: None,
+                }],
+                doc: None,
+            }],
+            listeners: vec![ListenerDef {
+                name: "message_listener".into(),
+                event_callback: "OnMessage".into(),
+                doc: None,
+            }],
+            ..simple_module("events", vec![])
+        }]);
+        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
+        assert!(
+            code.contains("callback :weaveffi_events_OnMessage_fn, [:string, :pointer], :void"),
+            "callback decl: {code}"
+        );
+        assert!(
+            code.contains(
+                "attach_function :weaveffi_events_register_message_listener, [:weaveffi_events_OnMessage_fn, :pointer], :uint64"
+            ),
+            "register attach: {code}"
+        );
+        assert!(
+            code.contains("def self.register_message_listener(&block)"),
+            "register wrapper: {code}"
+        );
+        assert!(
+            code.contains("@listener_refs[listener_id] = trampoline"),
+            "trampoline pinned: {code}"
+        );
+        assert!(
+            code.contains("def self.unregister_message_listener(listener_id)"),
+            "unregister wrapper: {code}"
+        );
+        assert!(
+            code.contains("@listener_refs.delete(listener_id)"),
+            "trampoline released: {code}"
         );
     }
 
@@ -1590,21 +2251,16 @@ mod tests {
 
     #[test]
     fn ffi_type_mapping() {
-        assert_eq!(rb_param_ffi_types(&TypeRef::I32), vec![":int32"]);
-        assert_eq!(rb_param_ffi_types(&TypeRef::U32), vec![":uint32"]);
-        assert_eq!(rb_param_ffi_types(&TypeRef::I64), vec![":int64"]);
-        assert_eq!(rb_param_ffi_types(&TypeRef::F64), vec![":double"]);
-        assert_eq!(rb_param_ffi_types(&TypeRef::Bool), vec![":int32"]);
-        assert_eq!(rb_param_ffi_types(&TypeRef::Handle), vec![":uint64"]);
-        assert_eq!(rb_param_ffi_types(&TypeRef::StringUtf8), vec![":string"]);
-        assert_eq!(
-            rb_param_ffi_types(&TypeRef::Enum("Color".into())),
-            vec![":int32"]
-        );
-        assert_eq!(
-            rb_param_ffi_types(&TypeRef::Struct("Foo".into())),
-            vec![":pointer"]
-        );
+        let types = |ty: &TypeRef| rb_abi_types(&abi::lower_param("_", ty, "", false), false);
+        assert_eq!(types(&TypeRef::I32), vec![":int32"]);
+        assert_eq!(types(&TypeRef::U32), vec![":uint32"]);
+        assert_eq!(types(&TypeRef::I64), vec![":int64"]);
+        assert_eq!(types(&TypeRef::F64), vec![":double"]);
+        assert_eq!(types(&TypeRef::Bool), vec![":int32"]);
+        assert_eq!(types(&TypeRef::Handle), vec![":uint64"]);
+        assert_eq!(types(&TypeRef::StringUtf8), vec![":string"]);
+        assert_eq!(types(&TypeRef::Enum("Color".into())), vec![":int32"]);
+        assert_eq!(types(&TypeRef::Struct("Foo".into())), vec![":pointer"]);
     }
 
     #[test]
@@ -1744,7 +2400,7 @@ mod tests {
 
     fn contacts_api() -> Api {
         Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![

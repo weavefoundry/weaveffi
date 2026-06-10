@@ -49,7 +49,7 @@ A complete, validating example lives at the bottom of this page in the
 
 | Field        | Type                        | Required | Description                              |
 |--------------|-----------------------------|----------|------------------------------------------|
-| `version`    | string                      | yes      | Schema version (`"0.1.0"`, `"0.2.0"`, or `"0.3.0"`) |
+| `version`    | string                      | yes      | Schema version; only the current version (`"0.3.0"`) is accepted |
 | `package`    | Package                     | no       | Publishable identity stamped into every generated manifest (see [Package metadata](#package-metadata)) |
 | `modules`    | array of Module             | yes      | One or more modules                      |
 | `generators` | map of string to object     | no       | Per-generator configuration (see [generators section](#generators-section)) |

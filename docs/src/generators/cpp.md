@@ -4,9 +4,10 @@
 
 The C++ target emits a header-only library `weaveffi.hpp` that wraps the
 C ABI in idiomatic C++17. Structs become RAII classes with deleted copies
-and movable handles, errors map to exceptions, and async functions return
-`std::future`. A `CMakeLists.txt` is included so the generated directory
-can be dropped into any CMake build.
+and movable handles, errors map to exceptions, async functions return
+`std::future`, and listeners accept `std::function` callbacks. A
+`CMakeLists.txt` is included so the generated directory can be dropped
+into any CMake build.
 
 ## What gets generated
 
@@ -33,6 +34,7 @@ can be dropped into any CMake build.
 | `T?`         | `std::optional<T>`                   | `const std::optional<T>&`   |
 | `[T]`        | `std::vector<T>`                     | `const std::vector<T>&`     |
 | `{K: V}`     | `std::unordered_map<K, V>`           | `const std::unordered_map<K, V>&` |
+| `iter<T>`    | `std::vector<T>` (return only; see [Iterators](#iterators)) | — |
 
 ## Example IDL → generated code
 
@@ -169,11 +171,12 @@ try {
 
 ## Build instructions
 
-The generated `CMakeLists.txt` defines an INTERFACE library:
+The generated `CMakeLists.txt` defines an INTERFACE library (the
+project version mirrors `package.version` from the IDL):
 
 ```cmake
 cmake_minimum_required(VERSION 3.14)
-project(weaveffi_cpp)
+project(weaveffi_cpp VERSION 1.0.0)
 add_library(weaveffi_cpp INTERFACE)
 target_include_directories(weaveffi_cpp INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(weaveffi_cpp INTERFACE weaveffi)
@@ -203,6 +206,68 @@ Then `#include "weaveffi.hpp"` and link against the Rust shared library
 - `std::vector<T>` returns own their contents. List parameters borrow
   the underlying buffer for the duration of the call.
 
+## Callbacks and listeners
+
+Listeners surface as free functions taking `std::function`. The
+register wrapper boxes the callable in a `std::shared_ptr`, hands the
+C ABI a capture-less trampoline plus the raw pointer as `context`, and
+pins the box in a global registry so it stays alive until unregister.
+From the `events` sample (trimmed):
+
+```cpp
+namespace detail {
+
+inline std::mutex& wv_listener_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+inline std::unordered_map<uint64_t, std::shared_ptr<void>>& wv_listener_registry() {
+    static std::unordered_map<uint64_t, std::shared_ptr<void>> registry;
+    return registry;
+}
+
+} // namespace detail
+
+inline uint64_t events_register_message_listener(std::function<void(std::string)> callback) {
+    auto fn = std::make_shared<std::function<void(std::string)>>(std::move(callback));
+    uint64_t id = weaveffi_events_register_message_listener(
+        [](const char* message, void* context) {
+            auto& cb = *static_cast<std::function<void(std::string)>*>(context);
+            cb(std::string(message ? message : ""));
+        },
+        fn.get());
+    std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());
+    detail::wv_listener_registry()[id] = fn;
+    return id;
+}
+
+inline void events_unregister_message_listener(uint64_t id) {
+    weaveffi_events_unregister_message_listener(id);
+    std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());
+    detail::wv_listener_registry().erase(id);
+}
+```
+
+- `register_*` returns the `uint64_t` subscription id from the C
+  layer. The registry (`detail::wv_listener_registry()`, a
+  `std::unordered_map<uint64_t, std::shared_ptr<void>>` guarded by
+  `detail::wv_listener_mutex()`) maps that id to the boxed
+  `std::function`, keeping it alive while events can still fire.
+- `unregister_*` first unregisters at the C layer, then erases the
+  registry entry, releasing the callable.
+- The static trampoline converts the C arguments to C++ types
+  (`const char*` → `std::string`) before invoking the stored function.
+- The callback runs on the producer's thread, not the thread that
+  registered it; capture and synchronize accordingly.
+
+```cpp
+uint64_t id = weaveffi::events_register_message_listener(
+    [](std::string message) { std::cout << message << '\n'; });
+weaveffi::events_send_message("hello");
+weaveffi::events_unregister_message_listener(id);
+```
+
 ## Async support
 
 Async IDL functions return `std::future<T>`. The wrapper allocates a
@@ -230,9 +295,59 @@ inline std::future<Contact> contacts_fetch_contact(int32_t id) {
 }
 ```
 
-Use it with `.get()` (blocking) or compose with your event loop. When
-the IDL marks the function `cancel: true`, the generated wrapper
-forwards an additional `weaveffi_cancel_token*`.
+Use it with `.get()` (blocking) or compose with your event loop. The
+promise is completed (or rejected with a `WeaveFFIError` exception)
+exactly once in the completion lambda, which then deletes it.
+
+When the IDL marks the function `cancellable: true`, the wrapper gains
+a trailing `weaveffi_cancel_token*` parameter defaulting to `nullptr`
+(from the `kvstore` sample):
+
+```cpp
+inline std::future<int64_t> kv_compact_async(Store& store,
+    weaveffi_cancel_token* cancel_token = nullptr) { /* ... */ }
+```
+
+```cpp
+weaveffi_cancel_token* token = weaveffi_cancel_token_create();
+auto fut = weaveffi::kv_compact_async(store, token);
+weaveffi_cancel_token_cancel(token);   // from any thread
+// fut.get() throws WeaveFFIError if the operation was cancelled
+weaveffi_cancel_token_destroy(token);
+```
+
+C++ is one of only three targets (C, C++, Kotlin) that expose the
+cancel token; see [Async functions](../guides/async.md).
+
+## Iterators
+
+`iter<T>` return values surface as a plain `std::vector<T>`: the
+wrapper drains the C iterator with `_next`, frees each element,
+destroys the iterator handle, and returns the collected values. From the `events`
+sample (`get_messages` returns `iter<string>`, trimmed):
+
+```cpp
+inline std::vector<std::string> events_get_messages() {
+    weaveffi_error err{};
+    weaveffi_events_GetMessagesIterator* iter = weaveffi_events_get_messages(&err);
+    // ... throw WeaveFFIError on error ...
+    std::vector<std::string> ret;
+    while (true) {
+        const char* item{};
+        int32_t has_item = weaveffi_events_GetMessagesIterator_next(iter, &item, &err);
+        // ... destroy iterator + throw on error ...
+        if (has_item == 0) break;
+        ret.emplace_back(item);
+        weaveffi_free_string(item);
+    }
+    weaveffi_events_GetMessagesIterator_destroy(iter);
+    return ret;
+}
+```
+
+Iteration is eager — the full sequence is materialized before the
+wrapper returns. Drop to the C ABI (`_next`/`_destroy`) if you need
+streaming consumption.
 
 ## Troubleshooting
 

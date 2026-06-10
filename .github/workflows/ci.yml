@@ -211,8 +211,9 @@ jobs:
     # symbol, or skips a feature fails here (unlike the examples/ smoke programs
     # in build-test, which mostly check exit status). Covers contacts + events +
     # kvstore across C, C++, Python, Ruby, Dart, Go, Swift, .NET, Node, Kotlin,
-    # and WASM (the kvstore lanes exercise list/map/bytes/optional returns,
-    # builders, and iterators; see conformance/run.sh).
+    # and WASM: the events lanes exercise listeners/callbacks + iterators, and
+    # the kvstore lanes exercise handles, struct getters (bytes/optional/list/
+    # map), builders, eviction listeners, and async; see conformance/run.sh.
     name: Conformance harness
     runs-on: ubuntu-latest
     steps:
@@ -248,11 +249,18 @@ jobs:
         with:
           swift-version: "5.10"
 
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
       - name: Install consumer toolchains
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             clang g++ python3 golang-go ruby-ffi
+          sudo snap install kotlin --classic
 
       - name: Run conformance harness
         run: bash conformance/run.sh

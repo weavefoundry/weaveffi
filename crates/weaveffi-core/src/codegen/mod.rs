@@ -14,6 +14,7 @@ use serde::Serialize;
 use weaveffi_ir::ir::Api;
 
 use crate::cache;
+use crate::capabilities::{self, TargetCapabilities};
 
 pub mod common;
 pub mod writer;
@@ -56,6 +57,24 @@ pub trait Generator: Send + Sync {
     /// Used as the cache file basename and the `--target` filter token.
     fn name(&self) -> &'static str;
 
+    /// The gated IDL features this target implements. The orchestrator
+    /// refuses to run a generator against an API that uses a feature its
+    /// declared capabilities do not cover — a target either generates a
+    /// feature or fails loudly; it never silently omits one.
+    fn capabilities(&self) -> TargetCapabilities;
+
+    /// Whether the user explicitly opted in to generating this target even
+    /// though the API uses features the target does not support (for example
+    /// `generators.wasm.allow_unsupported: true`). When `true` the
+    /// orchestrator downgrades the capability failure to a loud warning and
+    /// the generator must emit an explicit unsupported surface (throwing
+    /// stubs, documentation) rather than silently omitting the feature.
+    /// Default: `false` — opting in must always be an explicit config act.
+    fn allows_unsupported(&self, config: &Self::Config) -> bool {
+        let _ = config;
+        false
+    }
+
     /// Render the bindings under `out_dir`.
     fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()>;
 
@@ -75,6 +94,10 @@ pub trait Generator: Send + Sync {
 /// [`ConfiguredGenerator`] is the canonical adapter.
 pub trait DynGenerator: Send + Sync {
     fn name(&self) -> &'static str;
+    fn capabilities(&self) -> TargetCapabilities;
+    /// See [`Generator::allows_unsupported`] — evaluated against the bound
+    /// config.
+    fn allows_unsupported(&self) -> bool;
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()>;
     fn output_files(&self, api: &Api, out_dir: &Utf8Path) -> Vec<String>;
     /// Canonical-JSON encoding of the bound config, fed into the cache
@@ -111,6 +134,14 @@ impl<G: Generator> ConfiguredGenerator<G> {
 impl<G: Generator> DynGenerator for ConfiguredGenerator<G> {
     fn name(&self) -> &'static str {
         self.inner.name()
+    }
+
+    fn capabilities(&self) -> TargetCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn allows_unsupported(&self) -> bool {
+        self.inner.allows_unsupported(&self.config)
     }
 
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
@@ -157,6 +188,34 @@ impl<'a> Orchestrator<'a> {
         hooks: &OrchestratorHooks,
         force: bool,
     ) -> Result<()> {
+        // Capability gate: every selected target must support every gated
+        // feature the API uses. Collect all violations before failing so the
+        // user sees the complete picture in one run. A generator whose config
+        // explicitly opted in via `allow_unsupported` downgrades its failure
+        // to a loud warning: the generator emits an explicit unsupported
+        // surface (throwing stubs) for the missing features instead.
+        let mut violations: Vec<String> = Vec::new();
+        for g in &self.generators {
+            let Err(err) = capabilities::check(api, g.name(), &g.capabilities()) else {
+                continue;
+            };
+            if g.allows_unsupported() {
+                eprintln!(
+                    "warning: target '{}' does not support every feature this IDL uses; \
+                     generating anyway because allow_unsupported is set:",
+                    g.name()
+                );
+                for (feature, locations) in &err.violations {
+                    eprintln!("  - {feature} (used by: {})", locations.join(", "));
+                }
+            } else {
+                violations.push(err.to_string());
+            }
+        }
+        if !violations.is_empty() {
+            bail!("{}", violations.join("\n"));
+        }
+
         if force {
             cache::invalidate_all(out_dir)?;
         }
@@ -211,11 +270,13 @@ mod tests {
     #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
     struct TestConfig {
         knob: Option<String>,
+        allow_unsupported: bool,
     }
 
     struct CountingGenerator {
         name: &'static str,
         calls: Arc<AtomicUsize>,
+        caps: TargetCapabilities,
     }
 
     impl Generator for CountingGenerator {
@@ -223,6 +284,14 @@ mod tests {
 
         fn name(&self) -> &'static str {
             self.name
+        }
+
+        fn capabilities(&self) -> TargetCapabilities {
+            self.caps
+        }
+
+        fn allows_unsupported(&self, config: &Self::Config) -> bool {
+            config.allow_unsupported
         }
 
         fn generate(&self, _api: &Api, out_dir: &Utf8Path, _config: &Self::Config) -> Result<()> {
@@ -236,7 +305,7 @@ mod tests {
 
     fn test_api() -> Api {
         Api {
-            version: "0.1.0".to_string(),
+            version: "0.3.0".to_string(),
             modules: vec![Module {
                 name: "math".to_string(),
                 functions: vec![Function {
@@ -278,7 +347,137 @@ mod tests {
         name: &'static str,
         calls: Arc<AtomicUsize>,
     ) -> ConfiguredGenerator<CountingGenerator> {
-        ConfiguredGenerator::new(CountingGenerator { name, calls }, TestConfig::default())
+        ConfiguredGenerator::new(
+            CountingGenerator {
+                name,
+                calls,
+                caps: TargetCapabilities::full(),
+            },
+            TestConfig::default(),
+        )
+    }
+
+    /// An API that uses listeners, so a target without listener support
+    /// trips the capability gate.
+    fn listener_api() -> Api {
+        let mut api = test_api();
+        api.modules[0].listeners = vec![weaveffi_ir::ir::ListenerDef {
+            name: "on_change".to_string(),
+            event_callback: "OnChange".to_string(),
+            doc: None,
+        }];
+        api.modules[0].callbacks = vec![weaveffi_ir::ir::CallbackDef {
+            name: "OnChange".to_string(),
+            params: vec![],
+            doc: None,
+        }];
+        api
+    }
+
+    fn partial(
+        calls: Arc<AtomicUsize>,
+        allow_unsupported: bool,
+    ) -> ConfiguredGenerator<CountingGenerator> {
+        ConfiguredGenerator::new(
+            CountingGenerator {
+                name: "partial",
+                calls,
+                caps: TargetCapabilities {
+                    callbacks: false,
+                    listeners: false,
+                    ..TargetCapabilities::full()
+                },
+            },
+            TestConfig {
+                knob: None,
+                allow_unsupported,
+            },
+        )
+    }
+
+    #[test]
+    fn capability_gate_blocks_unsupported_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gen = partial(Arc::clone(&calls), false);
+
+        let err = Orchestrator::new()
+            .with_generator(&gen)
+            .run(
+                &listener_api(),
+                out_dir,
+                &OrchestratorHooks::default(),
+                false,
+            )
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("target 'partial' does not support"), "{msg}");
+        assert!(msg.contains("math.on_change"), "{msg}");
+        assert!(msg.contains("allow_unsupported"), "{msg}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "gated generator must not run"
+        );
+    }
+
+    #[test]
+    fn allow_unsupported_downgrades_gate_to_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gen = partial(Arc::clone(&calls), true);
+
+        Orchestrator::new()
+            .with_generator(&gen)
+            .run(
+                &listener_api(),
+                out_dir,
+                &OrchestratorHooks::default(),
+                false,
+            )
+            .expect("allow_unsupported must let generation proceed");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "generator should run");
+    }
+
+    #[test]
+    fn allow_unsupported_does_not_relax_other_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
+        let opted_calls = Arc::new(AtomicUsize::new(0));
+        let strict_calls = Arc::new(AtomicUsize::new(0));
+        let opted = partial(Arc::clone(&opted_calls), true);
+        let strict = ConfiguredGenerator::new(
+            CountingGenerator {
+                name: "strict",
+                calls: Arc::clone(&strict_calls),
+                caps: TargetCapabilities {
+                    listeners: false,
+                    ..TargetCapabilities::full()
+                },
+            },
+            TestConfig::default(),
+        );
+
+        let err = Orchestrator::new()
+            .with_generator(&opted)
+            .with_generator(&strict)
+            .run(
+                &listener_api(),
+                out_dir,
+                &OrchestratorHooks::default(),
+                false,
+            )
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("target 'strict'"), "{msg}");
+        assert!(!msg.contains("target 'partial'"), "{msg}");
+        assert_eq!(opted_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(strict_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -420,6 +619,7 @@ mod tests {
             CountingGenerator {
                 name: "counting",
                 calls: Arc::clone(&calls),
+                caps: TargetCapabilities::full(),
             },
             TestConfig::default(),
         );
@@ -434,9 +634,11 @@ mod tests {
             CountingGenerator {
                 name: "counting",
                 calls: Arc::clone(&calls),
+                caps: TargetCapabilities::full(),
             },
             TestConfig {
                 knob: Some("changed".into()),
+                allow_unsupported: false,
             },
         );
         Orchestrator::new()

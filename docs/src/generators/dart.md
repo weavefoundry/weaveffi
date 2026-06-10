@@ -33,6 +33,7 @@ required — the generated `.dart` file is ready to import.
 | `T?`         | `T?`                | same as inner type     | same as inner type   |
 | `[T]`        | `List<T>`           | `Pointer<Void>`        | `Pointer<Void>`      |
 | `{K: V}`     | `Map<K, V>`         | `Pointer<Void>`        | `Pointer<Void>`      |
+| `iter<T>`    | `Iterable<T>`       | `Pointer<Void>`        | `Pointer<Void>`      |
 
 Booleans cross as `Int32` (`0`/`1`) and the wrapper converts both ways.
 
@@ -81,6 +82,10 @@ The loader auto-detects the platform:
 
 ```dart
 DynamicLibrary _openLibrary() {
+  // An explicit path in WEAVEFFI_LIBRARY wins, so callers can point at a
+  // specific build artifact regardless of its file name or location.
+  final override = Platform.environment['WEAVEFFI_LIBRARY'];
+  if (override != null && override.isNotEmpty) return DynamicLibrary.open(override);
   if (Platform.isMacOS) return DynamicLibrary.open('libweaveffi.dylib');
   if (Platform.isLinux) return DynamicLibrary.open('libweaveffi.so');
   if (Platform.isWindows) return DynamicLibrary.open('weaveffi.dll');
@@ -164,7 +169,7 @@ Standalone Dart:
 1. Generate the bindings:
 
    ```bash
-   weaveffi generate --input api.yaml --output generated/ --target dart
+   weaveffi generate api.yaml -o generated --target dart
    ```
 
 2. Build the Rust shared library:
@@ -223,33 +228,141 @@ Flutter:
 - **Optionals:** `T?` returns check the native pointer against
   `nullptr` before wrapping; absent struct optionals become `null`.
 
-## Async support
+## Callbacks and listeners
 
-Functions marked `async: true` produce a synchronous helper plus a
-public `Future`-returning wrapper that runs the FFI call on a separate
-isolate via `Isolate.run`:
+A `callbacks:` entry in the IDL defines the native function-pointer
+type; a `listeners:` entry generates a register/unregister pair around
+it. Registration wraps the Dart closure in a `NativeCallable`, hands
+its `nativeFunction` pointer to the C ABI, and returns the `int`
+subscription id the native side minted:
 
 ```dart
-String _fetchData(int id) {
+// Live listener trampolines by subscription id. Holding the
+// NativeCallable here keeps its native thunk alive until unregistered.
+final Map<int, NativeCallable> _listenerCallables = {};
+
+/// Registers a OnMessage listener. Returns a subscription id for
+/// unregisterMessageListener().
+int registerMessageListener(void Function(String message) callback) {
+  final callable =
+      NativeCallable<_NativeCb_weaveffi_events_OnMessage_fn>.isolateLocal(
+          (Pointer<Utf8> message, Pointer<Void> context) {
+    callback(message == nullptr ? '' : message.toDartString());
+  });
+  final id = _weaveffiEventsRegisterMessageListener(callable.nativeFunction, nullptr);
+  _listenerCallables[id] = callable;
+  return id;
+}
+
+/// Unregisters a listener previously registered with registerMessageListener().
+void unregisterMessageListener(int id) {
+  _weaveffiEventsUnregisterMessageListener(id);
+  _listenerCallables.remove(id)?.close();
+}
+```
+
+- **Lifetime.** The live `NativeCallable` is stored in
+  `_listenerCallables` keyed by subscription id; that reference keeps
+  the native thunk and the captured closure alive. Unregistering
+  removes the entry and `close()`s the callable. The C `void* context`
+  slot is unused (`nullptr`) — the closure travels inside the callable,
+  so no registry id needs to cross the boundary.
+- **Threading.** Listener trampolines are
+  `NativeCallable.isolateLocal`, not `.listener`: WeaveFFI listeners
+  fire synchronously on the thread calling the producer API (here,
+  while `sendMessage` runs), and the argument pointers are only valid
+  for that borrow window, so they are converted to Dart values inside
+  the callback before the producer frees them. An `isolateLocal`
+  callable may only be invoked on the owning isolate's thread, so
+  events are delivered during the isolate's own calls into the
+  library rather than queued to the event loop.
+- **Isolate lifetime.** The generated code never sets
+  `keepIsolateAlive = false`, so the `dart:ffi` default applies: a
+  registered listener keeps its isolate alive until it is
+  unregistered.
+
+## Async support
+
+Functions marked `async: true` return a `Future<T>` backed by the
+`_async`-suffixed C launcher. The completion callback is a
+`NativeCallable.listener`, which may be invoked from any native
+thread: the event is posted to the owning isolate's event loop, where
+it completes the `Completer`:
+
+```dart
+Future<TaskResult> runTask(String name) {
+  final completer = Completer<TaskResult>();
+  final namePtr = name.toNativeUtf8();
+  late NativeCallable<_NativeAsyncCb_weaveffi_tasks_run_task> callable;
+  callable = NativeCallable<_NativeAsyncCb_weaveffi_tasks_run_task>.listener(
+      (Pointer<Void> context, Pointer<_WeaveFFIError> err, Pointer<Void> result) {
+    try {
+      if (err.address != 0 && err.ref.code != 0) {
+        final code = err.ref.code;
+        final msg = err.ref.message.toDartString();
+        _weaveffiErrorClear(err);
+        completer.completeError(WeaveFFIException(code, msg));
+        return;
+      }
+      completer.complete(TaskResult._(result));
+    } catch (e) {
+      completer.completeError(e);
+    } finally {
+      callable.close();
+    }
+  });
+  try {
+    _weaveffiTasksRunTaskAsync(namePtr, callable.nativeFunction, nullptr);
+  } catch (e) {
+    callable.close();
+    calloc.free(namePtr);
+    rethrow;
+  }
+  return completer.future.whenComplete(() {
+    calloc.free(namePtr);
+  });
+}
+```
+
+The callable is closed in the callback's `finally` (or immediately if
+the launch itself throws), so each native trampoline is freed exactly
+once; input buffers are released in `whenComplete` once the future
+settles. The `dart:async` import is only emitted when the IDL contains
+at least one async function.
+
+For functions marked `cancellable: true` the C launcher gains a
+`weaveffi_cancel_token*` parameter. The Dart wrapper passes `nullptr`
+for it and does not expose the token — only the C, C++, and Kotlin
+targets surface cancellation tokens.
+
+## Iterators
+
+`iter<T>` returns surface as `Iterable<T>`. The wrapper launches the
+iterator, drains it eagerly into a `List<T>` through the generated
+`_next` binding, then destroys the iterator handle:
+
+```dart
+/// Return an iterator over all sent messages
+Iterable<String> getMessages() {
   final err = calloc<_WeaveFFIError>();
   try {
-    final result = _weaveffiMathFetchData(id, err);
+    final iter = _weaveffiEventsGetMessages(err);
     _checkError(err);
-    return result.toDartString();
+    final items = <String>[];
+    final outItem = calloc<Pointer<Utf8>>();
+    while (_weaveffiEventsGetMessagesIteratorNext(iter, outItem, err) != 0) {
+      _checkError(err);
+      items.add(outItem.value.toDartString());
+    }
+    _checkError(err);
+    calloc.free(outItem);
+    _weaveffiEventsGetMessagesIteratorDestroy(iter);
+    return items;
   } finally {
     calloc.free(err);
   }
 }
-
-Future<String> fetchData(int id) async {
-  return await Isolate.run(() => _fetchData(id));
-}
 ```
-
-The `dart:isolate` import is only included when the IDL contains at
-least one async function. When the IDL marks the function
-`cancel: true`, the wrapper forwards Dart cancellation tokens to the
-underlying `weaveffi_cancel_token`.
 
 ## Troubleshooting
 

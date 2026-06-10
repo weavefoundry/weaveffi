@@ -10,6 +10,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <pthread.h>
 #include "weaveffi.h"
 
 static void throw_weaveffi_error(JNIEnv* env, weaveffi_error* err) {
@@ -40,6 +41,67 @@ typedef struct {
     JavaVM* jvm;
     jobject callback;
 } weaveffi_jni_async_ctx;
+
+typedef struct weaveffi_jni_listener_ctx {
+    JavaVM* jvm;
+    jobject callback;
+    uint64_t id;
+    struct weaveffi_jni_listener_ctx* next;
+} weaveffi_jni_listener_ctx;
+
+static weaveffi_jni_listener_ctx* weaveffi_jni_listeners = NULL;
+static pthread_mutex_t weaveffi_jni_listener_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void weaveffi_kv_OnEvict_fn_jni_tramp(const char* key, void* context) {
+    weaveffi_jni_listener_ctx* ctx = (weaveffi_jni_listener_ctx*)context;
+    JNIEnv* env = NULL;
+    int attached = 0;
+    if ((*ctx->jvm)->GetEnv(ctx->jvm, (void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if ((*ctx->jvm)->AttachCurrentThread(ctx->jvm, (void**)&env, NULL) != JNI_OK) return;
+        attached = 1;
+    }
+    if ((*env)->PushLocalFrame(env, 32) != 0) {
+        if (attached) (*ctx->jvm)->DetachCurrentThread(ctx->jvm);
+        return;
+    }
+    jobject _a0 = key ? (jobject)(*env)->NewStringUTF(env, key) : (jobject)(*env)->NewStringUTF(env, "");
+    jclass fn_cls = (*env)->GetObjectClass(env, ctx->callback);
+    jmethodID invoke = (*env)->GetMethodID(env, fn_cls, "invoke", "(Ljava/lang/Object;)Ljava/lang/Object;");
+    (*env)->CallObjectMethod(env, ctx->callback, invoke, _a0);
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    (*env)->PopLocalFrame(env, NULL);
+    if (attached) (*ctx->jvm)->DetachCurrentThread(ctx->jvm);
+}
+
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_kv_1register_1eviction_1listener(JNIEnv* env, jclass clazz, jobject callback) {
+    weaveffi_jni_listener_ctx* ctx = (weaveffi_jni_listener_ctx*)calloc(1, sizeof(weaveffi_jni_listener_ctx));
+    (*env)->GetJavaVM(env, &ctx->jvm);
+    ctx->callback = (*env)->NewGlobalRef(env, callback);
+    uint64_t id = weaveffi_kv_register_eviction_listener(weaveffi_kv_OnEvict_fn_jni_tramp, ctx);
+    ctx->id = id;
+    pthread_mutex_lock(&weaveffi_jni_listener_lock);
+    ctx->next = weaveffi_jni_listeners;
+    weaveffi_jni_listeners = ctx;
+    pthread_mutex_unlock(&weaveffi_jni_listener_lock);
+    return (jlong)id;
+}
+
+JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_kv_1unregister_1eviction_1listener(JNIEnv* env, jclass clazz, jlong id) {
+    weaveffi_kv_unregister_eviction_listener((uint64_t)id);
+    pthread_mutex_lock(&weaveffi_jni_listener_lock);
+    weaveffi_jni_listener_ctx** link = &weaveffi_jni_listeners;
+    while (*link != NULL) {
+        if ((*link)->id == (uint64_t)id) {
+            weaveffi_jni_listener_ctx* found = *link;
+            *link = found->next;
+            (*env)->DeleteGlobalRef(env, found->callback);
+            free(found);
+            break;
+        }
+        link = &(*link)->next;
+    }
+    pthread_mutex_unlock(&weaveffi_jni_listener_lock);
+}
 
 JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_kv_1open_1storeJni(JNIEnv* env, jclass clazz, jstring path) {
     weaveffi_error err = {0, NULL};
@@ -167,8 +229,12 @@ JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_kv_1clearJni(JNIEnv* env, jcla
 
 static void weaveffi_kv_compact_async_jni_cb(void* context, weaveffi_error* err, int64_t result) {
     weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)context;
-    JNIEnv* env;
-    (*ctx->jvm)->AttachCurrentThread(ctx->jvm, (void**)&env, NULL);
+    JNIEnv* env = NULL;
+    int attached = 0;
+    if ((*ctx->jvm)->GetEnv(ctx->jvm, (void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if ((*ctx->jvm)->AttachCurrentThread(ctx->jvm, (void**)&env, NULL) != JNI_OK) { free(ctx); return; }
+        attached = 1;
+    }
     if (err != NULL && err->code != 0) {
         const char* msg = err->message ? err->message : "WeaveFFI error";
         jstring jmsg = (*env)->NewStringUTF(env, msg);
@@ -183,8 +249,11 @@ static void weaveffi_kv_compact_async_jni_cb(void* context, weaveffi_error* err,
         jmethodID mid = (*env)->GetMethodID(env, cls, "onSuccess", "(Ljava/lang/Object;)V");
         (*env)->CallVoidMethod(env, ctx->callback, mid, boxed);
     }
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
     (*env)->DeleteGlobalRef(env, ctx->callback);
+    JavaVM* jvm = ctx->jvm;
     free(ctx);
+    if (attached) (*jvm)->DetachCurrentThread(jvm);
 }
 
 JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_kv_1compact_1asyncAsync(JNIEnv* env, jclass clazz, jlong store, jlong cancelToken, jobject callback) {

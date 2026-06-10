@@ -26,8 +26,12 @@ typedef struct {
 
 static void weaveffi_tasks_run_task_jni_cb(void* context, weaveffi_error* err, void* result) {
     weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)context;
-    JNIEnv* env;
-    (*ctx->jvm)->AttachCurrentThread(ctx->jvm, (void**)&env, NULL);
+    JNIEnv* env = NULL;
+    int attached = 0;
+    if ((*ctx->jvm)->GetEnv(ctx->jvm, (void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if ((*ctx->jvm)->AttachCurrentThread(ctx->jvm, (void**)&env, NULL) != JNI_OK) { free(ctx); return; }
+        attached = 1;
+    }
     if (err != NULL && err->code != 0) {
         const char* msg = err->message ? err->message : "WeaveFFI error";
         jstring jmsg = (*env)->NewStringUTF(env, msg);
@@ -42,8 +46,11 @@ static void weaveffi_tasks_run_task_jni_cb(void* context, weaveffi_error* err, v
         jmethodID mid = (*env)->GetMethodID(env, cls, "onSuccess", "(Ljava/lang/Object;)V");
         (*env)->CallVoidMethod(env, ctx->callback, mid, boxed);
     }
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
     (*env)->DeleteGlobalRef(env, ctx->callback);
+    JavaVM* jvm = ctx->jvm;
     free(ctx);
+    if (attached) (*jvm)->DetachCurrentThread(jvm);
 }
 
 JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_tasks_1run_1taskAsync(JNIEnv* env, jclass clazz, jstring name, jobject callback) {
@@ -57,8 +64,12 @@ JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_tasks_1run_1taskAsync(JNIEnv* 
 
 static void weaveffi_tasks_run_batch_jni_cb(void* context, weaveffi_error* err, void* result) {
     weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)context;
-    JNIEnv* env;
-    (*ctx->jvm)->AttachCurrentThread(ctx->jvm, (void**)&env, NULL);
+    JNIEnv* env = NULL;
+    int attached = 0;
+    if ((*ctx->jvm)->GetEnv(ctx->jvm, (void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if ((*ctx->jvm)->AttachCurrentThread(ctx->jvm, (void**)&env, NULL) != JNI_OK) { free(ctx); return; }
+        attached = 1;
+    }
     if (err != NULL && err->code != 0) {
         const char* msg = err->message ? err->message : "WeaveFFI error";
         jstring jmsg = (*env)->NewStringUTF(env, msg);
@@ -71,8 +82,11 @@ static void weaveffi_tasks_run_batch_jni_cb(void* context, weaveffi_error* err, 
         jmethodID mid = (*env)->GetMethodID(env, cls, "onSuccess", "(Ljava/lang/Object;)V");
         (*env)->CallVoidMethod(env, ctx->callback, mid, boxed);
     }
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
     (*env)->DeleteGlobalRef(env, ctx->callback);
+    JavaVM* jvm = ctx->jvm;
     free(ctx);
+    if (attached) (*jvm)->DetachCurrentThread(jvm);
 }
 
 JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_tasks_1run_1batchAsync(JNIEnv* env, jclass clazz, jobjectArray names, jobject callback) {
@@ -106,8 +120,12 @@ JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_tasks_1cancel_1task(JNIEnv
 
 static void weaveffi_tasks_run_n_tasks_jni_cb(void* context, weaveffi_error* err, int32_t result) {
     weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)context;
-    JNIEnv* env;
-    (*ctx->jvm)->AttachCurrentThread(ctx->jvm, (void**)&env, NULL);
+    JNIEnv* env = NULL;
+    int attached = 0;
+    if ((*ctx->jvm)->GetEnv(ctx->jvm, (void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if ((*ctx->jvm)->AttachCurrentThread(ctx->jvm, (void**)&env, NULL) != JNI_OK) { free(ctx); return; }
+        attached = 1;
+    }
     if (err != NULL && err->code != 0) {
         const char* msg = err->message ? err->message : "WeaveFFI error";
         jstring jmsg = (*env)->NewStringUTF(env, msg);
@@ -122,8 +140,11 @@ static void weaveffi_tasks_run_n_tasks_jni_cb(void* context, weaveffi_error* err
         jmethodID mid = (*env)->GetMethodID(env, cls, "onSuccess", "(Ljava/lang/Object;)V");
         (*env)->CallVoidMethod(env, ctx->callback, mid, boxed);
     }
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
     (*env)->DeleteGlobalRef(env, ctx->callback);
+    JavaVM* jvm = ctx->jvm;
     free(ctx);
+    if (attached) (*jvm)->DetachCurrentThread(jvm);
 }
 
 JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_tasks_1run_1n_1tasksAsync(JNIEnv* env, jclass clazz, jint n, jobject callback) {

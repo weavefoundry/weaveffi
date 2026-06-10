@@ -49,7 +49,6 @@ evaluate against it: **UniFFI**, **cbindgen**, **diplomat**, **SWIG**, and
 | `extract` from annotated source    | ✓ (Rust)     | ✓ (proc-macro) | ✓ (Rust) | ✓ (Rust)    | n/a      | ✓ (C++)     |
 | `watch` mode                       | ✓            | —          | ✓ (`--watch`) | —          | —        | partial     |
 | `format` IDL canonicalizer         | ✓            | —          | n/a          | n/a          | —        | n/a         |
-| Schema migrations (`upgrade`)      | ✓            | —          | n/a          | n/a          | —        | n/a         |
 | Custom template overrides          | —            | partial (Mako) | —        | partial      | ✓ (`%typemap`) | partial |
 | Snapshot-tested generator output   | ✓            | ✓          | ✓            | ✓            | partial  | ✓           |
 | Maturity                           | pre-1.0      | 1.0+ in Mozilla shipping products | 1.0+ widely deployed | pre-1.0 | 30+ years, ubiquitous | pre-1.0 |
@@ -87,9 +86,9 @@ We try hard to be honest about the trade-offs. Pick the right tool for the job:
   extensions of varying quality. WeaveFFI ships a JSON Schema for editor
   autocompletion and a `format` command, but no first-party IDE plugin.
 - **No formal stability guarantee yet.** WeaveFFI is pre-1.0; the IDL,
-  generated output, and runtime symbol names can shift in minor releases
-  (always with a `weaveffi upgrade` path). UniFFI, cbindgen, and SWIG offer
-  stronger compatibility commitments today.
+  generated output, and runtime symbol names can shift in minor releases.
+  UniFFI, cbindgen, and SWIG offer stronger compatibility commitments
+  today.
 
 ## When to choose WeaveFFI
 
@@ -111,13 +110,14 @@ WeaveFFI is the right pick when you want:
    Async functions become `async/await` in Swift, `Promise`s in Node,
    `suspend fun` in Kotlin, `async def` in Python, and `Task<T>` in C#
    — all from the same `async: true` flag in the IDL.
-5. **A CLI workflow with `validate`, `lint`, `diff`, `watch`, `format`,
-   and `upgrade`.** WeaveFFI is built for monorepos and CI: every
-   sub-command has a `--format json` output mode, and `diff --check` and
+5. **A CLI workflow with `validate`, `lint`, `diff`, `watch`, and
+   `format`.** WeaveFFI is built for monorepos and CI: every sub-command
+   has a `--format json` output mode, and `diff --check` and
    `format --check` are designed to drop into pre-commit and CI gates.
-6. **Honest pre-1.0 churn that's mechanically migratable.** Every breaking
-   IDL change ships with a `weaveffi upgrade` migration. You don't get
-   stuck on an old version because the migration path is missing.
+6. **Honest pre-1.0 churn, documented every release.** Every breaking IDL
+   change is called out in `CHANGELOG.md` with a migration note, and
+   `weaveffi validate` rejects out-of-date schema versions with an
+   actionable error instead of silently misreading them.
 
 ## When to choose something else
 

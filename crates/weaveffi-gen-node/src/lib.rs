@@ -10,9 +10,13 @@ use std::collections::HashMap;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
 use serde::{Deserialize, Serialize};
+use weaveffi_core::abi;
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
+use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
-use weaveffi_core::model::{BindingModel, FnBinding, ParamBinding, StructBinding};
+use weaveffi_core::model::{
+    BindingModel, CallbackBinding, FnBinding, ListenerBinding, ParamBinding, StructBinding,
+};
 use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::utils::{
     c_abi_struct_name, local_type_name, render_json_prelude, render_prelude, render_trailer,
@@ -61,6 +65,10 @@ impl LanguageBackend for NodeGenerator {
         "node"
     }
 
+    fn capabilities(&self) -> TargetCapabilities {
+        TargetCapabilities::full()
+    }
+
     fn prefix<'a>(&self, config: &'a Self::Config) -> &'a str {
         config.prefix()
     }
@@ -81,7 +89,11 @@ impl LanguageBackend for NodeGenerator {
             OutputFile::new(
                 dir.join("index.js"),
                 format!(
-                    "{}module.exports = require('./index.node')\n\n{}",
+                    "{}// Prefer the default node-gyp output path; fall back to a\n\
+                     // prebuilt index.node placed next to this file.\n\
+                     let addon;\n\
+                     try {{\n  addon = require('./build/Release/weaveffi.node');\n}} catch (e) {{\n  addon = require('./index.node');\n}}\n\
+                     module.exports = addon;\n\n{}",
                     render_prelude(dbl, input_basename),
                     render_trailer(dbl, "index.js"),
                 ),
@@ -231,18 +243,49 @@ fn render_addon_c(
     ));
 
     let model = BindingModel::build(api, prefix);
-    let has_async = model.functions().any(|(_, f)| f.is_async);
-    if has_async {
-        out.push_str("typedef struct {\n");
-        out.push_str("    napi_env env;\n");
-        out.push_str("    napi_deferred deferred;\n");
-        out.push_str("} weaveffi_napi_async_ctx;\n\n");
-    }
-
     let mut all_exports: Vec<(String, String)> = Vec::new();
     let structs = struct_registry(&model);
 
+    let has_listeners = model.modules.iter().any(|m| !m.listeners.is_empty());
+    if has_listeners {
+        render_listener_support_c(&mut out, prefix);
+    }
+
     for m in &model.modules {
+        // Callbacks referenced by listeners get a payload struct, a producer-
+        // thread trampoline, and a JS-thread marshaller (threadsafe function).
+        let used_callbacks: Vec<&CallbackBinding> = m
+            .listeners
+            .iter()
+            .filter_map(|l| m.callback(&l.event_callback))
+            .collect();
+        for cb in &used_callbacks {
+            render_cb_payload_struct(&mut out, cb, prefix);
+            render_cb_tramp(&mut out, cb, prefix);
+            render_cb_calljs(&mut out, cb, prefix);
+        }
+        for l in &m.listeners {
+            let Some(cb) = m.callback(&l.event_callback) else {
+                unreachable!("validation guarantees the listener's callback exists");
+            };
+            render_listener_napi_fns(&mut out, l, cb, prefix);
+            all_exports.push((
+                wrapper_name(
+                    &m.path,
+                    &format!("register_{}", l.name),
+                    strip_module_prefix,
+                ),
+                format!("Napi_{}", l.register_symbol),
+            ));
+            all_exports.push((
+                wrapper_name(
+                    &m.path,
+                    &format!("unregister_{}", l.name),
+                    strip_module_prefix,
+                ),
+                format!("Napi_{}", l.unregister_symbol),
+            ));
+        }
         for f in &m.functions {
             let c_name = &f.c_base;
             let napi_name = format!("Napi_{c_name}");
@@ -250,7 +293,7 @@ fn render_addon_c(
             all_exports.push((js_name, napi_name.clone()));
 
             if f.is_async {
-                render_async_callback(&mut out, f, c_name, &m.path, prefix, &structs);
+                render_async_machinery(&mut out, f, c_name, &m.path, prefix, &structs);
             }
 
             out.push_str(&format!(
@@ -289,6 +332,489 @@ fn render_addon_c(
     out
 }
 
+/// The listener context + registry shared by every generated listener. The
+/// registry is only mutated from the JS thread (register/unregister are plain
+/// N-API calls), so a simple singly-linked list suffices.
+fn render_listener_support_c(out: &mut String, prefix: &str) {
+    out.push_str(&format!("typedef struct {prefix}_napi_listener_ctx {{\n"));
+    out.push_str("    napi_threadsafe_function tsfn;\n");
+    out.push_str("    uint64_t id;\n");
+    out.push_str(&format!("    struct {prefix}_napi_listener_ctx* next;\n"));
+    out.push_str(&format!("}} {prefix}_napi_listener_ctx;\n\n"));
+    out.push_str(&format!(
+        "static {prefix}_napi_listener_ctx* {prefix}_napi_listeners = NULL;\n\n"
+    ));
+}
+
+fn cb_payload_name(cb: &CallbackBinding) -> String {
+    format!("{}_payload", cb.c_fn_type)
+}
+
+/// The C slot declarations of a callback's parameters (without context).
+fn cb_slot_decls(cb: &CallbackBinding, prefix: &str) -> Vec<String> {
+    cb.params
+        .iter()
+        .flat_map(|p| abi::lower_param(&p.name, &p.ty, "", false))
+        .map(|slot| format!("{} {}", slot.ty.render_c(prefix), slot.name))
+        .collect()
+}
+
+/// The deep-copy payload carried from the producer thread to the JS thread.
+/// Every pointer field is owned by the payload (strdup/memcpy in the
+/// trampoline, freed in the call-js marshaller); struct/handle pointers are
+/// shallow-copied and surface as numeric handles.
+fn render_cb_payload_struct(out: &mut String, cb: &CallbackBinding, prefix: &str) {
+    out.push_str("typedef struct {\n");
+    for p in &cb.params {
+        let slots = abi::lower_param(&p.name, &p.ty, "", false);
+        let n0 = &slots[0].name;
+        match &p.ty {
+            TypeRef::I32
+            | TypeRef::U32
+            | TypeRef::I64
+            | TypeRef::F64
+            | TypeRef::Bool
+            | TypeRef::Handle
+            | TypeRef::Enum(_) => {
+                out.push_str(&format!("    {} {n0};\n", slots[0].ty.render_c(prefix)));
+            }
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                out.push_str(&format!("    char* {n0};\n"));
+            }
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
+                out.push_str(&format!("    uint8_t* {n0};\n"));
+                out.push_str(&format!("    size_t {};\n", slots[1].name));
+            }
+            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+                out.push_str(&format!("    void* {n0};\n"));
+            }
+            TypeRef::Optional(inner) => match inner.as_ref() {
+                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                    out.push_str(&format!("    char* {n0};\n"));
+                }
+                TypeRef::Bytes | TypeRef::BorrowedBytes => {
+                    out.push_str(&format!("    int {n0}_has;\n"));
+                    out.push_str(&format!("    uint8_t* {n0};\n"));
+                    out.push_str(&format!("    size_t {};\n", slots[1].name));
+                }
+                TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+                    out.push_str(&format!("    void* {n0};\n"));
+                }
+                other => {
+                    out.push_str(&format!("    int {n0}_has;\n"));
+                    out.push_str(&format!(
+                        "    {} {n0};\n",
+                        abi::element_ctype(other, "").render_c(prefix)
+                    ));
+                }
+            },
+            TypeRef::List(inner) => {
+                let elem = elem_payload_ctype(inner, prefix);
+                out.push_str(&format!("    {elem}* {n0};\n"));
+                out.push_str(&format!("    size_t {};\n", slots[1].name));
+            }
+            TypeRef::Map(k, v) => {
+                let kt = elem_payload_ctype(k, prefix);
+                let vt = elem_payload_ctype(v, prefix);
+                out.push_str(&format!("    {kt}* {n0};\n"));
+                out.push_str(&format!("    {vt}* {};\n", slots[1].name));
+                out.push_str(&format!("    size_t {};\n", slots[2].name));
+            }
+            TypeRef::Iterator(_) => unreachable!("validated: iterator not a callback param"),
+        }
+    }
+    out.push_str(&format!("}} {};\n\n", cb_payload_name(cb)));
+}
+
+/// The payload element type for list/map callback parameters. Strings own
+/// their copies (`char*`); scalar elements keep their C ABI type.
+fn elem_payload_ctype(ty: &TypeRef, prefix: &str) -> String {
+    match ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "char*".into(),
+        other => abi::element_ctype(other, "").render_c(prefix),
+    }
+}
+
+/// The producer-thread trampoline: deep-copies the C arguments into a payload
+/// and queues it onto the threadsafe function. Runs on whatever thread the
+/// producer fires the event from; never touches `napi_env`.
+fn render_cb_tramp(out: &mut String, cb: &CallbackBinding, prefix: &str) {
+    let payload = cb_payload_name(cb);
+    let mut decls = cb_slot_decls(cb, prefix);
+    decls.push("void* context".into());
+    out.push_str(&format!(
+        "static void {}_napi_tramp({}) {{\n",
+        cb.c_fn_type,
+        decls.join(", ")
+    ));
+    out.push_str(&format!(
+        "    {prefix}_napi_listener_ctx* ctx = ({prefix}_napi_listener_ctx*)context;\n"
+    ));
+    out.push_str(&format!(
+        "    {payload}* p = ({payload}*)calloc(1, sizeof({payload}));\n"
+    ));
+    for p in &cb.params {
+        let slots = abi::lower_param(&p.name, &p.ty, "", false);
+        let n0 = &slots[0].name;
+        match &p.ty {
+            TypeRef::I32
+            | TypeRef::U32
+            | TypeRef::I64
+            | TypeRef::F64
+            | TypeRef::Bool
+            | TypeRef::Handle
+            | TypeRef::Enum(_) => {
+                out.push_str(&format!("    p->{n0} = {n0};\n"));
+            }
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                out.push_str(&format!("    p->{n0} = {n0} ? strdup({n0}) : NULL;\n"));
+            }
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
+                let n1 = &slots[1].name;
+                out.push_str(&format!("    p->{n1} = {n1};\n"));
+                out.push_str(&format!(
+                    "    if ({n0} != NULL && {n1} > 0) {{ p->{n0} = (uint8_t*)malloc({n1}); memcpy(p->{n0}, {n0}, {n1}); }}\n"
+                ));
+            }
+            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+                out.push_str(&format!("    p->{n0} = (void*){n0};\n"));
+            }
+            TypeRef::Optional(inner) => match inner.as_ref() {
+                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                    out.push_str(&format!("    p->{n0} = {n0} ? strdup({n0}) : NULL;\n"));
+                }
+                TypeRef::Bytes | TypeRef::BorrowedBytes => {
+                    let n1 = &slots[1].name;
+                    out.push_str(&format!("    p->{n0}_has = {n0} != NULL;\n"));
+                    out.push_str(&format!("    p->{n1} = {n1};\n"));
+                    out.push_str(&format!(
+                        "    if ({n0} != NULL && {n1} > 0) {{ p->{n0} = (uint8_t*)malloc({n1}); memcpy(p->{n0}, {n0}, {n1}); }}\n"
+                    ));
+                }
+                TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+                    out.push_str(&format!("    p->{n0} = (void*){n0};\n"));
+                }
+                _ => {
+                    out.push_str(&format!("    p->{n0}_has = {n0} != NULL;\n"));
+                    out.push_str(&format!("    if ({n0} != NULL) p->{n0} = *{n0};\n"));
+                }
+            },
+            TypeRef::List(inner) => {
+                let n1 = &slots[1].name;
+                out.push_str(&format!("    p->{n1} = {n1};\n"));
+                match inner.as_ref() {
+                    TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                        out.push_str(&format!(
+                            "    if ({n0} != NULL && {n1} > 0) {{\n        p->{n0} = (char**)calloc({n1}, sizeof(char*));\n        for (size_t i = 0; i < {n1}; i++) p->{n0}[i] = {n0}[i] ? strdup({n0}[i]) : NULL;\n    }}\n"
+                        ));
+                    }
+                    _ => {
+                        out.push_str(&format!(
+                            "    if ({n0} != NULL && {n1} > 0) {{ p->{n0} = malloc({n1} * sizeof(*p->{n0})); memcpy(p->{n0}, {n0}, {n1} * sizeof(*p->{n0})); }}\n"
+                        ));
+                    }
+                }
+            }
+            TypeRef::Map(k, v) => {
+                let keys = n0;
+                let vals = &slots[1].name;
+                let len = &slots[2].name;
+                out.push_str(&format!("    p->{len} = {len};\n"));
+                for (base, ty) in [(keys, k), (vals, v)] {
+                    match ty.as_ref() {
+                        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                            out.push_str(&format!(
+                                "    if ({base} != NULL && {len} > 0) {{\n        p->{base} = (char**)calloc({len}, sizeof(char*));\n        for (size_t i = 0; i < {len}; i++) p->{base}[i] = {base}[i] ? strdup({base}[i]) : NULL;\n    }}\n"
+                            ));
+                        }
+                        _ => {
+                            out.push_str(&format!(
+                                "    if ({base} != NULL && {len} > 0) {{ p->{base} = malloc({len} * sizeof(*p->{base})); memcpy(p->{base}, {base}, {len} * sizeof(*p->{base})); }}\n"
+                            ));
+                        }
+                    }
+                }
+            }
+            TypeRef::Iterator(_) => unreachable!("validated: iterator not a callback param"),
+        }
+    }
+    out.push_str("    napi_call_threadsafe_function(ctx->tsfn, p, napi_tsfn_nonblocking);\n");
+    out.push_str("}\n\n");
+}
+
+/// One payload field rendered to a `napi_value` in `argv[idx]` (call-js side).
+fn emit_payload_to_napi(out: &mut String, p: &ParamBinding, idx: usize, prefix: &str) {
+    let slots = abi::lower_param(&p.name, &p.ty, "", false);
+    let n0 = &slots[0].name;
+    let target = format!("argv[{idx}]");
+    let _ = prefix;
+    match &p.ty {
+        TypeRef::I32 => out.push_str(&format!(
+            "        napi_create_int32(env, p->{n0}, &{target});\n"
+        )),
+        TypeRef::U32 => out.push_str(&format!(
+            "        napi_create_uint32(env, p->{n0}, &{target});\n"
+        )),
+        TypeRef::I64 => out.push_str(&format!(
+            "        napi_create_int64(env, p->{n0}, &{target});\n"
+        )),
+        TypeRef::F64 => out.push_str(&format!(
+            "        napi_create_double(env, p->{n0}, &{target});\n"
+        )),
+        TypeRef::Bool => out.push_str(&format!(
+            "        napi_get_boolean(env, p->{n0}, &{target});\n"
+        )),
+        TypeRef::Handle => out.push_str(&format!(
+            "        napi_create_int64(env, (int64_t)p->{n0}, &{target});\n"
+        )),
+        TypeRef::Enum(_) => out.push_str(&format!(
+            "        napi_create_int32(env, (int32_t)p->{n0}, &{target});\n"
+        )),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => out.push_str(&format!(
+            "        napi_create_string_utf8(env, p->{n0} ? p->{n0} : \"\", NAPI_AUTO_LENGTH, &{target});\n"
+        )),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            let n1 = &slots[1].name;
+            out.push_str(&format!(
+                "        napi_create_buffer_copy(env, p->{n1}, p->{n0} ? (const void*)p->{n0} : (const void*)\"\", NULL, &{target});\n"
+            ));
+        }
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => out.push_str(&format!(
+            "        napi_create_int64(env, (int64_t)(intptr_t)p->{n0}, &{target});\n"
+        )),
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => out.push_str(&format!(
+                "        if (p->{n0}) napi_create_string_utf8(env, p->{n0}, NAPI_AUTO_LENGTH, &{target}); else napi_get_null(env, &{target});\n"
+            )),
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
+                let n1 = &slots[1].name;
+                out.push_str(&format!(
+                    "        if (p->{n0}_has) napi_create_buffer_copy(env, p->{n1}, p->{n0} ? (const void*)p->{n0} : (const void*)\"\", NULL, &{target}); else napi_get_null(env, &{target});\n"
+                ));
+            }
+            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => out.push_str(&format!(
+                "        if (p->{n0}) napi_create_int64(env, (int64_t)(intptr_t)p->{n0}, &{target}); else napi_get_null(env, &{target});\n"
+            )),
+            other => {
+                let leaf = payload_leaf_to_napi(other, &format!("p->{n0}"), &target);
+                out.push_str(&format!(
+                    "        if (p->{n0}_has) {{ {leaf} }} else napi_get_null(env, &{target});\n"
+                ));
+            }
+        },
+        TypeRef::List(inner) => {
+            let n1 = &slots[1].name;
+            out.push_str(&format!("        napi_create_array(env, &{target});\n"));
+            out.push_str(&format!(
+                "        for (size_t i = 0; p->{n0} != NULL && i < p->{n1}; i++) {{\n"
+            ));
+            out.push_str("            napi_value elem;\n");
+            let leaf = payload_elem_to_napi(inner, &format!("p->{n0}[i]"), "elem");
+            out.push_str(&format!("            {leaf}\n"));
+            out.push_str(&format!(
+                "            napi_set_element(env, {target}, (uint32_t)i, elem);\n"
+            ));
+            out.push_str("        }\n");
+        }
+        TypeRef::Map(k, v) => {
+            let keys = n0;
+            let vals = &slots[1].name;
+            let len = &slots[2].name;
+            out.push_str(&format!("        napi_create_object(env, &{target});\n"));
+            out.push_str(&format!(
+                "        for (size_t i = 0; p->{keys} != NULL && p->{vals} != NULL && i < p->{len}; i++) {{\n"
+            ));
+            out.push_str("            napi_value mk; napi_value mv;\n");
+            let kc = payload_elem_to_napi(k, &format!("p->{keys}[i]"), "mk");
+            let vc = payload_elem_to_napi(v, &format!("p->{vals}[i]"), "mv");
+            out.push_str(&format!("            {kc}\n"));
+            out.push_str(&format!("            {vc}\n"));
+            out.push_str(&format!(
+                "            napi_set_property(env, {target}, mk, mv);\n"
+            ));
+            out.push_str("        }\n");
+        }
+        TypeRef::Iterator(_) => unreachable!("validated: iterator not a callback param"),
+    }
+}
+
+/// One scalar-ish payload value to a napi_value (single statement).
+fn payload_leaf_to_napi(ty: &TypeRef, expr: &str, target: &str) -> String {
+    match ty {
+        TypeRef::I32 => format!("napi_create_int32(env, {expr}, &{target});"),
+        TypeRef::U32 => format!("napi_create_uint32(env, {expr}, &{target});"),
+        TypeRef::I64 => format!("napi_create_int64(env, {expr}, &{target});"),
+        TypeRef::F64 => format!("napi_create_double(env, {expr}, &{target});"),
+        TypeRef::Bool => format!("napi_get_boolean(env, {expr}, &{target});"),
+        TypeRef::Handle => format!("napi_create_int64(env, (int64_t){expr}, &{target});"),
+        TypeRef::Enum(_) => format!("napi_create_int32(env, (int32_t){expr}, &{target});"),
+        _ => format!("napi_get_null(env, &{target});"),
+    }
+}
+
+/// One list/map element payload value to a napi_value (single statement).
+fn payload_elem_to_napi(ty: &TypeRef, expr: &str, target: &str) -> String {
+    match ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!(
+            "napi_create_string_utf8(env, {expr} ? {expr} : \"\", NAPI_AUTO_LENGTH, &{target});"
+        ),
+        other => payload_leaf_to_napi(other, expr, target),
+    }
+}
+
+/// Frees one payload field after the JS call.
+fn emit_payload_free(out: &mut String, p: &ParamBinding) {
+    let slots = abi::lower_param(&p.name, &p.ty, "", false);
+    let n0 = &slots[0].name;
+    match &p.ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            out.push_str(&format!("    free(p->{n0});\n"));
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            out.push_str(&format!("    free(p->{n0});\n"));
+        }
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::StringUtf8
+            | TypeRef::BorrowedStr
+            | TypeRef::Bytes
+            | TypeRef::BorrowedBytes => {
+                out.push_str(&format!("    free(p->{n0});\n"));
+            }
+            _ => {}
+        },
+        TypeRef::List(inner) => {
+            let n1 = &slots[1].name;
+            if matches!(inner.as_ref(), TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
+                out.push_str(&format!(
+                    "    for (size_t i = 0; p->{n0} != NULL && i < p->{n1}; i++) free(p->{n0}[i]);\n"
+                ));
+            }
+            out.push_str(&format!("    free(p->{n0});\n"));
+        }
+        TypeRef::Map(k, v) => {
+            let keys = n0;
+            let vals = &slots[1].name;
+            let len = &slots[2].name;
+            for (base, ty) in [(keys, k), (vals, v)] {
+                if matches!(ty.as_ref(), TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
+                    out.push_str(&format!(
+                        "    for (size_t i = 0; p->{base} != NULL && i < p->{len}; i++) free(p->{base}[i]);\n"
+                    ));
+                }
+                out.push_str(&format!("    free(p->{base});\n"));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The JS-thread marshaller invoked by the threadsafe function: converts the
+/// payload into JS arguments, calls the user callback, and frees the payload.
+fn render_cb_calljs(out: &mut String, cb: &CallbackBinding, prefix: &str) {
+    let payload = cb_payload_name(cb);
+    out.push_str(&format!(
+        "static void {}_napi_calljs(napi_env env, napi_value js_cb, void* context, void* data) {{\n",
+        cb.c_fn_type
+    ));
+    out.push_str("    (void)context;\n");
+    out.push_str(&format!("    {payload}* p = ({payload}*)data;\n"));
+    out.push_str("    if (env != NULL) {\n");
+    out.push_str("        napi_value undefined;\n");
+    out.push_str("        napi_get_undefined(env, &undefined);\n");
+    let argc = cb.params.len();
+    if argc > 0 {
+        out.push_str(&format!("        napi_value argv[{argc}];\n"));
+        for (i, p) in cb.params.iter().enumerate() {
+            emit_payload_to_napi(out, p, i, prefix);
+        }
+        out.push_str(&format!(
+            "        napi_call_function(env, undefined, js_cb, {argc}, argv, NULL);\n"
+        ));
+    } else {
+        out.push_str("        napi_call_function(env, undefined, js_cb, 0, NULL, NULL);\n");
+    }
+    out.push_str("    }\n");
+    for p in &cb.params {
+        emit_payload_free(out, p);
+    }
+    out.push_str("    free(p);\n");
+    out.push_str("}\n\n");
+}
+
+/// The `Napi_*` register/unregister entry points for one listener. Register
+/// wraps the JS callback in an unref'd threadsafe function (so live listeners
+/// don't pin the event loop) and stores it in the registry; unregister stops
+/// the producer first, then releases the threadsafe function.
+fn render_listener_napi_fns(
+    out: &mut String,
+    l: &ListenerBinding,
+    cb: &CallbackBinding,
+    prefix: &str,
+) {
+    let register_sym = &l.register_symbol;
+    let unregister_sym = &l.unregister_symbol;
+    let tramp = format!("{}_napi_tramp", cb.c_fn_type);
+    let calljs = format!("{}_napi_calljs", cb.c_fn_type);
+
+    out.push_str(&format!(
+        "static napi_value Napi_{register_sym}(napi_env env, napi_callback_info info) {{\n"
+    ));
+    out.push_str("  size_t argc = 1;\n");
+    out.push_str("  napi_value args[1];\n");
+    out.push_str("  napi_get_cb_info(env, info, &argc, args, NULL, NULL);\n");
+    out.push_str(&format!(
+        "  {prefix}_napi_listener_ctx* ctx = ({prefix}_napi_listener_ctx*)calloc(1, sizeof({prefix}_napi_listener_ctx));\n"
+    ));
+    out.push_str("  napi_value resource_name;\n");
+    out.push_str(&format!(
+        "  napi_create_string_utf8(env, \"{register_sym}\", NAPI_AUTO_LENGTH, &resource_name);\n"
+    ));
+    out.push_str(&format!(
+        "  napi_create_threadsafe_function(env, args[0], NULL, resource_name, 0, 1, NULL, NULL, NULL, {calljs}, &ctx->tsfn);\n"
+    ));
+    out.push_str("  napi_unref_threadsafe_function(env, ctx->tsfn);\n");
+    out.push_str(&format!("  uint64_t id = {register_sym}({tramp}, ctx);\n"));
+    out.push_str("  ctx->id = id;\n");
+    out.push_str(&format!("  ctx->next = {prefix}_napi_listeners;\n"));
+    out.push_str(&format!("  {prefix}_napi_listeners = ctx;\n"));
+    out.push_str("  napi_value ret;\n");
+    out.push_str("  napi_create_double(env, (double)id, &ret);\n");
+    out.push_str("  return ret;\n");
+    out.push_str("}\n\n");
+
+    out.push_str(&format!(
+        "static napi_value Napi_{unregister_sym}(napi_env env, napi_callback_info info) {{\n"
+    ));
+    out.push_str("  size_t argc = 1;\n");
+    out.push_str("  napi_value args[1];\n");
+    out.push_str("  napi_get_cb_info(env, info, &argc, args, NULL, NULL);\n");
+    out.push_str("  double id_d = 0;\n");
+    out.push_str("  napi_get_value_double(env, args[0], &id_d);\n");
+    out.push_str("  uint64_t id = (uint64_t)id_d;\n");
+    // Stop producer-side delivery before tearing down the tsfn so no new
+    // payloads are queued against a released function.
+    out.push_str(&format!("  {unregister_sym}(id);\n"));
+    out.push_str(&format!(
+        "  {prefix}_napi_listener_ctx** link = &{prefix}_napi_listeners;\n"
+    ));
+    out.push_str("  while (*link != NULL) {\n");
+    out.push_str("    if ((*link)->id == id) {\n");
+    out.push_str(&format!(
+        "      {prefix}_napi_listener_ctx* found = *link;\n"
+    ));
+    out.push_str("      *link = found->next;\n");
+    out.push_str("      napi_release_threadsafe_function(found->tsfn, napi_tsfn_release);\n");
+    out.push_str("      free(found);\n");
+    out.push_str("      break;\n");
+    out.push_str("    }\n");
+    out.push_str("    link = &(*link)->next;\n");
+    out.push_str("  }\n");
+    out.push_str("  napi_value ret;\n");
+    out.push_str("  napi_get_undefined(env, &ret);\n");
+    out.push_str("  return ret;\n");
+    out.push_str("}\n\n");
+}
+
 fn async_cb_result_params_node(ret: Option<&TypeRef>, module: &str, prefix: &str) -> String {
     match ret {
         None => String::new(),
@@ -309,46 +835,15 @@ fn async_cb_result_params_node(ret: Option<&TypeRef>, module: &str, prefix: &str
     }
 }
 
-fn emit_async_resolve_value(
-    out: &mut String,
-    ret: Option<&TypeRef>,
-    module: &str,
-    prefix: &str,
-    structs: &HashMap<String, StructBinding>,
-) {
-    out.push_str("        napi_value val;\n");
-    match ret {
-        None => out.push_str("        napi_get_undefined(ctx->env, &val);\n"),
-        Some(TypeRef::I32) => out.push_str("        napi_create_int32(ctx->env, result, &val);\n"),
-        Some(TypeRef::U32) => out.push_str("        napi_create_uint32(ctx->env, result, &val);\n"),
-        Some(TypeRef::I64) => out.push_str("        napi_create_int64(ctx->env, result, &val);\n"),
-        Some(TypeRef::F64) => out.push_str("        napi_create_double(ctx->env, result, &val);\n"),
-        Some(TypeRef::Bool) => out.push_str("        napi_get_boolean(ctx->env, result, &val);\n"),
-        Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
-            out.push_str(
-                "        napi_create_string_utf8(ctx->env, result, NAPI_AUTO_LENGTH, &val);\n",
-            );
-        }
-        Some(TypeRef::TypedHandle(_) | TypeRef::Handle) => {
-            out.push_str("        napi_create_int64(ctx->env, (int64_t)(intptr_t)result, &val);\n");
-        }
-        Some(TypeRef::Struct(name)) => {
-            emit_struct_to_object(
-                out, "ctx->env", name, "result", "val", module, prefix, structs, "        ", true,
-            );
-        }
-        Some(TypeRef::Enum(_)) => {
-            out.push_str("        napi_create_int32(ctx->env, (int32_t)result, &val);\n");
-        }
-        Some(TypeRef::Iterator(_)) => {
-            out.push_str("        napi_create_int64(ctx->env, (int64_t)(intptr_t)result, &val);\n");
-        }
-        _ => out.push_str("        napi_get_undefined(ctx->env, &val);\n"),
-    }
-    out.push_str("        napi_resolve_deferred(ctx->env, ctx->deferred, val);\n");
-}
-
-fn render_async_callback(
+/// Emit the per-async-function machinery: a context struct carrying the
+/// promise + threadsafe function + deep-copied results, the producer-thread
+/// completion callback (which only copies and queues), and the JS-thread
+/// marshaller (which settles the promise).
+///
+/// The completion callback may fire on any thread, so it must never touch
+/// `napi_env`; the ref'd threadsafe function also keeps the event loop alive
+/// until the promise settles.
+fn render_async_machinery(
     out: &mut String,
     f: &FnBinding,
     c_name: &str,
@@ -356,22 +851,326 @@ fn render_async_callback(
     prefix: &str,
     structs: &HashMap<String, StructBinding>,
 ) {
+    let actx = format!("{c_name}_napi_actx");
     let cb_name = format!("{c_name}_napi_cb");
+    let calljs = format!("{c_name}_napi_settle");
     let cb_result = async_cb_result_params_node(f.ret.as_ref(), module, prefix);
 
+    // -- context struct --
+    out.push_str("typedef struct {\n");
+    out.push_str("    napi_deferred deferred;\n");
+    out.push_str("    napi_threadsafe_function tsfn;\n");
+    out.push_str("    int32_t err_code;\n");
+    out.push_str("    char* err_msg;\n");
+    match f.ret.as_ref() {
+        None => {}
+        Some(TypeRef::I32) => out.push_str("    int32_t result;\n"),
+        Some(TypeRef::U32) => out.push_str("    uint32_t result;\n"),
+        Some(TypeRef::I64) => out.push_str("    int64_t result;\n"),
+        Some(TypeRef::F64) => out.push_str("    double result;\n"),
+        Some(TypeRef::Bool) => out.push_str("    bool result;\n"),
+        Some(TypeRef::Enum(_)) => out.push_str("    int32_t result;\n"),
+        Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
+            out.push_str("    char* result;\n");
+            out.push_str("    int result_null;\n");
+        }
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
+            out.push_str("    uint8_t* result;\n");
+            out.push_str("    size_t result_len;\n");
+        }
+        Some(TypeRef::Handle) => out.push_str("    uint64_t result;\n"),
+        Some(TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Iterator(_)) => {
+            out.push_str("    void* result;\n")
+        }
+        Some(TypeRef::Optional(inner)) => match inner.as_ref() {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                out.push_str("    char* result;\n");
+                out.push_str("    int result_null;\n");
+            }
+            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+                out.push_str("    void* result;\n");
+            }
+            other => {
+                out.push_str("    int result_has;\n");
+                out.push_str(&format!(
+                    "    {} result;\n",
+                    c_elem_type(other, module, prefix)
+                ));
+            }
+        },
+        Some(TypeRef::List(inner)) => {
+            let elem = match inner.as_ref() {
+                TypeRef::StringUtf8 | TypeRef::BorrowedStr => "char*".to_string(),
+                other => c_elem_type(other, module, prefix),
+            };
+            out.push_str(&format!("    {elem}* result;\n"));
+            out.push_str("    size_t result_len;\n");
+        }
+        Some(TypeRef::Map(k, v)) => {
+            for (field, ty) in [("result_keys", k), ("result_values", v)] {
+                let elem = match ty.as_ref() {
+                    TypeRef::StringUtf8 | TypeRef::BorrowedStr => "char*".to_string(),
+                    other => c_elem_type(other, module, prefix),
+                };
+                out.push_str(&format!("    {elem}* {field};\n"));
+            }
+            out.push_str("    size_t result_len;\n");
+        }
+    }
+    out.push_str(&format!("}} {actx};\n\n"));
+
+    // -- producer-thread completion callback: deep-copy + queue --
     out.push_str(&format!(
         "static void {cb_name}(void* context, weaveffi_error* err{cb_result}) {{\n"
     ));
-    out.push_str("    weaveffi_napi_async_ctx* ctx = (weaveffi_napi_async_ctx*)context;\n");
+    out.push_str(&format!("    {actx}* ctx = ({actx}*)context;\n"));
     out.push_str("    if (err != NULL && err->code != 0) {\n");
+    out.push_str("        ctx->err_code = err->code;\n");
+    out.push_str(
+        "        ctx->err_msg = err->message ? strdup(err->message) : strdup(\"unknown error\");\n",
+    );
+    out.push_str("    } else {\n");
+    match f.ret.as_ref() {
+        None => {}
+        Some(
+            TypeRef::I32
+            | TypeRef::U32
+            | TypeRef::I64
+            | TypeRef::F64
+            | TypeRef::Bool
+            | TypeRef::Handle,
+        ) => {
+            out.push_str("        ctx->result = result;\n");
+        }
+        Some(TypeRef::Enum(_)) => {
+            out.push_str("        ctx->result = (int32_t)result;\n");
+        }
+        Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
+            out.push_str("        ctx->result_null = result == NULL;\n");
+            out.push_str("        ctx->result = result ? strdup(result) : NULL;\n");
+        }
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
+            out.push_str("        ctx->result_len = result_len;\n");
+            out.push_str(
+                "        if (result != NULL && result_len > 0) { ctx->result = (uint8_t*)malloc(result_len); memcpy(ctx->result, result, result_len); }\n",
+            );
+        }
+        // Ownership of struct/handle/iterator results transfers to the
+        // receiver, so the pointer stays valid across the thread hop.
+        Some(TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Iterator(_)) => {
+            out.push_str("        ctx->result = (void*)result;\n");
+        }
+        Some(TypeRef::Optional(inner)) => match inner.as_ref() {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                out.push_str("        ctx->result_null = result == NULL;\n");
+                out.push_str("        ctx->result = result ? strdup(result) : NULL;\n");
+            }
+            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+                out.push_str("        ctx->result = (void*)result;\n");
+            }
+            _ => {
+                out.push_str("        ctx->result_has = result != NULL;\n");
+                out.push_str("        if (result != NULL) ctx->result = *result;\n");
+            }
+        },
+        Some(TypeRef::List(inner)) => {
+            out.push_str("        ctx->result_len = result_len;\n");
+            match inner.as_ref() {
+                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                    out.push_str(
+                        "        if (result != NULL && result_len > 0) {\n            ctx->result = (char**)calloc(result_len, sizeof(char*));\n            for (size_t i = 0; i < result_len; i++) ctx->result[i] = result[i] ? strdup(result[i]) : NULL;\n        }\n",
+                    );
+                }
+                _ => {
+                    out.push_str(
+                        "        if (result != NULL && result_len > 0) { ctx->result = malloc(result_len * sizeof(*ctx->result)); memcpy(ctx->result, result, result_len * sizeof(*ctx->result)); }\n",
+                    );
+                }
+            }
+        }
+        Some(TypeRef::Map(k, v)) => {
+            out.push_str("        ctx->result_len = result_len;\n");
+            for (field, src, ty) in [
+                ("result_keys", "result_keys", k),
+                ("result_values", "result_values", v),
+            ] {
+                match ty.as_ref() {
+                    TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                        out.push_str(&format!(
+                            "        if ({src} != NULL && result_len > 0) {{\n            ctx->{field} = (char**)calloc(result_len, sizeof(char*));\n            for (size_t i = 0; i < result_len; i++) ctx->{field}[i] = {src}[i] ? strdup({src}[i]) : NULL;\n        }}\n"
+                        ));
+                    }
+                    _ => {
+                        out.push_str(&format!(
+                            "        if ({src} != NULL && result_len > 0) {{ ctx->{field} = malloc(result_len * sizeof(*ctx->{field})); memcpy(ctx->{field}, {src}, result_len * sizeof(*ctx->{field})); }}\n"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    out.push_str("    }\n");
+    out.push_str("    napi_call_threadsafe_function(ctx->tsfn, ctx, napi_tsfn_blocking);\n");
+    out.push_str("}\n\n");
+
+    // -- JS-thread marshaller: settle the promise, free, release --
+    out.push_str(&format!(
+        "static void {calljs}(napi_env env, napi_value js_cb, void* context, void* data) {{\n"
+    ));
+    out.push_str("    (void)js_cb;\n");
+    out.push_str("    (void)context;\n");
+    out.push_str(&format!("    {actx}* ctx = ({actx}*)data;\n"));
+    out.push_str("    if (env != NULL) {\n");
+    out.push_str("    if (ctx->err_code != 0) {\n");
     out.push_str("        napi_value err_msg;\n");
     out.push_str(
-        "        napi_create_string_utf8(ctx->env, err->message, NAPI_AUTO_LENGTH, &err_msg);\n",
+        "        napi_create_string_utf8(env, ctx->err_msg ? ctx->err_msg : \"\", NAPI_AUTO_LENGTH, &err_msg);\n",
     );
-    out.push_str("        napi_reject_deferred(ctx->env, ctx->deferred, err_msg);\n");
+    out.push_str("        napi_value err_obj;\n");
+    out.push_str("        napi_create_error(env, NULL, err_msg, &err_obj);\n");
+    out.push_str("        napi_value err_code;\n");
+    out.push_str("        napi_create_int32(env, ctx->err_code, &err_code);\n");
+    out.push_str("        napi_set_named_property(env, err_obj, \"code\", err_code);\n");
+    out.push_str("        napi_reject_deferred(env, ctx->deferred, err_obj);\n");
     out.push_str("    } else {\n");
-    emit_async_resolve_value(out, f.ret.as_ref(), module, prefix, structs);
+    out.push_str("        napi_value val;\n");
+    match f.ret.as_ref() {
+        None => out.push_str("        napi_get_undefined(env, &val);\n"),
+        Some(TypeRef::I32) => out.push_str("        napi_create_int32(env, ctx->result, &val);\n"),
+        Some(TypeRef::U32) => out.push_str("        napi_create_uint32(env, ctx->result, &val);\n"),
+        Some(TypeRef::I64) => out.push_str("        napi_create_int64(env, ctx->result, &val);\n"),
+        Some(TypeRef::F64) => out.push_str("        napi_create_double(env, ctx->result, &val);\n"),
+        Some(TypeRef::Bool) => out.push_str("        napi_get_boolean(env, ctx->result, &val);\n"),
+        Some(TypeRef::Enum(_)) => {
+            out.push_str("        napi_create_int32(env, ctx->result, &val);\n");
+        }
+        Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
+            out.push_str(
+                "        if (ctx->result_null) napi_get_null(env, &val); else napi_create_string_utf8(env, ctx->result ? ctx->result : \"\", NAPI_AUTO_LENGTH, &val);\n",
+            );
+        }
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
+            out.push_str(
+                "        napi_create_buffer_copy(env, ctx->result_len, ctx->result ? (const void*)ctx->result : (const void*)\"\", NULL, &val);\n",
+            );
+        }
+        Some(TypeRef::Handle) => {
+            out.push_str("        napi_create_int64(env, (int64_t)ctx->result, &val);\n");
+        }
+        Some(TypeRef::TypedHandle(_) | TypeRef::Iterator(_)) => {
+            out.push_str("        napi_create_int64(env, (int64_t)(intptr_t)ctx->result, &val);\n");
+        }
+        Some(TypeRef::Struct(name)) => {
+            emit_struct_to_object(
+                out,
+                "env",
+                name,
+                "ctx->result",
+                "val",
+                module,
+                prefix,
+                structs,
+                "        ",
+                true,
+            );
+        }
+        Some(TypeRef::Optional(inner)) => match inner.as_ref() {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                out.push_str(
+                    "        if (ctx->result_null) napi_get_null(env, &val); else napi_create_string_utf8(env, ctx->result ? ctx->result : \"\", NAPI_AUTO_LENGTH, &val);\n",
+                );
+            }
+            TypeRef::Struct(name) => {
+                out.push_str(
+                    "        if (ctx->result == NULL) { napi_get_null(env, &val); } else {\n",
+                );
+                emit_struct_to_object(
+                    out,
+                    "env",
+                    name,
+                    "ctx->result",
+                    "val",
+                    module,
+                    prefix,
+                    structs,
+                    "            ",
+                    true,
+                );
+                out.push_str("        }\n");
+            }
+            TypeRef::TypedHandle(_) => {
+                out.push_str(
+                    "        if (ctx->result == NULL) napi_get_null(env, &val); else napi_create_int64(env, (int64_t)(intptr_t)ctx->result, &val);\n",
+                );
+            }
+            other => {
+                let leaf = payload_leaf_to_napi(other, "ctx->result", "val");
+                out.push_str(&format!(
+                    "        if (ctx->result_has) {{ {leaf} }} else napi_get_null(env, &val);\n"
+                ));
+            }
+        },
+        Some(TypeRef::List(inner)) => {
+            out.push_str("        napi_create_array(env, &val);\n");
+            out.push_str(
+                "        for (size_t i = 0; ctx->result != NULL && i < ctx->result_len; i++) {\n",
+            );
+            out.push_str("            napi_value elem;\n");
+            let leaf = payload_elem_to_napi(inner, "ctx->result[i]", "elem");
+            out.push_str(&format!("            {leaf}\n"));
+            out.push_str("            napi_set_element(env, val, (uint32_t)i, elem);\n");
+            out.push_str("        }\n");
+        }
+        Some(TypeRef::Map(k, v)) => {
+            out.push_str("        napi_create_object(env, &val);\n");
+            out.push_str(
+                "        for (size_t i = 0; ctx->result_keys != NULL && ctx->result_values != NULL && i < ctx->result_len; i++) {\n",
+            );
+            out.push_str("            napi_value mk; napi_value mv;\n");
+            let kc = payload_elem_to_napi(k, "ctx->result_keys[i]", "mk");
+            let vc = payload_elem_to_napi(v, "ctx->result_values[i]", "mv");
+            out.push_str(&format!("            {kc}\n"));
+            out.push_str(&format!("            {vc}\n"));
+            out.push_str("            napi_set_property(env, val, mk, mv);\n");
+            out.push_str("        }\n");
+        }
+    }
+    out.push_str("        napi_resolve_deferred(env, ctx->deferred, val);\n");
     out.push_str("    }\n");
+    out.push_str("    }\n");
+    out.push_str("    free(ctx->err_msg);\n");
+    match f.ret.as_ref() {
+        Some(
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr | TypeRef::Bytes | TypeRef::BorrowedBytes,
+        ) => {
+            out.push_str("    free(ctx->result);\n");
+        }
+        Some(TypeRef::Optional(inner))
+            if matches!(inner.as_ref(), TypeRef::StringUtf8 | TypeRef::BorrowedStr) =>
+        {
+            out.push_str("    free(ctx->result);\n");
+        }
+        Some(TypeRef::List(inner)) => {
+            if matches!(inner.as_ref(), TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
+                out.push_str(
+                    "    for (size_t i = 0; ctx->result != NULL && i < ctx->result_len; i++) free(ctx->result[i]);\n",
+                );
+            }
+            out.push_str("    free(ctx->result);\n");
+        }
+        Some(TypeRef::Map(k, v)) => {
+            for (field, ty) in [("result_keys", k), ("result_values", v)] {
+                if matches!(ty.as_ref(), TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
+                    out.push_str(&format!(
+                        "    for (size_t i = 0; ctx->{field} != NULL && i < ctx->result_len; i++) free(ctx->{field}[i]);\n"
+                    ));
+                }
+                out.push_str(&format!("    free(ctx->{field});\n"));
+            }
+        }
+        _ => {}
+    }
+    out.push_str("    napi_release_threadsafe_function(ctx->tsfn, napi_tsfn_release);\n");
     out.push_str("    free(ctx);\n");
     out.push_str("}\n\n");
 }
@@ -408,12 +1207,20 @@ fn render_async_napi_body(
         );
     }
 
-    out.push_str(
-        "  weaveffi_napi_async_ctx* ctx = (weaveffi_napi_async_ctx*)malloc(sizeof(weaveffi_napi_async_ctx));\n",
-    );
-    out.push_str("  ctx->env = env;\n");
+    let actx = format!("{c_name}_napi_actx");
+    out.push_str(&format!(
+        "  {actx}* ctx = ({actx}*)calloc(1, sizeof({actx}));\n"
+    ));
     out.push_str("  napi_value promise;\n");
     out.push_str("  napi_create_promise(env, &ctx->deferred, &promise);\n");
+    out.push_str("  napi_value resource_name;\n");
+    out.push_str(&format!(
+        "  napi_create_string_utf8(env, \"{c_name}\", NAPI_AUTO_LENGTH, &resource_name);\n"
+    ));
+    // Ref'd (unlike listeners): a pending promise must keep the loop alive.
+    out.push_str(&format!(
+        "  napi_create_threadsafe_function(env, NULL, NULL, resource_name, 0, 1, NULL, NULL, NULL, {c_name}_napi_settle, &ctx->tsfn);\n"
+    ));
 
     if f.cancellable {
         c_args.push("NULL".into());
@@ -1704,6 +2511,32 @@ fn render_node_dts(
             out.push_str("}\n");
         }
         out.push_str(&format!("// module {}\n", m.path));
+        for l in &m.listeners {
+            let Some(cb) = m.callback(&l.event_callback) else {
+                continue;
+            };
+            let cb_params: Vec<String> = cb
+                .params
+                .iter()
+                .map(|p| format!("{}: {}", p.name, ts_type_for(&p.ty)))
+                .collect();
+            let register = wrapper_name(
+                &m.path,
+                &format!("register_{}", l.name),
+                strip_module_prefix,
+            );
+            let unregister = wrapper_name(
+                &m.path,
+                &format!("unregister_{}", l.name),
+                strip_module_prefix,
+            );
+            emit_doc(&mut out, &l.doc, "");
+            out.push_str(&format!(
+                "export function {register}(callback: ({}) => void): number\n",
+                cb_params.join(", ")
+            ));
+            out.push_str(&format!("export function {unregister}(id: number): void\n"));
+        }
         for f in &m.functions {
             let params: Vec<String> = f
                 .params
@@ -1746,7 +2579,7 @@ mod tests {
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules,
             generators: None,
             package: None,
@@ -1764,6 +2597,71 @@ mod tests {
             errors: None,
             modules: vec![],
         }
+    }
+
+    #[test]
+    fn listeners_generate_tsfn_register_unregister() {
+        use weaveffi_ir::ir::{CallbackDef, ListenerDef};
+        let api = make_api(vec![Module {
+            name: "events".into(),
+            functions: vec![],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![CallbackDef {
+                name: "OnMessage".into(),
+                doc: None,
+                params: vec![Param {
+                    name: "message".into(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                    doc: None,
+                }],
+            }],
+            listeners: vec![ListenerDef {
+                name: "message_listener".into(),
+                event_callback: "OnMessage".into(),
+                doc: None,
+            }],
+            errors: None,
+            modules: vec![],
+        }]);
+        let dir = tempfile::tempdir().unwrap();
+        let out = Utf8Path::from_path(dir.path()).unwrap();
+        NodeGenerator
+            .generate(&api, out, &NodeConfig::default())
+            .unwrap();
+        let addon = std::fs::read_to_string(dir.path().join("node/weaveffi_addon.c")).unwrap();
+        assert!(
+            addon.contains("napi_create_threadsafe_function"),
+            "listeners must use threadsafe functions: {addon}"
+        );
+        assert!(
+            addon.contains("Napi_weaveffi_events_register_message_listener"),
+            "register N-API fn missing: {addon}"
+        );
+        assert!(
+            addon.contains("Napi_weaveffi_events_unregister_message_listener"),
+            "unregister N-API fn missing: {addon}"
+        );
+        assert!(
+            addon.contains("napi_call_threadsafe_function(ctx->tsfn, p, napi_tsfn_nonblocking)"),
+            "trampoline must queue payloads: {addon}"
+        );
+        assert!(
+            addon.contains("napi_unref_threadsafe_function"),
+            "tsfn must be unref'd so listeners don't pin the loop: {addon}"
+        );
+        let dts = std::fs::read_to_string(dir.path().join("node/types.d.ts")).unwrap();
+        assert!(
+            dts.contains(
+                "export function events_register_message_listener(callback: (message: string) => void): number"
+            ),
+            "register dts missing: {dts}"
+        );
+        assert!(
+            dts.contains("export function events_unregister_message_listener(id: number): void"),
+            "unregister dts missing: {dts}"
+        );
     }
 
     #[test]
@@ -2949,8 +3847,8 @@ mod tests {
             "async callback should call napi_reject_deferred: {addon}"
         );
         assert!(
-            addon.contains("weaveffi_napi_async_ctx"),
-            "async addon should define async context struct: {addon}"
+            addon.contains("weaveffi_tasks_run_napi_actx"),
+            "async addon should define per-fn async context struct: {addon}"
         );
         assert!(
             addon.contains("weaveffi_tasks_run_async("),
@@ -2960,13 +3858,23 @@ mod tests {
             addon.contains("weaveffi_tasks_run_napi_cb"),
             "async addon should define the callback: {addon}"
         );
+        // The completion callback may fire on any producer thread, so it must
+        // queue through a threadsafe function instead of touching napi_env.
+        assert!(
+            addon.contains("napi_call_threadsafe_function(ctx->tsfn, ctx, napi_tsfn_blocking)"),
+            "completion callback must hop to the JS thread via tsfn: {addon}"
+        );
+        assert!(
+            !addon.contains("napi_resolve_deferred(ctx->env"),
+            "deferred must never be settled from the producer thread: {addon}"
+        );
     }
 
-    /// The N-API deferred is created with `napi_create_promise` and consumed
-    /// (and freed) by exactly one of `napi_resolve_deferred` /
-    /// `napi_reject_deferred`. The async context struct that carries the
-    /// deferred across the C callback boundary must be `malloc`-ed once and
-    /// `free`-d exactly once on the callback path.
+    /// The N-API deferred is created with `napi_create_promise` and settled
+    /// (on the JS thread) by exactly one of `napi_resolve_deferred` /
+    /// `napi_reject_deferred`. The per-fn async context that carries the
+    /// deferred + threadsafe function across threads must be allocated once
+    /// and freed exactly once, and the tsfn released exactly once.
     #[test]
     fn node_async_pins_callback_for_lifetime() {
         let api = make_api(vec![{
@@ -2992,10 +3900,13 @@ mod tests {
         let create_count = addon.matches("napi_create_promise").count();
         let resolve_count = addon.matches("napi_resolve_deferred").count();
         let reject_count = addon.matches("napi_reject_deferred").count();
-        let malloc_count = addon
-            .matches("malloc(sizeof(weaveffi_napi_async_ctx))")
+        let alloc_count = addon
+            .matches("calloc(1, sizeof(weaveffi_tasks_run_napi_actx))")
             .count();
         let free_count = addon.matches("free(ctx);").count();
+        let release_count = addon
+            .matches("napi_release_threadsafe_function(ctx->tsfn, napi_tsfn_release);")
+            .count();
         assert_eq!(
             create_count, 1,
             "expected one napi_create_promise per async fn, got {create_count}: {addon}"
@@ -3009,8 +3920,12 @@ mod tests {
             "expected one napi_reject_deferred per async fn, got {reject_count}: {addon}"
         );
         assert_eq!(
-            malloc_count, free_count,
-            "ctx malloc / free must balance per async fn: malloc={malloc_count} free={free_count}: {addon}"
+            alloc_count, free_count,
+            "ctx alloc / free must balance per async fn: alloc={alloc_count} free={free_count}: {addon}"
+        );
+        assert_eq!(
+            release_count, 1,
+            "tsfn must be released exactly once per async fn, got {release_count}: {addon}"
         );
     }
 

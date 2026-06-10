@@ -88,6 +88,36 @@ func main() {
 	expect(st.TotalEntries() == 2, "stats total entries == 2")
 	st.Close()
 
+	// Eviction listener: delete fires the //export trampoline synchronously
+	// on the deleting goroutine's thread.
+	var evicted []string
+	sub := wv.KvRegisterEvictionListener(func(key string) {
+		evicted = append(evicted, key)
+	})
+	expect(sub > 0, "listener id positive")
+	ok, err = wv.KvDelete(store, "beta")
+	expect(err == nil && ok, "delete beta")
+	expect(len(evicted) == 1 && evicted[0] == "beta",
+		fmt.Sprintf("eviction fired for beta (got %v)", evicted))
+
+	// Unregister stops delivery.
+	wv.KvUnregisterEvictionListener(sub)
+	ok, err = wv.KvDelete(store, "alpha")
+	expect(err == nil && ok, "delete alpha")
+	expect(len(evicted) == 1, fmt.Sprintf("no eviction after unregister (got %v)", evicted))
+
+	// Async: an immediately-expired entry gives compact 3 bytes to reclaim;
+	// the cgo trampoline bridges the producer's worker thread to a channel.
+	ok, err = wv.KvPut(store, "doomed", payload, wv.EntryKindVolatile, ptrInt64(0))
+	expect(err == nil && ok, "put doomed")
+	reclaimed, err := wv.KvCompactAsync(store)
+	expect(err == nil, "compact async")
+	expect(reclaimed == 3, fmt.Sprintf("compact reclaimed 3 bytes (got %d)", reclaimed))
+	n, err = wv.KvCount(store)
+	expect(err == nil && n == 0, "store empty after deletes + compact")
+
 	store.Close()
 	fmt.Println("go/kvstore: OK")
 }
+
+func ptrInt64(v int64) *int64 { return &v }

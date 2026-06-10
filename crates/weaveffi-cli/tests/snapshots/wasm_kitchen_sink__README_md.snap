@@ -46,6 +46,19 @@ export the following functions:
 - `weaveffi_alloc(size: i32) -> i32` — allocate `size` bytes in linear memory
 - `weaveffi_error_clear(err_ptr: i32)` — clear and free error resources
 
+## Unsupported Features
+
+This IDL uses features the wasm target does not support (generated because
+`allow_unsupported` is set). Single-threaded `wasm32-unknown-unknown` has no
+producer thread to deliver events from, so:
+
+- **callbacks**: kitchen.OnReady
+- **listeners**: kitchen.ready_listener
+
+The TypeScript declarations omit these entry points; the JS module exposes
+explicit stubs that throw on call. Use a native target (node, python, …) when
+you need them.
+
 ## API Reference
 
 ### Module: `shared`

@@ -15,6 +15,9 @@ class WeaveFFI {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
+        /** Subscribe to per-key eviction notifications */
+        @JvmStatic external fun kv_register_eviction_listener(callback: (String) -> Unit): Long
+        @JvmStatic external fun kv_unregister_eviction_listener(id: Long)
         /**
          * Open (or create) a store backed by the given filesystem path
          */
@@ -34,7 +37,7 @@ class WeaveFFI {
          * Look up an entry by key; returns null if missing or expired
          */
         @JvmStatic private external fun kv_getJni(store: Long, key: String): Long?
-        @JvmStatic fun kv_get(store: Store, key: String): Long? = kv_getJni(store.handle, key)
+        @JvmStatic fun kv_get(store: Store, key: String): Entry? = kv_getJni(store.handle, key)?.let { Entry(it) }
         /**
          * Remove the entry for the given key, returning true if it existed
          */
@@ -58,9 +61,9 @@ class WeaveFFI {
         /**
          * Reclaim space asynchronously; returns the number of bytes reclaimed
          */
-        @JvmStatic private external fun kv_compact_asyncAsync(store: Store, cancelToken: Long, callback: Any)
+        @JvmStatic private external fun kv_compact_asyncAsync(store: Long, cancelToken: Long, callback: Any)
         @JvmStatic suspend fun kv_compact_async(store: Store): Long = suspendCancellableCoroutine { cont ->
-            kv_compact_asyncAsync(store, 0L, WeaveContinuation(cont))
+            kv_compact_asyncAsync(store.handle, 0L, WeaveContinuation(cont))
         }
         /**
          * Legacy single-shot put kept for compatibility
@@ -72,7 +75,7 @@ class WeaveFFI {
          * Snapshot the current store statistics
          */
         @JvmStatic private external fun kv_stats_get_statsJni(store: Long): Long
-        @JvmStatic fun kv_stats_get_stats(store: Store): Long = kv_stats_get_statsJni(store.handle)
+        @JvmStatic fun kv_stats_get_stats(store: Store): Stats = Stats(kv_stats_get_statsJni(store.handle))
     }
 }
 

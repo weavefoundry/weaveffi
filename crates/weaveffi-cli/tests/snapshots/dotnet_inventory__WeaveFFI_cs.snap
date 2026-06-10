@@ -92,7 +92,7 @@ namespace WeaveFFI
                 var ptr = NativeMethods.weaveffi_products_Product_get_name(_handle);
                 var str = WeaveFFIHelpers.PtrToString(ptr);
                 NativeMethods.weaveffi_free_string(ptr);
-                return str;
+                return str ?? "";
             }
         }
 
@@ -130,7 +130,12 @@ namespace WeaveFFI
             {
                 var ptr = NativeMethods.weaveffi_products_Product_get_tags(_handle, out var len);
                 if (ptr == IntPtr.Zero) return Array.Empty<string>();
-                return Array.Empty<string>();
+                var arr = new string[(int)len];
+                for (int i = 0; i < (int)len; i++)
+                {
+                    arr[i] = Marshal.PtrToStringUTF8(Marshal.ReadIntPtr(ptr, i * IntPtr.Size)) ?? "";
+                }
+                return arr;
             }
         }
 
@@ -252,7 +257,7 @@ namespace WeaveFFI
                 var ptr = NativeMethods.weaveffi_orders_Order_get_status(_handle);
                 var str = WeaveFFIHelpers.PtrToString(ptr);
                 NativeMethods.weaveffi_free_string(ptr);
-                return str;
+                return str ?? "";
             }
         }
 
@@ -431,9 +436,19 @@ namespace WeaveFFI
         public static ulong OrdersCreateOrder(OrderItem[] items)
         {
             var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_orders_create_order(items, ref err);
-            WeaveFFIError.Check(err);
-            return result;
+            var itemsArr = new IntPtr[items.Length];
+            for (var itemsIt = 0; itemsIt < items.Length; itemsIt++) itemsArr[itemsIt] = IntPtr.Zero;
+            var itemsPin = GCHandle.Alloc(itemsArr, GCHandleType.Pinned);
+            try
+            {
+                var result = NativeMethods.weaveffi_orders_create_order(items.Length == 0 ? IntPtr.Zero : itemsPin.AddrOfPinnedObject(), (UIntPtr)items.Length, ref err);
+                WeaveFFIError.Check(err);
+                return result;
+            }
+            finally
+            {
+                itemsPin.Free();
+            }
         }
 
         public static Order OrdersGetOrder(ulong id)

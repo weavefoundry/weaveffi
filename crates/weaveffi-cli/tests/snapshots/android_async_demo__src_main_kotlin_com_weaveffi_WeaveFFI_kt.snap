@@ -16,8 +16,11 @@ class WeaveFFI {
         init { System.loadLibrary("weaveffi") }
 
         @JvmStatic private external fun tasks_run_taskAsync(name: String, callback: Any)
-        @JvmStatic suspend fun tasks_run_task(name: String): Long = suspendCancellableCoroutine { cont ->
-            tasks_run_taskAsync(name, WeaveContinuation(cont))
+        @JvmStatic suspend fun tasks_run_task(name: String): TaskResult {
+            val raw: Long = suspendCancellableCoroutine { cont ->
+                tasks_run_taskAsync(name, WeaveContinuation(cont))
+            }
+            return TaskResult(raw)
         }
         @JvmStatic private external fun tasks_run_batchAsync(names: Array<String>, callback: Any)
         @JvmStatic suspend fun tasks_run_batch(names: Array<String>): LongArray = suspendCancellableCoroutine { cont ->

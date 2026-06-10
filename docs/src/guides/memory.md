@@ -87,6 +87,14 @@ Structs are opaque on the consumer side. The lifecycle is:
    `f64`, `bool`) return values directly. String/bytes getters return
    **new owned copies** that must be freed.
 
+Functions that take a `handle<T>` parameter always **borrow** it — the
+producer must never free a handle it receives, even for `close`-style
+functions. The only function that frees a handle is its `*_destroy`
+symbol. Generated wrappers call `*_destroy` automatically (Swift
+`deinit`, Python `__del__`, Ruby `FFI::AutoPointer`, ...), so a
+producer that frees a handle inside an ordinary function causes a
+double-free as soon as the wrapper is garbage collected.
+
 ```c
 weaveffi_error err = {0, NULL};
 

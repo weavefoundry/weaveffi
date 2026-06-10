@@ -2,21 +2,22 @@
 //
 // Exercises the struct-materialization paths the JNI layer previously stubbed or
 // mis-marshalled: the `ByteArray` bytes getter (`Entry.value`), the `Long?`
-// nullable-scalar getter (`Entry.expiresAt`), the `Array<String>` list getter
+// nullable-scalar getter (`Entry.expires_at`), the `Array<String>` list getter
 // (`Entry.tags`) and the `Map<String,String>` map getter (`Entry.metadata`) over
 // the triple-pointer ABI. Also covers the iterator-backed `kv_list_keys`
 // (drained into a Kotlin `Iterator`), the typed-handle return of `kv_open_store`
-// (re-wrapped into `Store`), the `EntryBuilder` (optional fields pass through),
-// and the `kv.stats` submodule. Compiled in-module with the generated
-// `WeaveFFI.kt`, so the `internal` `Entry`/`Stats` constructors are reachable.
+// (re-wrapped into `Store`), the wrapped struct returns of `kv_get` (`Entry?`)
+// and `kv_stats_get_stats` (`Stats`), the `EntryBuilder`, the JNI eviction
+// listener (register → fire → unregister), and the suspend `kv_compact_async`
+// (coroutine resumed from the producer's worker thread). Compiled in-module
+// with the generated `WeaveFFI.kt`, so `internal` constructors are reachable.
 @file:JvmName("Main")
 
-import com.weaveffi.Entry
 import com.weaveffi.EntryBuilder
 import com.weaveffi.EntryKind
-import com.weaveffi.Stats
 import com.weaveffi.WeaveFFI
 import kotlin.system.exitProcess
+import kotlinx.coroutines.runBlocking
 
 fun expect(cond: Boolean, msg: String) {
     if (!cond) {
@@ -39,11 +40,10 @@ fun main() {
     keys.sort()
     expect(keys == listOf("alpha", "beta"), "list_keys values")
 
-    // Optional struct return -> nullable raw handle -> wrap in Entry.
-    val alphaHandle = WeaveFFI.kv_get(store, "alpha")
-    expect(alphaHandle != null, "get alpha present")
-    val alpha = Entry(alphaHandle!!)
-    expect(alpha.id > 0, "entry id positive")
+    // Optional struct return arrives as a wrapped `Entry?`.
+    val alpha = WeaveFFI.kv_get(store, "alpha")
+    expect(alpha != null, "get alpha present")
+    expect(alpha!!.id > 0, "entry id positive")
     expect(alpha.key == "alpha", "entry key")
 
     // Bytes getter -> ByteArray.
@@ -57,8 +57,8 @@ fun main() {
     expect(alpha.tags.isEmpty(), "alpha tags empty")
     expect(alpha.metadata.isEmpty(), "alpha metadata empty")
 
-    val beta = Entry(WeaveFFI.kv_get(store, "beta")!!)
-    expect(beta.expires_at != null && beta.expires_at!! > 0L, "beta expires_at present")
+    val beta = WeaveFFI.kv_get(store, "beta")
+    expect(beta != null && beta.expires_at != null && beta.expires_at!! > 0L, "beta expires_at present")
 
     // Builder carries a non-empty list + map so the list/map getters return
     // producer-allocated arrays (the case the triple-pointer ABI redesign fixes).
@@ -93,9 +93,29 @@ fun main() {
     expect(empty.metadata.isEmpty(), "empty metadata")
     expect(empty.expires_at == 99L, "empty expires_at present")
 
-    // kv.stats submodule.
-    val stats = Stats(WeaveFFI.kv_stats_get_stats(store))
+    // kv.stats submodule: wrapped struct return.
+    val stats = WeaveFFI.kv_stats_get_stats(store)
     expect(stats.total_entries == 2L, "stats total entries == 2")
+
+    // Eviction listener: deleting an existing key fires OnEvict synchronously
+    // through the JNI trampoline (producer thread == caller thread here).
+    val evicted = mutableListOf<String>()
+    val sub = WeaveFFI.kv_register_eviction_listener { key -> evicted.add(key) }
+    expect(sub > 0L, "listener id positive")
+    expect(WeaveFFI.kv_delete(store, "beta"), "delete beta")
+    expect(evicted == listOf("beta"), "eviction fired for beta (got $evicted)")
+
+    // Unregister stops delivery.
+    WeaveFFI.kv_unregister_eviction_listener(sub)
+    expect(WeaveFFI.kv_delete(store, "alpha"), "delete alpha")
+    expect(evicted == listOf("beta"), "no eviction after unregister (got $evicted)")
+
+    // Suspend async: an immediately-expired entry gives compact 3 bytes to
+    // reclaim; the continuation resumes from the producer's worker thread.
+    expect(WeaveFFI.kv_put(store, "doomed", payload, EntryKind.Volatile, 0L), "put doomed")
+    val reclaimed = runBlocking { WeaveFFI.kv_compact_async(store) }
+    expect(reclaimed == 3L, "compact reclaimed 3 bytes (got $reclaimed)")
+    expect(WeaveFFI.kv_count(store) == 0L, "store empty after deletes + compact")
 
     println("kotlin/kvstore: OK")
 }

@@ -357,7 +357,7 @@ mod tests {
 
     fn minimal_api(functions: Vec<Function>, structs: Vec<StructDef>) -> Api {
         Api {
-            version: "0.1.0".to_string(),
+            version: "0.3.0".to_string(),
             modules: vec![Module {
                 name: "calc".to_string(),
                 functions,
@@ -939,7 +939,7 @@ mod tests {
         // symbols must use the underscore-joined module path so they line up
         // with the generated bindings.
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "graphics".into(),
                 functions: vec![],
@@ -1002,7 +1002,7 @@ mod tests {
         // (e.g. `shared.Token`). The scaffold must flatten it to the owning
         // module's C symbol, never embed the dot or the referrer's module.
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "kitchen".into(),
                 functions: vec![Function {
@@ -1043,7 +1043,7 @@ mod tests {
     #[test]
     fn scaffold_multiple_modules() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![
                 Module {
                     name: "math".into(),

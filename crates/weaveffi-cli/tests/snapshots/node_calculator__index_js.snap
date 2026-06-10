@@ -5,6 +5,14 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // DO NOT EDIT — your changes will be overwritten.
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
-module.exports = require('./index.node')
+// Prefer the default node-gyp output path; fall back to a
+// prebuilt index.node placed next to this file.
+let addon;
+try {
+  addon = require('./build/Release/weaveffi.node');
+} catch (e) {
+  addon = require('./index.node');
+}
+module.exports = addon;
 
 // END index.js

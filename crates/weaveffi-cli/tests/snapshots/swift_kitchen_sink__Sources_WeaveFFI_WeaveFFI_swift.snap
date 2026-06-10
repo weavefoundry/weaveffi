@@ -59,6 +59,14 @@ private final class ContinuationRef<T> {
     init(_ value: CheckedContinuation<T, Error>) { self.value = value }
 }
 
+final class WvCallbackBox<T> {
+    let value: T
+    init(_ value: T) { self.value = value }
+}
+
+var wvListenerContexts: [UInt64: UnsafeMutableRawPointer] = [:]
+let wvListenerLock = NSLock()
+
 /// A reusable token referenced across modules
 public class Token {
     let ptr: OpaquePointer
@@ -337,6 +345,30 @@ public class ItemBuilder {
 }
 
 public enum Kitchen {
+    /// Subscribe to OnReady events
+    /// - Returns: A subscription id for ``kitchen_unregister_ready_listener(_:)``.
+    public static func kitchen_register_ready_listener(_ callback: @escaping (Int32, String) -> Void) -> UInt64 {
+        let box = WvCallbackBox(callback)
+        let ctx = Unmanaged.passRetained(box).toOpaque()
+        let id = weaveffi_kitchen_register_ready_listener({ code, msg, context in
+            let cb = Unmanaged<WvCallbackBox<(Int32, String) -> Void>>.fromOpaque(context!).takeUnretainedValue().value
+            cb(code, String(cString: msg!))
+        }, ctx)
+        wvListenerLock.lock()
+        wvListenerContexts[id] = ctx
+        wvListenerLock.unlock()
+        return id
+    }
+    /// Unregisters a listener previously registered with ``kitchen_register_ready_listener(_:)``.
+    public static func kitchen_unregister_ready_listener(_ id: UInt64) {
+        weaveffi_kitchen_unregister_ready_listener(id)
+        wvListenerLock.lock()
+        let ctx = wvListenerContexts.removeValue(forKey: id)
+        wvListenerLock.unlock()
+        if let ctx = ctx {
+            Unmanaged<WvCallbackBox<(Int32, String) -> Void>>.fromOpaque(ctx).release()
+        }
+    }
     /// Identity for bool
     public static func kitchen_bool_id(_ x: Bool) throws -> Bool {
         var err = weaveffi_error(code: 0, message: nil)

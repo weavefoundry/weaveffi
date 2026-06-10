@@ -1,5 +1,5 @@
 const GENERATOR_DOCS_YAML: &str = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: contacts
     enums:
@@ -409,7 +409,7 @@ fn readme_quickstart_generates_c_header() {
 }
 
 const GETTING_STARTED_YAML: &str = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: math
     structs:
@@ -598,7 +598,6 @@ fn readme_cli_reference_lists_every_subcommand() {
         "weaveffi extract",
         "weaveffi format",
         "weaveffi watch",
-        "weaveffi upgrade",
         "weaveffi schema ",
         "weaveffi schema-version",
         "weaveffi doctor",

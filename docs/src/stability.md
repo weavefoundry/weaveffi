@@ -36,9 +36,8 @@ After the 1.0.0 release, the following surfaces will be governed by SemVer:
 
 While the workspace is at `0.x`, **everything** above may change without
 warning. In practice we try to keep breaking changes batched (one batch per
-minor release, with a schema-version bump and a `weaveffi upgrade`
-migration), but the contract is "no contract." Things that have already
-changed during 0.x:
+minor release, with a schema-version bump), but the contract is "no
+contract." Things that have already changed during 0.x:
 
 - IR type-reference syntax (`callback` was removed in `0.3.0`).
 - The `Generator` trait gained `generate_with_config` in `0.3.0`, then
@@ -76,33 +75,20 @@ In short: nothing disappears in a patch release, nothing disappears without
 at least one minor release of warnings, and every removal ships with a
 documented replacement.
 
-## IR schema migration policy
+## IR schema version policy
 
 The IR schema version is independent of the workspace version, but it is
 tied to `weaveffi-ir`'s minor version: each `weaveffi-ir` minor bump
 corresponds to at most one schema version bump.
 [`CURRENT_SCHEMA_VERSION`](https://github.com/weavefoundry/weaveffi/blob/main/crates/weaveffi-ir/src/ir.rs)
-in `crates/weaveffi-ir/src/ir.rs` is the source of truth. The supported
-versions list (`SUPPORTED_VERSIONS`) names every schema version the parser
-can read.
+in `crates/weaveffi-ir/src/ir.rs` is the source of truth.
 
-The migration guarantee:
-
-- `weaveffi upgrade <file>` always supports **N-1 → N**. If you skip a
-  release, run `weaveffi upgrade` repeatedly (or pin to the intermediate
-  version once, upgrade, then upgrade again) — the upgrader chains
-  migrations in order through every version in `SUPPORTED_VERSIONS`.
-- The upgrader is idempotent. Running it on an already-current file prints
-  `Already up to date (version X.Y.Z).` and exits 0.
-- The upgrader exits non-zero in `--check` mode if migrations would
-  rewrite the file, so you can wire it into CI:
-
-```bash
-weaveffi upgrade idl/api.yml --check
-```
-
-Schema version bumps are documented in `CHANGELOG.md` with a "Migration"
-section explaining what the upgrader rewrote.
+Pre-1.0, **only the current schema version is accepted**
+(`SUPPORTED_VERSIONS` contains exactly `CURRENT_SCHEMA_VERSION`). When a
+schema bump lands, update the `version` field in your IDL and adjust the
+document to the new schema — the changes are documented in `CHANGELOG.md`
+with a "Migration" section. Post-1.0, schema bumps will ship with an
+automated migration tool and a widened `SUPPORTED_VERSIONS` window.
 
 ## Generated-code stability (determinism)
 

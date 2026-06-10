@@ -35,6 +35,7 @@ layer bridges them to the C ABI.
 | `[i32]`        | `IntArray`             | `IntArray`            | `jintArray`    |
 | `[i64]`        | `LongArray`            | `LongArray`           | `jlongArray`   |
 | `[string]`     | `Array<String>`        | `Array<String>`       | `jobjectArray` |
+| `iter<T>`      | `Iterator<T>`          | `Iterator<T>`         | `jobject`      |
 
 ## Example IDL → generated code
 
@@ -68,7 +69,12 @@ modules:
 ```
 
 The Kotlin wrapper declares `external fun` entries inside a companion
-object and loads the JNI library on first use:
+object and loads the JNI library on first use. Function names are
+prefixed with the module name. Where a parameter or return value needs
+wrapping (enums, structs), the external entry is a private `...Jni`
+function with lowered types and a public wrapper converts at the
+boundary — struct returns come back as handles and are wrapped in the
+struct class; `[Contact]` stays a `LongArray` of handles:
 
 ```kotlin
 package com.weaveffi
@@ -76,8 +82,11 @@ package com.weaveffi
 class WeaveFFI {
     companion object {
         init { System.loadLibrary("weaveffi") }
-        @JvmStatic external fun get_contact(id: Int): Long
-        @JvmStatic external fun find_by_type(contact_type: Int): LongArray
+
+        @JvmStatic private external fun contacts_get_contactJni(id: Int): Long
+        @JvmStatic fun contacts_get_contact(id: Int): Contact = Contact(contacts_get_contactJni(id))
+        @JvmStatic private external fun contacts_find_by_typeJni(contact_type: Int): LongArray
+        @JvmStatic fun contacts_find_by_type(contact_type: ContactType): LongArray = contacts_find_by_typeJni(contact_type.value)
     }
 }
 ```
@@ -96,16 +105,19 @@ enum class ContactType(val value: Int) {
 }
 ```
 
-Structs are wrapped in a Kotlin class implementing `Closeable`:
+Structs are wrapped in a Kotlin class implementing `Closeable`, with a
+`finalize()` safety net:
 
 ```kotlin
-class Contact internal constructor(private var handle: Long) : java.io.Closeable {
+class Contact internal constructor(internal var handle: Long) : java.io.Closeable {
     companion object {
         init { System.loadLibrary("weaveffi") }
+
         @JvmStatic external fun nativeCreate(name: String, age: Int): Long
         @JvmStatic external fun nativeDestroy(handle: Long)
         @JvmStatic external fun nativeGetName(handle: Long): String
         @JvmStatic external fun nativeGetAge(handle: Long): Int
+
         fun create(name: String, age: Int): Contact = Contact(nativeCreate(name, age))
     }
 
@@ -118,23 +130,30 @@ class Contact internal constructor(private var handle: Long) : java.io.Closeable
             handle = 0L
         }
     }
+
+    protected fun finalize() {
+        close()
+    }
 }
 ```
 
 The JNI shims (`weaveffi_jni.c`) bridge each Kotlin `external fun` into
-the C ABI, throwing a `WeaveFFIException` on error:
+the C ABI and route errors through a shared `throw_weaveffi_error`
+helper:
 
 ```c
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_get_1contact(
-    JNIEnv* env, jclass clazz, jint id) {
+static void throw_weaveffi_error(JNIEnv* env, weaveffi_error* err) {
+    const char* msg = err->message ? err->message : "WeaveFFI error";
+    jclass exClass = (*env)->FindClass(env, "java/lang/RuntimeException");
+    (*env)->ThrowNew(env, exClass, msg);
+    weaveffi_error_clear(err);
+}
+
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_contacts_1get_1contactJni(JNIEnv* env, jclass clazz, jint id) {
     weaveffi_error err = {0, NULL};
-    weaveffi_contacts_Contact* rv = weaveffi_contacts_get_contact(
-        (int32_t)id, &err);
+    weaveffi_contacts_Contact* rv = weaveffi_contacts_get_contact((int32_t)id, &err);
     if (err.code != 0) {
-        jclass exClass = (*env)->FindClass(env, "java/lang/RuntimeException");
-        const char* msg = err.message ? err.message : "WeaveFFI error";
-        (*env)->ThrowNew(env, exClass, msg);
-        weaveffi_error_clear(&err);
+        throw_weaveffi_error(env, &err);
         return 0;
     }
     return (jlong)(intptr_t)rv;
@@ -193,31 +212,179 @@ target_include_directories(weaveffi PRIVATE ../../../../c)
 
 ## Async support
 
-Async IDL functions are exposed as Kotlin `suspend fun` declarations
-that bridge the C ABI callback into a `CompletableDeferred` and
-`await()` the result. The JNI shim retains the deferred via a global
-reference, invokes it from the C callback, and releases the reference:
+Async IDL functions (`async: true`) are exposed as Kotlin `suspend fun`
+declarations built on `suspendCancellableCoroutine`. The public suspend
+wrapper passes a `WeaveContinuation` (a small class with `onSuccess` /
+`onError` methods) to a private external launcher; struct results
+resume as raw handles and are re-wrapped after the await. From the
+`async-demo` sample (`WeaveFFI.kt`):
 
 ```kotlin
-companion object {
-    @JvmStatic external fun fetchContactAsync(id: Int, deferred: Long): Unit
+@JvmStatic private external fun tasks_run_taskAsync(name: String, callback: Any)
+@JvmStatic suspend fun tasks_run_task(name: String): TaskResult {
+    val raw: Long = suspendCancellableCoroutine { cont ->
+        tasks_run_taskAsync(name, WeaveContinuation(cont))
+    }
+    return TaskResult(raw)
 }
 
-suspend fun fetchContact(id: Int): Contact {
-    val deferred = CompletableDeferred<Contact>()
-    val ref = JNIDeferred.retain(deferred)
-    try {
-        WeaveFFI.fetchContactAsync(id, ref)
-        return deferred.await()
-    } finally {
-        JNIDeferred.release(ref)
-    }
+internal class WeaveContinuation<T>(private val cont: kotlinx.coroutines.CancellableContinuation<T>) {
+    @Suppress("UNCHECKED_CAST")
+    fun onSuccess(result: Any?) { cont.resume(result as T) }
+    fun onError(message: String) { cont.resumeWithException(RuntimeException(message)) }
 }
 ```
 
-When the IDL marks the function `cancel: true`, the generated wrapper
-hooks into Kotlin `CoroutineContext` cancellation and invokes the
-underlying `weaveffi_cancel_token`.
+The JNI launcher allocates a per-call context holding the `JavaVM` and
+a `NewGlobalRef` to the `WeaveContinuation`, then hands the C ABI a
+completion callback. That callback attaches the producer's thread to
+the JVM if it is not already attached, calls `onSuccess`/`onError`,
+deletes the global ref, frees the context exactly once, and detaches
+the thread if it attached it:
+
+```c
+typedef struct {
+    JavaVM* jvm;
+    jobject callback;
+} weaveffi_jni_async_ctx;
+
+JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_tasks_1run_1taskAsync(JNIEnv* env, jclass clazz, jstring name, jobject callback) {
+    weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)malloc(sizeof(weaveffi_jni_async_ctx));
+    (*env)->GetJavaVM(env, &ctx->jvm);
+    ctx->callback = (*env)->NewGlobalRef(env, callback);
+    const char* name_chars = (*env)->GetStringUTFChars(env, name, NULL);
+    weaveffi_tasks_run_task_async(name_chars, weaveffi_tasks_run_task_jni_cb, ctx);
+    (*env)->ReleaseStringUTFChars(env, name, name_chars);
+}
+
+static void weaveffi_tasks_run_task_jni_cb(void* context, weaveffi_error* err, void* result) {
+    weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)context;
+    JNIEnv* env = NULL;
+    int attached = 0;
+    if ((*ctx->jvm)->GetEnv(ctx->jvm, (void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if ((*ctx->jvm)->AttachCurrentThread(ctx->jvm, (void**)&env, NULL) != JNI_OK) { free(ctx); return; }
+        attached = 1;
+    }
+    /* ... calls callback.onError(String) or callback.onSuccess(Object) ... */
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    (*env)->DeleteGlobalRef(env, ctx->callback);
+    JavaVM* jvm = ctx->jvm;
+    free(ctx);
+    if (attached) (*jvm)->DetachCurrentThread(jvm);
+}
+```
+
+The generated `build.gradle` does not declare a coroutines dependency;
+add `org.jetbrains.kotlinx:kotlinx-coroutines-android` (or `-core`) to
+the consuming project.
+
+For functions marked `cancellable: true`, the C ABI takes an extra
+`weaveffi_cancel_token*` parameter. The private external launcher
+carries it as `cancelToken: Long` and the shim casts it to
+`weaveffi_cancel_token*`, but the public suspend wrapper currently
+passes `0L` (no token) — coroutine cancellation is not wired to the
+native cancel token:
+
+```kotlin
+@JvmStatic private external fun kv_compact_asyncAsync(store: Long, cancelToken: Long, callback: Any)
+@JvmStatic suspend fun kv_compact_async(store: Store): Long = suspendCancellableCoroutine { cont ->
+    kv_compact_asyncAsync(store.handle, 0L, WeaveContinuation(cont))
+}
+```
+
+## Callbacks and listeners
+
+IDL `callbacks` paired with `listeners` produce a register/unregister
+pair. From the `events` sample:
+
+```yaml
+modules:
+  - name: events
+    callbacks:
+      - name: OnMessage
+        params:
+          - { name: message, type: string }
+    listeners:
+      - name: message_listener
+        event_callback: OnMessage
+```
+
+The Kotlin surface takes a lambda and returns a `Long` subscription id;
+pass that id back to unregister:
+
+```kotlin
+@JvmStatic external fun events_register_message_listener(callback: (String) -> Unit): Long
+@JvmStatic external fun events_unregister_message_listener(id: Long)
+```
+
+The JNI shim keeps the lambda alive with a `NewGlobalRef` stored in a
+mutex-guarded registry (a linked list of contexts holding the `JavaVM`,
+the global ref, and the subscription id). When the producer fires, a C
+trampoline attaches the producer's thread to the JVM if needed and
+invokes the lambda through its `kotlin.jvm.functions.Function1`
+`invoke(Object): Object` method; unregistering removes the registry
+entry, deletes the global ref, and frees the context:
+
+```c
+static void weaveffi_events_OnMessage_fn_jni_tramp(const char* message, void* context) {
+    weaveffi_jni_listener_ctx* ctx = (weaveffi_jni_listener_ctx*)context;
+    JNIEnv* env = NULL;
+    int attached = 0;
+    if ((*ctx->jvm)->GetEnv(ctx->jvm, (void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if ((*ctx->jvm)->AttachCurrentThread(ctx->jvm, (void**)&env, NULL) != JNI_OK) return;
+        attached = 1;
+    }
+    if ((*env)->PushLocalFrame(env, 32) != 0) {
+        if (attached) (*ctx->jvm)->DetachCurrentThread(ctx->jvm);
+        return;
+    }
+    jobject _a0 = message ? (jobject)(*env)->NewStringUTF(env, message) : (jobject)(*env)->NewStringUTF(env, "");
+    jclass fn_cls = (*env)->GetObjectClass(env, ctx->callback);
+    jmethodID invoke = (*env)->GetMethodID(env, fn_cls, "invoke", "(Ljava/lang/Object;)Ljava/lang/Object;");
+    (*env)->CallObjectMethod(env, ctx->callback, invoke, _a0);
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    (*env)->PopLocalFrame(env, NULL);
+    if (attached) (*ctx->jvm)->DetachCurrentThread(ctx->jvm);
+}
+
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_events_1register_1message_1listener(JNIEnv* env, jclass clazz, jobject callback) {
+    weaveffi_jni_listener_ctx* ctx = (weaveffi_jni_listener_ctx*)calloc(1, sizeof(weaveffi_jni_listener_ctx));
+    (*env)->GetJavaVM(env, &ctx->jvm);
+    ctx->callback = (*env)->NewGlobalRef(env, callback);
+    uint64_t id = weaveffi_events_register_message_listener(weaveffi_events_OnMessage_fn_jni_tramp, ctx);
+    /* ... stores ctx in the registry under id ... */
+    return (jlong)id;
+}
+```
+
+The callback runs on the producer's thread — whichever thread the
+native side fires the event from. For UI work, hop to the main thread
+yourself (e.g. `withContext(Dispatchers.Main)` or `Handler.post`).
+
+## Iterators
+
+`iter<T>` returns surface as `Iterator<T>` in Kotlin, but the shim
+drains the native iterator eagerly: it calls the generated `_next` C
+function until exhaustion, copies each element into a
+`java.util.ArrayList` (freeing the Rust string as it goes), destroys
+the iterator handle, and returns the list's `iterator()`. From the
+`events` sample (`get_messages` returns `iter<string>`):
+
+```kotlin
+@JvmStatic external fun events_get_messages(): Iterator<String>
+```
+
+```c
+weaveffi_events_GetMessagesIterator* _iter = weaveffi_events_get_messages(&err);
+/* ... */
+while (weaveffi_events_GetMessagesIterator_next(_iter, &_item, &_iter_err) != 0) {
+    jstring _jitem = _item ? (*env)->NewStringUTF(env, _item) : (*env)->NewStringUTF(env, "");
+    (*env)->CallBooleanMethod(env, _list, _al_add, _jitem);
+    (*env)->DeleteLocalRef(env, _jitem);
+    weaveffi_free_string(_item);
+}
+weaveffi_events_GetMessagesIterator_destroy(_iter);
+```
 
 ## Troubleshooting
 

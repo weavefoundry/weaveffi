@@ -15,6 +15,7 @@ use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::cabi;
+use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::model::BindingModel;
 use weaveffi_core::utils::{
     render_abi_prefix_aliases, render_prelude, render_trailer, CommentStyle,
@@ -53,6 +54,10 @@ impl LanguageBackend for CGenerator {
 
     fn name(&self) -> &'static str {
         "c"
+    }
+
+    fn capabilities(&self) -> TargetCapabilities {
+        TargetCapabilities::full()
     }
 
     fn prefix<'a>(&self, config: &'a Self::Config) -> &'a str {

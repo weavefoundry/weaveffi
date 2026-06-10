@@ -77,7 +77,7 @@ pub type weaveffi_net_fetch_data_callback =
     extern "C" fn(context: *mut c_void, err: *mut weaveffi_error, result: *const c_char);
 
 #[no_mangle]
-pub extern "C" fn weaveffi_net_fetch_data(
+pub extern "C" fn weaveffi_net_fetch_data_async(
     url: *const c_char,
     callback: weaveffi_net_fetch_data_callback,
     context: *mut c_void,
@@ -92,6 +92,10 @@ pub extern "C" fn weaveffi_net_fetch_data(
     });
 }
 ```
+
+The async launcher symbol always carries the `_async` suffix
+(`weaveffi_net_fetch_data_async`), keeping the name free for a possible
+synchronous variant.
 
 ### 3. Call it from each target
 
@@ -133,69 +137,84 @@ final payload = await fetchData('https://example.com/data');
 
 ### 4. Cancel a running operation
 
-For `cancellable: true` functions the wrapper plumbs the target's
-native cancellation primitive into the C ABI cancel token. Cancellation
-is observed by the Rust worker, but the callback is **always**
-invoked exactly once — either with the result or with a `Cancelled`
-error. The pin/unpin pair (see Reference) runs on the cancellation
-path identically to the success path.
+For `cancellable: true` functions the C launcher gains a
+`weaveffi_cancel_token*` slot (before `callback` and `context`), and
+the `weaveffi-abi` runtime provides the token lifecycle:
 
-```swift
-let task = Task { try await Net.uploadFile(path: "x", data: data) }
-task.cancel()
+```c
+weaveffi_cancel_token* token = weaveffi_cancel_token_create();
+weaveffi_net_upload_file_async(path, data, data_len, token, on_done, ctx);
+/* later, from any thread: */
+weaveffi_cancel_token_cancel(token);
 ```
 
-```python
-task = asyncio.create_task(net.upload_file("x", data))
-task.cancel()
-```
+The Rust worker polls `weaveffi_cancel_token_is_cancelled(token)` and
+stops early, but the callback is **always** invoked exactly once —
+either with the result or with a `Cancelled` error. The pin/unpin pair
+(see Reference) runs on the cancellation path identically to the
+success path.
+
+Today the **C, C++, and Kotlin** surfaces expose the token (C++ as a
+trailing `cancel_token = nullptr` parameter, Kotlin as a `cancelToken:
+Long`); the other wrappers pass `NULL` — the operation runs to
+completion even if the consumer-side future is abandoned.
 
 ## Reference
 
 ### C ABI shape
 
-```c
-typedef void (*weaveffi_callback_string)(
-    const char* result,
-    const weaveffi_error* err,
-    void* user_data
-);
+Each async function gets its own callback typedef — `(context, err,
+<result slots>)` — and a launcher with the `_async` suffix:
 
-void weaveffi_net_fetch_data(
-    const uint8_t* url, size_t url_len,
-    weaveffi_callback_string on_complete,
-    void* user_data
-);
+```c
+typedef void (*weaveffi_net_fetch_data_callback)(
+    void* context,
+    weaveffi_error* err,
+    const char* result);
+
+void weaveffi_net_fetch_data_async(
+    const char* url,
+    weaveffi_net_fetch_data_callback callback,
+    void* context);
 ```
 
-For `cancellable: true`:
+For `cancellable: true` the launcher takes a token slot before the
+callback, and the runtime provides the token lifecycle:
 
 ```c
-uint64_t weaveffi_net_upload_file(
-    const uint8_t* path, size_t path_len,
+void weaveffi_net_upload_file_async(
+    const char* path,
     const uint8_t* data, size_t data_len,
-    weaveffi_callback_bool on_complete,
-    void* user_data
-);
+    weaveffi_cancel_token* cancel_token,
+    weaveffi_net_upload_file_callback callback,
+    void* context);
 
-void weaveffi_cancel(uint64_t cancel_handle);
+weaveffi_cancel_token* weaveffi_cancel_token_create(void);
+void weaveffi_cancel_token_cancel(weaveffi_cancel_token* token);
+bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token* token);
+void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
 ```
 
 ### Per-target async surface
 
-| Target  | Async surface                              | Cancellation hook                         |
+| Target  | Async surface                              | Cancel token exposure (`cancellable: true`) |
 |---------|--------------------------------------------|-------------------------------------------|
-| C       | Raw callback                               | `weaveffi_cancel(handle)`                 |
-| C++     | `std::future<T>`                            | `weaveffi_cancel_token*` argument         |
-| Swift   | `async throws`                              | `withTaskCancellationHandler`             |
-| Kotlin  | `suspend fun`                               | `invokeOnCancellation`                    |
-| Node.js | `Promise<T>`                                | `AbortSignal` (when `cancellable: true`)  |
-| Python  | `async def`                                 | `asyncio.CancelledError`                  |
-| .NET    | `Task<T>`                                   | `CancellationToken`                       |
-| Dart    | `Future<T>` (runs on isolate)               | `Future.timeout` / cancellation token     |
-| WASM    | `Promise<T>` (synchronous shim today)       | n/a                                       |
-| Go      | _Not async-capable_ — generator skips today | n/a                                       |
-| Ruby    | _Not async-capable_ — generator skips today | n/a                                       |
+| C       | Raw callback + `_async` launcher            | `weaveffi_cancel_token*` slot before the callback |
+| C++     | `std::future<T>`                            | trailing `cancel_token = nullptr` parameter |
+| Swift   | `async throws`                              | not exposed — wrapper passes `nil`        |
+| Kotlin  | `suspend fun`                               | `cancelToken: Long` parameter (raw token pointer) |
+| Node.js | `Promise<T>` (thread-safe function settling) | not exposed — wrapper passes `NULL`      |
+| Python  | `async def` (executor thread + event)       | not exposed — wrapper passes `None`       |
+| .NET    | `Task<T>`                                   | not exposed — wrapper passes `IntPtr.Zero` |
+| Dart    | `Future<T>` (`NativeCallable.listener`)     | not exposed — wrapper passes `nullptr`    |
+| WASM    | `Promise<T>` (table trampolines)            | not exposed — wrapper passes `0`          |
+| Go      | blocking bridge (`chan` receive); call from a goroutine | not exposed — wrapper passes `nil` |
+| Ruby    | blocking bridge (`Queue#pop`); call from a Thread | not exposed — wrapper passes `NULL` |
+
+A wrapper that does not expose the token still launches and completes
+the call correctly; the operation simply runs to completion even if
+the consumer abandons the future. Drop to the C surface when you need
+cooperative cancellation from one of those targets.
 
 ### Pin / unpin matrix
 
@@ -216,8 +235,8 @@ generator implements; each row is verified by a
 | C++     | `new std::promise<T>()` plus the lambda capture          | `delete p;` once at the end of the lambda       | The lambda owns the heap promise on every exit branch. |
 | Dart    | `NativeCallable<...>.listener(...)`                      | `callable.close()` in `finally` and on the catch path | Pointer-typed parameters are kept alive in `whenComplete`. |
 | WASM    | `_registerTrampoline` per signature plus `_asyncContexts.set(ctxId, ...)` per call | `_asyncContexts.delete(ctxId)` in the trampoline | Per-call resolver closures are removed after resolve/reject. |
-| Go      | _Not async-capable_; `async: true` is skipped today | n/a | Re-enabling Go async requires solving channel-vs-callback lifetime. |
-| Ruby    | _Not async-capable_; `async: true` is skipped today | n/a | Future async impl must `rb_global_variable` the callback and release it on completion. |
+| Go      | `wvCallbackStore(ch)` registers the channel in a global registry keyed by an integer id | `wvCallbackTake(id)` removes it when the exported trampoline fires | The context crossing C is an integer id, never a Go pointer (cgo rule); the channel is buffered so the producer thread never blocks. |
+| Ruby    | the `FFI::Function` trampoline is a local kept alive by the enclosing method scope | the blocking `queue.pop` returns only after the callback ran | The wrapper blocks the calling Ruby thread, so the trampoline cannot be collected while the producer can still call it. |
 
 ### Audit invariants
 
@@ -237,13 +256,14 @@ For every async-capable target:
 
 - **Async void functions** — the validator emits a warning. They are
   valid but almost always indicate a missing return type.
-- **Forgetting `cancellable: true`** — without it, `weaveffi_cancel`
-  is a no-op for that function.
+- **Forgetting `cancellable: true`** — without it, the launcher has no
+  cancel-token slot and the operation cannot be cancelled at all.
 - **Using async for CPU-bound work** — the callback overhead exceeds
   the work being done; keep it synchronous.
-- **Calling Go/Ruby async functions** — the generators skip async
-  functions entirely for these targets today. Either keep the function
-  synchronous or run the async path from a different consumer.
+- **Calling Go/Ruby async functions on a latency-sensitive thread** —
+  both wrappers block the calling thread until the producer completes.
+  Wrap the call in a goroutine / Ruby `Thread` when you need
+  concurrency; the native work already runs off-thread.
 - **Letting the callback closure get garbage-collected** — every
   generator pins it explicitly. Do not strip those pins when editing
   generated code by hand.

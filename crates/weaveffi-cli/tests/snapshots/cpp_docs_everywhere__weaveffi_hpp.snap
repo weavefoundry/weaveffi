@@ -15,6 +15,8 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <memory>
 #include <stdexcept>
 #include <future>
+#include <functional>
+#include <mutex>
 
 extern "C" {
 
@@ -118,6 +120,20 @@ class InvalidStatusError : public WeaveFFIError {
 public:
     InvalidStatusError(const std::string& msg) : WeaveFFIError(2, msg) {}
 };
+
+namespace detail {
+
+inline std::mutex& wv_listener_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+inline std::unordered_map<uint64_t, std::shared_ptr<void>>& wv_listener_registry() {
+    static std::unordered_map<uint64_t, std::shared_ptr<void>> registry;
+    return registry;
+}
+
+} // namespace detail
 
 /**
  * Lifecycle status of a document.
@@ -261,6 +277,28 @@ public:
         return Document(ptr);
     }
 };
+
+/** Subscribe to document-saved notifications */
+/** @return A subscription id for docs_unregister_saved_listener(). */
+inline uint64_t docs_register_saved_listener(std::function<void(int64_t, int32_t)> callback) {
+    auto fn = std::make_shared<std::function<void(int64_t, int32_t)>>(std::move(callback));
+    uint64_t id = weaveffi_docs_register_saved_listener(
+        [](int64_t doc_id, int32_t revision, void* context) {
+            auto& cb = *static_cast<std::function<void(int64_t, int32_t)>*>(context);
+            cb(doc_id, revision);
+        },
+        fn.get());
+    std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());
+    detail::wv_listener_registry()[id] = fn;
+    return id;
+}
+
+/** Unregisters a listener previously registered with docs_register_saved_listener(). */
+inline void docs_unregister_saved_listener(uint64_t id) {
+    weaveffi_docs_unregister_saved_listener(id);
+    std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());
+    detail::wv_listener_registry().erase(id);
+}
 
 /**
  * Create a brand new document.

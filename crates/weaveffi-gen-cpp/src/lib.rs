@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use weaveffi_core::abi::{self, AbiParam};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::cabi;
+use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, is_c_pointer_type, walk_modules, walk_modules_with_path,
     DocCommentStyle,
@@ -80,6 +81,10 @@ impl LanguageBackend for CppGenerator {
 
     fn name(&self) -> &'static str {
         "cpp"
+    }
+
+    fn capabilities(&self) -> TargetCapabilities {
+        TargetCapabilities::full()
     }
 
     fn prefix<'a>(&self, config: &'a Self::Config) -> &'a str {
@@ -198,6 +203,11 @@ fn render_cpp_header(
     if walk_modules(&api.modules).any(|m| m.functions.iter().any(|f| f.r#async)) {
         out.push_str("#include <future>\n");
     }
+    let has_listeners = walk_modules(&api.modules).any(|m| !m.listeners.is_empty());
+    if has_listeners {
+        out.push_str("#include <functional>\n");
+        out.push_str("#include <mutex>\n");
+    }
     out.push('\n');
 
     out.push_str(&render_abi_prefix_aliases(c_prefix));
@@ -212,6 +222,23 @@ fn render_cpp_header(
         .flat_map(|e| &e.codes)
         .collect();
     render_cpp_error_classes(&mut out, &error_codes);
+
+    if has_listeners {
+        // Listener closures are heap-boxed and threaded through the C `context`
+        // pointer; the registry pins each box (type-erased) until unregistration.
+        out.push_str("namespace detail {\n\n");
+        out.push_str("inline std::mutex& wv_listener_mutex() {\n");
+        out.push_str("    static std::mutex m;\n");
+        out.push_str("    return m;\n");
+        out.push_str("}\n\n");
+        out.push_str(
+            "inline std::unordered_map<uint64_t, std::shared_ptr<void>>& wv_listener_registry() {\n",
+        );
+        out.push_str("    static std::unordered_map<uint64_t, std::shared_ptr<void>> registry;\n");
+        out.push_str("    return registry;\n");
+        out.push_str("}\n\n");
+        out.push_str("} // namespace detail\n\n");
+    }
 
     // Enums first: they reference no wrapper types and are used by value.
     for (module, _path) in walk_modules_with_path(&api.modules) {
@@ -741,6 +768,9 @@ fn render_cpp_functions(
     abi_module: &str,
     prefix: &str,
 ) {
+    for l in &module.listeners {
+        render_cpp_listener(out, module, l, abi_module, prefix);
+    }
     for func in &module.functions {
         if func.r#async {
             render_cpp_async_function(out, func, abi_module, prefix);
@@ -748,6 +778,200 @@ fn render_cpp_functions(
             render_cpp_function(out, func, abi_module, error_codes, prefix);
         }
     }
+}
+
+/// The C++ type one callback parameter surfaces as in the user callback.
+/// Struct and handle parameters stay raw (`const {c_tag}*`): wrapping them in
+/// the owning C++ class would `*_destroy` a borrowed handle on destruction.
+fn cpp_cb_param_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
+    match ty {
+        TypeRef::Struct(n) | TypeRef::TypedHandle(n) => {
+            format!("const {}*", c_abi_struct_name(n, module, prefix))
+        }
+        TypeRef::Optional(inner)
+            if matches!(inner.as_ref(), TypeRef::Struct(_) | TypeRef::TypedHandle(_)) =>
+        {
+            cpp_cb_param_type(inner, module, prefix)
+        }
+        TypeRef::List(inner)
+            if matches!(inner.as_ref(), TypeRef::Struct(_) | TypeRef::TypedHandle(_)) =>
+        {
+            format!("std::vector<{}>", cpp_cb_param_type(inner, module, prefix))
+        }
+        other => cpp_type(other),
+    }
+}
+
+/// One element read from a parallel-array base pointer at loop index `i`.
+fn cpp_cb_elem_expr(ty: &TypeRef, base: &str, module: &str, prefix: &str) -> String {
+    let _ = (module, prefix);
+    match ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            format!("std::string({base}[i] ? {base}[i] : \"\")")
+        }
+        TypeRef::Enum(e) => format!(
+            "static_cast<{}>(static_cast<int32_t>({base}[i]))",
+            local_type_name(e)
+        ),
+        _ => format!("{base}[i]"),
+    }
+}
+
+/// Statements (pushed to `stmts`) plus the expression converting one callback
+/// parameter's C slots into the value handed to the user callback.
+fn cpp_cb_arg(
+    p: &weaveffi_ir::ir::Param,
+    abi_module: &str,
+    prefix: &str,
+    stmts: &mut Vec<String>,
+) -> String {
+    let slots = abi::lower_param(&p.name, &p.ty, abi_module, false);
+    let n0 = slots[0].name.clone();
+    match &p.ty {
+        TypeRef::I32
+        | TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::F64
+        | TypeRef::Bool
+        | TypeRef::Handle => n0,
+        TypeRef::Enum(e) => format!(
+            "static_cast<{}>(static_cast<int32_t>({n0}))",
+            local_type_name(e)
+        ),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("std::string({n0} ? {n0} : \"\")"),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            let n1 = &slots[1].name;
+            format!("{n0} ? std::vector<uint8_t>({n0}, {n0} + {n1}) : std::vector<uint8_t>{{}}")
+        }
+        // Borrowed for the duration of the callback; passed through raw.
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => n0,
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                format!("{n0} ? std::optional<std::string>(std::string({n0})) : std::nullopt")
+            }
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
+                let n1 = &slots[1].name;
+                format!(
+                    "{n0} ? std::optional<std::vector<uint8_t>>(std::vector<uint8_t>({n0}, {n0} + {n1})) : std::nullopt"
+                )
+            }
+            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => n0,
+            TypeRef::Enum(e) => {
+                let local = local_type_name(e);
+                format!(
+                    "{n0} ? std::optional<{local}>(static_cast<{local}>(static_cast<int32_t>(*{n0}))) : std::nullopt"
+                )
+            }
+            other => {
+                let t = cpp_type(other);
+                format!("{n0} ? std::optional<{t}>(*{n0}) : std::nullopt")
+            }
+        },
+        TypeRef::List(inner) => {
+            let n1 = &slots[1].name;
+            let var = format!("{}_vec", p.name);
+            let elem_ty = cpp_cb_param_type(inner, abi_module, prefix);
+            let elem = cpp_cb_elem_expr(inner, &n0, abi_module, prefix);
+            stmts.push(format!("std::vector<{elem_ty}> {var};"));
+            stmts.push(format!(
+                "if ({n0} != nullptr) {{ {var}.reserve({n1}); for (size_t i = 0; i < {n1}; ++i) {var}.push_back({elem}); }}"
+            ));
+            var
+        }
+        TypeRef::Map(k, v) => {
+            let keys = &slots[0].name;
+            let vals = &slots[1].name;
+            let len = &slots[2].name;
+            let var = format!("{}_map", p.name);
+            let kt = cpp_cb_param_type(k, abi_module, prefix);
+            let vt = cpp_cb_param_type(v, abi_module, prefix);
+            let ke = cpp_cb_elem_expr(k, keys, abi_module, prefix);
+            let ve = cpp_cb_elem_expr(v, vals, abi_module, prefix);
+            stmts.push(format!("std::unordered_map<{kt}, {vt}> {var};"));
+            stmts.push(format!(
+                "if ({keys} != nullptr && {vals} != nullptr) {{ for (size_t i = 0; i < {len}; ++i) {var}[{ke}] = {ve}; }}"
+            ));
+            var
+        }
+        TypeRef::Iterator(_) => unreachable!("iterator not valid as callback parameter"),
+    }
+}
+
+/// The register/unregister pair for one listener. The user `std::function` is
+/// heap-boxed and threaded through the C `context` pointer; a capture-free
+/// lambda (convertible to the C function pointer) unboxes and invokes it.
+fn render_cpp_listener(
+    out: &mut String,
+    module: &Module,
+    l: &weaveffi_ir::ir::ListenerDef,
+    abi_module: &str,
+    prefix: &str,
+) {
+    let Some(cb) = module.callbacks.iter().find(|c| c.name == l.event_callback) else {
+        unreachable!("validation guarantees the listener's callback exists");
+    };
+
+    let fn_params: Vec<String> = cb
+        .params
+        .iter()
+        .map(|p| cpp_cb_param_type(&p.ty, abi_module, prefix))
+        .collect();
+    let std_fn = format!("std::function<void({})>", fn_params.join(", "));
+
+    let mut slots: Vec<AbiParam> = cb
+        .params
+        .iter()
+        .flat_map(|p| abi::lower_param(&p.name, &p.ty, abi_module, false))
+        .collect();
+    slots.push(abi::context_param());
+    let lambda_params = render_param_decls(&slots, prefix).join(", ");
+
+    let mut stmts = Vec::new();
+    let args: Vec<String> = cb
+        .params
+        .iter()
+        .map(|p| cpp_cb_arg(p, abi_module, prefix, &mut stmts))
+        .collect();
+
+    let register_name = format!("{abi_module}_register_{}", l.name);
+    let unregister_name = format!("{abi_module}_unregister_{}", l.name);
+    let register_sym = format!("{prefix}_{abi_module}_register_{}", l.name);
+    let unregister_sym = format!("{prefix}_{abi_module}_unregister_{}", l.name);
+
+    emit_doc(out, &l.doc, "");
+    out.push_str(&format!(
+        "/** @return A subscription id for {unregister_name}(). */\n"
+    ));
+    out.push_str(&format!(
+        "inline uint64_t {register_name}({std_fn} callback) {{\n"
+    ));
+    out.push_str(&format!(
+        "    auto fn = std::make_shared<{std_fn}>(std::move(callback));\n"
+    ));
+    out.push_str(&format!("    uint64_t id = {register_sym}(\n"));
+    out.push_str(&format!("        []({lambda_params}) {{\n"));
+    out.push_str(&format!(
+        "            auto& cb = *static_cast<{std_fn}*>(context);\n"
+    ));
+    for s in &stmts {
+        out.push_str(&format!("            {s}\n"));
+    }
+    out.push_str(&format!("            cb({});\n", args.join(", ")));
+    out.push_str("        },\n");
+    out.push_str("        fn.get());\n");
+    out.push_str("    std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());\n");
+    out.push_str("    detail::wv_listener_registry()[id] = fn;\n");
+    out.push_str("    return id;\n");
+    out.push_str("}\n\n");
+
+    out.push_str(&format!(
+        "/** Unregisters a listener previously registered with {register_name}(). */\n"
+    ));
+    out.push_str(&format!("inline void {unregister_name}(uint64_t id) {{\n"));
+    out.push_str(&format!("    {unregister_sym}(id);\n"));
+    out.push_str("    std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());\n");
+    out.push_str("    detail::wv_listener_registry().erase(id);\n");
+    out.push_str("}\n\n");
 }
 
 /// Converts a C++ param into setup lines and C argument expressions.
@@ -1506,7 +1730,7 @@ mod tests {
 
     fn minimal_api() -> Api {
         Api {
-            version: "0.1.0".to_string(),
+            version: "0.3.0".to_string(),
             modules: vec![Module {
                 name: "calculator".to_string(),
                 functions: vec![Function {
@@ -1544,9 +1768,69 @@ mod tests {
         }
     }
 
+    #[test]
+    fn listeners_generate_register_unregister() {
+        use weaveffi_ir::ir::{CallbackDef, ListenerDef};
+        let api = Api {
+            version: "0.3.0".to_string(),
+            modules: vec![Module {
+                name: "events".to_string(),
+                functions: vec![],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![CallbackDef {
+                    name: "OnMessage".into(),
+                    doc: None,
+                    params: vec![Param {
+                        name: "message".into(),
+                        ty: TypeRef::StringUtf8,
+                        mutable: false,
+                        doc: None,
+                    }],
+                }],
+                listeners: vec![ListenerDef {
+                    name: "message_listener".into(),
+                    event_callback: "OnMessage".into(),
+                    doc: None,
+                }],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+            package: None,
+        };
+        let hpp = render_cpp_header(&api, "weaveffi", "weaveffi", "weaveffi.yml", "weaveffi.hpp");
+        assert!(
+            hpp.contains("#include <functional>") && hpp.contains("#include <mutex>"),
+            "listener includes missing: {hpp}"
+        );
+        assert!(
+            hpp.contains(
+                "inline uint64_t events_register_message_listener(std::function<void(std::string)> callback)"
+            ),
+            "register wrapper missing: {hpp}"
+        );
+        assert!(
+            hpp.contains("inline void events_unregister_message_listener(uint64_t id)"),
+            "unregister wrapper missing: {hpp}"
+        );
+        assert!(
+            hpp.contains("detail::wv_listener_registry()[id] = fn;"),
+            "closure box must be pinned in the registry: {hpp}"
+        );
+        assert!(
+            hpp.contains("cb(std::string(message ? message : \"\"));"),
+            "trampoline must convert the string arg: {hpp}"
+        );
+        assert!(
+            hpp.contains("detail::wv_listener_registry().erase(id);"),
+            "unregister must drop the box: {hpp}"
+        );
+    }
+
     fn contacts_api() -> Api {
         Api {
-            version: "0.1.0".to_string(),
+            version: "0.3.0".to_string(),
             modules: vec![Module {
                 name: "contacts".to_string(),
                 enums: vec![EnumDef {
@@ -2088,7 +2372,7 @@ mod tests {
     #[test]
     fn cpp_string_param_function() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "io".into(),
                 functions: vec![Function {
@@ -2131,7 +2415,7 @@ mod tests {
     #[test]
     fn cpp_list_return_function() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "store".into(),
                 functions: vec![Function {
@@ -2172,7 +2456,7 @@ mod tests {
     #[test]
     fn cpp_optional_i32_return() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "store".into(),
                 functions: vec![Function {
@@ -2215,7 +2499,7 @@ mod tests {
     #[test]
     fn cpp_enum_param_function() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "paint".into(),
                 functions: vec![Function {
@@ -2276,7 +2560,7 @@ mod tests {
     #[test]
     fn cpp_list_struct_return() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![Function {
@@ -2323,7 +2607,7 @@ mod tests {
     #[test]
     fn cpp_map_return_function() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "store".into(),
                 functions: vec![Function {
@@ -2363,7 +2647,7 @@ mod tests {
     #[test]
     fn cpp_struct_getter_list() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "m".into(),
                 functions: vec![],
@@ -2397,7 +2681,7 @@ mod tests {
     #[test]
     fn cpp_struct_getter_map() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "m".into(),
                 functions: vec![],
@@ -2497,7 +2781,7 @@ mod tests {
     #[test]
     fn cpp_bytes_return_function() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "io".into(),
                 functions: vec![Function {
@@ -2531,7 +2815,7 @@ mod tests {
     #[test]
     fn cpp_typed_handle_param() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "db".into(),
                 functions: vec![Function {
@@ -2599,7 +2883,7 @@ mod tests {
     #[test]
     fn cpp_error_domains_generate_subclasses() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "auth".into(),
                 functions: vec![Function {
@@ -2770,7 +3054,7 @@ mod tests {
     #[test]
     fn generate_cpp_with_structs() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "db".into(),
                 functions: vec![],
@@ -2843,7 +3127,7 @@ mod tests {
     #[test]
     fn cpp_builder_struct_emits_extern_and_wrapper() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "geo".into(),
                 functions: vec![],
@@ -2894,7 +3178,7 @@ mod tests {
     #[test]
     fn generate_cpp_with_enums() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "status".into(),
                 functions: vec![],
@@ -2951,7 +3235,7 @@ mod tests {
     #[test]
     fn generate_cpp_with_optionals() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "store".into(),
                 functions: vec![Function {
@@ -3008,7 +3292,7 @@ mod tests {
     #[test]
     fn generate_cpp_with_lists() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "data".into(),
                 functions: vec![Function {
@@ -3071,7 +3355,7 @@ mod tests {
     #[test]
     fn generate_cpp_with_maps() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "kv".into(),
                 functions: vec![Function {
@@ -3126,7 +3410,7 @@ mod tests {
     #[test]
     fn generate_cpp_with_typed_handle() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "session".into(),
                 functions: vec![Function {
@@ -3255,7 +3539,7 @@ mod tests {
     #[test]
     fn cpp_async_returns_future() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "tasks".into(),
                 functions: vec![Function {
@@ -3311,7 +3595,7 @@ mod tests {
     #[test]
     fn cpp_async_uses_promise() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "tasks".into(),
                 functions: vec![
@@ -3386,7 +3670,7 @@ mod tests {
     #[test]
     fn cpp_async_pins_callback_for_lifetime() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "tasks".into(),
                 functions: vec![Function {
@@ -3430,7 +3714,7 @@ mod tests {
     #[test]
     fn cpp_no_double_free_on_error() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 structs: vec![StructDef {
@@ -3503,7 +3787,7 @@ mod tests {
     #[test]
     fn cpp_null_check_on_optional_return() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![Function {
@@ -3557,7 +3841,7 @@ mod tests {
 
     fn doc_api() -> Api {
         Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "docs".into(),
                 functions: vec![Function {

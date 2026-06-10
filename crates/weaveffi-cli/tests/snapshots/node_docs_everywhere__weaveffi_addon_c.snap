@@ -10,10 +10,82 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <stdlib.h>
 #include <string.h>
 
+typedef struct weaveffi_napi_listener_ctx {
+    napi_threadsafe_function tsfn;
+    uint64_t id;
+    struct weaveffi_napi_listener_ctx* next;
+} weaveffi_napi_listener_ctx;
+
+static weaveffi_napi_listener_ctx* weaveffi_napi_listeners = NULL;
+
 typedef struct {
-    napi_env env;
-    napi_deferred deferred;
-} weaveffi_napi_async_ctx;
+    int64_t doc_id;
+    int32_t revision;
+} weaveffi_docs_OnSaved_fn_payload;
+
+static void weaveffi_docs_OnSaved_fn_napi_tramp(int64_t doc_id, int32_t revision, void* context) {
+    weaveffi_napi_listener_ctx* ctx = (weaveffi_napi_listener_ctx*)context;
+    weaveffi_docs_OnSaved_fn_payload* p = (weaveffi_docs_OnSaved_fn_payload*)calloc(1, sizeof(weaveffi_docs_OnSaved_fn_payload));
+    p->doc_id = doc_id;
+    p->revision = revision;
+    napi_call_threadsafe_function(ctx->tsfn, p, napi_tsfn_nonblocking);
+}
+
+static void weaveffi_docs_OnSaved_fn_napi_calljs(napi_env env, napi_value js_cb, void* context, void* data) {
+    (void)context;
+    weaveffi_docs_OnSaved_fn_payload* p = (weaveffi_docs_OnSaved_fn_payload*)data;
+    if (env != NULL) {
+        napi_value undefined;
+        napi_get_undefined(env, &undefined);
+        napi_value argv[2];
+        napi_create_int64(env, p->doc_id, &argv[0]);
+        napi_create_int32(env, p->revision, &argv[1]);
+        napi_call_function(env, undefined, js_cb, 2, argv, NULL);
+    }
+    free(p);
+}
+
+static napi_value Napi_weaveffi_docs_register_saved_listener(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  weaveffi_napi_listener_ctx* ctx = (weaveffi_napi_listener_ctx*)calloc(1, sizeof(weaveffi_napi_listener_ctx));
+  napi_value resource_name;
+  napi_create_string_utf8(env, "weaveffi_docs_register_saved_listener", NAPI_AUTO_LENGTH, &resource_name);
+  napi_create_threadsafe_function(env, args[0], NULL, resource_name, 0, 1, NULL, NULL, NULL, weaveffi_docs_OnSaved_fn_napi_calljs, &ctx->tsfn);
+  napi_unref_threadsafe_function(env, ctx->tsfn);
+  uint64_t id = weaveffi_docs_register_saved_listener(weaveffi_docs_OnSaved_fn_napi_tramp, ctx);
+  ctx->id = id;
+  ctx->next = weaveffi_napi_listeners;
+  weaveffi_napi_listeners = ctx;
+  napi_value ret;
+  napi_create_double(env, (double)id, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_docs_unregister_saved_listener(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  double id_d = 0;
+  napi_get_value_double(env, args[0], &id_d);
+  uint64_t id = (uint64_t)id_d;
+  weaveffi_docs_unregister_saved_listener(id);
+  weaveffi_napi_listener_ctx** link = &weaveffi_napi_listeners;
+  while (*link != NULL) {
+    if ((*link)->id == id) {
+      weaveffi_napi_listener_ctx* found = *link;
+      *link = found->next;
+      napi_release_threadsafe_function(found->tsfn, napi_tsfn_release);
+      free(found);
+      break;
+    }
+    link = &(*link)->next;
+  }
+  napi_value ret;
+  napi_get_undefined(env, &ret);
+  return ret;
+}
 
 static napi_value Napi_weaveffi_docs_create_document(napi_env env, napi_callback_info info) {
   size_t argc = 2;
@@ -136,17 +208,47 @@ static napi_value Napi_weaveffi_docs_get_document(napi_env env, napi_callback_in
   return ret;
 }
 
+typedef struct {
+    napi_deferred deferred;
+    napi_threadsafe_function tsfn;
+    int32_t err_code;
+    char* err_msg;
+    bool result;
+} weaveffi_docs_publish_async_napi_actx;
+
 static void weaveffi_docs_publish_async_napi_cb(void* context, weaveffi_error* err, bool result) {
-    weaveffi_napi_async_ctx* ctx = (weaveffi_napi_async_ctx*)context;
+    weaveffi_docs_publish_async_napi_actx* ctx = (weaveffi_docs_publish_async_napi_actx*)context;
     if (err != NULL && err->code != 0) {
+        ctx->err_code = err->code;
+        ctx->err_msg = err->message ? strdup(err->message) : strdup("unknown error");
+    } else {
+        ctx->result = result;
+    }
+    napi_call_threadsafe_function(ctx->tsfn, ctx, napi_tsfn_blocking);
+}
+
+static void weaveffi_docs_publish_async_napi_settle(napi_env env, napi_value js_cb, void* context, void* data) {
+    (void)js_cb;
+    (void)context;
+    weaveffi_docs_publish_async_napi_actx* ctx = (weaveffi_docs_publish_async_napi_actx*)data;
+    if (env != NULL) {
+    if (ctx->err_code != 0) {
         napi_value err_msg;
-        napi_create_string_utf8(ctx->env, err->message, NAPI_AUTO_LENGTH, &err_msg);
-        napi_reject_deferred(ctx->env, ctx->deferred, err_msg);
+        napi_create_string_utf8(env, ctx->err_msg ? ctx->err_msg : "", NAPI_AUTO_LENGTH, &err_msg);
+        napi_value err_obj;
+        napi_create_error(env, NULL, err_msg, &err_obj);
+        napi_value err_code;
+        napi_create_int32(env, ctx->err_code, &err_code);
+        napi_set_named_property(env, err_obj, "code", err_code);
+        napi_reject_deferred(env, ctx->deferred, err_obj);
     } else {
         napi_value val;
-        napi_get_boolean(ctx->env, result, &val);
-        napi_resolve_deferred(ctx->env, ctx->deferred, val);
+        napi_get_boolean(env, ctx->result, &val);
+        napi_resolve_deferred(env, ctx->deferred, val);
     }
+    }
+    free(ctx->err_msg);
+    napi_release_threadsafe_function(ctx->tsfn, napi_tsfn_release);
     free(ctx);
 }
 
@@ -156,21 +258,25 @@ static napi_value Napi_weaveffi_docs_publish_async(napi_env env, napi_callback_i
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
   int64_t id;
   napi_get_value_int64(env, args[0], &id);
-  weaveffi_napi_async_ctx* ctx = (weaveffi_napi_async_ctx*)malloc(sizeof(weaveffi_napi_async_ctx));
-  ctx->env = env;
+  weaveffi_docs_publish_async_napi_actx* ctx = (weaveffi_docs_publish_async_napi_actx*)calloc(1, sizeof(weaveffi_docs_publish_async_napi_actx));
   napi_value promise;
   napi_create_promise(env, &ctx->deferred, &promise);
+  napi_value resource_name;
+  napi_create_string_utf8(env, "weaveffi_docs_publish_async", NAPI_AUTO_LENGTH, &resource_name);
+  napi_create_threadsafe_function(env, NULL, NULL, resource_name, 0, 1, NULL, NULL, NULL, weaveffi_docs_publish_async_napi_settle, &ctx->tsfn);
   weaveffi_docs_publish_async_async(id, weaveffi_docs_publish_async_napi_cb, ctx);
   return promise;
 }
 
 static napi_value Init(napi_env env, napi_value exports) {
   napi_property_descriptor props[] = {
+    { "docs_register_saved_listener", NULL, Napi_weaveffi_docs_register_saved_listener, NULL, NULL, NULL, napi_default, NULL },
+    { "docs_unregister_saved_listener", NULL, Napi_weaveffi_docs_unregister_saved_listener, NULL, NULL, NULL, napi_default, NULL },
     { "docs_create_document", NULL, Napi_weaveffi_docs_create_document, NULL, NULL, NULL, napi_default, NULL },
     { "docs_get_document", NULL, Napi_weaveffi_docs_get_document, NULL, NULL, NULL, napi_default, NULL },
     { "docs_publish_async", NULL, Napi_weaveffi_docs_publish_async, NULL, NULL, NULL, napi_default, NULL },
   };
-  napi_define_properties(env, exports, 3, props);
+  napi_define_properties(env, exports, 5, props);
   return exports;
 }
 

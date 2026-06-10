@@ -11,8 +11,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use weaveffi_core::abi::{self, AbiParam, CType};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
+use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::model::{
-    BindingModel, EnumBinding, FieldBinding, FnBinding, ModuleBinding, ParamBinding, StructBinding,
+    BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
+    IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding, StructBinding,
 };
 use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::utils::{
@@ -60,6 +62,10 @@ impl LanguageBackend for DotnetGenerator {
 
     fn name(&self) -> &'static str {
         "dotnet"
+    }
+
+    fn capabilities(&self) -> TargetCapabilities {
+        TargetCapabilities::full()
     }
 
     fn prefix<'a>(&self, config: &'a Self::Config) -> &'a str {
@@ -233,14 +239,6 @@ fn pinvoke_return_info(ty: &TypeRef) -> (String, Vec<String>) {
                 "out UIntPtr out_len".into(),
             ],
         ),
-        // Iterator constructors lower like a list at the ABI boundary.
-        TypeRef::Iterator(inner) => {
-            let r = abi::lower_return(&TypeRef::List(inner.clone()), "");
-            (
-                cs_pinvoke_ctype(&r.ret),
-                r.out_params.iter().map(cs_out_param).collect(),
-            )
-        }
         _ => {
             let r = abi::lower_return(ty, "");
             (
@@ -488,7 +486,16 @@ fn render_csharp(
     let by_path: HashMap<&str, &ModuleBinding> =
         model.modules.iter().map(|m| (m.path.as_str(), m)).collect();
     for m in &api.modules {
-        render_wrapper_class(&mut out, &by_path, m, &m.name, "    ", strip_module_prefix);
+        let class_name = m.name.to_upper_camel_case();
+        render_wrapper_class(
+            &mut out,
+            &by_path,
+            m,
+            &m.name,
+            &class_name,
+            "    ",
+            strip_module_prefix,
+        );
     }
 
     out.push_str("}\n\n");
@@ -583,12 +590,41 @@ fn render_struct_class(out: &mut String, s: &StructBinding) {
     out.push_str("    }\n\n");
 }
 
-fn cs_type_builder_storage(ty: &TypeRef) -> String {
+/// The builder slot's storage type and zero-value default. Scalars start at
+/// 0/false/""/empty, collections empty, optionals absent — the same contract
+/// as the other backends, so unset fields lower to valid C arguments.
+fn cs_field_default(ty: &TypeRef) -> (String, String) {
     let t = cs_type(ty);
-    if t.ends_with('?') {
-        t
-    } else {
-        format!("{t}?")
+    match ty {
+        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle => (t, "0".into()),
+        TypeRef::F64 => (t, "0.0".into()),
+        TypeRef::Bool => (t, "false".into()),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => (t, "\"\"".into()),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => (t, "Array.Empty<byte>()".into()),
+        TypeRef::List(inner) => {
+            let elem = cs_type(inner);
+            (t, format!("Array.Empty<{elem}>()"))
+        }
+        TypeRef::Map(_, _) => {
+            let init = format!("new {t}()");
+            (t, init)
+        }
+        TypeRef::Optional(_) => (t, "null".into()),
+        TypeRef::Enum(_) => (t, "default".into()),
+        // No synthesizable zero value; the With setter is the only path.
+        _ => (format!("{t}?"), "null".into()),
+    }
+}
+
+/// A synthetic [`ParamBinding`] so builder fields reuse the function-parameter
+/// marshalling helpers (`render_marshal_setup` / `build_call_args` / cleanup).
+fn field_as_param(field: &FieldBinding) -> ParamBinding {
+    ParamBinding {
+        name: field.name.clone(),
+        ty: field.ty.clone(),
+        mutable: false,
+        doc: None,
+        abi: Vec::new(),
     }
 }
 
@@ -600,9 +636,11 @@ fn render_builder_class(out: &mut String, s: &StructBinding) {
     emit_doc(out, &s.doc, "    ");
     out.push_str(&format!("    public class {builder_name}\n    {{\n"));
     for field in &s.fields {
-        let storage = cs_type_builder_storage(&field.ty);
+        let (storage, default) = cs_field_default(&field.ty);
         let fname = safe_cs_name(&field.name);
-        out.push_str(&format!("        private {storage} _{fname};\n"));
+        out.push_str(&format!(
+            "        private {storage} _{fname} = {default};\n"
+        ));
     }
     out.push('\n');
     for field in &s.fields {
@@ -614,20 +652,48 @@ fn render_builder_class(out: &mut String, s: &StructBinding) {
             "        public {builder_name} With{pascal}({param_ty} value)\n        {{\n            _{fname} = value;\n            return this;\n        }}\n\n"
         ));
     }
+    // Build: marshal every field into the struct's C `create` call with the
+    // same lowering used for function parameters, then wrap the handle.
     out.push_str(&format!(
         "        public {name} Build()\n        {{\n",
         name = s.name
     ));
-    for field in &s.fields {
-        let fname = safe_cs_name(&field.name);
-        let raw = field.name.replace('\\', "\\\\").replace('"', "\\\"");
-        out.push_str(&format!(
-            "            if (_{fname} == null) throw new InvalidOperationException(\"missing field: {raw}\");\n"
-        ));
+    out.push_str("            var err = new WeaveFFIError();\n");
+    let params: Vec<ParamBinding> = s.fields.iter().map(field_as_param).collect();
+    for p in &params {
+        let fname = safe_cs_name(&p.name);
+        out.push_str(&format!("            var {fname} = _{fname};\n"));
     }
-    out.push_str(&format!(
-        "            throw new NotImplementedException(\"{builder_name}.Build requires FFI backing\");\n        }}\n    }}\n\n"
-    ));
+    let needs_try = params.iter().any(|p| param_needs_marshal(&p.ty));
+    let call_args = build_call_args(&params);
+    let args_part = if call_args.is_empty() {
+        String::new()
+    } else {
+        format!("{call_args}, ")
+    };
+    let call = format!(
+        "var result = NativeMethods.{}({args_part}ref err);",
+        s.create.symbol
+    );
+    if needs_try {
+        for p in &params {
+            render_marshal_setup(out, p, "            ");
+        }
+        out.push_str("            try\n            {\n");
+        out.push_str(&format!("                {call}\n"));
+        out.push_str("                WeaveFFIError.Check(err);\n");
+        out.push_str(&format!("                return new {}(result);\n", s.name));
+        out.push_str("            }\n            finally\n            {\n");
+        for p in &params {
+            render_marshal_cleanup(out, p, "                ");
+        }
+        out.push_str("            }\n");
+    } else {
+        out.push_str(&format!("            {call}\n"));
+        out.push_str("            WeaveFFIError.Check(err);\n");
+        out.push_str(&format!("            return new {}(result);\n", s.name));
+    }
+    out.push_str("        }\n    }\n\n");
 }
 
 fn render_struct_getter(out: &mut String, field: &FieldBinding) {
@@ -663,7 +729,7 @@ fn render_struct_getter(out: &mut String, field: &FieldBinding) {
             ));
             out.push_str("                var str = WeaveFFIHelpers.PtrToString(ptr);\n");
             out.push_str("                NativeMethods.weaveffi_free_string(ptr);\n");
-            out.push_str("                return str;\n");
+            out.push_str("                return str ?? \"\";\n");
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             out.push_str(&format!(
@@ -794,52 +860,34 @@ fn render_struct_getter(out: &mut String, field: &FieldBinding) {
 }
 
 fn render_list_unmarshal(out: &mut String, inner: &TypeRef, indent: &str) {
+    render_list_decode(out, inner, "ptr", "len", indent);
+}
+
+/// Decodes a C parallel array (`base` + `len`) into a managed `T[]` and
+/// returns it. Blittable scalars bulk-copy; everything else element-reads via
+/// [`marshal_read_element`].
+fn render_list_decode(out: &mut String, inner: &TypeRef, base: &str, len: &str, indent: &str) {
     let elem = cs_type(inner);
     out.push_str(&format!(
-        "{indent}if (ptr == IntPtr.Zero) return Array.Empty<{elem}>();\n"
+        "{indent}if ({base} == IntPtr.Zero) return Array.Empty<{elem}>();\n"
     ));
     match inner {
-        TypeRef::I32 => {
-            out.push_str(&format!("{indent}var arr = new int[(int)len];\n"));
-            out.push_str(&format!("{indent}Marshal.Copy(ptr, arr, 0, (int)len);\n"));
-            out.push_str(&format!("{indent}return arr;\n"));
-        }
-        TypeRef::I64 => {
-            out.push_str(&format!("{indent}var arr = new long[(int)len];\n"));
-            out.push_str(&format!("{indent}Marshal.Copy(ptr, arr, 0, (int)len);\n"));
-            out.push_str(&format!("{indent}return arr;\n"));
-        }
-        TypeRef::F64 => {
-            out.push_str(&format!("{indent}var arr = new double[(int)len];\n"));
-            out.push_str(&format!("{indent}Marshal.Copy(ptr, arr, 0, (int)len);\n"));
-            out.push_str(&format!("{indent}return arr;\n"));
-        }
-        TypeRef::Struct(name) => {
-            let cn = local_type_name(name);
-            out.push_str(&format!("{indent}var arr = new {cn}[(int)len];\n"));
+        TypeRef::I32 | TypeRef::I64 | TypeRef::F64 => {
+            out.push_str(&format!("{indent}var arr = new {elem}[(int){len}];\n"));
             out.push_str(&format!(
-                "{indent}for (int i = 0; i < (int)len; i++)\n{indent}{{\n"
+                "{indent}Marshal.Copy({base}, arr, 0, (int){len});\n"
             ));
-            out.push_str(&format!(
-                "{indent}    arr[i] = new {cn}(Marshal.ReadIntPtr(ptr, i * IntPtr.Size));\n"
-            ));
-            out.push_str(&format!("{indent}}}\n"));
-            out.push_str(&format!("{indent}return arr;\n"));
-        }
-        TypeRef::Enum(name) => {
-            let cn = local_type_name(name);
-            out.push_str(&format!("{indent}var arr = new {cn}[(int)len];\n"));
-            out.push_str(&format!(
-                "{indent}for (int i = 0; i < (int)len; i++)\n{indent}{{\n"
-            ));
-            out.push_str(&format!(
-                "{indent}    arr[i] = ({cn})Marshal.ReadInt32(ptr + i * sizeof(int));\n"
-            ));
-            out.push_str(&format!("{indent}}}\n"));
             out.push_str(&format!("{indent}return arr;\n"));
         }
         _ => {
-            out.push_str(&format!("{indent}return Array.Empty<{elem}>();\n"));
+            let read = marshal_read_element(inner, base, "i");
+            out.push_str(&format!("{indent}var arr = new {elem}[(int){len}];\n"));
+            out.push_str(&format!(
+                "{indent}for (int i = 0; i < (int){len}; i++)\n{indent}{{\n"
+            ));
+            out.push_str(&format!("{indent}    arr[i] = {read};\n"));
+            out.push_str(&format!("{indent}}}\n"));
+            out.push_str(&format!("{indent}return arr;\n"));
         }
     }
 }
@@ -859,6 +907,12 @@ fn render_native_methods(out: &mut String, model: &BindingModel) {
         for s in &m.structs {
             render_struct_pinvoke(out, s);
         }
+        for cb in &m.callbacks {
+            render_callback_pinvoke(out, cb);
+        }
+        for l in &m.listeners {
+            render_listener_pinvoke(out, l);
+        }
         for f in &m.functions {
             render_function_pinvoke(out, f);
             if f.is_async {
@@ -868,6 +922,42 @@ fn render_native_methods(out: &mut String, model: &BindingModel) {
     }
 
     out.push_str("    }\n\n");
+}
+
+/// The unmanaged delegate type for one module callback declaration, shared by
+/// every listener that fires it.
+fn render_callback_pinvoke(out: &mut String, cb: &CallbackBinding) {
+    let delegate_name = format!("Cb_{}", cb.c_fn_type);
+    let params: Vec<String> = cb
+        .abi_params
+        .iter()
+        .map(|slot| format!("{} {}", cs_pinvoke_ctype(&slot.ty), slot.name))
+        .collect();
+    out.push_str("        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]\n");
+    out.push_str(&format!(
+        "        internal delegate void {delegate_name}({});\n\n",
+        params.join(", ")
+    ));
+}
+
+fn render_listener_pinvoke(out: &mut String, l: &ListenerBinding) {
+    let delegate_name = format!("Cb_{}", l.callback_c_fn_type);
+    let register_sym = &l.register_symbol;
+    let unregister_sym = &l.unregister_symbol;
+
+    out.push_str(&format!(
+        "        [DllImport(LibName, EntryPoint = \"{register_sym}\", CallingConvention = CallingConvention.Cdecl)]\n"
+    ));
+    out.push_str(&format!(
+        "        internal static extern ulong {register_sym}({delegate_name} callback, IntPtr context);\n\n"
+    ));
+
+    out.push_str(&format!(
+        "        [DllImport(LibName, EntryPoint = \"{unregister_sym}\", CallingConvention = CallingConvention.Cdecl)]\n"
+    ));
+    out.push_str(&format!(
+        "        internal static extern void {unregister_sym}(ulong id);\n\n"
+    ));
 }
 
 fn render_struct_pinvoke(out: &mut String, s: &StructBinding) {
@@ -922,6 +1012,10 @@ fn render_struct_pinvoke(out: &mut String, s: &StructBinding) {
 }
 
 fn render_function_pinvoke(out: &mut String, f: &FnBinding) {
+    if let CallShape::Iterator(it) = &f.shape {
+        render_iterator_pinvoke(out, it);
+        return;
+    }
     let c_sym = &f.c_base;
 
     out.push_str(&format!(
@@ -943,6 +1037,59 @@ fn render_function_pinvoke(out: &mut String, f: &FnBinding) {
     out.push_str(&format!(
         "        internal static extern {ret_type} {c_sym}({});\n\n",
         params.join(", ")
+    ));
+}
+
+/// Whether an ABI slot is the trailing `{prefix}_error* out_err`.
+fn is_error_slot(slot: &AbiParam) -> bool {
+    matches!(&slot.ty, CType::Ptr { pointee, .. } if matches!(pointee.as_ref(), CType::Error))
+}
+
+/// One P/Invoke parameter for an iterator-shape ABI slot: the trailing error
+/// slot becomes `ref WeaveFFIError`, `out_*` pointer slots become `out`
+/// pointee values, everything else is passed by value.
+fn iterator_slot_param(slot: &AbiParam) -> String {
+    if is_error_slot(slot) {
+        return format!("ref WeaveFFIError {}", slot.name);
+    }
+    match &slot.ty {
+        CType::Ptr { .. } if slot.name.starts_with("out_") => cs_out_param(slot),
+        ty => format!("{} {}", cs_pinvoke_ctype(ty), slot.name),
+    }
+}
+
+/// The three entry points behind one `iter<T>` function: the constructor
+/// returning the opaque iterator handle, `_next`, and `_destroy`.
+fn render_iterator_pinvoke(out: &mut String, it: &IteratorBinding) {
+    let launch_params: Vec<String> = it.launch.params.iter().map(iterator_slot_param).collect();
+    out.push_str(&format!(
+        "        [DllImport(LibName, EntryPoint = \"{0}\", CallingConvention = CallingConvention.Cdecl)]\n",
+        it.launch.symbol
+    ));
+    out.push_str(&format!(
+        "        internal static extern IntPtr {}({});\n\n",
+        it.launch.symbol,
+        launch_params.join(", ")
+    ));
+
+    let next_params: Vec<String> = it.next.params.iter().map(iterator_slot_param).collect();
+    out.push_str(&format!(
+        "        [DllImport(LibName, EntryPoint = \"{0}\", CallingConvention = CallingConvention.Cdecl)]\n",
+        it.next.symbol
+    ));
+    out.push_str(&format!(
+        "        internal static extern int {}({});\n\n",
+        it.next.symbol,
+        next_params.join(", ")
+    ));
+
+    out.push_str(&format!(
+        "        [DllImport(LibName, EntryPoint = \"{0}\", CallingConvention = CallingConvention.Cdecl)]\n",
+        it.destroy_symbol
+    ));
+    out.push_str(&format!(
+        "        internal static extern void {}(IntPtr iter);\n\n",
+        it.destroy_symbol
     ));
 }
 
@@ -996,40 +1143,275 @@ fn render_async_function_pinvoke(out: &mut String, f: &FnBinding) {
     ));
 }
 
+/// Statements (appended to `out`) plus the expression converting one callback
+/// parameter's delegate slots into the value handed to the user callback.
+fn render_cb_arg(out: &mut String, p: &ParamBinding, idx: usize, indent: &str) -> String {
+    let slots = abi::lower_param(&p.name, &p.ty, "", false);
+    let n0 = safe_cs_name(&slots[0].name);
+    match &p.ty {
+        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 => n0,
+        TypeRef::Handle => n0,
+        TypeRef::Bool => format!("{n0} != 0"),
+        TypeRef::Enum(name) => format!("({}){n0}", local_type_name(name)),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            format!("Marshal.PtrToStringUTF8({n0}) ?? \"\"")
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            let len = safe_cs_name(&slots[1].name);
+            let arg = format!("arg{idx}");
+            out.push_str(&format!(
+                "{indent}var {arg} = new byte[(int){len}];\n"
+            ));
+            out.push_str(&format!(
+                "{indent}if ({n0} != IntPtr.Zero && (int){len} > 0) Marshal.Copy({n0}, {arg}, 0, (int){len});\n"
+            ));
+            arg
+        }
+        // Borrowed for the duration of the callback; the consumer must not
+        // Dispose() the wrapper.
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+            format!("new {}({n0})", local_type_name(name))
+        }
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                format!("Marshal.PtrToStringUTF8({n0})")
+            }
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
+                let len = safe_cs_name(&slots[1].name);
+                let arg = format!("arg{idx}");
+                out.push_str(&format!("{indent}byte[]? {arg} = null;\n"));
+                out.push_str(&format!(
+                    "{indent}if ({n0} != IntPtr.Zero)\n{indent}{{\n"
+                ));
+                out.push_str(&format!(
+                    "{indent}    {arg} = new byte[(int){len}];\n"
+                ));
+                out.push_str(&format!(
+                    "{indent}    if ((int){len} > 0) Marshal.Copy({n0}, {arg}, 0, (int){len});\n"
+                ));
+                out.push_str(&format!("{indent}}}\n"));
+                arg
+            }
+            TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+                let cn = local_type_name(name);
+                format!("{n0} == IntPtr.Zero ? null : new {cn}({n0})")
+            }
+            TypeRef::I32 => format!("{n0} == IntPtr.Zero ? (int?)null : Marshal.ReadInt32({n0})"),
+            TypeRef::U32 => format!(
+                "{n0} == IntPtr.Zero ? (uint?)null : (uint)Marshal.ReadInt32({n0})"
+            ),
+            TypeRef::I64 => {
+                format!("{n0} == IntPtr.Zero ? (long?)null : Marshal.ReadInt64({n0})")
+            }
+            TypeRef::Handle => format!(
+                "{n0} == IntPtr.Zero ? (ulong?)null : (ulong)Marshal.ReadInt64({n0})"
+            ),
+            TypeRef::F64 => format!(
+                "{n0} == IntPtr.Zero ? (double?)null : BitConverter.Int64BitsToDouble(Marshal.ReadInt64({n0}))"
+            ),
+            TypeRef::Bool => {
+                format!("{n0} == IntPtr.Zero ? (bool?)null : Marshal.ReadInt32({n0}) != 0")
+            }
+            TypeRef::Enum(name) => {
+                let cn = local_type_name(name);
+                format!("{n0} == IntPtr.Zero ? ({cn}?)null : ({cn})Marshal.ReadInt32({n0})")
+            }
+            _ => "default".into(),
+        },
+        TypeRef::List(inner) => {
+            let len = safe_cs_name(&slots[1].name);
+            let arg = format!("arg{idx}");
+            let elem = cs_type(inner);
+            out.push_str(&format!(
+                "{indent}var {arg} = new {elem}[(int){len}];\n"
+            ));
+            out.push_str(&format!(
+                "{indent}if ({n0} != IntPtr.Zero)\n{indent}{{\n"
+            ));
+            out.push_str(&format!(
+                "{indent}    for (int i = 0; i < (int){len}; i++)\n{indent}    {{\n"
+            ));
+            out.push_str(&format!(
+                "{indent}        {arg}[i] = {};\n",
+                marshal_read_element(inner, &n0, "i")
+            ));
+            out.push_str(&format!("{indent}    }}\n{indent}}}\n"));
+            arg
+        }
+        TypeRef::Map(k, v) => {
+            let keys = safe_cs_name(&slots[0].name);
+            let vals = safe_cs_name(&slots[1].name);
+            let len = safe_cs_name(&slots[2].name);
+            let arg = format!("arg{idx}");
+            let (k_cs, v_cs) = (cs_type(k), cs_type(v));
+            out.push_str(&format!(
+                "{indent}var {arg} = new Dictionary<{k_cs}, {v_cs}>();\n"
+            ));
+            out.push_str(&format!(
+                "{indent}if ({keys} != IntPtr.Zero && {vals} != IntPtr.Zero)\n{indent}{{\n"
+            ));
+            out.push_str(&format!(
+                "{indent}    for (int i = 0; i < (int){len}; i++)\n{indent}    {{\n"
+            ));
+            out.push_str(&format!(
+                "{indent}        {arg}[{}] = {};\n",
+                marshal_read_element(k, &keys, "i"),
+                marshal_read_element(v, &vals, "i")
+            ));
+            out.push_str(&format!("{indent}    }}\n{indent}}}\n"));
+            arg
+        }
+        TypeRef::Iterator(_) => unreachable!("iterator not valid as callback parameter"),
+    }
+}
+
+/// The register/unregister method pair for one listener, emitted into the
+/// module's wrapper class alongside `_listenerRefs`.
+fn render_listener_methods(
+    out: &mut String,
+    mb: &ModuleBinding,
+    l: &ListenerBinding,
+    strip_module_prefix: bool,
+) {
+    let Some(cb) = mb.callback(&l.event_callback) else {
+        unreachable!("validation guarantees the listener's callback exists");
+    };
+    let register_name = wrapper_name(
+        &mb.path,
+        &format!("register_{}", l.name),
+        strip_module_prefix,
+    )
+    .to_upper_camel_case();
+    let unregister_name = wrapper_name(
+        &mb.path,
+        &format!("unregister_{}", l.name),
+        strip_module_prefix,
+    )
+    .to_upper_camel_case();
+    let delegate_name = format!("NativeMethods.Cb_{}", cb.c_fn_type);
+
+    let action_type = if cb.params.is_empty() {
+        "Action".to_string()
+    } else {
+        format!(
+            "Action<{}>",
+            cb.params
+                .iter()
+                .map(|p| cs_type(&p.ty))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
+    let lambda_formals: Vec<String> = cb
+        .abi_params
+        .iter()
+        .map(|slot| safe_cs_name(&slot.name))
+        .collect();
+
+    emit_doc(out, &l.doc, "        ");
+    out.push_str(&format!(
+        "        /// <returns>A subscription id for {unregister_name}().</returns>\n"
+    ));
+    out.push_str(&format!(
+        "        public static ulong {register_name}({action_type} callback)\n        {{\n"
+    ));
+    out.push_str(&format!(
+        "            {delegate_name} trampoline = ({}) =>\n            {{\n",
+        lambda_formals.join(", ")
+    ));
+    let mut stmts = String::new();
+    let mut args = Vec::new();
+    for (idx, p) in cb.params.iter().enumerate() {
+        args.push(render_cb_arg(&mut stmts, p, idx, "                "));
+    }
+    out.push_str(&stmts);
+    out.push_str(&format!("                callback({});\n", args.join(", ")));
+    out.push_str("            };\n");
+    out.push_str("            ulong id;\n");
+    out.push_str("            lock (_listenerLock)\n            {\n");
+    out.push_str(&format!(
+        "                id = NativeMethods.{}(trampoline, IntPtr.Zero);\n",
+        l.register_symbol
+    ));
+    out.push_str("                _listenerRefs[id] = trampoline;\n");
+    out.push_str("            }\n");
+    out.push_str("            return id;\n");
+    out.push_str("        }\n\n");
+
+    out.push_str(&format!(
+        "        /// <summary>Unregisters a listener previously registered with {register_name}().</summary>\n"
+    ));
+    out.push_str(&format!(
+        "        public static void {unregister_name}(ulong id)\n        {{\n"
+    ));
+    out.push_str(&format!(
+        "            NativeMethods.{}(id);\n",
+        l.unregister_symbol
+    ));
+    out.push_str("            lock (_listenerLock)\n            {\n");
+    out.push_str("                _listenerRefs.Remove(id);\n");
+    out.push_str("            }\n");
+    out.push_str("        }\n\n");
+}
+
+/// Renders one module's static wrapper class, then its submodules as sibling
+/// classes named by their full path (`KvStats`, not a nested `Kv.Stats`).
+/// Flat classes keep generated type names (`Stats`) unambiguous: a nested
+/// module class with the same name as a struct wrapper would shadow it.
 fn render_wrapper_class(
     out: &mut String,
     by_path: &HashMap<&str, &ModuleBinding>,
     m: &Module,
     module_path: &str,
+    class_name: &str,
     indent: &str,
     strip_module_prefix: bool,
 ) {
-    let class_name = m.name.to_upper_camel_case();
     out.push_str(&format!(
         "{indent}public static class {class_name}\n{indent}{{\n"
     ));
 
     let mb = by_path[module_path];
+    if !mb.listeners.is_empty() {
+        let mut buf = String::new();
+        buf.push_str("        private static readonly object _listenerLock = new object();\n");
+        buf.push_str(
+            "        // Live listener delegates by subscription id. Holding the delegate\n",
+        );
+        buf.push_str(
+            "        // here keeps its native thunk alive until unregistered; without this\n",
+        );
+        buf.push_str("        // the GC could collect a delegate the producer still calls.\n");
+        buf.push_str(
+            "        private static readonly Dictionary<ulong, Delegate> _listenerRefs = new Dictionary<ulong, Delegate>();\n\n",
+        );
+        for l in &mb.listeners {
+            render_listener_methods(&mut buf, mb, l, strip_module_prefix);
+        }
+        reindent(out, &buf, indent.len().saturating_sub(4));
+    }
     for f in &mb.functions {
         let mut buf = String::new();
         render_wrapper_method(&mut buf, module_path, f, strip_module_prefix);
         reindent(out, &buf, indent.len().saturating_sub(4));
     }
 
+    out.push_str(&format!("{indent}}}\n\n"));
+
     for sub in &m.modules {
         let sub_path = format!("{module_path}_{}", sub.name);
-        let inner_indent = format!("{indent}    ");
+        let sub_class = format!("{class_name}{}", sub.name.to_upper_camel_case());
         render_wrapper_class(
             out,
             by_path,
             sub,
             &sub_path,
-            &inner_indent,
+            &sub_class,
+            indent,
             strip_module_prefix,
         );
     }
-
-    out.push_str(&format!("{indent}}}\n\n"));
 }
 
 fn param_needs_marshal(ty: &TypeRef) -> bool {
@@ -1037,6 +1419,7 @@ fn param_needs_marshal(ty: &TypeRef) -> bool {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr | TypeRef::Bytes | TypeRef::BorrowedBytes => {
             true
         }
+        TypeRef::List(_) | TypeRef::Map(_, _) => true,
         TypeRef::Optional(inner) => matches!(
             inner.as_ref(),
             TypeRef::StringUtf8
@@ -1082,6 +1465,10 @@ fn render_wrapper_method(
         render_async_wrapper_method(out, module_path, f, strip_module_prefix);
         return;
     }
+    if let CallShape::Iterator(it) = &f.shape {
+        render_iterator_wrapper_method(out, module_path, f, it, strip_module_prefix);
+        return;
+    }
     let method_name = wrapper_name(module_path, &f.name, strip_module_prefix).to_upper_camel_case();
     let ret_cs = f.ret.as_ref().map(cs_type).unwrap_or_else(|| "void".into());
 
@@ -1123,6 +1510,154 @@ fn render_wrapper_method(
         render_pinvoke_call_and_return(out, f, "            ");
     }
 
+    out.push_str("        }\n\n");
+}
+
+/// The statements converting one `_next` out-item into the yielded C# value,
+/// freeing any producer-allocated memory along the way. Returns the expression
+/// to `yield return`.
+fn iterator_item_conversion(out: &mut String, elem: &TypeRef, indent: &str) -> String {
+    match elem {
+        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => {
+            "out_item".into()
+        }
+        TypeRef::Bool => "out_item != 0".into(),
+        TypeRef::Enum(name) => format!("({})out_item", local_type_name(name)),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            out.push_str(&format!(
+                "{indent}var item = Marshal.PtrToStringUTF8(out_item) ?? \"\";\n"
+            ));
+            out.push_str(&format!(
+                "{indent}NativeMethods.weaveffi_free_string(out_item);\n"
+            ));
+            "item".into()
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            out.push_str(&format!("{indent}var item = new byte[(int)out_len];\n"));
+            out.push_str(&format!(
+                "{indent}if (out_item != IntPtr.Zero && (int)out_len > 0) Marshal.Copy(out_item, item, 0, (int)out_len);\n"
+            ));
+            out.push_str(&format!(
+                "{indent}NativeMethods.weaveffi_free_bytes(out_item, out_len);\n"
+            ));
+            "item".into()
+        }
+        // The consumer owns each yielded wrapper; Dispose() destroys it.
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+            format!("new {}(out_item)", local_type_name(name))
+        }
+        _ => "default!".into(),
+    }
+}
+
+/// An `iter<T>` function surfaces as `IEnumerable<T>`: an eager constructor
+/// call (so launch errors throw immediately), then a lazy enumerator that
+/// drives `_next` and destroys the handle when enumeration ends or the
+/// enumerator is disposed.
+fn render_iterator_wrapper_method(
+    out: &mut String,
+    module_path: &str,
+    f: &FnBinding,
+    it: &IteratorBinding,
+    strip_module_prefix: bool,
+) {
+    let method_name = wrapper_name(module_path, &f.name, strip_module_prefix).to_upper_camel_case();
+    let elem_cs = cs_type(&it.elem);
+
+    let params_sig: Vec<String> = f
+        .params
+        .iter()
+        .map(|p| format!("{} {}", cs_type(&p.ty), safe_cs_name(&p.name)))
+        .collect();
+
+    emit_fn_doc(out, &f.doc, &f.params, "        ");
+    if let Some(msg) = &f.deprecated {
+        out.push_str(&format!(
+            "        [Obsolete(\"{}\")]\n",
+            msg.replace('"', "\\\"")
+        ));
+    }
+
+    out.push_str(&format!(
+        "        public static IEnumerable<{elem_cs}> {method_name}({})\n        {{\n",
+        params_sig.join(", ")
+    ));
+    out.push_str("            var err = new WeaveFFIError();\n");
+
+    let call_args = build_call_args(&f.params);
+    let args_part = if call_args.is_empty() {
+        String::new()
+    } else {
+        format!("{call_args}, ")
+    };
+    let launch_call = format!(
+        "var iter = NativeMethods.{}({args_part}ref err);",
+        it.launch.symbol
+    );
+
+    let needs_try = f.params.iter().any(|p| param_needs_marshal(&p.ty));
+    if needs_try {
+        for p in &f.params {
+            render_marshal_setup(out, p, "            ");
+        }
+        out.push_str("            try\n            {\n");
+        out.push_str(&format!("                {launch_call}\n"));
+        out.push_str("                WeaveFFIError.Check(err);\n");
+        out.push_str(&format!(
+            "                return Enumerate{method_name}(iter);\n"
+        ));
+        out.push_str("            }\n            finally\n            {\n");
+        for p in &f.params {
+            render_marshal_cleanup(out, p, "                ");
+        }
+        out.push_str("            }\n");
+    } else {
+        out.push_str(&format!("            {launch_call}\n"));
+        out.push_str("            WeaveFFIError.Check(err);\n");
+        out.push_str(&format!(
+            "            return Enumerate{method_name}(iter);\n"
+        ));
+    }
+    out.push_str("        }\n\n");
+
+    // The `_next` out-slots after the iterator handle, excluding the error.
+    let next_out_args: Vec<String> = it
+        .next
+        .params
+        .iter()
+        .skip(1)
+        .filter(|slot| !is_error_slot(slot))
+        .map(|slot| format!("out var {}", slot.name))
+        .collect();
+
+    out.push_str(&format!(
+        "        private static IEnumerable<{elem_cs}> Enumerate{method_name}(IntPtr iter)\n        {{\n"
+    ));
+    out.push_str("            try\n            {\n");
+    out.push_str("                while (true)\n                {\n");
+    out.push_str("                    var iterErr = new WeaveFFIError();\n");
+    out.push_str(&format!(
+        "                    if (NativeMethods.{}(iter, {}, ref iterErr) == 0)\n",
+        it.next.symbol,
+        next_out_args.join(", ")
+    ));
+    out.push_str("                    {\n");
+    out.push_str("                        WeaveFFIError.Check(iterErr);\n");
+    out.push_str("                        yield break;\n");
+    out.push_str("                    }\n");
+    out.push_str("                    WeaveFFIError.Check(iterErr);\n");
+    let mut conv = String::new();
+    let item_expr = iterator_item_conversion(&mut conv, &it.elem, "                    ");
+    out.push_str(&conv);
+    out.push_str(&format!("                    yield return {item_expr};\n"));
+    out.push_str("                }\n");
+    out.push_str("            }\n");
+    out.push_str("            finally\n            {\n");
+    out.push_str(&format!(
+        "                NativeMethods.{}(iter);\n",
+        it.destroy_symbol
+    ));
+    out.push_str("            }\n");
     out.push_str("        }\n\n");
 }
 
@@ -1347,8 +1882,90 @@ fn render_marshal_setup(out: &mut String, p: &ParamBinding, indent: &str) {
             }
             _ => {}
         },
+        TypeRef::List(elem) => {
+            render_array_marshal_setup(out, &name, &format!("{name}.Length"), elem, indent);
+        }
+        TypeRef::Map(k, v) => {
+            // Parallel key/value arrays in dictionary iteration order.
+            let (k_arr, k_conv) = cs_elem_array_slot(k, "kv.Key");
+            let (v_arr, v_conv) = cs_elem_array_slot(v, "kv.Value");
+            out.push_str(&format!(
+                "{indent}var {name}KeysArr = new {k_arr}[{name}.Count];\n"
+            ));
+            out.push_str(&format!(
+                "{indent}var {name}ValsArr = new {v_arr}[{name}.Count];\n"
+            ));
+            out.push_str(&format!("{indent}var {name}I = 0;\n"));
+            out.push_str(&format!("{indent}foreach (var kv in {name})\n{indent}{{\n"));
+            out.push_str(&format!("{indent}    {name}KeysArr[{name}I] = {k_conv};\n"));
+            out.push_str(&format!("{indent}    {name}ValsArr[{name}I] = {v_conv};\n"));
+            out.push_str(&format!("{indent}    {name}I++;\n"));
+            out.push_str(&format!("{indent}}}\n"));
+            out.push_str(&format!(
+                "{indent}var {name}KeysPin = GCHandle.Alloc({name}KeysArr, GCHandleType.Pinned);\n"
+            ));
+            out.push_str(&format!(
+                "{indent}var {name}ValsPin = GCHandle.Alloc({name}ValsArr, GCHandleType.Pinned);\n"
+            ));
+        }
         _ => {}
     }
+}
+
+/// One pinned native array for a list parameter: `{name}Arr` (the converted
+/// element array) and `{name}Pin` (the pin). String elements become
+/// CoTaskMem-allocated UTF-8 pointers freed in cleanup.
+fn render_array_marshal_setup(
+    out: &mut String,
+    name: &str,
+    len_expr: &str,
+    elem: &TypeRef,
+    indent: &str,
+) {
+    match elem {
+        // Blittable element arrays pin in place; no conversion copy needed.
+        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => {
+            out.push_str(&format!("{indent}var {name}Arr = {name};\n"));
+        }
+        _ => {
+            let (arr_ty, conv) = cs_elem_array_slot(elem, &format!("{name}[{name}It]"));
+            out.push_str(&format!(
+                "{indent}var {name}Arr = new {arr_ty}[{len_expr}];\n"
+            ));
+            out.push_str(&format!(
+                "{indent}for (var {name}It = 0; {name}It < {len_expr}; {name}It++) {name}Arr[{name}It] = {conv};\n"
+            ));
+        }
+    }
+    out.push_str(&format!(
+        "{indent}var {name}Pin = GCHandle.Alloc({name}Arr, GCHandleType.Pinned);\n"
+    ));
+}
+
+/// The native array slot type and per-element conversion expression for one
+/// list/map element.
+fn cs_elem_array_slot(elem: &TypeRef, expr: &str) -> (String, String) {
+    match elem {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => (
+            "IntPtr".into(),
+            format!("Marshal.StringToCoTaskMemUTF8({expr})"),
+        ),
+        TypeRef::Enum(_) => ("int".into(), format!("(int){expr}")),
+        TypeRef::Bool => ("int".into(), format!("{expr} ? 1 : 0")),
+        TypeRef::I32 => ("int".into(), expr.into()),
+        TypeRef::U32 => ("uint".into(), expr.into()),
+        TypeRef::I64 => ("long".into(), expr.into()),
+        TypeRef::F64 => ("double".into(), expr.into()),
+        TypeRef::Handle => ("ulong".into(), expr.into()),
+        // Validation (`UnsupportedElementType`) rejects other element shapes.
+        _ => ("IntPtr".into(), "IntPtr.Zero".into()),
+    }
+}
+
+/// True when the element conversion CoTaskMem-allocates per element (strings),
+/// requiring a matching per-element free in cleanup.
+fn cs_elem_allocates(elem: &TypeRef) -> bool {
+    matches!(elem, TypeRef::StringUtf8 | TypeRef::BorrowedStr)
 }
 
 fn render_marshal_cleanup(out: &mut String, p: &ParamBinding, indent: &str) {
@@ -1382,6 +1999,28 @@ fn render_marshal_cleanup(out: &mut String, p: &ParamBinding, indent: &str) {
             }
             _ => {}
         },
+        TypeRef::List(elem) => {
+            out.push_str(&format!("{indent}{name}Pin.Free();\n"));
+            if cs_elem_allocates(elem) {
+                out.push_str(&format!(
+                    "{indent}foreach (var {name}P in {name}Arr) Marshal.FreeCoTaskMem({name}P);\n"
+                ));
+            }
+        }
+        TypeRef::Map(k, v) => {
+            out.push_str(&format!("{indent}{name}KeysPin.Free();\n"));
+            out.push_str(&format!("{indent}{name}ValsPin.Free();\n"));
+            if cs_elem_allocates(k) {
+                out.push_str(&format!(
+                    "{indent}foreach (var {name}KP in {name}KeysArr) Marshal.FreeCoTaskMem({name}KP);\n"
+                ));
+            }
+            if cs_elem_allocates(v) {
+                out.push_str(&format!(
+                    "{indent}foreach (var {name}VP in {name}ValsArr) Marshal.FreeCoTaskMem({name}VP);\n"
+                ));
+            }
+        }
         _ => {}
     }
 }
@@ -1398,7 +2037,7 @@ fn render_pinvoke_call_and_return(out: &mut String, f: &FnBinding, indent: &str)
     let has_out_len = f.ret.as_ref().is_some_and(|r| {
         matches!(
             r,
-            TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) | TypeRef::Iterator(_)
+            TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_)
         ) || matches!(
             r,
             TypeRef::Optional(inner)
@@ -1467,6 +2106,15 @@ fn build_call_args(params: &[ParamBinding]) -> String {
                     | TypeRef::Enum(_) => vec![format!("{name}Ptr")],
                     _ => vec![name],
                 },
+                TypeRef::List(_) => vec![
+                    format!("{name}.Length == 0 ? IntPtr.Zero : {name}Pin.AddrOfPinnedObject()"),
+                    format!("(UIntPtr){name}.Length"),
+                ],
+                TypeRef::Map(_, _) => vec![
+                    format!("{name}.Count == 0 ? IntPtr.Zero : {name}KeysPin.AddrOfPinnedObject()"),
+                    format!("{name}.Count == 0 ? IntPtr.Zero : {name}ValsPin.AddrOfPinnedObject()"),
+                    format!("(UIntPtr){name}.Count"),
+                ],
                 _ => vec![name],
             }
         })
@@ -1516,9 +2164,10 @@ fn render_return_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
         TypeRef::Optional(inner) => {
             render_optional_return_conversion(out, inner, indent);
         }
-        TypeRef::List(inner) | TypeRef::Iterator(inner) => {
+        TypeRef::List(inner) => {
             render_list_return(out, inner, indent);
         }
+        TypeRef::Iterator(_) => unreachable!("iterator functions render via CallShape::Iterator"),
         TypeRef::Map(_, _) => {}
         _ => {
             out.push_str(&format!("{indent}return result;\n"));
@@ -1623,60 +2272,7 @@ fn render_optional_return_conversion(out: &mut String, inner: &TypeRef, indent: 
 }
 
 fn render_list_return(out: &mut String, inner: &TypeRef, indent: &str) {
-    let elem = cs_type(inner);
-    out.push_str(&format!(
-        "{indent}if (result == IntPtr.Zero) return Array.Empty<{elem}>();\n"
-    ));
-    match inner {
-        TypeRef::I32 => {
-            out.push_str(&format!("{indent}var arr = new int[(int)outLen];\n"));
-            out.push_str(&format!(
-                "{indent}Marshal.Copy(result, arr, 0, (int)outLen);\n"
-            ));
-            out.push_str(&format!("{indent}return arr;\n"));
-        }
-        TypeRef::I64 => {
-            out.push_str(&format!("{indent}var arr = new long[(int)outLen];\n"));
-            out.push_str(&format!(
-                "{indent}Marshal.Copy(result, arr, 0, (int)outLen);\n"
-            ));
-            out.push_str(&format!("{indent}return arr;\n"));
-        }
-        TypeRef::F64 => {
-            out.push_str(&format!("{indent}var arr = new double[(int)outLen];\n"));
-            out.push_str(&format!(
-                "{indent}Marshal.Copy(result, arr, 0, (int)outLen);\n"
-            ));
-            out.push_str(&format!("{indent}return arr;\n"));
-        }
-        TypeRef::Struct(name) => {
-            let cn = local_type_name(name);
-            out.push_str(&format!("{indent}var arr = new {cn}[(int)outLen];\n"));
-            out.push_str(&format!(
-                "{indent}for (int i = 0; i < (int)outLen; i++)\n{indent}{{\n"
-            ));
-            out.push_str(&format!(
-                "{indent}    arr[i] = new {cn}(Marshal.ReadIntPtr(result, i * IntPtr.Size));\n"
-            ));
-            out.push_str(&format!("{indent}}}\n"));
-            out.push_str(&format!("{indent}return arr;\n"));
-        }
-        TypeRef::Enum(name) => {
-            let cn = local_type_name(name);
-            out.push_str(&format!("{indent}var arr = new {cn}[(int)outLen];\n"));
-            out.push_str(&format!(
-                "{indent}for (int i = 0; i < (int)outLen; i++)\n{indent}{{\n"
-            ));
-            out.push_str(&format!(
-                "{indent}    arr[i] = ({cn})Marshal.ReadInt32(result + i * sizeof(int));\n"
-            ));
-            out.push_str(&format!("{indent}}}\n"));
-            out.push_str(&format!("{indent}return arr;\n"));
-        }
-        _ => {
-            out.push_str(&format!("{indent}return Array.Empty<{elem}>();\n"));
-        }
-    }
+    render_list_decode(out, inner, "result", "outLen", indent);
 }
 
 fn render_map_return_call(
@@ -1732,7 +2328,9 @@ fn marshal_read_element(ty: &TypeRef, arr: &str, idx: &str) -> String {
             format!("new {cn}(Marshal.ReadIntPtr({arr}, {idx} * IntPtr.Size))")
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            format!("Marshal.PtrToStringUTF8(Marshal.ReadIntPtr({arr}, {idx} * IntPtr.Size))")
+            format!(
+                "Marshal.PtrToStringUTF8(Marshal.ReadIntPtr({arr}, {idx} * IntPtr.Size)) ?? \"\""
+            )
         }
         TypeRef::Enum(name) => {
             let cn = local_type_name(name);
@@ -1767,7 +2365,7 @@ mod tests {
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules,
             generators: None,
             package: None,
@@ -1852,9 +2450,73 @@ mod tests {
     }
 
     #[test]
+    fn listeners_generate_register_unregister() {
+        use weaveffi_ir::ir::{CallbackDef, ListenerDef};
+        let api = make_api(vec![Module {
+            name: "events".into(),
+            functions: vec![],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![CallbackDef {
+                name: "OnMessage".into(),
+                doc: None,
+                params: vec![Param {
+                    name: "message".into(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                    doc: None,
+                }],
+            }],
+            listeners: vec![ListenerDef {
+                name: "message_listener".into(),
+                event_callback: "OnMessage".into(),
+                doc: None,
+            }],
+            errors: None,
+            modules: vec![],
+        }]);
+        let dir = tempfile::tempdir().unwrap();
+        let out = Utf8Path::from_path(dir.path()).unwrap();
+        DotnetGenerator
+            .generate(&api, out, &DotnetConfig::default())
+            .unwrap();
+        let cs = std::fs::read_to_string(dir.path().join("dotnet/WeaveFFI.cs")).unwrap();
+        assert!(
+            cs.contains("internal delegate void Cb_weaveffi_events_OnMessage_fn"),
+            "unmanaged delegate type must be declared: {cs}"
+        );
+        assert!(
+            cs.contains("[UnmanagedFunctionPointer(CallingConvention.Cdecl)]"),
+            "delegate must use cdecl: {cs}"
+        );
+        assert!(
+            cs.contains("internal static extern ulong weaveffi_events_register_message_listener"),
+            "register pinvoke missing: {cs}"
+        );
+        assert!(
+            cs.contains(
+                "public static ulong EventsRegisterMessageListener(Action<string> callback)"
+            ),
+            "register wrapper missing: {cs}"
+        );
+        assert!(
+            cs.contains("public static void EventsUnregisterMessageListener(ulong id)"),
+            "unregister wrapper missing: {cs}"
+        );
+        assert!(
+            cs.contains("_listenerRefs[id] = trampoline;"),
+            "delegate must be pinned in the registry: {cs}"
+        );
+        assert!(
+            cs.contains("Marshal.PtrToStringUTF8(message) ?? \"\""),
+            "string arg must be marshaled: {cs}"
+        );
+    }
+
+    #[test]
     fn dotnet_builder_generated() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![],
@@ -1906,6 +2568,25 @@ mod tests {
         assert!(cs.contains("WithName("), "missing WithName: {cs}");
         assert!(cs.contains("WithAge("), "missing WithAge: {cs}");
         assert!(cs.contains("Build()"), "missing Build: {cs}");
+        // Build is FFI-backed: it calls the C create symbol, checks the
+        // error, and wraps the returned handle. Unset fields default to zero
+        // values rather than throwing.
+        assert!(
+            cs.contains("NativeMethods.weaveffi_contacts_Contact_create("),
+            "missing create call: {cs}"
+        );
+        assert!(
+            cs.contains("return new Contact(result);"),
+            "missing handle wrap: {cs}"
+        );
+        assert!(
+            cs.contains("private string _name = \"\";") && cs.contains("private int _age = 0;"),
+            "missing zero defaults: {cs}"
+        );
+        assert!(
+            !cs.contains("NotImplementedException"),
+            "stub must be gone: {cs}"
+        );
     }
 
     #[test]
@@ -4173,7 +4854,7 @@ mod tests {
     #[test]
     fn dotnet_typed_handle_type() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![Function {
@@ -4540,8 +5221,8 @@ mod tests {
             "top-level wrapper class missing: {cs}"
         );
         assert!(
-            cs.contains("public static class Child"),
-            "nested wrapper class missing: {cs}"
+            cs.contains("public static class ParentChild"),
+            "submodule wrapper class must be flattened to its full path: {cs}"
         );
         assert!(
             cs.contains("weaveffi_parent_outer_fn"),

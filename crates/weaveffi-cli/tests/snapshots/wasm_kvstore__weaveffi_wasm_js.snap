@@ -554,6 +554,12 @@ export async function loadWeaveffiWasm(url) {
         _freeErr(wasm, _err);
         return _r !== 0;
       },
+      register_eviction_listener() {
+        throw new Error("weaveffi: listener 'eviction_listener' is not supported by the wasm target (single-threaded wasm has no producer thread to deliver events); use a native target for listeners");
+      },
+      unregister_eviction_listener() {
+        throw new Error("weaveffi: listener 'eviction_listener' is not supported by the wasm target (single-threaded wasm has no producer thread to deliver events); use a native target for listeners");
+      },
       Store: {
         create: (...args) => Store.create(wasm, ...args),
       },

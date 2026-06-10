@@ -14,6 +14,8 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <unordered_map>
 #include <memory>
 #include <stdexcept>
+#include <functional>
+#include <mutex>
 
 extern "C" {
 
@@ -54,6 +56,41 @@ public:
     WeaveFFIError(int32_t code, const std::string& msg) : std::runtime_error(msg), code_(code) {}
     int32_t code() const { return code_; }
 };
+
+namespace detail {
+
+inline std::mutex& wv_listener_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+inline std::unordered_map<uint64_t, std::shared_ptr<void>>& wv_listener_registry() {
+    static std::unordered_map<uint64_t, std::shared_ptr<void>> registry;
+    return registry;
+}
+
+} // namespace detail
+
+/** @return A subscription id for events_unregister_message_listener(). */
+inline uint64_t events_register_message_listener(std::function<void(std::string)> callback) {
+    auto fn = std::make_shared<std::function<void(std::string)>>(std::move(callback));
+    uint64_t id = weaveffi_events_register_message_listener(
+        [](const char* message, void* context) {
+            auto& cb = *static_cast<std::function<void(std::string)>*>(context);
+            cb(std::string(message ? message : ""));
+        },
+        fn.get());
+    std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());
+    detail::wv_listener_registry()[id] = fn;
+    return id;
+}
+
+/** Unregisters a listener previously registered with events_register_message_listener(). */
+inline void events_unregister_message_listener(uint64_t id) {
+    weaveffi_events_unregister_message_listener(id);
+    std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());
+    detail::wv_listener_registry().erase(id);
+}
 
 /** Send a message, triggering the OnMessage callback */
 inline void events_send_message(const std::string& text) {

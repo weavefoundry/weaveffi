@@ -6,7 +6,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 # To regenerate: weaveffi generate weaveffi.yml -o <out>
 
 from enum import IntEnum
-from typing import Dict, Iterator, List, Optional
+from typing import Callable, Dict, Iterator, List, Optional
 
 # Lifecycle status of a document.
 #
@@ -35,6 +35,10 @@ class Document:
     # Free-form tags for grouping
     @property
     def tags(self) -> List[str]: ...
+
+# Subscribe to document-saved notifications
+def docs_register_saved_listener(callback: Callable[[int, int], None]) -> int: ...
+def docs_unregister_saved_listener(listener_id: int) -> None: ...
 
 # Create a brand new document.
 #

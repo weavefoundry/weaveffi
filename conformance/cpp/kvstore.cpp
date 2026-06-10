@@ -3,11 +3,15 @@
 // Drives the generated header-only wrappers, focusing on the map return-by-value
 // redesign: `Entry::metadata()` reads the triple-pointer out-params into an
 // `unordered_map`. Also covers the `[string]` list getter, the builder's
-// list/map *input* marshaling, the iterator-backed `kv_list_keys`, and the
-// `kv.stats` submodule wrapper. Aborts (non-zero) on any failed assertion.
+// list/map *input* marshaling, the iterator-backed `kv_list_keys`, the
+// `kv.stats` submodule wrapper, the std::function eviction listener (register
+// -> fire synchronously on delete -> unregister), and the std::future-backed
+// `kv_compact_async` settled from the producer's worker thread. Aborts
+// (non-zero) on any failed assertion.
 
 #include <cassert>
 #include <cstdio>
+#include <future>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -77,6 +81,27 @@ int main() {
     // kv.stats submodule wrapper.
     Stats st = kv_stats_get_stats(store);
     assert(st.total_entries() == 2);
+
+    // Eviction listener: delete fires the std::function trampoline
+    // synchronously on the calling thread.
+    std::vector<std::string> evicted;
+    uint64_t sub = kv_register_eviction_listener(
+        [&evicted](std::string key) { evicted.push_back(std::move(key)); });
+    assert(sub > 0);
+    assert(kv_delete(store, "beta"));
+    assert(evicted.size() == 1 && evicted[0] == "beta");
+
+    // Unregister stops delivery.
+    kv_unregister_eviction_listener(sub);
+    assert(kv_delete(store, "alpha"));
+    assert(evicted.size() == 1);
+
+    // Async: an immediately-expired entry gives compact 3 bytes to reclaim;
+    // the std::future is settled from the producer's worker thread.
+    assert(kv_put(store, "doomed", payload, EntryKind::Volatile, 0));
+    std::future<int64_t> pending = kv_compact_async(store);
+    assert(pending.get() == 3);
+    assert(kv_count(store) == 0);
 
     // No explicit kv_close_store: the producer frees the store there *and* the
     // Store destructor calls Store_destroy, so closing here would double-free.

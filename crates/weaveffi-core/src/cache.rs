@@ -147,7 +147,7 @@ mod tests {
 
     fn minimal_api() -> Api {
         Api {
-            version: "0.1.0".to_string(),
+            version: "0.3.0".to_string(),
             modules: vec![Module {
                 name: "math".to_string(),
                 functions: vec![Function {
@@ -195,6 +195,10 @@ mod tests {
 
         fn name(&self) -> &'static str {
             self.name
+        }
+
+        fn capabilities(&self) -> crate::capabilities::TargetCapabilities {
+            crate::capabilities::TargetCapabilities::full()
         }
 
         fn generate(

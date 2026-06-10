@@ -124,7 +124,7 @@ fn build_large_api() -> Api {
         .collect();
 
     Api {
-        version: "0.1.0".into(),
+        version: "0.3.0".into(),
         modules,
         generators: None,
         package: None,

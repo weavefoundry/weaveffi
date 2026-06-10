@@ -11,7 +11,7 @@ import ctypes
 import os
 import platform
 from enum import IntEnum
-from typing import Dict, Iterator, List, Optional
+from typing import Callable, Dict, Iterator, List, Optional
 
 
 class WeaveFFIError(Exception):
@@ -86,6 +86,12 @@ def _bytes_to_string(ptr) -> Optional[str]:
 
 import asyncio
 import threading
+
+
+# Registered listener trampolines, keyed by subscription id. Holding
+# the ctypes function objects here keeps them alive until unregistered;
+# without this the GC could collect a trampoline the producer still calls.
+_listener_refs: Dict[int, object] = {}
 
 
 # === Module: docs ===
@@ -172,10 +178,10 @@ class DocumentBuilder:
     Documents are persisted to disk and exposed via the public API.
     """
     def __init__(self) -> None:
-        self._id: Optional[int] = None
-        self._title: Optional[str] = None
+        self._id: int = 0
+        self._title: str = ""
         self._status: Optional["Status"] = None
-        self._tags: Optional[List[str]] = None
+        self._tags: List[str] = []
 
     def with_id(self, value: int) -> "DocumentBuilder":
         """Stable opaque identifier"""
@@ -198,15 +204,51 @@ class DocumentBuilder:
         return self
 
     def build(self) -> "Document":
-        if self._id is None:
-            raise ValueError("missing field: id")
-        if self._title is None:
-            raise ValueError("missing field: title")
-        if self._status is None:
-            raise ValueError("missing field: status")
-        if self._tags is None:
-            raise ValueError("missing field: tags")
-        raise NotImplementedError("DocumentBuilder.build requires FFI backing")
+        id = self._id
+        title = self._title
+        status = self._status
+        tags = self._tags
+        _fn = _lib.weaveffi_docs_Document_create
+        _fn.argtypes = [ctypes.c_int64, ctypes.c_char_p, ctypes.c_int32, ctypes.POINTER(ctypes.c_char_p), ctypes.c_size_t, ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_void_p
+        _tags_arr = (ctypes.c_char_p * len(tags))(*[_string_to_bytes(v) for v in tags])
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(id, _string_to_bytes(title), status.value, _tags_arr, len(tags), ctypes.byref(_err))
+        _check_error(_err)
+        if _result is None:
+            raise WeaveFFIError(-1, "null pointer")
+        return Document(_result)
+
+
+# Fires after a document has been persisted successfully
+# Callback type OnSaved: Callable[[int, int], None]
+_CFUNC_weaveffi_docs_OnSaved_fn = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_int32, ctypes.c_void_p)
+
+
+def docs_register_saved_listener(callback: Callable[[int, int], None]) -> int:
+    """
+    Subscribe to document-saved notifications
+
+    Returns a subscription id for docs_unregister_saved_listener().
+    """
+    def _trampoline(doc_id, revision, _context):
+        callback(doc_id, revision)
+    _cfunc = _CFUNC_weaveffi_docs_OnSaved_fn(_trampoline)
+    _fn = _lib.weaveffi_docs_register_saved_listener
+    _fn.argtypes = [_CFUNC_weaveffi_docs_OnSaved_fn, ctypes.c_void_p]
+    _fn.restype = ctypes.c_uint64
+    _listener_id = int(_fn(_cfunc, None))
+    _listener_refs[_listener_id] = _cfunc
+    return _listener_id
+
+
+def docs_unregister_saved_listener(listener_id: int) -> None:
+    """Unregister a listener previously registered with docs_register_saved_listener()."""
+    _fn = _lib.weaveffi_docs_unregister_saved_listener
+    _fn.argtypes = [ctypes.c_uint64]
+    _fn.restype = None
+    _fn(ctypes.c_uint64(listener_id))
+    _listener_refs.pop(listener_id, None)
 
 
 def docs_create_document(title: str, tags: List[str]) -> "Document":
