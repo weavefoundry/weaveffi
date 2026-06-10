@@ -62,7 +62,13 @@ module WeaveFFI
   attach_function :weaveffi_tasks_TaskResult_get_id, [:pointer], :int64
   attach_function :weaveffi_tasks_TaskResult_get_value, [:pointer], :pointer
   attach_function :weaveffi_tasks_TaskResult_get_success, [:pointer], :int32
+  callback :weaveffi_tasks_run_task_callback, [:pointer, :pointer, :pointer], :void
+  attach_function :weaveffi_tasks_run_task_async, [:string, :weaveffi_tasks_run_task_callback, :pointer], :void
+  callback :weaveffi_tasks_run_batch_callback, [:pointer, :pointer, :pointer, :size_t], :void
+  attach_function :weaveffi_tasks_run_batch_async, [:pointer, :size_t, :weaveffi_tasks_run_batch_callback, :pointer], :void
   attach_function :weaveffi_tasks_cancel_task, [:int64, :pointer], :int32
+  callback :weaveffi_tasks_run_n_tasks_callback, [:pointer, :pointer, :int32], :void
+  attach_function :weaveffi_tasks_run_n_tasks_async, [:int32, :weaveffi_tasks_run_n_tasks_callback, :pointer], :void
   attach_function :weaveffi_tasks_active_callbacks, [:pointer], :int64
 
   class TaskResultPtr < FFI::AutoPointer
@@ -107,11 +113,78 @@ module WeaveFFI
     end
   end
 
+  # Blocks until the async producer completes.
+  def self.run_task(name)
+    queue = Queue.new
+    callback = FFI::Function.new(:void, [:pointer, :pointer, :pointer]) do |_context, err_ptr, result|
+      err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
+      if err && err[:code] != 0
+        code = err[:code]
+        msg = err[:message].null? ? '' : err[:message].read_string
+        weaveffi_error_clear(err_ptr)
+        queue << Error.new(code, msg)
+      else
+        if result.null?
+          queue << Error.new(-1, 'null pointer')
+        else
+          queue << TaskResult.new(result)
+        end
+      end
+    end
+    weaveffi_tasks_run_task_async(name, callback, FFI::Pointer::NULL)
+    value = queue.pop
+    raise value if value.is_a?(Error)
+    value
+  end
+
+  # Blocks until the async producer completes.
+  def self.run_batch(names)
+    queue = Queue.new
+    callback = FFI::Function.new(:void, [:pointer, :pointer, :pointer, :size_t]) do |_context, err_ptr, result, result_len|
+      err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
+      if err && err[:code] != 0
+        code = err[:code]
+        msg = err[:message].null? ? '' : err[:message].read_string
+        weaveffi_error_clear(err_ptr)
+        queue << Error.new(code, msg)
+      else
+        queue << (result.null? ? [] : result.read_array_of_pointer(result_len).map { |p| TaskResult.new(p) })
+      end
+    end
+    names_buf = FFI::MemoryPointer.new(:pointer, names.length)
+    names_ptrs = names.map { |s| FFI::MemoryPointer.from_string(s) }
+    names_buf.write_array_of_pointer(names_ptrs)
+    weaveffi_tasks_run_batch_async(names_buf, names.length, callback, FFI::Pointer::NULL)
+    value = queue.pop
+    raise value if value.is_a?(Error)
+    value
+  end
+
   def self.cancel_task(id)
     err = ErrorStruct.new
     result = weaveffi_tasks_cancel_task(id, err)
     check_error!(err)
     result != 0
+  end
+
+  # Blocks until the async producer completes.
+  def self.run_n_tasks(n)
+    queue = Queue.new
+    callback = FFI::Function.new(:void, [:pointer, :pointer, :int32]) do |_context, err_ptr, result|
+      err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
+      if err && err[:code] != 0
+        code = err[:code]
+        msg = err[:message].null? ? '' : err[:message].read_string
+        weaveffi_error_clear(err_ptr)
+        queue << Error.new(code, msg)
+      else
+        queue << result
+      end
+    end
+    weaveffi_tasks_run_n_tasks_async(n, callback, FFI::Pointer::NULL)
+    value = queue.pop
+    raise value if value.is_a?(Error)
+    value
   end
 
   def self.active_callbacks()

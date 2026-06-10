@@ -33,6 +33,7 @@ errors become managed exceptions, and the project targets `net8.0`.
 | `T?`         | `T?` (nullable)            | `IntPtr`      |
 | `[T]`        | `T[]`                      | `IntPtr`      |
 | `{K: V}`     | `Dictionary<K, V>`         | `IntPtr`      |
+| `iter<T>`    | `IEnumerable<T>` (lazy)    | `IntPtr`      |
 
 ## Example IDL → generated code
 
@@ -96,46 +97,63 @@ public class Contact : IDisposable
     private IntPtr _handle;
     private bool _disposed;
 
-    internal Contact(IntPtr handle) { _handle = handle; }
+    internal Contact(IntPtr handle)
+    {
+        _handle = handle;
+    }
 
-    public string Name {
-        get {
+    internal IntPtr Handle => _handle;
+
+    public string Name
+    {
+        get
+        {
             var ptr = NativeMethods.weaveffi_contacts_Contact_get_name(_handle);
             var str = WeaveFFIHelpers.PtrToString(ptr);
             NativeMethods.weaveffi_free_string(ptr);
-            return str;
+            return str ?? "";
         }
     }
 
-    public void Dispose() {
-        if (!_disposed) {
+    public void Dispose()
+    {
+        if (!_disposed)
+        {
             NativeMethods.weaveffi_contacts_Contact_destroy(_handle);
             _disposed = true;
         }
         GC.SuppressFinalize(this);
     }
 
-    ~Contact() { Dispose(); }
+    ~Contact()
+    {
+        Dispose();
+    }
 }
 ```
 
-Functions live as static methods on a class named after the module
-and throw `WeaveFFIException` on failure:
+Functions live as static methods on a class named after the module.
+Method names carry the module prefix (`ContactsCreateContact`), and
+nested IDL modules flatten into a single class with a concatenated
+name (a `stats` module nested under `kv` becomes `KvStats` with
+`KvStatsGetStats`). All wrappers throw `WeaveFFIException` on failure:
 
 ```csharp
 public static class Contacts
 {
-    public static ulong CreateContact(string name, string? email, int age)
+    public static ulong ContactsCreateContact(string name, string? email, int age)
     {
         var err = new WeaveFFIError();
         var namePtr = Marshal.StringToCoTaskMemUTF8(name);
         var emailPtr = email != null ? Marshal.StringToCoTaskMemUTF8(email) : IntPtr.Zero;
-        try {
-            var result = NativeMethods.weaveffi_contacts_create_contact(
-                namePtr, emailPtr, age, ref err);
+        try
+        {
+            var result = NativeMethods.weaveffi_contacts_create_contact(namePtr, emailPtr, age, ref err);
             WeaveFFIError.Check(err);
             return result;
-        } finally {
+        }
+        finally
+        {
             Marshal.FreeCoTaskMem(namePtr);
             if (emailPtr != IntPtr.Zero) Marshal.FreeCoTaskMem(emailPtr);
         }
@@ -153,10 +171,8 @@ internal static class NativeMethods
     [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     internal static extern void weaveffi_free_string(IntPtr ptr);
 
-    [DllImport(LibName, EntryPoint = "weaveffi_contacts_create_contact",
-               CallingConvention = CallingConvention.Cdecl)]
-    internal static extern ulong weaveffi_contacts_create_contact(
-        IntPtr name, IntPtr email, int age, ref WeaveFFIError err);
+    [DllImport(LibName, EntryPoint = "weaveffi_contacts_create_contact", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern ulong weaveffi_contacts_create_contact(IntPtr name, IntPtr email, int age, ref WeaveFFIError err);
 }
 ```
 
@@ -165,7 +181,7 @@ internal static class NativeMethods
 1. Generate the bindings:
 
    ```bash
-   weaveffi generate --input api.yaml --output generated/ --target dotnet
+   weaveffi generate api.yaml -o generated/ --target dotnet
    ```
 
 2. Build:
@@ -201,30 +217,111 @@ internal static class NativeMethods
   `Marshal.StringToCoTaskMemUTF8` and freed in a `finally` block.
 - Optional struct returns surface as `IntPtr.Zero` from the C ABI and
   become `null` in C#.
+- `iter<T>` functions return a lazy `IEnumerable<T>` that pulls items
+  through the C `_next` function as you enumerate; the native iterator
+  handle is destroyed in a `finally` block when enumeration completes
+  or the enumerator is disposed early.
 
 ## Async support
 
-Async IDL functions are exposed as `async Task<T>` methods. The
-generator emits a static dispatcher that wires the C ABI callback into
-a `TaskCompletionSource<T>`:
+Async IDL functions are exposed as `async Task<T>` methods (named like
+every other wrapper — no extra `Async` suffix is appended). The wrapper
+wires the C ABI completion callback into a `TaskCompletionSource<T>`
+and keeps the callback delegate alive with a `GCHandle` while the call
+is in flight:
 
 ```csharp
-public static Task<Contact> FetchContactAsync(int id, CancellationToken ct = default)
+public static async Task<TaskResult> TasksRunTask(string name)
 {
-    var tcs = new TaskCompletionSource<Contact>();
-    var handle = GCHandle.Alloc(tcs);
-    NativeMethods.weaveffi_contacts_fetch_contact_async(
-        id, _asyncCallback, GCHandle.ToIntPtr(handle));
-    if (ct.CanBeCanceled) {
-        ct.Register(() => NativeMethods.weaveffi_cancel(/* token */));
-    }
-    return tcs.Task;
+    var tcs = new TaskCompletionSource<TaskResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+    NativeMethods.AsyncCb_weaveffi_tasks_run_task callback = (context, err, result) =>
+    {
+        try
+        {
+            // ... tcs.SetException(new WeaveFFIException(...)) on error ...
+            tcs.SetResult(new TaskResult(result));
+        }
+        finally
+        {
+            if (context != IntPtr.Zero)
+            {
+                GCHandle.FromIntPtr(context).Free();
+            }
+        }
+    };
+    var gcHandle = GCHandle.Alloc(callback, GCHandleType.Normal);
+    var ctx = GCHandle.ToIntPtr(gcHandle);
+    // ... marshal parameters, gcHandle.Free() in a catch if the native call throws ...
+    NativeMethods.weaveffi_tasks_run_task_async(namePtr, callback, ctx);
+    return await tcs.Task;
 }
 ```
 
-When the IDL marks the function `cancel: true`, the generated wrapper
-forwards `CancellationToken` cancellation to the underlying
-`weaveffi_cancel_token`.
+- The `GCHandle` prevents the GC from collecting the delegate (and the
+  native thunk the producer will call) before completion. It is freed
+  exactly once: in the callback's `finally`, or on the `catch` path if
+  the native call itself throws synchronously.
+- The completion callback runs on the producer's native thread;
+  `RunContinuationsAsynchronously` keeps awaiting code from running
+  inline on that thread.
+- Errors fault the task with a `WeaveFFIException` carrying the C
+  error code and message.
+
+For functions marked `cancellable: true` the wrapper passes
+`IntPtr.Zero` for the C ABI's cancel-token slot; no
+`CancellationToken` parameter is exposed. Only the C, C++, and Kotlin
+targets expose cancellation tokens.
+
+## Callbacks and listeners
+
+An IDL `listener` becomes a register/unregister pair on the module
+class. Registration takes an `Action<...>` and returns a `ulong`
+subscription id; unregistration takes that id back:
+
+```csharp
+public static ulong EventsRegisterMessageListener(Action<string> callback)
+public static void EventsUnregisterMessageListener(ulong id)
+```
+
+The id is the `uint64` returned by the C ABI's
+`weaveffi_events_register_message_listener(callback_fn, context)`.
+Registration wraps the `Action` in a Cdecl delegate trampoline and
+stores it in a registry keyed by the subscription id so the GC cannot
+collect it while the native side may still call it:
+
+```csharp
+private static readonly object _listenerLock = new object();
+private static readonly Dictionary<ulong, Delegate> _listenerRefs = new Dictionary<ulong, Delegate>();
+
+public static ulong EventsRegisterMessageListener(Action<string> callback)
+{
+    NativeMethods.Cb_weaveffi_events_OnMessage_fn trampoline = (message, context) =>
+    {
+        callback(Marshal.PtrToStringUTF8(message) ?? "");
+    };
+    ulong id;
+    lock (_listenerLock)
+    {
+        id = NativeMethods.weaveffi_events_register_message_listener(trampoline, IntPtr.Zero);
+        _listenerRefs[id] = trampoline;
+    }
+    return id;
+}
+```
+
+The trampoline's delegate type is declared with
+`[UnmanagedFunctionPointer(CallingConvention.Cdecl)]`.
+`EventsUnregisterMessageListener(id)` calls the C ABI unregister first
+and then drops the registry entry, releasing the delegate for
+collection.
+
+Threading caveats:
+
+- The callback runs on the producer's native thread — not on any
+  captured `SynchronizationContext`. Post to your UI thread or
+  dispatcher yourself if needed.
+- Keep callbacks fast and non-throwing; they execute while the native
+  producer is delivering the event.
 
 ## Troubleshooting
 

@@ -107,7 +107,7 @@ namespace WeaveFFI
                 var ptr = NativeMethods.weaveffi_docs_Document_get_title(_handle);
                 var str = WeaveFFIHelpers.PtrToString(ptr);
                 NativeMethods.weaveffi_free_string(ptr);
-                return str;
+                return str ?? "";
             }
         }
 
@@ -127,7 +127,12 @@ namespace WeaveFFI
             {
                 var ptr = NativeMethods.weaveffi_docs_Document_get_tags(_handle, out var len);
                 if (ptr == IntPtr.Zero) return Array.Empty<string>();
-                return Array.Empty<string>();
+                var arr = new string[(int)len];
+                for (int i = 0; i < (int)len; i++)
+                {
+                    arr[i] = Marshal.PtrToStringUTF8(Marshal.ReadIntPtr(ptr, i * IntPtr.Size)) ?? "";
+                }
+                return arr;
             }
         }
 
@@ -154,10 +159,10 @@ namespace WeaveFFI
     /// </summary>
     public class DocumentBuilder
     {
-        private long? _id;
-        private string? _title;
-        private Status? _status;
-        private string[]? _tags;
+        private long _id = 0;
+        private string _title = "";
+        private Status _status = default;
+        private string[] _tags = Array.Empty<string>();
 
         /// <summary>Stable opaque identifier</summary>
         public DocumentBuilder WithId(long value)
@@ -189,11 +194,27 @@ namespace WeaveFFI
 
         public Document Build()
         {
-            if (_id == null) throw new InvalidOperationException("missing field: id");
-            if (_title == null) throw new InvalidOperationException("missing field: title");
-            if (_status == null) throw new InvalidOperationException("missing field: status");
-            if (_tags == null) throw new InvalidOperationException("missing field: tags");
-            throw new NotImplementedException("DocumentBuilder.Build requires FFI backing");
+            var err = new WeaveFFIError();
+            var id = _id;
+            var title = _title;
+            var status = _status;
+            var tags = _tags;
+            var titlePtr = Marshal.StringToCoTaskMemUTF8(title);
+            var tagsArr = new IntPtr[tags.Length];
+            for (var tagsIt = 0; tagsIt < tags.Length; tagsIt++) tagsArr[tagsIt] = Marshal.StringToCoTaskMemUTF8(tags[tagsIt]);
+            var tagsPin = GCHandle.Alloc(tagsArr, GCHandleType.Pinned);
+            try
+            {
+                var result = NativeMethods.weaveffi_docs_Document_create(id, titlePtr, (int)status, tags.Length == 0 ? IntPtr.Zero : tagsPin.AddrOfPinnedObject(), (UIntPtr)tags.Length, ref err);
+                WeaveFFIError.Check(err);
+                return new Document(result);
+            }
+            finally
+            {
+                Marshal.FreeCoTaskMem(titlePtr);
+                tagsPin.Free();
+                foreach (var tagsP in tagsArr) Marshal.FreeCoTaskMem(tagsP);
+            }
         }
     }
 
@@ -225,6 +246,15 @@ namespace WeaveFFI
         [DllImport(LibName, EntryPoint = "weaveffi_docs_Document_get_tags", CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr weaveffi_docs_Document_get_tags(IntPtr ptr, out UIntPtr out_len);
 
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        internal delegate void Cb_weaveffi_docs_OnSaved_fn(long doc_id, int revision, IntPtr context);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_docs_register_saved_listener", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern ulong weaveffi_docs_register_saved_listener(Cb_weaveffi_docs_OnSaved_fn callback, IntPtr context);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_docs_unregister_saved_listener", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_docs_unregister_saved_listener(ulong id);
+
         [DllImport(LibName, EntryPoint = "weaveffi_docs_create_document", CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr weaveffi_docs_create_document(IntPtr title, IntPtr tags, UIntPtr tags_len, ref WeaveFFIError err);
 
@@ -244,6 +274,39 @@ namespace WeaveFFI
 
     public static class Docs
     {
+        private static readonly object _listenerLock = new object();
+        // Live listener delegates by subscription id. Holding the delegate
+        // here keeps its native thunk alive until unregistered; without this
+        // the GC could collect a delegate the producer still calls.
+        private static readonly Dictionary<ulong, Delegate> _listenerRefs = new Dictionary<ulong, Delegate>();
+
+        /// <summary>Subscribe to document-saved notifications</summary>
+        /// <returns>A subscription id for DocsUnregisterSavedListener().</returns>
+        public static ulong DocsRegisterSavedListener(Action<long, int> callback)
+        {
+            NativeMethods.Cb_weaveffi_docs_OnSaved_fn trampoline = (doc_id, revision, context) =>
+            {
+                callback(doc_id, revision);
+            };
+            ulong id;
+            lock (_listenerLock)
+            {
+                id = NativeMethods.weaveffi_docs_register_saved_listener(trampoline, IntPtr.Zero);
+                _listenerRefs[id] = trampoline;
+            }
+            return id;
+        }
+
+        /// <summary>Unregisters a listener previously registered with DocsRegisterSavedListener().</summary>
+        public static void DocsUnregisterSavedListener(ulong id)
+        {
+            NativeMethods.weaveffi_docs_unregister_saved_listener(id);
+            lock (_listenerLock)
+            {
+                _listenerRefs.Remove(id);
+            }
+        }
+
         /// <summary>
         /// Create a brand new document.
         /// 
@@ -256,15 +319,20 @@ namespace WeaveFFI
         {
             var err = new WeaveFFIError();
             var titlePtr = Marshal.StringToCoTaskMemUTF8(title);
+            var tagsArr = new IntPtr[tags.Length];
+            for (var tagsIt = 0; tagsIt < tags.Length; tagsIt++) tagsArr[tagsIt] = Marshal.StringToCoTaskMemUTF8(tags[tagsIt]);
+            var tagsPin = GCHandle.Alloc(tagsArr, GCHandleType.Pinned);
             try
             {
-                var result = NativeMethods.weaveffi_docs_create_document(titlePtr, tags, ref err);
+                var result = NativeMethods.weaveffi_docs_create_document(titlePtr, tags.Length == 0 ? IntPtr.Zero : tagsPin.AddrOfPinnedObject(), (UIntPtr)tags.Length, ref err);
                 WeaveFFIError.Check(err);
                 return new Document(result);
             }
             finally
             {
                 Marshal.FreeCoTaskMem(titlePtr);
+                tagsPin.Free();
+                foreach (var tagsP in tagsArr) Marshal.FreeCoTaskMem(tagsP);
             }
         }
 

@@ -11,11 +11,15 @@ package weaveffi
 #cgo LDFLAGS: -lweaveffi
 #include "weaveffi.h"
 #include <stdlib.h>
+extern void goWv_weaveffi_kitchen_OnReady_fn(int32_t code, char* msg, void* context);
+extern void goWv_weaveffi_kitchen_do_async_callback(void* context, weaveffi_error* err, char* result);
+extern void goWv_weaveffi_kitchen_do_cancellable_callback(void* context, weaveffi_error* err, char* result);
 */
 import "C"
 
 import (
 	"fmt"
+	"sync"
 	"unsafe"
 )
 
@@ -25,6 +29,42 @@ func boolToC(b bool) C._Bool {
 
 func cToBool(b C._Bool) bool {
 	return bool(b)
+}
+
+var (
+	wvCallbackMu  sync.Mutex
+	wvCallbackSeq uint64
+	wvCallbacks   = map[uint64]interface{}{}
+	// Subscription id -> registry id, so unregister can release the Go callback.
+	wvListenerCtx = map[uint64]uint64{}
+)
+
+func wvCallbackStore(v interface{}) uint64 {
+	wvCallbackMu.Lock()
+	defer wvCallbackMu.Unlock()
+	wvCallbackSeq++
+	wvCallbacks[wvCallbackSeq] = v
+	return wvCallbackSeq
+}
+
+func wvCallbackLoad(id uint64) interface{} {
+	wvCallbackMu.Lock()
+	defer wvCallbackMu.Unlock()
+	return wvCallbacks[id]
+}
+
+func wvCallbackTake(id uint64) interface{} {
+	wvCallbackMu.Lock()
+	defer wvCallbackMu.Unlock()
+	v := wvCallbacks[id]
+	delete(wvCallbacks, id)
+	return v
+}
+
+func wvCallbackDelete(id uint64) {
+	wvCallbackMu.Lock()
+	defer wvCallbackMu.Unlock()
+	delete(wvCallbacks, id)
 }
 
 // Token: A reusable token referenced across modules
@@ -339,6 +379,44 @@ func (b *ItemBuilder) Build() (*Item, error) {
 	return &Item{ptr: result}, nil
 }
 
+//export goWv_weaveffi_kitchen_OnReady_fn
+func goWv_weaveffi_kitchen_OnReady_fn(code C.int32_t, msg *C.char, context unsafe.Pointer) {
+	v := wvCallbackLoad(uint64(uintptr(context)))
+	if v == nil {
+		return
+	}
+	cb := v.(func(code int32, msg string))
+	arg0 := int32(code)
+	arg1 := ""
+	if msg != nil {
+		arg1 = C.GoString(msg)
+	}
+	cb(arg0, arg1)
+}
+
+// KitchenRegisterReadyListener: Subscribe to OnReady events
+// Returns a subscription id for KitchenUnregisterReadyListener.
+func KitchenRegisterReadyListener(callback func(code int32, msg string)) uint64 {
+	ctxID := wvCallbackStore(callback)
+	id := uint64(C.weaveffi_kitchen_register_ready_listener(C.weaveffi_kitchen_OnReady_fn(unsafe.Pointer(C.goWv_weaveffi_kitchen_OnReady_fn)), unsafe.Pointer(uintptr(ctxID))))
+	wvCallbackMu.Lock()
+	wvListenerCtx[id] = ctxID
+	wvCallbackMu.Unlock()
+	return id
+}
+
+// KitchenUnregisterReadyListener unregisters a listener previously registered with KitchenRegisterReadyListener.
+func KitchenUnregisterReadyListener(id uint64) {
+	C.weaveffi_kitchen_unregister_ready_listener(C.uint64_t(id))
+	wvCallbackMu.Lock()
+	ctxID, ok := wvListenerCtx[id]
+	delete(wvListenerCtx, id)
+	wvCallbackMu.Unlock()
+	if ok {
+		wvCallbackDelete(ctxID)
+	}
+}
+
 // KitchenBoolId: Identity for bool
 func KitchenBoolId(x bool) (bool, error) {
 	var cErr C.weaveffi_error
@@ -591,6 +669,88 @@ func KitchenCrossModuleToken() (*Token, error) {
 		return nil, goErr
 	}
 	return &Token{ptr: result}, nil
+}
+
+type wvOutcomeKitchenDoAsync struct {
+	val string
+	err error
+}
+
+//export goWv_weaveffi_kitchen_do_async_callback
+func goWv_weaveffi_kitchen_do_async_callback(context unsafe.Pointer, err *C.weaveffi_error, result *C.char) {
+	v := wvCallbackTake(uint64(uintptr(context)))
+	if v == nil {
+		return
+	}
+	ch := v.(chan wvOutcomeKitchenDoAsync)
+	if err != nil && err.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(err.message), int(err.code))
+		C.weaveffi_error_clear(err)
+		ch <- wvOutcomeKitchenDoAsync{err: goErr}
+		return
+	}
+	val := ""
+	if result != nil {
+		val = C.GoString(result)
+		C.weaveffi_free_string(result)
+	}
+	ch <- wvOutcomeKitchenDoAsync{val: val}
+}
+
+// KitchenDoAsync: Async operation
+// Blocks until the async producer completes.
+func KitchenDoAsync(input string) (string, error) {
+	ch := make(chan wvOutcomeKitchenDoAsync, 1)
+	ctxID := wvCallbackStore(ch)
+	cInput := C.CString(input)
+	defer C.free(unsafe.Pointer(cInput))
+	C.weaveffi_kitchen_do_async_async(cInput, C.weaveffi_kitchen_do_async_callback(unsafe.Pointer(C.goWv_weaveffi_kitchen_do_async_callback)), unsafe.Pointer(uintptr(ctxID)))
+	outcome := <-ch
+	if outcome.err != nil {
+		return "", outcome.err
+	}
+	return outcome.val, nil
+}
+
+type wvOutcomeKitchenDoCancellable struct {
+	val string
+	err error
+}
+
+//export goWv_weaveffi_kitchen_do_cancellable_callback
+func goWv_weaveffi_kitchen_do_cancellable_callback(context unsafe.Pointer, err *C.weaveffi_error, result *C.char) {
+	v := wvCallbackTake(uint64(uintptr(context)))
+	if v == nil {
+		return
+	}
+	ch := v.(chan wvOutcomeKitchenDoCancellable)
+	if err != nil && err.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(err.message), int(err.code))
+		C.weaveffi_error_clear(err)
+		ch <- wvOutcomeKitchenDoCancellable{err: goErr}
+		return
+	}
+	val := ""
+	if result != nil {
+		val = C.GoString(result)
+		C.weaveffi_free_string(result)
+	}
+	ch <- wvOutcomeKitchenDoCancellable{val: val}
+}
+
+// KitchenDoCancellable: Cancellable async operation
+// Blocks until the async producer completes.
+func KitchenDoCancellable(input string) (string, error) {
+	ch := make(chan wvOutcomeKitchenDoCancellable, 1)
+	ctxID := wvCallbackStore(ch)
+	cInput := C.CString(input)
+	defer C.free(unsafe.Pointer(cInput))
+	C.weaveffi_kitchen_do_cancellable_async(cInput, nil, C.weaveffi_kitchen_do_cancellable_callback(unsafe.Pointer(C.goWv_weaveffi_kitchen_do_cancellable_callback)), unsafe.Pointer(uintptr(ctxID)))
+	outcome := <-ch
+	if outcome.err != nil {
+		return "", outcome.err
+	}
+	return outcome.val, nil
 }
 
 // KitchenLegacyOp: Legacy operation kept for compatibility

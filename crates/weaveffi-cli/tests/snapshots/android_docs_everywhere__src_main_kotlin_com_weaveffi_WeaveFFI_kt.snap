@@ -15,6 +15,9 @@ class WeaveFFI {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
+        /** Subscribe to document-saved notifications */
+        @JvmStatic external fun docs_register_saved_listener(callback: (Long, Int) -> Unit): Long
+        @JvmStatic external fun docs_unregister_saved_listener(id: Long)
         /**
          * Create a brand new document.
          *
@@ -23,12 +26,14 @@ class WeaveFFI {
          * @param title Human-readable title for the new document
          * @param tags Initial set of tags (may be empty)
          */
-        @JvmStatic external fun docs_create_document(title: String, tags: Array<String>): Long
+        @JvmStatic private external fun docs_create_documentJni(title: String, tags: Array<String>): Long
+        @JvmStatic fun docs_create_document(title: String, tags: Array<String>): Document = Document(docs_create_documentJni(title, tags))
         /**
          * Look up a document by identifier
          * @param id Identifier returned from create_document
          */
-        @JvmStatic external fun docs_get_document(id: Long): Long?
+        @JvmStatic private external fun docs_get_documentJni(id: Long): Long?
+        @JvmStatic fun docs_get_document(id: Long): Document? = docs_get_documentJni(id)?.let { Document(it) }
         /**
          * Publish a document in the background
          * @param id Identifier of the document to publish

@@ -38,7 +38,7 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_contacts_1create_1contactJni(
     return (jlong) rv;
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_contacts_1get_1contact(JNIEnv* env, jclass clazz, jlong id) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_contacts_1get_1contactJni(JNIEnv* env, jclass clazz, jlong id) {
     weaveffi_error err = {0, NULL};
     weaveffi_contacts_Contact* rv = weaveffi_contacts_get_contact((weaveffi_handle_t)id, &err);
     if (err.code != 0) {

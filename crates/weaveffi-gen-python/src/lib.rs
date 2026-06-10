@@ -9,12 +9,13 @@ use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
 use weaveffi_core::abi::{self, CType};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
+use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, is_c_pointer_type, pascal_case, DocCommentStyle,
 };
 use weaveffi_core::model::{
-    BindingModel, CallShape, EnumBinding, FieldBinding, FnBinding, ModuleBinding, ParamBinding,
-    StructBinding,
+    BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
+    ListenerBinding, ModuleBinding, ParamBinding, StructBinding,
 };
 use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::utils::{
@@ -78,6 +79,15 @@ impl PythonGenerator {
         if has_async {
             out.push_str("\nimport asyncio\nimport threading\n");
         }
+        let has_listeners = model.modules.iter().any(|m| !m.listeners.is_empty());
+        if has_listeners {
+            out.push_str(
+                "\n\n# Registered listener trampolines, keyed by subscription id. Holding\n\
+                 # the ctypes function objects here keeps them alive until unregistered;\n\
+                 # without this the GC could collect a trampoline the producer still calls.\n\
+                 _listener_refs: Dict[int, object] = {}\n",
+            );
+        }
         // The model is a flat, pre-order list of modules, each carrying its
         // joined symbol path — the same traversal order the recursive walk
         // produced.
@@ -96,6 +106,10 @@ impl LanguageBackend for PythonGenerator {
 
     fn name(&self) -> &'static str {
         "python"
+    }
+
+    fn capabilities(&self) -> TargetCapabilities {
+        TargetCapabilities::full()
     }
 
     fn prefix<'a>(&self, config: &'a Self::Config) -> &'a str {
@@ -117,6 +131,26 @@ impl LanguageBackend for PythonGenerator {
         if s.builder.is_some() {
             render_builder(out, s);
         }
+    }
+
+    fn render_callback(
+        &self,
+        out: &mut String,
+        _module: &ModuleBinding,
+        c: &CallbackBinding,
+        _config: &Self::Config,
+    ) {
+        render_callback_type(out, c);
+    }
+
+    fn render_listener(
+        &self,
+        out: &mut String,
+        module: &ModuleBinding,
+        l: &ListenerBinding,
+        config: &Self::Config,
+    ) {
+        render_listener(out, module, l, config.strip_module_prefix);
     }
 
     fn render_function(
@@ -450,7 +484,9 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
                 }
             }
         }
-        Some(TypeRef::Iterator(_)) => todo!("async iterator return"),
+        // Validation rejects `async` + `iter<T>` (AsyncIteratorReturn), so an
+        // iterator can never reach an async completion handler.
+        Some(TypeRef::Iterator(_)) => unreachable!("async iterator returns are rejected upstream"),
     }
 }
 
@@ -670,7 +706,7 @@ import ctypes
 import os
 import platform
 from enum import IntEnum
-from typing import Dict, Iterator, List, Optional
+from typing import Callable, Dict, Iterator, List, Optional
 
 
 class WeaveFFIError(Exception):
@@ -791,11 +827,14 @@ fn render_builder(out: &mut String, s: &StructBinding) {
     out.push_str(&format!("\n\nclass {}:\n", builder_name));
     emit_docstring(out, &s.doc, "    ");
     out.push_str("    def __init__(self) -> None:");
+    // Zero-value defaults (the same contract as the other backends): scalars
+    // start at 0/False/""/b"", collections empty, optionals absent. Unset
+    // fields therefore lower to valid C arguments instead of raising.
     for field in &s.fields {
-        let py_ty = py_type_hint(&field.ty);
+        let (default, hint) = py_field_default(&field.ty);
         out.push_str(&format!(
-            "\n        self._{}: Optional[{}] = None",
-            field.name, py_ty
+            "\n        self._{}: {} = {}",
+            field.name, hint, default
         ));
     }
     for field in &s.fields {
@@ -829,17 +868,219 @@ fn render_builder(out: &mut String, s: &StructBinding) {
     }
     let ret_ty = py_type_hint(&TypeRef::Struct(s.name.clone()));
     out.push_str(&format!("\n\n    def build(self) -> {}:", ret_ty));
+    // Marshal every field into the struct's C `create` call with the same
+    // lowering used for function parameters, then wrap the returned handle.
+    let ind = "        ";
     for field in &s.fields {
-        out.push_str(&format!(
-            "\n        if self._{} is None:\n            raise ValueError(\"missing field: {}\")",
-            field.name, field.name
-        ));
+        out.push_str(&format!("\n{ind}{} = self._{}", field.name, field.name));
     }
+    out.push_str(&format!("\n{ind}_fn = _lib.{}", s.create.symbol));
+    let mut argtypes: Vec<String> = Vec::new();
+    for field in &s.fields {
+        argtypes.extend(py_param_argtypes(&field.ty));
+    }
+    argtypes.push("ctypes.POINTER(_WeaveFFIErrorStruct)".into());
+    out.push_str(&format!("\n{ind}_fn.argtypes = [{}]", argtypes.join(", ")));
+    out.push_str(&format!("\n{ind}_fn.restype = ctypes.c_void_p"));
+    for field in &s.fields {
+        for line in py_param_conversion(&field.name, &field.ty, ind) {
+            out.push('\n');
+            out.push_str(&line);
+        }
+    }
+    out.push_str(&format!("\n{ind}_err = _WeaveFFIErrorStruct()"));
+    let mut call_args: Vec<String> = Vec::new();
+    for field in &s.fields {
+        call_args.extend(py_param_call_args(&field.name, &field.ty));
+    }
+    call_args.push("ctypes.byref(_err)".into());
+    out.push_str(&format!("\n{ind}_result = _fn({})", call_args.join(", ")));
+    out.push_str(&format!("\n{ind}_check_error(_err)"));
+    out.push_str(&format!("\n{ind}if _result is None:"));
     out.push_str(&format!(
-        "\n        raise NotImplementedError(\"{}Builder.build requires FFI backing\")",
-        s.name
+        "\n{ind}    raise WeaveFFIError(-1, \"null pointer\")"
     ));
+    out.push_str(&format!("\n{ind}return {}(_result)", s.name));
     out.push('\n');
+}
+
+/// The zero-value default (and matching type hint) for one builder slot.
+fn py_field_default(ty: &TypeRef) -> (String, String) {
+    let hint = py_type_hint(ty);
+    match ty {
+        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle => ("0".into(), hint),
+        TypeRef::F64 => ("0.0".into(), hint),
+        TypeRef::Bool => ("False".into(), hint),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => ("\"\"".into(), hint),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => ("b\"\"".into(), hint),
+        TypeRef::List(_) => ("[]".into(), hint),
+        TypeRef::Map(_, _) => ("{}".into(), hint),
+        TypeRef::Optional(_) => ("None".into(), hint),
+        // No synthesizable zero value; the with_ setter is the only path.
+        _ => ("None".into(), format!("Optional[{hint}]")),
+    }
+}
+
+// ── Callbacks & listeners ──
+
+/// The module-level `ctypes.CFUNCTYPE` alias for one callback type. Listener
+/// registration binds against this; the C side sees the matching
+/// `typedef void (*{c_fn_type})(…, void* context)`.
+fn render_callback_type(out: &mut String, c: &CallbackBinding) {
+    let mut parts: Vec<String> = vec!["None".into()];
+    parts.extend(c.abi_params.iter().map(|p| py_ctype(&p.ty)));
+    out.push_str("\n\n");
+    emit_doc(out, &c.doc, "");
+    out.push_str(&format!(
+        "# Callback type {}: {}\n",
+        c.name,
+        py_callable_hint(&c.params)
+    ));
+    out.push_str(&format!(
+        "_CFUNC_{} = ctypes.CFUNCTYPE({})\n",
+        c.c_fn_type,
+        parts.join(", ")
+    ));
+}
+
+/// `Callable[[<param hints>], None]` for a callback's idiomatic signature.
+fn py_callable_hint(params: &[ParamBinding]) -> String {
+    let hints: Vec<String> = params.iter().map(|p| py_type_hint(&p.ty)).collect();
+    format!("Callable[[{}], None]", hints.join(", "))
+}
+
+/// The Python expression converting one trampoline parameter's C slots into
+/// the idiomatic value passed to the user callback. `n` is the IR parameter
+/// name (slot names derive from it, mirroring [`abi::lower_param`]).
+fn py_cb_param_expr(n: &str, ty: &TypeRef) -> String {
+    match ty {
+        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => n.into(),
+        TypeRef::Bool => format!("bool({n})"),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("_bytes_to_string({n})"),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            format!("bytes({n}_ptr[:{n}_len]) if {n}_ptr else b\"\"")
+        }
+        TypeRef::Enum(name) => format!("{}({n})", local_type_name(name)),
+        // Borrowed by contract: the producer owns callback arguments for the
+        // duration of the call, so opaque pointers pass through raw rather
+        // than being wrapped in an owning class whose __del__ would free them.
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => n.into(),
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("_bytes_to_string({n})"),
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
+                format!("bytes({n}_ptr[:{n}_len]) if {n}_ptr else None")
+            }
+            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => n.into(),
+            TypeRef::List(elem) => {
+                let read = py_read_element(&format!("{n}[_i]"), elem);
+                format!("[{read} for _i in range({n}_len)] if {n} else None")
+            }
+            TypeRef::Map(k, v) => {
+                let kread = py_read_element(&format!("{n}_keys[_i]"), k);
+                let vread = py_read_element(&format!("{n}_values[_i]"), v);
+                format!("{{{kread}: {vread} for _i in range({n}_len)}} if {n}_keys else None")
+            }
+            TypeRef::Bool => format!("bool({n}[0]) if {n} else None"),
+            TypeRef::Enum(name) => format!("{}({n}[0]) if {n} else None", local_type_name(name)),
+            _ => format!("{n}[0] if {n} else None"),
+        },
+        TypeRef::List(inner) => {
+            let read = py_read_element(&format!("{n}[_i]"), inner);
+            format!("[{read} for _i in range({n}_len)] if {n} else []")
+        }
+        TypeRef::Map(k, v) => {
+            let kread = py_read_element(&format!("{n}_keys[_i]"), k);
+            let vread = py_read_element(&format!("{n}_values[_i]"), v);
+            format!("{{{kread}: {vread} for _i in range({n}_len)}} if {n}_keys else {{}}")
+        }
+        TypeRef::Iterator(_) => unreachable!("iterator not valid as callback parameter"),
+    }
+}
+
+/// Register/unregister wrapper pair for one listener. The trampoline converts
+/// each C slot to its idiomatic value, and the `ctypes` function object is
+/// pinned in `_listener_refs` until `unregister` so the producer never calls
+/// a collected trampoline.
+fn render_listener(
+    out: &mut String,
+    module: &ModuleBinding,
+    l: &ListenerBinding,
+    strip_module_prefix: bool,
+) {
+    let Some(cb) = module.callbacks.iter().find(|c| c.name == l.event_callback) else {
+        // Validation guarantees the referenced callback exists in-module.
+        unreachable!("listener '{}' references unknown callback", l.name);
+    };
+    let register_name = wrapper_name(
+        &module.path,
+        &format!("register_{}", l.name),
+        strip_module_prefix,
+    );
+    let unregister_name = wrapper_name(
+        &module.path,
+        &format!("unregister_{}", l.name),
+        strip_module_prefix,
+    );
+    let cfunc = format!("_CFUNC_{}", cb.c_fn_type);
+    let ind = "    ";
+
+    // register_{listener}(callback) -> int
+    out.push_str(&format!(
+        "\n\ndef {register_name}(callback: {}) -> int:\n",
+        py_callable_hint(&cb.params)
+    ));
+    let reg_doc = match &l.doc {
+        Some(d) => format!(
+            "{}\n\nReturns a subscription id for {unregister_name}().",
+            d.trim()
+        ),
+        None => format!(
+            "Register a {} listener. Returns a subscription id for {unregister_name}().",
+            cb.name
+        ),
+    };
+    emit_docstring(out, &Some(reg_doc), ind);
+
+    let tramp_params: Vec<String> = cb
+        .params
+        .iter()
+        .flat_map(|p| p.abi.iter().map(|slot| slot.name.clone()))
+        .chain(std::iter::once("_context".to_string()))
+        .collect();
+    let call_args: Vec<String> = cb
+        .params
+        .iter()
+        .map(|p| py_cb_param_expr(&p.name, &p.ty))
+        .collect();
+    out.push_str(&format!(
+        "{ind}def _trampoline({}):\n",
+        tramp_params.join(", ")
+    ));
+    out.push_str(&format!("{ind}    callback({})\n", call_args.join(", ")));
+    out.push_str(&format!("{ind}_cfunc = {cfunc}(_trampoline)\n"));
+    out.push_str(&format!("{ind}_fn = _lib.{}\n", l.register_symbol));
+    out.push_str(&format!("{ind}_fn.argtypes = [{cfunc}, ctypes.c_void_p]\n"));
+    out.push_str(&format!("{ind}_fn.restype = ctypes.c_uint64\n"));
+    out.push_str(&format!("{ind}_listener_id = int(_fn(_cfunc, None))\n"));
+    out.push_str(&format!("{ind}_listener_refs[_listener_id] = _cfunc\n"));
+    out.push_str(&format!("{ind}return _listener_id\n"));
+
+    // unregister_{listener}(listener_id) -> None
+    out.push_str(&format!(
+        "\n\ndef {unregister_name}(listener_id: int) -> None:\n"
+    ));
+    emit_docstring(
+        out,
+        &Some(format!(
+            "Unregister a listener previously registered with {register_name}()."
+        )),
+        ind,
+    );
+    out.push_str(&format!("{ind}_fn = _lib.{}\n", l.unregister_symbol));
+    out.push_str(&format!("{ind}_fn.argtypes = [ctypes.c_uint64]\n"));
+    out.push_str(&format!("{ind}_fn.restype = None\n"));
+    out.push_str(&format!("{ind}_fn(ctypes.c_uint64(listener_id))\n"));
+    out.push_str(&format!("{ind}_listener_refs.pop(listener_id, None)\n"));
 }
 
 fn render_getter(out: &mut String, field: &FieldBinding) {
@@ -1479,13 +1720,18 @@ fn render_pyi_module(api: &Api, strip_module_prefix: bool, input_basename: &str)
     // model is used purely for its flattened, path-carrying module traversal.
     let model = BindingModel::build(api, "weaveffi");
     let mut out = render_prelude(CommentStyle::Hash, input_basename);
-    out.push_str("from enum import IntEnum\nfrom typing import Dict, Iterator, List, Optional\n");
+    out.push_str(
+        "from enum import IntEnum\nfrom typing import Callable, Dict, Iterator, List, Optional\n",
+    );
     for m in &model.modules {
         for e in &m.enums {
             render_pyi_enum(&mut out, e);
         }
         for s in &m.structs {
             render_pyi_struct(&mut out, s);
+        }
+        for l in &m.listeners {
+            render_pyi_listener(&mut out, m, l, strip_module_prefix);
         }
         for f in &m.functions {
             render_pyi_function(&mut out, &m.path, f, strip_module_prefix);
@@ -1518,6 +1764,36 @@ fn render_pyi_struct(out: &mut String, s: &StructBinding) {
             field.name, py_ty
         ));
     }
+}
+
+fn render_pyi_listener(
+    out: &mut String,
+    module: &ModuleBinding,
+    l: &ListenerBinding,
+    strip_module_prefix: bool,
+) {
+    let Some(cb) = module.callbacks.iter().find(|c| c.name == l.event_callback) else {
+        unreachable!("listener '{}' references unknown callback", l.name);
+    };
+    let register_name = wrapper_name(
+        &module.path,
+        &format!("register_{}", l.name),
+        strip_module_prefix,
+    );
+    let unregister_name = wrapper_name(
+        &module.path,
+        &format!("unregister_{}", l.name),
+        strip_module_prefix,
+    );
+    out.push('\n');
+    emit_doc(out, &l.doc, "");
+    out.push_str(&format!(
+        "def {register_name}(callback: {}) -> int: ...\n",
+        py_callable_hint(&cb.params)
+    ));
+    out.push_str(&format!(
+        "def {unregister_name}(listener_id: int) -> None: ...\n"
+    ));
 }
 
 fn render_pyi_function(
@@ -1559,7 +1835,7 @@ mod tests {
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules,
             generators: None,
             package: None,
@@ -1966,7 +2242,7 @@ mod tests {
     #[test]
     fn python_builder_generated() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![],
@@ -2011,6 +2287,25 @@ mod tests {
         assert!(py.contains("def with_name("), "missing with_name: {py}");
         assert!(py.contains("def with_age("), "missing with_age: {py}");
         assert!(py.contains("def build("), "missing build: {py}");
+        // Build is FFI-backed: it calls the C create symbol, checks the
+        // error, and wraps the returned handle. Unset fields default to zero
+        // values rather than raising.
+        assert!(
+            py.contains("_fn = _lib.weaveffi_contacts_Contact_create"),
+            "missing create call: {py}"
+        );
+        assert!(
+            py.contains("return Contact(_result)"),
+            "missing handle wrap: {py}"
+        );
+        assert!(
+            py.contains("self._name: str = \"\"") && py.contains("self._age: int = 0"),
+            "missing zero defaults: {py}"
+        );
+        assert!(
+            !py.contains("requires FFI backing"),
+            "stub must be gone: {py}"
+        );
     }
 
     #[test]
@@ -2855,7 +3150,7 @@ mod tests {
             "missing IntEnum import"
         );
         assert!(
-            pyi.contains("from typing import Dict, Iterator, List, Optional"),
+            pyi.contains("from typing import Callable, Dict, Iterator, List, Optional"),
             "missing typing imports"
         );
 
@@ -2961,7 +3256,7 @@ mod tests {
 
         assert!(py.contains("import ctypes"));
         assert!(py.contains("from enum import IntEnum"));
-        assert!(py.contains("from typing import Dict, Iterator, List, Optional"));
+        assert!(py.contains("from typing import Callable, Dict, Iterator, List, Optional"));
         assert!(py.contains("class WeaveFFIError(Exception):"));
         assert!(py.contains("def _load_library()"));
         assert!(py.contains("_lib = _load_library()"));
@@ -3534,7 +3829,7 @@ mod tests {
         let pyi = render_pyi_module(&api, true, "weaveffi.yml");
 
         assert!(pyi.contains("from enum import IntEnum"));
-        assert!(pyi.contains("from typing import Dict, Iterator, List, Optional"));
+        assert!(pyi.contains("from typing import Callable, Dict, Iterator, List, Optional"));
 
         assert!(pyi.contains("class ContactType(IntEnum):"));
         assert!(pyi.contains("    Personal: int"));
@@ -4195,7 +4490,7 @@ mod tests {
     #[test]
     fn python_typed_handle_type() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![Function {
@@ -4436,6 +4731,118 @@ mod tests {
         assert!(
             code.contains("run_in_executor(None, _fetch_data_sync, id)"),
             "should use run_in_executor with sync fn and args: {code}"
+        );
+    }
+
+    #[test]
+    fn listener_register_unregister_wrappers() {
+        use weaveffi_ir::ir::{CallbackDef, ListenerDef};
+        let api = make_api(vec![Module {
+            callbacks: vec![CallbackDef {
+                name: "OnMessage".into(),
+                params: vec![Param {
+                    name: "message".into(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                    doc: None,
+                }],
+                doc: None,
+            }],
+            listeners: vec![ListenerDef {
+                name: "message_listener".into(),
+                event_callback: "OnMessage".into(),
+                doc: None,
+            }],
+            ..simple_module(vec![])
+        }]);
+        let code = render_python_module(&api, false, "weaveffi", "weaveffi.yml");
+        // CFUNCTYPE alias matches the C typedef shape: (const char*, void*).
+        assert!(
+            code.contains(
+                "_CFUNC_weaveffi_math_OnMessage_fn = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_void_p)"
+            ),
+            "callback CFUNCTYPE alias: {code}"
+        );
+        // Registry pinning keeps the trampoline alive until unregister.
+        assert!(
+            code.contains("_listener_refs: Dict[int, object] = {}"),
+            "listener registry: {code}"
+        );
+        assert!(
+            code.contains(
+                "def math_register_message_listener(callback: Callable[[str], None]) -> int:"
+            ),
+            "register wrapper: {code}"
+        );
+        assert!(
+            code.contains("callback(_bytes_to_string(message))"),
+            "trampoline converts the C string: {code}"
+        );
+        assert!(
+            code.contains("_listener_refs[_listener_id] = _cfunc"),
+            "register pins the trampoline: {code}"
+        );
+        assert!(
+            code.contains("def math_unregister_message_listener(listener_id: int) -> None:"),
+            "unregister wrapper: {code}"
+        );
+        assert!(
+            code.contains("_listener_refs.pop(listener_id, None)"),
+            "unregister releases the trampoline: {code}"
+        );
+    }
+
+    #[test]
+    fn listener_bytes_and_enum_params_convert() {
+        use weaveffi_ir::ir::{CallbackDef, EnumDef, EnumVariant, ListenerDef};
+        let api = make_api(vec![Module {
+            enums: vec![EnumDef {
+                name: "Level".into(),
+                doc: None,
+                variants: vec![EnumVariant {
+                    name: "Info".into(),
+                    value: 0,
+                    doc: None,
+                }],
+            }],
+            callbacks: vec![CallbackDef {
+                name: "OnChunk".into(),
+                params: vec![
+                    Param {
+                        name: "data".into(),
+                        ty: TypeRef::Bytes,
+                        mutable: false,
+                        doc: None,
+                    },
+                    Param {
+                        name: "level".into(),
+                        ty: TypeRef::Enum("Level".into()),
+                        mutable: false,
+                        doc: None,
+                    },
+                ],
+                doc: None,
+            }],
+            listeners: vec![ListenerDef {
+                name: "chunks".into(),
+                event_callback: "OnChunk".into(),
+                doc: None,
+            }],
+            ..simple_module(vec![])
+        }]);
+        let code = render_python_module(&api, false, "weaveffi", "weaveffi.yml");
+        // Bytes lower to (ptr, len) slots; the trampoline reconstructs bytes.
+        assert!(
+            code.contains("def _trampoline(data_ptr, data_len, level, _context):"),
+            "trampoline signature has flattened slots: {code}"
+        );
+        assert!(
+            code.contains("bytes(data_ptr[:data_len]) if data_ptr else b\"\""),
+            "bytes param converts: {code}"
+        );
+        assert!(
+            code.contains("Level(level)"),
+            "enum param converts to IntEnum: {code}"
         );
     }
 

@@ -11,7 +11,7 @@ import ctypes
 import os
 import platform
 from enum import IntEnum
-from typing import Dict, Iterator, List, Optional
+from typing import Callable, Dict, Iterator, List, Optional
 
 
 class WeaveFFIError(Exception):
@@ -86,6 +86,12 @@ def _bytes_to_string(ptr) -> Optional[str]:
 
 import asyncio
 import threading
+
+
+# Registered listener trampolines, keyed by subscription id. Holding
+# the ctypes function objects here keeps them alive until unregistered;
+# without this the GC could collect a trampoline the producer still calls.
+_listener_refs: Dict[int, object] = {}
 
 
 # === Module: kv ===
@@ -224,13 +230,13 @@ class Entry:
 class EntryBuilder:
     """A single key-value entry persisted in the store"""
     def __init__(self) -> None:
-        self._id: Optional[int] = None
-        self._key: Optional[str] = None
-        self._value: Optional[bytes] = None
-        self._created_at: Optional[int] = None
-        self._expires_at: Optional[Optional[int]] = None
-        self._tags: Optional[List[str]] = None
-        self._metadata: Optional[Dict[str, str]] = None
+        self._id: int = 0
+        self._key: str = ""
+        self._value: bytes = b""
+        self._created_at: int = 0
+        self._expires_at: Optional[int] = None
+        self._tags: List[str] = []
+        self._metadata: Dict[str, str] = {}
 
     def with_id(self, value: int) -> "EntryBuilder":
         """Stable monotonic identifier assigned on insert"""
@@ -268,21 +274,60 @@ class EntryBuilder:
         return self
 
     def build(self) -> "Entry":
-        if self._id is None:
-            raise ValueError("missing field: id")
-        if self._key is None:
-            raise ValueError("missing field: key")
-        if self._value is None:
-            raise ValueError("missing field: value")
-        if self._created_at is None:
-            raise ValueError("missing field: created_at")
-        if self._expires_at is None:
-            raise ValueError("missing field: expires_at")
-        if self._tags is None:
-            raise ValueError("missing field: tags")
-        if self._metadata is None:
-            raise ValueError("missing field: metadata")
-        raise NotImplementedError("EntryBuilder.build requires FFI backing")
+        id = self._id
+        key = self._key
+        value = self._value
+        created_at = self._created_at
+        expires_at = self._expires_at
+        tags = self._tags
+        metadata = self._metadata
+        _fn = _lib.weaveffi_kv_Entry_create
+        _fn.argtypes = [ctypes.c_int64, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.c_int64, ctypes.POINTER(ctypes.c_int64), ctypes.POINTER(ctypes.c_char_p), ctypes.c_size_t, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_char_p), ctypes.c_size_t, ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_void_p
+        _value_arr = (ctypes.c_uint8 * len(value))(*value)
+        _expires_at_c = ctypes.byref(ctypes.c_int64(expires_at)) if expires_at is not None else None
+        _tags_arr = (ctypes.c_char_p * len(tags))(*[_string_to_bytes(v) for v in tags])
+        _metadata_keys = list(metadata.keys())
+        _metadata_vals = [metadata[_k] for _k in _metadata_keys]
+        _metadata_ka = (ctypes.c_char_p * len(_metadata_keys))(*[_string_to_bytes(_k) for _k in _metadata_keys])
+        _metadata_va = (ctypes.c_char_p * len(_metadata_vals))(*[_string_to_bytes(_v) for _v in _metadata_vals])
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(id, _string_to_bytes(key), _value_arr, len(value), created_at, _expires_at_c, _tags_arr, len(tags), _metadata_ka, _metadata_va, len(_metadata_keys), ctypes.byref(_err))
+        _check_error(_err)
+        if _result is None:
+            raise WeaveFFIError(-1, "null pointer")
+        return Entry(_result)
+
+
+# Fires when an entry is evicted from the store
+# Callback type OnEvict: Callable[[str], None]
+_CFUNC_weaveffi_kv_OnEvict_fn = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_void_p)
+
+
+def kv_register_eviction_listener(callback: Callable[[str], None]) -> int:
+    """
+    Subscribe to per-key eviction notifications
+
+    Returns a subscription id for kv_unregister_eviction_listener().
+    """
+    def _trampoline(key, _context):
+        callback(_bytes_to_string(key))
+    _cfunc = _CFUNC_weaveffi_kv_OnEvict_fn(_trampoline)
+    _fn = _lib.weaveffi_kv_register_eviction_listener
+    _fn.argtypes = [_CFUNC_weaveffi_kv_OnEvict_fn, ctypes.c_void_p]
+    _fn.restype = ctypes.c_uint64
+    _listener_id = int(_fn(_cfunc, None))
+    _listener_refs[_listener_id] = _cfunc
+    return _listener_id
+
+
+def kv_unregister_eviction_listener(listener_id: int) -> None:
+    """Unregister a listener previously registered with kv_register_eviction_listener()."""
+    _fn = _lib.weaveffi_kv_unregister_eviction_listener
+    _fn.argtypes = [ctypes.c_uint64]
+    _fn.restype = None
+    _fn(ctypes.c_uint64(listener_id))
+    _listener_refs.pop(listener_id, None)
 
 
 def kv_open_store(path: str) -> "Store":

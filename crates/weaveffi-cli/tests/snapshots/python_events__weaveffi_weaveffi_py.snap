@@ -11,7 +11,7 @@ import ctypes
 import os
 import platform
 from enum import IntEnum
-from typing import Dict, Iterator, List, Optional
+from typing import Callable, Dict, Iterator, List, Optional
 
 
 class WeaveFFIError(Exception):
@@ -85,7 +85,39 @@ def _bytes_to_string(ptr) -> Optional[str]:
     return ptr.decode("utf-8")
 
 
+# Registered listener trampolines, keyed by subscription id. Holding
+# the ctypes function objects here keeps them alive until unregistered;
+# without this the GC could collect a trampoline the producer still calls.
+_listener_refs: Dict[int, object] = {}
+
+
 # === Module: events ===
+
+# Callback type OnMessage: Callable[[str], None]
+_CFUNC_weaveffi_events_OnMessage_fn = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_void_p)
+
+
+def events_register_message_listener(callback: Callable[[str], None]) -> int:
+    """Register a OnMessage listener. Returns a subscription id for events_unregister_message_listener()."""
+    def _trampoline(message, _context):
+        callback(_bytes_to_string(message))
+    _cfunc = _CFUNC_weaveffi_events_OnMessage_fn(_trampoline)
+    _fn = _lib.weaveffi_events_register_message_listener
+    _fn.argtypes = [_CFUNC_weaveffi_events_OnMessage_fn, ctypes.c_void_p]
+    _fn.restype = ctypes.c_uint64
+    _listener_id = int(_fn(_cfunc, None))
+    _listener_refs[_listener_id] = _cfunc
+    return _listener_id
+
+
+def events_unregister_message_listener(listener_id: int) -> None:
+    """Unregister a listener previously registered with events_register_message_listener()."""
+    _fn = _lib.weaveffi_events_unregister_message_listener
+    _fn.argtypes = [ctypes.c_uint64]
+    _fn.restype = None
+    _fn(ctypes.c_uint64(listener_id))
+    _listener_refs.pop(listener_id, None)
+
 
 def events_send_message(text: str) -> None:
     """Send a message, triggering the OnMessage callback

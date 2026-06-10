@@ -23,6 +23,9 @@ negligible compared to the work done inside the Rust library.
 | `python/setup.py` | Fallback setuptools script |
 | `python/README.md` | Basic usage instructions |
 
+The package directory follows the IDL `package.name` (a package named
+`events` produces `python/events/...`); `weaveffi` is the default.
+
 ## Type mapping
 
 | IDL type     | Python type hint     | ctypes type                        |
@@ -40,6 +43,7 @@ negligible compared to the work done inside the Rust library.
 | `T?`         | `Optional[T]`        | `ctypes.POINTER(scalar)` for values; same pointer for strings/structs |
 | `[T]`        | `List[T]`            | `ctypes.POINTER(scalar)` + `ctypes.c_size_t` |
 | `{K: V}`     | `Dict[K, V]`         | key/value pointer arrays + `ctypes.c_size_t` |
+| `iter<T>`    | `Iterator[T]`        | opaque `ctypes.c_void_p` iterator handle |
 
 Booleans cross the boundary as `c_int32` (`0`/`1`) because C has no
 standard fixed-width boolean type across ABIs.
@@ -104,7 +108,7 @@ Functions become Python functions with full type hints; ctypes
 `argtypes`/`restype` are set up at the call site:
 
 ```python
-def create_contact(name: str, email: Optional[str], contact_type: "ContactType") -> int:
+def contacts_create_contact(name: str, email: Optional[str], contact_type: "ContactType") -> int:
     _fn = _lib.weaveffi_contacts_create_contact
     _fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int32,
                     ctypes.POINTER(_WeaveFFIErrorStruct)]
@@ -167,15 +171,19 @@ class Contact:
     @property
     def age(self) -> int: ...
 
-def create_contact(name: str, email: Optional[str], contact_type: "ContactType") -> int: ...
+def contacts_create_contact(name: str, email: Optional[str], contact_type: "ContactType") -> int: ...
 ```
+
+Wrapper names carry the IDL module prefix by default
+(`contacts_create_contact`); set `strip_module_prefix: true` in the
+Python generator config to drop it.
 
 ## Build instructions
 
 1. Generate the bindings:
 
    ```bash
-   weaveffi generate --input api.yaml --output generated/ --target python
+   weaveffi generate weaveffi.yaml -o generated --target python
    ```
 
 2. Build the Rust shared library:
@@ -201,12 +209,17 @@ def create_contact(name: str, email: Optional[str], contact_type: "ContactType")
 5. Use the bindings:
 
    ```python
-   from weaveffi import ContactType, create_contact, get_contact, count_contacts
+   from weaveffi import (
+       ContactType,
+       contacts_create_contact,
+       contacts_get_contact,
+       contacts_count_contacts,
+   )
 
-   handle = create_contact("Alice", "alice@example.com", ContactType.Work)
-   contact = get_contact(handle)
+   handle = contacts_create_contact("Alice", "alice@example.com", ContactType.Work)
+   contact = contacts_get_contact(handle)
    print(f"{contact.name} ({contact.email})")
-   print(f"Total: {count_contacts()}")
+   print(f"Total: {contacts_count_contacts()}")
    ```
 
 ## Memory and ownership
@@ -230,23 +243,157 @@ def create_contact(name: str, email: Optional[str], contact_type: "ContactType")
 
 ## Async support
 
-Async IDL functions are exposed as `async def` wrappers that schedule
-the C ABI callback onto the running asyncio event loop using
-`loop.call_soon_threadsafe` and a `Future`. The wrapper captures the
-loop, hands the C ABI a callback that resolves the future, and awaits
-it:
+Async IDL functions (`async: true`) are exposed as `async def`
+wrappers. Each wrapper delegates to a generated blocking
+`_<module>_<name>_sync` helper via `run_in_executor`, so the asyncio
+event loop stays free while a worker thread waits for the native
+completion callback:
 
 ```python
-async def fetch_contact(id: int) -> Contact:
-    loop = asyncio.get_running_loop()
-    fut: asyncio.Future[Contact] = loop.create_future()
-    _ctx_id = _retain_ctx((loop, fut))
-    _lib.weaveffi_contacts_fetch_contact_async(id, _async_trampoline, _ctx_id)
-    return await fut
+async def tasks_run_task(name: str) -> "TaskResult":
+    _loop = asyncio.get_event_loop()
+    return await _loop.run_in_executor(None, _tasks_run_task_sync, name)
 ```
 
-When the IDL marks the function `cancel: true`, the wrapper hooks the
-asyncio cancellation into a `weaveffi_cancel_token`.
+The `_sync` helper builds a `ctypes.CFUNCTYPE` completion callback,
+calls the `_async`-suffixed C launcher, and blocks on a
+`threading.Event` until the C side fires the callback. An error
+reported through the callback is re-raised as `WeaveFFIError`:
+
+```python
+def _tasks_run_task_sync(name: str) -> "TaskResult":
+    _fn = _lib.weaveffi_tasks_run_task_async
+    _ev = threading.Event()
+    _state = {"err": None, "val": None}
+    def _cb_impl(context, err, result):
+        try:
+            if err and err.contents.code != 0:
+                # ... decode the error, weaveffi_error_clear ...
+                _state["err"] = WeaveFFIError(_code, _msg)
+            else:
+                # ... null-pointer guard ...
+                _state["val"] = TaskResult(result)
+        finally:
+            _ev.set()
+    _cb_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p,
+                                ctypes.POINTER(_WeaveFFIErrorStruct),
+                                ctypes.c_void_p)
+    _cb = _cb_type(_cb_impl)
+    _fn.argtypes = [ctypes.c_char_p, _cb_type, ctypes.c_void_p]
+    _fn.restype = None
+    _fn(_string_to_bytes(name), _cb, None)
+    _ev.wait()
+    if _state["err"] is not None:
+        raise _state["err"]
+    return _state["val"]
+```
+
+For functions marked `cancellable: true` the C launcher takes an extra
+cancel-token parameter; the Python wrapper always passes `None` (NULL)
+for it. The token is not exposed, so cancelling the awaiting asyncio
+task does not stop the native operation. Cancellation tokens are
+currently surfaced only by the C, C++, and Kotlin targets.
+
+## Callbacks and listeners
+
+IDL `callbacks` declare a C function-pointer type; a `listener` pairs
+one with register/unregister entry points:
+
+```yaml
+callbacks:
+  - name: OnMessage
+    params:
+      - { name: message, type: string }
+listeners:
+  - name: message_listener
+    event_callback: OnMessage
+```
+
+Each listener becomes a register/unregister pair of module functions.
+Registering wraps the Python callable in a `ctypes.CFUNCTYPE`
+trampoline that decodes each C slot, and returns a `uint64`
+subscription id:
+
+```python
+_CFUNC_weaveffi_events_OnMessage_fn = ctypes.CFUNCTYPE(
+    None, ctypes.c_char_p, ctypes.c_void_p)
+
+
+def events_register_message_listener(callback: Callable[[str], None]) -> int:
+    def _trampoline(message, _context):
+        callback(_bytes_to_string(message))
+    _cfunc = _CFUNC_weaveffi_events_OnMessage_fn(_trampoline)
+    _fn = _lib.weaveffi_events_register_message_listener
+    _fn.argtypes = [_CFUNC_weaveffi_events_OnMessage_fn, ctypes.c_void_p]
+    _fn.restype = ctypes.c_uint64
+    _listener_id = int(_fn(_cfunc, None))
+    _listener_refs[_listener_id] = _cfunc
+    return _listener_id
+
+
+def events_unregister_message_listener(listener_id: int) -> None:
+    _fn = _lib.weaveffi_events_unregister_message_listener
+    # ...
+    _fn(ctypes.c_uint64(listener_id))
+    _listener_refs.pop(listener_id, None)
+```
+
+- **GC safety** — the ctypes function object is pinned in the
+  module-level `_listener_refs` dict, keyed by subscription id, so the
+  garbage collector cannot reclaim a trampoline the producer may still
+  call. Unregistering drops the reference.
+- **Subscription ids** — registration returns the `uint64` id produced
+  by `weaveffi_events_register_message_listener(fn, context)`; pass it
+  to `events_unregister_message_listener` to stop delivery and release
+  the trampoline.
+- **Threading** — the callback fires on the producer's thread, not the
+  thread that registered it. Do not block inside it; if results must
+  reach an asyncio loop or UI thread, marshal them yourself (e.g. with
+  `loop.call_soon_threadsafe`).
+
+Typical round trip:
+
+```python
+listener_id = events_register_message_listener(lambda m: print(m))
+events_send_message("hello")
+events_unregister_message_listener(listener_id)
+```
+
+## Iterators
+
+Functions returning `iter<T>` receive an opaque iterator handle from
+the C ABI (`weaveffi_events_get_messages`). The wrapper drains it
+eagerly with the generated `_next` binding
+(`weaveffi_events_GetMessagesIterator_next`), destroys the handle, and
+returns the collected items; the signature is annotated
+`Iterator[str]`:
+
+```python
+def events_get_messages() -> Iterator[str]:
+    _fn = _lib.weaveffi_events_get_messages
+    _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
+    _fn.restype = ctypes.c_void_p
+    _err = _WeaveFFIErrorStruct()
+    _result = _fn(ctypes.byref(_err))
+    _check_error(_err)
+    # ... argtypes/restype for _next_fn and _destroy_fn ...
+    _items = []
+    while True:
+        _out_item = ctypes.c_char_p()
+        _item_err = _WeaveFFIErrorStruct()
+        _has = _next_fn(_result, ctypes.byref(_out_item),
+                        ctypes.byref(_item_err))
+        _check_error(_item_err)
+        if not _has:
+            break
+        _items.append(_bytes_to_string(_out_item.value))
+    _destroy_fn(_result)
+    return _items
+```
+
+An error from `_next` raises `WeaveFFIError`; on success the iterator
+handle is destroyed before the wrapper returns, so no native state
+outlives the call.
 
 ## Troubleshooting
 

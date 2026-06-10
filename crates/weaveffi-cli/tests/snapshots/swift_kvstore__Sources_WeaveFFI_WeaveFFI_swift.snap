@@ -71,6 +71,14 @@ private final class ContinuationRef<T> {
     init(_ value: CheckedContinuation<T, Error>) { self.value = value }
 }
 
+final class WvCallbackBox<T> {
+    let value: T
+    init(_ value: T) { self.value = value }
+}
+
+var wvListenerContexts: [UInt64: UnsafeMutableRawPointer] = [:]
+let wvListenerLock = NSLock()
+
 /// Persistence semantics applied to a stored entry
 public enum EntryKind: UInt32 {
     /// In-memory only; lost on close
@@ -301,6 +309,30 @@ public class Stats {
 }
 
 public enum Kv {
+    /// Subscribe to per-key eviction notifications
+    /// - Returns: A subscription id for ``kv_unregister_eviction_listener(_:)``.
+    public static func kv_register_eviction_listener(_ callback: @escaping (String) -> Void) -> UInt64 {
+        let box = WvCallbackBox(callback)
+        let ctx = Unmanaged.passRetained(box).toOpaque()
+        let id = weaveffi_kv_register_eviction_listener({ key, context in
+            let cb = Unmanaged<WvCallbackBox<(String) -> Void>>.fromOpaque(context!).takeUnretainedValue().value
+            cb(String(cString: key!))
+        }, ctx)
+        wvListenerLock.lock()
+        wvListenerContexts[id] = ctx
+        wvListenerLock.unlock()
+        return id
+    }
+    /// Unregisters a listener previously registered with ``kv_register_eviction_listener(_:)``.
+    public static func kv_unregister_eviction_listener(_ id: UInt64) {
+        weaveffi_kv_unregister_eviction_listener(id)
+        wvListenerLock.lock()
+        let ctx = wvListenerContexts.removeValue(forKey: id)
+        wvListenerLock.unlock()
+        if let ctx = ctx {
+            Unmanaged<WvCallbackBox<(String) -> Void>>.fromOpaque(ctx).release()
+        }
+    }
     /// Open (or create) a store backed by the given filesystem path
     public static func kv_open_store(_ path: String) throws -> Store {
         var err = weaveffi_error(code: 0, message: nil)

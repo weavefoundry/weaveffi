@@ -12,12 +12,13 @@ use camino::Utf8Path;
 use heck::ToUpperCamelCase;
 use serde::{Deserialize, Serialize};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
+use weaveffi_core::capabilities::{self, TargetCapabilities};
 use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, walk_modules, walk_modules_with_path, DocCommentStyle,
 };
 use weaveffi_core::model::{
-    BindingModel, CallShape, EnumBinding, FieldBinding, FnBinding, IteratorBinding, ModuleBinding,
-    StructBinding,
+    BindingModel, CallShape, EnumBinding, FieldBinding, FnBinding, IteratorBinding,
+    ListenerBinding, ModuleBinding, StructBinding,
 };
 use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::utils::{
@@ -40,6 +41,12 @@ pub struct WasmConfig {
     /// via `[global] c_prefix`; honored so the wasm glue calls the same
     /// exported symbols the producer emits.
     pub prefix: Option<String>,
+    /// Opt in to generating wasm bindings for an IDL that uses features the
+    /// wasm target does not support (callbacks and listeners). The supported
+    /// surface is generated normally; each unsupported entry point becomes an
+    /// explicit stub that throws at call time, and the orchestrator prints a
+    /// warning listing what was skipped. Without this flag, generation fails.
+    pub allow_unsupported: bool,
     /// Basename of the IDL the CLI was invoked with.
     #[serde(skip)]
     pub input_basename: Option<String>,
@@ -64,6 +71,28 @@ impl LanguageBackend for WasmGenerator {
 
     fn name(&self) -> &'static str {
         "wasm"
+    }
+
+    /// Callbacks and listeners are not supported. Async completion works
+    /// because each call registers a single-shot trampoline in the wasm
+    /// function table that the producer invokes before the launcher returns
+    /// control; module callbacks/listeners are long-lived and producer-
+    /// initiated (typically from worker threads), and single-threaded
+    /// `wasm32-unknown-unknown` has no thread to deliver them from. Rather
+    /// than pretend (the pre-capability generator silently dropped both),
+    /// declare them unsupported; `allow_unsupported: true` opts in to
+    /// generating the supported surface with explicit throwing stubs.
+    fn capabilities(&self) -> TargetCapabilities {
+        TargetCapabilities {
+            async_functions: true,
+            callbacks: false,
+            listeners: false,
+            iterators: true,
+        }
+    }
+
+    fn allows_unsupported(&self, config: &Self::Config) -> bool {
+        config.allow_unsupported
     }
 
     fn prefix<'a>(&self, config: &'a Self::Config) -> &'a str {
@@ -241,6 +270,8 @@ fn render_wasm_readme(api: &Api, prefix: &str, input_basename: &str) -> String {
     out.push_str("- `weaveffi_alloc(size: i32) -> i32` — allocate `size` bytes in linear memory\n");
     out.push_str("- `weaveffi_error_clear(err_ptr: i32)` — clear and free error resources\n");
 
+    render_unsupported_section(&mut out, api);
+
     if !api.modules.is_empty() {
         let model = BindingModel::build(api, prefix);
         render_api_reference(&mut out, api, &model);
@@ -249,6 +280,35 @@ fn render_wasm_readme(api: &Api, prefix: &str, input_basename: &str) -> String {
     out.push('\n');
     out.push_str(&render_trailer(CommentStyle::Xml, "README.md"));
     out
+}
+
+/// When the IDL uses features the wasm target does not support (callbacks,
+/// listeners — generation only proceeds under `allow_unsupported`), document
+/// exactly what is missing and how it behaves, listing each declaration.
+fn render_unsupported_section(out: &mut String, api: &Api) {
+    let used = capabilities::used_features(api);
+    let caps = LanguageBackend::capabilities(&WasmGenerator);
+    let unsupported: Vec<_> = used
+        .iter()
+        .filter(|(feature, _)| !caps.supports(**feature))
+        .collect();
+    if unsupported.is_empty() {
+        return;
+    }
+    out.push_str("\n## Unsupported Features\n\n");
+    out.push_str(
+        "This IDL uses features the wasm target does not support (generated because\n\
+         `allow_unsupported` is set). Single-threaded `wasm32-unknown-unknown` has no\n\
+         producer thread to deliver events from, so:\n\n",
+    );
+    for (feature, locations) in unsupported {
+        out.push_str(&format!("- **{feature}**: {}\n", locations.join(", ")));
+    }
+    out.push_str(
+        "\nThe TypeScript declarations omit these entry points; the JS module exposes\n\
+         explicit stubs that throw on call. Use a native target (node, python, …) when\n\
+         you need them.\n",
+    );
 }
 
 fn render_api_reference(out: &mut String, api: &Api, model: &BindingModel) {
@@ -1357,9 +1417,9 @@ fn module_tree_has_content(
     path: &str,
     by_path: &HashMap<&str, &ModuleBinding>,
 ) -> bool {
-    let here = by_path
-        .get(path)
-        .is_some_and(|mb| !mb.functions.is_empty() || !mb.structs.is_empty());
+    let here = by_path.get(path).is_some_and(|mb| {
+        !mb.functions.is_empty() || !mb.structs.is_empty() || !mb.listeners.is_empty()
+    });
     here || m
         .modules
         .iter()
@@ -1386,6 +1446,9 @@ fn render_js_module_object(
             _ => emit_js_function_wrapper(out, f, &inner),
         }
     }
+    for l in &mb.listeners {
+        emit_js_listener_stub(out, l, &inner);
+    }
     for s in &mb.structs {
         emit_js_struct_factory(out, s, &inner);
     }
@@ -1394,6 +1457,25 @@ fn render_js_module_object(
         render_js_module_object(out, sub, &sub_path, by_path, &inner);
     }
     let _ = writeln!(out, "{indent}}},");
+}
+
+/// Listeners are unsupported on wasm (see `WasmGenerator::capabilities`);
+/// generation only reaches here when `allow_unsupported` is set. Each
+/// register/unregister entry point becomes an explicit stub that throws at
+/// call time, so the gap is impossible to miss from JS even though the
+/// `.d.ts` deliberately omits the pair (a compile-time error for TS users).
+fn emit_js_listener_stub(out: &mut String, l: &ListenerBinding, indent: &str) {
+    for op in ["register", "unregister"] {
+        let _ = writeln!(out, "{indent}{op}_{}() {{", l.name);
+        let _ = writeln!(
+            out,
+            "{indent}  throw new Error(\"weaveffi: listener '{}' is not supported by the wasm \
+             target (single-threaded wasm has no producer thread to deliver events); use a \
+             native target for listeners\");",
+            l.name
+        );
+        let _ = writeln!(out, "{indent}}},");
+    }
 }
 
 /// Expose a struct's `create(...)` and (when present) `builder()` on the module
@@ -1822,7 +1904,7 @@ mod tests {
 
     fn empty_api() -> Api {
         Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![],
             generators: None,
             package: None,
@@ -1831,7 +1913,7 @@ mod tests {
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules,
             generators: None,
             package: None,
@@ -1909,6 +1991,115 @@ mod tests {
             errors: None,
             modules: vec![],
         }])
+    }
+
+    /// An API with a callback + listener, which the wasm target declares
+    /// unsupported.
+    fn listener_api() -> Api {
+        make_api(vec![Module {
+            name: "events".into(),
+            functions: vec![Function {
+                name: "send".into(),
+                params: vec![Param {
+                    name: "text".into(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                    doc: None,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![weaveffi_ir::ir::CallbackDef {
+                name: "OnMessage".into(),
+                params: vec![Param {
+                    name: "message".into(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                    doc: None,
+                }],
+                doc: None,
+            }],
+            listeners: vec![weaveffi_ir::ir::ListenerDef {
+                name: "message_listener".into(),
+                event_callback: "OnMessage".into(),
+                doc: None,
+            }],
+            errors: None,
+            modules: vec![],
+        }])
+    }
+
+    #[test]
+    fn capabilities_declare_callbacks_and_listeners_unsupported() {
+        let caps = LanguageBackend::capabilities(&WasmGenerator);
+        assert!(caps.async_functions);
+        assert!(caps.iterators);
+        assert!(!caps.callbacks);
+        assert!(!caps.listeners);
+    }
+
+    #[test]
+    fn allow_unsupported_flag_flows_from_config() {
+        assert!(!LanguageBackend::allows_unsupported(
+            &WasmGenerator,
+            &WasmConfig::default()
+        ));
+        let cfg = WasmConfig {
+            allow_unsupported: true,
+            ..WasmConfig::default()
+        };
+        assert!(LanguageBackend::allows_unsupported(&WasmGenerator, &cfg));
+    }
+
+    #[test]
+    fn listeners_emit_throwing_stubs_in_js() {
+        let js = render_wasm_js_stub(
+            &listener_api(),
+            DEFAULT_MODULE_NAME,
+            "weaveffi",
+            "weaveffi.yml",
+            "weaveffi_wasm.js",
+        );
+        assert!(js.contains("register_message_listener() {"), "{js}");
+        assert!(js.contains("unregister_message_listener() {"), "{js}");
+        assert!(
+            js.contains("listener 'message_listener' is not supported by the wasm target"),
+            "{js}"
+        );
+    }
+
+    #[test]
+    fn listeners_omitted_from_dts() {
+        let api = listener_api();
+        let dts = render_wasm_dts(
+            &api,
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.d.ts",
+        );
+        assert!(!dts.contains("register_message_listener"), "{dts}");
+        assert!(dts.contains("send(text: string)"), "{dts}");
+    }
+
+    #[test]
+    fn readme_documents_unsupported_features() {
+        let readme = render_wasm_readme(&listener_api(), "weaveffi", "weaveffi.yml");
+        assert!(readme.contains("## Unsupported Features"), "{readme}");
+        assert!(readme.contains("events.message_listener"), "{readme}");
+        assert!(readme.contains("events.OnMessage"), "{readme}");
+        assert!(readme.contains("throw on call"), "{readme}");
+    }
+
+    #[test]
+    fn supported_only_api_has_no_unsupported_section() {
+        let readme = render_wasm_readme(&sample_api(), "weaveffi", "weaveffi.yml");
+        assert!(!readme.contains("## Unsupported Features"));
     }
 
     #[test]

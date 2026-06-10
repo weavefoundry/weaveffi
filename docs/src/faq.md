@@ -16,7 +16,7 @@ Kotlin, and Python. We built WeaveFFI because we needed:
   shorter and the rest live as community extensions of varying maturity.
 - **A standalone CLI workflow.** WeaveFFI is a single binary
   (`cargo install weaveffi-cli`) with `validate`, `lint`, `diff`,
-  `watch`, `format`, `upgrade`, and `extract` subcommands designed to
+  `watch`, `format`, and `extract` subcommands designed to
   drop into CI. UniFFI is a build-script integration first.
 - **A non-Rust-only story.** WeaveFFI's IR is language-agnostic — any
   backend that can expose a stable C ABI (Rust, C, C++, Zig, …) can be

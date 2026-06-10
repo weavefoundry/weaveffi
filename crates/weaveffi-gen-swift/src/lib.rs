@@ -11,11 +11,13 @@ use std::fmt::Write;
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use serde::{Deserialize, Serialize};
+use weaveffi_core::abi;
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
+use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, walk_modules, DocCommentStyle};
 use weaveffi_core::model::{
-    BindingModel, CallShape, EnumBinding, FieldBinding, FnBinding, ModuleBinding, ParamBinding,
-    StructBinding,
+    BindingModel, CallShape, EnumBinding, FieldBinding, FnBinding, ListenerBinding, ModuleBinding,
+    ParamBinding, StructBinding,
 };
 use weaveffi_core::utils::{
     local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
@@ -93,6 +95,10 @@ impl LanguageBackend for SwiftGenerator {
 
     fn name(&self) -> &'static str {
         "swift"
+    }
+
+    fn capabilities(&self) -> TargetCapabilities {
+        TargetCapabilities::full()
     }
 
     fn prefix<'a>(&self, config: &'a Self::Config) -> &'a str {
@@ -466,6 +472,19 @@ fn render_swift_wrapper(
         out.push_str("}\n\n");
     }
 
+    let has_listeners = model.modules.iter().any(|m| !m.listeners.is_empty());
+    if has_listeners {
+        // A C function pointer cannot capture state, so each registered Swift
+        // closure is boxed and threaded through the `void* context` slot. The
+        // registry keeps the +1 retain alive until unregistration releases it.
+        out.push_str("final class WvCallbackBox<T> {\n");
+        out.push_str("    let value: T\n");
+        out.push_str("    init(_ value: T) { self.value = value }\n");
+        out.push_str("}\n\n");
+        out.push_str("var wvListenerContexts: [UInt64: UnsafeMutableRawPointer] = [:]\n");
+        out.push_str("let wvListenerLock = NSLock()\n\n");
+    }
+
     for m in &api.modules {
         render_swift_module_types(&mut out, c_prefix, &by_path, m, &m.name, ctx);
         let type_name = m.name.to_upper_camel_case();
@@ -523,6 +542,12 @@ fn render_swift_module_body(
 ) {
     let indent = "    ".repeat(depth);
     let mb = by_path[module_path];
+    let mut bodies: Vec<String> = Vec::new();
+    for l in &mb.listeners {
+        let mut buf = String::new();
+        render_swift_listener(&mut buf, module_path, mb, l, strip_module_prefix, ctx);
+        bodies.push(buf);
+    }
     for f in &mb.functions {
         let mut buf = String::new();
         if f.is_async {
@@ -537,6 +562,9 @@ fn render_swift_module_body(
         } else {
             render_swift_function(&mut buf, c_prefix, module_path, f, strip_module_prefix, ctx);
         }
+        bodies.push(buf);
+    }
+    for buf in bodies {
         if depth > 1 {
             let extra = "    ".repeat(depth - 1);
             for line in buf.lines() {
@@ -859,6 +887,200 @@ fn write_swift_params_sig(out: &mut String, params: &[ParamBinding], ctx: SwiftC
         }
         let _ = write!(out, "_ {}: {}", p.name, swift_type_ctx(&p.ty, ctx));
     }
+}
+
+/// The Swift type one callback parameter surfaces as in the user closure.
+/// Struct and handle parameters stay raw (`OpaquePointer?`): wrapping them in
+/// the owning Swift class would `*_destroy` a borrowed handle on ARC release.
+fn swift_cb_param_type(ty: &TypeRef, ctx: SwiftCtx) -> String {
+    match ty {
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => "OpaquePointer?".into(),
+        TypeRef::Optional(inner)
+            if matches!(inner.as_ref(), TypeRef::Struct(_) | TypeRef::TypedHandle(_)) =>
+        {
+            "OpaquePointer?".into()
+        }
+        other => swift_type_ctx(other, ctx),
+    }
+}
+
+/// The expression converting one callback parameter's C slots into the value
+/// handed to the user closure. Slot names follow [`abi::lower_param`].
+fn swift_cb_arg_expr(p: &ParamBinding, ctx: SwiftCtx) -> String {
+    let slots = abi::lower_param(&p.name, &p.ty, "", false);
+    let n0 = slots[0].name.clone();
+    match &p.ty {
+        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => n0,
+        TypeRef::Bool => format!("{n0} != 0"),
+        TypeRef::Enum(name) => {
+            let local = swift_type_ctx(&p.ty, ctx);
+            let _ = name;
+            format!("{local}(rawValue: {n0}.rawValue)!")
+        }
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("String(cString: {n0}!)"),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            let n1 = &slots[1].name;
+            format!(
+                "{n0} != nil ? [UInt8](UnsafeBufferPointer(start: {n0}, count: Int({n1}))) : []"
+            )
+        }
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => n0,
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                format!("{n0}.map {{ String(cString: $0) }}")
+            }
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
+                let n1 = &slots[1].name;
+                format!("{n0}.map {{ [UInt8](UnsafeBufferPointer(start: $0, count: Int({n1}))) }}")
+            }
+            TypeRef::Enum(_) => {
+                let local = swift_type_ctx(inner, ctx);
+                format!("{n0}.map {{ {local}(rawValue: $0.pointee.rawValue)! }}")
+            }
+            TypeRef::Bool => format!("{n0}.map {{ $0.pointee != 0 }}"),
+            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => n0,
+            _ => format!("{n0}.map {{ $0.pointee }}"),
+        },
+        TypeRef::List(inner) => {
+            let n1 = &slots[1].name;
+            match inner.as_ref() {
+                TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!(
+                    "{n0} != nil ? (0..<Int({n1})).map {{ String(cString: {n0}![$0]!) }} : []"
+                ),
+                TypeRef::Enum(_) => {
+                    let local = swift_type_ctx(inner, ctx);
+                    format!(
+                        "{n0} != nil ? (0..<Int({n1})).map {{ {local}(rawValue: {n0}![$0].rawValue)! }} : []"
+                    )
+                }
+                TypeRef::Bool => {
+                    format!("{n0} != nil ? (0..<Int({n1})).map {{ {n0}![$0] != 0 }} : []")
+                }
+                _ => {
+                    let elem = swift_type_ctx(inner, ctx);
+                    format!(
+                        "{n0} != nil ? [{elem}](UnsafeBufferPointer(start: {n0}, count: Int({n1}))) : []"
+                    )
+                }
+            }
+        }
+        TypeRef::Map(k, v) => {
+            let keys = &slots[0].name;
+            let vals = &slots[1].name;
+            let len = &slots[2].name;
+            let key_expr = swift_map_elem_expr(k, keys, ctx);
+            let val_expr = swift_map_elem_expr(v, vals, ctx);
+            format!(
+                "Dictionary(uniqueKeysWithValues: (0..<Int({len})).map {{ ({key_expr}, {val_expr}) }})"
+            )
+        }
+        TypeRef::Iterator(_) => unreachable!("iterator not valid as callback parameter"),
+    }
+}
+
+/// One element read from a parallel-array base pointer at closure index `$0`.
+fn swift_map_elem_expr(ty: &TypeRef, base: &str, ctx: SwiftCtx) -> String {
+    match ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("String(cString: {base}![$0]!)"),
+        TypeRef::Enum(_) => {
+            let local = swift_type_ctx(ty, ctx);
+            format!("{local}(rawValue: {base}![$0].rawValue)!")
+        }
+        TypeRef::Bool => format!("{base}![$0] != 0"),
+        _ => format!("{base}![$0]"),
+    }
+}
+
+/// The register/unregister pair for one listener. The user closure is boxed
+/// (`WvCallbackBox`) and retained through the C `context` pointer; the
+/// capture-free trampoline closure unboxes and invokes it.
+fn render_swift_listener(
+    out: &mut String,
+    module_path: &str,
+    mb: &ModuleBinding,
+    l: &ListenerBinding,
+    strip_module_prefix: bool,
+    ctx: SwiftCtx,
+) {
+    let Some(cb) = mb.callback(&l.event_callback) else {
+        unreachable!("validation guarantees the listener's callback exists");
+    };
+    let register_fn = wrapper_name(
+        module_path,
+        &format!("register_{}", l.name),
+        strip_module_prefix,
+    );
+    let unregister_fn = wrapper_name(
+        module_path,
+        &format!("unregister_{}", l.name),
+        strip_module_prefix,
+    );
+
+    let closure_type = format!(
+        "({}) -> Void",
+        cb.params
+            .iter()
+            .map(|p| swift_cb_param_type(&p.ty, ctx))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    // Trampoline closure formals: every ABI slot, context last.
+    let slot_names: Vec<String> = cb.abi_params.iter().map(|s| s.name.clone()).collect();
+    let args: Vec<String> = cb
+        .params
+        .iter()
+        .map(|p| swift_cb_arg_expr(p, ctx))
+        .collect();
+
+    emit_fn_doc(out, &l.doc, &[], "    ");
+    let _ = writeln!(
+        out,
+        "    /// - Returns: A subscription id for ``{unregister_fn}(_:)``."
+    );
+    let _ = writeln!(
+        out,
+        "    public static func {register_fn}(_ callback: @escaping {closure_type}) -> UInt64 {{"
+    );
+    out.push_str("        let box = WvCallbackBox(callback)\n");
+    out.push_str("        let ctx = Unmanaged.passRetained(box).toOpaque()\n");
+    let _ = writeln!(
+        out,
+        "        let id = {}({{ {} in",
+        l.register_symbol,
+        slot_names.join(", ")
+    );
+    let _ = writeln!(
+        out,
+        "            let cb = Unmanaged<WvCallbackBox<{closure_type}>>.fromOpaque(context!).takeUnretainedValue().value"
+    );
+    let _ = writeln!(out, "            cb({})", args.join(", "));
+    out.push_str("        }, ctx)\n");
+    out.push_str("        wvListenerLock.lock()\n");
+    out.push_str("        wvListenerContexts[id] = ctx\n");
+    out.push_str("        wvListenerLock.unlock()\n");
+    out.push_str("        return id\n");
+    out.push_str("    }\n");
+
+    let _ = writeln!(
+        out,
+        "    /// Unregisters a listener previously registered with ``{register_fn}(_:)``."
+    );
+    let _ = writeln!(
+        out,
+        "    public static func {unregister_fn}(_ id: UInt64) {{"
+    );
+    let _ = writeln!(out, "        {}(id)", l.unregister_symbol);
+    out.push_str("        wvListenerLock.lock()\n");
+    out.push_str("        let ctx = wvListenerContexts.removeValue(forKey: id)\n");
+    out.push_str("        wvListenerLock.unlock()\n");
+    out.push_str("        if let ctx = ctx {\n");
+    let _ = writeln!(
+        out,
+        "            Unmanaged<WvCallbackBox<{closure_type}>>.fromOpaque(ctx).release()"
+    );
+    out.push_str("        }\n");
+    out.push_str("    }\n");
 }
 
 fn render_swift_async_function(
@@ -2478,11 +2700,66 @@ mod tests {
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.1.0".to_string(),
+            version: "0.3.0".to_string(),
             modules,
             generators: None,
             package: None,
         }
+    }
+
+    #[test]
+    fn listeners_generate_register_unregister() {
+        use weaveffi_ir::ir::{CallbackDef, ListenerDef};
+        let api = make_api(vec![Module {
+            name: "events".into(),
+            functions: vec![],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![CallbackDef {
+                name: "OnMessage".into(),
+                doc: None,
+                params: vec![Param {
+                    name: "message".into(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                    doc: None,
+                }],
+            }],
+            listeners: vec![ListenerDef {
+                name: "message_listener".into(),
+                event_callback: "OnMessage".into(),
+                doc: None,
+            }],
+            errors: None,
+            modules: vec![],
+        }]);
+        let swift = render_swift_wrapper(&api, "weaveffi", false, "weaveffi.yml", "WeaveFFI.swift");
+        assert!(
+            swift.contains("final class WvCallbackBox<T>"),
+            "callback box must be emitted: {swift}"
+        );
+        assert!(
+            swift.contains(
+                "public static func events_register_message_listener(_ callback: @escaping (String) -> Void) -> UInt64"
+            ),
+            "register wrapper missing: {swift}"
+        );
+        assert!(
+            swift.contains("public static func events_unregister_message_listener(_ id: UInt64)"),
+            "unregister wrapper missing: {swift}"
+        );
+        assert!(
+            swift.contains("cb(String(cString: message!))"),
+            "trampoline must convert the string arg: {swift}"
+        );
+        assert!(
+            swift.contains("Unmanaged.passRetained(box).toOpaque()"),
+            "closure box must be retained through context: {swift}"
+        );
+        assert!(
+            swift.contains(".fromOpaque(ctx).release()"),
+            "unregister must release the retained box: {swift}"
+        );
     }
 
     #[test]
@@ -3013,7 +3290,7 @@ mod tests {
     #[test]
     fn swift_builder_generated() {
         let api = Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![],

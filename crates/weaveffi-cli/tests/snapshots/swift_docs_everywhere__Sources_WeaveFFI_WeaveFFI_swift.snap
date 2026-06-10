@@ -61,6 +61,14 @@ private final class ContinuationRef<T> {
     init(_ value: CheckedContinuation<T, Error>) { self.value = value }
 }
 
+final class WvCallbackBox<T> {
+    let value: T
+    init(_ value: T) { self.value = value }
+}
+
+var wvListenerContexts: [UInt64: UnsafeMutableRawPointer] = [:]
+let wvListenerLock = NSLock()
+
 /// Lifecycle status of a document.
 ///
 /// Used to drive UI badges and filters.
@@ -175,6 +183,30 @@ public class DocumentBuilder {
 }
 
 public enum Docs {
+    /// Subscribe to document-saved notifications
+    /// - Returns: A subscription id for ``docs_unregister_saved_listener(_:)``.
+    public static func docs_register_saved_listener(_ callback: @escaping (Int64, Int32) -> Void) -> UInt64 {
+        let box = WvCallbackBox(callback)
+        let ctx = Unmanaged.passRetained(box).toOpaque()
+        let id = weaveffi_docs_register_saved_listener({ doc_id, revision, context in
+            let cb = Unmanaged<WvCallbackBox<(Int64, Int32) -> Void>>.fromOpaque(context!).takeUnretainedValue().value
+            cb(doc_id, revision)
+        }, ctx)
+        wvListenerLock.lock()
+        wvListenerContexts[id] = ctx
+        wvListenerLock.unlock()
+        return id
+    }
+    /// Unregisters a listener previously registered with ``docs_register_saved_listener(_:)``.
+    public static func docs_unregister_saved_listener(_ id: UInt64) {
+        weaveffi_docs_unregister_saved_listener(id)
+        wvListenerLock.lock()
+        let ctx = wvListenerContexts.removeValue(forKey: id)
+        wvListenerLock.unlock()
+        if let ctx = ctx {
+            Unmanaged<WvCallbackBox<(Int64, Int32) -> Void>>.fromOpaque(ctx).release()
+        }
+    }
     /// Create a brand new document.
     ///
     /// The document starts in `Draft` status; callers must publish

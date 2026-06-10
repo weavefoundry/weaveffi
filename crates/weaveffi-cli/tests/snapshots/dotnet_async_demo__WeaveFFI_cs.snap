@@ -85,7 +85,7 @@ namespace WeaveFFI
                 var ptr = NativeMethods.weaveffi_tasks_TaskResult_get_value(_handle);
                 var str = WeaveFFIHelpers.PtrToString(ptr);
                 NativeMethods.weaveffi_free_string(ptr);
-                return str;
+                return str ?? "";
             }
         }
 
@@ -253,14 +253,25 @@ namespace WeaveFFI
             };
             var gcHandle = GCHandle.Alloc(callback, GCHandleType.Normal);
             var ctx = GCHandle.ToIntPtr(gcHandle);
+            var namesArr = new IntPtr[names.Length];
+            for (var namesIt = 0; namesIt < names.Length; namesIt++) namesArr[namesIt] = Marshal.StringToCoTaskMemUTF8(names[namesIt]);
+            var namesPin = GCHandle.Alloc(namesArr, GCHandleType.Pinned);
             try
             {
-                NativeMethods.weaveffi_tasks_run_batch_async(names, callback, ctx);
+                try
+                {
+                    NativeMethods.weaveffi_tasks_run_batch_async(names.Length == 0 ? IntPtr.Zero : namesPin.AddrOfPinnedObject(), (UIntPtr)names.Length, callback, ctx);
+                }
+                catch
+                {
+                    if (gcHandle.IsAllocated) gcHandle.Free();
+                    throw;
+                }
             }
-            catch
+            finally
             {
-                if (gcHandle.IsAllocated) gcHandle.Free();
-                throw;
+                namesPin.Free();
+                foreach (var namesP in namesArr) Marshal.FreeCoTaskMem(namesP);
             }
             return await tcs.Task;
         }

@@ -31,14 +31,15 @@ stays buildable under any name.
 | `u32`        | `UInt32`                    | Direct value                     |
 | `i64`        | `Int64`                     | Direct value                     |
 | `f64`        | `Double`                    | Direct value                     |
-| `bool`       | `Bool`                      | Mapped to `Int32` 0/1 at the ABI |
-| `string`     | `String`                    | UTF-8 buffers + length           |
+| `bool`       | `Bool`                      | C `bool` at the ABI              |
+| `string`     | `String`                    | NUL-terminated UTF-8 (`withCString`) |
 | `bytes`      | `Data` / `[UInt8]`          | Pointer + length                 |
 | `handle`     | `UInt64`                    | Direct value                     |
 | `StructName` | `StructName` (class)        | Wraps `OpaquePointer`            |
-| `EnumName`   | `EnumName` (`enum`)         | Backed by `Int32`                |
+| `EnumName`   | `EnumName` (`enum`)         | Backed by `UInt32`               |
 | `T?`         | `T?`                        | Optional pointer / sentinel      |
 | `[T]`        | `[T]`                       | Pointer + length                 |
+| `iter<T>`    | `[T]`                       | Drained eagerly via `_next`      |
 
 ## Example IDL → generated code
 
@@ -82,10 +83,10 @@ modules:
           - { name: contact_type, type: ContactType }
 ```
 
-Enums become Swift enums with lowerCamelCase cases backed by `Int32`:
+Enums become Swift enums with lowerCamelCase cases backed by `UInt32`:
 
 ```swift
-public enum ContactType: Int32 {
+public enum ContactType: UInt32 {
     case personal = 0
     case work = 1
     case other = 2
@@ -110,25 +111,26 @@ public class Contact {
 }
 ```
 
-Module functions live as static methods on a namespace enum and `try`
-into Swift errors:
+Module functions live as static methods on a namespace enum, are
+prefixed with the module name, and `try` into Swift errors. String
+parameters are passed as NUL-terminated C strings via `withCString`:
 
 ```swift
 public enum Contacts {
-    public static func create_contact(_ name: String, _ age: Int32) throws -> Contact {
+    public static func contacts_create_contact(_ name: String, _ age: Int32) throws -> Contact {
         var err = weaveffi_error(code: 0, message: nil)
-        let rv = weaveffi_contacts_create_contact(name_ptr, name_len, age, &err)
-        try check(&err)
-        guard let rv = rv else {
-            throw WeaveFFIError.error(code: -1, message: "null pointer")
+        let result: OpaquePointer? = name.withCString { name_ptr in
+                return weaveffi_contacts_create_contact(name_ptr, age, &err)
         }
-        return Contact(ptr: rv)
+        try check(&err)
+        guard let result = result else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
+        return Contact(ptr: result)
     }
 }
 ```
 
-Optionals and lists use `withOptionalPointer` and
-`withUnsafeBufferPointer` helpers:
+Optionals and lists use `withOptionalPointer`, `withOptionalCString`,
+and `withUnsafeBufferPointer` helpers:
 
 ```swift
 @inline(__always)
@@ -189,37 +191,138 @@ of an XCFramework or bundled `.dylib`/`.so`.
   freed via `weaveffi_free_string` immediately.
 - `withUnsafeBufferPointer` and `withOptionalPointer` keep input buffers
   alive only for the duration of the C call — there is no copy.
-- For `bytes` parameters, the wrapper uses `withUnsafeBytes` so Swift
-  retains ownership.
+- For `bytes` parameters, the wrapper copies the `Data` into a
+  `[UInt8]` array and passes it via `withUnsafeBufferPointer`; returned
+  `bytes` are copied into `Data` and the Rust buffer is freed with
+  `weaveffi_free_bytes`.
 
 ## Async support
 
-Async IDL functions are exposed as `async throws` methods that bridge
-the C ABI callback into Swift's structured concurrency via
-`withCheckedThrowingContinuation`:
+Async IDL functions (`async: true`) are exposed as `async throws`
+methods that bridge the C ABI completion callback into Swift structured
+concurrency via `withCheckedThrowingContinuation`. The continuation is
+boxed in a `ContinuationRef`, retained with `Unmanaged.passRetained`,
+and released exactly once — by `takeRetainedValue()` inside the C
+completion callback. From the `async-demo` sample:
 
 ```swift
-public static func fetch_contact(_ id: Int32) async throws -> Contact {
-    return try await withCheckedThrowingContinuation { cont in
-        weaveffi_contacts_fetch_contact_async(id, { ctx, err, result in
-            let cont = Unmanaged<ContWrapper>.fromOpaque(ctx!)
-                .takeRetainedValue().cont
-            if let err = err, err.pointee.code != 0 {
-                cont.resume(throwing: WeaveFFIError.from(err.pointee))
-            } else if let result = result {
-                cont.resume(returning: Contact(ptr: result))
-            } else {
-                cont.resume(throwing: WeaveFFIError.error(code: -1,
-                    message: "null result"))
-            }
-        }, Unmanaged.passRetained(ContWrapper(cont: cont)).toOpaque())
+private final class ContinuationRef<T> {
+    let value: CheckedContinuation<T, Error>
+    init(_ value: CheckedContinuation<T, Error>) { self.value = value }
+}
+
+public static func tasks_run_task(_ name: String) async throws -> TaskResult {
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<TaskResult, Error>) in
+        let ctx = Unmanaged.passRetained(ContinuationRef(continuation)).toOpaque()
+        name.withCString { name_ptr in
+            weaveffi_tasks_run_task_async(name_ptr, { context, err, result in
+                let contRef = Unmanaged<ContinuationRef<TaskResult>>.fromOpaque(context!).takeRetainedValue()
+                if let err = err, err.pointee.code != 0 {
+                    let code = err.pointee.code
+                    let msg = err.pointee.message.flatMap { String(cString: $0) } ?? ""
+                    contRef.value.resume(throwing: WeaveFFIError.error(code: code, message: msg))
+                } else {
+                    guard let result = result else {
+                        contRef.value.resume(throwing: WeaveFFIError.error(code: -1, message: "null pointer"))
+                        return
+                    }
+                    contRef.value.resume(returning: TaskResult(ptr: result))
+                }
+            }, ctx)
+        }
     }
 }
 ```
 
-When the IDL marks the function `cancel: true`, the generated wrapper
-exposes a Swift `Task` cancellation handler that forwards to the
-underlying `weaveffi_cancel_token`.
+For functions marked `cancellable: true`, the C ABI takes an extra
+`weaveffi_cancel_token*` parameter. The Swift wrapper passes `nil` for
+that slot — cancellation is not surfaced in Swift, and Swift `Task`
+cancellation does not propagate to the native operation:
+
+```swift
+weaveffi_kv_compact_async_async(store.ptr, nil, { context, err, result in
+```
+
+## Callbacks and listeners
+
+IDL `callbacks` paired with `listeners` produce a register/unregister
+pair. From the `events` sample:
+
+```yaml
+modules:
+  - name: events
+    callbacks:
+      - name: OnMessage
+        params:
+          - { name: message, type: string }
+    listeners:
+      - name: message_listener
+        event_callback: OnMessage
+```
+
+Registration is a static method on the module's namespace enum: it
+takes a plain Swift closure and returns a `UInt64` subscription id;
+pass that id back to unregister. The closure is boxed
+(`WvCallbackBox`), retained with `Unmanaged.passRetained`, and handed
+to the C ABI as the `void* context` of a C trampoline. The context
+pointer is kept in a global `wvListenerContexts` dictionary keyed by
+subscription id and guarded by an `NSLock` (`wvListenerLock`);
+unregistering removes the entry and releases the box:
+
+```swift
+public static func events_register_message_listener(_ callback: @escaping (String) -> Void) -> UInt64 {
+    let box = WvCallbackBox(callback)
+    let ctx = Unmanaged.passRetained(box).toOpaque()
+    let id = weaveffi_events_register_message_listener({ message, context in
+        let cb = Unmanaged<WvCallbackBox<(String) -> Void>>.fromOpaque(context!).takeUnretainedValue().value
+        cb(String(cString: message!))
+    }, ctx)
+    wvListenerLock.lock()
+    wvListenerContexts[id] = ctx
+    wvListenerLock.unlock()
+    return id
+}
+
+public static func events_unregister_message_listener(_ id: UInt64) {
+    weaveffi_events_unregister_message_listener(id)
+    wvListenerLock.lock()
+    let ctx = wvListenerContexts.removeValue(forKey: id)
+    wvListenerLock.unlock()
+    if let ctx = ctx {
+        Unmanaged<WvCallbackBox<(String) -> Void>>.fromOpaque(ctx).release()
+    }
+}
+```
+
+The callback runs on the producer's thread — whichever thread the
+native side fires the event from. For UI work, hop to the main thread
+yourself (e.g. `DispatchQueue.main.async` or `await MainActor.run`).
+
+## Iterators
+
+`iter<T>` returns are drained eagerly: the wrapper calls the generated
+`_next` C function until it reports exhaustion, frees each element,
+destroys the iterator handle, and returns a Swift array. From the
+`events` sample (`get_messages` returns `iter<string>`):
+
+```swift
+public static func events_get_messages() throws -> [String] {
+    var err = weaveffi_error(code: 0, message: nil)
+    let iter = weaveffi_events_get_messages(&err)
+    try check(&err)
+    guard let iter = iter else { return [] }
+    var items: [String] = []
+    var iterItem: UnsafePointer<CChar>? = nil
+    var iterErr = weaveffi_error(code: 0, message: nil)
+    while weaveffi_events_GetMessagesIterator_next(iter, &iterItem, &iterErr) != 0 {
+        items.append(String(cString: iterItem!))
+        weaveffi_free_string(UnsafeMutablePointer(mutating: iterItem))
+    }
+    weaveffi_events_GetMessagesIterator_destroy(iter)
+    try check(&iterErr)
+    return items
+}
+```
 
 ## Troubleshooting
 

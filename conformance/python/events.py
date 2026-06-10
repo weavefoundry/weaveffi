@@ -1,9 +1,9 @@
 """Conformance consumer: events sample, Python target.
 
-Validates that `events_get_messages()` drives the opaque-iterator ABI
-(`next(iter, &out_item, &err) -> int32`) correctly from ctypes and yields the
-messages in order. (Module-level listener registration is not yet emitted by
-the Python backend, so only the send + iterate path is exercised here.)
+Exercises the full events surface: the ctypes CFUNCTYPE listener trampoline
+(register -> fire synchronously on send -> unregister stops delivery) and the
+opaque-iterator ABI (`next(iter, &out_item, &err) -> int32`) behind
+`events_get_messages()`.
 """
 import os
 import sys
@@ -14,12 +14,25 @@ import events as wv  # noqa: E402
 
 
 def main() -> None:
+    received: list[str] = []
+    sub = wv.events_register_message_listener(received.append)
+    assert sub > 0, sub
+
     wv.events_send_message("alpha")
     wv.events_send_message("beta")
+    assert received == ["alpha", "beta"], received
+
     wv.events_send_message("gamma")
+    assert received == ["alpha", "beta", "gamma"], received
 
     msgs = list(wv.events_get_messages())
     assert msgs == ["alpha", "beta", "gamma"], msgs
+
+    # Unregister stops delivery; messages still accumulate producer-side.
+    wv.events_unregister_message_listener(sub)
+    wv.events_send_message("delta")
+    assert received == ["alpha", "beta", "gamma"], received
+    assert list(wv.events_get_messages()) == ["alpha", "beta", "gamma", "delta"]
 
     print("python/events: OK")
 

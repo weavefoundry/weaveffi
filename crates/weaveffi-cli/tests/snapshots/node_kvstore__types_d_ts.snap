@@ -56,6 +56,9 @@ export enum EntryKind {
   Encrypted = 2,
 }
 // module kv
+/** Subscribe to per-key eviction notifications */
+export function kv_register_eviction_listener(callback: (key: string) => void): number
+export function kv_unregister_eviction_listener(id: number): void
 /**
  * Open (or create) a store backed by the given filesystem path
  * Maps to C function: weaveffi_kv_open_store

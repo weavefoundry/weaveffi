@@ -13,7 +13,8 @@ class WeaveFFI {
 
         @JvmStatic private external fun contacts_create_contactJni(first_name: String, last_name: String, email: String?, contact_type: Int): Long
         @JvmStatic fun contacts_create_contact(first_name: String, last_name: String, email: String?, contact_type: ContactType): Long = contacts_create_contactJni(first_name, last_name, email, contact_type.value)
-        @JvmStatic external fun contacts_get_contact(id: Long): Long
+        @JvmStatic private external fun contacts_get_contactJni(id: Long): Long
+        @JvmStatic fun contacts_get_contact(id: Long): Contact = Contact(contacts_get_contactJni(id))
         @JvmStatic external fun contacts_list_contacts(): LongArray
         @JvmStatic external fun contacts_delete_contact(id: Long): Boolean
         @JvmStatic external fun contacts_count_contacts(): Int

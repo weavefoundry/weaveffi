@@ -7,6 +7,8 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 // Generated types for WeaveFFI functions
 // module events
+export function events_register_message_listener(callback: (message: string) => void): number
+export function events_unregister_message_listener(id: number): void
 /**
  * Send a message, triggering the OnMessage callback
  * Maps to C function: weaveffi_events_send_message

@@ -191,6 +191,12 @@ List<Contact> listContacts() { /* ... */ }
   Swift gets `async/await` and `throws`, Kotlin gets `suspend` and JNI glue,
   Python gets typed `.pyi` stubs, TypeScript gets `Promise`s, Dart gets
   `dart:ffi` — all from the same definition.
+- **The whole IDL surface, on every target.** Async functions, iterators,
+  callbacks, and event listeners work across all eleven languages (WASM
+  excepts callbacks/listeners and says so loudly). Generators declare
+  their capabilities and `weaveffi generate` fails with a clear error —
+  never a silent skip — if a target can't deliver a feature you use. See
+  the [feature matrix](docs/src/generators/README.md#feature-support-matrix).
 
 ## How does it compare?
 
@@ -246,7 +252,6 @@ weaveffi schema-version    # prints 0.3.0
 | `weaveffi extract <file.rs>` | Extract an IDL from annotated Rust source (alternative to writing IDL by hand) |
 | `weaveffi format <file>` | Rewrite an IDL file in canonical form (sorted keys); `--check` for CI |
 | `weaveffi watch <file>` | Re-run `generate` whenever the IDL file changes |
-| `weaveffi upgrade <file>` | Migrate an older IDL to the current schema version; `--check` for CI |
 | `weaveffi schema --format json-schema` | Print the JSON Schema for the IDL |
 | `weaveffi schema-version` | Print the current IR schema version (`0.3.0`) |
 | `weaveffi doctor` | Check for required toolchains; `--target swift` to scope to one language, `--format json` for CI |
@@ -279,9 +284,8 @@ Full documentation lives at <https://docs.weaveffi.com/> (sources under
 WeaveFFI is in active `0.x` development. Following [Semantic
 Versioning](https://semver.org/), the public surface — the CLI, the IDL
 schema, the generated code, and the `weaveffi-abi` runtime symbols — may
-change between minor releases while the project is pre-1.0. Breaking IDL
-changes ship with a `weaveffi upgrade` migration so you can move
-definitions forward mechanically. See [Stability and
+change between minor releases while the project is pre-1.0, and only the
+current IDL schema version is accepted. See [Stability and
 Versioning](docs/src/stability.md) for what that means in practice and the
 recommended `weaveffi diff --check` CI workflow.
 

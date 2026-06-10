@@ -11,11 +11,16 @@ package weaveffi
 #cgo LDFLAGS: -lweaveffi
 #include "weaveffi.h"
 #include <stdlib.h>
+extern void goWv_weaveffi_tasks_run_task_callback(void* context, weaveffi_error* err, weaveffi_tasks_TaskResult* result);
+extern void goWv_weaveffi_tasks_run_batch_callback(void* context, weaveffi_error* err, weaveffi_tasks_TaskResult** result, size_t result_len);
+extern void goWv_weaveffi_tasks_run_n_tasks_callback(void* context, weaveffi_error* err, int32_t result);
 */
 import "C"
 
 import (
 	"fmt"
+	"sync"
+	"unsafe"
 )
 
 func boolToC(b bool) C._Bool {
@@ -24,6 +29,40 @@ func boolToC(b bool) C._Bool {
 
 func cToBool(b C._Bool) bool {
 	return bool(b)
+}
+
+var (
+	wvCallbackMu  sync.Mutex
+	wvCallbackSeq uint64
+	wvCallbacks   = map[uint64]interface{}{}
+)
+
+func wvCallbackStore(v interface{}) uint64 {
+	wvCallbackMu.Lock()
+	defer wvCallbackMu.Unlock()
+	wvCallbackSeq++
+	wvCallbacks[wvCallbackSeq] = v
+	return wvCallbackSeq
+}
+
+func wvCallbackLoad(id uint64) interface{} {
+	wvCallbackMu.Lock()
+	defer wvCallbackMu.Unlock()
+	return wvCallbacks[id]
+}
+
+func wvCallbackTake(id uint64) interface{} {
+	wvCallbackMu.Lock()
+	defer wvCallbackMu.Unlock()
+	v := wvCallbacks[id]
+	delete(wvCallbacks, id)
+	return v
+}
+
+func wvCallbackDelete(id uint64) {
+	wvCallbackMu.Lock()
+	defer wvCallbackMu.Unlock()
+	delete(wvCallbacks, id)
 }
 
 type TaskResult struct {
@@ -49,6 +88,95 @@ func (s *TaskResult) Close() {
 	}
 }
 
+type wvOutcomeTasksRunTask struct {
+	val *TaskResult
+	err error
+}
+
+//export goWv_weaveffi_tasks_run_task_callback
+func goWv_weaveffi_tasks_run_task_callback(context unsafe.Pointer, err *C.weaveffi_error, result *C.weaveffi_tasks_TaskResult) {
+	v := wvCallbackTake(uint64(uintptr(context)))
+	if v == nil {
+		return
+	}
+	ch := v.(chan wvOutcomeTasksRunTask)
+	if err != nil && err.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(err.message), int(err.code))
+		C.weaveffi_error_clear(err)
+		ch <- wvOutcomeTasksRunTask{err: goErr}
+		return
+	}
+	ch <- wvOutcomeTasksRunTask{val: &TaskResult{ptr: result}}
+}
+
+// Blocks until the async producer completes.
+func TasksRunTask(name string) (*TaskResult, error) {
+	ch := make(chan wvOutcomeTasksRunTask, 1)
+	ctxID := wvCallbackStore(ch)
+	cName := C.CString(name)
+	defer C.free(unsafe.Pointer(cName))
+	C.weaveffi_tasks_run_task_async(cName, C.weaveffi_tasks_run_task_callback(unsafe.Pointer(C.goWv_weaveffi_tasks_run_task_callback)), unsafe.Pointer(uintptr(ctxID)))
+	outcome := <-ch
+	if outcome.err != nil {
+		return nil, outcome.err
+	}
+	return outcome.val, nil
+}
+
+type wvOutcomeTasksRunBatch struct {
+	val []*TaskResult
+	err error
+}
+
+//export goWv_weaveffi_tasks_run_batch_callback
+func goWv_weaveffi_tasks_run_batch_callback(context unsafe.Pointer, err *C.weaveffi_error, result **C.weaveffi_tasks_TaskResult, result_len C.size_t) {
+	v := wvCallbackTake(uint64(uintptr(context)))
+	if v == nil {
+		return
+	}
+	ch := v.(chan wvOutcomeTasksRunBatch)
+	if err != nil && err.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(err.message), int(err.code))
+		C.weaveffi_error_clear(err)
+		ch <- wvOutcomeTasksRunBatch{err: goErr}
+		return
+	}
+	count := int(result_len)
+	val := make([]*TaskResult, count)
+	if count > 0 && result != nil {
+		for i, v := range unsafe.Slice((**C.weaveffi_tasks_TaskResult)(unsafe.Pointer(result)), count) {
+			val[i] = &TaskResult{ptr: v}
+		}
+	}
+	ch <- wvOutcomeTasksRunBatch{val: val}
+}
+
+// Blocks until the async producer completes.
+func TasksRunBatch(names []string) ([]*TaskResult, error) {
+	ch := make(chan wvOutcomeTasksRunBatch, 1)
+	ctxID := wvCallbackStore(ch)
+	cNamesLen := C.size_t(len(names))
+	cNamesArr := make([]*C.char, len(names))
+	for i, s := range names {
+		cNamesArr[i] = C.CString(s)
+	}
+	defer func() {
+		for _, p := range cNamesArr {
+			C.free(unsafe.Pointer(p))
+		}
+	}()
+	var cNamesPtr **C.char
+	if len(cNamesArr) > 0 {
+		cNamesPtr = (**C.char)(unsafe.Pointer(&cNamesArr[0]))
+	}
+	C.weaveffi_tasks_run_batch_async(cNamesPtr, cNamesLen, C.weaveffi_tasks_run_batch_callback(unsafe.Pointer(C.goWv_weaveffi_tasks_run_batch_callback)), unsafe.Pointer(uintptr(ctxID)))
+	outcome := <-ch
+	if outcome.err != nil {
+		return nil, outcome.err
+	}
+	return outcome.val, nil
+}
+
 func TasksCancelTask(id int64) (bool, error) {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_tasks_cancel_task(C.int64_t(id), &cErr)
@@ -58,6 +186,39 @@ func TasksCancelTask(id int64) (bool, error) {
 		return false, goErr
 	}
 	return cToBool(result), nil
+}
+
+type wvOutcomeTasksRunNTasks struct {
+	val int32
+	err error
+}
+
+//export goWv_weaveffi_tasks_run_n_tasks_callback
+func goWv_weaveffi_tasks_run_n_tasks_callback(context unsafe.Pointer, err *C.weaveffi_error, result C.int32_t) {
+	v := wvCallbackTake(uint64(uintptr(context)))
+	if v == nil {
+		return
+	}
+	ch := v.(chan wvOutcomeTasksRunNTasks)
+	if err != nil && err.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(err.message), int(err.code))
+		C.weaveffi_error_clear(err)
+		ch <- wvOutcomeTasksRunNTasks{err: goErr}
+		return
+	}
+	ch <- wvOutcomeTasksRunNTasks{val: int32(result)}
+}
+
+// Blocks until the async producer completes.
+func TasksRunNTasks(n int32) (int32, error) {
+	ch := make(chan wvOutcomeTasksRunNTasks, 1)
+	ctxID := wvCallbackStore(ch)
+	C.weaveffi_tasks_run_n_tasks_async(C.int32_t(n), C.weaveffi_tasks_run_n_tasks_callback(unsafe.Pointer(C.goWv_weaveffi_tasks_run_n_tasks_callback)), unsafe.Pointer(uintptr(ctxID)))
+	outcome := <-ch
+	if outcome.err != nil {
+		return 0, outcome.err
+	}
+	return outcome.val, nil
 }
 
 func TasksActiveCallbacks() (int64, error) {

@@ -273,39 +273,39 @@ namespace WeaveFFI
             return new Canvas(result);
         }
 
-        public static class Shapes
+    }
+
+    public static class GraphicsShapes
+    {
+        /// <summary>Construct a Shape.</summary>
+        public static Shape GraphicsShapesMakeShape(int sides)
         {
-            /// <summary>Construct a Shape.</summary>
-            public static Shape GraphicsShapesMakeShape(int sides)
-            {
-                var err = new WeaveFFIError();
-                var result = NativeMethods.weaveffi_graphics_shapes_make_shape(sides, ref err);
-                WeaveFFIError.Check(err);
-                return new Shape(result);
-            }
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_graphics_shapes_make_shape(sides, ref err);
+            WeaveFFIError.Check(err);
+            return new Shape(result);
+        }
 
-            /// <summary>Nested function returning a struct owned by an ancestor module.</summary>
-            public static Canvas GraphicsShapesDescribe()
-            {
-                var err = new WeaveFFIError();
-                var result = NativeMethods.weaveffi_graphics_shapes_describe(ref err);
-                WeaveFFIError.Check(err);
-                return new Canvas(result);
-            }
+        /// <summary>Nested function returning a struct owned by an ancestor module.</summary>
+        public static Canvas GraphicsShapesDescribe()
+        {
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_graphics_shapes_describe(ref err);
+            WeaveFFIError.Check(err);
+            return new Canvas(result);
+        }
 
-            public static class Geometry
-            {
-                /// <summary>Deeper function taking an ancestor-module struct.</summary>
-                public static Detail GraphicsShapesGeometryCompute(Shape shape)
-                {
-                    var err = new WeaveFFIError();
-                    var result = NativeMethods.weaveffi_graphics_shapes_geometry_compute(shape.Handle, ref err);
-                    WeaveFFIError.Check(err);
-                    return new Detail(result);
-                }
+    }
 
-            }
-
+    public static class GraphicsShapesGeometry
+    {
+        /// <summary>Deeper function taking an ancestor-module struct.</summary>
+        public static Detail GraphicsShapesGeometryCompute(Shape shape)
+        {
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_graphics_shapes_geometry_compute(shape.Handle, ref err);
+            WeaveFFIError.Check(err);
+            return new Detail(result);
         }
 
     }

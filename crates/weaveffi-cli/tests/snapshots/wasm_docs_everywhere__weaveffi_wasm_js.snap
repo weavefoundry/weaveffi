@@ -301,6 +301,12 @@ export async function loadWeaveffiWasm(url) {
           wasm.weaveffi_docs_publish_async_async(BigInt(id), _cbPtr_i32_i32_i32, ctxId);
         });
       },
+      register_saved_listener() {
+        throw new Error("weaveffi: listener 'saved_listener' is not supported by the wasm target (single-threaded wasm has no producer thread to deliver events); use a native target for listeners");
+      },
+      unregister_saved_listener() {
+        throw new Error("weaveffi: listener 'saved_listener' is not supported by the wasm target (single-threaded wasm has no producer thread to deliver events); use a native target for listeners");
+      },
       Document: {
         create: (...args) => Document.create(wasm, ...args),
         builder: () => new DocumentBuilder(wasm),

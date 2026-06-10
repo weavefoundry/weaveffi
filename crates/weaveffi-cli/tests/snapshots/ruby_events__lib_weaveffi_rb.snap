@@ -56,11 +56,39 @@ module WeaveFFI
     raise Error.new(code, msg)
   end
 
+  # Registered listener trampolines, keyed by subscription id. Holding the
+  # FFI::Function objects here keeps them alive until unregistered; without
+  # this the GC could collect a trampoline the producer still calls.
+  @listener_refs = {}
+
   # === Module: events ===
+  callback :weaveffi_events_OnMessage_fn, [:string, :pointer], :void
+  attach_function :weaveffi_events_register_message_listener, [:weaveffi_events_OnMessage_fn, :pointer], :uint64
+  attach_function :weaveffi_events_unregister_message_listener, [:uint64], :void
   # Send a message, triggering the OnMessage callback
   attach_function :weaveffi_events_send_message, [:string, :pointer], :void
   # Return an iterator over all sent messages
-  attach_function :weaveffi_events_get_messages, [:pointer, :pointer], :pointer
+  attach_function :weaveffi_events_get_messages, [:pointer], :pointer
+  attach_function :weaveffi_events_GetMessagesIterator_next, [:pointer, :pointer, :pointer], :int32
+  attach_function :weaveffi_events_GetMessagesIterator_destroy, [:pointer], :void
+
+  # Registers a OnMessage listener block. Returns a subscription id for
+  # unregister_message_listener.
+  def self.register_message_listener(&block)
+    trampoline = FFI::Function.new(:void, [:string, :pointer]) do |message, _context|
+      block.call(message)
+    end
+    listener_id = weaveffi_events_register_message_listener(trampoline, FFI::Pointer::NULL)
+    @listener_refs[listener_id] = trampoline
+    listener_id
+  end
+
+  # Unregisters a listener previously registered with register_message_listener.
+  def self.unregister_message_listener(listener_id)
+    weaveffi_events_unregister_message_listener(listener_id)
+    @listener_refs.delete(listener_id)
+    nil
+  end
 
   # Send a message, triggering the OnMessage callback
   def self.send_message(text)
@@ -72,12 +100,29 @@ module WeaveFFI
   # Return an iterator over all sent messages
   def self.get_messages()
     err = ErrorStruct.new
-    out_len = FFI::MemoryPointer.new(:size_t)
-    result = weaveffi_events_get_messages(out_len, err)
+    iter = weaveffi_events_get_messages(err)
     check_error!(err)
-    return [] if result.null?
-    len = out_len.read(:size_t)
-    result.read_array_of_pointer(len).map { |p| p.null? ? '' : p.read_string }
+    items = []
+    return items if iter.null?
+    loop do
+      out_item = FFI::MemoryPointer.new(:pointer)
+      item_err = ErrorStruct.new
+      has_item = weaveffi_events_GetMessagesIterator_next(iter, out_item, item_err)
+      if item_err[:code] != 0
+        weaveffi_events_GetMessagesIterator_destroy(iter)
+        check_error!(item_err)
+      end
+      break if has_item.zero?
+      item_ptr = out_item.read_pointer
+      if item_ptr.null?
+        items << ''
+      else
+        items << item_ptr.read_string
+        weaveffi_free_string(item_ptr)
+      end
+    end
+    weaveffi_events_GetMessagesIterator_destroy(iter)
+    items
   end
 end
 

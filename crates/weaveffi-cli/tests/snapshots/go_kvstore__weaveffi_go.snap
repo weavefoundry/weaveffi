@@ -11,11 +11,14 @@ package weaveffi
 #cgo LDFLAGS: -lweaveffi
 #include "weaveffi.h"
 #include <stdlib.h>
+extern void goWv_weaveffi_kv_OnEvict_fn(char* key, void* context);
+extern void goWv_weaveffi_kv_compact_async_callback(void* context, weaveffi_error* err, int64_t result);
 */
 import "C"
 
 import (
 	"fmt"
+	"sync"
 	"unsafe"
 )
 
@@ -25,6 +28,42 @@ func boolToC(b bool) C._Bool {
 
 func cToBool(b C._Bool) bool {
 	return bool(b)
+}
+
+var (
+	wvCallbackMu  sync.Mutex
+	wvCallbackSeq uint64
+	wvCallbacks   = map[uint64]interface{}{}
+	// Subscription id -> registry id, so unregister can release the Go callback.
+	wvListenerCtx = map[uint64]uint64{}
+)
+
+func wvCallbackStore(v interface{}) uint64 {
+	wvCallbackMu.Lock()
+	defer wvCallbackMu.Unlock()
+	wvCallbackSeq++
+	wvCallbacks[wvCallbackSeq] = v
+	return wvCallbackSeq
+}
+
+func wvCallbackLoad(id uint64) interface{} {
+	wvCallbackMu.Lock()
+	defer wvCallbackMu.Unlock()
+	return wvCallbacks[id]
+}
+
+func wvCallbackTake(id uint64) interface{} {
+	wvCallbackMu.Lock()
+	defer wvCallbackMu.Unlock()
+	v := wvCallbacks[id]
+	delete(wvCallbacks, id)
+	return v
+}
+
+func wvCallbackDelete(id uint64) {
+	wvCallbackMu.Lock()
+	defer wvCallbackMu.Unlock()
+	delete(wvCallbacks, id)
 }
 
 // EntryKind: Persistence semantics applied to a stored entry
@@ -269,6 +308,43 @@ func (b *EntryBuilder) Build() (*Entry, error) {
 	return &Entry{ptr: result}, nil
 }
 
+//export goWv_weaveffi_kv_OnEvict_fn
+func goWv_weaveffi_kv_OnEvict_fn(key *C.char, context unsafe.Pointer) {
+	v := wvCallbackLoad(uint64(uintptr(context)))
+	if v == nil {
+		return
+	}
+	cb := v.(func(key string))
+	arg0 := ""
+	if key != nil {
+		arg0 = C.GoString(key)
+	}
+	cb(arg0)
+}
+
+// KvRegisterEvictionListener: Subscribe to per-key eviction notifications
+// Returns a subscription id for KvUnregisterEvictionListener.
+func KvRegisterEvictionListener(callback func(key string)) uint64 {
+	ctxID := wvCallbackStore(callback)
+	id := uint64(C.weaveffi_kv_register_eviction_listener(C.weaveffi_kv_OnEvict_fn(unsafe.Pointer(C.goWv_weaveffi_kv_OnEvict_fn)), unsafe.Pointer(uintptr(ctxID))))
+	wvCallbackMu.Lock()
+	wvListenerCtx[id] = ctxID
+	wvCallbackMu.Unlock()
+	return id
+}
+
+// KvUnregisterEvictionListener unregisters a listener previously registered with KvRegisterEvictionListener.
+func KvUnregisterEvictionListener(id uint64) {
+	C.weaveffi_kv_unregister_eviction_listener(C.uint64_t(id))
+	wvCallbackMu.Lock()
+	ctxID, ok := wvListenerCtx[id]
+	delete(wvListenerCtx, id)
+	wvCallbackMu.Unlock()
+	if ok {
+		wvCallbackDelete(ctxID)
+	}
+}
+
 // KvOpenStore: Open (or create) a store backed by the given filesystem path
 func KvOpenStore(path string) (*Store, error) {
 	cPath := C.CString(path)
@@ -405,6 +481,40 @@ func KvClear(store *Store) error {
 		return goErr
 	}
 	return nil
+}
+
+type wvOutcomeKvCompactAsync struct {
+	val int64
+	err error
+}
+
+//export goWv_weaveffi_kv_compact_async_callback
+func goWv_weaveffi_kv_compact_async_callback(context unsafe.Pointer, err *C.weaveffi_error, result C.int64_t) {
+	v := wvCallbackTake(uint64(uintptr(context)))
+	if v == nil {
+		return
+	}
+	ch := v.(chan wvOutcomeKvCompactAsync)
+	if err != nil && err.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(err.message), int(err.code))
+		C.weaveffi_error_clear(err)
+		ch <- wvOutcomeKvCompactAsync{err: goErr}
+		return
+	}
+	ch <- wvOutcomeKvCompactAsync{val: int64(result)}
+}
+
+// KvCompactAsync: Reclaim space asynchronously; returns the number of bytes reclaimed
+// Blocks until the async producer completes.
+func KvCompactAsync(store *Store) (int64, error) {
+	ch := make(chan wvOutcomeKvCompactAsync, 1)
+	ctxID := wvCallbackStore(ch)
+	C.weaveffi_kv_compact_async_async(store.ptr, nil, C.weaveffi_kv_compact_async_callback(unsafe.Pointer(C.goWv_weaveffi_kv_compact_async_callback)), unsafe.Pointer(uintptr(ctxID)))
+	outcome := <-ch
+	if outcome.err != nil {
+		return 0, outcome.err
+	}
+	return outcome.val, nil
 }
 
 // KvLegacyPut: Legacy single-shot put kept for compatibility

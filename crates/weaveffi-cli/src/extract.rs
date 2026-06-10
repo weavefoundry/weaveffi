@@ -4,6 +4,59 @@ use weaveffi_ir::ir::{
     StructField, TypeRef,
 };
 
+/// `weaveffi extract` — CLI glue around [`extract_api_from_rust`]: read the
+/// annotated Rust source, extract the [`Api`], validate (warnings only), and
+/// serialize to the requested format.
+pub(crate) fn cmd_extract(
+    input: &str,
+    output: Option<&str>,
+    format: &str,
+    quiet: bool,
+) -> miette::Result<()> {
+    use miette::{miette, IntoDiagnostic, WrapErr};
+
+    let source = std::fs::read_to_string(input)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read source file: {}", input))?;
+
+    let mut api = extract_api_from_rust(&source)
+        .map_err(|e| miette!("failed to extract API from Rust source: {:#}", e))?;
+
+    if let Err(e) = weaveffi_core::validate::validate_api(&mut api, None) {
+        eprintln!("warning: {}", e);
+    }
+
+    let serialized = match format {
+        "yaml" | "yml" => serde_yaml::to_string(&api)
+            .into_diagnostic()
+            .wrap_err("failed to serialize API as YAML")?,
+        "json" => serde_json::to_string_pretty(&api)
+            .into_diagnostic()
+            .wrap_err("failed to serialize API as JSON")?,
+        "toml" => toml::to_string_pretty(&api)
+            .into_diagnostic()
+            .wrap_err("failed to serialize API as TOML")?,
+        other => miette::bail!(
+            "unsupported output format: {} (expected yaml, json, or toml)",
+            other
+        ),
+    };
+
+    match output {
+        Some(path) => {
+            std::fs::write(path, &serialized)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to write output file: {}", path))?;
+            if !quiet {
+                println!("Extracted API written to {}", path);
+            }
+        }
+        None => print!("{}", serialized),
+    }
+
+    Ok(())
+}
+
 fn has_attr(attrs: &[syn::Attribute], name: &str) -> bool {
     attrs.iter().any(|a| a.path().is_ident(name))
 }
@@ -414,7 +467,7 @@ pub fn extract_api_from_rust(source: &str) -> Result<Api> {
     }
 
     Ok(Api {
-        version: "0.1.0".to_string(),
+        version: weaveffi_ir::ir::CURRENT_SCHEMA_VERSION.to_string(),
         modules,
         generators: None,
         package: None,
@@ -428,7 +481,7 @@ mod tests {
     #[test]
     fn empty_source_produces_no_modules() {
         let api = extract_api_from_rust("").unwrap();
-        assert_eq!(api.version, "0.1.0");
+        assert_eq!(api.version, "0.3.0");
         assert!(api.modules.is_empty());
     }
 

@@ -23,13 +23,14 @@ way to inspect what the IDL compiles to.
 | `i64`        | `int64_t`                               | `int64_t`                          |
 | `f64`        | `double`                                | `double`                           |
 | `bool`       | `bool`                                  | `bool`                             |
-| `string`     | `const uint8_t* ptr, size_t len`        | `const char*`                      |
+| `string`     | `const char*` (NUL-terminated UTF-8)    | `const char*`                      |
 | `bytes`      | `const uint8_t* ptr, size_t len`        | `const uint8_t*` + `size_t* out_len`|
 | `handle`     | `weaveffi_handle_t`                     | `weaveffi_handle_t`                |
 | `Struct`     | `const weaveffi_m_S*`                   | `weaveffi_m_S*`                    |
 | `Enum`       | `weaveffi_m_E`                          | `weaveffi_m_E`                     |
 | `T?` (value) | `const T*` (NULL = absent)              | `T*` (NULL = absent)               |
 | `[T]`        | `const T* items, size_t items_len`      | `T*` + `size_t* out_len`           |
+| `iter<T>`    | —                                       | opaque iterator handle — see [Iterators](#iterators) |
 
 C ABI symbol naming follows a strict convention:
 
@@ -42,6 +43,17 @@ C ABI symbol naming follows a strict convention:
 | Struct getter     | `weaveffi_{module}_{Struct}_get_{field}`          | `weaveffi_contacts_Contact_get_name`          |
 | Enum type         | `weaveffi_{module}_{Enum}`                        | `weaveffi_contacts_ContactType`               |
 | Enum variant      | `weaveffi_{module}_{Enum}_{Variant}`              | `weaveffi_contacts_ContactType_Personal`      |
+| Callback typedef  | `weaveffi_{module}_{Callback}_fn`                 | `weaveffi_events_OnMessage_fn`                |
+| Listener register | `weaveffi_{module}_register_{listener}`           | `weaveffi_events_register_message_listener`   |
+| Listener unregister | `weaveffi_{module}_unregister_{listener}`       | `weaveffi_events_unregister_message_listener` |
+| Async callback    | `weaveffi_{module}_{function}_callback`           | `weaveffi_tasks_run_task_callback`            |
+| Async launcher    | `weaveffi_{module}_{function}_async`              | `weaveffi_tasks_run_task_async`               |
+| Iterator type     | `weaveffi_{module}_{Function}Iterator`            | `weaveffi_events_GetMessagesIterator`         |
+| Iterator next     | `weaveffi_{module}_{Function}Iterator_next`       | `weaveffi_events_GetMessagesIterator_next`    |
+| Iterator destroy  | `weaveffi_{module}_{Function}Iterator_destroy`    | `weaveffi_events_GetMessagesIterator_destroy` |
+
+`{Function}` is the function name converted to PascalCase
+(`get_messages` → `GetMessages`).
 
 When the IDL sets `c_prefix`, every symbol — including the runtime
 helpers — is rewritten with the new prefix.
@@ -221,27 +233,128 @@ For struct handles, call the matching `_destroy` symbol when the
 consumer is done. Borrowed parameters (`const T*`, `string`/`bytes`
 inputs) remain owned by the caller for the duration of the call only.
 
-## Async support
+## Callbacks and listeners
 
-Async functions (`async: true`) generate a callback-based variant with
-the suffix `_async`. The wrapper accepts a function pointer whose
-signature mirrors the synchronous return and an opaque `void* context`.
-WeaveFFI invokes the callback once with either a result or an error.
+A `callbacks:` entry becomes a function-pointer typedef whose
+parameters mirror the IDL signature plus a trailing opaque
+`void* context`. A `listeners:` entry becomes a register/unregister
+pair built on that typedef. From the `events` sample:
 
 ```c
-typedef void (*weaveffi_demo_fetch_cb)(
+typedef void (*weaveffi_events_OnMessage_fn)(const char* message, void* context);
+
+uint64_t weaveffi_events_register_message_listener(
+    weaveffi_events_OnMessage_fn callback,
+    void* context);
+void weaveffi_events_unregister_message_listener(uint64_t id);
+```
+
+The contract:
+
+- `register_*` stores the `(callback, context)` pair and returns a
+  `uint64_t` subscription id. Pass that id to `unregister_*` to stop
+  delivery.
+- `context` is opaque to the producer and is passed back verbatim as
+  the last argument of every invocation. It must stay valid until the
+  listener is unregistered.
+- The producer invokes the callback on **its own thread**, whenever
+  the event fires. The callback must be thread-safe and must not
+  assume it runs on the registering thread.
+- Pointer arguments (e.g. `const char* message`) are only valid for
+  the duration of the invocation; copy anything that must outlive it.
+
+```c
+static void on_message(const char* message, void* context) {
+    int* count = context;       /* runs on the producer's thread */
+    (*count)++;
+}
+
+weaveffi_error err = {0, NULL};
+int count = 0;
+uint64_t id = weaveffi_events_register_message_listener(on_message, &count);
+weaveffi_events_send_message("hello", &err);   /* fires the listener */
+weaveffi_events_unregister_message_listener(id);
+```
+
+## Async support
+
+Async functions (`async: true`) get no synchronous prototype. Each one
+emits a per-function callback typedef — `(void* context,
+weaveffi_error* err, <result slots>)` — and a launcher with the
+`_async` suffix. From the `async-demo` sample:
+
+```c
+typedef void (*weaveffi_tasks_run_task_callback)(
     void* context,
     weaveffi_error* err,
-    const char* result);
+    weaveffi_tasks_TaskResult* result);
 
-void weaveffi_demo_fetch_async(
-    int32_t id,
-    weaveffi_demo_fetch_cb callback,
+void weaveffi_tasks_run_task_async(
+    const char* name,
+    weaveffi_tasks_run_task_callback callback,
     void* context);
 ```
 
-Cancellable functions also accept a `weaveffi_cancel_token*`. See
-[Async functions](../guides/async.md) for the full pattern.
+The launcher returns immediately; WeaveFFI invokes the callback
+exactly once — with either a result or a populated error — from the
+producer's worker thread.
+
+For `cancellable: true` functions the launcher gains a
+`weaveffi_cancel_token*` slot before the callback, and the runtime
+provides the token lifecycle (from the `kvstore` sample, whose
+function is named `compact_async` — hence the doubled suffix):
+
+```c
+void weaveffi_kv_compact_async_async(
+    weaveffi_kv_Store* store,
+    weaveffi_cancel_token* cancel_token,
+    weaveffi_kv_compact_async_callback callback,
+    void* context);
+
+weaveffi_cancel_token* weaveffi_cancel_token_create(void);
+void weaveffi_cancel_token_cancel(weaveffi_cancel_token* token);
+bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token* token);
+void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
+```
+
+See [Async functions](../guides/async.md) for the full pattern.
+
+## Iterators
+
+Functions returning `iter<T>` produce an opaque iterator handle plus
+`_next`/`_destroy` functions instead of a materialized list. From the
+`events` sample (`get_messages` returns `iter<string>`):
+
+```c
+typedef struct weaveffi_events_GetMessagesIterator weaveffi_events_GetMessagesIterator;
+
+weaveffi_events_GetMessagesIterator* weaveffi_events_get_messages(
+    weaveffi_error* out_err);
+int32_t weaveffi_events_GetMessagesIterator_next(
+    weaveffi_events_GetMessagesIterator* iter,
+    const char** out_item,
+    weaveffi_error* out_err);
+void weaveffi_events_GetMessagesIterator_destroy(
+    weaveffi_events_GetMessagesIterator* iter);
+```
+
+`_next` writes the next element into the one-slot out-param and
+returns `1`, or returns `0` when exhausted (leaving `*out_item`
+untouched). Failures are reported through `out_err`. Element ownership
+follows the usual return rules — here each `const char*` must be freed
+with `weaveffi_free_string`. Always call `_destroy` when done, even if
+iteration stopped early:
+
+```c
+weaveffi_error err = {0, NULL};
+weaveffi_events_GetMessagesIterator* iter = weaveffi_events_get_messages(&err);
+const char* item = NULL;
+while (weaveffi_events_GetMessagesIterator_next(iter, &item, &err) == 1) {
+    printf("%s\n", item);
+    weaveffi_free_string(item);
+}
+weaveffi_events_GetMessagesIterator_destroy(iter);
+```
 
 ## Troubleshooting
 

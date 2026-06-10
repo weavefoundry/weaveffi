@@ -6,7 +6,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 # To regenerate: weaveffi generate weaveffi.yml -o <out>
 
 from enum import IntEnum
-from typing import Dict, Iterator, List, Optional
+from typing import Callable, Dict, Iterator, List, Optional
 
 # Persistence semantics applied to a stored entry
 class EntryKind(IntEnum):
@@ -46,6 +46,10 @@ class Entry:
     # Arbitrary string-valued metadata pairs
     @property
     def metadata(self) -> Dict[str, str]: ...
+
+# Subscribe to per-key eviction notifications
+def kv_register_eviction_listener(callback: Callable[[str], None]) -> int: ...
+def kv_unregister_eviction_listener(listener_id: int) -> None: ...
 
 # Open (or create) a store backed by the given filesystem path
 def kv_open_store(path: str) -> "Store": ...

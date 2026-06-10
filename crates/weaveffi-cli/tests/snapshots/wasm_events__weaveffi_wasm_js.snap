@@ -149,6 +149,12 @@ export async function loadWeaveffiWasm(url) {
         wasm.weaveffi_events_GetMessagesIterator_destroy(_it);
         return _out;
       },
+      register_message_listener() {
+        throw new Error("weaveffi: listener 'message_listener' is not supported by the wasm target (single-threaded wasm has no producer thread to deliver events); use a native target for listeners");
+      },
+      unregister_message_listener() {
+        throw new Error("weaveffi: listener 'message_listener' is not supported by the wasm target (single-threaded wasm has no producer thread to deliver events); use a native target for listeners");
+      },
     },
   };
 }

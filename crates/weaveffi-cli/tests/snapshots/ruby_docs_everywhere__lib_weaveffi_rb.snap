@@ -56,6 +56,11 @@ module WeaveFFI
     raise Error.new(code, msg)
   end
 
+  # Registered listener trampolines, keyed by subscription id. Holding the
+  # FFI::Function objects here keeps them alive until unregistered; without
+  # this the GC could collect a trampoline the producer still calls.
+  @listener_refs = {}
+
   # === Module: docs ===
 
   # Lifecycle status of a document.
@@ -71,6 +76,7 @@ module WeaveFFI
   end
 
   attach_function :weaveffi_docs_Document_destroy, [:pointer], :void
+  attach_function :weaveffi_docs_Document_create, [:int64, :string, :int32, :pointer, :size_t, :pointer], :pointer
   # Stable opaque identifier
   attach_function :weaveffi_docs_Document_get_id, [:pointer], :int64
   # Human-readable title shown in lists
@@ -79,6 +85,10 @@ module WeaveFFI
   attach_function :weaveffi_docs_Document_get_status, [:pointer], :int32
   # Free-form tags for grouping
   attach_function :weaveffi_docs_Document_get_tags, [:pointer, :pointer], :pointer
+  # Fires after a document has been persisted successfully
+  callback :weaveffi_docs_OnSaved_fn, [:int64, :int32, :pointer], :void
+  attach_function :weaveffi_docs_register_saved_listener, [:weaveffi_docs_OnSaved_fn, :pointer], :uint64
+  attach_function :weaveffi_docs_unregister_saved_listener, [:uint64], :void
   # Create a brand new document.
   #
   # The document starts in `Draft` status; callers must publish
@@ -86,6 +96,9 @@ module WeaveFFI
   attach_function :weaveffi_docs_create_document, [:string, :pointer, :size_t, :pointer], :pointer
   # Look up a document by identifier
   attach_function :weaveffi_docs_get_document, [:int64, :pointer], :pointer
+  # Publish a document in the background
+  callback :weaveffi_docs_publish_async_callback, [:pointer, :pointer, :int32], :void
+  attach_function :weaveffi_docs_publish_async_async, [:int64, :weaveffi_docs_publish_async_callback, :pointer], :void
 
   class DocumentPtr < FFI::AutoPointer
     def self.release(ptr)
@@ -149,10 +162,10 @@ module WeaveFFI
   # Documents are persisted to disk and exposed via the public API.
   class DocumentBuilder
     def initialize
-      @id = nil
-      @title = nil
-      @status = nil
-      @tags = nil
+      @id = 0
+      @title = ""
+      @status = 0
+      @tags = []
     end
 
     # Stable opaque identifier
@@ -180,12 +193,37 @@ module WeaveFFI
     end
 
     def build
-      raise "missing field: id" if @id.nil?
-      raise "missing field: title" if @title.nil?
-      raise "missing field: status" if @status.nil?
-      raise "missing field: tags" if @tags.nil?
-      raise NotImplementedError, "DocumentBuilder.build requires FFI backing"
+      err = WeaveFFI::ErrorStruct.new
+      id = @id
+      title = @title
+      status = @status
+      tags = @tags
+      tags_buf = FFI::MemoryPointer.new(:pointer, tags.length)
+      tags_ptrs = tags.map { |s| FFI::MemoryPointer.from_string(s) }
+      tags_buf.write_array_of_pointer(tags_ptrs)
+      result = WeaveFFI.weaveffi_docs_Document_create(id, title, status, tags_buf, tags.length, err)
+      WeaveFFI.check_error!(err)
+      Document.new(result)
     end
+  end
+
+  # Subscribe to document-saved notifications
+  # Registers a OnSaved listener block. Returns a subscription id for
+  # unregister_saved_listener.
+  def self.register_saved_listener(&block)
+    trampoline = FFI::Function.new(:void, [:int64, :int32, :pointer]) do |doc_id, revision, _context|
+      block.call(doc_id, revision)
+    end
+    listener_id = weaveffi_docs_register_saved_listener(trampoline, FFI::Pointer::NULL)
+    @listener_refs[listener_id] = trampoline
+    listener_id
+  end
+
+  # Unregisters a listener previously registered with register_saved_listener.
+  def self.unregister_saved_listener(listener_id)
+    weaveffi_docs_unregister_saved_listener(listener_id)
+    @listener_refs.delete(listener_id)
+    nil
   end
 
   # Create a brand new document.
@@ -197,7 +235,8 @@ module WeaveFFI
   def self.create_document(title, tags)
     err = ErrorStruct.new
     tags_buf = FFI::MemoryPointer.new(:pointer, tags.length)
-    tags_buf.write_array_of_pointer(tags.map { |s| FFI::MemoryPointer.from_string(s) })
+    tags_ptrs = tags.map { |s| FFI::MemoryPointer.from_string(s) }
+    tags_buf.write_array_of_pointer(tags_ptrs)
     result = weaveffi_docs_create_document(title, tags_buf, tags.length, err)
     check_error!(err)
     raise Error.new(-1, 'null pointer') if result.null?
@@ -212,6 +251,27 @@ module WeaveFFI
     check_error!(err)
     return nil if result.null?
     Document.new(result)
+  end
+
+  # Publish a document in the background
+  # Blocks until the async producer completes.
+  def self.publish_async(id)
+    queue = Queue.new
+    callback = FFI::Function.new(:void, [:pointer, :pointer, :int32]) do |_context, err_ptr, result|
+      err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
+      if err && err[:code] != 0
+        code = err[:code]
+        msg = err[:message].null? ? '' : err[:message].read_string
+        weaveffi_error_clear(err_ptr)
+        queue << Error.new(code, msg)
+      else
+        queue << (result != 0)
+      end
+    end
+    weaveffi_docs_publish_async_async(id, callback, FFI::Pointer::NULL)
+    value = queue.pop
+    raise value if value.is_a?(Error)
+    value
   end
 end
 

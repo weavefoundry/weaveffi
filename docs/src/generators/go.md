@@ -33,6 +33,7 @@ methods plus an explicit `Close()`.
 | `T?`         | `*T`          | pointer to scalar; nil-able pointer for strings/structs |
 | `[T]`        | `[]T`         | pointer + `C.size_t`       |
 | `{K: V}`     | `map[K]V`     | key/value arrays + `C.size_t` |
+| `iter<T>`    | `[]T` (drained eagerly) | opaque iterator pointer + `_next`/`_destroy` |
 
 Booleans map to `C._Bool`, matching CGo's representation of `_Bool`.
 
@@ -194,7 +195,7 @@ generators:
 1. Generate the bindings:
 
    ```bash
-   weaveffi generate --input api.yaml --output generated/ --target go
+   weaveffi generate api.yaml -o generated --target go
    ```
 
 2. Build the Rust shared library:
@@ -235,34 +236,156 @@ use a MinGW-w64 toolchain or the MSVC build provided by `go env`.
 - **Optionals:** scalar optionals are `*T`; struct/string optionals
   rely on a nil pointer to indicate absence.
 
-## Async support
+## Callbacks and listeners
 
-Async IDL functions are exposed as Go functions that return a typed
-channel and an `error`. The wrapper allocates a Go-side struct,
-registers it with the CGo handle table, hands the C ABI a callback,
-and resolves the channel when the callback fires:
+A `callbacks:` entry in the IDL defines a C function-pointer type; a
+`listeners:` entry generates a register/unregister pair around it:
+
+```yaml
+modules:
+  - name: events
+    callbacks:
+      - name: OnMessage
+        params:
+          - { name: message, type: string }
+    listeners:
+      - name: message_listener
+        event_callback: OnMessage
+```
+
+The C ABI is `weaveffi_events_register_message_listener(callback,
+void* context)`, which returns a `uint64_t` subscription id, plus
+`weaveffi_events_unregister_message_listener(id)`. The Go surface
+takes a closure and returns that id:
 
 ```go
-func ContactsFetchContact(id int32) (<-chan ContactsFetchContactResult, error) {
-    ch := make(chan ContactsFetchContactResult, 1)
-    handle := cgo.NewHandle(ch)
-    var cErr C.weaveffi_error
-    C.weaveffi_contacts_fetch_contact_async(C.int32_t(id),
-        C.weaveffi_callback(C.weaveffi_go_async_trampoline),
-        unsafe.Pointer(&handle), &cErr)
-    if cErr.code != 0 {
-        handle.Delete()
-        msg := C.GoString(cErr.message)
-        C.weaveffi_error_clear(&cErr)
-        return nil, fmt.Errorf("weaveffi: %s (code %d)", msg, int(cErr.code))
-    }
-    return ch, nil
+// Returns a subscription id for EventsUnregisterMessageListener.
+func EventsRegisterMessageListener(callback func(message string)) uint64 {
+	ctxID := wvCallbackStore(callback)
+	id := uint64(C.weaveffi_events_register_message_listener(
+		C.weaveffi_events_OnMessage_fn(unsafe.Pointer(C.goWv_weaveffi_events_OnMessage_fn)),
+		unsafe.Pointer(uintptr(ctxID))))
+	wvCallbackMu.Lock()
+	wvListenerCtx[id] = ctxID
+	wvCallbackMu.Unlock()
+	return id
+}
+
+func EventsUnregisterMessageListener(id uint64) {
+	C.weaveffi_events_unregister_message_listener(C.uint64_t(id))
+	wvCallbackMu.Lock()
+	ctxID, ok := wvListenerCtx[id]
+	delete(wvListenerCtx, id)
+	wvCallbackMu.Unlock()
+	if ok {
+		wvCallbackDelete(ctxID)
+	}
 }
 ```
 
-When the IDL marks the function `cancel: true`, the wrapper accepts a
-`context.Context` and forwards cancellation to the underlying
-`weaveffi_cancel_token`.
+CGo forbids passing Go pointers to C, so the closure itself never
+crosses the boundary. The bindings keep a mutex-guarded registry
+(`wvCallbacks`, written through `wvCallbackStore`) and hand C two
+things: a `//export`ed trampoline (`goWv_weaveffi_events_OnMessage_fn`,
+declared `extern` in the CGo preamble) as the function pointer, and
+the registry key as the `void* context` — an integer id cast via
+`unsafe.Pointer(uintptr(ctxID))` that the C side never dereferences.
+When the event fires, the trampoline looks the closure up and calls it:
+
+```go
+//export goWv_weaveffi_events_OnMessage_fn
+func goWv_weaveffi_events_OnMessage_fn(message *C.char, context unsafe.Pointer) {
+	v := wvCallbackLoad(uint64(uintptr(context)))
+	if v == nil {
+		return
+	}
+	cb := v.(func(message string))
+	arg0 := ""
+	if message != nil {
+		arg0 = C.GoString(message)
+	}
+	cb(arg0)
+}
+```
+
+- **Subscription ids:** the native library mints the `uint64` id; pair
+  every register with exactly one unregister. Unregistering tears down
+  the native subscription, then uses `wvListenerCtx` (subscription id →
+  registry key) to delete the stored closure so it can be collected. A
+  leaked subscription pins the closure forever.
+- **Threading:** the callback runs as a CGo callback on whatever thread
+  the producer fires it from — in the events sample, synchronously
+  inside `EventsSendMessage`. Don't block in it; forward to a channel
+  or goroutine if handling is slow.
+
+## Async support
+
+Functions marked `async: true` are exposed through `_async`-suffixed C
+launchers that take a completion callback plus `void* context`. The
+generated Go wrapper turns that into a plain blocking call: it makes a
+buffered channel, stores it in the same callback registry the listener
+bindings use, launches the C call with an exported trampoline and the
+integer context id, then receives from the channel:
+
+```go
+// Blocks until the async producer completes.
+func TasksRunTask(name string) (*TaskResult, error) {
+	ch := make(chan wvOutcomeTasksRunTask, 1)
+	ctxID := wvCallbackStore(ch)
+	cName := C.CString(name)
+	defer C.free(unsafe.Pointer(cName))
+	C.weaveffi_tasks_run_task_async(cName,
+		C.weaveffi_tasks_run_task_callback(unsafe.Pointer(C.goWv_weaveffi_tasks_run_task_callback)),
+		unsafe.Pointer(uintptr(ctxID)))
+	outcome := <-ch
+	if outcome.err != nil {
+		return nil, outcome.err
+	}
+	return outcome.val, nil
+}
+```
+
+The completion trampoline removes the channel from the registry with
+`wvCallbackTake` (one-shot), converts the C error or result, and sends
+a single `wvOutcome…` value. The native producer already runs on its
+own thread, so the wrapper simply blocks the calling goroutine; callers
+that want concurrency run the call from a goroutine of their own.
+
+For functions marked `cancellable: true` the C launcher gains a
+`weaveffi_cancel_token*` parameter. The Go wrapper passes `nil` for it
+and does not expose the token — only the C, C++, and Kotlin targets
+surface cancellation tokens.
+
+## Iterators
+
+`iter<T>` returns map to plain `[]T`. The wrapper obtains the opaque
+iterator pointer, drains it eagerly through the generated `_next`
+symbol, and destroys it before returning:
+
+```go
+func EventsGetMessages() ([]string, error) {
+	var cErr C.weaveffi_error
+	it := C.weaveffi_events_get_messages(&cErr)
+	// ... error check ...
+	defer C.weaveffi_events_GetMessagesIterator_destroy(it)
+	goResult := []string{}
+	for {
+		var outItem *C.char
+		var iterErr C.weaveffi_error
+		if C.weaveffi_events_GetMessagesIterator_next(it, &outItem, &iterErr) == 0 {
+			break
+		}
+		// ... error check ...
+		goResult = append(goResult, C.GoString(outItem))
+		C.weaveffi_free_string(outItem)
+	}
+	return goResult, nil
+}
+```
+
+Each yielded element is copied into Go memory and its Rust allocation
+released (strings via `weaveffi_free_string`); the iterator handle is
+destroyed by the deferred `_destroy` call.
 
 ## Troubleshooting
 

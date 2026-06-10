@@ -11,38 +11,63 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <string.h>
 
 typedef struct {
-    napi_env env;
     napi_deferred deferred;
-} weaveffi_napi_async_ctx;
+    napi_threadsafe_function tsfn;
+    int32_t err_code;
+    char* err_msg;
+    void* result;
+} weaveffi_tasks_run_task_napi_actx;
 
 static void weaveffi_tasks_run_task_napi_cb(void* context, weaveffi_error* err, weaveffi_tasks_TaskResult* result) {
-    weaveffi_napi_async_ctx* ctx = (weaveffi_napi_async_ctx*)context;
+    weaveffi_tasks_run_task_napi_actx* ctx = (weaveffi_tasks_run_task_napi_actx*)context;
     if (err != NULL && err->code != 0) {
+        ctx->err_code = err->code;
+        ctx->err_msg = err->message ? strdup(err->message) : strdup("unknown error");
+    } else {
+        ctx->result = (void*)result;
+    }
+    napi_call_threadsafe_function(ctx->tsfn, ctx, napi_tsfn_blocking);
+}
+
+static void weaveffi_tasks_run_task_napi_settle(napi_env env, napi_value js_cb, void* context, void* data) {
+    (void)js_cb;
+    (void)context;
+    weaveffi_tasks_run_task_napi_actx* ctx = (weaveffi_tasks_run_task_napi_actx*)data;
+    if (env != NULL) {
+    if (ctx->err_code != 0) {
         napi_value err_msg;
-        napi_create_string_utf8(ctx->env, err->message, NAPI_AUTO_LENGTH, &err_msg);
-        napi_reject_deferred(ctx->env, ctx->deferred, err_msg);
+        napi_create_string_utf8(env, ctx->err_msg ? ctx->err_msg : "", NAPI_AUTO_LENGTH, &err_msg);
+        napi_value err_obj;
+        napi_create_error(env, NULL, err_msg, &err_obj);
+        napi_value err_code;
+        napi_create_int32(env, ctx->err_code, &err_code);
+        napi_set_named_property(env, err_obj, "code", err_code);
+        napi_reject_deferred(env, ctx->deferred, err_obj);
     } else {
         napi_value val;
         {
-          weaveffi_tasks_TaskResult* val_p = (weaveffi_tasks_TaskResult*)result;
-          napi_create_object(ctx->env, &val);
+          weaveffi_tasks_TaskResult* val_p = (weaveffi_tasks_TaskResult*)ctx->result;
+          napi_create_object(env, &val);
           napi_value val_id;
-          napi_create_int64(ctx->env, weaveffi_tasks_TaskResult_get_id(val_p), &val_id);
-          napi_set_named_property(ctx->env, val, "id", val_id);
+          napi_create_int64(env, weaveffi_tasks_TaskResult_get_id(val_p), &val_id);
+          napi_set_named_property(env, val, "id", val_id);
           napi_value val_value;
           {
             char* val_value_s = (char*)weaveffi_tasks_TaskResult_get_value(val_p);
-            napi_create_string_utf8(ctx->env, val_value_s, NAPI_AUTO_LENGTH, &val_value);
+            napi_create_string_utf8(env, val_value_s, NAPI_AUTO_LENGTH, &val_value);
             weaveffi_free_string(val_value_s);
           }
-          napi_set_named_property(ctx->env, val, "value", val_value);
+          napi_set_named_property(env, val, "value", val_value);
           napi_value val_success;
-          napi_get_boolean(ctx->env, weaveffi_tasks_TaskResult_get_success(val_p), &val_success);
-          napi_set_named_property(ctx->env, val, "success", val_success);
+          napi_get_boolean(env, weaveffi_tasks_TaskResult_get_success(val_p), &val_success);
+          napi_set_named_property(env, val, "success", val_success);
           weaveffi_tasks_TaskResult_destroy(val_p);
         }
-        napi_resolve_deferred(ctx->env, ctx->deferred, val);
+        napi_resolve_deferred(env, ctx->deferred, val);
     }
+    }
+    free(ctx->err_msg);
+    napi_release_threadsafe_function(ctx->tsfn, napi_tsfn_release);
     free(ctx);
 }
 
@@ -54,26 +79,66 @@ static napi_value Napi_weaveffi_tasks_run_task(napi_env env, napi_callback_info 
   napi_get_value_string_utf8(env, args[0], NULL, 0, &name_len);
   char* name = (char*)malloc(name_len + 1);
   napi_get_value_string_utf8(env, args[0], name, name_len + 1, &name_len);
-  weaveffi_napi_async_ctx* ctx = (weaveffi_napi_async_ctx*)malloc(sizeof(weaveffi_napi_async_ctx));
-  ctx->env = env;
+  weaveffi_tasks_run_task_napi_actx* ctx = (weaveffi_tasks_run_task_napi_actx*)calloc(1, sizeof(weaveffi_tasks_run_task_napi_actx));
   napi_value promise;
   napi_create_promise(env, &ctx->deferred, &promise);
+  napi_value resource_name;
+  napi_create_string_utf8(env, "weaveffi_tasks_run_task", NAPI_AUTO_LENGTH, &resource_name);
+  napi_create_threadsafe_function(env, NULL, NULL, resource_name, 0, 1, NULL, NULL, NULL, weaveffi_tasks_run_task_napi_settle, &ctx->tsfn);
   weaveffi_tasks_run_task_async(name, weaveffi_tasks_run_task_napi_cb, ctx);
   free(name);
   return promise;
 }
 
+typedef struct {
+    napi_deferred deferred;
+    napi_threadsafe_function tsfn;
+    int32_t err_code;
+    char* err_msg;
+    weaveffi_tasks_TaskResult** result;
+    size_t result_len;
+} weaveffi_tasks_run_batch_napi_actx;
+
 static void weaveffi_tasks_run_batch_napi_cb(void* context, weaveffi_error* err, weaveffi_tasks_TaskResult** result, size_t result_len) {
-    weaveffi_napi_async_ctx* ctx = (weaveffi_napi_async_ctx*)context;
+    weaveffi_tasks_run_batch_napi_actx* ctx = (weaveffi_tasks_run_batch_napi_actx*)context;
     if (err != NULL && err->code != 0) {
+        ctx->err_code = err->code;
+        ctx->err_msg = err->message ? strdup(err->message) : strdup("unknown error");
+    } else {
+        ctx->result_len = result_len;
+        if (result != NULL && result_len > 0) { ctx->result = malloc(result_len * sizeof(*ctx->result)); memcpy(ctx->result, result, result_len * sizeof(*ctx->result)); }
+    }
+    napi_call_threadsafe_function(ctx->tsfn, ctx, napi_tsfn_blocking);
+}
+
+static void weaveffi_tasks_run_batch_napi_settle(napi_env env, napi_value js_cb, void* context, void* data) {
+    (void)js_cb;
+    (void)context;
+    weaveffi_tasks_run_batch_napi_actx* ctx = (weaveffi_tasks_run_batch_napi_actx*)data;
+    if (env != NULL) {
+    if (ctx->err_code != 0) {
         napi_value err_msg;
-        napi_create_string_utf8(ctx->env, err->message, NAPI_AUTO_LENGTH, &err_msg);
-        napi_reject_deferred(ctx->env, ctx->deferred, err_msg);
+        napi_create_string_utf8(env, ctx->err_msg ? ctx->err_msg : "", NAPI_AUTO_LENGTH, &err_msg);
+        napi_value err_obj;
+        napi_create_error(env, NULL, err_msg, &err_obj);
+        napi_value err_code;
+        napi_create_int32(env, ctx->err_code, &err_code);
+        napi_set_named_property(env, err_obj, "code", err_code);
+        napi_reject_deferred(env, ctx->deferred, err_obj);
     } else {
         napi_value val;
-        napi_get_undefined(ctx->env, &val);
-        napi_resolve_deferred(ctx->env, ctx->deferred, val);
+        napi_create_array(env, &val);
+        for (size_t i = 0; ctx->result != NULL && i < ctx->result_len; i++) {
+            napi_value elem;
+            napi_get_null(env, &elem);
+            napi_set_element(env, val, (uint32_t)i, elem);
+        }
+        napi_resolve_deferred(env, ctx->deferred, val);
     }
+    }
+    free(ctx->err_msg);
+    free(ctx->result);
+    napi_release_threadsafe_function(ctx->tsfn, napi_tsfn_release);
     free(ctx);
 }
 
@@ -93,10 +158,12 @@ static napi_value Napi_weaveffi_tasks_run_batch(napi_env env, napi_callback_info
     napi_get_value_string_utf8(env, names_el, names_s, names_sl + 1, &names_sl);
     names_arr[names_i] = names_s;
   }
-  weaveffi_napi_async_ctx* ctx = (weaveffi_napi_async_ctx*)malloc(sizeof(weaveffi_napi_async_ctx));
-  ctx->env = env;
+  weaveffi_tasks_run_batch_napi_actx* ctx = (weaveffi_tasks_run_batch_napi_actx*)calloc(1, sizeof(weaveffi_tasks_run_batch_napi_actx));
   napi_value promise;
   napi_create_promise(env, &ctx->deferred, &promise);
+  napi_value resource_name;
+  napi_create_string_utf8(env, "weaveffi_tasks_run_batch", NAPI_AUTO_LENGTH, &resource_name);
+  napi_create_threadsafe_function(env, NULL, NULL, resource_name, 0, 1, NULL, NULL, NULL, weaveffi_tasks_run_batch_napi_settle, &ctx->tsfn);
   weaveffi_tasks_run_batch_async(names_arr, (size_t)names_count, weaveffi_tasks_run_batch_napi_cb, ctx);
   for (uint32_t names_j = 0; names_j < names_count; names_j++) free((void*)names_arr[names_j]);
   free(names_arr);
@@ -121,17 +188,47 @@ static napi_value Napi_weaveffi_tasks_cancel_task(napi_env env, napi_callback_in
   return ret;
 }
 
+typedef struct {
+    napi_deferred deferred;
+    napi_threadsafe_function tsfn;
+    int32_t err_code;
+    char* err_msg;
+    int32_t result;
+} weaveffi_tasks_run_n_tasks_napi_actx;
+
 static void weaveffi_tasks_run_n_tasks_napi_cb(void* context, weaveffi_error* err, int32_t result) {
-    weaveffi_napi_async_ctx* ctx = (weaveffi_napi_async_ctx*)context;
+    weaveffi_tasks_run_n_tasks_napi_actx* ctx = (weaveffi_tasks_run_n_tasks_napi_actx*)context;
     if (err != NULL && err->code != 0) {
+        ctx->err_code = err->code;
+        ctx->err_msg = err->message ? strdup(err->message) : strdup("unknown error");
+    } else {
+        ctx->result = result;
+    }
+    napi_call_threadsafe_function(ctx->tsfn, ctx, napi_tsfn_blocking);
+}
+
+static void weaveffi_tasks_run_n_tasks_napi_settle(napi_env env, napi_value js_cb, void* context, void* data) {
+    (void)js_cb;
+    (void)context;
+    weaveffi_tasks_run_n_tasks_napi_actx* ctx = (weaveffi_tasks_run_n_tasks_napi_actx*)data;
+    if (env != NULL) {
+    if (ctx->err_code != 0) {
         napi_value err_msg;
-        napi_create_string_utf8(ctx->env, err->message, NAPI_AUTO_LENGTH, &err_msg);
-        napi_reject_deferred(ctx->env, ctx->deferred, err_msg);
+        napi_create_string_utf8(env, ctx->err_msg ? ctx->err_msg : "", NAPI_AUTO_LENGTH, &err_msg);
+        napi_value err_obj;
+        napi_create_error(env, NULL, err_msg, &err_obj);
+        napi_value err_code;
+        napi_create_int32(env, ctx->err_code, &err_code);
+        napi_set_named_property(env, err_obj, "code", err_code);
+        napi_reject_deferred(env, ctx->deferred, err_obj);
     } else {
         napi_value val;
-        napi_create_int32(ctx->env, result, &val);
-        napi_resolve_deferred(ctx->env, ctx->deferred, val);
+        napi_create_int32(env, ctx->result, &val);
+        napi_resolve_deferred(env, ctx->deferred, val);
     }
+    }
+    free(ctx->err_msg);
+    napi_release_threadsafe_function(ctx->tsfn, napi_tsfn_release);
     free(ctx);
 }
 
@@ -141,10 +238,12 @@ static napi_value Napi_weaveffi_tasks_run_n_tasks(napi_env env, napi_callback_in
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
   int32_t n;
   napi_get_value_int32(env, args[0], &n);
-  weaveffi_napi_async_ctx* ctx = (weaveffi_napi_async_ctx*)malloc(sizeof(weaveffi_napi_async_ctx));
-  ctx->env = env;
+  weaveffi_tasks_run_n_tasks_napi_actx* ctx = (weaveffi_tasks_run_n_tasks_napi_actx*)calloc(1, sizeof(weaveffi_tasks_run_n_tasks_napi_actx));
   napi_value promise;
   napi_create_promise(env, &ctx->deferred, &promise);
+  napi_value resource_name;
+  napi_create_string_utf8(env, "weaveffi_tasks_run_n_tasks", NAPI_AUTO_LENGTH, &resource_name);
+  napi_create_threadsafe_function(env, NULL, NULL, resource_name, 0, 1, NULL, NULL, NULL, weaveffi_tasks_run_n_tasks_napi_settle, &ctx->tsfn);
   weaveffi_tasks_run_n_tasks_async(n, weaveffi_tasks_run_n_tasks_napi_cb, ctx);
   return promise;
 }

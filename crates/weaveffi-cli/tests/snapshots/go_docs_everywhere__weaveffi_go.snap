@@ -11,13 +11,60 @@ package weaveffi
 #cgo LDFLAGS: -lweaveffi
 #include "weaveffi.h"
 #include <stdlib.h>
+extern void goWv_weaveffi_docs_OnSaved_fn(int64_t doc_id, int32_t revision, void* context);
+extern void goWv_weaveffi_docs_publish_async_callback(void* context, weaveffi_error* err, bool result);
 */
 import "C"
 
 import (
 	"fmt"
+	"sync"
 	"unsafe"
 )
+
+func boolToC(b bool) C._Bool {
+	return C._Bool(b)
+}
+
+func cToBool(b C._Bool) bool {
+	return bool(b)
+}
+
+var (
+	wvCallbackMu  sync.Mutex
+	wvCallbackSeq uint64
+	wvCallbacks   = map[uint64]interface{}{}
+	// Subscription id -> registry id, so unregister can release the Go callback.
+	wvListenerCtx = map[uint64]uint64{}
+)
+
+func wvCallbackStore(v interface{}) uint64 {
+	wvCallbackMu.Lock()
+	defer wvCallbackMu.Unlock()
+	wvCallbackSeq++
+	wvCallbacks[wvCallbackSeq] = v
+	return wvCallbackSeq
+}
+
+func wvCallbackLoad(id uint64) interface{} {
+	wvCallbackMu.Lock()
+	defer wvCallbackMu.Unlock()
+	return wvCallbacks[id]
+}
+
+func wvCallbackTake(id uint64) interface{} {
+	wvCallbackMu.Lock()
+	defer wvCallbackMu.Unlock()
+	v := wvCallbacks[id]
+	delete(wvCallbacks, id)
+	return v
+}
+
+func wvCallbackDelete(id uint64) {
+	wvCallbackMu.Lock()
+	defer wvCallbackMu.Unlock()
+	delete(wvCallbacks, id)
+}
 
 // Status: Lifecycle status of a document.
 //
@@ -145,6 +192,41 @@ func (b *DocumentBuilder) Build() (*Document, error) {
 	return &Document{ptr: result}, nil
 }
 
+//export goWv_weaveffi_docs_OnSaved_fn
+func goWv_weaveffi_docs_OnSaved_fn(doc_id C.int64_t, revision C.int32_t, context unsafe.Pointer) {
+	v := wvCallbackLoad(uint64(uintptr(context)))
+	if v == nil {
+		return
+	}
+	cb := v.(func(docId int64, revision int32))
+	arg0 := int64(doc_id)
+	arg1 := int32(revision)
+	cb(arg0, arg1)
+}
+
+// DocsRegisterSavedListener: Subscribe to document-saved notifications
+// Returns a subscription id for DocsUnregisterSavedListener.
+func DocsRegisterSavedListener(callback func(docId int64, revision int32)) uint64 {
+	ctxID := wvCallbackStore(callback)
+	id := uint64(C.weaveffi_docs_register_saved_listener(C.weaveffi_docs_OnSaved_fn(unsafe.Pointer(C.goWv_weaveffi_docs_OnSaved_fn)), unsafe.Pointer(uintptr(ctxID))))
+	wvCallbackMu.Lock()
+	wvListenerCtx[id] = ctxID
+	wvCallbackMu.Unlock()
+	return id
+}
+
+// DocsUnregisterSavedListener unregisters a listener previously registered with DocsRegisterSavedListener.
+func DocsUnregisterSavedListener(id uint64) {
+	C.weaveffi_docs_unregister_saved_listener(C.uint64_t(id))
+	wvCallbackMu.Lock()
+	ctxID, ok := wvListenerCtx[id]
+	delete(wvListenerCtx, id)
+	wvCallbackMu.Unlock()
+	if ok {
+		wvCallbackDelete(ctxID)
+	}
+}
+
 // DocsCreateDocument: Create a brand new document.
 //
 // The document starts in `Draft` status; callers must publish
@@ -196,6 +278,43 @@ func DocsGetDocument(id int64) (*Document, error) {
 		return nil, nil
 	}
 	return &Document{ptr: result}, nil
+}
+
+type wvOutcomeDocsPublishAsync struct {
+	val bool
+	err error
+}
+
+//export goWv_weaveffi_docs_publish_async_callback
+func goWv_weaveffi_docs_publish_async_callback(context unsafe.Pointer, err *C.weaveffi_error, result C._Bool) {
+	v := wvCallbackTake(uint64(uintptr(context)))
+	if v == nil {
+		return
+	}
+	ch := v.(chan wvOutcomeDocsPublishAsync)
+	if err != nil && err.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(err.message), int(err.code))
+		C.weaveffi_error_clear(err)
+		ch <- wvOutcomeDocsPublishAsync{err: goErr}
+		return
+	}
+	ch <- wvOutcomeDocsPublishAsync{val: cToBool(result)}
+}
+
+// DocsPublishAsync: Publish a document in the background
+//
+// Parameters:
+//   - id: Identifier of the document to publish
+// Blocks until the async producer completes.
+func DocsPublishAsync(id int64) (bool, error) {
+	ch := make(chan wvOutcomeDocsPublishAsync, 1)
+	ctxID := wvCallbackStore(ch)
+	C.weaveffi_docs_publish_async_async(C.int64_t(id), C.weaveffi_docs_publish_async_callback(unsafe.Pointer(C.goWv_weaveffi_docs_publish_async_callback)), unsafe.Pointer(uintptr(ctxID)))
+	outcome := <-ch
+	if outcome.err != nil {
+		return false, outcome.err
+	}
+	return outcome.val, nil
 }
 
 

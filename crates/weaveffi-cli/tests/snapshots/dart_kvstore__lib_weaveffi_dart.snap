@@ -53,6 +53,10 @@ void _checkError(Pointer<_WeaveFFIError> err) {
   }
 }
 
+// Live listener trampolines by subscription id. Holding the
+// NativeCallable here keeps its native thunk alive until unregistered.
+final Map<int, NativeCallable> _listenerCallables = {};
+
 /// Persistence semantics applied to a stored entry
 enum EntryKind {
   /// In-memory only; lost on close
@@ -336,6 +340,35 @@ class EntryBuilder {
       calloc.free(err);
     }
   }
+}
+
+typedef _NativeCb_weaveffi_kv_OnEvict_fn = Void Function(Pointer<Utf8>, Pointer<Void>);
+
+typedef _NativeWeaveffiKvRegisterEvictionListener = Uint64 Function(Pointer<NativeFunction<_NativeCb_weaveffi_kv_OnEvict_fn>>, Pointer<Void>);
+typedef _DartWeaveffiKvRegisterEvictionListener = int Function(Pointer<NativeFunction<_NativeCb_weaveffi_kv_OnEvict_fn>>, Pointer<Void>);
+final _weaveffiKvRegisterEvictionListener = _lib.lookupFunction<
+    _NativeWeaveffiKvRegisterEvictionListener, _DartWeaveffiKvRegisterEvictionListener>('weaveffi_kv_register_eviction_listener');
+
+typedef _NativeWeaveffiKvUnregisterEvictionListener = Void Function(Uint64);
+typedef _DartWeaveffiKvUnregisterEvictionListener = void Function(int);
+final _weaveffiKvUnregisterEvictionListener = _lib.lookupFunction<
+    _NativeWeaveffiKvUnregisterEvictionListener, _DartWeaveffiKvUnregisterEvictionListener>('weaveffi_kv_unregister_eviction_listener');
+
+/// Subscribe to per-key eviction notifications
+/// Registers a OnEvict listener. Returns a subscription id for unregisterEvictionListener().
+int registerEvictionListener(void Function(String key) callback) {
+  final callable = NativeCallable<_NativeCb_weaveffi_kv_OnEvict_fn>.isolateLocal((Pointer<Utf8> key, Pointer<Void> context) {
+    callback(key == nullptr ? '' : key.toDartString());
+  });
+  final id = _weaveffiKvRegisterEvictionListener(callable.nativeFunction, nullptr);
+  _listenerCallables[id] = callable;
+  return id;
+}
+
+/// Unregisters a listener previously registered with registerEvictionListener().
+void unregisterEvictionListener(int id) {
+  _weaveffiKvUnregisterEvictionListener(id);
+  _listenerCallables.remove(id)?.close();
 }
 
 typedef _NativeWeaveffiKvOpenStore = Pointer<Void> Function(Pointer<Utf8>, Pointer<_WeaveFFIError>);

@@ -53,6 +53,10 @@ void _checkError(Pointer<_WeaveFFIError> err) {
   }
 }
 
+// Live listener trampolines by subscription id. Holding the
+// NativeCallable here keeps its native thunk alive until unregistered.
+final Map<int, NativeCallable> _listenerCallables = {};
+
 /// Lifecycle status of a document.
 ///
 /// Used to drive UI badges and filters.
@@ -211,6 +215,35 @@ class DocumentBuilder {
       calloc.free(err);
     }
   }
+}
+
+typedef _NativeCb_weaveffi_docs_OnSaved_fn = Void Function(Int64, Int32, Pointer<Void>);
+
+typedef _NativeWeaveffiDocsRegisterSavedListener = Uint64 Function(Pointer<NativeFunction<_NativeCb_weaveffi_docs_OnSaved_fn>>, Pointer<Void>);
+typedef _DartWeaveffiDocsRegisterSavedListener = int Function(Pointer<NativeFunction<_NativeCb_weaveffi_docs_OnSaved_fn>>, Pointer<Void>);
+final _weaveffiDocsRegisterSavedListener = _lib.lookupFunction<
+    _NativeWeaveffiDocsRegisterSavedListener, _DartWeaveffiDocsRegisterSavedListener>('weaveffi_docs_register_saved_listener');
+
+typedef _NativeWeaveffiDocsUnregisterSavedListener = Void Function(Uint64);
+typedef _DartWeaveffiDocsUnregisterSavedListener = void Function(int);
+final _weaveffiDocsUnregisterSavedListener = _lib.lookupFunction<
+    _NativeWeaveffiDocsUnregisterSavedListener, _DartWeaveffiDocsUnregisterSavedListener>('weaveffi_docs_unregister_saved_listener');
+
+/// Subscribe to document-saved notifications
+/// Registers a OnSaved listener. Returns a subscription id for unregisterSavedListener().
+int registerSavedListener(void Function(int docId, int revision) callback) {
+  final callable = NativeCallable<_NativeCb_weaveffi_docs_OnSaved_fn>.isolateLocal((int docId, int revision, Pointer<Void> context) {
+    callback(docId, revision);
+  });
+  final id = _weaveffiDocsRegisterSavedListener(callable.nativeFunction, nullptr);
+  _listenerCallables[id] = callable;
+  return id;
+}
+
+/// Unregisters a listener previously registered with registerSavedListener().
+void unregisterSavedListener(int id) {
+  _weaveffiDocsUnregisterSavedListener(id);
+  _listenerCallables.remove(id)?.close();
 }
 
 typedef _NativeWeaveffiDocsCreateDocument = Pointer<Void> Function(Pointer<Utf8>, Pointer<Pointer<Utf8>>, Size, Pointer<_WeaveFFIError>);

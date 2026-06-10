@@ -42,6 +42,10 @@ impl Generator for CountingGenerator {
         self.name
     }
 
+    fn capabilities(&self) -> weaveffi_core::capabilities::TargetCapabilities {
+        weaveffi_core::capabilities::TargetCapabilities::full()
+    }
+
     fn generate(&self, _api: &Api, out_dir: &Utf8Path, _config: &Self::Config) -> Result<()> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let dir = out_dir.join(self.name);
@@ -53,7 +57,7 @@ impl Generator for CountingGenerator {
 
 fn test_api() -> Api {
     Api {
-        version: "0.1.0".to_string(),
+        version: "0.3.0".to_string(),
         modules: vec![Module {
             name: "math".to_string(),
             functions: vec![Function {

@@ -4,13 +4,41 @@
 // `{string:string}` lowers to `const char*** out_keys, const char*** out_values,
 // size_t* out_len`, and the caller passes the address of a `const char**` it owns.
 // Also covers the `[string]` list getter, the iterator out-param `next`
-// convention, and the `kv.stats` submodule. Exits 0 on success; aborts otherwise.
+// convention, the `kv.stats` submodule, the raw listener registration ABI
+// (register -> fire synchronously on delete -> unregister), and the raw
+// `_async` launcher whose completion callback arrives on the producer's worker
+// thread (synchronized here with C11 atomics). Exits 0 on success; aborts
+// otherwise.
 
 #include <assert.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "weaveffi.h"
+
+// ── eviction listener state ────────────────────────────────────────────────
+static int g_evictions = 0;
+static char g_last_evicted[64];
+
+static void on_evict(const char* key, void* context) {
+    (void)context;
+    g_evictions++;
+    snprintf(g_last_evicted, sizeof g_last_evicted, "%s", key);
+}
+
+// ── async completion state ─────────────────────────────────────────────────
+static atomic_int g_compact_done = 0;
+static int64_t g_compact_result = -1;
+static int32_t g_compact_err = -1;
+
+static void on_compact_done(void* context, weaveffi_error* err, int64_t result) {
+    (void)context;
+    g_compact_err = err ? err->code : 0;
+    g_compact_result = result;
+    atomic_store(&g_compact_done, 1);
+}
 
 int main(void) {
     weaveffi_error err = {0, NULL};
@@ -100,6 +128,32 @@ int main(void) {
     assert(err.code == 0 && st != NULL);
     assert(weaveffi_kv_stats_Stats_get_total_entries(st) == 2);
     weaveffi_kv_stats_Stats_destroy(st);
+
+    // Eviction listener: delete fires the raw callback synchronously on the
+    // calling thread.
+    uint64_t sub = weaveffi_kv_register_eviction_listener(on_evict, NULL);
+    assert(sub > 0);
+    assert(weaveffi_kv_delete(store, "beta", &err) && err.code == 0);
+    assert(g_evictions == 1 && strcmp(g_last_evicted, "beta") == 0);
+
+    // Unregister stops delivery.
+    weaveffi_kv_unregister_eviction_listener(sub);
+    assert(weaveffi_kv_delete(store, "alpha", &err) && err.code == 0);
+    assert(g_evictions == 1);
+
+    // Async: an immediately-expired entry gives compact 3 bytes to reclaim.
+    // The raw `_async` launcher returns immediately; completion arrives on the
+    // producer's worker thread, so poll the atomic flag (with a ~5s timeout).
+    int64_t zero_ttl = 0;
+    assert(weaveffi_kv_put(store, "doomed", payload, sizeof payload,
+                           weaveffi_kv_EntryKind_Volatile, &zero_ttl, &err));
+    assert(err.code == 0);
+    weaveffi_kv_compact_async_async(store, NULL, on_compact_done, NULL);
+    for (int i = 0; i < 5000 && !atomic_load(&g_compact_done); i++) usleep(1000);
+    assert(atomic_load(&g_compact_done));
+    assert(g_compact_err == 0);
+    assert(g_compact_result == 3);
+    assert(weaveffi_kv_count(store, &err) == 0 && err.code == 0);
 
     weaveffi_kv_close_store(store, &err);
     assert(err.code == 0);

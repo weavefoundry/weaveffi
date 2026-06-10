@@ -136,6 +136,11 @@ modules:
               - { name: store, type: "handle<Store>" }
             return: Stats
 generators:
+  # The wasm target cannot deliver producer-initiated callbacks/listeners
+  # (single-threaded, no producer thread); opt in to generating the rest of
+  # the surface — the on_change listener becomes an explicit throwing stub.
+  wasm:
+    allow_unsupported: true
   ruby:
     module_name: Kvstore
   dotnet:

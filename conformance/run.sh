@@ -143,6 +143,7 @@ py_consumer() {
 
 python_contacts() { py_consumer contacts contacts.py; }
 python_events()   { py_consumer events events.py; }
+python_kvstore()  { py_consumer kvstore kvstore.py; }
 
 # Run a Ruby consumer; same library-selection story as Python.
 rb_consumer() {
@@ -153,6 +154,8 @@ rb_consumer() {
 }
 
 ruby_contacts() { rb_consumer contacts contacts.rb; }
+ruby_events()   { rb_consumer events events.rb; }
+ruby_kvstore()  { rb_consumer kvstore kvstore.rb; }
 
 # Run a Dart consumer from inside the generated package so `package:weaveffi`
 # and the cached `ffi` dependency resolve. The cdylib comes via WEAVEFFI_LIBRARY.
@@ -172,6 +175,7 @@ dart_consumer() {
 }
 
 dart_contacts() { dart_consumer contacts contacts.dart; }
+dart_events()   { dart_consumer events events.dart; }
 dart_kvstore() { dart_consumer kvstore kvstore.dart; }
 
 # A directory containing `libweaveffi.<ext>` symlinked to the sample cdylib, so
@@ -215,6 +219,7 @@ EOF
 }
 
 go_contacts() { go_consumer contacts contacts.go; }
+go_events()   { go_consumer events events.go; }
 go_kvstore()  { go_consumer kvstore kvstore.go; }
 
 # Swift: assemble a throwaway SwiftPM package that vendors the generated
@@ -262,21 +267,25 @@ EOF
 }
 
 swift_contacts() { swift_consumer contacts contacts.swift; }
+swift_events()   { swift_consumer events events.swift; }
 swift_kvstore()  { swift_consumer kvstore kvstore.swift; }
 
-# .NET: compile the generated P/Invoke source (WeaveFFI.cs) together with the
-# consumer into one console app. The producer cdylib is resolved at runtime by
-# a DllImportResolver in the consumer reading WEAVEFFI_LIBRARY (avoids the
-# SIP-stripped DYLD path and the backend's default `weaveffi` name). Targets the
-# installed SDK's framework so no reference packs need downloading.
+# .NET: compile the generated P/Invoke source together with the consumer into
+# one console app. The generated file is named after the resolved identity
+# (WeaveFFI.cs, Kvstore.cs, ...), so discover it from the generated tree. The
+# producer cdylib is resolved at runtime by a DllImportResolver in the consumer
+# reading WEAVEFFI_LIBRARY (avoids the SIP-stripped DYLD path and the backend's
+# default `weaveffi` name). Targets the installed SDK's framework so no
+# reference packs need downloading.
 dotnet_consumer() {
     local sample="$1" src="$2"
     local proj="$OUT/dotnet-$sample"
-    local tfm
+    local tfm gen_cs
     tfm="net$(dotnet --version | cut -d. -f1).0"
+    gen_cs=$(ls "$GENROOT/$sample/dotnet"/*.cs | head -1)
     rm -rf "$proj"
     mkdir -p "$proj"
-    cp "$GENROOT/$sample/dotnet/WeaveFFI.cs" "$proj/WeaveFFI.cs"
+    cp "$gen_cs" "$proj/Generated.cs"
     cp "$ROOT/conformance/dotnet/$src" "$proj/Program.cs"
     cat > "$proj/conformance.csproj" <<EOF
 <Project Sdk="Microsoft.NET.Sdk">
@@ -295,6 +304,8 @@ EOF
 }
 
 dotnet_contacts() { dotnet_consumer contacts Contacts.cs; }
+dotnet_events()   { dotnet_consumer events Events.cs; }
+dotnet_kvstore()  { dotnet_consumer kvstore Kvstore.cs; }
 
 # Node: build the generated N-API addon with node-gyp against the producer
 # cdylib (via the `libweaveffi` link alias + include of the generated C header),
@@ -324,6 +335,7 @@ EOF
 }
 
 node_contacts() { node_consumer contacts contacts.js; }
+node_events()   { node_consumer events events.js; }
 node_kvstore() { node_consumer kvstore kvstore.js; }
 
 # Kotlin/Android: compile the generated JNI bridge into `libweaveffi.<ext>` (what
@@ -340,19 +352,28 @@ kotlin_consumer() {
     rm -rf "$b"; mkdir -p "$b"
     local jh jni_os_inc
     jh="${JAVA_HOME:-$(/usr/libexec/java_home 2>/dev/null)}"
+    # Last resort: derive JAVA_HOME from the resolved `java` binary (Linux).
+    if [ -z "$jh" ] || [ ! -f "$jh/include/jni.h" ]; then
+        local javabin
+        javabin=$(readlink -f "$(command -v java)" 2>/dev/null)
+        [ -n "$javabin" ] && jh=$(dirname "$(dirname "$javabin")")
+    fi
     [ -n "$jh" ] && [ -f "$jh/include/jni.h" ] || { echo "jni.h not found (set JAVA_HOME)" >&2; return 1; }
     case "$(uname -s)" in
         Darwin) jni_os_inc="$jh/include/darwin" ;;
         *)      jni_os_inc="$jh/include/linux" ;;
     esac
-    # Locate the coroutines runtime shipped inside the kotlinc distribution.
+    # Locate the coroutines runtime shipped inside the kotlinc distribution
+    # (homebrew libexec/lib, plain dist lib/, snap, or sdkman layouts).
     local kc real coro
     kc=$(command -v kotlinc) || { echo "kotlinc not found" >&2; return 1; }
     real=$(readlink -f "$kc" 2>/dev/null || echo "$kc")
     coro=$(ls "$(dirname "$real")/../libexec/lib/kotlinx-coroutines-core-jvm.jar" \
               "$(dirname "$real")/../lib/kotlinx-coroutines-core-jvm.jar" 2>/dev/null | head -1)
     [ -n "$coro" ] || coro=$(ls /usr/local/Cellar/kotlin/*/libexec/lib/kotlinx-coroutines-core-jvm.jar \
-                                /opt/homebrew/Cellar/kotlin/*/libexec/lib/kotlinx-coroutines-core-jvm.jar 2>/dev/null | head -1)
+                                /opt/homebrew/Cellar/kotlin/*/libexec/lib/kotlinx-coroutines-core-jvm.jar \
+                                /snap/kotlin/current/lib/kotlinx-coroutines-core-jvm.jar \
+                                "$HOME/.sdkman/candidates/kotlin/current/lib/kotlinx-coroutines-core-jvm.jar" 2>/dev/null | head -1)
     [ -n "$coro" ] || { echo "kotlinx-coroutines-core-jvm.jar not found" >&2; return 1; }
     cc -shared -fPIC "$GENROOT/$sample/android/src/main/cpp/weaveffi_jni.c" \
         -I"$jh/include" -I"$jni_os_inc" -I"$GENROOT/$sample/c" \
@@ -366,6 +387,7 @@ kotlin_consumer() {
         java -Djava.library.path="$b" -cp "$b/app.jar:$coro" Main
 }
 
+kotlin_events()  { kotlin_consumer events events.kt; }
 kotlin_kvstore() { kotlin_consumer kvstore kvstore.kt; }
 
 # WASM: compile the producer to wasm32-unknown-unknown and drive the generated
@@ -390,6 +412,7 @@ wasm_consumer() {
         node --experimental-wasm-type-reflection "$ROOT/conformance/wasm/$src"
 }
 
+wasm_events()  { wasm_consumer events events.mjs; }
 wasm_kvstore() { wasm_consumer kvstore kvstore.mjs; }
 
 # ---------------------------------------------------------------------------
@@ -403,26 +426,39 @@ build_producer kvstore
 generate kvstore samples/kvstore/kvstore.yml
 
 # ---------------------------------------------------------------------------
-# Run matrix
+# Run matrix: every language runs the events lane (callbacks/listeners +
+# iterators) and the kvstore lane (handles, structs, builders, async, eviction
+# listener); contacts covers the original struct/enum/optional surface.
 # ---------------------------------------------------------------------------
 check c-contacts c_contacts
 check c-events c_events
-check cpp-events cpp_events
 check c-kvstore c_kvstore
+check cpp-events cpp_events
 check cpp-kvstore cpp_kvstore
-check swift-kvstore swift_kvstore
 check python-contacts python_contacts
 check python-events python_events
+check python-kvstore python_kvstore
 check ruby-contacts ruby_contacts
+check ruby-events ruby_events
+check ruby-kvstore ruby_kvstore
 check dart-contacts dart_contacts
+check dart-events dart_events
 check dart-kvstore dart_kvstore
 check go-contacts go_contacts
+check go-events go_events
 check go-kvstore go_kvstore
 check swift-contacts swift_contacts
+check swift-events swift_events
+check swift-kvstore swift_kvstore
 check dotnet-contacts dotnet_contacts
+check dotnet-events dotnet_events
+check dotnet-kvstore dotnet_kvstore
 check node-contacts node_contacts
+check node-events node_events
 check node-kvstore node_kvstore
+check kotlin-events kotlin_events
 check kotlin-kvstore kotlin_kvstore
+check wasm-events wasm_events
 check wasm-kvstore wasm_kvstore
 
 echo

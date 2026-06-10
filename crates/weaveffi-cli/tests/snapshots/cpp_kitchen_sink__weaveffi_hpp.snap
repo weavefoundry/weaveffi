@@ -15,6 +15,8 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <memory>
 #include <stdexcept>
 #include <future>
+#include <functional>
+#include <mutex>
 
 extern "C" {
 
@@ -169,6 +171,20 @@ class InvalidInputError : public WeaveFFIError {
 public:
     InvalidInputError(const std::string& msg) : WeaveFFIError(2, msg) {}
 };
+
+namespace detail {
+
+inline std::mutex& wv_listener_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+inline std::unordered_map<uint64_t, std::shared_ptr<void>>& wv_listener_registry() {
+    static std::unordered_map<uint64_t, std::shared_ptr<void>> registry;
+    return registry;
+}
+
+} // namespace detail
 
 /** Task priority levels */
 enum class Priority : int32_t {
@@ -454,6 +470,28 @@ inline std::string shared_ping() {
     std::string ret(result);
     weaveffi_free_string(result);
     return ret;
+}
+
+/** Subscribe to OnReady events */
+/** @return A subscription id for kitchen_unregister_ready_listener(). */
+inline uint64_t kitchen_register_ready_listener(std::function<void(int32_t, std::string)> callback) {
+    auto fn = std::make_shared<std::function<void(int32_t, std::string)>>(std::move(callback));
+    uint64_t id = weaveffi_kitchen_register_ready_listener(
+        [](int32_t code, const char* msg, void* context) {
+            auto& cb = *static_cast<std::function<void(int32_t, std::string)>*>(context);
+            cb(code, std::string(msg ? msg : ""));
+        },
+        fn.get());
+    std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());
+    detail::wv_listener_registry()[id] = fn;
+    return id;
+}
+
+/** Unregisters a listener previously registered with kitchen_register_ready_listener(). */
+inline void kitchen_unregister_ready_listener(uint64_t id) {
+    weaveffi_kitchen_unregister_ready_listener(id);
+    std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());
+    detail::wv_listener_registry().erase(id);
 }
 
 /** Identity for bool */

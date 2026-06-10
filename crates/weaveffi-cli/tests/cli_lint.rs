@@ -27,7 +27,7 @@ fn lint_clean_calculator() {
 fn lint_warns_on_undocumented() {
     let dir = tempfile::tempdir().unwrap();
     let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: nodocs
     functions:

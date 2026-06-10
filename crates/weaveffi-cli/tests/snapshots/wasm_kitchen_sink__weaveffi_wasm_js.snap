@@ -689,6 +689,12 @@ export async function loadWeaveffiWasm(url) {
         _freeErr(wasm, _err);
         return _r;
       },
+      register_ready_listener() {
+        throw new Error("weaveffi: listener 'ready_listener' is not supported by the wasm target (single-threaded wasm has no producer thread to deliver events); use a native target for listeners");
+      },
+      unregister_ready_listener() {
+        throw new Error("weaveffi: listener 'ready_listener' is not supported by the wasm target (single-threaded wasm has no producer thread to deliver events); use a native target for listeners");
+      },
       Item: {
         create: (...args) => Item.create(wasm, ...args),
         builder: () => new ItemBuilder(wasm),

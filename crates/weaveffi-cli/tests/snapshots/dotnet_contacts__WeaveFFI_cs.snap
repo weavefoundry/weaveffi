@@ -91,7 +91,7 @@ namespace WeaveFFI
                 var ptr = NativeMethods.weaveffi_contacts_Contact_get_first_name(_handle);
                 var str = WeaveFFIHelpers.PtrToString(ptr);
                 NativeMethods.weaveffi_free_string(ptr);
-                return str;
+                return str ?? "";
             }
         }
 
@@ -102,7 +102,7 @@ namespace WeaveFFI
                 var ptr = NativeMethods.weaveffi_contacts_Contact_get_last_name(_handle);
                 var str = WeaveFFIHelpers.PtrToString(ptr);
                 NativeMethods.weaveffi_free_string(ptr);
-                return str;
+                return str ?? "";
             }
         }
 

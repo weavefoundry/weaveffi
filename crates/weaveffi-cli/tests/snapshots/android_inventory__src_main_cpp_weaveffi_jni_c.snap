@@ -31,7 +31,7 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_products_1create_1productJni(
     return (jlong) rv;
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_products_1get_1product(JNIEnv* env, jclass clazz, jlong id) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_products_1get_1productJni(JNIEnv* env, jclass clazz, jlong id) {
     weaveffi_error err = {0, NULL};
     weaveffi_products_Product* rv = weaveffi_products_get_product((weaveffi_handle_t)id, &err);
     if (err.code != 0) {
@@ -87,7 +87,7 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_orders_1create_1order(JNIEnv*
     return (jlong) rv;
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_orders_1get_1order(JNIEnv* env, jclass clazz, jlong id) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_orders_1get_1orderJni(JNIEnv* env, jclass clazz, jlong id) {
     weaveffi_error err = {0, NULL};
     weaveffi_orders_Order* rv = weaveffi_orders_get_order((weaveffi_handle_t)id, &err);
     if (err.code != 0) {
@@ -107,7 +107,7 @@ JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_orders_1cancel_1order(JNIE
     return rv ? JNI_TRUE : JNI_FALSE;
 }
 
-JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_orders_1add_1product_1to_1order(JNIEnv* env, jclass clazz, jlong order_id, jlong product) {
+JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_orders_1add_1product_1to_1orderJni(JNIEnv* env, jclass clazz, jlong order_id, jlong product) {
     weaveffi_error err = {0, NULL};
     bool rv = weaveffi_orders_add_product_to_order((weaveffi_handle_t)order_id, (const weaveffi_products_Product*)(intptr_t)product, &err);
     if (err.code != 0) {

@@ -6,7 +6,10 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 # To regenerate: weaveffi generate weaveffi.yml -o <out>
 
 from enum import IntEnum
-from typing import Dict, Iterator, List, Optional
+from typing import Callable, Dict, Iterator, List, Optional
+
+def events_register_message_listener(callback: Callable[[str], None]) -> int: ...
+def events_unregister_message_listener(listener_id: int) -> None: ...
 
 # Send a message, triggering the OnMessage callback
 def events_send_message(text: str) -> None: ...

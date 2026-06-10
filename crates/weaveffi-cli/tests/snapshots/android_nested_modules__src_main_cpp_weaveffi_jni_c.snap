@@ -19,7 +19,7 @@ static void throw_weaveffi_error(JNIEnv* env, weaveffi_error* err) {
     weaveffi_error_clear(err);
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_graphics_1new_1canvas(JNIEnv* env, jclass clazz, jint width) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_graphics_1new_1canvasJni(JNIEnv* env, jclass clazz, jint width) {
     weaveffi_error err = {0, NULL};
     weaveffi_graphics_Canvas* rv = weaveffi_graphics_new_canvas((int32_t)width, &err);
     if (err.code != 0) {
@@ -29,7 +29,7 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_graphics_1new_1canvas(JNIEnv*
     return (jlong)(intptr_t)rv;
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_graphics_1shapes_1make_1shape(JNIEnv* env, jclass clazz, jint sides) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_graphics_1shapes_1make_1shapeJni(JNIEnv* env, jclass clazz, jint sides) {
     weaveffi_error err = {0, NULL};
     weaveffi_graphics_shapes_Shape* rv = weaveffi_graphics_shapes_make_shape((int32_t)sides, &err);
     if (err.code != 0) {
@@ -39,7 +39,7 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_graphics_1shapes_1make_1shape
     return (jlong)(intptr_t)rv;
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_graphics_1shapes_1describe(JNIEnv* env, jclass clazz) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_graphics_1shapes_1describeJni(JNIEnv* env, jclass clazz) {
     weaveffi_error err = {0, NULL};
     weaveffi_graphics_Canvas* rv = weaveffi_graphics_shapes_describe(&err);
     if (err.code != 0) {
@@ -49,7 +49,7 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_graphics_1shapes_1describe(JN
     return (jlong)(intptr_t)rv;
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_graphics_1shapes_1geometry_1compute(JNIEnv* env, jclass clazz, jlong shape) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_graphics_1shapes_1geometry_1computeJni(JNIEnv* env, jclass clazz, jlong shape) {
     weaveffi_error err = {0, NULL};
     weaveffi_graphics_shapes_geometry_Detail* rv = weaveffi_graphics_shapes_geometry_compute((const weaveffi_graphics_shapes_Shape*)(intptr_t)shape, &err);
     if (err.code != 0) {

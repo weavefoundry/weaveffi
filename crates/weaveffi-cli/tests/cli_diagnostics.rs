@@ -25,7 +25,7 @@ fn write_temp_file(dir: &tempfile::TempDir, name: &str, contents: &str) -> std::
 #[test]
 fn parse_yaml_error_includes_line() {
     let dir = tempfile::tempdir().unwrap();
-    let yaml = "version: \"0.1.0\"\nmodules:\n  - name: [bad\n";
+    let yaml = "version: \"0.3.0\"\nmodules:\n  - name: [bad\n";
     let path = write_temp_file(&dir, "broken.yml", yaml);
 
     let output = cargo_bin()
@@ -56,7 +56,7 @@ fn parse_yaml_error_includes_line() {
 #[test]
 fn validate_unknown_typeref_includes_offending_name() {
     let dir = tempfile::tempdir().unwrap();
-    let yaml = r#"version: "0.1.0"
+    let yaml = r#"version: "0.3.0"
 modules:
   - name: m
     functions:
@@ -94,7 +94,7 @@ modules:
 #[test]
 fn validate_duplicate_module_includes_offending_name() {
     let dir = tempfile::tempdir().unwrap();
-    let yaml = r#"version: "0.1.0"
+    let yaml = r#"version: "0.3.0"
 modules:
   - name: alpha
     functions:
@@ -134,7 +134,7 @@ modules:
 #[test]
 fn parse_json_error_includes_line() {
     let dir = tempfile::tempdir().unwrap();
-    let json = "{\n  \"version\": \"0.1.0\",\n  \"modules\": [ broken\n}\n";
+    let json = "{\n  \"version\": \"0.3.0\",\n  \"modules\": [ broken\n}\n";
     let path = write_temp_file(&dir, "broken.json", json);
 
     let output = cargo_bin()

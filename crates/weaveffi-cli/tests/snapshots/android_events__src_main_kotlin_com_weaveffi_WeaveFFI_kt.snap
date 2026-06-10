@@ -11,6 +11,8 @@ class WeaveFFI {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
+        @JvmStatic external fun events_register_message_listener(callback: (String) -> Unit): Long
+        @JvmStatic external fun events_unregister_message_listener(id: Long)
         /**
          * Send a message, triggering the OnMessage callback
          */

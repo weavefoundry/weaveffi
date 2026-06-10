@@ -173,10 +173,15 @@ pub extern "C" fn weaveffi_kv_open_store(
     Box::into_raw(Box::new(store))
 }
 
+/// Releases the store's in-memory contents but NOT the handle itself.
+/// Handle params are always borrowed across the C ABI; the wrapper (or the
+/// C consumer) frees the handle exactly once via `weaveffi_kv_Store_destroy`.
+/// Freeing here would double-free under GC'd wrappers (Python/Ruby/Swift/...).
 #[no_mangle]
 pub extern "C" fn weaveffi_kv_close_store(store: *mut Store, out_err: *mut weaveffi_error) {
     if !store.is_null() {
-        unsafe { drop(Box::from_raw(store)) };
+        let s = unsafe { &*store };
+        s.entries.lock().clear();
     }
     abi::error_set_ok(out_err);
 }
@@ -1001,6 +1006,7 @@ mod tests {
         let s = open();
         let mut err = new_err();
         weaveffi_kv_close_store(s, &mut err);
+        weaveffi_kv_Store_destroy(s);
         assert_eq!(err.code, 0);
     }
 
@@ -1033,6 +1039,7 @@ mod tests {
 
         weaveffi_kv_Entry_destroy(entry);
         weaveffi_kv_close_store(s, &mut err);
+        weaveffi_kv_Store_destroy(s);
     }
 
     #[test]
@@ -1054,6 +1061,7 @@ mod tests {
         assert_eq!(err.code, KV_IO_ERROR);
         abi::error_clear(&mut err);
         weaveffi_kv_close_store(s, &mut err);
+        weaveffi_kv_Store_destroy(s);
     }
 
     #[test]
@@ -1067,6 +1075,7 @@ mod tests {
         assert_eq!(err.code, KV_KEY_NOT_FOUND);
         abi::error_clear(&mut err);
         weaveffi_kv_close_store(s, &mut err);
+        weaveffi_kv_Store_destroy(s);
     }
 
     #[test]
@@ -1092,6 +1101,7 @@ mod tests {
         assert_eq!(err.code, KV_EXPIRED);
         abi::error_clear(&mut err);
         weaveffi_kv_close_store(s, &mut err);
+        weaveffi_kv_Store_destroy(s);
     }
 
     #[test]
@@ -1105,6 +1115,7 @@ mod tests {
         assert_eq!(err.code, 0);
         assert!(!weaveffi_kv_delete(s, key.as_ptr(), &mut err));
         weaveffi_kv_close_store(s, &mut err);
+        weaveffi_kv_Store_destroy(s);
     }
 
     #[test]
@@ -1136,6 +1147,7 @@ mod tests {
         assert_eq!(got, vec!["alpha", "beta", "gamma"]);
 
         weaveffi_kv_close_store(s, &mut err);
+        weaveffi_kv_Store_destroy(s);
     }
 
     #[test]
@@ -1162,6 +1174,7 @@ mod tests {
         assert_eq!(got, vec!["user.alice", "user.bob"]);
 
         weaveffi_kv_close_store(s, &mut err);
+        weaveffi_kv_Store_destroy(s);
     }
 
     #[test]
@@ -1177,6 +1190,7 @@ mod tests {
         assert_eq!(err.code, 0);
         assert_eq!(weaveffi_kv_count(s, &mut err), 0);
         weaveffi_kv_close_store(s, &mut err);
+        weaveffi_kv_Store_destroy(s);
     }
 
     #[test]
@@ -1189,6 +1203,7 @@ mod tests {
         assert!(ok);
         assert_eq!(weaveffi_kv_count(s, &mut err), 1);
         weaveffi_kv_close_store(s, &mut err);
+        weaveffi_kv_Store_destroy(s);
     }
 
     #[test]
@@ -1238,6 +1253,7 @@ mod tests {
         assert_eq!(reclaimed, 5);
         abi::cancel_token_destroy(token);
         weaveffi_kv_close_store(s, &mut err);
+        weaveffi_kv_Store_destroy(s);
     }
 
     #[test]
@@ -1267,6 +1283,7 @@ mod tests {
         assert_eq!(reclaimed, 0);
         abi::cancel_token_destroy(token);
         weaveffi_kv_close_store(s, &mut err);
+        weaveffi_kv_Store_destroy(s);
     }
 
     #[test]
@@ -1284,6 +1301,7 @@ mod tests {
         assert_eq!(weaveffi_kv_stats_Stats_get_expired_entries(stats), 0);
         weaveffi_kv_stats_Stats_destroy(stats);
         weaveffi_kv_close_store(s, &mut err);
+        weaveffi_kv_Store_destroy(s);
     }
 
     #[test]
@@ -1486,6 +1504,7 @@ mod tests {
         assert_eq!(COUNT.load(Ordering::Relaxed), 1);
 
         weaveffi_kv_close_store(s, &mut err);
+        weaveffi_kv_Store_destroy(s);
     }
 
     #[test]
@@ -1520,6 +1539,7 @@ mod tests {
 
         weaveffi_kv_unregister_eviction_listener(id);
         weaveffi_kv_close_store(s, &mut err);
+        weaveffi_kv_Store_destroy(s);
     }
 
     #[test]

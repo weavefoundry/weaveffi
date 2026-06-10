@@ -70,6 +70,9 @@ export enum Priority {
   High = 2,
 }
 // module kitchen
+/** Subscribe to OnReady events */
+export function kitchen_register_ready_listener(callback: (code: number, msg: string) => void): number
+export function kitchen_unregister_ready_listener(id: number): void
 /**
  * Identity for bool
  * Maps to C function: weaveffi_kitchen_bool_id

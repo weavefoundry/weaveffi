@@ -14,19 +14,23 @@ class WeaveFFI {
         /**
          * Construct a Canvas.
          */
-        @JvmStatic external fun graphics_new_canvas(width: Int): Long
+        @JvmStatic private external fun graphics_new_canvasJni(width: Int): Long
+        @JvmStatic fun graphics_new_canvas(width: Int): Canvas = Canvas(graphics_new_canvasJni(width))
         /**
          * Construct a Shape.
          */
-        @JvmStatic external fun graphics_shapes_make_shape(sides: Int): Long
+        @JvmStatic private external fun graphics_shapes_make_shapeJni(sides: Int): Long
+        @JvmStatic fun graphics_shapes_make_shape(sides: Int): Shape = Shape(graphics_shapes_make_shapeJni(sides))
         /**
          * Nested function returning a struct owned by an ancestor module.
          */
-        @JvmStatic external fun graphics_shapes_describe(): Long
+        @JvmStatic private external fun graphics_shapes_describeJni(): Long
+        @JvmStatic fun graphics_shapes_describe(): Canvas = Canvas(graphics_shapes_describeJni())
         /**
          * Deeper function taking an ancestor-module struct.
          */
-        @JvmStatic external fun graphics_shapes_geometry_compute(shape: Long): Long
+        @JvmStatic private external fun graphics_shapes_geometry_computeJni(shape: Long): Long
+        @JvmStatic fun graphics_shapes_geometry_compute(shape: Shape): Detail = Detail(graphics_shapes_geometry_computeJni(shape.handle))
     }
 }
 

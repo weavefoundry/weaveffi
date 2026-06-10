@@ -9,9 +9,11 @@ use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use serde::{Deserialize, Serialize};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
+use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
 use weaveffi_core::model::{
-    BindingModel, CallShape, EnumBinding, FnBinding, IteratorBinding, StructBinding,
+    BindingModel, CallShape, CallbackBinding, EnumBinding, FnBinding, IteratorBinding,
+    ListenerBinding, ModuleBinding, ParamBinding, StructBinding,
 };
 use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::utils::{local_type_name, render_prelude, render_trailer, CommentStyle};
@@ -54,6 +56,10 @@ impl LanguageBackend for DartGenerator {
 
     fn name(&self) -> &'static str {
         "dart"
+    }
+
+    fn capabilities(&self) -> TargetCapabilities {
+        TargetCapabilities::full()
     }
 
     fn prefix<'a>(&self, config: &'a Self::Config) -> &'a str {
@@ -716,6 +722,13 @@ fn render_dart_module(api: &Api, prefix: &str, input_basename: &str) -> String {
     out.push_str("  }\n");
     out.push_str("}\n");
 
+    let has_listeners = model.modules.iter().any(|m| !m.listeners.is_empty());
+    if has_listeners {
+        out.push_str("\n// Live listener trampolines by subscription id. Holding the\n");
+        out.push_str("// NativeCallable here keeps its native thunk alive until unregistered.\n");
+        out.push_str("final Map<int, NativeCallable> _listenerCallables = {};\n");
+    }
+
     for module in &model.modules {
         for e in &module.enums {
             render_enum(&mut out, e);
@@ -725,6 +738,12 @@ fn render_dart_module(api: &Api, prefix: &str, input_basename: &str) -> String {
             if s.builder.is_some() {
                 render_dart_builder(&mut out, s);
             }
+        }
+        for cb in &module.callbacks {
+            render_callback_typedef(&mut out, cb);
+        }
+        for l in &module.listeners {
+            render_listener(&mut out, module, l);
         }
         for f in &module.functions {
             render_function(&mut out, f);
@@ -1013,6 +1032,159 @@ fn render_function(out: &mut String, f: &FnBinding) {
         wrapper_params.join(", ")
     ));
     emit_function_body(out, f, c_sym);
+    out.push_str("}\n");
+}
+
+/// The native FFI typedef for a module-level callback declaration, shared by
+/// every listener that fires it.
+fn render_callback_typedef(out: &mut String, cb: &CallbackBinding) {
+    let mut slots: Vec<String> = Vec::new();
+    for p in &cb.params {
+        for (n, _) in input_slots(&p.ty) {
+            slots.push(n);
+        }
+    }
+    slots.push("Pointer<Void>".into());
+    out.push_str(&format!(
+        "\ntypedef _NativeCb_{} = Void Function({});\n",
+        cb.c_fn_type,
+        slots.join(", ")
+    ));
+}
+
+/// The Dart expression converting one callback parameter's trampoline slots
+/// into the value handed to the user callback. Slot names follow the lowered
+/// ABI (`{n}`, `{n}_ptr`/`{n}_len`, `{n}_keys`/`{n}_values`/`{n}_len`).
+fn cb_arg_expr(p: &ParamBinding) -> String {
+    let n0 = p.abi[0].name.to_lower_camel_case();
+    match &p.ty {
+        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::F64 => n0,
+        TypeRef::Bool => format!("{n0} != 0"),
+        TypeRef::Enum(name) => format!(
+            "{}.fromValue({n0})",
+            local_type_name(name).to_upper_camel_case()
+        ),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            format!("{n0} == nullptr ? '' : {n0}.toDartString()")
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            let len = p.abi[1].name.to_lower_camel_case();
+            format!("{n0} == nullptr ? <int>[] : {n0}.asTypedList({len}).toList()")
+        }
+        // Borrowed for the duration of the callback: do not dispose().
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+            format!("{}._({n0})", local_type_name(name).to_upper_camel_case())
+        }
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                format!("{n0} == nullptr ? null : {n0}.toDartString()")
+            }
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
+                let len = p.abi[1].name.to_lower_camel_case();
+                format!("{n0} == nullptr ? null : {n0}.asTypedList({len}).toList()")
+            }
+            TypeRef::Struct(name) | TypeRef::TypedHandle(name) => format!(
+                "{n0} == nullptr ? null : {}._({n0})",
+                local_type_name(name).to_upper_camel_case()
+            ),
+            TypeRef::Bool => format!("{n0} == nullptr ? null : {n0}.value != 0"),
+            TypeRef::Enum(name) => format!(
+                "{n0} == nullptr ? null : {}.fromValue({n0}.value)",
+                local_type_name(name).to_upper_camel_case()
+            ),
+            _ => format!("{n0} == nullptr ? null : {n0}.value"),
+        },
+        TypeRef::List(inner) => {
+            let len = p.abi[1].name.to_lower_camel_case();
+            let elem = map_elem_read(&n0, "i", inner);
+            let dt = dart_type(inner);
+            format!("{n0} == nullptr ? <{dt}>[] : List.generate({len}, (i) => {elem})")
+        }
+        TypeRef::Map(k, v) => {
+            let keys = p.abi[0].name.to_lower_camel_case();
+            let vals = p.abi[1].name.to_lower_camel_case();
+            let len = p.abi[2].name.to_lower_camel_case();
+            let kexpr = map_elem_read(&keys, "i", k);
+            let vexpr = map_elem_read(&vals, "i", v);
+            let (kt, vt) = (dart_type(k), dart_type(v));
+            format!(
+                "{keys} == nullptr ? <{kt}, {vt}>{{}} : {{ for (var i = 0; i < {len}; i++) {kexpr}: {vexpr} }}"
+            )
+        }
+        TypeRef::Iterator(_) => unreachable!("iterator not valid as callback parameter"),
+    }
+}
+
+/// The register/unregister wrapper pair for one listener. The trampoline is an
+/// `isolateLocal` NativeCallable: WeaveFFI listeners fire synchronously on the
+/// thread calling the producer API, so arguments are converted inside the
+/// borrow window (a `.listener` callable would read freed pointers later).
+fn render_listener(out: &mut String, m: &ModuleBinding, l: &ListenerBinding) {
+    let Some(cb) = m.callback(&l.event_callback) else {
+        unreachable!("validation guarantees the listener's callback exists");
+    };
+    let cb_typedef = format!("_NativeCb_{}", cb.c_fn_type);
+    let register_name = format!("register_{}", l.name).to_lower_camel_case();
+    let unregister_name = format!("unregister_{}", l.name).to_lower_camel_case();
+
+    emit_typedef_and_lookup(
+        out,
+        &l.register_symbol,
+        &format!("Pointer<NativeFunction<{cb_typedef}>>, Pointer<Void>"),
+        &format!("Pointer<NativeFunction<{cb_typedef}>>, Pointer<Void>"),
+        "Uint64",
+        "int",
+    );
+    emit_typedef_and_lookup(out, &l.unregister_symbol, "Uint64", "int", "Void", "void");
+
+    let user_fn_params: Vec<String> = cb
+        .params
+        .iter()
+        .map(|p| format!("{} {}", dart_type(&p.ty), p.name.to_lower_camel_case()))
+        .collect();
+    let mut tramp_decls: Vec<String> = Vec::new();
+    for p in &cb.params {
+        for ((_, d), slot) in input_slots(&p.ty).iter().zip(p.abi.iter()) {
+            tramp_decls.push(format!("{d} {}", slot.name.to_lower_camel_case()));
+        }
+    }
+    tramp_decls.push("Pointer<Void> context".into());
+    let call_args: Vec<String> = cb.params.iter().map(cb_arg_expr).collect();
+
+    out.push('\n');
+    emit_doc(out, &l.doc, "");
+    out.push_str(&format!(
+        "/// Registers a {} listener. Returns a subscription id for {unregister_name}().\n",
+        cb.name
+    ));
+    out.push_str(&format!(
+        "int {register_name}(void Function({}) callback) {{\n",
+        user_fn_params.join(", ")
+    ));
+    out.push_str(&format!(
+        "  final callable = NativeCallable<{cb_typedef}>.isolateLocal(({}) {{\n",
+        tramp_decls.join(", ")
+    ));
+    out.push_str(&format!("    callback({});\n", call_args.join(", ")));
+    out.push_str("  });\n");
+    out.push_str(&format!(
+        "  final id = _{}(callable.nativeFunction, nullptr);\n",
+        l.register_symbol.to_lower_camel_case()
+    ));
+    out.push_str("  _listenerCallables[id] = callable;\n");
+    out.push_str("  return id;\n");
+    out.push_str("}\n");
+
+    out.push('\n');
+    out.push_str(&format!(
+        "/// Unregisters a listener previously registered with {register_name}().\n"
+    ));
+    out.push_str(&format!("void {unregister_name}(int id) {{\n"));
+    out.push_str(&format!(
+        "  _{}(id);\n",
+        l.unregister_symbol.to_lower_camel_case()
+    ));
+    out.push_str("  _listenerCallables.remove(id)?.close();\n");
     out.push_str("}\n");
 }
 
@@ -1521,7 +1693,7 @@ mod tests {
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.1.0".into(),
+            version: "0.3.0".into(),
             modules,
             generators: None,
             package: None,

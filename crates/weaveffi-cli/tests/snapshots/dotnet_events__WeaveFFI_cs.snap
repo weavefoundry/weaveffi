@@ -67,16 +67,63 @@ namespace WeaveFFI
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_free_bytes(IntPtr ptr, UIntPtr len);
 
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        internal delegate void Cb_weaveffi_events_OnMessage_fn(IntPtr message, IntPtr context);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_events_register_message_listener", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern ulong weaveffi_events_register_message_listener(Cb_weaveffi_events_OnMessage_fn callback, IntPtr context);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_events_unregister_message_listener", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_events_unregister_message_listener(ulong id);
+
         [DllImport(LibName, EntryPoint = "weaveffi_events_send_message", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_events_send_message(IntPtr text, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_events_get_messages", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_events_get_messages(out UIntPtr out_len, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_events_get_messages(ref WeaveFFIError out_err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_events_GetMessagesIterator_next", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int weaveffi_events_GetMessagesIterator_next(IntPtr iter, out IntPtr out_item, ref WeaveFFIError out_err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_events_GetMessagesIterator_destroy", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_events_GetMessagesIterator_destroy(IntPtr iter);
 
     }
 
     public static class Events
     {
+        private static readonly object _listenerLock = new object();
+        // Live listener delegates by subscription id. Holding the delegate
+        // here keeps its native thunk alive until unregistered; without this
+        // the GC could collect a delegate the producer still calls.
+        private static readonly Dictionary<ulong, Delegate> _listenerRefs = new Dictionary<ulong, Delegate>();
+
+        /// <returns>A subscription id for EventsUnregisterMessageListener().</returns>
+        public static ulong EventsRegisterMessageListener(Action<string> callback)
+        {
+            NativeMethods.Cb_weaveffi_events_OnMessage_fn trampoline = (message, context) =>
+            {
+                callback(Marshal.PtrToStringUTF8(message) ?? "");
+            };
+            ulong id;
+            lock (_listenerLock)
+            {
+                id = NativeMethods.weaveffi_events_register_message_listener(trampoline, IntPtr.Zero);
+                _listenerRefs[id] = trampoline;
+            }
+            return id;
+        }
+
+        /// <summary>Unregisters a listener previously registered with EventsRegisterMessageListener().</summary>
+        public static void EventsUnregisterMessageListener(ulong id)
+        {
+            NativeMethods.weaveffi_events_unregister_message_listener(id);
+            lock (_listenerLock)
+            {
+                _listenerRefs.Remove(id);
+            }
+        }
+
         /// <summary>Send a message, triggering the OnMessage callback</summary>
         public static void EventsSendMessage(string text)
         {
@@ -97,10 +144,33 @@ namespace WeaveFFI
         public static IEnumerable<string> EventsGetMessages()
         {
             var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_events_get_messages(out var outLen, ref err);
+            var iter = NativeMethods.weaveffi_events_get_messages(ref err);
             WeaveFFIError.Check(err);
-            if (result == IntPtr.Zero) return Array.Empty<string>();
-            return Array.Empty<string>();
+            return EnumerateEventsGetMessages(iter);
+        }
+
+        private static IEnumerable<string> EnumerateEventsGetMessages(IntPtr iter)
+        {
+            try
+            {
+                while (true)
+                {
+                    var iterErr = new WeaveFFIError();
+                    if (NativeMethods.weaveffi_events_GetMessagesIterator_next(iter, out var out_item, ref iterErr) == 0)
+                    {
+                        WeaveFFIError.Check(iterErr);
+                        yield break;
+                    }
+                    WeaveFFIError.Check(iterErr);
+                    var item = Marshal.PtrToStringUTF8(out_item) ?? "";
+                    NativeMethods.weaveffi_free_string(out_item);
+                    yield return item;
+                }
+            }
+            finally
+            {
+                NativeMethods.weaveffi_events_GetMessagesIterator_destroy(iter);
+            }
         }
 
     }

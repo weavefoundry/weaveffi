@@ -51,6 +51,9 @@ export enum Status {
   Archived = 2,
 }
 // module docs
+/** Subscribe to document-saved notifications */
+export function docs_register_saved_listener(callback: (doc_id: number, revision: number) => void): number
+export function docs_unregister_saved_listener(id: number): void
 /**
  * Create a brand new document.
  *

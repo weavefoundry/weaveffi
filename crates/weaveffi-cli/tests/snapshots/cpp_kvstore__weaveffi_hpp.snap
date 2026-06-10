@@ -15,6 +15,8 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <memory>
 #include <stdexcept>
 #include <future>
+#include <functional>
+#include <mutex>
 
 extern "C" {
 
@@ -168,6 +170,20 @@ class IoError : public WeaveFFIError {
 public:
     IoError(const std::string& msg) : WeaveFFIError(1004, msg) {}
 };
+
+namespace detail {
+
+inline std::mutex& wv_listener_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+inline std::unordered_map<uint64_t, std::shared_ptr<void>>& wv_listener_registry() {
+    static std::unordered_map<uint64_t, std::shared_ptr<void>> registry;
+    return registry;
+}
+
+} // namespace detail
 
 /** Persistence semantics applied to a stored entry */
 enum class EntryKind : int32_t {
@@ -432,6 +448,28 @@ public:
     }
 
 };
+
+/** Subscribe to per-key eviction notifications */
+/** @return A subscription id for kv_unregister_eviction_listener(). */
+inline uint64_t kv_register_eviction_listener(std::function<void(std::string)> callback) {
+    auto fn = std::make_shared<std::function<void(std::string)>>(std::move(callback));
+    uint64_t id = weaveffi_kv_register_eviction_listener(
+        [](const char* key, void* context) {
+            auto& cb = *static_cast<std::function<void(std::string)>*>(context);
+            cb(std::string(key ? key : ""));
+        },
+        fn.get());
+    std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());
+    detail::wv_listener_registry()[id] = fn;
+    return id;
+}
+
+/** Unregisters a listener previously registered with kv_register_eviction_listener(). */
+inline void kv_unregister_eviction_listener(uint64_t id) {
+    weaveffi_kv_unregister_eviction_listener(id);
+    std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());
+    detail::wv_listener_registry().erase(id);
+}
 
 /** Open (or create) a store backed by the given filesystem path */
 inline Store kv_open_store(const std::string& path) {

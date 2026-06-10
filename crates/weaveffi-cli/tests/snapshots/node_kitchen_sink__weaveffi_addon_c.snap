@@ -10,10 +10,13 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct {
-    napi_env env;
-    napi_deferred deferred;
-} weaveffi_napi_async_ctx;
+typedef struct weaveffi_napi_listener_ctx {
+    napi_threadsafe_function tsfn;
+    uint64_t id;
+    struct weaveffi_napi_listener_ctx* next;
+} weaveffi_napi_listener_ctx;
+
+static weaveffi_napi_listener_ctx* weaveffi_napi_listeners = NULL;
 
 static napi_value Napi_weaveffi_shared_ping(napi_env env, napi_callback_info info) {
   size_t argc = 0;
@@ -28,6 +31,76 @@ static napi_value Napi_weaveffi_shared_ping(napi_env env, napi_callback_info inf
   napi_value ret;
   napi_create_string_utf8(env, result, NAPI_AUTO_LENGTH, &ret);
   weaveffi_free_string(result);
+  return ret;
+}
+
+typedef struct {
+    int32_t code;
+    char* msg;
+} weaveffi_kitchen_OnReady_fn_payload;
+
+static void weaveffi_kitchen_OnReady_fn_napi_tramp(int32_t code, const char* msg, void* context) {
+    weaveffi_napi_listener_ctx* ctx = (weaveffi_napi_listener_ctx*)context;
+    weaveffi_kitchen_OnReady_fn_payload* p = (weaveffi_kitchen_OnReady_fn_payload*)calloc(1, sizeof(weaveffi_kitchen_OnReady_fn_payload));
+    p->code = code;
+    p->msg = msg ? strdup(msg) : NULL;
+    napi_call_threadsafe_function(ctx->tsfn, p, napi_tsfn_nonblocking);
+}
+
+static void weaveffi_kitchen_OnReady_fn_napi_calljs(napi_env env, napi_value js_cb, void* context, void* data) {
+    (void)context;
+    weaveffi_kitchen_OnReady_fn_payload* p = (weaveffi_kitchen_OnReady_fn_payload*)data;
+    if (env != NULL) {
+        napi_value undefined;
+        napi_get_undefined(env, &undefined);
+        napi_value argv[2];
+        napi_create_int32(env, p->code, &argv[0]);
+        napi_create_string_utf8(env, p->msg ? p->msg : "", NAPI_AUTO_LENGTH, &argv[1]);
+        napi_call_function(env, undefined, js_cb, 2, argv, NULL);
+    }
+    free(p->msg);
+    free(p);
+}
+
+static napi_value Napi_weaveffi_kitchen_register_ready_listener(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  weaveffi_napi_listener_ctx* ctx = (weaveffi_napi_listener_ctx*)calloc(1, sizeof(weaveffi_napi_listener_ctx));
+  napi_value resource_name;
+  napi_create_string_utf8(env, "weaveffi_kitchen_register_ready_listener", NAPI_AUTO_LENGTH, &resource_name);
+  napi_create_threadsafe_function(env, args[0], NULL, resource_name, 0, 1, NULL, NULL, NULL, weaveffi_kitchen_OnReady_fn_napi_calljs, &ctx->tsfn);
+  napi_unref_threadsafe_function(env, ctx->tsfn);
+  uint64_t id = weaveffi_kitchen_register_ready_listener(weaveffi_kitchen_OnReady_fn_napi_tramp, ctx);
+  ctx->id = id;
+  ctx->next = weaveffi_napi_listeners;
+  weaveffi_napi_listeners = ctx;
+  napi_value ret;
+  napi_create_double(env, (double)id, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_kitchen_unregister_ready_listener(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  double id_d = 0;
+  napi_get_value_double(env, args[0], &id_d);
+  uint64_t id = (uint64_t)id_d;
+  weaveffi_kitchen_unregister_ready_listener(id);
+  weaveffi_napi_listener_ctx** link = &weaveffi_napi_listeners;
+  while (*link != NULL) {
+    if ((*link)->id == id) {
+      weaveffi_napi_listener_ctx* found = *link;
+      *link = found->next;
+      napi_release_threadsafe_function(found->tsfn, napi_tsfn_release);
+      free(found);
+      break;
+    }
+    link = &(*link)->next;
+  }
+  napi_value ret;
+  napi_get_undefined(env, &ret);
   return ret;
 }
 
@@ -540,17 +613,50 @@ static napi_value Napi_weaveffi_kitchen_cross_module_token(napi_env env, napi_ca
   return ret;
 }
 
+typedef struct {
+    napi_deferred deferred;
+    napi_threadsafe_function tsfn;
+    int32_t err_code;
+    char* err_msg;
+    char* result;
+    int result_null;
+} weaveffi_kitchen_do_async_napi_actx;
+
 static void weaveffi_kitchen_do_async_napi_cb(void* context, weaveffi_error* err, const char* result) {
-    weaveffi_napi_async_ctx* ctx = (weaveffi_napi_async_ctx*)context;
+    weaveffi_kitchen_do_async_napi_actx* ctx = (weaveffi_kitchen_do_async_napi_actx*)context;
     if (err != NULL && err->code != 0) {
+        ctx->err_code = err->code;
+        ctx->err_msg = err->message ? strdup(err->message) : strdup("unknown error");
+    } else {
+        ctx->result_null = result == NULL;
+        ctx->result = result ? strdup(result) : NULL;
+    }
+    napi_call_threadsafe_function(ctx->tsfn, ctx, napi_tsfn_blocking);
+}
+
+static void weaveffi_kitchen_do_async_napi_settle(napi_env env, napi_value js_cb, void* context, void* data) {
+    (void)js_cb;
+    (void)context;
+    weaveffi_kitchen_do_async_napi_actx* ctx = (weaveffi_kitchen_do_async_napi_actx*)data;
+    if (env != NULL) {
+    if (ctx->err_code != 0) {
         napi_value err_msg;
-        napi_create_string_utf8(ctx->env, err->message, NAPI_AUTO_LENGTH, &err_msg);
-        napi_reject_deferred(ctx->env, ctx->deferred, err_msg);
+        napi_create_string_utf8(env, ctx->err_msg ? ctx->err_msg : "", NAPI_AUTO_LENGTH, &err_msg);
+        napi_value err_obj;
+        napi_create_error(env, NULL, err_msg, &err_obj);
+        napi_value err_code;
+        napi_create_int32(env, ctx->err_code, &err_code);
+        napi_set_named_property(env, err_obj, "code", err_code);
+        napi_reject_deferred(env, ctx->deferred, err_obj);
     } else {
         napi_value val;
-        napi_create_string_utf8(ctx->env, result, NAPI_AUTO_LENGTH, &val);
-        napi_resolve_deferred(ctx->env, ctx->deferred, val);
+        if (ctx->result_null) napi_get_null(env, &val); else napi_create_string_utf8(env, ctx->result ? ctx->result : "", NAPI_AUTO_LENGTH, &val);
+        napi_resolve_deferred(env, ctx->deferred, val);
     }
+    }
+    free(ctx->err_msg);
+    free(ctx->result);
+    napi_release_threadsafe_function(ctx->tsfn, napi_tsfn_release);
     free(ctx);
 }
 
@@ -562,26 +668,61 @@ static napi_value Napi_weaveffi_kitchen_do_async(napi_env env, napi_callback_inf
   napi_get_value_string_utf8(env, args[0], NULL, 0, &input_len);
   char* input = (char*)malloc(input_len + 1);
   napi_get_value_string_utf8(env, args[0], input, input_len + 1, &input_len);
-  weaveffi_napi_async_ctx* ctx = (weaveffi_napi_async_ctx*)malloc(sizeof(weaveffi_napi_async_ctx));
-  ctx->env = env;
+  weaveffi_kitchen_do_async_napi_actx* ctx = (weaveffi_kitchen_do_async_napi_actx*)calloc(1, sizeof(weaveffi_kitchen_do_async_napi_actx));
   napi_value promise;
   napi_create_promise(env, &ctx->deferred, &promise);
+  napi_value resource_name;
+  napi_create_string_utf8(env, "weaveffi_kitchen_do_async", NAPI_AUTO_LENGTH, &resource_name);
+  napi_create_threadsafe_function(env, NULL, NULL, resource_name, 0, 1, NULL, NULL, NULL, weaveffi_kitchen_do_async_napi_settle, &ctx->tsfn);
   weaveffi_kitchen_do_async_async(input, weaveffi_kitchen_do_async_napi_cb, ctx);
   free(input);
   return promise;
 }
 
+typedef struct {
+    napi_deferred deferred;
+    napi_threadsafe_function tsfn;
+    int32_t err_code;
+    char* err_msg;
+    char* result;
+    int result_null;
+} weaveffi_kitchen_do_cancellable_napi_actx;
+
 static void weaveffi_kitchen_do_cancellable_napi_cb(void* context, weaveffi_error* err, const char* result) {
-    weaveffi_napi_async_ctx* ctx = (weaveffi_napi_async_ctx*)context;
+    weaveffi_kitchen_do_cancellable_napi_actx* ctx = (weaveffi_kitchen_do_cancellable_napi_actx*)context;
     if (err != NULL && err->code != 0) {
+        ctx->err_code = err->code;
+        ctx->err_msg = err->message ? strdup(err->message) : strdup("unknown error");
+    } else {
+        ctx->result_null = result == NULL;
+        ctx->result = result ? strdup(result) : NULL;
+    }
+    napi_call_threadsafe_function(ctx->tsfn, ctx, napi_tsfn_blocking);
+}
+
+static void weaveffi_kitchen_do_cancellable_napi_settle(napi_env env, napi_value js_cb, void* context, void* data) {
+    (void)js_cb;
+    (void)context;
+    weaveffi_kitchen_do_cancellable_napi_actx* ctx = (weaveffi_kitchen_do_cancellable_napi_actx*)data;
+    if (env != NULL) {
+    if (ctx->err_code != 0) {
         napi_value err_msg;
-        napi_create_string_utf8(ctx->env, err->message, NAPI_AUTO_LENGTH, &err_msg);
-        napi_reject_deferred(ctx->env, ctx->deferred, err_msg);
+        napi_create_string_utf8(env, ctx->err_msg ? ctx->err_msg : "", NAPI_AUTO_LENGTH, &err_msg);
+        napi_value err_obj;
+        napi_create_error(env, NULL, err_msg, &err_obj);
+        napi_value err_code;
+        napi_create_int32(env, ctx->err_code, &err_code);
+        napi_set_named_property(env, err_obj, "code", err_code);
+        napi_reject_deferred(env, ctx->deferred, err_obj);
     } else {
         napi_value val;
-        napi_create_string_utf8(ctx->env, result, NAPI_AUTO_LENGTH, &val);
-        napi_resolve_deferred(ctx->env, ctx->deferred, val);
+        if (ctx->result_null) napi_get_null(env, &val); else napi_create_string_utf8(env, ctx->result ? ctx->result : "", NAPI_AUTO_LENGTH, &val);
+        napi_resolve_deferred(env, ctx->deferred, val);
     }
+    }
+    free(ctx->err_msg);
+    free(ctx->result);
+    napi_release_threadsafe_function(ctx->tsfn, napi_tsfn_release);
     free(ctx);
 }
 
@@ -593,10 +734,12 @@ static napi_value Napi_weaveffi_kitchen_do_cancellable(napi_env env, napi_callba
   napi_get_value_string_utf8(env, args[0], NULL, 0, &input_len);
   char* input = (char*)malloc(input_len + 1);
   napi_get_value_string_utf8(env, args[0], input, input_len + 1, &input_len);
-  weaveffi_napi_async_ctx* ctx = (weaveffi_napi_async_ctx*)malloc(sizeof(weaveffi_napi_async_ctx));
-  ctx->env = env;
+  weaveffi_kitchen_do_cancellable_napi_actx* ctx = (weaveffi_kitchen_do_cancellable_napi_actx*)calloc(1, sizeof(weaveffi_kitchen_do_cancellable_napi_actx));
   napi_value promise;
   napi_create_promise(env, &ctx->deferred, &promise);
+  napi_value resource_name;
+  napi_create_string_utf8(env, "weaveffi_kitchen_do_cancellable", NAPI_AUTO_LENGTH, &resource_name);
+  napi_create_threadsafe_function(env, NULL, NULL, resource_name, 0, 1, NULL, NULL, NULL, weaveffi_kitchen_do_cancellable_napi_settle, &ctx->tsfn);
   weaveffi_kitchen_do_cancellable_async(input, NULL, weaveffi_kitchen_do_cancellable_napi_cb, ctx);
   free(input);
   return promise;
@@ -651,6 +794,8 @@ static napi_value Napi_weaveffi_kitchen_nested_hello(napi_env env, napi_callback
 static napi_value Init(napi_env env, napi_value exports) {
   napi_property_descriptor props[] = {
     { "shared_ping", NULL, Napi_weaveffi_shared_ping, NULL, NULL, NULL, napi_default, NULL },
+    { "kitchen_register_ready_listener", NULL, Napi_weaveffi_kitchen_register_ready_listener, NULL, NULL, NULL, napi_default, NULL },
+    { "kitchen_unregister_ready_listener", NULL, Napi_weaveffi_kitchen_unregister_ready_listener, NULL, NULL, NULL, napi_default, NULL },
     { "kitchen_bool_id", NULL, Napi_weaveffi_kitchen_bool_id, NULL, NULL, NULL, napi_default, NULL },
     { "kitchen_i32_id", NULL, Napi_weaveffi_kitchen_i32_id, NULL, NULL, NULL, napi_default, NULL },
     { "kitchen_u32_id", NULL, Napi_weaveffi_kitchen_u32_id, NULL, NULL, NULL, napi_default, NULL },
@@ -673,7 +818,7 @@ static napi_value Init(napi_env env, napi_value exports) {
     { "kitchen_new_op", NULL, Napi_weaveffi_kitchen_new_op, NULL, NULL, NULL, napi_default, NULL },
     { "kitchen_nested_hello", NULL, Napi_weaveffi_kitchen_nested_hello, NULL, NULL, NULL, napi_default, NULL },
   };
-  napi_define_properties(env, exports, 22, props);
+  napi_define_properties(env, exports, 24, props);
   return exports;
 }
 

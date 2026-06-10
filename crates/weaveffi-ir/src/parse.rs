@@ -131,7 +131,7 @@ mod tests {
 
     fn expected_api() -> Api {
         Api {
-            version: "0.1.0".to_string(),
+            version: "0.3.0".to_string(),
             modules: vec![Module {
                 name: "math".to_string(),
                 functions: vec![Function {
@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn parse_yaml_round_trip() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: math
     functions:
@@ -191,7 +191,7 @@ modules:
     #[test]
     fn parse_json_round_trip() {
         let json = r#"{
-            "version": "0.1.0",
+            "version": "0.3.0",
             "modules": [{
                 "name": "math",
                 "functions": [{
@@ -211,7 +211,7 @@ modules:
     #[test]
     fn parse_toml_round_trip() {
         let toml_str = r#"
-version = "0.1.0"
+version = "0.3.0"
 
 [[modules]]
 name = "math"
@@ -235,7 +235,7 @@ type = "i32"
     #[test]
     fn parse_missing_optional_fields() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: math
     functions:
@@ -369,7 +369,7 @@ modules:
     #[test]
     fn parse_struct_definitions() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: contacts
     functions: []
@@ -398,7 +398,7 @@ modules:
     #[test]
     fn parse_enum_definitions() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: colors
     functions: []
@@ -427,7 +427,7 @@ modules:
     #[test]
     fn parse_optional_types() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: ops
     functions:
@@ -450,7 +450,7 @@ modules:
     #[test]
     fn parse_list_types() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: ops
     functions:
@@ -470,7 +470,7 @@ modules:
     #[test]
     fn parse_struct_ref_in_function() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: contacts
     functions:
@@ -493,7 +493,7 @@ modules:
     #[test]
     fn parse_complex_nested_types() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: ops
     functions:
@@ -521,7 +521,7 @@ modules:
     #[test]
     fn doc_example_primitives() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: demo
     functions:
@@ -585,7 +585,7 @@ modules:
     #[test]
     fn doc_example_structs() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: geometry
     structs:
@@ -641,7 +641,7 @@ modules:
     #[test]
     fn doc_example_enums() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: contacts
     enums:
@@ -680,7 +680,7 @@ modules:
     #[test]
     fn doc_example_optionals() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: contacts
     structs:
@@ -723,7 +723,7 @@ modules:
     #[test]
     fn doc_example_lists() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: ops
     structs:
@@ -756,7 +756,7 @@ modules:
     #[test]
     fn doc_example_nested_types() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: ops
     structs:
@@ -800,7 +800,7 @@ modules:
     #[test]
     fn doc_example_error_domain() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: contacts
     errors:
@@ -853,7 +853,7 @@ modules:
     #[test]
     fn doc_example_complete_contacts() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: contacts
     enums:
@@ -895,7 +895,7 @@ modules:
         return: i32
 "#;
         let api = parse_api_str(yaml, "yaml").unwrap();
-        assert_eq!(api.version, "0.1.0");
+        assert_eq!(api.version, "0.3.0");
         let m = &api.modules[0];
         assert_eq!(m.name, "contacts");
         assert_eq!(m.enums.len(), 1);
@@ -919,7 +919,7 @@ modules:
     #[test]
     fn parse_function_with_map_param() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: store
     functions:
@@ -940,7 +940,7 @@ modules:
     #[test]
     fn parse_function_with_map_return() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: store
     structs:
@@ -1122,7 +1122,7 @@ modules:
     #[test]
     fn parse_idl_doc_map_example() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: example
     structs:
@@ -1187,7 +1187,7 @@ modules:
     #[test]
     fn parse_nested_modules() {
         let yaml = r#"
-version: "0.1.0"
+version: "0.3.0"
 modules:
   - name: parent
     functions:

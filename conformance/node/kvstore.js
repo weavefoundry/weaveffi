@@ -4,9 +4,12 @@
 // to null: the `Buffer` bytes getter (`Entry.value`), the nullable-scalar getter
 // (`Entry.expires_at`), the array list getter (`Entry.tags`) and the object map
 // getter (`Entry.metadata`) over the triple-pointer ABI. Also covers the
-// iterator-backed `kv_list_keys` and the `kv.stats` submodule. Node materializes
-// structs by value and exposes no builder, so tags/metadata are read in their
-// (empty) producer state; the bytes and optional-scalar paths carry payloads.
+// iterator-backed `kv_list_keys`, the `kv.stats` submodule, the TSFN-backed
+// eviction listener (delivery hops to the JS thread, so assertions follow a
+// setImmediate boundary), and the promise-returning `kv_compact_async` settled
+// via a threadsafe function from the producer's worker thread. Node
+// materializes structs by value and exposes no builder, so tags/metadata are
+// read in their (empty) producer state.
 
 'use strict';
 
@@ -18,6 +21,8 @@ function expect(cond, msg) {
     process.exit(1);
   }
 }
+
+const tick = () => new Promise((resolve) => setImmediate(resolve));
 
 const EntryKind = { Volatile: 0, Persistent: 1, Encrypted: 2 };
 
@@ -64,5 +69,30 @@ expect(typeof beta.expires_at === 'number' && beta.expires_at > 0, 'beta expires
 const st = addon.kv_stats_get_stats(store);
 expect(st.total_entries === 2, 'stats total entries == 2');
 
-addon.kv_close_store(store);
-console.log('node/kvstore: OK');
+(async () => {
+  // Eviction listener: the producer fires on the deleting thread; the TSFN
+  // queues delivery onto the JS thread (visible after an event-loop tick).
+  const evicted = [];
+  const sub = addon.kv_register_eviction_listener((key) => evicted.push(key));
+  expect(typeof sub === 'number' && sub > 0, 'listener id positive');
+
+  expect(addon.kv_delete(store, 'beta') === true, 'delete beta');
+  await tick();
+  expect(evicted.length === 1 && evicted[0] === 'beta', `eviction fired for beta (got ${JSON.stringify(evicted)})`);
+
+  // Unregister stops delivery.
+  addon.kv_unregister_eviction_listener(sub);
+  expect(addon.kv_delete(store, 'alpha') === true, 'delete alpha');
+  await tick();
+  expect(evicted.length === 1, `no eviction after unregister (got ${JSON.stringify(evicted)})`);
+
+  // Async: an immediately-expired entry gives compact 3 bytes to reclaim; the
+  // promise settles via a TSFN from the producer's worker thread.
+  expect(addon.kv_put(store, 'doomed', payload, EntryKind.Volatile, 0) === true, 'put doomed');
+  const reclaimed = await addon.kv_compact_async(store);
+  expect(reclaimed === 3, `compact reclaimed 3 bytes (got ${reclaimed})`);
+  expect(addon.kv_count(store) === 0, 'store empty after deletes + compact');
+
+  addon.kv_close_store(store);
+  console.log('node/kvstore: OK');
+})();

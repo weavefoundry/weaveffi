@@ -53,6 +53,10 @@ void _checkError(Pointer<_WeaveFFIError> err) {
   }
 }
 
+// Live listener trampolines by subscription id. Holding the
+// NativeCallable here keeps its native thunk alive until unregistered.
+final Map<int, NativeCallable> _listenerCallables = {};
+
 typedef _NativeWeaveffiSharedTokenDestroy = Void Function(Pointer<Void>);
 typedef _DartWeaveffiSharedTokenDestroy = void Function(Pointer<Void>);
 final _weaveffiSharedTokenDestroy = _lib.lookupFunction<
@@ -460,6 +464,35 @@ class ItemBuilder {
       calloc.free(err);
     }
   }
+}
+
+typedef _NativeCb_weaveffi_kitchen_OnReady_fn = Void Function(Int32, Pointer<Utf8>, Pointer<Void>);
+
+typedef _NativeWeaveffiKitchenRegisterReadyListener = Uint64 Function(Pointer<NativeFunction<_NativeCb_weaveffi_kitchen_OnReady_fn>>, Pointer<Void>);
+typedef _DartWeaveffiKitchenRegisterReadyListener = int Function(Pointer<NativeFunction<_NativeCb_weaveffi_kitchen_OnReady_fn>>, Pointer<Void>);
+final _weaveffiKitchenRegisterReadyListener = _lib.lookupFunction<
+    _NativeWeaveffiKitchenRegisterReadyListener, _DartWeaveffiKitchenRegisterReadyListener>('weaveffi_kitchen_register_ready_listener');
+
+typedef _NativeWeaveffiKitchenUnregisterReadyListener = Void Function(Uint64);
+typedef _DartWeaveffiKitchenUnregisterReadyListener = void Function(int);
+final _weaveffiKitchenUnregisterReadyListener = _lib.lookupFunction<
+    _NativeWeaveffiKitchenUnregisterReadyListener, _DartWeaveffiKitchenUnregisterReadyListener>('weaveffi_kitchen_unregister_ready_listener');
+
+/// Subscribe to OnReady events
+/// Registers a OnReady listener. Returns a subscription id for unregisterReadyListener().
+int registerReadyListener(void Function(int code, String msg) callback) {
+  final callable = NativeCallable<_NativeCb_weaveffi_kitchen_OnReady_fn>.isolateLocal((int code, Pointer<Utf8> msg, Pointer<Void> context) {
+    callback(code, msg == nullptr ? '' : msg.toDartString());
+  });
+  final id = _weaveffiKitchenRegisterReadyListener(callable.nativeFunction, nullptr);
+  _listenerCallables[id] = callable;
+  return id;
+}
+
+/// Unregisters a listener previously registered with registerReadyListener().
+void unregisterReadyListener(int id) {
+  _weaveffiKitchenUnregisterReadyListener(id);
+  _listenerCallables.remove(id)?.close();
 }
 
 typedef _NativeWeaveffiKitchenBoolId = Int32 Function(Int32, Pointer<_WeaveFFIError>);
