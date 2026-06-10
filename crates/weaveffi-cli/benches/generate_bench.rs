@@ -149,9 +149,16 @@ fn all_default_generators() -> Vec<Box<dyn DynGenerator>> {
             NodeGenerator,
             NodeConfig::default(),
         )),
+        // The kitchen-sink fixture uses callbacks/listeners, which the wasm
+        // target cannot deliver; opt in (mirroring `generators.wasm.
+        // allow_unsupported` in real IDLs) so the orchestrator benches can
+        // still fan out to all 11 targets.
         Box::new(ConfiguredGenerator::new(
             WasmGenerator,
-            WasmConfig::default(),
+            WasmConfig {
+                allow_unsupported: true,
+                ..WasmConfig::default()
+            },
         )),
         Box::new(ConfiguredGenerator::new(
             PythonGenerator,
