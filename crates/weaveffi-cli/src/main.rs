@@ -1,9 +1,9 @@
 //! `weaveffi` command-line entry point: `clap` definitions and dispatch.
 //!
-//! Each subcommand's implementation lives in [`commands`] (or its own
-//! top-level module for the self-contained ones: [`doctor`], [`extract`],
-//! [`scaffold`]); the generator registry and config plumbing live in
-//! [`config`].
+//! Each subcommand's implementation lives in `commands` (or its own
+//! top-level module for the self-contained ones: `doctor`, `extract`,
+//! `scaffold`); the generator registry and config plumbing live in
+//! `config`.
 
 mod commands;
 mod config;
