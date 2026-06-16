@@ -51,9 +51,15 @@ The short version:
 1. Create `crates/weaveffi-gen-<lang>/` following the layout of an existing
    generator (e.g. `weaveffi-gen-c`). Add it to the workspace `members` list
    in the root `Cargo.toml` and depend on `weaveffi-core` and `weaveffi-ir`.
-2. Implement `Generator`: define the associated `Config` type, then
-   `name`, `generate`, and the `output_files` override. Reuse the shared
-   `weaveffi_core::codegen::common` helpers and `writer::CodeWriter`.
+2. Implement `weaveffi_core::backend::LanguageBackend`: define the
+   associated `Config` type, then `name`, `prefix` (if the config carries a
+   `c_prefix`), and `files`. For a single-pass layout, override the
+   `render_enum`/`render_struct`/`render_function` hooks and compose
+   `emit_members`; otherwise build the layout directly in `files`. Add
+   `weaveffi_core::impl_generator_via_backend!(<Generator>);` to bridge it to
+   `Generator`. Reuse `BindingModel` and the shared
+   `weaveffi_core::codegen::common` helpers instead of re-deriving traversal
+   or ABI classification.
 3. Wire the generator into `crates/weaveffi-cli/src/main.rs` so the
    `--targets` flag accepts it.
 4. Add snapshot fixtures under

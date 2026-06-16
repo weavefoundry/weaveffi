@@ -66,8 +66,8 @@ impl LanguageBackend for CGenerator {
 
     fn files(
         &self,
-        api: &Api,
-        _model: &BindingModel,
+        _api: &Api,
+        model: &BindingModel,
         out_dir: &Utf8Path,
         config: &Self::Config,
     ) -> Vec<OutputFile> {
@@ -79,7 +79,7 @@ impl LanguageBackend for CGenerator {
         vec![
             OutputFile::new(
                 dir.join(&header_name),
-                render_c_header(api, prefix, input_basename, &header_name),
+                render_c_header_from_model(model, input_basename, &header_name),
             ),
             OutputFile::new(
                 dir.join(&source_name),
@@ -93,11 +93,26 @@ weaveffi_core::impl_generator_via_backend!(CGenerator);
 
 /// Render the complete `{prefix}.h` for `api` using `prefix` for every symbol.
 ///
+/// Thin `Api`-based wrapper over [`render_c_header_from_model`] for tests and
+/// callers that only hold an [`Api`]; the production path renders directly from
+/// the driver-built [`BindingModel`] without re-deriving it.
+pub fn render_c_header(api: &Api, prefix: &str, input_basename: &str, filename: &str) -> String {
+    render_c_header_from_model(&BindingModel::build(api, prefix), input_basename, filename)
+}
+
+/// Render the complete header from the shared [`BindingModel`].
+///
 /// The per-declaration rendering is shared with the C++ backend via
 /// [`weaveffi_core::cabi`]; this function only adds the header framing
-/// (include guard, includes, prefix aliases, the map-convention comment).
-pub fn render_c_header(api: &Api, prefix: &str, input_basename: &str, filename: &str) -> String {
-    let model = BindingModel::build(api, prefix);
+/// (include guard, includes, prefix aliases, the map-convention comment). The
+/// C symbol prefix is read from [`BindingModel::prefix`], so every name already
+/// agrees with the symbols baked into the model.
+pub fn render_c_header_from_model(
+    model: &BindingModel,
+    input_basename: &str,
+    filename: &str,
+) -> String {
+    let prefix = model.prefix.as_str();
     let guard = format!("{}_H", prefix.to_uppercase());
     let mut out = String::with_capacity(2048 + model.modules.len() * 4096);
     out.push_str(&render_prelude(CommentStyle::DoubleSlash, input_basename));

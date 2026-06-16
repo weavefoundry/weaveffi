@@ -72,17 +72,25 @@ pub fn render_json_prelude(input_basename: &str) -> String {
     )
 }
 
-/// Symbols (functions and types) exported by the `weaveffi-abi` runtime crate.
+/// Runtime symbols (functions and types) that consumer code links against from
+/// the `weaveffi-abi` runtime: the `weaveffi_error`/`weaveffi_handle_t`/
+/// `weaveffi_cancel_token` types and every `#[no_mangle]` entry point that
+/// `weaveffi_abi::export_runtime!` emits into the consumer cdylib.
 ///
 /// Generators that emit C/C++ headers use this list to produce
 /// `#define {prefix}_{name} weaveffi_{name}` aliases at the top of the header
 /// when a non-default `c_prefix` is configured, so consumer code can refer to
 /// runtime helpers by the prefixed name while still linking against the
 /// canonical `weaveffi_*` symbols supplied by `weaveffi-abi`.
+///
+/// This list must stay in lockstep with `export_runtime!`: every entry has to
+/// be a real exported C symbol (or a public C type), otherwise the generated
+/// `#define` would alias a name that does not exist. In particular `error_set`
+/// is intentionally absent — it is a Rust-only `pub fn` taking `&str`, never a
+/// C ABI symbol.
 pub const ABI_RUNTIME_SYMBOLS: &[&str] = &[
     "error",
     "handle_t",
-    "error_set",
     "error_clear",
     "free_string",
     "free_bytes",

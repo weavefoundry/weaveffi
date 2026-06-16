@@ -36,9 +36,15 @@ impl Default for HandleArena {
     }
 }
 
+// The `weaveffi_arena_*` C ABI entry points are *not* defined here with
+// `#[no_mangle]`. Like every other runtime symbol, the logic lives as a plain
+// `pub fn` and the `#[no_mangle] extern "C"` thunk is emitted in the consumer
+// cdylib by [`crate::export_runtime!`]. `#[no_mangle]` symbols buried in a
+// transitive rlib are not guaranteed to be re-exported from a cdylib, so
+// defining them here would make the documented arena ABI unreachable.
+
 /// Create a new arena, returning an owned pointer. Free with `weaveffi_arena_destroy`.
-#[no_mangle]
-pub extern "C" fn weaveffi_arena_create() -> *mut HandleArena {
+pub fn arena_create() -> *mut HandleArena {
     Box::into_raw(Box::new(HandleArena::new()))
 }
 
@@ -46,10 +52,9 @@ pub extern "C" fn weaveffi_arena_create() -> *mut HandleArena {
 ///
 /// # Safety
 ///
-/// `arena` must be a valid pointer returned by `weaveffi_arena_create`.
-/// `ptr` and `dtor` must remain valid until `weaveffi_arena_destroy` is called.
-#[no_mangle]
-pub extern "C" fn weaveffi_arena_register(
+/// `arena` must be a valid pointer returned by `arena_create`.
+/// `ptr` and `dtor` must remain valid until `arena_destroy` is called.
+pub fn arena_register(
     arena: *mut HandleArena,
     ptr: *mut c_void,
     dtor: unsafe extern "C" fn(*mut c_void),
@@ -65,10 +70,9 @@ pub extern "C" fn weaveffi_arena_register(
 ///
 /// # Safety
 ///
-/// `arena` must be a valid pointer returned by `weaveffi_arena_create` and must
-/// not be used after this call.
-#[no_mangle]
-pub extern "C" fn weaveffi_arena_destroy(arena: *mut HandleArena) {
+/// `arena` must be a valid pointer returned by `arena_create` and must not be
+/// used after this call.
+pub fn arena_destroy(arena: *mut HandleArena) {
     if arena.is_null() {
         return;
     }
@@ -119,20 +123,20 @@ mod tests {
         let counter = AtomicUsize::new(0);
         let counter_ptr = &counter as *const AtomicUsize as *mut c_void;
 
-        let arena = weaveffi_arena_create();
+        let arena = arena_create();
         assert!(!arena.is_null());
 
-        weaveffi_arena_register(arena, counter_ptr, counting_dtor);
-        weaveffi_arena_register(arena, counter_ptr, counting_dtor);
+        arena_register(arena, counter_ptr, counting_dtor);
+        arena_register(arena, counter_ptr, counting_dtor);
 
-        weaveffi_arena_destroy(arena);
+        arena_destroy(arena);
         assert_eq!(counter.load(Ordering::SeqCst), 2);
     }
 
     #[test]
     fn arena_null_register_is_safe() {
         unsafe extern "C" fn noop(_ptr: *mut c_void) {}
-        weaveffi_arena_register(
+        arena_register(
             std::ptr::null_mut(),
             std::ptr::dangling_mut::<c_void>(),
             noop,
@@ -141,6 +145,6 @@ mod tests {
 
     #[test]
     fn arena_null_destroy_is_safe() {
-        weaveffi_arena_destroy(std::ptr::null_mut());
+        arena_destroy(std::ptr::null_mut());
     }
 }

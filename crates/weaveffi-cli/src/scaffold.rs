@@ -1,169 +1,81 @@
-use weaveffi_core::utils::c_abi_struct_name;
-use weaveffi_ir::ir::{Api, EnumDef, Module, StructDef, TypeRef};
+use std::fmt::Write;
 
-fn is_pointer_type(ty: &TypeRef) -> bool {
-    matches!(
-        ty,
-        TypeRef::StringUtf8
-            | TypeRef::BorrowedStr
-            | TypeRef::Bytes
-            | TypeRef::BorrowedBytes
-            | TypeRef::Struct(_)
-            | TypeRef::TypedHandle(_)
-            | TypeRef::List(_)
-            | TypeRef::Map(_, _)
-    )
+use weaveffi_core::abi::AbiParam;
+use weaveffi_core::model::{
+    AbiFn, BindingModel, CallShape, EnumBinding, FieldBinding, ModuleBinding, StructBinding,
+};
+use weaveffi_ir::ir::Api;
+
+/// The body every generated stub carries until the producer fills it in.
+const TODO_BODY: &str = "    todo!()\n";
+
+/// Render `name: <rust-ffi-type>` for one lowered ABI slot.
+fn slot_decl(p: &AbiParam, prefix: &str) -> String {
+    format!("{}: {}", p.name, p.ty.render_rust(prefix))
 }
 
-fn rust_scalar_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
-    match ty {
-        TypeRef::I8 => "i8".into(),
-        TypeRef::I16 => "i16".into(),
-        TypeRef::I32 => "i32".into(),
-        TypeRef::U8 => "u8".into(),
-        TypeRef::U16 => "u16".into(),
-        TypeRef::U32 => "u32".into(),
-        TypeRef::I64 => "i64".into(),
-        TypeRef::U64 => "u64".into(),
-        TypeRef::F32 => "f32".into(),
-        TypeRef::F64 => "f64".into(),
-        TypeRef::Bool => "bool".into(),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "c_char".into(),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => "u8".into(),
-        TypeRef::Handle => "u64".into(),
-        TypeRef::TypedHandle(name) => name.clone(),
-        TypeRef::Struct(s) => c_abi_struct_name(s, module, prefix),
-        TypeRef::Enum(_) => "i32".into(),
-        TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
-            rust_scalar_type(inner, module, prefix)
-        }
-        TypeRef::Map(_, _) => "u8".into(),
-    }
+/// Join lowered ABI slots into a Rust parameter list.
+fn slots_decl(params: &[AbiParam], prefix: &str) -> String {
+    params
+        .iter()
+        .map(|p| slot_decl(p, prefix))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
-fn rust_param_fragments(name: &str, ty: &TypeRef, module: &str, prefix: &str) -> Vec<String> {
-    match ty {
-        TypeRef::I8 => vec![format!("{name}: i8")],
-        TypeRef::I16 => vec![format!("{name}: i16")],
-        TypeRef::I32 => vec![format!("{name}: i32")],
-        TypeRef::U8 => vec![format!("{name}: u8")],
-        TypeRef::U16 => vec![format!("{name}: u16")],
-        TypeRef::U32 => vec![format!("{name}: u32")],
-        TypeRef::I64 => vec![format!("{name}: i64")],
-        TypeRef::U64 => vec![format!("{name}: u64")],
-        TypeRef::F32 => vec![format!("{name}: f32")],
-        TypeRef::F64 => vec![format!("{name}: f64")],
-        TypeRef::Bool => vec![format!("{name}: bool")],
-        // A string parameter is a single NUL-terminated `const char*` in the C
-        // ABI (see the generated header and `samples/`), not a pointer+length
-        // pair. Only byte slices carry an explicit length.
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![format!("{name}: *const c_char")],
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            vec![
-                format!("{name}_ptr: *const u8"),
-                format!("{name}_len: usize"),
-            ]
-        }
-        TypeRef::Handle => vec![format!("{name}: u64")],
-        TypeRef::TypedHandle(th) => vec![format!("{name}: *mut {th}")],
-        TypeRef::Struct(s) => {
-            let tag = c_abi_struct_name(s, module, prefix);
-            vec![format!("{name}: *const {tag}")]
-        }
-        TypeRef::Enum(_) => vec![format!("{name}: i32")],
-        TypeRef::Optional(inner) => {
-            if is_pointer_type(inner) {
-                rust_param_fragments(name, inner, module, prefix)
-            } else {
-                let scalar = rust_scalar_type(inner, module, prefix);
-                vec![format!("{name}: *const {scalar}")]
-            }
-        }
-        TypeRef::List(inner) => {
-            let elem = rust_scalar_type(inner, module, prefix);
-            if is_pointer_type(inner) {
-                vec![
-                    format!("{name}: *const *const {elem}"),
-                    format!("{name}_len: usize"),
-                ]
-            } else {
-                vec![
-                    format!("{name}: *const {elem}"),
-                    format!("{name}_len: usize"),
-                ]
-            }
-        }
-        TypeRef::Map(key_ty, val_ty) => {
-            let k = rust_scalar_type(key_ty, module, prefix);
-            let v = rust_scalar_type(val_ty, module, prefix);
-            let key_frag = if is_pointer_type(key_ty) {
-                format!("{name}_keys: *const *const {k}")
-            } else {
-                format!("{name}_keys: *const {k}")
-            };
-            let val_frag = if is_pointer_type(val_ty) {
-                format!("{name}_values: *const *const {v}")
-            } else {
-                format!("{name}_values: *const {v}")
-            };
-            vec![key_frag, val_frag, format!("{name}_len: usize")]
-        }
-        TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
-    }
+/// Emit a `#[no_mangle] pub extern "C"` stub from an explicit signature.
+fn emit_stub(out: &mut String, symbol: &str, params: &str, ret: &str, body: &str) {
+    out.push_str("#[no_mangle]\n");
+    let _ = writeln!(out, "pub extern \"C\" fn {symbol}({params}){ret} {{");
+    out.push_str(body);
+    out.push_str("}\n\n");
 }
 
-fn rust_return_type(ty: &TypeRef, module: &str, prefix: &str) -> (String, bool) {
-    match ty {
-        TypeRef::I8 => ("i8".into(), false),
-        TypeRef::I16 => ("i16".into(), false),
-        TypeRef::I32 => ("i32".into(), false),
-        TypeRef::U8 => ("u8".into(), false),
-        TypeRef::U16 => ("u16".into(), false),
-        TypeRef::U32 => ("u32".into(), false),
-        TypeRef::I64 => ("i64".into(), false),
-        TypeRef::U64 => ("u64".into(), false),
-        TypeRef::F32 => ("f32".into(), false),
-        TypeRef::F64 => ("f64".into(), false),
-        TypeRef::Bool => ("bool".into(), false),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => ("*const c_char".into(), false),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => ("*mut u8".into(), true),
-        TypeRef::Handle => ("u64".into(), false),
-        TypeRef::TypedHandle(name) => (format!("*mut {name}"), false),
-        TypeRef::Struct(s) => (
-            format!("*mut {}", c_abi_struct_name(s, module, prefix)),
-            false,
-        ),
-        TypeRef::Enum(_) => ("i32".into(), false),
-        TypeRef::Optional(inner) => {
-            if is_pointer_type(inner) {
-                rust_return_type(inner, module, prefix)
-            } else {
-                let scalar = rust_scalar_type(inner, module, prefix);
-                (format!("*mut {scalar}"), false)
-            }
-        }
-        TypeRef::List(inner) => {
-            let elem = rust_scalar_type(inner, module, prefix);
-            if is_pointer_type(inner) {
-                (format!("*mut *mut {elem}"), true)
-            } else {
-                (format!("*mut {elem}"), true)
-            }
-        }
-        TypeRef::Map(_, _) => ("*mut u8".into(), true),
-        TypeRef::Iterator(_) => ("*mut std::ffi::c_void".into(), false),
-    }
+/// Emit a stub directly from a lowered [`AbiFn`]. A `void` return omits the
+/// `-> T`; every other return type is rendered via the shared Rust vocabulary.
+fn emit_abi_fn(out: &mut String, f: &AbiFn, prefix: &str, body: &str) {
+    let ret = if f.ret == weaveffi_core::abi::CType::Void {
+        String::new()
+    } else {
+        format!(" -> {}", f.ret.render_rust(prefix))
+    };
+    emit_stub(out, &f.symbol, &slots_decl(&f.params, prefix), &ret, body);
 }
 
+/// Emit a getter stub: an implicit `ptr: *const {tag}` receiver, any trailing
+/// `out_*` slots (e.g. `out_len`), and the field's C return type.
+fn emit_getter(out: &mut String, tag: &str, field: &FieldBinding, prefix: &str) {
+    let mut params = vec![format!("ptr: *const {tag}")];
+    params.extend(field.getter_out_params.iter().map(|p| slot_decl(p, prefix)));
+    let ret = format!(" -> {}", field.getter_ret.render_rust(prefix));
+    emit_stub(
+        out,
+        &field.getter_symbol,
+        &params.join(", "),
+        &ret,
+        TODO_BODY,
+    );
+}
+
+/// Render Rust `#[no_mangle] extern "C"` producer stubs for every symbol the
+/// generated C ABI exposes, with `todo!()` bodies for the author to fill in.
+///
+/// Every signature is lowered through the shared [`BindingModel`] and
+/// [`render_rust`](weaveffi_core::abi::CType::render_rust), so a scaffolded
+/// producer matches the generated header (and therefore every language binding)
+/// by construction — there is no second, drift-prone ABI lowering here.
 pub fn render_scaffold(api: &Api, c_prefix: &str) -> String {
+    let model = BindingModel::build(api, c_prefix);
     let mut out = String::new();
     out.push_str("#![allow(unsafe_code)]\n");
     out.push_str("#![allow(clippy::not_unsafe_ptr_arg_deref)]\n\n");
     out.push_str("use std::os::raw::c_char;\n");
     out.push_str("use weaveffi_abi::{self as abi, *};\n\n");
 
-    for m in &api.modules {
-        render_module(&mut out, m, "", c_prefix);
+    // `BindingModel::modules` is already flattened in pre-order, so a single
+    // pass covers nested modules without re-deriving the joined path.
+    for m in &model.modules {
+        render_module(&mut out, m, c_prefix);
     }
 
     out.push_str("// Re-export the fixed WeaveFFI C ABI runtime surface\n");
@@ -174,268 +86,160 @@ pub fn render_scaffold(api: &Api, c_prefix: &str) -> String {
     out
 }
 
-fn render_module(out: &mut String, module: &Module, parent_path: &str, prefix: &str) {
-    // C ABI symbols flatten the whole module path to underscores, so a nested
-    // module `graphics.shapes` contributes the prefix segment `graphics_shapes`.
-    // This must match the binding generators (which key off the same joined
-    // path) and the qualified references the resolver produces.
-    let mod_name = if parent_path.is_empty() {
-        module.name.clone()
-    } else {
-        format!("{parent_path}_{}", module.name)
-    };
-
-    for s in &module.structs {
-        render_struct_scaffold(out, &mod_name, s, prefix);
-    }
-
-    // A rich (algebraic) enum crosses the ABI as an opaque object, so it needs
-    // the same producer surface as a struct: per-variant constructors and field
-    // getters, a tag reader, and a destructor. C-style enums are bare integers
-    // and need no producer functions.
-    for e in &module.enums {
+fn render_module(out: &mut String, m: &ModuleBinding, prefix: &str) {
+    for e in &m.enums {
         if e.is_rich() {
-            render_rich_enum_scaffold(out, &mod_name, e, prefix);
+            render_rich_enum_scaffold(out, e, prefix);
         }
     }
-
-    for f in &module.functions {
-        let fn_name = format!("{prefix}_{mod_name}_{}", f.name);
-        let mut params = Vec::new();
-        for p in &f.params {
-            params.extend(rust_param_fragments(&p.name, &p.ty, &mod_name, prefix));
-        }
-
-        if f.r#async {
-            render_async_function(
-                out,
-                &fn_name,
-                &params,
-                f.returns.as_ref(),
-                &mod_name,
-                prefix,
-            );
-        } else {
-            render_sync_function(
-                out,
-                &fn_name,
-                &mut params,
-                f.returns.as_ref(),
-                &mod_name,
-                prefix,
-            );
-        }
+    for s in &m.structs {
+        render_struct_scaffold(out, s, prefix);
     }
-
-    // Recurse so nested-module producers also get stubs, with the full joined
-    // path threaded through.
-    for child in &module.modules {
-        render_module(out, child, &mod_name, prefix);
+    // Module-scope callback function-pointer typedefs the producer invokes.
+    for cb in &m.callbacks {
+        let _ = writeln!(
+            out,
+            "pub type {} = extern \"C\" fn({});\n",
+            cb.c_fn_type,
+            slots_decl(&cb.abi_params, prefix)
+        );
+    }
+    // Event listeners: a register/unregister pair bound to a callback.
+    for l in &m.listeners {
+        emit_stub(
+            out,
+            &l.register_symbol,
+            &format!(
+                "callback: {}, context: *mut std::ffi::c_void",
+                l.callback_c_fn_type
+            ),
+            " -> u64",
+            TODO_BODY,
+        );
+        emit_stub(out, &l.unregister_symbol, "id: u64", "", TODO_BODY);
+    }
+    for f in &m.functions {
+        match &f.shape {
+            CallShape::Sync(abi) => emit_abi_fn(out, abi, prefix, TODO_BODY),
+            CallShape::Async(a) => {
+                // The completion callback typedef, then the launcher (its
+                // params already carry the callback + context slots).
+                let _ = writeln!(
+                    out,
+                    "pub type {} = extern \"C\" fn({});\n",
+                    a.callback_type,
+                    slots_decl(&a.callback_params, prefix)
+                );
+                emit_abi_fn(
+                    out,
+                    &a.launch,
+                    prefix,
+                    "    todo!(\"spawn async work and call callback with result\")\n",
+                );
+            }
+            CallShape::Iterator(it) => {
+                let tag = &it.iter_tag;
+                let _ = writeln!(out, "#[repr(C)]\npub struct {tag} {{");
+                out.push_str("    // TODO: hold the iterator's streaming state\n");
+                out.push_str("}\n\n");
+                emit_abi_fn(out, &it.launch, prefix, TODO_BODY);
+                emit_abi_fn(out, &it.next, prefix, TODO_BODY);
+                emit_stub(
+                    out,
+                    &it.destroy_symbol,
+                    &format!("iter: *mut {tag}"),
+                    "",
+                    TODO_BODY,
+                );
+            }
+        }
     }
 }
 
-fn render_sync_function(
-    out: &mut String,
-    fn_name: &str,
-    params: &mut Vec<String>,
-    returns: Option<&TypeRef>,
-    mod_name: &str,
-    prefix: &str,
-) {
-    let ret_sig = if let Some(ret) = returns {
-        if let TypeRef::Map(key_ty, val_ty) = ret {
-            let k = rust_scalar_type(key_ty, mod_name, prefix);
-            let v = rust_scalar_type(val_ty, mod_name, prefix);
-            if is_pointer_type(key_ty) {
-                params.push(format!("out_keys: *mut *mut {k}"));
-            } else {
-                params.push(format!("out_keys: *mut {k}"));
-            }
-            if is_pointer_type(val_ty) {
-                params.push(format!("out_values: *mut *mut {v}"));
-            } else {
-                params.push(format!("out_values: *mut {v}"));
-            }
-            params.push("out_map_len: *mut usize".into());
-            String::new()
-        } else {
-            let (ret_ty, needs_len) = rust_return_type(ret, mod_name, prefix);
-            if needs_len {
-                params.push("out_len: *mut usize".into());
-            }
-            format!(" -> {ret_ty}")
-        }
-    } else {
-        String::new()
-    };
-    params.push("out_err: *mut weaveffi_error".into());
-
-    out.push_str("#[no_mangle]\n");
-    out.push_str(&format!(
-        "pub extern \"C\" fn {fn_name}({}){ret_sig} {{\n",
-        params.join(", ")
-    ));
-    out.push_str("    todo!()\n");
-    out.push_str("}\n\n");
-}
-
-fn render_async_function(
-    out: &mut String,
-    fn_name: &str,
-    params: &[String],
-    returns: Option<&TypeRef>,
-    mod_name: &str,
-    prefix: &str,
-) {
-    let mut cb_params = Vec::new();
-    if let Some(ret) = returns {
-        if let TypeRef::Map(key_ty, val_ty) = ret {
-            let k = rust_scalar_type(key_ty, mod_name, prefix);
-            let v = rust_scalar_type(val_ty, mod_name, prefix);
-            cb_params.push(if is_pointer_type(key_ty) {
-                format!("*mut *mut {k}")
-            } else {
-                format!("*mut {k}")
-            });
-            cb_params.push(if is_pointer_type(val_ty) {
-                format!("*mut *mut {v}")
-            } else {
-                format!("*mut {v}")
-            });
-            cb_params.push("usize".into());
-        } else {
-            let (ret_ty, needs_len) = rust_return_type(ret, mod_name, prefix);
-            cb_params.push(ret_ty);
-            if needs_len {
-                cb_params.push("usize".into());
-            }
-        }
-    }
-    cb_params.push("*mut weaveffi_error".into());
-    cb_params.push("*mut std::ffi::c_void".into());
-
-    let cb_type = format!("{fn_name}_callback");
-    out.push_str(&format!(
-        "pub type {cb_type} = extern \"C\" fn({});\n\n",
-        cb_params.join(", ")
-    ));
-
-    let mut fn_params = params.to_vec();
-    fn_params.push(format!("callback: {cb_type}"));
-    fn_params.push("context: *mut std::ffi::c_void".into());
-
-    out.push_str("#[no_mangle]\n");
-    out.push_str(&format!(
-        "pub extern \"C\" fn {fn_name}({}) {{\n",
-        fn_params.join(", ")
-    ));
-    out.push_str("    todo!(\"spawn async work and call callback with result\")\n");
-    out.push_str("}\n\n");
-}
-
-fn render_struct_scaffold(out: &mut String, module: &str, s: &StructDef, prefix: &str) {
-    let tag = c_abi_struct_name(&s.name, module, prefix);
-
-    out.push_str("#[repr(C)]\n");
-    out.push_str(&format!("pub struct {tag} {{\n"));
+fn render_struct_scaffold(out: &mut String, s: &StructBinding, prefix: &str) {
+    let tag = &s.c_tag;
+    let _ = writeln!(out, "#[repr(C)]\npub struct {tag} {{");
     out.push_str("    // TODO: add fields\n");
     out.push_str("}\n\n");
 
-    let mut params = Vec::new();
-    for f in &s.fields {
-        params.extend(rust_param_fragments(&f.name, &f.ty, module, prefix));
-    }
-    params.push("out_err: *mut weaveffi_error".into());
-    out.push_str("#[no_mangle]\n");
-    out.push_str(&format!(
-        "pub extern \"C\" fn {tag}_create({}) -> *mut {tag} {{\n",
-        params.join(", ")
-    ));
-    out.push_str("    todo!()\n");
-    out.push_str("}\n\n");
-
-    out.push_str("#[no_mangle]\n");
-    out.push_str(&format!(
-        "pub extern \"C\" fn {tag}_destroy(ptr: *mut {tag}) {{\n"
-    ));
-    out.push_str("    todo!()\n");
-    out.push_str("}\n\n");
-
+    emit_abi_fn(out, &s.create, prefix, TODO_BODY);
+    emit_stub(
+        out,
+        &s.destroy_symbol,
+        &format!("ptr: *mut {tag}"),
+        "",
+        TODO_BODY,
+    );
     for field in &s.fields {
-        let (ret_ty, needs_len) = rust_return_type(&field.ty, module, prefix);
-        let getter = format!("{tag}_get_{}", field.name);
-        let mut getter_params = vec![format!("ptr: *const {tag}")];
-        if needs_len {
-            getter_params.push("out_len: *mut usize".into());
-        }
-        out.push_str("#[no_mangle]\n");
-        out.push_str(&format!(
-            "pub extern \"C\" fn {getter}({}) -> {ret_ty} {{\n",
-            getter_params.join(", ")
-        ));
-        out.push_str("    todo!()\n");
+        emit_getter(out, tag, field, prefix);
+    }
+
+    if let Some(b) = &s.builder {
+        let bt = &b.builder_tag;
+        let _ = writeln!(out, "#[repr(C)]\npub struct {bt} {{");
+        out.push_str("    // TODO: accumulate fields until build()\n");
         out.push_str("}\n\n");
+        emit_stub(out, &b.new_symbol, "", &format!(" -> *mut {bt}"), TODO_BODY);
+        for (field, (_, setter)) in s.fields.iter().zip(&b.setters) {
+            let params = std::iter::once(format!("builder: *mut {bt}"))
+                .chain(field.value_params.iter().map(|p| slot_decl(p, prefix)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            emit_stub(out, setter, &params, "", TODO_BODY);
+        }
+        emit_stub(
+            out,
+            &b.build_symbol,
+            &format!("builder: *mut {bt}, out_err: *mut weaveffi_error"),
+            &format!(" -> *mut {tag}"),
+            TODO_BODY,
+        );
+        emit_stub(
+            out,
+            &b.destroy_symbol,
+            &format!("builder: *mut {bt}"),
+            "",
+            TODO_BODY,
+        );
     }
 }
 
 /// Emit the producer surface for a rich (algebraic) enum: an opaque object type
 /// plus, for every variant, a `{tag}_{Variant}_new` constructor and one
 /// `{tag}_{Variant}_get_{field}` getter per associated field, followed by the
-/// shared `{tag}_tag` reader and `{tag}_destroy`. The symbol names mirror the
-/// generated C header exactly (see `cabi::render_rich_enum_fn_decls`).
-fn render_rich_enum_scaffold(out: &mut String, module: &str, e: &EnumDef, prefix: &str) {
-    let tag = c_abi_struct_name(&e.name, module, prefix);
-
-    out.push_str("#[repr(C)]\n");
-    out.push_str(&format!("pub struct {tag} {{\n"));
+/// shared `{tag}_tag` reader and `{tag}_destroy`. The symbol names and lowered
+/// signatures come straight from the [`BindingModel`], so they mirror the
+/// generated C header exactly.
+fn render_rich_enum_scaffold(out: &mut String, e: &EnumBinding, prefix: &str) {
+    let Some(rich) = &e.rich else {
+        return;
+    };
+    let tag = &e.c_tag;
+    let _ = writeln!(out, "#[repr(C)]\npub struct {tag} {{");
     out.push_str("    // TODO: represent the active variant and its associated data\n");
     out.push_str("}\n\n");
 
-    for v in &e.variants {
-        let mut params = Vec::new();
-        for f in &v.fields {
-            params.extend(rust_param_fragments(&f.name, &f.ty, module, prefix));
-        }
-        params.push("out_err: *mut weaveffi_error".into());
-        out.push_str("#[no_mangle]\n");
-        out.push_str(&format!(
-            "pub extern \"C\" fn {tag}_{}_new({}) -> *mut {tag} {{\n",
-            v.name,
-            params.join(", ")
-        ));
-        out.push_str("    todo!()\n");
-        out.push_str("}\n\n");
-
-        for f in &v.fields {
-            let (ret_ty, needs_len) = rust_return_type(&f.ty, module, prefix);
-            let getter = format!("{tag}_{}_get_{}", v.name, f.name);
-            let mut getter_params = vec![format!("ptr: *const {tag}")];
-            if needs_len {
-                getter_params.push("out_len: *mut usize".into());
-            }
-            out.push_str("#[no_mangle]\n");
-            out.push_str(&format!(
-                "pub extern \"C\" fn {getter}({}) -> {ret_ty} {{\n",
-                getter_params.join(", ")
-            ));
-            out.push_str("    todo!()\n");
-            out.push_str("}\n\n");
+    for v in &rich.variants {
+        emit_abi_fn(out, &v.create, prefix, TODO_BODY);
+        for field in &v.fields {
+            emit_getter(out, tag, field, prefix);
         }
     }
 
-    out.push_str("#[no_mangle]\n");
-    out.push_str(&format!(
-        "pub extern \"C\" fn {tag}_tag(ptr: *const {tag}) -> i32 {{\n"
-    ));
-    out.push_str("    todo!()\n");
-    out.push_str("}\n\n");
-
-    out.push_str("#[no_mangle]\n");
-    out.push_str(&format!(
-        "pub extern \"C\" fn {tag}_destroy(ptr: *mut {tag}) {{\n"
-    ));
-    out.push_str("    todo!()\n");
-    out.push_str("}\n\n");
+    emit_stub(
+        out,
+        &rich.tag_symbol,
+        &format!("ptr: *const {tag}"),
+        " -> i32",
+        TODO_BODY,
+    );
+    emit_stub(
+        out,
+        &rich.destroy_symbol,
+        &format!("ptr: *mut {tag}"),
+        "",
+        TODO_BODY,
+    );
 }
 
 #[cfg(test)]
@@ -641,9 +445,11 @@ mod tests {
             out.contains("out_len: *mut usize"),
             "bytes return should add out_len param: {out}"
         );
+        // Matches the C header's `const uint8_t*` return exactly (the producer
+        // hands back a buffer the consumer frees via `weaveffi_free_bytes`).
         assert!(
-            out.contains("-> *mut u8"),
-            "bytes return type should be *mut u8: {out}"
+            out.contains("-> *const u8"),
+            "bytes return type should be *const u8: {out}"
         );
     }
 
@@ -1010,17 +816,23 @@ mod tests {
             out.contains("grades_len: usize"),
             "map param should have length: {out}"
         );
+        // A returned map is two callee-allocated parallel arrays handed back
+        // through pointer-to-pointer out-params. These now lower through the
+        // canonical `abi::lower_return`, so they match the header
+        // (`const char*** out_keys, int32_t** out_values, size_t* out_len`)
+        // exactly — the previous hand-rolled lowering dropped a level of
+        // indirection on `out_values` and renamed the length to `out_map_len`.
         assert!(
-            out.contains("out_keys: *mut *mut c_char"),
-            "map return should have out_keys: {out}"
+            out.contains("out_keys: *mut *mut *const c_char"),
+            "map return out_keys must match `const char***`: {out}"
         );
         assert!(
-            out.contains("out_values: *mut i32"),
-            "map return should have out_values: {out}"
+            out.contains("out_values: *mut *mut i32"),
+            "map return out_values must match `int32_t**`: {out}"
         );
         assert!(
-            out.contains("out_map_len: *mut usize"),
-            "map return should have out_map_len: {out}"
+            out.contains("out_len: *mut usize"),
+            "map return should use the canonical out_len: {out}"
         );
     }
 
@@ -1045,13 +857,15 @@ mod tests {
             vec![],
         );
         let out = render_scaffold(&api, "weaveffi");
+        // A typed handle crosses the ABI as the module's opaque tag pointer,
+        // exactly as the header forward-declares it.
         assert!(
-            out.contains("contact: *mut Contact"),
-            "TypedHandle param should be *mut Contact: {out}"
+            out.contains("contact: *mut weaveffi_calc_Contact"),
+            "TypedHandle param should be the opaque tag pointer: {out}"
         );
         assert!(
-            out.contains("-> *mut Contact"),
-            "TypedHandle return should be *mut Contact: {out}"
+            out.contains("-> *mut weaveffi_calc_Contact"),
+            "TypedHandle return should be the opaque tag pointer: {out}"
         );
     }
 
@@ -1118,11 +932,14 @@ mod tests {
             vec![],
         );
         let out = render_scaffold(&api, "weaveffi");
+        // The callback prefix is `(context, err)` — matching the header's
+        // `typedef void (*..)(void* context, weaveffi_error* err)`. The earlier
+        // hand-rolled scaffold emitted these in the reverse order.
         assert!(
             out.contains(
-                "pub type weaveffi_calc_sync_data_callback = extern \"C\" fn(*mut weaveffi_error, *mut std::ffi::c_void);"
+                "pub type weaveffi_calc_sync_data_callback = extern \"C\" fn(context: *mut std::ffi::c_void, err: *mut weaveffi_error);"
             ),
-            "void async callback should only have error + context: {out}"
+            "void async callback should be (context, err): {out}"
         );
         assert!(
             out.contains("callback: weaveffi_calc_sync_data_callback"),
@@ -1287,5 +1104,199 @@ mod tests {
         let out = render_scaffold(&api, "weaveffi");
         assert!(out.contains("weaveffi_math_add"), "missing math module");
         assert!(out.contains("weaveffi_io_read"), "missing io module");
+    }
+
+    fn events_module(
+        functions: Vec<Function>,
+        callbacks: Vec<weaveffi_ir::ir::CallbackDef>,
+        listeners: Vec<weaveffi_ir::ir::ListenerDef>,
+    ) -> Api {
+        Api {
+            version: "0.4.0".into(),
+            modules: vec![Module {
+                name: "events".into(),
+                functions,
+                structs: vec![],
+                enums: vec![],
+                callbacks,
+                listeners,
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+            package: None,
+        }
+    }
+
+    #[test]
+    fn scaffold_iterator_emits_opaque_type_next_and_destroy() {
+        let api = events_module(
+            vec![Function {
+                name: "get_messages".into(),
+                params: vec![],
+                returns: Some(TypeRef::Iterator(Box::new(TypeRef::StringUtf8))),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            vec![],
+            vec![],
+        );
+        let out = render_scaffold(&api, "weaveffi");
+        // Opaque iterator object the producer fills with streaming state.
+        assert!(
+            out.contains("pub struct weaveffi_events_GetMessagesIterator {"),
+            "iterator opaque type missing: {out}"
+        );
+        // Launcher returns the opaque iterator pointer.
+        assert!(
+            out.contains("pub extern \"C\" fn weaveffi_events_get_messages(out_err: *mut weaveffi_error) -> *mut weaveffi_events_GetMessagesIterator {"),
+            "iterator launcher missing/incorrect: {out}"
+        );
+        // `next` writes the element through `out_item` and returns a status int.
+        assert!(
+            out.contains("pub extern \"C\" fn weaveffi_events_GetMessagesIterator_next(iter: *mut weaveffi_events_GetMessagesIterator, out_item: *mut *const c_char, out_err: *mut weaveffi_error) -> i32 {"),
+            "iterator next missing/incorrect: {out}"
+        );
+        assert!(
+            out.contains("pub extern \"C\" fn weaveffi_events_GetMessagesIterator_destroy(iter: *mut weaveffi_events_GetMessagesIterator) {"),
+            "iterator destroy missing/incorrect: {out}"
+        );
+    }
+
+    #[test]
+    fn scaffold_listener_emits_callback_typedef_and_register_pair() {
+        use weaveffi_ir::ir::{CallbackDef, ListenerDef};
+        let api = events_module(
+            vec![],
+            vec![CallbackDef {
+                name: "on_message".into(),
+                params: vec![Param {
+                    name: "text".into(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                    doc: None,
+                }],
+                doc: None,
+            }],
+            vec![ListenerDef {
+                name: "messages".into(),
+                event_callback: "on_message".into(),
+                doc: None,
+            }],
+        );
+        let out = render_scaffold(&api, "weaveffi");
+        assert!(
+            out.contains("pub type weaveffi_events_on_message_fn = extern \"C\" fn(text: *const c_char, context: *mut std::ffi::c_void);"),
+            "module callback typedef missing/incorrect: {out}"
+        );
+        assert!(
+            out.contains("pub extern \"C\" fn weaveffi_events_register_messages(callback: weaveffi_events_on_message_fn, context: *mut std::ffi::c_void) -> u64 {"),
+            "listener register missing/incorrect: {out}"
+        );
+        assert!(
+            out.contains("pub extern \"C\" fn weaveffi_events_unregister_messages(id: u64) {"),
+            "listener unregister missing/incorrect: {out}"
+        );
+    }
+
+    #[test]
+    fn scaffold_struct_builder_emits_full_surface() {
+        let api = Api {
+            version: "0.4.0".into(),
+            modules: vec![Module {
+                name: "contacts".into(),
+                functions: vec![],
+                structs: vec![StructDef {
+                    name: "Contact".into(),
+                    doc: None,
+                    fields: vec![StructField {
+                        name: "name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                        default: None,
+                    }],
+                    builder: true,
+                }],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+            package: None,
+        };
+        let out = render_scaffold(&api, "weaveffi");
+        assert!(
+            out.contains("pub struct weaveffi_contacts_ContactBuilder {"),
+            "builder opaque type missing: {out}"
+        );
+        assert!(
+            out.contains("pub extern \"C\" fn weaveffi_contacts_Contact_Builder_new() -> *mut weaveffi_contacts_ContactBuilder {"),
+            "builder new missing/incorrect: {out}"
+        );
+        assert!(
+            out.contains("pub extern \"C\" fn weaveffi_contacts_Contact_Builder_set_name(builder: *mut weaveffi_contacts_ContactBuilder, name: *const c_char) {"),
+            "builder setter missing/incorrect: {out}"
+        );
+        assert!(
+            out.contains("pub extern \"C\" fn weaveffi_contacts_Contact_Builder_build(builder: *mut weaveffi_contacts_ContactBuilder, out_err: *mut weaveffi_error) -> *mut weaveffi_contacts_Contact {"),
+            "builder build missing/incorrect: {out}"
+        );
+        assert!(
+            out.contains("pub extern \"C\" fn weaveffi_contacts_Contact_Builder_destroy(builder: *mut weaveffi_contacts_ContactBuilder) {"),
+            "builder destroy missing/incorrect: {out}"
+        );
+    }
+
+    #[test]
+    fn scaffold_cancellable_async_threads_cancel_token() {
+        let api = Api {
+            version: "0.4.0".into(),
+            modules: vec![Module {
+                name: "net".into(),
+                functions: vec![Function {
+                    name: "fetch".into(),
+                    params: vec![Param {
+                        name: "id".into(),
+                        ty: TypeRef::I64,
+                        mutable: false,
+                        doc: None,
+                    }],
+                    returns: Some(TypeRef::StringUtf8),
+                    doc: None,
+                    r#async: true,
+                    cancellable: true,
+                    deprecated: None,
+                    since: None,
+                }],
+                structs: vec![],
+                enums: vec![],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+            package: None,
+        };
+        let out = render_scaffold(&api, "weaveffi");
+        // The completion callback prefix is (context, err, result).
+        assert!(
+            out.contains("pub type weaveffi_net_fetch_callback = extern \"C\" fn(context: *mut std::ffi::c_void, err: *mut weaveffi_error, result: *const c_char);"),
+            "async callback typedef missing/incorrect: {out}"
+        );
+        // The cancel token slot sits before callback/context on the launcher.
+        assert!(
+            out.contains("cancel_token: *mut weaveffi_cancel_token"),
+            "cancellable async must thread a cancel token: {out}"
+        );
+        assert!(
+            out.contains("pub extern \"C\" fn weaveffi_net_fetch_async(id: i64, cancel_token: *mut weaveffi_cancel_token, callback: weaveffi_net_fetch_callback, context: *mut std::ffi::c_void) {"),
+            "async launcher signature missing/incorrect: {out}"
+        );
     }
 }

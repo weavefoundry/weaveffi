@@ -118,9 +118,18 @@ weaveffi extract src/api.rs -f json -o api.json  # JSON to file
 weaveffi extract src/api.rs | weaveffi generate -o generated
 ```
 
-The extracted IDL is validated automatically. Validation warnings (such
-as cross-module references that needed resolution) are printed to
-stderr but do not prevent output.
+The extracted IDL is validated automatically and **extraction fails
+loudly** if the result would not generate — for example a `handle<T>`
+whose target type the source never declares, a duplicate name, or a
+listener pointing at a missing callback. This prevents `extract` from
+emitting a silently-broken IDL. Pass `--warn` to downgrade those errors
+to a `warning:` line on stderr and emit the IDL anyway, which is useful
+when bootstrapping from source that references types you have not
+declared yet:
+
+```sh
+weaveffi extract src/api.rs --warn          # best-effort, errors as warnings
+```
 
 ### 3. Validate and generate
 
@@ -134,7 +143,7 @@ weaveffi generate api.yml -o generated/
 ### CLI command
 
 ```
-weaveffi extract <INPUT> [--output <PATH>] [--format <FORMAT>]
+weaveffi extract <INPUT> [--output <PATH>] [--format <FORMAT>] [--warn]
 ```
 
 | Flag             | Default  | Description                                   |
@@ -142,6 +151,7 @@ weaveffi extract <INPUT> [--output <PATH>] [--format <FORMAT>]
 | `<INPUT>`        | required | Path to a `.rs` source file                   |
 | `-o`, `--output` | stdout   | Write to a file instead of stdout             |
 | `-f`, `--format` | `yaml`   | Output format: `yaml`, `json`, or `toml`      |
+| `--warn`         | off      | Downgrade validation errors to warnings and emit the IDL anyway |
 
 ### Attribute reference
 
@@ -174,9 +184,14 @@ Doc comments (`///`) on items, fields, and enum variants become the
 
 | Rust type            | WeaveFFI TypeRef         | IDL string       |
 |----------------------|--------------------------|------------------|
+| `i8`                 | `I8`                     | `i8`             |
+| `i16`                | `I16`                    | `i16`            |
 | `i32`                | `I32`                    | `i32`            |
-| `u32`                | `U32`                    | `u32`            |
 | `i64`                | `I64`                    | `i64`            |
+| `u8`                 | `U8`                     | `u8`             |
+| `u16`                | `U16`                    | `u16`            |
+| `u32`                | `U32`                    | `u32`            |
+| `f32`                | `F32`                    | `f32`            |
 | `f64`                | `F64`                    | `f64`            |
 | `bool`               | `Bool`                   | `bool`           |
 | `String`             | `StringUtf8`             | `string`         |

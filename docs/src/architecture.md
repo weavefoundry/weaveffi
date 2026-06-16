@@ -344,9 +344,6 @@ Shared rendering infrastructure lives in `weaveffi_core`:
 - `codegen::common` — module-tree traversal (`walk_modules`,
   `walk_modules_with_path`), the `is_c_pointer_type` ABI classifier,
   doc-comment emission (`emit_doc`), and `pascal_case` naming.
-- `codegen::writer::CodeWriter` — an indentation-aware string builder so a
-  generator declares *what* to emit at *what nesting level* instead of
-  threading literal indent strings through every `push_str`.
 
 The signatures above use `Result<T>` from `anyhow` and IR types from
 `weaveffi_ir`; consult those crates for the precise import set.
@@ -449,9 +446,10 @@ non-deterministically on different platforms or insta orderings.
 
 ## Snapshot tests
 
-`crates/weaveffi-cli/tests/snapshots.rs` runs every generator across an
-eight-fixture corpus (the calculator, contacts, inventory, async-demo,
-and events samples plus a kitchen-sink IDL). Output is diffed via
+`crates/weaveffi-cli/tests/snapshots.rs` runs every generator across a
+nine-fixture corpus (`tests/fixtures/01_calculator` … `09_nested_modules`:
+calculator, contacts, inventory, async-demo, events, kitchen-sink,
+docs-everywhere, kvstore, and nested-modules). Output is diffed via
 [`cargo-insta`][insta]. When a snapshot diff is intentional:
 
 ```bash
@@ -485,8 +483,8 @@ A condensed checklist (the long version lives in
    layout directly in `files`. Then add
    `weaveffi_core::impl_generator_via_backend!(<Generator>);` to bridge it
    to `Generator` (this derives `generate` and `output_files`). Reuse
-   `BindingModel`, `weaveffi_core::codegen::common`, and `writer::CodeWriter`
-   instead of re-deriving traversal, ABI classification, or indentation.
+   `BindingModel` and `weaveffi_core::codegen::common` instead of
+   re-deriving traversal or ABI classification.
 3. Wire the generator into the `cli_targets!` registry macro in
    `crates/weaveffi-cli/src/main.rs` — add one line
    (`"<name>" => <field>: <Config> via <Generator>`, plus `strip` if the
