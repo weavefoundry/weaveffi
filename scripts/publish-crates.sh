@@ -23,6 +23,9 @@ CRATES=(
 
 MAX_RETRIES=5
 RETRY_WAIT=180
+# Transient network/CDN errors recover quickly, so back off briefly rather
+# than the multi-minute wait used for rate limits and index propagation.
+NET_RETRY_WAIT=20
 # Sparse-index polling: crates.io can lag minutes behind a successful
 # upload (cargo's own post-publish wait has been observed to time out
 # under backlog), and a dependent crate cannot be published until its
@@ -32,6 +35,14 @@ INDEX_POLL_ATTEMPTS=90 # 90 x 10s = 15 minutes
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
+
+# Harden cargo's network layer against the transient crates.io CDN failures
+# that have aborted releases mid-publish (e.g. "[16] Error in the HTTP2 framing
+# layer" while fetching a dependency during `cargo publish`'s verify step):
+# forcing HTTP/1.1 sidesteps the intermittent HTTP/2 framing bug, and
+# CARGO_NET_RETRY lets cargo retry dropped downloads before this script does.
+export CARGO_NET_RETRY="${CARGO_NET_RETRY:-10}"
+export CARGO_HTTP_MULTIPLEXING="${CARGO_HTTP_MULTIPLEXING:-false}"
 
 # Path of a crate in the sparse index (https://index.crates.io), per
 # https://doc.rust-lang.org/cargo/reference/registry-index.html#index-files
@@ -112,6 +123,21 @@ for crate in "${CRATES[@]}"; do
       fi
       echo "$crate cannot resolve a just-published dependency yet, waiting ${RETRY_WAIT}s (attempt $attempt/$MAX_RETRIES)..."
       sleep "$RETRY_WAIT"
+      continue
+    fi
+
+    # Transient crates.io / CDN / registry errors (HTTP/2 framing glitches,
+    # dropped downloads, registry-update hiccups). These are non-deterministic
+    # and almost always succeed on retry, so back off and retry rather than
+    # aborting a release that has already published earlier crates.
+    if echo "$output" | grep -qiE "error in the http2 framing layer|curl failed|spurious network error|unable to update registry|download of .+ failed|failed to get .+ as a dependency|(operation )?timed out|connection (reset|closed|refused)|\b(502|503|504)\b"; then
+      if [ "$attempt" -ge "$MAX_RETRIES" ]; then
+        echo "ERROR: $crate failed to publish after $MAX_RETRIES retries (transient network/registry error)."
+        echo "$output"
+        exit 1
+      fi
+      echo "$crate hit a transient network/registry error, waiting ${NET_RETRY_WAIT}s (attempt $attempt/$MAX_RETRIES)..."
+      sleep "$NET_RETRY_WAIT"
       continue
     fi
 

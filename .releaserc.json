@@ -39,8 +39,7 @@
     [
       "@semantic-release/exec",
       {
-        "prepareCmd": "bash scripts/update-cargo-versions.sh ${nextRelease.version}",
-        "publishCmd": "bash scripts/publish-crates.sh"
+        "prepareCmd": "bash scripts/update-cargo-versions.sh ${nextRelease.version}"
       }
     ],
     [
@@ -50,6 +49,12 @@
         "message": "chore(release): v${nextRelease.version}"
       }
     ],
-    "@semantic-release/github"
+    "@semantic-release/github",
+    [
+      "@semantic-release/exec",
+      {
+        "publishCmd": "bash scripts/publish-crates.sh"
+      }
+    ]
   ]
 }
