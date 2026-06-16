@@ -92,6 +92,58 @@ impl CType {
         matches!(self, CType::Ptr { .. })
     }
 
+    /// Render this type as the Rust `extern "C"` spelling a producer cdylib
+    /// uses, with `prefix` for every WeaveFFI-owned symbol.
+    ///
+    /// This is the Rust counterpart of [`render_c`](Self::render_c): it is the
+    /// single source of truth for the `weaveffi generate --scaffold` producer
+    /// stubs, so a scaffolded signature matches the generated C header by
+    /// construction. Notable lowerings:
+    ///
+    /// * [`Char`](Self::Char) renders bare as `c_char` (the scaffold imports
+    ///   `std::os::raw::c_char`), and [`Void`](Self::Void) as
+    ///   `std::ffi::c_void` (only meaningful as a pointee; a bare `void`
+    ///   *return* is the absence of a `-> T`, handled by the caller).
+    /// * A C-style [`Enum`](Self::Enum) crosses the ABI as its `int`-sized
+    ///   discriminant, so it lowers to `i32` (matching the header's
+    ///   `int`-backed `typedef enum`).
+    /// * Both `const` placements collapse to `*const` (Rust draws no
+    ///   east/west distinction); a non-`const` pointer is `*mut`.
+    pub fn render_rust(&self, prefix: &str) -> String {
+        match self {
+            CType::Int8 => "i8".to_string(),
+            CType::Int16 => "i16".to_string(),
+            CType::Int32 => "i32".to_string(),
+            CType::Int64 => "i64".to_string(),
+            CType::Uint8 => "u8".to_string(),
+            CType::Uint16 => "u16".to_string(),
+            CType::Uint32 => "u32".to_string(),
+            CType::Uint64 => "u64".to_string(),
+            CType::Float => "f32".to_string(),
+            CType::Double => "f64".to_string(),
+            CType::Bool => "bool".to_string(),
+            CType::Size => "usize".to_string(),
+            CType::Char => "c_char".to_string(),
+            CType::Void => "std::ffi::c_void".to_string(),
+            CType::Handle => "u64".to_string(),
+            // The runtime types come from `weaveffi-abi` and keep their fixed
+            // names regardless of the configured business-symbol prefix.
+            CType::CancelToken => "weaveffi_cancel_token".to_string(),
+            CType::Error => "weaveffi_error".to_string(),
+            // A C-style enum is passed/returned as its int discriminant.
+            CType::Enum { .. } => "i32".to_string(),
+            CType::StructTag { module, name } => format!("{prefix}_{module}_{name}"),
+            CType::Named(core) => format!("{prefix}_{core}"),
+            CType::Ptr { konst, pointee } => {
+                let inner = pointee.render_rust(prefix);
+                match konst {
+                    ConstPos::None => format!("*mut {inner}"),
+                    ConstPos::West | ConstPos::East => format!("*const {inner}"),
+                }
+            }
+        }
+    }
+
     /// Render this type as canonical C source using `prefix` for every
     /// WeaveFFI-owned symbol.
     pub fn render_c(&self, prefix: &str) -> String {
@@ -176,6 +228,89 @@ mod tests {
         assert_eq!(
             CType::Named("events_on_data_fn".into()).render_c("weaveffi"),
             "weaveffi_events_on_data_fn"
+        );
+    }
+
+    #[test]
+    fn rust_scalars_render() {
+        assert_eq!(CType::Int32.render_rust("weaveffi"), "i32");
+        assert_eq!(CType::Uint8.render_rust("weaveffi"), "u8");
+        assert_eq!(CType::Float.render_rust("weaveffi"), "f32");
+        assert_eq!(CType::Double.render_rust("weaveffi"), "f64");
+        assert_eq!(CType::Bool.render_rust("weaveffi"), "bool");
+        assert_eq!(CType::Size.render_rust("weaveffi"), "usize");
+        assert_eq!(CType::Handle.render_rust("weaveffi"), "u64");
+    }
+
+    #[test]
+    fn rust_runtime_types_keep_canonical_names_under_custom_prefix() {
+        // `weaveffi-abi` exports these Rust types under fixed names regardless
+        // of the configured business-symbol prefix.
+        assert_eq!(CType::Error.render_rust("acme"), "weaveffi_error");
+        assert_eq!(
+            CType::CancelToken.render_rust("acme"),
+            "weaveffi_cancel_token"
+        );
+    }
+
+    #[test]
+    fn rust_string_param_is_const_char_pointer() {
+        assert_eq!(
+            CType::const_ptr(CType::Char).render_rust("weaveffi"),
+            "*const c_char"
+        );
+        assert_eq!(
+            CType::ptr(CType::Char).render_rust("weaveffi"),
+            "*mut c_char"
+        );
+    }
+
+    #[test]
+    fn rust_c_style_enum_lowers_to_i32() {
+        let e = CType::Enum {
+            module: "gfx".into(),
+            name: "Color".into(),
+        };
+        assert_eq!(e.render_rust("weaveffi"), "i32");
+    }
+
+    #[test]
+    fn rust_struct_tag_uses_prefix_and_module() {
+        let t = CType::StructTag {
+            module: "contacts".into(),
+            name: "Contact".into(),
+        };
+        assert_eq!(t.render_rust("weaveffi"), "weaveffi_contacts_Contact");
+        assert_eq!(
+            CType::ptr(t).render_rust("weaveffi"),
+            "*mut weaveffi_contacts_Contact"
+        );
+    }
+
+    #[test]
+    fn rust_east_const_collapses_to_const() {
+        // `[string]` lowers to an east-const array of string pointers; Rust has
+        // no east/west distinction so both render `*const`.
+        let arr = CType::Ptr {
+            konst: ConstPos::East,
+            pointee: Box::new(CType::const_ptr(CType::Char)),
+        };
+        assert_eq!(arr.render_rust("weaveffi"), "*const *const c_char");
+    }
+
+    #[test]
+    fn rust_map_return_keys_match_header_arity() {
+        // The header types a returned map's keys as `const char*** out_keys`;
+        // the Rust producer must declare the matching `*mut *mut *const c_char`.
+        let out_keys = CType::ptr(CType::ptr(CType::const_ptr(CType::Char)));
+        assert_eq!(out_keys.render_rust("weaveffi"), "*mut *mut *const c_char");
+    }
+
+    #[test]
+    fn rust_void_is_only_a_pointee() {
+        assert_eq!(
+            CType::ptr(CType::Void).render_rust("weaveffi"),
+            "*mut std::ffi::c_void"
         );
     }
 }

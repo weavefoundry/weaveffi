@@ -26,6 +26,9 @@
 /// - `weaveffi_cancel_token_cancel`
 /// - `weaveffi_cancel_token_is_cancelled`
 /// - `weaveffi_cancel_token_destroy`
+/// - `weaveffi_arena_create`
+/// - `weaveffi_arena_register`
+/// - `weaveffi_arena_destroy`
 ///
 /// On `wasm32` targets it additionally emits a linear-memory allocator that the
 /// generated JS bindings call to stage inputs and return slots:
@@ -100,6 +103,28 @@ macro_rules! export_runtime {
         #[no_mangle]
         pub extern "C" fn weaveffi_cancel_token_destroy(token: *mut $crate::weaveffi_cancel_token) {
             $crate::cancel_token_destroy(token)
+        }
+
+        // The batch-free arena is part of the documented stable runtime ABI, so
+        // its thunks are re-exported here for the same reason as the rest: an
+        // rlib-local `#[no_mangle]` is not guaranteed to survive into the cdylib.
+        #[no_mangle]
+        pub extern "C" fn weaveffi_arena_create() -> *mut $crate::arena::HandleArena {
+            $crate::arena::arena_create()
+        }
+
+        #[no_mangle]
+        pub extern "C" fn weaveffi_arena_register(
+            arena: *mut $crate::arena::HandleArena,
+            ptr: *mut ::std::ffi::c_void,
+            dtor: unsafe extern "C" fn(*mut ::std::ffi::c_void),
+        ) {
+            $crate::arena::arena_register(arena, ptr, dtor)
+        }
+
+        #[no_mangle]
+        pub extern "C" fn weaveffi_arena_destroy(arena: *mut $crate::arena::HandleArena) {
+            $crate::arena::arena_destroy(arena)
         }
     };
 }

@@ -17,7 +17,6 @@ use crate::cache;
 use crate::capabilities::{self, TargetCapabilities};
 
 pub mod common;
-pub mod writer;
 
 fn run_hook(label: &str, cmd: &str) -> Result<()> {
     let status = if cfg!(target_os = "windows") {

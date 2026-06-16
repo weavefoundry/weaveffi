@@ -77,6 +77,11 @@ enum Commands {
         /// Output format: yaml (default), json, or toml
         #[arg(short, long, default_value = "yaml")]
         format: Option<String>,
+        /// Downgrade validation errors to warnings and emit the IDL anyway.
+        /// Useful for bootstrapping from source that references types it does
+        /// not yet declare (e.g. opaque handle targets you will define later).
+        #[arg(long)]
+        warn: bool,
     },
     Lint {
         /// Input IDL/IR file (yaml|yml|json|toml)
@@ -193,10 +198,12 @@ fn main() -> Result<()> {
             input,
             output,
             format,
+            warn,
         } => extract::cmd_extract(
             &input,
             output.as_deref(),
             format.as_deref().unwrap_or("yaml"),
+            warn,
             quiet,
         )?,
         Commands::Lint { input, format } => {

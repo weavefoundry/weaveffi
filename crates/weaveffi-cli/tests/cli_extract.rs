@@ -305,9 +305,11 @@ mod sessions {{
         .unwrap();
     }
 
+    // `Session` is an opaque handle target the source never declares, so the
+    // extracted IDL does not validate; `--warn` emits it anyway for bootstrapping.
     let output = assert_cmd::Command::cargo_bin("weaveffi")
         .expect("binary not found")
-        .args(["extract", src_path.to_str().unwrap()])
+        .args(["extract", src_path.to_str().unwrap(), "--warn"])
         .output()
         .expect("failed to run extract");
 
@@ -322,6 +324,45 @@ mod sessions {{
         .unwrap()[0];
     assert_eq!(param["name"].as_str().unwrap(), "session");
     assert_eq!(param["type"].as_str().unwrap(), "handle<Session>");
+}
+
+#[test]
+fn extract_fails_loud_on_invalid_api_without_warn() {
+    // An undeclared handle target makes the extracted API fail validation.
+    // Without `--warn`, `extract` must abort instead of emitting broken IDL.
+    let dir = tempfile::tempdir().expect("failed to create temp dir");
+    let src_path = dir.path().join("lib.rs");
+    {
+        let mut f = std::fs::File::create(&src_path).unwrap();
+        write!(
+            f,
+            r#"
+mod sessions {{
+    #[weaveffi_export]
+    fn close(session: *mut Session) {{
+        todo!()
+    }}
+}}
+"#
+        )
+        .unwrap();
+    }
+
+    let output = assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args(["extract", src_path.to_str().unwrap()])
+        .output()
+        .expect("failed to run extract");
+
+    assert!(
+        !output.status.success(),
+        "extract should fail loudly on an API that does not validate"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--warn"),
+        "the error should point users at --warn: {stderr}"
+    );
 }
 
 #[test]

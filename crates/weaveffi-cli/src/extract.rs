@@ -5,12 +5,20 @@ use weaveffi_ir::ir::{
 };
 
 /// `weaveffi extract` — CLI glue around [`extract_api_from_rust`]: read the
-/// annotated Rust source, extract the [`Api`], validate (warnings only), and
-/// serialize to the requested format.
+/// annotated Rust source, extract the [`Api`], validate, and serialize to the
+/// requested format.
+///
+/// Validation is **fail-loud by default**: an extracted API that would not
+/// generate (an undeclared type reference, a duplicate name, a listener
+/// pointing at a missing callback, …) aborts with the diagnostic rather than
+/// emitting a silently-broken IDL. Passing `warn` downgrades those errors to a
+/// `warning:` line and emits the IDL anyway, which is useful when bootstrapping
+/// from source that references types it does not yet declare.
 pub(crate) fn cmd_extract(
     input: &str,
     output: Option<&str>,
     format: &str,
+    warn: bool,
     quiet: bool,
 ) -> miette::Result<()> {
     use miette::{miette, IntoDiagnostic, WrapErr};
@@ -23,7 +31,15 @@ pub(crate) fn cmd_extract(
         .map_err(|e| miette!("failed to extract API from Rust source: {:#}", e))?;
 
     if let Err(e) = weaveffi_core::validate::validate_api(&mut api, None) {
-        eprintln!("warning: {}", e);
+        if warn {
+            eprintln!("warning: {}", e);
+        } else {
+            return Err(miette!(
+                "{e:?}\n\nThe extracted API does not validate, so it would not \
+                 generate. Fix the source (e.g. declare the referenced types), \
+                 or pass `--warn` to emit the IDL anyway."
+            ));
+        }
     }
 
     let serialized = match format {
@@ -230,12 +246,19 @@ fn map_type(ty: &syn::Type) -> Result<TypeRef> {
                 .ok_or_else(|| eyre!("empty type path"))?;
             let ident = seg.ident.to_string();
             match ident.as_str() {
+                "i8" => Ok(TypeRef::I8),
+                "i16" => Ok(TypeRef::I16),
                 "i32" => Ok(TypeRef::I32),
-                "u32" => Ok(TypeRef::U32),
                 "i64" => Ok(TypeRef::I64),
+                "u8" => Ok(TypeRef::U8),
+                "u16" => Ok(TypeRef::U16),
+                "u32" => Ok(TypeRef::U32),
+                "f32" => Ok(TypeRef::F32),
                 "f64" => Ok(TypeRef::F64),
                 "bool" => Ok(TypeRef::Bool),
                 "String" => Ok(TypeRef::StringUtf8),
+                // By convention a bare `u64` is a WeaveFFI opaque handle; reach
+                // for a real `u64` scalar via the IR directly if you need one.
                 "u64" => Ok(TypeRef::Handle),
                 "Vec" => {
                     let inner = single_generic_arg(seg)?;
@@ -544,6 +567,42 @@ mod tests {
         assert_eq!(params[5].ty, TypeRef::StringUtf8);
         assert_eq!(params[6].ty, TypeRef::Bytes);
         assert_eq!(params[7].ty, TypeRef::Handle);
+    }
+
+    #[test]
+    fn maps_extended_numeric_types() {
+        // Regression: `i8`/`i16`/`u8`/`u16`/`f32` used to fall through the
+        // scalar match and become bogus `Struct("i8")` references that failed
+        // validation. They now map to their IR scalars.
+        let src = r#"
+            mod types {
+                #[weaveffi_export]
+                fn nums(a: i8, b: i16, c: u8, d: u16, e: f32) {}
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        let params = &api.modules[0].functions[0].params;
+        assert_eq!(params[0].ty, TypeRef::I8);
+        assert_eq!(params[1].ty, TypeRef::I16);
+        assert_eq!(params[2].ty, TypeRef::U8);
+        assert_eq!(params[3].ty, TypeRef::U16);
+        assert_eq!(params[4].ty, TypeRef::F32);
+    }
+
+    #[test]
+    fn list_of_extended_numeric_is_not_a_struct() {
+        // `Vec<u16>` previously produced `List(Struct("u16"))`.
+        let src = r#"
+            mod m {
+                #[weaveffi_export]
+                fn xs(v: Vec<u16>) {}
+            }
+        "#;
+        let api = extract_api_from_rust(src).unwrap();
+        assert_eq!(
+            api.modules[0].functions[0].params[0].ty,
+            TypeRef::List(Box::new(TypeRef::U16))
+        );
     }
 
     #[test]
