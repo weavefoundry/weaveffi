@@ -5,8 +5,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 use weaveffi_ir::ir::{Api, Module, TypeRef};
 
+/// How a bare type name resolves: a struct, a C-style enum, or an algebraic
+/// (rich) enum. The two enum kinds differ in their C ABI lowering — a C-style
+/// enum is a by-value integer ([`TypeRef::Enum`]) while a rich enum is an
+/// opaque object pointer ([`TypeRef::RichEnum`]) — so the resolver must know
+/// which to emit for every reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypeKind {
+    Struct,
+    Enum,
+    RichEnum,
+}
+
 pub fn resolve_type_refs(api: &mut Api) {
-    let mut global_types: BTreeMap<String, (String, bool)> = BTreeMap::new();
+    let mut global_types: BTreeMap<String, (String, TypeKind)> = BTreeMap::new();
     for module in &api.modules {
         index_module_types(module, "", &mut global_types);
     }
@@ -23,14 +35,20 @@ pub fn resolve_type_refs(api: &mut Api) {
 fn index_module_types(
     module: &Module,
     parent_path: &str,
-    out: &mut BTreeMap<String, (String, bool)>,
+    out: &mut BTreeMap<String, (String, TypeKind)>,
 ) {
     let path = join_module_path(parent_path, &module.name);
     for s in &module.structs {
-        out.entry(s.name.clone()).or_insert((path.clone(), false));
+        out.entry(s.name.clone())
+            .or_insert((path.clone(), TypeKind::Struct));
     }
     for e in &module.enums {
-        out.entry(e.name.clone()).or_insert((path.clone(), true));
+        let kind = if e.is_rich() {
+            TypeKind::RichEnum
+        } else {
+            TypeKind::Enum
+        };
+        out.entry(e.name.clone()).or_insert((path.clone(), kind));
     }
     for child in &module.modules {
         index_module_types(child, &path, out);
@@ -44,46 +62,61 @@ fn index_module_types(
 fn resolve_module_type_refs(
     module: &mut Module,
     parent_path: &str,
-    global_types: &BTreeMap<String, (String, bool)>,
+    global_types: &BTreeMap<String, (String, TypeKind)>,
 ) {
     let module_path = join_module_path(parent_path, &module.name);
-    let local_enum_names: BTreeSet<String> = module.enums.iter().map(|e| e.name.clone()).collect();
+    // Only *C-style* enums are rewritten to `TypeRef::Enum` (by-value lowering).
+    // A rich (algebraic) enum is left as `TypeRef::Struct` because it crosses
+    // the ABI as an opaque object pointer, exactly like a struct — so it does
+    // not belong in `local_enum_names`.
+    let local_enum_names: BTreeSet<String> = module
+        .enums
+        .iter()
+        .filter(|e| !e.is_rich())
+        .map(|e| e.name.clone())
+        .collect();
     let local_struct_names: BTreeSet<String> =
         module.structs.iter().map(|s| s.name.clone()).collect();
+    let ctx = ResolveCtx {
+        local_enum_names: &local_enum_names,
+        local_struct_names: &local_struct_names,
+        current_module: &module_path,
+        global_types,
+    };
     for f in &mut module.functions {
         for p in &mut f.params {
-            resolve_single_type_ref(
-                &mut p.ty,
-                &local_enum_names,
-                &local_struct_names,
-                &module_path,
-                global_types,
-            );
+            resolve_single_type_ref(&mut p.ty, &ctx);
         }
         if let Some(ret) = &mut f.returns {
-            resolve_single_type_ref(
-                ret,
-                &local_enum_names,
-                &local_struct_names,
-                &module_path,
-                global_types,
-            );
+            resolve_single_type_ref(ret, &ctx);
         }
     }
     for s in &mut module.structs {
         for field in &mut s.fields {
-            resolve_single_type_ref(
-                &mut field.ty,
-                &local_enum_names,
-                &local_struct_names,
-                &module_path,
-                global_types,
-            );
+            resolve_single_type_ref(&mut field.ty, &ctx);
+        }
+    }
+    // A rich enum's variant fields are themselves type references that must be
+    // resolved (e.g. a variant field of struct or sibling-enum type).
+    for e in &mut module.enums {
+        for v in &mut e.variants {
+            for field in &mut v.fields {
+                resolve_single_type_ref(&mut field.ty, &ctx);
+            }
         }
     }
     for child in &mut module.modules {
         resolve_module_type_refs(child, &module_path, global_types);
     }
+}
+
+/// Bundled lookup tables for resolving a single type reference within one
+/// module, so the recursive resolver does not thread several parameters.
+struct ResolveCtx<'a> {
+    local_enum_names: &'a BTreeSet<String>,
+    local_struct_names: &'a BTreeSet<String>,
+    current_module: &'a str,
+    global_types: &'a BTreeMap<String, (String, TypeKind)>,
 }
 
 /// Join a parent module path with a child segment using `.`. A top-level
@@ -97,26 +130,24 @@ fn join_module_path(parent_path: &str, name: &str) -> String {
     }
 }
 
-fn resolve_single_type_ref(
-    ty: &mut TypeRef,
-    local_enum_names: &BTreeSet<String>,
-    local_struct_names: &BTreeSet<String>,
-    current_module: &str,
-    global_types: &BTreeMap<String, (String, bool)>,
-) {
+fn resolve_single_type_ref(ty: &mut TypeRef, ctx: &ResolveCtx<'_>) {
     match ty {
-        TypeRef::Struct(name) if local_enum_names.contains(name.as_str()) => {
+        // A bare reference to a local C-style enum becomes a by-value `Enum`.
+        // A local rich enum or struct is left as `Struct` (opaque pointer).
+        TypeRef::Struct(name) if ctx.local_enum_names.contains(name.as_str()) => {
             let name = std::mem::take(name);
             *ty = TypeRef::Enum(name);
         }
-        TypeRef::Struct(name) if !local_struct_names.contains(name.as_str()) => {
-            if let Some((mod_name, is_enum)) = global_types.get(name.as_str()) {
-                if mod_name != current_module {
+        TypeRef::Struct(name) if !ctx.local_struct_names.contains(name.as_str()) => {
+            if let Some((mod_name, kind)) = ctx.global_types.get(name.as_str()) {
+                if mod_name != ctx.current_module {
                     let qualified = format!("{mod_name}.{name}");
-                    if *is_enum {
-                        *ty = TypeRef::Enum(qualified);
-                    } else {
-                        *name = qualified;
+                    match kind {
+                        // C-style enum: by-value reference.
+                        TypeKind::Enum => *ty = TypeRef::Enum(qualified),
+                        // Struct or rich enum: opaque-pointer reference, kept
+                        // as `Struct` with the owner's qualified path.
+                        TypeKind::Struct | TypeKind::RichEnum => *name = qualified,
                     }
                 }
             }
@@ -126,37 +157,19 @@ fn resolve_single_type_ref(
         // referring to `kv.Store`), qualify it to the owner's path so the C ABI
         // lowering and every generator emit the owner's symbol prefix rather
         // than the referrer's. Mirrors the `Struct` arm above.
-        TypeRef::TypedHandle(name) if !local_struct_names.contains(name.as_str()) => {
-            if let Some((mod_name, _is_enum)) = global_types.get(name.as_str()) {
-                if mod_name != current_module {
+        TypeRef::TypedHandle(name) if !ctx.local_struct_names.contains(name.as_str()) => {
+            if let Some((mod_name, _kind)) = ctx.global_types.get(name.as_str()) {
+                if mod_name != ctx.current_module {
                     *name = format!("{mod_name}.{name}");
                 }
             }
         }
         TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
-            resolve_single_type_ref(
-                inner,
-                local_enum_names,
-                local_struct_names,
-                current_module,
-                global_types,
-            );
+            resolve_single_type_ref(inner, ctx);
         }
         TypeRef::Map(k, v) => {
-            resolve_single_type_ref(
-                k,
-                local_enum_names,
-                local_struct_names,
-                current_module,
-                global_types,
-            );
-            resolve_single_type_ref(
-                v,
-                local_enum_names,
-                local_struct_names,
-                current_module,
-                global_types,
-            );
+            resolve_single_type_ref(k, ctx);
+            resolve_single_type_ref(v, ctx);
         }
         _ => {}
     }

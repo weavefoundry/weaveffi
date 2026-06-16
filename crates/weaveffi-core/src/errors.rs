@@ -157,7 +157,7 @@ mod tests {
 
     fn api_with(mods: Vec<Module>) -> Api {
         Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             package: None,
             modules: mods,
             generators: None,

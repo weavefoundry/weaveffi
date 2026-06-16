@@ -15,9 +15,15 @@ fn callback_param_type_supported(ty: &TypeRef) -> bool {
     fn leaf(ty: &TypeRef) -> bool {
         matches!(
             ty,
-            TypeRef::I32
+            TypeRef::I8
+                | TypeRef::I16
+                | TypeRef::I32
+                | TypeRef::U8
+                | TypeRef::U16
                 | TypeRef::U32
                 | TypeRef::I64
+                | TypeRef::U64
+                | TypeRef::F32
                 | TypeRef::F64
                 | TypeRef::Bool
                 | TypeRef::Enum(_)
@@ -33,9 +39,15 @@ fn callback_param_type_supported(ty: &TypeRef) -> bool {
     fn elem(ty: &TypeRef) -> bool {
         matches!(
             ty,
-            TypeRef::I32
+            TypeRef::I8
+                | TypeRef::I16
+                | TypeRef::I32
+                | TypeRef::U8
+                | TypeRef::U16
                 | TypeRef::U32
                 | TypeRef::I64
+                | TypeRef::U64
+                | TypeRef::F32
                 | TypeRef::F64
                 | TypeRef::Bool
                 | TypeRef::Enum(_)
@@ -171,6 +183,17 @@ pub(super) fn validate_module(
                     value: v.value,
                 });
             }
+            let mut variant_field_names = BTreeSet::new();
+            for f in &v.fields {
+                check_identifier(&f.name)?;
+                if !variant_field_names.insert(f.name.clone()) {
+                    return Err(ValidationError::DuplicateEnumVariantField {
+                        enum_name: e.name.clone(),
+                        variant: v.name.clone(),
+                        field: f.name.clone(),
+                    });
+                }
+            }
         }
     }
 
@@ -196,6 +219,31 @@ pub(super) fn validate_module(
             check_element_shapes(&f.ty, || {
                 format!("field '{}' of struct '{}'", f.name, s.name)
             })?;
+        }
+    }
+    // Rich-enum variant fields carry associated data and lower exactly like
+    // struct fields (by value across the C ABI), so they obey the same
+    // positional rules: no borrowed views, no iterators, and only
+    // ABI-representable element shapes.
+    for e in &module.enums {
+        for v in &e.variants {
+            for f in &v.fields {
+                if let Some(ty) = contains_borrowed(&f.ty) {
+                    return Err(ValidationError::BorrowedTypeInInvalidPosition {
+                        ty: ty.to_string(),
+                        location: format!("field '{}' of variant '{}::{}'", f.name, e.name, v.name),
+                    });
+                }
+                if contains_iterator(&f.ty) {
+                    return Err(ValidationError::IteratorInInvalidPosition {
+                        location: format!("field '{}' of variant '{}::{}'", f.name, e.name, v.name),
+                    });
+                }
+                validate_type_ref(&f.ty, &known_types, all_modules)?;
+                check_element_shapes(&f.ty, || {
+                    format!("field '{}' of variant '{}::{}'", f.name, e.name, v.name)
+                })?;
+            }
         }
     }
     for f in &module.functions {
@@ -329,9 +377,15 @@ fn unsupported_element_shape(ty: &TypeRef) -> Option<&TypeRef> {
     fn slot_leaf(ty: &TypeRef) -> bool {
         matches!(
             ty,
-            TypeRef::I32
+            TypeRef::I8
+                | TypeRef::I16
+                | TypeRef::I32
+                | TypeRef::U8
+                | TypeRef::U16
                 | TypeRef::U32
                 | TypeRef::I64
+                | TypeRef::U64
+                | TypeRef::F32
                 | TypeRef::F64
                 | TypeRef::Bool
                 | TypeRef::Enum(_)
@@ -345,9 +399,15 @@ fn unsupported_element_shape(ty: &TypeRef) -> Option<&TypeRef> {
     fn scalar_elem(ty: &TypeRef) -> bool {
         matches!(
             ty,
-            TypeRef::I32
+            TypeRef::I8
+                | TypeRef::I16
+                | TypeRef::I32
+                | TypeRef::U8
+                | TypeRef::U16
                 | TypeRef::U32
                 | TypeRef::I64
+                | TypeRef::U64
+                | TypeRef::F32
                 | TypeRef::F64
                 | TypeRef::Bool
                 | TypeRef::Enum(_)

@@ -6,14 +6,15 @@
 //! generator pipeline.
 
 use camino::Utf8Path;
-use heck::{ToLowerCamelCase, ToUpperCamelCase};
+use heck::{ToLowerCamelCase, ToSnakeCase, ToUpperCamelCase};
 use serde::{Deserialize, Serialize};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
 use weaveffi_core::model::{
-    BindingModel, CallShape, CallbackBinding, EnumBinding, FnBinding, IteratorBinding,
-    ListenerBinding, ModuleBinding, ParamBinding, StructBinding,
+    BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
+    IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding, RichVariantBinding,
+    StructBinding,
 };
 use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::utils::{local_type_name, render_prelude, render_trailer, CommentStyle};
@@ -111,8 +112,16 @@ weaveffi_core::impl_generator_via_backend!(DartGenerator);
 
 fn dart_type(ty: &TypeRef) -> String {
     match ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle => "int".into(),
-        TypeRef::F64 => "double".into(),
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::I64
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::U64
+        | TypeRef::Handle => "int".into(),
+        TypeRef::F32 | TypeRef::F64 => "double".into(),
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "String".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "List<int>".into(),
@@ -140,9 +149,15 @@ fn dart_nullable_type_for_builder_field(ty: &TypeRef) -> String {
 
 fn native_ffi_type(ty: &TypeRef) -> String {
     match ty {
+        TypeRef::I8 => "Int8".into(),
+        TypeRef::I16 => "Int16".into(),
         TypeRef::I32 => "Int32".into(),
+        TypeRef::U8 => "Uint8".into(),
+        TypeRef::U16 => "Uint16".into(),
         TypeRef::U32 => "Uint32".into(),
+        TypeRef::U64 => "Uint64".into(),
         TypeRef::I64 | TypeRef::Handle => "Int64".into(),
+        TypeRef::F32 => "Float".into(),
         TypeRef::F64 => "Double".into(),
         TypeRef::Bool | TypeRef::Enum(_) => "Int32".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Utf8>".into(),
@@ -155,13 +170,18 @@ fn native_ffi_type(ty: &TypeRef) -> String {
 
 fn dart_ffi_type(ty: &TypeRef) -> String {
     match ty {
-        TypeRef::I32
-        | TypeRef::U32
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
         | TypeRef::I64
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::U64
         | TypeRef::Handle
         | TypeRef::Bool
         | TypeRef::Enum(_) => "int".into(),
-        TypeRef::F64 => "double".into(),
+        TypeRef::F32 | TypeRef::F64 => "double".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Utf8>".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "Pointer<Uint8>".into(),
         TypeRef::TypedHandle(_) | TypeRef::Struct(_) => "Pointer<Void>".into(),
@@ -175,9 +195,15 @@ fn dart_ffi_type(ty: &TypeRef) -> String {
 /// dart:ffi (native, dart) types of a leaf scalar passed by value.
 fn scalar_ffi(ty: &TypeRef) -> (&'static str, &'static str) {
     match ty {
+        TypeRef::I8 => ("Int8", "int"),
+        TypeRef::I16 => ("Int16", "int"),
+        TypeRef::U8 => ("Uint8", "int"),
+        TypeRef::U16 => ("Uint16", "int"),
         TypeRef::U32 => ("Uint32", "int"),
+        TypeRef::U64 => ("Uint64", "int"),
         TypeRef::I32 | TypeRef::Bool | TypeRef::Enum(_) => ("Int32", "int"),
         TypeRef::I64 | TypeRef::Handle => ("Int64", "int"),
+        TypeRef::F32 => ("Float", "double"),
         TypeRef::F64 => ("Double", "double"),
         _ => ("Int64", "int"),
     }
@@ -233,7 +259,17 @@ fn emit_input(out: &mut String, name: &str, ty: &TypeRef, frees: &mut Vec<String
         TypeRef::Bool => vec![format!("{name} ? 1 : 0")],
         TypeRef::Enum(_) => vec![format!("{name}.value")],
         TypeRef::TypedHandle(_) | TypeRef::Struct(_) => vec![format!("{name}._handle")],
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => {
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::I64
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::U64
+        | TypeRef::F32
+        | TypeRef::F64
+        | TypeRef::Handle => {
             vec![name.to_string()]
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
@@ -756,6 +792,12 @@ fn render_dart_module(api: &Api, prefix: &str, input_basename: &str) -> String {
 }
 
 fn render_enum(out: &mut String, e: &EnumBinding) {
+    // A rich (algebraic) enum crosses the ABI as an opaque object, so it is
+    // emitted as a wrapper class (like a struct), not a plain Dart `enum`.
+    if e.is_rich() {
+        render_rich_enum(out, e);
+        return;
+    }
     let name = e.name.to_upper_camel_case();
     out.push('\n');
     emit_doc(out, &e.doc, "");
@@ -789,25 +831,7 @@ fn render_struct(out: &mut String, s: &StructBinding) {
     );
 
     for field in &s.fields {
-        let getter_sym = &field.getter_symbol;
-        // Struct getters take only the opaque handle; they report no error. A
-        // bytes/list/map field adds its callee-allocated out-params and (for
-        // maps) lowers to a `void` symbol.
-        let mut nparams = vec!["Pointer<Void>".to_string()];
-        let mut dparams = vec!["Pointer<Void>".to_string()];
-        for (n, d) in return_out_slots(&field.ty) {
-            nparams.push(n);
-            dparams.push(d);
-        }
-        let (nr, dr) = return_ffi(&field.ty);
-        emit_typedef_and_lookup(
-            out,
-            getter_sym,
-            &nparams.join(", "),
-            &dparams.join(", "),
-            &nr,
-            &dr,
-        );
+        emit_field_getter_typedef(out, field);
     }
 
     out.push('\n');
@@ -824,48 +848,82 @@ fn render_struct(out: &mut String, s: &StructBinding) {
     out.push_str("  }\n");
 
     for field in &s.fields {
-        let getter_sym = &field.getter_symbol;
-        let dart_ret = dart_type(&field.ty);
-        let fname = field.name.to_lower_camel_case();
-
-        out.push('\n');
-        emit_doc(out, &field.doc, "  ");
-        out.push_str(&format!("  {dart_ret} get {fname} {{\n"));
-        if return_has_out_params(&field.ty) {
-            let mut frees: Vec<String> = Vec::new();
-            let mut args = vec!["_handle".to_string()];
-            args.extend(emit_return_alloc(out, &field.ty, &mut frees, "    "));
-            out.push_str("    try {\n");
-            if matches!(&field.ty, TypeRef::Map(_, _)) {
-                out.push_str(&format!(
-                    "      _{}({});\n",
-                    getter_sym.to_lower_camel_case(),
-                    args.join(", ")
-                ));
-            } else {
-                out.push_str(&format!(
-                    "      final result = _{}({});\n",
-                    getter_sym.to_lower_camel_case(),
-                    args.join(", ")
-                ));
-            }
-            emit_return_decode(out, &field.ty, "      ");
-            out.push_str("    } finally {\n");
-            for fr in &frees {
-                out.push_str(&format!("      {fr}\n"));
-            }
-            out.push_str("    }\n");
-        } else {
-            out.push_str(&format!(
-                "    final result = _{}(_handle);\n",
-                getter_sym.to_lower_camel_case()
-            ));
-            emit_result_conversion(out, &field.ty, "    ");
-        }
-        out.push_str("  }\n");
+        emit_field_getter_method(out, field);
     }
 
     out.push_str("}\n");
+}
+
+/// Emit the dart:ffi typedef + `lookupFunction` for one opaque-object field
+/// getter (a struct field or a rich-enum variant field). The getter takes only
+/// the opaque handle and reports no error; a bytes/list field adds its
+/// callee-allocated out-param and a map field adds its triple and lowers to a
+/// `void` symbol. The lookup is keyed on the field's precomputed
+/// `getter_symbol`, so a rich enum may rename the Dart member freely.
+fn emit_field_getter_typedef(out: &mut String, field: &FieldBinding) {
+    let getter_sym = &field.getter_symbol;
+    let mut nparams = vec!["Pointer<Void>".to_string()];
+    let mut dparams = vec!["Pointer<Void>".to_string()];
+    for (n, d) in return_out_slots(&field.ty) {
+        nparams.push(n);
+        dparams.push(d);
+    }
+    let (nr, dr) = return_ffi(&field.ty);
+    emit_typedef_and_lookup(
+        out,
+        getter_sym,
+        &nparams.join(", "),
+        &dparams.join(", "),
+        &nr,
+        &dr,
+    );
+}
+
+/// Emit the idiomatic Dart getter for one opaque-object field. The member name
+/// comes from `field.name` — so a rich enum can namespace it per variant (e.g.
+/// `circleRadius`) by passing a renamed [`FieldBinding`] — while the FFI lookup
+/// stays keyed on the precomputed `getter_symbol`. Receiver is the wrapper's
+/// `_handle`, common to both the struct and rich-enum classes.
+fn emit_field_getter_method(out: &mut String, field: &FieldBinding) {
+    let getter_sym = &field.getter_symbol;
+    let dart_ret = dart_type(&field.ty);
+    let fname = field.name.to_lower_camel_case();
+
+    out.push('\n');
+    emit_doc(out, &field.doc, "  ");
+    out.push_str(&format!("  {dart_ret} get {fname} {{\n"));
+    if return_has_out_params(&field.ty) {
+        let mut frees: Vec<String> = Vec::new();
+        let mut args = vec!["_handle".to_string()];
+        args.extend(emit_return_alloc(out, &field.ty, &mut frees, "    "));
+        out.push_str("    try {\n");
+        if matches!(&field.ty, TypeRef::Map(_, _)) {
+            out.push_str(&format!(
+                "      _{}({});\n",
+                getter_sym.to_lower_camel_case(),
+                args.join(", ")
+            ));
+        } else {
+            out.push_str(&format!(
+                "      final result = _{}({});\n",
+                getter_sym.to_lower_camel_case(),
+                args.join(", ")
+            ));
+        }
+        emit_return_decode(out, &field.ty, "      ");
+        out.push_str("    } finally {\n");
+        for fr in &frees {
+            out.push_str(&format!("      {fr}\n"));
+        }
+        out.push_str("    }\n");
+    } else {
+        out.push_str(&format!(
+            "    final result = _{}(_handle);\n",
+            getter_sym.to_lower_camel_case()
+        ));
+        emit_result_conversion(out, &field.ty, "    ");
+    }
+    out.push_str("  }\n");
 }
 
 fn render_dart_builder(out: &mut String, s: &StructBinding) {
@@ -964,6 +1022,200 @@ fn render_dart_builder(out: &mut String, s: &StructBinding) {
     out.push_str("}\n");
 }
 
+/// Render a rich (algebraic) enum as an opaque-object wrapper, mirroring the
+/// Dart struct wrapper: it owns the C handle behind a private `_handle` (so the
+/// existing function marshalling — `x._handle` in, `Name._(result)` out — keeps
+/// working unchanged, since a rich enum lowers to `TypeRef::Struct`), frees it
+/// once in `dispose()`, and exposes a `tag` discriminant reader, one `factory`
+/// per variant (`Shape.circle(2.5)`), and per-variant field getters namespaced
+/// by variant (`circleRadius`) to avoid collisions. The opaque-object surface
+/// (tag/destroy symbols, per-variant constructors and field getters) is
+/// precomputed in the binding model exactly like a struct's.
+fn render_rich_enum(out: &mut String, e: &EnumBinding) {
+    let rich = e
+        .rich
+        .as_ref()
+        .expect("render_rich_enum requires a rich (algebraic) enum");
+    let class_name = e.name.to_upper_camel_case();
+    let tag_name = format!("{class_name}Tag");
+
+    // A top-level discriminant enum (`ShapeTag.circle`), rendered exactly like a
+    // plain enum so the active variant reads back as a typed value.
+    render_rich_enum_tag(out, e, &tag_name);
+
+    // FFI typedefs + lookups, keyed on the model's precomputed symbols: the
+    // destructor, the tag getter, one constructor per variant, and every
+    // per-variant field getter.
+    emit_typedef_and_lookup(
+        out,
+        &rich.destroy_symbol,
+        "Pointer<Void>",
+        "Pointer<Void>",
+        "Void",
+        "void",
+    );
+    emit_typedef_and_lookup(
+        out,
+        &rich.tag_symbol,
+        "Pointer<Void>",
+        "Pointer<Void>",
+        "Int32",
+        "int",
+    );
+    for v in &rich.variants {
+        emit_rich_variant_create_typedef(out, v);
+    }
+    for v in &rich.variants {
+        for field in namespaced_variant_fields(v) {
+            emit_field_getter_typedef(out, &field);
+        }
+    }
+
+    out.push('\n');
+    emit_doc(out, &e.doc, "");
+    out.push_str(&format!("class {class_name} {{\n"));
+    out.push_str("  final Pointer<Void> _handle;\n");
+    out.push_str(&format!("  {class_name}._(this._handle);\n\n"));
+
+    out.push_str("  void dispose() {\n");
+    out.push_str(&format!(
+        "    _{}(_handle);\n",
+        rich.destroy_symbol.to_lower_camel_case()
+    ));
+    out.push_str("  }\n");
+
+    // The active variant's discriminant, read back as the typed tag enum.
+    out.push('\n');
+    out.push_str(&format!(
+        "  {tag_name} get tag =>\n      {tag_name}.fromValue(_{}(_handle));\n",
+        rich.tag_symbol.to_lower_camel_case()
+    ));
+
+    // One factory constructor per variant (`Shape.circle(2.5)`).
+    for v in &rich.variants {
+        emit_rich_variant_factory(out, &class_name, v);
+    }
+
+    // Per-variant field getters, namespaced by variant (`circleRadius`).
+    for v in &rich.variants {
+        for field in namespaced_variant_fields(v) {
+            emit_field_getter_method(out, &field);
+        }
+    }
+
+    out.push_str("}\n");
+}
+
+/// The typed discriminant of a rich enum, emitted as a top-level Dart `enum`
+/// (Dart cannot nest an `enum` in a class). Mirrors [`render_enum`]'s enhanced
+/// enum so `tag` reads back as e.g. `ShapeTag.circle`.
+fn render_rich_enum_tag(out: &mut String, e: &EnumBinding, tag_name: &str) {
+    out.push('\n');
+    emit_doc(out, &e.doc, "");
+    out.push_str(&format!("enum {tag_name} {{\n"));
+    for v in &e.variants {
+        let vname = v.name.to_lower_camel_case();
+        emit_doc(out, &v.doc, "  ");
+        out.push_str(&format!("  {vname}({}),\n", v.value));
+    }
+    out.push_str("  ;\n");
+    out.push_str(&format!("  const {tag_name}(this.value);\n"));
+    out.push_str("  final int value;\n\n");
+    out.push_str(&format!(
+        "  static {tag_name} fromValue(int value) =>\n      {tag_name}.values.firstWhere((e) => e.value == value);\n"
+    ));
+    out.push_str("}\n");
+}
+
+/// Project a variant's fields into [`FieldBinding`]s whose Dart member name is
+/// namespaced by the variant (`circle` + `radius` -> `circle_radius`, rendered
+/// `circleRadius`). The precomputed `getter_symbol` is left untouched, so the
+/// FFI lookup still targets the correct per-variant C symbol — this is what lets
+/// the rich enum reuse the struct field-getter renderers verbatim.
+fn namespaced_variant_fields(v: &RichVariantBinding) -> Vec<FieldBinding> {
+    let variant = v.name.to_snake_case();
+    v.fields
+        .iter()
+        .map(|f| {
+            let mut namespaced = f.clone();
+            namespaced.name = format!("{variant}_{}", f.name);
+            namespaced
+        })
+        .collect()
+}
+
+/// Emit the dart:ffi typedef + lookup for one variant constructor
+/// (`{c_tag}_{Variant}_new`): each variant field lowers to its ABI input slots,
+/// then a trailing `out_err`; the call returns the opaque handle. Mirrors the
+/// struct builder's `create` typedef.
+fn emit_rich_variant_create_typedef(out: &mut String, v: &RichVariantBinding) {
+    let create_sym = &v.create.symbol;
+    let mut nparams: Vec<String> = Vec::new();
+    let mut dparams: Vec<String> = Vec::new();
+    for f in &v.fields {
+        for (n, d) in input_slots(&f.ty) {
+            nparams.push(n);
+            dparams.push(d);
+        }
+    }
+    nparams.push("Pointer<_WeaveFFIError>".into());
+    dparams.push("Pointer<_WeaveFFIError>".into());
+    emit_typedef_and_lookup(
+        out,
+        create_sym,
+        &nparams.join(", "),
+        &dparams.join(", "),
+        "Pointer<Void>",
+        "Pointer<Void>",
+    );
+}
+
+/// Emit one variant's factory constructor (`Shape.circle(double radius)`).
+/// Mirrors the struct builder's `build()`: each field marshals to its ABI
+/// argument slots via [`emit_input`], the call threads an `out_err` checked with
+/// `_checkError`, and the returned handle is wrapped (`return Shape._(result)`).
+/// A unit variant takes no parameters and passes only the error slot.
+fn emit_rich_variant_factory(out: &mut String, class_name: &str, v: &RichVariantBinding) {
+    let create_sym = &v.create.symbol;
+    let factory = v.name.to_lower_camel_case();
+    let params: Vec<String> = v
+        .fields
+        .iter()
+        .map(|f| format!("{} {}", dart_type(&f.ty), f.name.to_lower_camel_case()))
+        .collect();
+
+    out.push('\n');
+    emit_doc(out, &v.doc, "  ");
+    out.push_str(&format!(
+        "  factory {class_name}.{factory}({}) {{\n",
+        params.join(", ")
+    ));
+
+    let mut frees: Vec<String> = Vec::new();
+    let mut call_args: Vec<String> = Vec::new();
+    for f in &v.fields {
+        let args = emit_input(out, &f.name.to_lower_camel_case(), &f.ty, &mut frees);
+        call_args.extend(args);
+    }
+    out.push_str("    final err = calloc<_WeaveFFIError>();\n");
+    frees.push("calloc.free(err);".into());
+    call_args.push("err".into());
+    out.push_str("    try {\n");
+    out.push_str(&format!(
+        "      final result = _{}({});\n",
+        create_sym.to_lower_camel_case(),
+        call_args.join(", ")
+    ));
+    out.push_str("      _checkError(err);\n");
+    out.push_str(&format!("      return {class_name}._(result);\n"));
+    out.push_str("    } finally {\n");
+    for fr in &frees {
+        out.push_str(&format!("      {fr}\n"));
+    }
+    out.push_str("    }\n");
+    out.push_str("  }\n");
+}
+
 fn render_function(out: &mut String, f: &FnBinding) {
     // `c_base` is the prefixed `{prefix}_{module}_{name}` symbol the shared
     // BindingModel already computed; the async/iterator suffixing matches the C
@@ -1058,7 +1310,17 @@ fn render_callback_typedef(out: &mut String, cb: &CallbackBinding) {
 fn cb_arg_expr(p: &ParamBinding) -> String {
     let n0 = p.abi[0].name.to_lower_camel_case();
     match &p.ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::F64 => n0,
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::I64
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::U64
+        | TypeRef::Handle
+        | TypeRef::F32
+        | TypeRef::F64 => n0,
         TypeRef::Bool => format!("{n0} != 0"),
         TypeRef::Enum(name) => format!(
             "{}.fromValue({n0})",
@@ -1693,7 +1955,7 @@ mod tests {
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules,
             generators: None,
             package: None,
@@ -2049,16 +2311,19 @@ mod tests {
                         name: "Red".into(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Green".into(),
                         value: 1,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Blue".into(),
                         value: 2,
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }],
@@ -2681,16 +2946,19 @@ mod tests {
                         name: "Personal".into(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Work".into(),
                         value: 1,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Other".into(),
                         value: 2,
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }],
@@ -2938,6 +3206,7 @@ mod tests {
                     name: "Small".into(),
                     value: 0,
                     doc: Some("A small one".into()),
+                    fields: vec![],
                 }],
             }],
             callbacks: vec![],
@@ -2970,5 +3239,299 @@ mod tests {
     fn dart_emits_doc_on_field() {
         let dart = render_dart_module(&doc_api(), "weaveffi", "weaveffi.yml");
         assert!(dart.contains("/// Stable id"), "{dart}");
+    }
+
+    /// A rich (algebraic) enum mirroring `samples/shapes`: a unit variant, an
+    /// f64 payload, two f32 payloads, and a (string, u8) payload, plus a plain
+    /// sibling enum and functions that take/return the rich enum by handle.
+    fn rich_enum_api() -> Api {
+        make_api(vec![Module {
+            name: "shapes".into(),
+            functions: vec![
+                Function {
+                    name: "describe".into(),
+                    params: vec![Param {
+                        name: "shape".into(),
+                        ty: TypeRef::Struct("Shape".into()),
+                        mutable: false,
+                        doc: None,
+                    }],
+                    returns: Some(TypeRef::StringUtf8),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "scale".into(),
+                    params: vec![
+                        Param {
+                            name: "shape".into(),
+                            ty: TypeRef::Struct("Shape".into()),
+                            mutable: false,
+                            doc: None,
+                        },
+                        Param {
+                            name: "factor".into(),
+                            ty: TypeRef::F64,
+                            mutable: false,
+                            doc: None,
+                        },
+                    ],
+                    returns: Some(TypeRef::Struct("Shape".into())),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+            ],
+            structs: vec![],
+            enums: vec![
+                EnumDef {
+                    name: "Shape".into(),
+                    doc: Some("An algebraic shape".into()),
+                    variants: vec![
+                        EnumVariant {
+                            name: "Empty".into(),
+                            value: 0,
+                            doc: None,
+                            fields: vec![],
+                        },
+                        EnumVariant {
+                            name: "Circle".into(),
+                            value: 1,
+                            doc: None,
+                            fields: vec![StructField {
+                                name: "radius".into(),
+                                ty: TypeRef::F64,
+                                doc: Some("Radius in points".into()),
+                                default: None,
+                            }],
+                        },
+                        EnumVariant {
+                            name: "Rectangle".into(),
+                            value: 2,
+                            doc: None,
+                            fields: vec![
+                                StructField {
+                                    name: "width".into(),
+                                    ty: TypeRef::F32,
+                                    doc: None,
+                                    default: None,
+                                },
+                                StructField {
+                                    name: "height".into(),
+                                    ty: TypeRef::F32,
+                                    doc: None,
+                                    default: None,
+                                },
+                            ],
+                        },
+                        EnumVariant {
+                            name: "Labeled".into(),
+                            value: 3,
+                            doc: None,
+                            fields: vec![
+                                StructField {
+                                    name: "label".into(),
+                                    ty: TypeRef::StringUtf8,
+                                    doc: None,
+                                    default: None,
+                                },
+                                StructField {
+                                    name: "count".into(),
+                                    ty: TypeRef::U8,
+                                    doc: None,
+                                    default: None,
+                                },
+                            ],
+                        },
+                    ],
+                },
+                EnumDef {
+                    name: "Channel".into(),
+                    doc: None,
+                    variants: vec![
+                        EnumVariant {
+                            name: "Red".into(),
+                            value: 0,
+                            doc: None,
+                            fields: vec![],
+                        },
+                        EnumVariant {
+                            name: "Green".into(),
+                            value: 1,
+                            doc: None,
+                            fields: vec![],
+                        },
+                    ],
+                },
+            ],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }])
+    }
+
+    #[test]
+    fn rich_enum_is_opaque_class_not_plain_enum() {
+        let dart = render_dart_module(&rich_enum_api(), "weaveffi", "weaveffi.yml");
+        // The rich enum must NOT be a plain Dart `enum`...
+        assert!(
+            !dart.contains("enum Shape {"),
+            "rich enum must not render as a plain enum: {dart}"
+        );
+        // ...but an opaque-object wrapper class, exactly like a struct.
+        assert!(
+            dart.contains("class Shape {"),
+            "missing Shape class: {dart}"
+        );
+        assert!(
+            dart.contains("final Pointer<Void> _handle;"),
+            "missing opaque handle field: {dart}"
+        );
+        assert!(
+            dart.contains("Shape._(this._handle);"),
+            "missing private wrapping constructor: {dart}"
+        );
+        assert!(
+            dart.contains("void dispose()") && dart.contains("weaveffi_shapes_Shape_destroy"),
+            "missing dispose()/destroy symbol: {dart}"
+        );
+        // A plain sibling enum still renders as a plain Dart enum.
+        assert!(
+            dart.contains("enum Channel {"),
+            "plain sibling enum should still render as an enum: {dart}"
+        );
+    }
+
+    #[test]
+    fn rich_enum_tag_reader() {
+        let dart = render_dart_module(&rich_enum_api(), "weaveffi", "weaveffi.yml");
+        assert!(
+            dart.contains("enum ShapeTag {"),
+            "missing typed discriminant enum: {dart}"
+        );
+        assert!(
+            dart.contains("empty(0)")
+                && dart.contains("circle(1)")
+                && dart.contains("rectangle(2)")
+                && dart.contains("labeled(3)"),
+            "missing tag discriminants: {dart}"
+        );
+        assert!(
+            dart.contains("ShapeTag get tag"),
+            "missing tag discriminant reader: {dart}"
+        );
+        assert!(
+            dart.contains("ShapeTag.fromValue(_weaveffiShapesShapeTag(_handle))"),
+            "tag reader must read the C tag symbol: {dart}"
+        );
+    }
+
+    #[test]
+    fn rich_enum_per_variant_factories() {
+        let dart = render_dart_module(&rich_enum_api(), "weaveffi", "weaveffi.yml");
+        assert!(
+            dart.contains("factory Shape.empty()"),
+            "missing unit-variant factory: {dart}"
+        );
+        assert!(
+            dart.contains("factory Shape.circle(double radius)"),
+            "missing f64 factory: {dart}"
+        );
+        assert!(
+            dart.contains("factory Shape.rectangle(double width, double height)"),
+            "missing two-f32 factory: {dart}"
+        );
+        assert!(
+            dart.contains("factory Shape.labeled(String label, int count)"),
+            "missing (string,u8) factory: {dart}"
+        );
+        // Each factory binds its own per-variant `_new` symbol...
+        assert!(
+            dart.contains("weaveffi_shapes_Shape_Empty_new")
+                && dart.contains("weaveffi_shapes_Shape_Circle_new")
+                && dart.contains("weaveffi_shapes_Shape_Rectangle_new")
+                && dart.contains("weaveffi_shapes_Shape_Labeled_new"),
+            "missing per-variant constructor symbols: {dart}"
+        );
+        // ...marshals string fields, checks the error, and wraps the handle.
+        assert!(
+            dart.contains("label.toNativeUtf8()"),
+            "labeled factory must marshal its string field: {dart}"
+        );
+        assert!(
+            dart.contains("_checkError(err);") && dart.contains("return Shape._(result);"),
+            "factory must check error and wrap the returned handle: {dart}"
+        );
+    }
+
+    #[test]
+    fn rich_enum_per_variant_getters_namespaced() {
+        let dart = render_dart_module(&rich_enum_api(), "weaveffi", "weaveffi.yml");
+        // Getters are namespaced by variant to avoid collisions; numerics map to
+        // int/double (incl. f32 -> double, u8 -> int) and strings decode.
+        assert!(
+            dart.contains("double get circleRadius"),
+            "missing circleRadius getter: {dart}"
+        );
+        assert!(
+            dart.contains("double get rectangleWidth"),
+            "missing rectangleWidth getter: {dart}"
+        );
+        assert!(
+            dart.contains("double get rectangleHeight"),
+            "missing rectangleHeight getter: {dart}"
+        );
+        assert!(
+            dart.contains("String get labeledLabel"),
+            "missing labeledLabel getter: {dart}"
+        );
+        assert!(
+            dart.contains("int get labeledCount"),
+            "missing labeledCount getter: {dart}"
+        );
+        // Getters bind their per-variant C symbols and the string getter decodes.
+        assert!(
+            dart.contains("weaveffi_shapes_Shape_Circle_get_radius")
+                && dart.contains("weaveffi_shapes_Shape_Labeled_get_label"),
+            "missing per-variant getter symbols: {dart}"
+        );
+        assert!(
+            dart.contains("return result.toDartString();"),
+            "string getter must decode the C string: {dart}"
+        );
+        // Carries the per-variant field doc through the namespaced getter.
+        assert!(
+            dart.contains("/// Radius in points"),
+            "variant field doc should be emitted: {dart}"
+        );
+    }
+
+    #[test]
+    fn rich_enum_functions_marshal_opaque_handle() {
+        let dart = render_dart_module(&rich_enum_api(), "weaveffi", "weaveffi.yml");
+        // Functions taking/returning the rich enum lower it to TypeRef::Struct,
+        // so they pass the opaque handle in and wrap the handle out unchanged.
+        assert!(
+            dart.contains("String describe(Shape shape)"),
+            "missing describe signature: {dart}"
+        );
+        assert!(
+            dart.contains("Shape scale(Shape shape, double factor)"),
+            "missing scale signature: {dart}"
+        );
+        assert!(
+            dart.contains("shape._handle"),
+            "a rich-enum argument must marshal as its opaque handle: {dart}"
+        );
+        assert!(
+            dart.contains("return Shape._(result);"),
+            "a rich-enum return must wrap the opaque handle: {dart}"
+        );
     }
 }

@@ -21,18 +21,24 @@ pub enum ConstPos {
 /// prefix (applied at render time by [`CType::render_c`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CType {
+    Int8,
+    Int16,
     Int32,
-    Uint32,
     Int64,
+    /// `uint8_t` as a standalone scalar (the `u8` primitive). Also used as the
+    /// pointee of a byte-buffer pointer.
+    Uint8,
+    Uint16,
+    Uint32,
     Uint64,
+    /// `float` (the `f32` primitive).
+    Float,
     Double,
     Bool,
     /// `size_t`.
     Size,
     /// `char` (only appears as the pointee of a string pointer).
     Char,
-    /// `uint8_t` (byte buffers).
-    Uint8,
     /// `void`.
     Void,
     /// `{prefix}_handle_t`.
@@ -90,15 +96,19 @@ impl CType {
     /// WeaveFFI-owned symbol.
     pub fn render_c(&self, prefix: &str) -> String {
         match self {
+            CType::Int8 => "int8_t".to_string(),
+            CType::Int16 => "int16_t".to_string(),
             CType::Int32 => "int32_t".to_string(),
-            CType::Uint32 => "uint32_t".to_string(),
             CType::Int64 => "int64_t".to_string(),
+            CType::Uint8 => "uint8_t".to_string(),
+            CType::Uint16 => "uint16_t".to_string(),
+            CType::Uint32 => "uint32_t".to_string(),
             CType::Uint64 => "uint64_t".to_string(),
+            CType::Float => "float".to_string(),
             CType::Double => "double".to_string(),
             CType::Bool => "bool".to_string(),
             CType::Size => "size_t".to_string(),
             CType::Char => "char".to_string(),
-            CType::Uint8 => "uint8_t".to_string(),
             CType::Void => "void".to_string(),
             CType::Handle => format!("{prefix}_handle_t"),
             CType::CancelToken => format!("{prefix}_cancel_token"),

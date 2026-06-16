@@ -13,7 +13,7 @@ use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, walk_modules, DocCommentStyle};
 use weaveffi_core::model::{
     AsyncBinding, BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
-    ListenerBinding, ModuleBinding, ParamBinding, StructBinding,
+    ListenerBinding, ModuleBinding, ParamBinding, RichVariantBinding, StructBinding,
 };
 use weaveffi_core::pkg;
 use weaveffi_core::utils::{
@@ -104,9 +104,15 @@ weaveffi_core::impl_generator_via_backend!(GoGenerator);
 
 fn go_type(ty: &TypeRef) -> String {
     match ty {
+        TypeRef::I8 => "int8".into(),
+        TypeRef::I16 => "int16".into(),
         TypeRef::I32 => "int32".into(),
+        TypeRef::U8 => "uint8".into(),
+        TypeRef::U16 => "uint16".into(),
         TypeRef::U32 => "uint32".into(),
+        TypeRef::U64 => "uint64".into(),
         TypeRef::I64 | TypeRef::Handle => "int64".into(),
+        TypeRef::F32 => "float32".into(),
         TypeRef::F64 => "float64".into(),
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string".into(),
@@ -130,7 +136,17 @@ fn go_type(ty: &TypeRef) -> String {
 
 fn go_zero(ty: &TypeRef) -> String {
     match ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::F64 => "0".into(),
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::I64
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::U64
+        | TypeRef::Handle
+        | TypeRef::F32
+        | TypeRef::F64 => "0".into(),
         TypeRef::Bool => "false".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "\"\"".into(),
         TypeRef::Enum(_) => "0".into(),
@@ -140,9 +156,15 @@ fn go_zero(ty: &TypeRef) -> String {
 
 fn c_scalar_type(ty: &TypeRef, prefix: &str, module: &str) -> Option<String> {
     match ty {
+        TypeRef::I8 => Some("C.int8_t".into()),
+        TypeRef::I16 => Some("C.int16_t".into()),
         TypeRef::I32 => Some("C.int32_t".into()),
+        TypeRef::U8 => Some("C.uint8_t".into()),
+        TypeRef::U16 => Some("C.uint16_t".into()),
         TypeRef::U32 => Some("C.uint32_t".into()),
+        TypeRef::U64 => Some("C.uint64_t".into()),
         TypeRef::I64 | TypeRef::Handle => Some("C.int64_t".into()),
+        TypeRef::F32 => Some("C.float".into()),
         TypeRef::F64 => Some("C.double".into()),
         TypeRef::Bool => Some("C._Bool".into()),
         TypeRef::Enum(n) => Some(format!("C.{}", c_abi_struct_name(n, module, prefix))),
@@ -165,9 +187,15 @@ fn c_scalar_conv(expr: &str, ty: &TypeRef, prefix: &str, module: &str) -> String
 
 fn go_scalar_conv(expr: &str, ty: &TypeRef) -> String {
     match ty {
+        TypeRef::I8 => format!("int8({expr})"),
+        TypeRef::I16 => format!("int16({expr})"),
         TypeRef::I32 => format!("int32({expr})"),
+        TypeRef::U8 => format!("uint8({expr})"),
+        TypeRef::U16 => format!("uint16({expr})"),
         TypeRef::U32 => format!("uint32({expr})"),
+        TypeRef::U64 => format!("uint64({expr})"),
         TypeRef::I64 | TypeRef::Handle => format!("int64({expr})"),
+        TypeRef::F32 => format!("float32({expr})"),
         TypeRef::F64 => format!("float64({expr})"),
         TypeRef::Bool => format!("cToBool({expr})"),
         TypeRef::Enum(n) => format!("{}({expr})", local_type_name(n).to_upper_camel_case()),
@@ -217,10 +245,14 @@ fn scan_imports(api: &Api) -> (bool, bool, bool, bool) {
     // A builder's `Build` calls the C `create` symbol and returns `(*T, error)`,
     // so it pulls in `fmt` (error formatting) just like a fallible function.
     let has_builder = walk_modules(&api.modules).any(|m| m.structs.iter().any(|s| s.builder));
+    // A rich (algebraic) enum emits a `New{Variant}` constructor per variant
+    // that returns `(*T, error)` and formats failures with `fmt`, exactly like
+    // a builder's `Build`.
+    let has_rich_enum = walk_modules(&api.modules).any(|m| m.enums.iter().any(|e| e.is_rich()));
     let has_async = walk_modules(&api.modules).any(|m| m.functions.iter().any(|f| f.r#async));
     let has_listeners = walk_modules(&api.modules).any(|m| !m.listeners.is_empty());
 
-    let needs_fmt = has_funcs || has_builder;
+    let needs_fmt = has_funcs || has_builder || has_rich_enum;
 
     // Async launchers and listener registration thread the registry id through
     // the C `void* context`, which always stages through unsafe.Pointer.
@@ -235,6 +267,16 @@ fn scan_imports(api: &Api) -> (bool, bool, bool, bool) {
                 // marshals every field *in* (strings stage through unsafe.Pointer).
                 s.fields.iter().any(|fld| return_uses_unsafe(&fld.ty))
                     || (s.builder && s.fields.iter().any(|fld| param_uses_unsafe(&fld.ty)))
+            }) || m.enums.iter().any(|e| {
+                // A rich enum's per-variant field getters materialize
+                // bytes/list/map, and its constructors marshal those fields *in*
+                // (strings stage through unsafe.Pointer), just like a struct.
+                e.is_rich()
+                    && e.variants.iter().any(|v| {
+                        v.fields
+                            .iter()
+                            .any(|fld| return_uses_unsafe(&fld.ty) || param_uses_unsafe(&fld.ty))
+                    })
             })
         });
 
@@ -246,6 +288,12 @@ fn scan_imports(api: &Api) -> (bool, bool, bool, bool) {
             .structs
             .iter()
             .any(|s| s.fields.iter().any(|fld| type_has_bool(&fld.ty)))
+            || m.enums.iter().any(|e| {
+                e.is_rich()
+                    && e.variants
+                        .iter()
+                        .any(|v| v.fields.iter().any(|fld| type_has_bool(&fld.ty)))
+            })
             || m.callbacks
                 .iter()
                 .any(|c| c.params.iter().any(|p| type_has_bool(&p.ty)))
@@ -476,7 +524,11 @@ fn render_go(api: &Api, prefix: &str, input_basename: &str) -> String {
 
     for m in &model.modules {
         for e in &m.enums {
+            // A plain C-style enum becomes an `int32` + constants; a rich
+            // (algebraic) enum becomes an opaque-object wrapper. Each renderer
+            // skips the other kind, mirroring the C++ backend.
             render_enum(&mut out, e);
+            render_rich_enum(&mut out, prefix, &m.path, e);
         }
         for s in &m.structs {
             render_struct(&mut out, prefix, &m.path, s);
@@ -509,15 +561,19 @@ fn render_go(api: &Api, prefix: &str, input_basename: &str) -> String {
 /// Go formal type for one C ABI slot in a trampoline signature.
 fn cgo_slot_type(ct: &CType, prefix: &str) -> String {
     match ct {
+        CType::Int8 => "C.int8_t".into(),
+        CType::Int16 => "C.int16_t".into(),
         CType::Int32 => "C.int32_t".into(),
+        CType::Uint8 => "C.uint8_t".into(),
+        CType::Uint16 => "C.uint16_t".into(),
         CType::Uint32 => "C.uint32_t".into(),
         CType::Int64 => "C.int64_t".into(),
         CType::Uint64 => "C.uint64_t".into(),
+        CType::Float => "C.float".into(),
         CType::Double => "C.double".into(),
         CType::Bool => "C._Bool".into(),
         CType::Size => "C.size_t".into(),
         CType::Char => "C.char".into(),
-        CType::Uint8 => "C.uint8_t".into(),
         CType::Handle => format!("C.{prefix}_handle_t"),
         CType::CancelToken => format!("C.{prefix}_cancel_token"),
         CType::Error => format!("C.{prefix}_error"),
@@ -652,7 +708,17 @@ fn emit_cb_param_arg(
     let arg = format!("arg{idx}");
     let n = &p.abi[0].name;
     match &p.ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::F64 => {
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::I64
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::U64
+        | TypeRef::Handle
+        | TypeRef::F32
+        | TypeRef::F64 => {
             out.push_str(&format!("\t{arg} := {}\n", go_scalar_conv(n, &p.ty)));
         }
         TypeRef::Bool => {
@@ -834,7 +900,17 @@ fn emit_async_result_send(
         return;
     };
     match ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::F64 => {
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::I64
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::U64
+        | TypeRef::Handle
+        | TypeRef::F32
+        | TypeRef::F64 => {
             out.push_str(&format!(
                 "\tch <- {outcome}{{val: {}}}\n",
                 go_scalar_conv("result", ty)
@@ -1031,6 +1107,11 @@ fn render_async_function(
 // ── Enums ──
 
 fn render_enum(out: &mut String, e: &EnumBinding) {
+    // Rich (algebraic) enums cross the ABI as opaque objects and are rendered
+    // as wrappers by `render_rich_enum`; only plain C-style enums are int32s.
+    if e.is_rich() {
+        return;
+    }
     let name = e.name.to_upper_camel_case();
     emit_doc(out, &e.doc, "", Some(&name));
     out.push_str(&format!("type {name} int32\n\n"));
@@ -1041,6 +1122,126 @@ fn render_enum(out: &mut String, e: &EnumBinding) {
         out.push_str(&format!("\t{vname} {name} = {}\n", v.value));
     }
     out.push_str(")\n\n");
+}
+
+/// Render a rich (algebraic) enum as an opaque-object wrapper, mirroring the Go
+/// struct wrapper ([`render_struct`]): a value type owning the `*C.{tag}` handle
+/// freed by an explicit `Close`, an `int32` discriminant read by `Tag()` plus
+/// exported per-variant tag constants (reusing the plain-enum const style), one
+/// `New{Enum}{Variant}` constructor per variant calling `{tag}_{V}_new`, and
+/// per-variant field accessors (`{Variant}{Field}()`) reusing the struct getter
+/// marshalling. Because a rich enum resolves to `TypeRef::Struct`, the existing
+/// function/param/return machinery handles it as a value unchanged.
+///
+/// A plain C-style enum is skipped here (it is handled by [`render_enum`]).
+fn render_rich_enum(out: &mut String, prefix: &str, module: &str, e: &EnumBinding) {
+    let Some(rich) = &e.rich else {
+        return;
+    };
+    let name = e.name.to_upper_camel_case();
+    let c_tag = &e.c_tag;
+
+    // Opaque-object value type owning the C handle (identical to a struct).
+    emit_doc(out, &e.doc, "", Some(&name));
+    out.push_str(&format!("type {name} struct {{\n"));
+    out.push_str(&format!("\tptr *C.{c_tag}\n"));
+    out.push_str("}\n\n");
+
+    // Exported discriminant constants in the plain-enum const style. The wrapper
+    // type name is taken by the struct above, so these are typed `int32` to
+    // match what `Tag` returns (`shape.Tag() == ShapeCircle`).
+    out.push_str("const (\n");
+    for v in &e.variants {
+        let vname = format!("{name}{}", v.name.to_upper_camel_case());
+        emit_doc(out, &v.doc, "\t", Some(&vname));
+        out.push_str(&format!("\t{vname} int32 = {}\n", v.value));
+    }
+    out.push_str(")\n\n");
+
+    // Tag reader: the active variant's discriminant.
+    out.push_str(&format!("func (s *{name}) Tag() int32 {{\n"));
+    out.push_str(&format!("\treturn int32(C.{}(s.ptr))\n", rich.tag_symbol));
+    out.push_str("}\n\n");
+
+    // One constructor per variant, calling `{tag}_{V}_new`.
+    for v in &rich.variants {
+        render_rich_enum_ctor(out, prefix, module, &name, v);
+    }
+
+    // Per-variant field accessors, namespaced by variant to avoid collisions
+    // between same-named fields. Reuse `render_getter` so the marshalling is
+    // identical to a struct getter; the synthesized `{variant}_{field}` name
+    // lowers to a `{Variant}{Field}` method (e.g. `CircleRadius`).
+    for v in &rich.variants {
+        for f in &v.fields {
+            let mut nf = f.clone();
+            nf.name = format!("{}_{}", v.name, f.name);
+            render_getter(out, prefix, module, &name, &nf);
+        }
+    }
+
+    // Cleanup: identical contract to a struct wrapper's `Close`.
+    out.push_str(&format!("func (s *{name}) Close() {{\n"));
+    out.push_str("\tif s.ptr != nil {\n");
+    out.push_str(&format!("\t\tC.{}(s.ptr)\n", rich.destroy_symbol));
+    out.push_str("\t\ts.ptr = nil\n");
+    out.push_str("\t}\n");
+    out.push_str("}\n\n");
+}
+
+/// One rich-enum variant constructor: `New{Enum}{Variant}(<fields>)
+/// (*{Enum}, error)`. Each field is marshaled with the same lowering used for a
+/// function parameter / struct-builder field, then `{tag}_{V}_new` is called and
+/// its `out_err` checked with the shared fallible-call convention. A unit
+/// variant takes no parameters (only `out_err`).
+fn render_rich_enum_ctor(
+    out: &mut String,
+    prefix: &str,
+    module: &str,
+    enum_name: &str,
+    v: &RichVariantBinding,
+) {
+    let ctor = format!("New{enum_name}{}", v.name.to_upper_camel_case());
+    let go_params: Vec<String> = v
+        .fields
+        .iter()
+        .map(|f| format!("{} {}", f.name.to_lower_camel_case(), go_type(&f.ty)))
+        .collect();
+
+    emit_doc(out, &v.doc, "", Some(&ctor));
+    out.push_str(&format!(
+        "func {ctor}({}) (*{enum_name}, error) {{\n",
+        go_params.join(", ")
+    ));
+
+    let mut pre = String::new();
+    let mut c_args: Vec<String> = Vec::new();
+    for f in &v.fields {
+        emit_param(
+            &mut pre,
+            &mut c_args,
+            &f.name.to_lower_camel_case(),
+            &f.ty,
+            prefix,
+            module,
+        );
+    }
+    pre.push_str("\tvar cErr C.weaveffi_error\n");
+    c_args.push("&cErr".into());
+
+    out.push_str(&pre);
+    out.push_str(&format!(
+        "\tresult := C.{}({})\n",
+        v.create.symbol,
+        c_args.join(", ")
+    ));
+    out.push_str("\tif cErr.code != 0 {\n");
+    out.push_str("\t\tgoErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(cErr.message), int(cErr.code))\n");
+    out.push_str("\t\tC.weaveffi_error_clear(&cErr)\n");
+    out.push_str("\t\treturn nil, goErr\n");
+    out.push_str("\t}\n");
+    out.push_str(&format!("\treturn &{enum_name}{{ptr: result}}, nil\n"));
+    out.push_str("}\n\n");
 }
 
 // ── Structs ──
@@ -1413,7 +1614,16 @@ fn emit_param(
     module: &str,
 ) {
     match ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 => {
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::I64
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::U64
+        | TypeRef::F32
+        | TypeRef::F64 => {
             args.push(c_scalar_conv(name, ty, prefix, module));
         }
         TypeRef::Bool => args.push(format!("boolToC({name})")),
@@ -1666,7 +1876,17 @@ fn emit_return_out_params(
 
 fn emit_return(out: &mut String, ty: &TypeRef, prefix: &str, module: &str) {
     match ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::F64 => {
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::I64
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::U64
+        | TypeRef::Handle
+        | TypeRef::F32
+        | TypeRef::F64 => {
             let conv = go_scalar_conv("result", ty);
             out.push_str(&format!("\treturn {conv}, nil\n"));
         }
@@ -1846,7 +2066,7 @@ mod tests {
 
     fn calculator_api() -> Api {
         Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "calculator".into(),
                 functions: vec![
@@ -1943,7 +2163,7 @@ mod tests {
     #[test]
     fn go_async_generates_blocking_wrapper() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "io".into(),
                 functions: vec![
@@ -2075,7 +2295,7 @@ mod tests {
     #[test]
     fn enum_generation() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "paint".into(),
                 functions: vec![],
@@ -2088,16 +2308,19 @@ mod tests {
                             name: "Red".into(),
                             value: 0,
                             doc: None,
+                            fields: vec![],
                         },
                         EnumVariant {
                             name: "Green".into(),
                             value: 1,
                             doc: None,
+                            fields: vec![],
                         },
                         EnumVariant {
                             name: "Blue".into(),
                             value: 2,
                             doc: None,
+                            fields: vec![],
                         },
                     ],
                 }],
@@ -2131,7 +2354,7 @@ mod tests {
     #[test]
     fn struct_with_getters_and_close() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![],
@@ -2194,7 +2417,7 @@ mod tests {
     #[test]
     fn struct_builder_type_and_setters() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "geo".into(),
                 functions: vec![],
@@ -2246,7 +2469,7 @@ mod tests {
     #[test]
     fn void_function() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "system".into(),
                 functions: vec![Function {
@@ -2283,7 +2506,7 @@ mod tests {
     #[test]
     fn handle_type() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "store".into(),
                 functions: vec![Function {
@@ -2325,7 +2548,7 @@ mod tests {
     #[test]
     fn bool_function_generates_helpers() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "logic".into(),
                 functions: vec![Function {
@@ -2369,7 +2592,7 @@ mod tests {
     #[test]
     fn enum_param_and_return() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "paint".into(),
                 functions: vec![Function {
@@ -2395,6 +2618,7 @@ mod tests {
                         name: "Red".into(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     }],
                 }],
                 callbacks: vec![],
@@ -2423,7 +2647,7 @@ mod tests {
     #[test]
     fn struct_return() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![Function {
@@ -2475,7 +2699,7 @@ mod tests {
     #[test]
     fn optional_string_param() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "store".into(),
                 functions: vec![Function {
@@ -2521,7 +2745,7 @@ mod tests {
     #[test]
     fn optional_struct_return() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![Function {
@@ -2562,7 +2786,7 @@ mod tests {
     #[test]
     fn list_return() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "store".into(),
                 functions: vec![Function {
@@ -2600,7 +2824,7 @@ mod tests {
     #[test]
     fn struct_list_return() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![Function {
@@ -2647,7 +2871,7 @@ mod tests {
     #[test]
     fn async_cancellable_passes_null_token() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "tasks".into(),
                 functions: vec![Function {
@@ -2684,7 +2908,7 @@ mod tests {
     #[test]
     fn listeners_generate_register_unregister() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "events".into(),
                 functions: vec![],
@@ -2804,7 +3028,7 @@ mod tests {
     #[test]
     fn optional_i32_param() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "store".into(),
                 functions: vec![Function {
@@ -2846,7 +3070,7 @@ mod tests {
     #[test]
     fn struct_optional_string_field() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![],
@@ -2884,7 +3108,7 @@ mod tests {
     #[test]
     fn no_bool_helpers_when_unneeded() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "math".into(),
                 functions: vec![Function {
@@ -2930,7 +3154,7 @@ mod tests {
     #[test]
     fn struct_enum_field_getter() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![],
@@ -2952,6 +3176,7 @@ mod tests {
                         name: "Personal".into(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     }],
                 }],
                 callbacks: vec![],
@@ -3004,7 +3229,7 @@ mod tests {
     #[test]
     fn generate_go_with_structs() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![Function {
@@ -3098,7 +3323,7 @@ mod tests {
     #[test]
     fn generate_go_with_enums() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![Function {
@@ -3125,16 +3350,19 @@ mod tests {
                             name: "Personal".into(),
                             value: 0,
                             doc: None,
+                            fields: vec![],
                         },
                         EnumVariant {
                             name: "Work".into(),
                             value: 1,
                             doc: None,
+                            fields: vec![],
                         },
                         EnumVariant {
                             name: "Other".into(),
                             value: 2,
                             doc: None,
+                            fields: vec![],
                         },
                     ],
                 }],
@@ -3183,7 +3411,7 @@ mod tests {
     #[test]
     fn generate_go_error_handling() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "store".into(),
                 functions: vec![
@@ -3268,7 +3496,7 @@ mod tests {
     #[test]
     fn generate_go_full_contacts() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![
@@ -3403,16 +3631,19 @@ mod tests {
                             name: "Personal".into(),
                             value: 0,
                             doc: None,
+                            fields: vec![],
                         },
                         EnumVariant {
                             name: "Work".into(),
                             value: 1,
                             doc: None,
+                            fields: vec![],
                         },
                         EnumVariant {
                             name: "Other".into(),
                             value: 2,
                             doc: None,
+                            fields: vec![],
                         },
                     ],
                 }],
@@ -3527,7 +3758,7 @@ mod tests {
     #[test]
     fn go_no_double_free_on_error() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 structs: vec![StructDef {
@@ -3601,7 +3832,7 @@ mod tests {
     #[test]
     fn go_null_check_on_optional_return() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![Function {
@@ -3655,7 +3886,7 @@ mod tests {
 
     fn doc_api() -> Api {
         Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "docs".into(),
                 functions: vec![Function {
@@ -3691,6 +3922,7 @@ mod tests {
                         name: "Small".into(),
                         value: 0,
                         doc: Some("A small one".into()),
+                        fields: vec![],
                     }],
                 }],
                 callbacks: vec![],

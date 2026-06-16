@@ -1,5 +1,5 @@
 const GENERATOR_DOCS_YAML: &str = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: contacts
     enums:
@@ -319,7 +319,7 @@ fn summary_md_all_links_resolve() {
 }
 
 const README_QUICKSTART_YAML: &str = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: contacts
     structs:
@@ -409,7 +409,7 @@ fn readme_quickstart_generates_c_header() {
 }
 
 const GETTING_STARTED_YAML: &str = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: math
     structs:
@@ -550,8 +550,8 @@ fn readme_states_value_proposition() {
 fn readme_uses_only_current_schema_version() {
     let readme = read_workspace_file("README.md");
     assert!(
-        readme.contains("\"0.3.0\""),
-        "README should reference schema version 0.3.0"
+        readme.contains("\"0.4.0\""),
+        "README should reference schema version 0.4.0"
     );
     assert!(
         !readme.contains("\"0.1.0\""),

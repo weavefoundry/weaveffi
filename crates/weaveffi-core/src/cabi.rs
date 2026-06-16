@@ -58,8 +58,9 @@ pub fn render_runtime_decls(out: &mut String, prefix: &str) {
     );
 }
 
-/// Render an enum typedef. Multi-line when any variant is documented.
-pub fn render_enum_decl(out: &mut String, e: &EnumBinding) {
+/// Render an enum's discriminant constants as a C `typedef enum` named
+/// `type_name`. Multi-line when any variant is documented.
+fn render_enum_constants(out: &mut String, e: &EnumBinding, type_name: &str) {
     emit_doc(out, &e.doc, "");
     if e.variants.iter().any(|v| v.doc.is_some()) {
         out.push_str("typedef enum {\n");
@@ -68,7 +69,7 @@ pub fn render_enum_decl(out: &mut String, e: &EnumBinding) {
             let comma = if i + 1 == e.variants.len() { "" } else { "," };
             let _ = writeln!(out, "    {} = {}{comma}", v.c_const, v.value);
         }
-        let _ = writeln!(out, "}} {};", e.c_tag);
+        let _ = writeln!(out, "}} {type_name};");
     } else {
         let variants: Vec<String> = e
             .variants
@@ -77,11 +78,59 @@ pub fn render_enum_decl(out: &mut String, e: &EnumBinding) {
             .collect();
         let _ = writeln!(
             out,
-            "typedef enum {{ {} }} {};",
-            variants.join(", "),
-            e.c_tag
+            "typedef enum {{ {} }} {type_name};",
+            variants.join(", ")
         );
     }
+}
+
+/// Render a C-style enum typedef. Multi-line when any variant is documented.
+pub fn render_enum_decl(out: &mut String, e: &EnumBinding) {
+    render_enum_constants(out, e, &e.c_tag);
+}
+
+/// Render the *discriminant* enum of a rich (algebraic) enum, named
+/// `{c_tag}_Tag`. The payload-carrying value itself is an opaque struct
+/// `{c_tag}` (forward-declared via [`render_module_type_tags`]); the tag getter
+/// returns one of these discriminant constants as `int32_t`.
+fn render_rich_enum_tag_decl(out: &mut String, e: &EnumBinding) {
+    let tag_enum = format!("{}_Tag", e.c_tag);
+    render_enum_constants(out, e, &tag_enum);
+}
+
+/// Render the function surface of a rich (algebraic) enum: the tag getter, each
+/// variant's constructor and field getters, then the destructor. Assumes the
+/// opaque object tag and every referenced type tag are already forward-declared.
+fn render_rich_enum_fn_decls(out: &mut String, e: &EnumBinding, prefix: &str) {
+    let Some(rich) = &e.rich else {
+        return;
+    };
+    let tag = &e.c_tag;
+    emit_doc(out, &e.doc, "");
+    let _ = writeln!(out, "int32_t {}(const {tag}* self);", rich.tag_symbol);
+    for v in &rich.variants {
+        emit_doc(out, &v.doc, "");
+        fn_decl(out, &v.create, prefix);
+        for field in &v.fields {
+            emit_doc(out, &field.doc, "");
+            let mut parts = vec![format!("const {tag}* self")];
+            parts.extend(
+                field
+                    .getter_out_params
+                    .iter()
+                    .map(|p| format!("{} {}", p.ty.render_c(prefix), p.name)),
+            );
+            let _ = writeln!(
+                out,
+                "{} {}({});",
+                field.getter_ret.render_c(prefix),
+                field.getter_symbol,
+                parts.join(", ")
+            );
+        }
+    }
+    let _ = writeln!(out, "void {}({tag}* self);", rich.destroy_symbol);
+    out.push('\n');
 }
 
 /// Render the opaque struct/builder *tags* (forward typedefs) for one struct.
@@ -151,7 +200,11 @@ fn render_struct_fn_decls(out: &mut String, s: &StructBinding, prefix: &str) {
 /// so they are emitted first across all modules.
 pub fn render_module_enum_defs(out: &mut String, module: &ModuleBinding) {
     for e in &module.enums {
-        render_enum_decl(out, e);
+        if e.is_rich() {
+            render_rich_enum_tag_decl(out, e);
+        } else {
+            render_enum_decl(out, e);
+        }
     }
 }
 
@@ -159,6 +212,13 @@ pub fn render_module_enum_defs(out: &mut String, module: &ModuleBinding) {
 /// Pointers to these are all the C ABI ever uses, so a forward typedef is
 /// sufficient and lets declarations in any module reference any struct.
 pub fn render_module_type_tags(out: &mut String, module: &ModuleBinding) {
+    // A rich (algebraic) enum is an opaque object, declared like a struct tag.
+    for e in &module.enums {
+        if e.is_rich() {
+            let t = &e.c_tag;
+            let _ = writeln!(out, "typedef struct {t} {t};");
+        }
+    }
     for s in &module.structs {
         render_struct_tags(out, s);
     }
@@ -200,6 +260,9 @@ pub fn render_module_callback_types(out: &mut String, module: &ModuleBinding, pr
 /// type tags and callback typedefs are assumed already emitted (phases 1a–1c).
 /// Caller controls the leading `// Module:` comment and any framing.
 pub fn render_module_fn_decls(out: &mut String, module: &ModuleBinding, prefix: &str) {
+    for e in &module.enums {
+        render_rich_enum_fn_decls(out, e, prefix);
+    }
     for s in &module.structs {
         render_struct_fn_decls(out, s, prefix);
     }

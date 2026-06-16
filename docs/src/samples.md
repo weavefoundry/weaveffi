@@ -47,6 +47,41 @@ Every consumer language under `examples/` ships with a kvstore smoke test
 (`open -> put -> get -> delete -> close`) that runs against the generated
 bindings and the produced `libkvstore` cdylib; see `examples/run_all.sh`.
 
+## Shapes (rich enums + numerics)
+
+Path: `samples/shapes`
+
+The reference sample for **rich (algebraic) enums** — sum types whose variants
+carry associated data — and the **expanded numeric primitives**. Use it when
+learning how a tagged union crosses the C ABI as an opaque object and how each
+backend wraps it.
+
+**What it demonstrates:**
+
+- A rich enum (`Shape`) with a data-less variant (`Empty`) and three payload
+  variants — `Circle { radius: f64 }`, `Rectangle { width: f32, height: f32 }`,
+  and `Labeled { label: string, count: u8 }` — lowered to an opaque object with
+  per-variant constructors, a `tag` reader, per-variant field getters, and a
+  destructor
+- A plain C-style enum (`Channel`) alongside the rich enum, showing both enum
+  flavors in one module
+- The new numeric primitives (`f32`, `u8`, `u64`) as variant fields, parameters,
+  and return types
+- Functions that take and return a rich enum (`describe`, `scale`) and a
+  list-of-bytes reduction (`sum_bytes(values: [u8]) -> u64`)
+
+**Build, generate bindings, and run the C ABI tests:**
+
+```bash
+cargo build -p shapes
+cargo test -p shapes
+weaveffi generate samples/shapes/shapes.yml -o generated
+```
+
+The `conformance/` harness ships a `shapes` consumer for every language that
+constructs each variant, reads the tag and fields back, and round-trips through
+`describe`/`scale`; see `conformance/run.sh`.
+
 ## Calculator
 
 Path: `samples/calculator`

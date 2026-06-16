@@ -24,12 +24,19 @@ required — the generated `.dart` file is ready to import.
 | `u32`        | `int`               | `Uint32`               | `int`                |
 | `i64`        | `int`               | `Int64`                | `int`                |
 | `f64`        | `double`            | `Double`               | `double`             |
+| `i8`         | `int`               | `Int8`                 | `int`                |
+| `i16`        | `int`               | `Int16`                | `int`                |
+| `u8`         | `int`               | `Uint8`                | `int`                |
+| `u16`        | `int`               | `Uint16`               | `int`                |
+| `u64`        | `int`               | `Uint64`               | `int`                |
+| `f32`        | `double`            | `Float`                | `double`             |
 | `bool`       | `bool`              | `Int32`                | `int`                |
 | `string`     | `String`            | `Pointer<Utf8>`        | `Pointer<Utf8>`      |
 | `bytes`      | `List<int>`         | `Pointer<Uint8>`       | `Pointer<Uint8>`     |
 | `handle`     | `int`               | `Int64`                | `int`                |
 | `StructName` | `StructName`        | `Pointer<Void>`        | `Pointer<Void>`      |
-| `EnumName`   | `EnumName`          | `Int32`                | `int`                |
+| `EnumName` (plain) | `EnumName`    | `Int32`                | `int`                |
+| `EnumName` (rich)  | `EnumName`    | `Pointer<Void>`        | `Pointer<Void>`      |
 | `T?`         | `T?`                | same as inner type     | same as inner type   |
 | `[T]`        | `List<T>`           | `Pointer<Void>`        | `Pointer<Void>`      |
 | `{K: V}`     | `Map<K, V>`         | `Pointer<Void>`        | `Pointer<Void>`      |
@@ -40,7 +47,7 @@ Booleans cross as `Int32` (`0`/`1`) and the wrapper converts both ways.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: contacts
     enums:
@@ -161,6 +168,106 @@ int createContact(String name, String? email, ContactType contactType) {
   }
 }
 ```
+
+## Rich (algebraic) enums
+
+A rich (algebraic) enum is a sum type whose variants carry associated
+data. A plain C-style enum surfaces as a Dart `enum` and crosses as an
+`Int32`; a rich enum instead lowers to an **opaque object handle**, so
+the generator emits a wrapper class with the same ownership model as a
+struct wrapper — a `Pointer<Void>` freed by an explicit `dispose()`.
+
+For a `Shape` enum with variants `Empty`, `Circle { radius: f64 }`,
+`Rectangle { width: f32, height: f32 }`, and `Labeled { label: string,
+count: u8 }`, the generator emits a companion `ShapeTag` enum, one
+`factory` per variant, a `tag` getter that maps the discriminant back to
+`ShapeTag`, and a getter per payload field:
+
+```dart
+/// An algebraic shape (sum type with associated data)
+enum ShapeTag {
+  empty(0),
+  circle(1),
+  rectangle(2),
+  labeled(3),
+  ;
+  const ShapeTag(this.value);
+  final int value;
+
+  static ShapeTag fromValue(int value) =>
+      ShapeTag.values.firstWhere((e) => e.value == value);
+}
+
+/// An algebraic shape (sum type with associated data)
+class Shape {
+  final Pointer<Void> _handle;
+  Shape._(this._handle);
+
+  void dispose() {
+    _weaveffiShapesShapeDestroy(_handle);
+  }
+
+  ShapeTag get tag =>
+      ShapeTag.fromValue(_weaveffiShapesShapeTag(_handle));
+
+  /// A circle with a radius
+  factory Shape.circle(double radius) {
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiShapesShapeCircleNew(radius, err);
+      _checkError(err);
+      return Shape._(result);
+    } finally {
+      calloc.free(err);
+    }
+  }
+
+  /// Radius in points
+  double get circleRadius {
+    final result = _weaveffiShapesShapeCircleGetRadius(_handle);
+    return result;
+  }
+
+  int get labeledCount {
+    final result = _weaveffiShapesShapeLabeledGetCount(_handle);
+    return result;
+  }
+}
+```
+
+The rest of the surface follows the same shape: factories
+`Shape.empty()`, `Shape.circle(radius)`, `Shape.rectangle(width,
+height)`, and `Shape.labeled(label, count)`; getters `circleRadius`,
+`rectangleWidth`, `rectangleHeight`, `labeledLabel`, and `labeledCount`.
+Each resolves a `weaveffi_shapes_Shape_<Variant>_new` /
+`weaveffi_shapes_Shape_<Variant>_get_<field>` symbol, and
+`weaveffi_shapes_Shape_tag` backs the `tag` getter.
+
+Construct a couple of variants, read the tag and a field, then pass the
+wrapper to a top-level function:
+
+```dart
+final circle = Shape.circle(2.0);
+final labeled = Shape.labeled('unit', 3);
+try {
+  if (circle.tag == ShapeTag.circle) {
+    print(circle.circleRadius);        // 2.0
+  }
+  print(labeled.labeledCount);         // 3
+
+  print(describe(circle));             // render via the C ABI
+  final bigger = scale(circle, 3.0);   // returns a new Shape
+  bigger.dispose();
+} finally {
+  circle.dispose();
+  labeled.dispose();
+}
+```
+
+**Ownership:** a `Shape` wraps a `Pointer<Void>` that you own; call
+`dispose()` (which invokes `weaveffi_shapes_Shape_destroy`) exactly as
+with struct wrappers. The `Shape` returned by `scale` is a separate
+handle you also dispose.
 
 ## Build instructions
 

@@ -24,12 +24,19 @@ errors become managed exceptions, and the project targets `net8.0`.
 | `u32`        | `uint`                     | `uint`        |
 | `i64`        | `long`                     | `long`        |
 | `f64`        | `double`                   | `double`      |
+| `i8`         | `sbyte`                    | `sbyte`       |
+| `i16`        | `short`                    | `short`       |
+| `u8`         | `byte`                     | `byte`        |
+| `u16`        | `ushort`                   | `ushort`      |
+| `u64`        | `ulong`                    | `ulong`       |
+| `f32`        | `float`                    | `float`       |
 | `bool`       | `bool`                     | `int`         |
 | `string`     | `string`                   | `IntPtr`      |
 | `handle`     | `ulong`                    | `ulong`       |
 | `bytes`      | `byte[]`                   | `IntPtr`      |
 | `StructName` | `StructName`               | `IntPtr`      |
-| `EnumName`   | `EnumName`                 | `int`         |
+| `EnumName` (plain) | `EnumName`           | `int`         |
+| `EnumName` (rich)  | `EnumName`           | `IntPtr`      |
 | `T?`         | `T?` (nullable)            | `IntPtr`      |
 | `[T]`        | `T[]`                      | `IntPtr`      |
 | `{K: V}`     | `Dictionary<K, V>`         | `IntPtr`      |
@@ -38,7 +45,7 @@ errors become managed exceptions, and the project targets `net8.0`.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: contacts
     enums:
@@ -175,6 +182,143 @@ internal static class NativeMethods
     internal static extern ulong weaveffi_contacts_create_contact(IntPtr name, IntPtr email, int age, ref WeaveFFIError err);
 }
 ```
+
+## Rich (algebraic) enums
+
+A *rich* (algebraic) enum — a sum type whose variants carry associated
+data — lowers to an **opaque handle** at the C ABI, just like a struct,
+and uses the same `IDisposable` ownership model as the struct wrappers
+above. The generated C# type is a class wrapping an `IntPtr`, with one
+static factory per variant, a nested `Tag` enum for the discriminant, and
+per-variant property getters. (A plain C-style enum with no payloads
+stays a normal C# `enum` backed by `int` — see above.)
+
+For the `shapes` module's `Shape` enum — `Empty`, `Circle { radius: f64 }`,
+`Rectangle { width: f32, height: f32 }`, and
+`Labeled { label: string, count: u8 }` — the generator emits (abridged):
+
+```csharp
+/// <summary>An algebraic shape (sum type with associated data)</summary>
+public class Shape : IDisposable
+{
+    private IntPtr _handle;
+    private bool _disposed;
+
+    internal Shape(IntPtr handle)
+    {
+        _handle = handle;
+    }
+
+    internal IntPtr Handle => _handle;
+
+    public enum Tag
+    {
+        Empty = 0,
+        Circle = 1,
+        Rectangle = 2,
+        Labeled = 3,
+    }
+
+    public Tag GetTag()
+    {
+        return (Tag)NativeMethods.weaveffi_shapes_Shape_tag(_handle);
+    }
+
+    /// <summary>A circle with a radius</summary>
+    public static Shape Circle(double radius)
+    {
+        var err = new WeaveFFIError();
+        var result = NativeMethods.weaveffi_shapes_Shape_Circle_new(radius, ref err);
+        WeaveFFIError.Check(err);
+        return new Shape(result);
+    }
+
+    /// <summary>A labeled shape with a small count</summary>
+    public static Shape Labeled(string label, byte count)
+    {
+        var err = new WeaveFFIError();
+        var labelPtr = Marshal.StringToCoTaskMemUTF8(label);
+        try
+        {
+            var result = NativeMethods.weaveffi_shapes_Shape_Labeled_new(labelPtr, count, ref err);
+            WeaveFFIError.Check(err);
+            return new Shape(result);
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem(labelPtr);
+        }
+    }
+
+    /// <summary>Radius in points</summary>
+    public double CircleRadius
+    {
+        get
+        {
+            return NativeMethods.weaveffi_shapes_Shape_Circle_get_radius(_handle);
+        }
+    }
+
+    public byte LabeledCount
+    {
+        get
+        {
+            return NativeMethods.weaveffi_shapes_Shape_Labeled_get_count(_handle);
+        }
+    }
+
+    public void Dispose()
+    {
+        if (!_disposed)
+        {
+            NativeMethods.weaveffi_shapes_Shape_destroy(_handle);
+            _disposed = true;
+        }
+        GC.SuppressFinalize(this);
+    }
+
+    ~Shape()
+    {
+        Dispose();
+    }
+}
+```
+
+The `static` factories (`Shape.Empty()`, `Shape.Circle(double)`,
+`Shape.Rectangle(float, float)`, `Shape.Labeled(string, byte)`) call the
+per-variant constructors `weaveffi_shapes_Shape_<Variant>_new`; `GetTag()`
+reads the discriminant via `weaveffi_shapes_Shape_tag`; each getter reads
+one variant field via `weaveffi_shapes_Shape_<Variant>_get_<field>`; and
+`Dispose()` frees the handle via `weaveffi_shapes_Shape_destroy`. The
+P/Invoke entries live in `NativeMethods`:
+
+```csharp
+[DllImport(LibName, EntryPoint = "weaveffi_shapes_Shape_tag", CallingConvention = CallingConvention.Cdecl)]
+internal static extern int weaveffi_shapes_Shape_tag(IntPtr ptr);
+
+[DllImport(LibName, EntryPoint = "weaveffi_shapes_Shape_Circle_new", CallingConvention = CallingConvention.Cdecl)]
+internal static extern IntPtr weaveffi_shapes_Shape_Circle_new(double radius, ref WeaveFFIError err);
+
+[DllImport(LibName, EntryPoint = "weaveffi_shapes_Shape_destroy", CallingConvention = CallingConvention.Cdecl)]
+internal static extern void weaveffi_shapes_Shape_destroy(IntPtr ptr);
+```
+
+Free functions that take or return the enum live on the module class
+`Shapes` and pass the wrapper's handle across the boundary
+(`Shapes.ShapesDescribe(Shape)`, `Shapes.ShapesScale(Shape, double)`):
+
+```csharp
+using var c = Shape.Circle(2.0);
+Console.WriteLine(c.GetTag());                  // Tag.Circle
+Console.WriteLine(c.CircleRadius);              // 2
+using var bigger = Shapes.ShapesScale(c, 3.0);  // returns a new Shape
+Console.WriteLine(Shapes.ShapesDescribe(bigger));
+```
+
+**Ownership:** a `Shape` owns its native handle, so dispose every `Shape`
+you create or receive — including the one returned by `ShapesScale` — with
+`using` or an explicit `Dispose()`. The finalizer is a safety net that
+runs on a non-deterministic schedule.
 
 ## Build instructions
 

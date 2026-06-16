@@ -26,7 +26,7 @@ and objects:
 
 ```text
 # yaml-language-server: $schema=./weaveffi.schema.json
-version: "0.3.0"
+version: "0.4.0"
 package:
   name: my_app
   version: "1.0.0"
@@ -49,7 +49,7 @@ A complete, validating example lives at the bottom of this page in the
 
 | Field        | Type                        | Required | Description                              |
 |--------------|-----------------------------|----------|------------------------------------------|
-| `version`    | string                      | yes      | Schema version; only the current version (`"0.3.0"`) is accepted |
+| `version`    | string                      | yes      | Schema version; only the current version (`"0.4.0"`) is accepted |
 | `package`    | Package                     | no       | Publishable identity stamped into every generated manifest (see [Package metadata](#package-metadata)) |
 | `modules`    | array of Module             | yes      | One or more modules                      |
 | `generators` | map of string to object     | no       | Per-generator configuration (see [generators section](#generators-section)) |
@@ -141,7 +141,7 @@ spelling.
 ### Package example
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 package:
   name: kvstore
   version: "1.0.0"
@@ -168,9 +168,15 @@ parameters and return types.
 
 | Type          | Description                          | Example value |
 |---------------|--------------------------------------|---------------|
+| `i8`          | Signed 8-bit integer                 | `-12`         |
+| `i16`         | Signed 16-bit integer                | `-1000`       |
 | `i32`         | Signed 32-bit integer                | `-42`         |
-| `u32`         | Unsigned 32-bit integer              | `300`         |
 | `i64`         | Signed 64-bit integer                | `9000000000`  |
+| `u8`          | Unsigned 8-bit integer               | `200`         |
+| `u16`         | Unsigned 16-bit integer              | `60000`       |
+| `u32`         | Unsigned 32-bit integer              | `300`         |
+| `u64`         | Unsigned 64-bit integer              | `18000000000` |
+| `f32`         | 32-bit floating point                | `1.5`         |
 | `f64`         | 64-bit floating point                | `3.14`        |
 | `bool`        | Boolean                              | `true`        |
 | `string`      | UTF-8 string (owned copy)            | `"hello"`     |
@@ -180,10 +186,14 @@ parameters and return types.
 | `&str`        | Borrowed string (zero-copy, param-only) | `"hello"`  |
 | `&[u8]`       | Borrowed byte slice (zero-copy, param-only) | binary data |
 
+> **Note on JavaScript/WASM:** 64-bit integers (`i64`, `u64`) surface as
+> `BigInt` in the Node and WebAssembly backends; all narrower integers and the
+> floats surface as `number`.
+
 ### Primitive examples
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: primitives
     structs:
@@ -263,7 +273,7 @@ knows how to spell the handle's type. At the C ABI level, `handle<T>` is
 still a `uint64_t`.
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: sessions
     structs:
@@ -323,7 +333,7 @@ Each field:
 ### Struct example
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: geometry
     structs:
@@ -391,16 +401,17 @@ explicit `value` (i32). Define enums under the `enums` key.
 
 Each variant:
 
-| Field   | Type   | Required | Description                  |
-|---------|--------|----------|------------------------------|
-| `name`  | string | yes      | Variant name (e.g. `Red`)    |
-| `value` | i32    | yes      | Integer discriminant          |
-| `doc`   | string | no       | Documentation string         |
+| Field    | Type             | Required | Description                                  |
+|----------|------------------|----------|----------------------------------------------|
+| `name`   | string           | yes      | Variant name (e.g. `Red`)                    |
+| `value`  | i32              | yes      | Integer discriminant                         |
+| `doc`    | string           | no       | Documentation string                         |
+| `fields` | array of Field   | no       | Associated data — makes the enum a *sum type* |
 
 ### Enum example
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: contacts
     enums:
@@ -426,6 +437,56 @@ modules:
 Variant values must be unique within an enum, and variant names must be unique
 within an enum.
 
+### Rich (algebraic) enums — sum types
+
+When one or more variants declare `fields`, the enum becomes a *rich* enum: an
+algebraic sum type whose variants carry associated data (like a Rust `enum` or a
+Swift `enum` with associated values). A *unit* variant (no `fields`) and a *data*
+variant may coexist in the same enum.
+
+```yaml
+version: "0.4.0"
+modules:
+  - name: shapes
+    enums:
+      - name: Shape
+        doc: "An algebraic shape"
+        variants:
+          - name: Empty
+            value: 0
+          - name: Circle
+            value: 1
+            fields:
+              - { name: radius, type: f64 }
+          - name: Rectangle
+            value: 2
+            fields:
+              - { name: width, type: f32 }
+              - { name: height, type: f32 }
+    functions:
+      - name: area
+        params:
+          - { name: shape, type: Shape }
+        return: f64
+```
+
+Unlike a plain C-style enum (which crosses the ABI by value as an integer), a
+rich enum crosses as an **opaque object pointer** — exactly like a struct. The C
+ABI gains a tag reader, a per-variant constructor and field getters, and a
+destructor; each backend wraps these into an idiomatic owned type:
+
+| Backend     | Surface                                                            |
+|-------------|-------------------------------------------------------------------|
+| C           | `*_tag`, `*_{Variant}_new`, `*_{Variant}_get_{field}`, `*_destroy` |
+| C++         | RAII class with nested `Tag`, static factories, per-variant getters |
+| Python/Ruby | class with a `tag`, per-variant factory + accessor methods          |
+| C#/Go       | owned class/struct with `Tag`, per-variant factories + accessors    |
+
+A variant `fields` entry uses the same shape as a struct field (`name`, `type`,
+`doc`), but obeys the positional rules of a *return-like* slot: no borrowed
+(`&str`/`&[u8]`) types and no iterators. Field names must be unique within a
+variant.
+
 ---
 
 ## Optional types
@@ -443,7 +504,7 @@ the default is null.
 ### Optional example
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: contacts
     structs:
@@ -485,7 +546,7 @@ Wrap a type in `[T]` brackets to declare a list (variable-length sequence).
 ### List example
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: lists
     structs:
@@ -529,7 +590,7 @@ and maps are not valid key types. Values may be any valid `TypeRef`.
 ### Map example
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: maps
     structs:
@@ -610,7 +671,7 @@ Optional and list modifiers compose freely:
 ### Nested type example
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: nested
     structs:
@@ -657,7 +718,7 @@ one at a time and are suitable for large or streaming result sets.
 ### Iterator example
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: streaming
     structs:
@@ -694,7 +755,7 @@ invokes a caller-provided function.
 ### Callback example
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: events
     functions: []
@@ -734,7 +795,7 @@ with subscribe/unsubscribe lifecycle management.
 ### Listener example
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: events
     functions: []
@@ -762,7 +823,7 @@ modules.
 ### Nested module example
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: app
     functions:
@@ -817,7 +878,7 @@ Functions can be marked as asynchronous. See the
 behaviour.
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: net
     functions:
@@ -843,7 +904,7 @@ they are unusual.
 Mark a function as deprecated with a migration message:
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: legacy
     functions:
@@ -865,7 +926,7 @@ Generators propagate the deprecation message to the target language
 Mark a parameter as mutable when the callee may modify it in-place:
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: buffers
     functions:
@@ -886,7 +947,7 @@ directly in the IDL file. This is an alternative to using a separate
 TOML configuration file with `--config`.
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: math
     functions:
@@ -921,9 +982,15 @@ All types are valid in both parameter and return positions unless noted.
 
 | Type           | Params | Returns | Struct fields | Notes                  |
 |----------------|--------|---------|---------------|------------------------|
+| `i8`           | yes    | yes     | yes           |                        |
+| `i16`          | yes    | yes     | yes           |                        |
 | `i32`          | yes    | yes     | yes           |                        |
-| `u32`          | yes    | yes     | yes           |                        |
 | `i64`          | yes    | yes     | yes           |                        |
+| `u8`           | yes    | yes     | yes           |                        |
+| `u16`          | yes    | yes     | yes           |                        |
+| `u32`          | yes    | yes     | yes           |                        |
+| `u64`          | yes    | yes     | yes           | `BigInt` in JS/WASM    |
+| `f32`          | yes    | yes     | yes           |                        |
 | `f64`          | yes    | yes     | yes           |                        |
 | `bool`         | yes    | yes     | yes           |                        |
 | `string`       | yes    | yes     | yes           |                        |
@@ -950,7 +1017,7 @@ A full IDL combining structs, enums, optionals, lists, and nested
 types:
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: contacts
     enums:
@@ -1034,7 +1101,7 @@ You can declare an optional error domain on a module to reserve symbolic names
 and numeric codes:
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: contacts
     errors:
@@ -1086,7 +1153,7 @@ Per-target syntax:
 Example IDL:
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: docs
     structs:

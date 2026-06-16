@@ -61,16 +61,19 @@ fn build_large_api() -> Api {
                             name: "Alpha".into(),
                             value: 0,
                             doc: None,
+                            fields: vec![],
                         },
                         EnumVariant {
                             name: "Beta".into(),
                             value: 1,
                             doc: None,
+                            fields: vec![],
                         },
                         EnumVariant {
                             name: "Gamma".into(),
                             value: 2,
                             doc: None,
+                            fields: vec![],
                         },
                     ],
                 })
@@ -124,7 +127,7 @@ fn build_large_api() -> Api {
         .collect();
 
     Api {
-        version: "0.3.0".into(),
+        version: "0.4.0".into(),
         modules,
         generators: None,
         package: None,

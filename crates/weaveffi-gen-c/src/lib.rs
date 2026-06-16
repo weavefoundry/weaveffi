@@ -181,7 +181,7 @@ mod tests {
 
     fn api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules,
             generators: None,
             package: None,
@@ -264,6 +264,7 @@ mod tests {
                     name: "Red".into(),
                     value: 0,
                     doc: None,
+                    fields: vec![],
                 }],
             }],
             ..module("gfx")

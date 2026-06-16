@@ -30,13 +30,20 @@ stays buildable under any name.
 | `i32`        | `Int32`                     | Direct value                     |
 | `u32`        | `UInt32`                    | Direct value                     |
 | `i64`        | `Int64`                     | Direct value                     |
+| `u64`        | `UInt64`                    | Direct value                     |
+| `i8`         | `Int8`                      | Direct value                     |
+| `i16`        | `Int16`                     | Direct value                     |
+| `u8`         | `UInt8`                     | Direct value                     |
+| `u16`        | `UInt16`                    | Direct value                     |
+| `f32`        | `Float`                     | Direct value                     |
 | `f64`        | `Double`                    | Direct value                     |
 | `bool`       | `Bool`                      | C `bool` at the ABI              |
 | `string`     | `String`                    | NUL-terminated UTF-8 (`withCString`) |
 | `bytes`      | `Data` / `[UInt8]`          | Pointer + length                 |
 | `handle`     | `UInt64`                    | Direct value                     |
 | `StructName` | `StructName` (class)        | Wraps `OpaquePointer`            |
-| `EnumName`   | `EnumName` (`enum`)         | Backed by `UInt32`               |
+| `EnumName` (plain) | `EnumName` (`enum`)   | Backed by `UInt32`               |
+| `EnumName` (rich)  | `EnumName` (class)    | Wraps `OpaquePointer`, like a struct |
 | `T?`         | `T?`                        | Optional pointer / sentinel      |
 | `[T]`        | `[T]`                       | Pointer + length                 |
 | `iter<T>`    | `[T]`                       | Drained eagerly via `_next`      |
@@ -44,7 +51,7 @@ stays buildable under any name.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: contacts
     enums:
@@ -144,6 +151,60 @@ ids.withUnsafeBufferPointer { buf in
     let ids_len = buf.count
 }
 ```
+
+## Rich (algebraic) enums
+
+An enum whose variants declare `fields` is a *rich* (algebraic) enum — a sum
+type with associated data. Plain C-style enums stay Swift `enum`s backed by
+`UInt32`; a rich enum instead becomes a wrapper `class` around an
+`OpaquePointer` (same ownership model as a struct class) with a nested `Tag`,
+throwing static factories, and per-variant computed properties. From the
+`shapes` sample:
+
+```swift
+public class Shape {
+    let ptr: OpaquePointer
+    deinit { weaveffi_shapes_Shape_destroy(ptr) }
+
+    public enum Tag: Int32 {
+        case empty = 0
+        case circle = 1
+        case rectangle = 2
+        case labeled = 3
+    }
+    public var tag: Tag { Tag(rawValue: weaveffi_shapes_Shape_tag(ptr))! }
+
+    public static func empty() throws -> Shape
+    public static func circle(_ radius: Double) throws -> Shape
+    public static func rectangle(_ width: Float, _ height: Float) throws -> Shape
+    public static func labeled(_ label: String, _ count: UInt8) throws -> Shape
+
+    public var circleRadius: Double { get }
+    public var rectangleWidth: Float { get }
+    public var rectangleHeight: Float { get }
+    public var labeledLabel: String { get }
+    public var labeledCount: UInt8 { get }
+}
+```
+
+Build a variant with its throwing factory, switch on `tag`, and read only the
+matching property. Module functions live on the `Shapes` namespace enum and
+take/return the wrapper:
+
+```swift
+let shape = try Shape.circle(2.0)
+
+if shape.tag == .circle {
+    print("radius = \(shape.circleRadius)")
+}
+
+print(try Shapes.shapes_describe(shape))
+let bigger = try Shapes.shapes_scale(shape, 3.0)
+```
+
+Ownership matches struct classes: the `Shape` `deinit` calls
+`weaveffi_shapes_Shape_destroy`, so ARC frees the handle when the last
+reference goes away — no manual free required.
 
 ## Build instructions
 

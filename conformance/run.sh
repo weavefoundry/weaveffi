@@ -123,6 +123,18 @@ cpp_kvstore() {
         && "$OUT/cpp_kvstore"
 }
 
+c_shapes() {
+    clang -I "$GENROOT/shapes/c" "$ROOT/conformance/c/shapes.c" \
+        -L "$LIBDIR" -lshapes -lm -o "$OUT/c_shapes" \
+        && "$OUT/c_shapes"
+}
+
+cpp_shapes() {
+    clang++ -std=c++17 -I "$GENROOT/shapes/cpp" "$ROOT/conformance/cpp/shapes.cpp" \
+        -L "$LIBDIR" -lshapes -o "$OUT/cpp_shapes" \
+        && "$OUT/cpp_shapes"
+}
+
 # Resolve the platform-specific cdylib path for a sample crate.
 sample_lib() {
     case "$(uname)" in
@@ -144,6 +156,7 @@ py_consumer() {
 python_contacts() { py_consumer contacts contacts.py; }
 python_events()   { py_consumer events events.py; }
 python_kvstore()  { py_consumer kvstore kvstore.py; }
+python_shapes()   { py_consumer shapes shapes.py; }
 
 # Run a Ruby consumer; same library-selection story as Python.
 rb_consumer() {
@@ -156,6 +169,7 @@ rb_consumer() {
 ruby_contacts() { rb_consumer contacts contacts.rb; }
 ruby_events()   { rb_consumer events events.rb; }
 ruby_kvstore()  { rb_consumer kvstore kvstore.rb; }
+ruby_shapes()   { rb_consumer shapes shapes.rb; }
 
 # Run a Dart consumer from inside the generated package so `package:weaveffi`
 # and the cached `ffi` dependency resolve. The cdylib comes via WEAVEFFI_LIBRARY.
@@ -177,6 +191,7 @@ dart_consumer() {
 dart_contacts() { dart_consumer contacts contacts.dart; }
 dart_events()   { dart_consumer events events.dart; }
 dart_kvstore() { dart_consumer kvstore kvstore.dart; }
+dart_shapes()   { dart_consumer shapes shapes.dart; }
 
 # A directory containing `libweaveffi.<ext>` symlinked to the sample cdylib, so
 # build-time `-lweaveffi` / `#cgo -lweaveffi` resolve. On Linux the consumer then
@@ -221,6 +236,7 @@ EOF
 go_contacts() { go_consumer contacts contacts.go; }
 go_events()   { go_consumer events events.go; }
 go_kvstore()  { go_consumer kvstore kvstore.go; }
+go_shapes()   { go_consumer shapes shapes.go; }
 
 # Swift: assemble a throwaway SwiftPM package that vendors the generated
 # WeaveFFI module plus a C shim whose module map points at the generated header
@@ -269,6 +285,7 @@ EOF
 swift_contacts() { swift_consumer contacts contacts.swift; }
 swift_events()   { swift_consumer events events.swift; }
 swift_kvstore()  { swift_consumer kvstore kvstore.swift; }
+swift_shapes()   { swift_consumer shapes shapes.swift; }
 
 # .NET: compile the generated P/Invoke source together with the consumer into
 # one console app. The generated file is named after the resolved identity
@@ -306,6 +323,7 @@ EOF
 dotnet_contacts() { dotnet_consumer contacts Contacts.cs; }
 dotnet_events()   { dotnet_consumer events Events.cs; }
 dotnet_kvstore()  { dotnet_consumer kvstore Kvstore.cs; }
+dotnet_shapes()   { dotnet_consumer shapes Shapes.cs; }
 
 # Node: build the generated N-API addon with node-gyp against the producer
 # cdylib (via the `libweaveffi` link alias + include of the generated C header),
@@ -337,6 +355,7 @@ EOF
 node_contacts() { node_consumer contacts contacts.js; }
 node_events()   { node_consumer events events.js; }
 node_kvstore() { node_consumer kvstore kvstore.js; }
+node_shapes()   { node_consumer shapes shapes.js; }
 
 # Kotlin/Android: compile the generated JNI bridge into `libweaveffi.<ext>` (what
 # `System.loadLibrary("weaveffi")` expects), linked against the producer cdylib;
@@ -389,6 +408,7 @@ kotlin_consumer() {
 
 kotlin_events()  { kotlin_consumer events events.kt; }
 kotlin_kvstore() { kotlin_consumer kvstore kvstore.kt; }
+kotlin_shapes()  { kotlin_consumer shapes shapes.kt; }
 
 # WASM: compile the producer to wasm32-unknown-unknown and drive the generated
 # ESM bindings from Node. The generated JS glue expects weaveffi_alloc/dealloc
@@ -414,6 +434,7 @@ wasm_consumer() {
 
 wasm_events()  { wasm_consumer events events.mjs; }
 wasm_kvstore() { wasm_consumer kvstore kvstore.mjs; }
+wasm_shapes()  { wasm_consumer shapes shapes.mjs; }
 
 # ---------------------------------------------------------------------------
 # Producers + generation
@@ -424,6 +445,8 @@ build_producer events
 generate events samples/events/events.yml
 build_producer kvstore
 generate kvstore samples/kvstore/kvstore.yml
+build_producer shapes
+generate shapes samples/shapes/shapes.yml
 
 # ---------------------------------------------------------------------------
 # Run matrix: every language runs the events lane (callbacks/listeners +
@@ -435,6 +458,17 @@ check c-events c_events
 check c-kvstore c_kvstore
 check cpp-events cpp_events
 check cpp-kvstore cpp_kvstore
+check c-shapes c_shapes
+check cpp-shapes cpp_shapes
+check python-shapes python_shapes
+check ruby-shapes ruby_shapes
+check go-shapes go_shapes
+check dotnet-shapes dotnet_shapes
+check dart-shapes dart_shapes
+check swift-shapes swift_shapes
+check node-shapes node_shapes
+check kotlin-shapes kotlin_shapes
+check wasm-shapes wasm_shapes
 check python-contacts python_contacts
 check python-events python_events
 check python-kvstore python_kvstore

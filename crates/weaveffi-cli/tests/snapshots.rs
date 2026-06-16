@@ -739,6 +739,62 @@ snapshot_test!(
     "09_nested_modules.yml"
 );
 
+// Rich (algebraic) enums + the expanded numeric primitives, across every
+// backend (fixture 10). Locks the rich-enum wrapper surface — opaque object,
+// per-variant constructors and field getters, tag reader, destructor — into the
+// snapshot oracle for all 11 generators.
+snapshot_test!(snapshot_c_shapes, CGenerator, "shapes", "10_shapes.yml");
+snapshot_test!(snapshot_cpp_shapes, CppGenerator, "shapes", "10_shapes.yml");
+snapshot_test!(
+    snapshot_swift_shapes,
+    SwiftGenerator,
+    "shapes",
+    "10_shapes.yml"
+);
+snapshot_test!(
+    snapshot_android_shapes,
+    AndroidGenerator,
+    "shapes",
+    "10_shapes.yml"
+);
+snapshot_test!(
+    snapshot_node_shapes,
+    NodeGenerator,
+    "shapes",
+    "10_shapes.yml"
+);
+snapshot_test!(
+    snapshot_wasm_shapes,
+    WasmGenerator,
+    "shapes",
+    "10_shapes.yml"
+);
+snapshot_test!(
+    snapshot_python_shapes,
+    PythonGenerator,
+    "shapes",
+    "10_shapes.yml"
+);
+snapshot_test!(
+    snapshot_dotnet_shapes,
+    DotnetGenerator,
+    "shapes",
+    "10_shapes.yml"
+);
+snapshot_test!(
+    snapshot_dart_shapes,
+    DartGenerator,
+    "shapes",
+    "10_shapes.yml"
+);
+snapshot_test!(snapshot_go_shapes, GoGenerator, "shapes", "10_shapes.yml");
+snapshot_test!(
+    snapshot_ruby_shapes,
+    RubyGenerator,
+    "shapes",
+    "10_shapes.yml"
+);
+
 /// Phase 5 prelude coverage: every generator, every fixture, every output file
 /// must carry the standard WeaveFFI prelude markers in its first five lines.
 #[test]
@@ -790,6 +846,7 @@ fn prelude_present_in_every_generated_file() {
         "07_docs_everywhere.yml",
         "08_kvstore.yml",
         "09_nested_modules.yml",
+        "10_shapes.yml",
     ];
 
     for fixture in fixtures {

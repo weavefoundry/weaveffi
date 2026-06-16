@@ -1,5 +1,5 @@
 use weaveffi_core::utils::c_abi_struct_name;
-use weaveffi_ir::ir::{Api, Module, StructDef, TypeRef};
+use weaveffi_ir::ir::{Api, EnumDef, Module, StructDef, TypeRef};
 
 fn is_pointer_type(ty: &TypeRef) -> bool {
     matches!(
@@ -17,9 +17,15 @@ fn is_pointer_type(ty: &TypeRef) -> bool {
 
 fn rust_scalar_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
     match ty {
+        TypeRef::I8 => "i8".into(),
+        TypeRef::I16 => "i16".into(),
         TypeRef::I32 => "i32".into(),
+        TypeRef::U8 => "u8".into(),
+        TypeRef::U16 => "u16".into(),
         TypeRef::U32 => "u32".into(),
         TypeRef::I64 => "i64".into(),
+        TypeRef::U64 => "u64".into(),
+        TypeRef::F32 => "f32".into(),
         TypeRef::F64 => "f64".into(),
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "c_char".into(),
@@ -37,9 +43,15 @@ fn rust_scalar_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
 
 fn rust_param_fragments(name: &str, ty: &TypeRef, module: &str, prefix: &str) -> Vec<String> {
     match ty {
+        TypeRef::I8 => vec![format!("{name}: i8")],
+        TypeRef::I16 => vec![format!("{name}: i16")],
         TypeRef::I32 => vec![format!("{name}: i32")],
+        TypeRef::U8 => vec![format!("{name}: u8")],
+        TypeRef::U16 => vec![format!("{name}: u16")],
         TypeRef::U32 => vec![format!("{name}: u32")],
         TypeRef::I64 => vec![format!("{name}: i64")],
+        TypeRef::U64 => vec![format!("{name}: u64")],
+        TypeRef::F32 => vec![format!("{name}: f32")],
         TypeRef::F64 => vec![format!("{name}: f64")],
         TypeRef::Bool => vec![format!("{name}: bool")],
         // A string parameter is a single NUL-terminated `const char*` in the C
@@ -102,9 +114,15 @@ fn rust_param_fragments(name: &str, ty: &TypeRef, module: &str, prefix: &str) ->
 
 fn rust_return_type(ty: &TypeRef, module: &str, prefix: &str) -> (String, bool) {
     match ty {
+        TypeRef::I8 => ("i8".into(), false),
+        TypeRef::I16 => ("i16".into(), false),
         TypeRef::I32 => ("i32".into(), false),
+        TypeRef::U8 => ("u8".into(), false),
+        TypeRef::U16 => ("u16".into(), false),
         TypeRef::U32 => ("u32".into(), false),
         TypeRef::I64 => ("i64".into(), false),
+        TypeRef::U64 => ("u64".into(), false),
+        TypeRef::F32 => ("f32".into(), false),
         TypeRef::F64 => ("f64".into(), false),
         TypeRef::Bool => ("bool".into(), false),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => ("*const c_char".into(), false),
@@ -169,6 +187,16 @@ fn render_module(out: &mut String, module: &Module, parent_path: &str, prefix: &
 
     for s in &module.structs {
         render_struct_scaffold(out, &mod_name, s, prefix);
+    }
+
+    // A rich (algebraic) enum crosses the ABI as an opaque object, so it needs
+    // the same producer surface as a struct: per-variant constructors and field
+    // getters, a tag reader, and a destructor. C-style enums are bare integers
+    // and need no producer functions.
+    for e in &module.enums {
+        if e.is_rich() {
+            render_rich_enum_scaffold(out, &mod_name, e, prefix);
+        }
     }
 
     for f in &module.functions {
@@ -350,6 +378,66 @@ fn render_struct_scaffold(out: &mut String, module: &str, s: &StructDef, prefix:
     }
 }
 
+/// Emit the producer surface for a rich (algebraic) enum: an opaque object type
+/// plus, for every variant, a `{tag}_{Variant}_new` constructor and one
+/// `{tag}_{Variant}_get_{field}` getter per associated field, followed by the
+/// shared `{tag}_tag` reader and `{tag}_destroy`. The symbol names mirror the
+/// generated C header exactly (see `cabi::render_rich_enum_fn_decls`).
+fn render_rich_enum_scaffold(out: &mut String, module: &str, e: &EnumDef, prefix: &str) {
+    let tag = c_abi_struct_name(&e.name, module, prefix);
+
+    out.push_str("#[repr(C)]\n");
+    out.push_str(&format!("pub struct {tag} {{\n"));
+    out.push_str("    // TODO: represent the active variant and its associated data\n");
+    out.push_str("}\n\n");
+
+    for v in &e.variants {
+        let mut params = Vec::new();
+        for f in &v.fields {
+            params.extend(rust_param_fragments(&f.name, &f.ty, module, prefix));
+        }
+        params.push("out_err: *mut weaveffi_error".into());
+        out.push_str("#[no_mangle]\n");
+        out.push_str(&format!(
+            "pub extern \"C\" fn {tag}_{}_new({}) -> *mut {tag} {{\n",
+            v.name,
+            params.join(", ")
+        ));
+        out.push_str("    todo!()\n");
+        out.push_str("}\n\n");
+
+        for f in &v.fields {
+            let (ret_ty, needs_len) = rust_return_type(&f.ty, module, prefix);
+            let getter = format!("{tag}_{}_get_{}", v.name, f.name);
+            let mut getter_params = vec![format!("ptr: *const {tag}")];
+            if needs_len {
+                getter_params.push("out_len: *mut usize".into());
+            }
+            out.push_str("#[no_mangle]\n");
+            out.push_str(&format!(
+                "pub extern \"C\" fn {getter}({}) -> {ret_ty} {{\n",
+                getter_params.join(", ")
+            ));
+            out.push_str("    todo!()\n");
+            out.push_str("}\n\n");
+        }
+    }
+
+    out.push_str("#[no_mangle]\n");
+    out.push_str(&format!(
+        "pub extern \"C\" fn {tag}_tag(ptr: *const {tag}) -> i32 {{\n"
+    ));
+    out.push_str("    todo!()\n");
+    out.push_str("}\n\n");
+
+    out.push_str("#[no_mangle]\n");
+    out.push_str(&format!(
+        "pub extern \"C\" fn {tag}_destroy(ptr: *mut {tag}) {{\n"
+    ));
+    out.push_str("    todo!()\n");
+    out.push_str("}\n\n");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,7 +445,7 @@ mod tests {
 
     fn minimal_api(functions: Vec<Function>, structs: Vec<StructDef>) -> Api {
         Api {
-            version: "0.3.0".to_string(),
+            version: "0.4.0".to_string(),
             modules: vec![Module {
                 name: "calc".to_string(),
                 functions,
@@ -626,6 +714,115 @@ mod tests {
         assert!(
             out.contains("fn weaveffi_calc_Point_get_y(ptr: *const weaveffi_calc_Point) -> f64"),
             "missing y getter: {out}"
+        );
+    }
+
+    #[test]
+    fn scaffold_rich_enum_emits_variant_surface() {
+        use weaveffi_ir::ir::{EnumDef, EnumVariant};
+        let api = Api {
+            version: "0.4.0".into(),
+            modules: vec![Module {
+                name: "shapes".into(),
+                functions: vec![],
+                structs: vec![],
+                enums: vec![EnumDef {
+                    name: "Shape".into(),
+                    doc: None,
+                    variants: vec![
+                        EnumVariant {
+                            name: "Empty".into(),
+                            value: 0,
+                            doc: None,
+                            fields: vec![],
+                        },
+                        EnumVariant {
+                            name: "Circle".into(),
+                            value: 1,
+                            doc: None,
+                            fields: vec![StructField {
+                                name: "radius".into(),
+                                ty: TypeRef::F64,
+                                doc: None,
+                                default: None,
+                            }],
+                        },
+                    ],
+                }],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+            package: None,
+        };
+        let out = render_scaffold(&api, "weaveffi");
+        assert!(
+            out.contains("pub struct weaveffi_shapes_Shape"),
+            "opaque enum object type missing: {out}"
+        );
+        assert!(
+            out.contains("fn weaveffi_shapes_Shape_Empty_new(out_err: *mut weaveffi_error) -> *mut weaveffi_shapes_Shape"),
+            "unit-variant constructor missing: {out}"
+        );
+        assert!(
+            out.contains("fn weaveffi_shapes_Shape_Circle_new(radius: f64, out_err: *mut weaveffi_error) -> *mut weaveffi_shapes_Shape"),
+            "data-variant constructor missing: {out}"
+        );
+        assert!(
+            out.contains("fn weaveffi_shapes_Shape_Circle_get_radius(ptr: *const weaveffi_shapes_Shape) -> f64"),
+            "variant field getter missing: {out}"
+        );
+        assert!(
+            out.contains("fn weaveffi_shapes_Shape_tag(ptr: *const weaveffi_shapes_Shape) -> i32"),
+            "tag reader missing: {out}"
+        );
+        assert!(
+            out.contains("fn weaveffi_shapes_Shape_destroy(ptr: *mut weaveffi_shapes_Shape)"),
+            "destructor missing: {out}"
+        );
+    }
+
+    #[test]
+    fn scaffold_c_style_enum_emits_no_producer_surface() {
+        use weaveffi_ir::ir::{EnumDef, EnumVariant};
+        let api = Api {
+            version: "0.4.0".into(),
+            modules: vec![Module {
+                name: "shapes".into(),
+                functions: vec![],
+                structs: vec![],
+                enums: vec![EnumDef {
+                    name: "Channel".into(),
+                    doc: None,
+                    variants: vec![
+                        EnumVariant {
+                            name: "Red".into(),
+                            value: 0,
+                            doc: None,
+                            fields: vec![],
+                        },
+                        EnumVariant {
+                            name: "Green".into(),
+                            value: 1,
+                            doc: None,
+                            fields: vec![],
+                        },
+                    ],
+                }],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+            package: None,
+        };
+        let out = render_scaffold(&api, "weaveffi");
+        assert!(
+            !out.contains("weaveffi_shapes_Channel"),
+            "plain C-style enum must not get producer stubs: {out}"
         );
     }
 
@@ -939,7 +1136,7 @@ mod tests {
         // symbols must use the underscore-joined module path so they line up
         // with the generated bindings.
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "graphics".into(),
                 functions: vec![],
@@ -1002,7 +1199,7 @@ mod tests {
         // (e.g. `shared.Token`). The scaffold must flatten it to the owning
         // module's C symbol, never embed the dot or the referrer's module.
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "kitchen".into(),
                 functions: vec![Function {
@@ -1043,7 +1240,7 @@ mod tests {
     #[test]
     fn scaffold_multiple_modules() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![
                 Module {
                     name: "math".into(),

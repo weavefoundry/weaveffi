@@ -1,0 +1,67 @@
+version: "0.4.0"
+package:
+  name: shapes
+  version: "0.1.0"
+modules:
+  - name: shapes
+    doc: Rich-enum + numerics smoke test
+    enums:
+      - name: Shape
+        doc: An algebraic shape (sum type with associated data)
+        variants:
+          - name: Empty
+            value: 0
+            doc: The empty shape
+          - name: Circle
+            value: 1
+            doc: A circle with a radius
+            fields:
+              - { name: radius, type: f64, doc: Radius in points }
+          - name: Rectangle
+            value: 2
+            doc: An axis-aligned rectangle
+            fields:
+              - { name: width, type: f32 }
+              - { name: height, type: f32 }
+          - name: Labeled
+            value: 3
+            doc: A labeled shape with a small count
+            fields:
+              - { name: label, type: string }
+              - { name: count, type: u8 }
+      - name: Channel
+        doc: A plain C-style enum (no payloads)
+        variants:
+          - { name: Red, value: 0 }
+          - { name: Green, value: 1 }
+          - { name: Blue, value: 2 }
+    functions:
+      - name: describe
+        doc: Render a shape to a string
+        params:
+          - { name: shape, type: Shape }
+        return: string
+      - name: scale
+        doc: Scale a shape by a factor, returning a new shape
+        params:
+          - { name: shape, type: Shape }
+          - { name: factor, type: f64 }
+        return: Shape
+      - name: sum_bytes
+        doc: Sum a list of bytes into a wide integer (numerics smoke)
+        params:
+          - { name: values, type: "[u8]" }
+        return: u64
+generators:
+  ruby:
+    module_name: Shapes
+  dotnet:
+    namespace: Shapes
+  swift:
+    module_name: Shapes
+  cpp:
+    namespace: shapes
+  dart:
+    package_name: shapes
+  go:
+    module_path: github.com/example/shapes

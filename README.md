@@ -1,6 +1,6 @@
 # WeaveFFI
 
-[![CI](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml/badge.svg)](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT) [![crates.io](https://img.shields.io/crates/v/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli) [![Schema](https://img.shields.io/badge/schema-0.3.0-orange)](./weaveffi.schema.json) [![downloads](https://img.shields.io/crates/d/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli)
+[![CI](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml/badge.svg)](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT) [![crates.io](https://img.shields.io/crates/v/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli) [![Schema](https://img.shields.io/badge/schema-0.4.0-orange)](./weaveffi.schema.json) [![downloads](https://img.shields.io/crates/d/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli)
 
 WeaveFFI generates type-safe bindings for 11 languages from a single IDL —
 no hand-written JNI, no duplicate implementations, no unsafe boilerplate.
@@ -19,7 +19,7 @@ cargo install weaveffi-cli
 **2. Define your API** in `contacts.yml`:
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: contacts
     structs:
@@ -237,7 +237,7 @@ Verify the install:
 
 ```bash
 weaveffi --version
-weaveffi schema-version    # prints 0.3.0
+weaveffi schema-version    # prints 0.4.0
 ```
 
 ## CLI reference
@@ -253,7 +253,7 @@ weaveffi schema-version    # prints 0.3.0
 | `weaveffi format <file>` | Rewrite an IDL file in canonical form (sorted keys); `--check` for CI |
 | `weaveffi watch <file>` | Re-run `generate` whenever the IDL file changes |
 | `weaveffi schema --format json-schema` | Print the JSON Schema for the IDL |
-| `weaveffi schema-version` | Print the current IR schema version (`0.3.0`) |
+| `weaveffi schema-version` | Print the current IR schema version (`0.4.0`) |
 | `weaveffi doctor` | Check for required toolchains; `--target swift` to scope to one language, `--format json` for CI |
 | `weaveffi completions <shell>` | Print shell completion scripts (`bash`, `zsh`, `fish`, `powershell`, `elvish`) |
 
@@ -261,7 +261,7 @@ Reference the JSON Schema from your IDL for editor autocompletion:
 
 ```yaml
 # yaml-language-server: $schema=./weaveffi.schema.json
-version: "0.3.0"
+version: "0.4.0"
 modules: ...
 ```
 

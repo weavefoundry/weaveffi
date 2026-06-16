@@ -85,7 +85,7 @@ fn parse_error_toml_shows_filename() {
 fn validation_error_duplicate_module_shows_suggestion() {
     let dir = tempfile::tempdir().unwrap();
     let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: foo
     functions:
@@ -123,7 +123,7 @@ modules:
 fn async_function_validates_successfully() {
     let dir = tempfile::tempdir().unwrap();
     let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: mymod
     functions:
@@ -149,7 +149,7 @@ modules:
 fn validation_error_duplicate_function_shows_suggestion() {
     let dir = tempfile::tempdir().unwrap();
     let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: mymod
     functions:
@@ -209,7 +209,7 @@ fn generate_parse_error_shows_filename_and_suggestion() {
 fn generate_validation_error_shows_suggestion() {
     let dir = tempfile::tempdir().unwrap();
     let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: dup
     functions:
@@ -249,7 +249,7 @@ modules:
 fn validate_with_warnings() {
     let dir = tempfile::tempdir().unwrap();
     let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: nodocs
     functions:

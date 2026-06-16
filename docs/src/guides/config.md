@@ -57,7 +57,7 @@ The `[global]` table accepts the alias `[weaveffi]`.
 ### 2. Embed `generators:` in the IDL
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: math
     functions:

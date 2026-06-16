@@ -166,14 +166,32 @@ pub struct StructBinding {
     pub builder: Option<BuilderBinding>,
 }
 
-/// An enum, fully lowered. WeaveFFI enums are C-style integer discriminants.
+/// An enum, fully lowered.
+///
+/// A *C-style* enum (every variant a bare discriminant) carries only
+/// [`variants`](Self::variants) and crosses the ABI by value as an integer. An
+/// *algebraic* (sum-type) enum — at least one variant with associated data —
+/// additionally carries [`rich`](Self::rich) and crosses the ABI as an opaque
+/// object pointer (tag getter + per-variant constructors and field getters +
+/// destructor), exactly like a struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumBinding {
     pub name: String,
     pub doc: Option<String>,
     /// `{prefix}_{module_path}_{name}`.
     pub c_tag: String,
+    /// Every variant's discriminant name/value, in declaration order. Present
+    /// for both kinds (the discriminant of a rich enum is its tag value).
     pub variants: Vec<EnumVariantBinding>,
+    /// `Some` iff this is a rich (algebraic) enum.
+    pub rich: Option<RichEnumBinding>,
+}
+
+impl EnumBinding {
+    /// `true` when this is a rich (algebraic) sum-type enum.
+    pub fn is_rich(&self) -> bool {
+        self.rich.is_some()
+    }
 }
 
 /// A single enum variant with its precomputed C constant name.
@@ -184,6 +202,39 @@ pub struct EnumVariantBinding {
     pub doc: Option<String>,
     /// `{enum_c_tag}_{variant}`.
     pub c_const: String,
+}
+
+/// The opaque-object surface of a rich (algebraic) enum: how its tag is read,
+/// how each variant is constructed and projected, and how the object is freed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RichEnumBinding {
+    /// `int32_t {tag_symbol}(const {c_tag}* self)` — returns the active
+    /// variant's discriminant (matching the per-variant
+    /// [`c_const`](EnumVariantBinding::c_const) values).
+    pub tag_symbol: String,
+    /// `void {destroy_symbol}({c_tag}* self)`.
+    pub destroy_symbol: String,
+    /// Per-variant constructors and field getters, in declaration order
+    /// (parallel to [`EnumBinding::variants`]).
+    pub variants: Vec<RichVariantBinding>,
+}
+
+/// One variant of a rich enum: its constructor and the getters for its
+/// associated data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RichVariantBinding {
+    pub name: String,
+    pub doc: Option<String>,
+    /// The variant's discriminant value (matches the tag getter's result).
+    pub value: i32,
+    /// `{enum_c_tag}_{variant}` — the discriminant constant.
+    pub c_const: String,
+    /// `{c_tag}_{variant}_new(<field slots>, error* out_err) -> {c_tag}*`.
+    /// A unit variant's constructor takes only `out_err`.
+    pub create: AbiFn,
+    /// Associated data. Each field's getter is `{c_tag}_{variant}_get_{field}`
+    /// with an implicit leading `const {c_tag}* self`; empty for a unit variant.
+    pub fields: Vec<FieldBinding>,
 }
 
 /// A callback function-pointer typedef declared at module scope.
@@ -358,11 +409,65 @@ fn lower_enum(e: &EnumDef, path: &str, prefix: &str) -> EnumBinding {
             c_const: format!("{c_tag}_{}", v.name),
         })
         .collect();
+
+    // A rich (algebraic) enum gains an opaque-object surface mirroring a
+    // struct: a tag getter, a destructor, and per-variant constructors and
+    // field getters. The variant name namespaces the per-variant symbols.
+    let rich = e.is_rich().then(|| {
+        let variants = e
+            .variants
+            .iter()
+            .map(|v| {
+                let fields: Vec<FieldBinding> = v
+                    .fields
+                    .iter()
+                    .map(|f| {
+                        let r = lower_return(&f.ty, path);
+                        FieldBinding {
+                            name: f.name.clone(),
+                            doc: f.doc.clone(),
+                            ty: f.ty.clone(),
+                            getter_symbol: format!("{c_tag}_{}_get_{}", v.name, f.name),
+                            getter_ret: r.ret,
+                            getter_out_params: r.out_params,
+                            value_params: lower_param(&f.name, &f.ty, path, false),
+                        }
+                    })
+                    .collect();
+                let mut create_params: Vec<AbiParam> = v
+                    .fields
+                    .iter()
+                    .flat_map(|f| lower_param(&f.name, &f.ty, path, false))
+                    .collect();
+                create_params.push(error_out_param());
+                let create = AbiFn {
+                    symbol: format!("{c_tag}_{}_new", v.name),
+                    params: create_params,
+                    ret: CType::ptr(CType::Named(format!("{path}_{}", e.name))),
+                };
+                RichVariantBinding {
+                    name: v.name.clone(),
+                    doc: v.doc.clone(),
+                    value: v.value,
+                    c_const: format!("{c_tag}_{}", v.name),
+                    create,
+                    fields,
+                }
+            })
+            .collect();
+        RichEnumBinding {
+            tag_symbol: format!("{c_tag}_tag"),
+            destroy_symbol: format!("{c_tag}_destroy"),
+            variants,
+        }
+    });
+
     EnumBinding {
         name: e.name.clone(),
         doc: e.doc.clone(),
         c_tag,
         variants,
+        rich,
     }
 }
 
@@ -593,7 +698,7 @@ mod tests {
 
     fn api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules,
             generators: None,
             package: None,
@@ -760,11 +865,13 @@ mod tests {
                         name: "Red".into(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Green".into(),
                         value: 1,
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }],

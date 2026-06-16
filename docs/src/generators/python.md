@@ -34,12 +34,19 @@ The package directory follows the IDL `package.name` (a package named
 | `u32`        | `int`                | `ctypes.c_uint32`                  |
 | `i64`        | `int`                | `ctypes.c_int64`                   |
 | `f64`        | `float`              | `ctypes.c_double`                  |
+| `i8`         | `int`                | `ctypes.c_int8`                    |
+| `i16`        | `int`                | `ctypes.c_int16`                   |
+| `u8`         | `int`                | `ctypes.c_uint8`                   |
+| `u16`        | `int`                | `ctypes.c_uint16`                  |
+| `u64`        | `int`                | `ctypes.c_uint64`                  |
+| `f32`        | `float`              | `ctypes.c_float`                   |
 | `bool`       | `bool`               | `ctypes.c_int32`                   |
 | `string`     | `str`                | `ctypes.c_char_p`                  |
 | `bytes`      | `bytes`              | `ctypes.POINTER(ctypes.c_uint8)` + `ctypes.c_size_t` |
 | `handle`     | `int`                | `ctypes.c_uint64`                  |
 | `Struct`     | `"StructName"`       | `ctypes.c_void_p`                  |
-| `Enum`       | `"EnumName"`         | `ctypes.c_int32`                   |
+| `Enum` (plain) | `"EnumName"`       | `ctypes.c_int32`                   |
+| `Enum` (rich)  | `"EnumName"`       | `ctypes.c_void_p`                  |
 | `T?`         | `Optional[T]`        | `ctypes.POINTER(scalar)` for values; same pointer for strings/structs |
 | `[T]`        | `List[T]`            | `ctypes.POINTER(scalar)` + `ctypes.c_size_t` |
 | `{K: V}`     | `Dict[K, V]`         | key/value pointer arrays + `ctypes.c_size_t` |
@@ -51,7 +58,7 @@ standard fixed-width boolean type across ABIs.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: contacts
     enums:
@@ -177,6 +184,99 @@ def contacts_create_contact(name: str, email: Optional[str], contact_type: "Cont
 Wrapper names carry the IDL module prefix by default
 (`contacts_create_contact`); set `strip_module_prefix: true` in the
 Python generator config to drop it.
+
+## Rich (algebraic) enums
+
+A rich (algebraic) enum is a sum type whose variants carry associated
+data. Unlike a plain C-style `Enum` — which crosses the boundary as a
+bare `ctypes.c_int32` discriminant — a rich enum lowers to an **opaque
+object handle**, so the generator emits a wrapper class with exactly the
+same ownership model as a struct wrapper: a `ctypes.c_void_p` held
+behind `@property` accessors and freed by `__del__`.
+
+Given a `Shape` enum with variants `Empty`, `Circle { radius: f64 }`,
+`Rectangle { width: f32, height: f32 }`, and `Labeled { label: string,
+count: u8 }`, the generated class exposes a nested `Tag` `IntEnum`, one
+`@classmethod` constructor per variant, a `tag` property, and a
+per-variant field getter for each payload:
+
+```python
+class Shape:
+    """An algebraic shape (sum type with associated data)"""
+
+    class Tag(IntEnum):
+        Empty = 0
+        Circle = 1
+        Rectangle = 2
+        Labeled = 3
+
+    def __del__(self) -> None:
+        if self._ptr is not None:
+            _lib.weaveffi_shapes_Shape_destroy.argtypes = [ctypes.c_void_p]
+            _lib.weaveffi_shapes_Shape_destroy.restype = None
+            _lib.weaveffi_shapes_Shape_destroy(self._ptr)
+            self._ptr = None
+
+    @property
+    def tag(self) -> int:
+        _fn = _lib.weaveffi_shapes_Shape_tag
+        _fn.argtypes = [ctypes.c_void_p]
+        _fn.restype = ctypes.c_int32
+        return _fn(self._ptr)
+
+    @classmethod
+    def circle(cls, radius: float) -> "Shape":
+        """A circle with a radius"""
+        _fn = _lib.weaveffi_shapes_Shape_Circle_new
+        _fn.argtypes = [ctypes.c_double, ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_void_p
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(radius, ctypes.byref(_err))
+        _check_error(_err)
+        if _result is None:
+            raise WeaveFFIError(-1, "null pointer")
+        return cls(_result)
+
+    @property
+    def circle_radius(self) -> float:
+        """Radius in points"""
+        _fn = _lib.weaveffi_shapes_Shape_Circle_get_radius
+        _fn.argtypes = [ctypes.c_void_p]
+        _fn.restype = ctypes.c_double
+        return _fn(self._ptr)
+```
+
+The full surface mirrors the variants: constructors `Shape.empty()`,
+`Shape.circle(radius)`, `Shape.rectangle(width, height)`, and
+`Shape.labeled(label, count)` (the last takes `ctypes.c_char_p` +
+`ctypes.c_uint8`); field getters `circle_radius`, `rectangle_width`,
+`rectangle_height`, `labeled_label`, and `labeled_count`. Each C symbol
+follows the `weaveffi_shapes_Shape_<Variant>_new` /
+`weaveffi_shapes_Shape_<Variant>_get_<field>` pattern, with
+`weaveffi_shapes_Shape_tag` reading the discriminant.
+
+Construct a couple of variants, read the tag and a field, then hand the
+wrapper to a free function:
+
+```python
+from weaveffi import Shape, shapes_describe, shapes_scale
+
+circle = Shape.circle(2.0)
+labeled = Shape.labeled("unit", 3)
+
+if circle.tag == Shape.Tag.Circle:
+    print(circle.circle_radius)      # 2.0
+print(labeled.labeled_count)         # 3
+
+print(shapes_describe(circle))       # render via the C ABI
+bigger = shapes_scale(circle, 3.0)   # returns a brand-new Shape
+```
+
+**Ownership:** each `Shape` owns its `ctypes.c_void_p`; `__del__` calls
+`weaveffi_shapes_Shape_destroy` once the last Python reference is
+dropped, and the `Shape` returned by `shapes_scale` is owned the same
+way. The `.pyi` stub mirrors the class — nested `Tag`, `@classmethod`
+constructors, and `@property` getters — for IDE and `mypy` support.
 
 ## Build instructions
 
