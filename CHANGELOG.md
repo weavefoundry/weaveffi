@@ -1,3 +1,13 @@
+## [0.10.0](https://github.com/weavefoundry/weaveffi/compare/v0.9.0...v0.10.0) (2026-06-16)
+
+### ⚠ BREAKING CHANGES
+
+* add rich algebraic enums and expanded numeric primitives (#16)
+
+### Features
+
+* add rich algebraic enums and expanded numeric primitives ([#16](https://github.com/weavefoundry/weaveffi/issues/16)) ([e51fb88](https://github.com/weavefoundry/weaveffi/commit/e51fb88c7b81e2505f02e4079407555bb2d41f0b))
+
 ## [0.9.0](https://github.com/weavefoundry/weaveffi/compare/v0.8.0...v0.9.0) (2026-06-10)
 
 ### ⚠ BREAKING CHANGES
