@@ -75,7 +75,7 @@ pub fn render_json_prelude(input_basename: &str) -> String {
 /// Runtime symbols (functions and types) that consumer code links against from
 /// the `weaveffi-abi` runtime: the `weaveffi_error`/`weaveffi_handle_t`/
 /// `weaveffi_cancel_token` types and every `#[no_mangle]` entry point that
-/// [`weaveffi_abi::export_runtime!`] emits into the consumer cdylib.
+/// `weaveffi_abi::export_runtime!` emits into the consumer cdylib.
 ///
 /// Generators that emit C/C++ headers use this list to produce
 /// `#define {prefix}_{name} weaveffi_{name}` aliases at the top of the header
