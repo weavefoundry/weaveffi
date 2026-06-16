@@ -17,7 +17,7 @@ use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, walk_modules, DocCommentStyle};
 use weaveffi_core::model::{
     BindingModel, CallShape, EnumBinding, FieldBinding, FnBinding, ListenerBinding, ModuleBinding,
-    ParamBinding, StructBinding,
+    ParamBinding, RichVariantBinding, StructBinding,
 };
 use weaveffi_core::utils::{
     local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
@@ -227,9 +227,15 @@ fn emit_fn_doc(out: &mut String, doc: &Option<String>, params: &[ParamBinding], 
 
 fn swift_type_for(t: &TypeRef) -> String {
     match t {
+        TypeRef::I8 => "Int8".to_string(),
+        TypeRef::I16 => "Int16".to_string(),
         TypeRef::I32 => "Int32".to_string(),
+        TypeRef::U8 => "UInt8".to_string(),
+        TypeRef::U16 => "UInt16".to_string(),
         TypeRef::U32 => "UInt32".to_string(),
+        TypeRef::U64 => "UInt64".to_string(),
         TypeRef::I64 => "Int64".to_string(),
+        TypeRef::F32 => "Float".to_string(),
         TypeRef::F64 => "Double".to_string(),
         TypeRef::Bool => "Bool".to_string(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "String".to_string(),
@@ -291,9 +297,15 @@ fn swift_type_ctx(t: &TypeRef, ctx: SwiftCtx) -> String {
 fn is_c_value_type(ty: &TypeRef) -> bool {
     matches!(
         ty,
-        TypeRef::I32
+        TypeRef::I8
+            | TypeRef::I16
+            | TypeRef::I32
+            | TypeRef::U8
+            | TypeRef::U16
             | TypeRef::U32
+            | TypeRef::U64
             | TypeRef::I64
+            | TypeRef::F32
             | TypeRef::F64
             | TypeRef::Bool
             | TypeRef::Handle
@@ -353,6 +365,126 @@ fn render_swift_enum(out: &mut String, e: &EnumBinding) {
         ));
     }
     out.push_str("}\n\n");
+}
+
+/// Render a rich (algebraic) enum as an opaque-object wrapper class, mirroring
+/// the struct wrapper: it owns the C handle (`let ptr: OpaquePointer`), frees it
+/// in `deinit` via the enum's `_destroy`, exposes a nested `Tag: Int32`
+/// discriminant plus a `tag` reader, a throwing static factory per variant
+/// (`Shape.circle(2.0)`), and per-variant field getters namespaced by variant
+/// (`circleRadius`) so identically-named fields on different variants never
+/// collide. Functions that take or return the enum see it lowered to
+/// [`TypeRef::Struct`], so the existing `x.ptr` / `T(ptr:)` marshalling binds
+/// them with no special-casing.
+fn render_swift_rich_enum(
+    out: &mut String,
+    c_prefix: &str,
+    module_path: &str,
+    e: &EnumBinding,
+    ctx: SwiftCtx,
+) {
+    let Some(rich) = &e.rich else {
+        return;
+    };
+    let class_name = &e.name;
+
+    emit_doc(out, &e.doc, "");
+    out.push_str(&format!("public class {} {{\n", class_name));
+    out.push_str("    let ptr: OpaquePointer\n\n");
+    out.push_str("    init(ptr: OpaquePointer) {\n");
+    out.push_str("        self.ptr = ptr\n");
+    out.push_str("    }\n\n");
+    out.push_str(&format!(
+        "    deinit {{\n        {}(ptr)\n    }}\n\n",
+        rich.destroy_symbol
+    ));
+
+    // The C tag getter returns `int32_t`, so the nested discriminant enum is
+    // always `Int32`-backed (regardless of the variant value signs).
+    out.push_str("    public enum Tag: Int32 {\n");
+    for v in &e.variants {
+        emit_doc(out, &v.doc, "        ");
+        out.push_str(&format!(
+            "        case {} = {}\n",
+            v.name.to_lower_camel_case(),
+            v.value
+        ));
+    }
+    out.push_str("    }\n\n");
+
+    out.push_str("    /// The active variant's discriminant.\n");
+    out.push_str("    public var tag: Tag {\n");
+    out.push_str(&format!(
+        "        return Tag(rawValue: {}(ptr))!\n",
+        rich.tag_symbol
+    ));
+    out.push_str("    }\n\n");
+
+    for v in &rich.variants {
+        render_swift_rich_variant_factory(out, c_prefix, module_path, class_name, v, ctx);
+    }
+
+    // Getters are namespaced per variant (`circleRadius`) and reuse the struct
+    // field getter marshalling unchanged: the field's `getter_symbol` already
+    // encodes the per-variant C accessor, only the Swift property name differs.
+    for v in &rich.variants {
+        for f in &v.fields {
+            let mut named = f.clone();
+            named.name = format!(
+                "{}{}",
+                v.name.to_lower_camel_case(),
+                f.name.to_upper_camel_case()
+            );
+            render_swift_getter(out, &named, ctx);
+        }
+    }
+
+    out.push_str("}\n\n");
+}
+
+/// One throwing static factory for a rich-enum variant (`static func
+/// circle(_ radius: Double) throws -> Shape`). Reuses the struct `create`
+/// marshalling: a buffer-free variant calls its `_new` symbol directly, while a
+/// variant carrying a string/bytes/list/map payload threads the same
+/// `withCString`/buffer staging the struct builder uses.
+fn render_swift_rich_variant_factory(
+    out: &mut String,
+    c_prefix: &str,
+    module_path: &str,
+    class_name: &str,
+    v: &RichVariantBinding,
+    ctx: SwiftCtx,
+) {
+    let params = struct_fields_as_params(&v.fields);
+    let create_sym = &v.create.symbol;
+
+    emit_doc(out, &v.doc, "    ");
+    let _ = write!(
+        out,
+        "    public static func {}(",
+        v.name.to_lower_camel_case()
+    );
+    write_swift_params_sig(out, &params, ctx);
+    let _ = writeln!(out, ") throws -> {} {{", class_name);
+    out.push_str("        var err = weaveffi_error(code: 0, message: nil)\n");
+
+    if !has_buffer_params(&params) {
+        let call_args = build_c_call_args(&params, c_prefix, module_path);
+        if call_args.is_empty() {
+            let _ = writeln!(out, "        let ptr = {}(&err)", create_sym);
+        } else {
+            let _ = writeln!(out, "        let ptr = {}({}, &err)", create_sym, call_args);
+        }
+        out.push_str("        try check(&err)\n");
+        out.push_str(
+            "        guard let ptr = ptr else { throw WeaveFFIError.error(code: -1, message: \"null pointer\") }\n",
+        );
+        let _ = writeln!(out, "        return {}(ptr: ptr)", class_name);
+    } else {
+        render_buffered_struct_create(out, c_prefix, module_path, create_sym, &params, class_name);
+    }
+
+    out.push_str("    }\n\n");
 }
 
 fn render_swift_wrapper(
@@ -515,7 +647,14 @@ fn render_swift_module_types(
 ) {
     let mb = by_path[module_path];
     for e in &mb.enums {
-        render_swift_enum(out, e);
+        // A rich (algebraic) enum is an opaque object, emitted as a wrapper
+        // class alongside structs; only a plain C-style enum maps to a Swift
+        // `enum`.
+        if e.is_rich() {
+            render_swift_rich_enum(out, c_prefix, module_path, e, ctx);
+        } else {
+            render_swift_enum(out, e);
+        }
     }
     for s in &mb.structs {
         render_swift_struct(out, s, ctx);
@@ -686,7 +825,8 @@ fn render_swift_builder(out: &mut String, c_prefix: &str, module_name: &str, s: 
         );
         out.push_str(&format!("        return {}(ptr: ptr)\n", class_name));
     } else {
-        render_buffered_struct_create(out, c_prefix, module_name, prefix, &params, class_name);
+        let create_sym = format!("{}_create", prefix);
+        render_buffered_struct_create(out, c_prefix, module_name, &create_sym, &params, class_name);
     }
 
     out.push_str("    }\n}\n\n");
@@ -910,7 +1050,17 @@ fn swift_cb_arg_expr(p: &ParamBinding, ctx: SwiftCtx) -> String {
     let slots = abi::lower_param(&p.name, &p.ty, "", false);
     let n0 = slots[0].name.clone();
     match &p.ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => n0,
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::U64
+        | TypeRef::I64
+        | TypeRef::F32
+        | TypeRef::F64
+        | TypeRef::Handle => n0,
         TypeRef::Bool => format!("{n0} != 0"),
         TypeRef::Enum(name) => {
             let local = swift_type_ctx(&p.ty, ctx);
@@ -1859,9 +2009,15 @@ fn render_list_return_inner(
 
 fn swift_c_ptr_element(ty: &TypeRef) -> String {
     match ty {
+        TypeRef::I8 => "Int8".to_string(),
+        TypeRef::I16 => "Int16".to_string(),
         TypeRef::I32 => "Int32".to_string(),
+        TypeRef::U8 => "UInt8".to_string(),
+        TypeRef::U16 => "UInt16".to_string(),
         TypeRef::U32 => "UInt32".to_string(),
+        TypeRef::U64 => "UInt64".to_string(),
         TypeRef::I64 => "Int64".to_string(),
+        TypeRef::F32 => "Float".to_string(),
         TypeRef::F64 => "Double".to_string(),
         TypeRef::Bool => "Bool".to_string(),
         TypeRef::Handle => "UInt64".to_string(),
@@ -2462,12 +2618,14 @@ fn render_buffered_call(
     }
 }
 
-/// Like `render_buffered_call`, but calls `{struct_prefix}_create` and always returns a struct pointer.
+/// Like `render_buffered_call`, but calls the constructor symbol `create_sym`
+/// and always returns a wrapper pointer. Shared by struct builders
+/// (`{c_tag}_create`) and rich-enum variant factories (`{c_tag}_{variant}_new`).
 fn render_buffered_struct_create(
     out: &mut String,
     c_prefix: &str,
     module_name: &str,
-    struct_prefix: &str,
+    create_sym: &str,
     params: &[ParamBinding],
     struct_class_name: &str,
 ) {
@@ -2664,7 +2822,6 @@ fn render_buffered_struct_create(
     }
 
     let inner_indent = "        ".to_string() + &"    ".repeat(closure_depth);
-    let create_sym = format!("{struct_prefix}_create");
     let call_args = build_c_call_args(params, c_prefix, module_name);
     let call_with_err = if call_args.is_empty() {
         format!("{}(&err)", create_sym)
@@ -2700,7 +2857,7 @@ mod tests {
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.3.0".to_string(),
+            version: "0.4.0".to_string(),
             modules,
             generators: None,
             package: None,
@@ -2815,16 +2972,19 @@ mod tests {
                         name: "Red".to_string(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Green".to_string(),
                         value: 1,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Blue".to_string(),
                         value: 2,
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }],
@@ -2861,11 +3021,13 @@ mod tests {
                         name: "InProgress".to_string(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "AllDone".to_string(),
                         value: 1,
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }],
@@ -3290,7 +3452,7 @@ mod tests {
     #[test]
     fn swift_builder_generated() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![],
@@ -3395,11 +3557,13 @@ mod tests {
                         name: "Red".to_string(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Green".to_string(),
                         value: 1,
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }],
@@ -3700,16 +3864,19 @@ mod tests {
                         name: "Red".to_string(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Green".to_string(),
                         value: 1,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Blue".to_string(),
                         value: 2,
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }],
@@ -4438,16 +4605,19 @@ mod tests {
                         name: "Red".into(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Green".into(),
                         value: 1,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Blue".into(),
                         value: 2,
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }],
@@ -5079,6 +5249,7 @@ mod tests {
                     name: "Small".into(),
                     value: 0,
                     doc: Some("A small one".into()),
+                    fields: vec![],
                 }],
             }],
             callbacks: vec![],
@@ -5155,5 +5326,360 @@ mod tests {
             "WeaveFFI.swift",
         );
         assert!(out.contains("/// - Parameter x: the input value"), "{out}");
+    }
+
+    /// The `shapes` sample: a rich (algebraic) enum `Shape` (a unit variant, an
+    /// f64 payload, two f32 payloads, and a string+u8 payload), a plain C-style
+    /// enum `Channel`, and the free functions that take/return `Shape` (lowered
+    /// to `TypeRef::Struct`) plus the numerics smoke `sum_bytes`.
+    fn shapes_api() -> Api {
+        use weaveffi_ir::ir::StructField;
+        fn field(name: &str, ty: TypeRef) -> StructField {
+            StructField {
+                name: name.into(),
+                ty,
+                doc: None,
+                default: None,
+            }
+        }
+        make_api(vec![Module {
+            name: "shapes".into(),
+            functions: vec![
+                Function {
+                    name: "describe".into(),
+                    params: vec![Param {
+                        name: "shape".into(),
+                        ty: TypeRef::Struct("Shape".into()),
+                        mutable: false,
+                        doc: None,
+                    }],
+                    returns: Some(TypeRef::StringUtf8),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "scale".into(),
+                    params: vec![
+                        Param {
+                            name: "shape".into(),
+                            ty: TypeRef::Struct("Shape".into()),
+                            mutable: false,
+                            doc: None,
+                        },
+                        Param {
+                            name: "factor".into(),
+                            ty: TypeRef::F64,
+                            mutable: false,
+                            doc: None,
+                        },
+                    ],
+                    returns: Some(TypeRef::Struct("Shape".into())),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "sum_bytes".into(),
+                    params: vec![Param {
+                        name: "values".into(),
+                        ty: TypeRef::List(Box::new(TypeRef::U8)),
+                        mutable: false,
+                        doc: None,
+                    }],
+                    returns: Some(TypeRef::U64),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+            ],
+            structs: vec![],
+            enums: vec![
+                EnumDef {
+                    name: "Shape".into(),
+                    doc: Some("An algebraic shape".into()),
+                    variants: vec![
+                        EnumVariant {
+                            name: "Empty".into(),
+                            value: 0,
+                            doc: Some("The empty shape".into()),
+                            fields: vec![],
+                        },
+                        EnumVariant {
+                            name: "Circle".into(),
+                            value: 1,
+                            doc: None,
+                            fields: vec![field("radius", TypeRef::F64)],
+                        },
+                        EnumVariant {
+                            name: "Rectangle".into(),
+                            value: 2,
+                            doc: None,
+                            fields: vec![
+                                field("width", TypeRef::F32),
+                                field("height", TypeRef::F32),
+                            ],
+                        },
+                        EnumVariant {
+                            name: "Labeled".into(),
+                            value: 3,
+                            doc: None,
+                            fields: vec![
+                                field("label", TypeRef::StringUtf8),
+                                field("count", TypeRef::U8),
+                            ],
+                        },
+                    ],
+                },
+                EnumDef {
+                    name: "Channel".into(),
+                    doc: None,
+                    variants: vec![
+                        EnumVariant {
+                            name: "Red".into(),
+                            value: 0,
+                            doc: None,
+                            fields: vec![],
+                        },
+                        EnumVariant {
+                            name: "Green".into(),
+                            value: 1,
+                            doc: None,
+                            fields: vec![],
+                        },
+                    ],
+                },
+            ],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }])
+    }
+
+    #[test]
+    fn rich_enum_emits_opaque_wrapper_class() {
+        let out = render_swift_wrapper(
+            &shapes_api(),
+            "weaveffi",
+            false,
+            "shapes.yml",
+            "Shapes.swift",
+        );
+        // Opaque-object wrapper mirroring a struct: owns the handle, frees it in
+        // deinit via the enum's _destroy. It must NOT be a plain Swift enum.
+        assert!(
+            out.contains("public class Shape {"),
+            "missing wrapper class: {out}"
+        );
+        assert!(
+            out.contains("let ptr: OpaquePointer"),
+            "missing ptr property: {out}"
+        );
+        assert!(
+            out.contains("init(ptr: OpaquePointer)"),
+            "missing init: {out}"
+        );
+        assert!(
+            out.contains("deinit {\n        weaveffi_shapes_Shape_destroy(ptr)"),
+            "missing destroy in deinit: {out}"
+        );
+        // A plain enum would be `public enum Shape: <raw> {`; the namespace
+        // `public enum Shapes {` must not trip this check.
+        assert!(
+            !out.contains("public enum Shape:"),
+            "rich enum must not be emitted as a plain enum: {out}"
+        );
+        // The sibling plain C-style enum is still a Swift enum.
+        assert!(
+            out.contains("public enum Channel: UInt32 {"),
+            "plain enum regressed: {out}"
+        );
+    }
+
+    #[test]
+    fn rich_enum_emits_tag_enum_and_reader() {
+        let out = render_swift_wrapper(
+            &shapes_api(),
+            "weaveffi",
+            false,
+            "shapes.yml",
+            "Shapes.swift",
+        );
+        assert!(
+            out.contains("public enum Tag: Int32 {"),
+            "missing Tag enum: {out}"
+        );
+        assert!(out.contains("case empty = 0"), "missing empty tag: {out}");
+        assert!(out.contains("case circle = 1"), "missing circle tag: {out}");
+        assert!(
+            out.contains("case rectangle = 2"),
+            "missing rectangle tag: {out}"
+        );
+        assert!(
+            out.contains("case labeled = 3"),
+            "missing labeled tag: {out}"
+        );
+        assert!(
+            out.contains("public var tag: Tag {"),
+            "missing tag reader: {out}"
+        );
+        assert!(
+            out.contains("return Tag(rawValue: weaveffi_shapes_Shape_tag(ptr))!"),
+            "missing tag getter call: {out}"
+        );
+    }
+
+    #[test]
+    fn rich_enum_emits_throwing_variant_factories() {
+        let out = render_swift_wrapper(
+            &shapes_api(),
+            "weaveffi",
+            false,
+            "shapes.yml",
+            "Shapes.swift",
+        );
+        // Unit variant: only out_err.
+        assert!(
+            out.contains("public static func empty() throws -> Shape {"),
+            "missing empty factory: {out}"
+        );
+        assert!(
+            out.contains("let ptr = weaveffi_shapes_Shape_Empty_new(&err)"),
+            "missing empty constructor call: {out}"
+        );
+        // f64 payload.
+        assert!(
+            out.contains("public static func circle(_ radius: Double) throws -> Shape {"),
+            "missing circle factory: {out}"
+        );
+        assert!(
+            out.contains("let ptr = weaveffi_shapes_Shape_Circle_new(radius, &err)"),
+            "missing circle constructor call: {out}"
+        );
+        // Two f32 payloads.
+        assert!(
+            out.contains(
+                "public static func rectangle(_ width: Float, _ height: Float) throws -> Shape {"
+            ),
+            "missing rectangle factory: {out}"
+        );
+        assert!(
+            out.contains("let ptr = weaveffi_shapes_Shape_Rectangle_new(width, height, &err)"),
+            "missing rectangle constructor call: {out}"
+        );
+        // string + u8 payload: the string threads through `withCString`.
+        assert!(
+            out.contains(
+                "public static func labeled(_ label: String, _ count: UInt8) throws -> Shape {"
+            ),
+            "missing labeled factory: {out}"
+        );
+        assert!(
+            out.contains("label.withCString { label_ptr in"),
+            "missing string staging for labeled: {out}"
+        );
+        assert!(
+            out.contains("weaveffi_shapes_Shape_Labeled_new(label_ptr, count, &err)"),
+            "missing labeled constructor call: {out}"
+        );
+        // Factories throw on a non-zero error code.
+        assert!(
+            out.contains("try check(&err)"),
+            "factory must check err: {out}"
+        );
+    }
+
+    #[test]
+    fn rich_enum_emits_per_variant_getters() {
+        let out = render_swift_wrapper(
+            &shapes_api(),
+            "weaveffi",
+            false,
+            "shapes.yml",
+            "Shapes.swift",
+        );
+        // Numeric getters, namespaced by variant to avoid collisions.
+        assert!(
+            out.contains("public var circleRadius: Double {"),
+            "missing circleRadius: {out}"
+        );
+        assert!(
+            out.contains("return weaveffi_shapes_Shape_Circle_get_radius(ptr)"),
+            "missing circleRadius call: {out}"
+        );
+        assert!(
+            out.contains("public var rectangleWidth: Float {"),
+            "missing rectangleWidth: {out}"
+        );
+        assert!(
+            out.contains("public var rectangleHeight: Float {"),
+            "missing rectangleHeight: {out}"
+        );
+        assert!(
+            out.contains("public var labeledCount: UInt8 {"),
+            "missing labeledCount: {out}"
+        );
+        // String getter frees the C string (reuses struct-field marshalling).
+        assert!(
+            out.contains("public var labeledLabel: String {"),
+            "missing labeledLabel: {out}"
+        );
+        assert!(
+            out.contains("let raw = weaveffi_shapes_Shape_Labeled_get_label(ptr)"),
+            "missing labeledLabel call: {out}"
+        );
+        assert!(
+            out.contains("weaveffi_free_string(raw)"),
+            "labeledLabel must free the C string: {out}"
+        );
+    }
+
+    #[test]
+    fn rich_enum_functions_marshal_the_handle() {
+        let out = render_swift_wrapper(
+            &shapes_api(),
+            "weaveffi",
+            false,
+            "shapes.yml",
+            "Shapes.swift",
+        );
+        // describe(Shape) -> String: passes the opaque pointer, frees the result.
+        assert!(
+            out.contains("public static func shapes_describe(_ shape: Shape) throws -> String {"),
+            "missing describe signature: {out}"
+        );
+        assert!(
+            out.contains("weaveffi_shapes_describe(shape.ptr, &err)"),
+            "describe must pass shape.ptr: {out}"
+        );
+        // scale(Shape, f64) -> Shape: rich enum in and out (wrapped via init).
+        assert!(
+            out.contains(
+                "public static func shapes_scale(_ shape: Shape, _ factor: Double) throws -> Shape {"
+            ),
+            "missing scale signature: {out}"
+        );
+        assert!(
+            out.contains("weaveffi_shapes_scale(shape.ptr, factor, &err)"),
+            "scale must pass shape.ptr + factor: {out}"
+        );
+        assert!(
+            out.contains("return Shape(ptr: rv)"),
+            "scale must wrap the returned handle: {out}"
+        );
+        // sum_bytes([u8]) -> u64: numerics smoke.
+        assert!(
+            out.contains(
+                "public static func shapes_sum_bytes(_ values: [UInt8]) throws -> UInt64 {"
+            ),
+            "missing sum_bytes signature: {out}"
+        );
     }
 }

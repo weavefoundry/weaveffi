@@ -131,9 +131,10 @@ pub fn walk_modules_with_path<'a>(
 /// Predicate: returns `true` when the IR type is represented as a
 /// pointer at the C ABI boundary.
 ///
-/// String types, byte buffers, struct values, typed handles, lists,
-/// maps, and iterators all cross the ABI as pointers. Scalars
-/// (`i32`/`bool`/etc.), `Handle`, and `Enum(_)` cross by value.
+/// String types, byte buffers, struct values (including rich/algebraic enums,
+/// which are spelled `Struct` after resolution), typed handles, lists, maps,
+/// and iterators all cross the ABI as pointers. Scalars (`i32`/`bool`/etc.),
+/// `Handle`, and a C-style `Enum(_)` cross by value.
 ///
 /// `Optional(T)` is *not* automatically a pointer here: callers that
 /// care about Optional pointer-ness (the C/C++ generators) recurse

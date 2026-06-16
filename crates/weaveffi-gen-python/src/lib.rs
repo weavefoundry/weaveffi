@@ -6,6 +6,7 @@
 //! bridges it into the generator pipeline.
 
 use camino::Utf8Path;
+use heck::ToSnakeCase;
 use serde::{Deserialize, Serialize};
 use weaveffi_core::abi::{self, CType};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
@@ -15,7 +16,7 @@ use weaveffi_core::codegen::common::{
 };
 use weaveffi_core::model::{
     BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
-    ListenerBinding, ModuleBinding, ParamBinding, StructBinding,
+    ListenerBinding, ModuleBinding, ParamBinding, RichVariantBinding, StructBinding,
 };
 use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::utils::{
@@ -219,9 +220,15 @@ weaveffi_core::impl_generator_via_backend!(PythonGenerator);
 
 fn py_ctypes_scalar(ty: &TypeRef) -> &'static str {
     match ty {
+        TypeRef::I8 => "ctypes.c_int8",
+        TypeRef::I16 => "ctypes.c_int16",
         TypeRef::I32 => "ctypes.c_int32",
+        TypeRef::U8 => "ctypes.c_uint8",
+        TypeRef::U16 => "ctypes.c_uint16",
         TypeRef::U32 => "ctypes.c_uint32",
         TypeRef::I64 => "ctypes.c_int64",
+        TypeRef::U64 => "ctypes.c_uint64",
+        TypeRef::F32 => "ctypes.c_float",
         TypeRef::F64 => "ctypes.c_double",
         TypeRef::Bool => "ctypes.c_int32",
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "ctypes.c_char_p",
@@ -238,13 +245,21 @@ fn py_ctypes_scalar(ty: &TypeRef) -> &'static str {
 
 fn py_type_hint(ty: &TypeRef) -> String {
     match ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle => "int".into(),
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::U64
+        | TypeRef::Handle => "int".into(),
         // Structs, enums, and typed handles all surface as bare local class names
         // in the generated module. A cross-module reference (e.g. `handle<Store>`
         // resolved to `kv.Store`) must still annotate the *local* `Store`, not the
         // qualified IR name, which is not a symbol in this module.
         TypeRef::TypedHandle(name) => format!("\"{}\"", local_type_name(name)),
-        TypeRef::F64 => "float".into(),
+        TypeRef::F32 | TypeRef::F64 => "float".into(),
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "str".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "bytes".into(),
@@ -264,10 +279,14 @@ fn py_type_hint(ty: &TypeRef) -> String {
 /// becomes the `c_char_p` convenience type.
 fn py_ctype(ty: &CType) -> String {
     match ty {
+        CType::Int8 => "ctypes.c_int8".into(),
+        CType::Int16 => "ctypes.c_int16".into(),
         CType::Int32 => "ctypes.c_int32".into(),
+        CType::Uint16 => "ctypes.c_uint16".into(),
         CType::Uint32 => "ctypes.c_uint32".into(),
         CType::Int64 => "ctypes.c_int64".into(),
         CType::Uint64 => "ctypes.c_uint64".into(),
+        CType::Float => "ctypes.c_float".into(),
         CType::Double => "ctypes.c_double".into(),
         CType::Bool => "ctypes.c_int32".into(),
         CType::Size => "ctypes.c_size_t".into(),
@@ -350,7 +369,19 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
         None => {
             out.push_str(&format!("{ind}_state[\"val\"] = None\n"));
         }
-        Some(TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle) => {
+        Some(
+            TypeRef::I8
+            | TypeRef::I16
+            | TypeRef::I32
+            | TypeRef::U8
+            | TypeRef::U16
+            | TypeRef::U32
+            | TypeRef::I64
+            | TypeRef::U64
+            | TypeRef::F32
+            | TypeRef::F64
+            | TypeRef::Handle,
+        ) => {
             out.push_str(&format!("{ind}_state[\"val\"] = result\n"));
         }
         Some(TypeRef::Bool) => {
@@ -783,6 +814,12 @@ def _bytes_to_string(ptr) -> Optional[str]:
 }
 
 fn render_enum(out: &mut String, e: &EnumBinding) {
+    // Rich (algebraic) enums cross the ABI as opaque objects, so they are
+    // emitted as wrapper classes (like structs), not plain `IntEnum`s.
+    if e.is_rich() {
+        render_rich_enum(out, e);
+        return;
+    }
     out.push_str(&format!("\n\nclass {}(IntEnum):\n", e.name));
     emit_docstring(out, &e.doc, "    ");
     for v in &e.variants {
@@ -796,6 +833,135 @@ fn render_enum(out: &mut String, e: &EnumBinding) {
         }
         out.push_str(&format!("    {} = {}\n", v.name, v.value));
     }
+}
+
+/// Render a rich (algebraic) enum as an opaque-object wrapper class, mirroring
+/// the Python struct wrapper: it owns the C handle and frees it once in
+/// `__del__` (matching [`render_struct`]), exposes a nested `Tag` `IntEnum`
+/// plus a `tag` property reading the active discriminant, one `@classmethod`
+/// factory per variant (`Shape.circle(radius)`), and per-variant field
+/// accessors namespaced by variant (`circle_radius`). The opaque-object surface
+/// (tag/destroy symbols, per-variant constructors and field getters) is
+/// precomputed in the binding model exactly like a struct's.
+fn render_rich_enum(out: &mut String, e: &EnumBinding) {
+    let rich = e
+        .rich
+        .as_ref()
+        .expect("render_rich_enum requires a rich (algebraic) enum");
+    let name = &e.name;
+    let destroy = &rich.destroy_symbol;
+    let tag_symbol = &rich.tag_symbol;
+
+    out.push_str(&format!("\n\nclass {}:\n", name));
+    emit_docstring(out, &e.doc, "    ");
+
+    // Nested discriminant enum (`Shape.Tag.Circle == 1`, …).
+    out.push_str("\n    class Tag(IntEnum):\n");
+    for v in &e.variants {
+        if let Some(d) = &v.doc {
+            let trimmed = d.trim();
+            if !trimmed.is_empty() {
+                for line in trimmed.lines() {
+                    out.push_str(&format!("        # {}\n", line));
+                }
+            }
+        }
+        out.push_str(&format!("        {} = {}\n", v.name, v.value));
+    }
+
+    // Ownership: keep the raw pointer and free it exactly once (no double-free).
+    out.push_str("\n    def __init__(self, _ptr: int) -> None:");
+    out.push_str("\n        self._ptr = _ptr");
+
+    out.push_str("\n\n    def __del__(self) -> None:");
+    out.push_str("\n        if self._ptr is not None:");
+    out.push_str(&format!(
+        "\n            _lib.{destroy}.argtypes = [ctypes.c_void_p]"
+    ));
+    out.push_str(&format!("\n            _lib.{destroy}.restype = None"));
+    out.push_str(&format!("\n            _lib.{destroy}(self._ptr)"));
+    out.push_str("\n            self._ptr = None");
+
+    // tag: read the active variant's discriminant (an `int`, comparable to the
+    // nested `Tag` members).
+    out.push_str("\n\n    @property\n    def tag(self) -> int:");
+    out.push_str(&format!("\n        _fn = _lib.{tag_symbol}"));
+    out.push_str("\n        _fn.argtypes = [ctypes.c_void_p]");
+    out.push_str("\n        _fn.restype = ctypes.c_int32");
+    out.push_str("\n        return _fn(self._ptr)");
+
+    // One factory classmethod per variant (`Shape.circle(2.5)`).
+    for v in &rich.variants {
+        render_rich_variant_factory(out, name, v);
+    }
+
+    // Per-variant field accessors, namespaced by variant to avoid collisions.
+    // Reuse the struct getter renderer (identical marshalling: string decode,
+    // bytes/list length out-params, wrapper construction, …) by projecting the
+    // namespaced Python name onto the field's precomputed getter symbol.
+    for v in &rich.variants {
+        let variant_snake = v.name.to_snake_case();
+        for f in &v.fields {
+            let mut namespaced = f.clone();
+            namespaced.name = format!("{variant_snake}_{}", f.name);
+            render_getter(out, &namespaced);
+        }
+    }
+    out.push('\n');
+}
+
+/// One variant constructor as a `@classmethod` factory. Mirrors the struct
+/// builder's `build()` marshalling: each variant field lowers to the same ABI
+/// argument slots, the call threads an `out_err` and is checked with
+/// `_check_error`, and the returned handle is wrapped (`return cls(_result)`).
+fn render_rich_variant_factory(out: &mut String, enum_name: &str, v: &RichVariantBinding) {
+    let factory = v.name.to_snake_case();
+    let ind = "        ";
+
+    let params_sig: Vec<String> = v
+        .fields
+        .iter()
+        .map(|f| format!("{}: {}", f.name, py_type_hint(&f.ty)))
+        .collect();
+    let sig = if params_sig.is_empty() {
+        "cls".to_string()
+    } else {
+        format!("cls, {}", params_sig.join(", "))
+    };
+    out.push_str(&format!(
+        "\n\n    @classmethod\n    def {factory}({sig}) -> \"{enum_name}\":\n"
+    ));
+    emit_docstring(out, &v.doc, ind);
+
+    out.push_str(&format!("{ind}_fn = _lib.{}\n", v.create.symbol));
+    let mut argtypes: Vec<String> = Vec::new();
+    for f in &v.fields {
+        argtypes.extend(py_param_argtypes(&f.ty));
+    }
+    argtypes.push("ctypes.POINTER(_WeaveFFIErrorStruct)".into());
+    out.push_str(&format!("{ind}_fn.argtypes = [{}]\n", argtypes.join(", ")));
+    out.push_str(&format!("{ind}_fn.restype = ctypes.c_void_p\n"));
+
+    for f in &v.fields {
+        for line in py_param_conversion(&f.name, &f.ty, ind) {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+
+    out.push_str(&format!("{ind}_err = _WeaveFFIErrorStruct()\n"));
+    let mut call_args: Vec<String> = Vec::new();
+    for f in &v.fields {
+        call_args.extend(py_param_call_args(&f.name, &f.ty));
+    }
+    call_args.push("ctypes.byref(_err)".into());
+    out.push_str(&format!("{ind}_result = _fn({})\n", call_args.join(", ")));
+    out.push_str(&format!("{ind}_check_error(_err)\n"));
+    out.push_str(&format!("{ind}if _result is None:\n"));
+    out.push_str(&format!(
+        "{ind}    raise WeaveFFIError(-1, \"null pointer\")\n"
+    ));
+    out.push_str(&format!("{ind}return cls(_result)\n"));
 }
 
 fn render_struct(out: &mut String, s: &StructBinding) {
@@ -908,8 +1074,16 @@ fn render_builder(out: &mut String, s: &StructBinding) {
 fn py_field_default(ty: &TypeRef) -> (String, String) {
     let hint = py_type_hint(ty);
     match ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle => ("0".into(), hint),
-        TypeRef::F64 => ("0.0".into(), hint),
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::U64
+        | TypeRef::Handle => ("0".into(), hint),
+        TypeRef::F32 | TypeRef::F64 => ("0.0".into(), hint),
         TypeRef::Bool => ("False".into(), hint),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => ("\"\"".into(), hint),
         TypeRef::Bytes | TypeRef::BorrowedBytes => ("b\"\"".into(), hint),
@@ -954,7 +1128,17 @@ fn py_callable_hint(params: &[ParamBinding]) -> String {
 /// name (slot names derive from it, mirroring [`abi::lower_param`]).
 fn py_cb_param_expr(n: &str, ty: &TypeRef) -> String {
     match ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => n.into(),
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::U64
+        | TypeRef::F32
+        | TypeRef::F64
+        | TypeRef::Handle => n.into(),
         TypeRef::Bool => format!("bool({n})"),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("_bytes_to_string({n})"),
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
@@ -1308,7 +1492,17 @@ fn py_param_conversion(name: &str, ty: &TypeRef, ind: &str) -> Vec<String> {
             vec![format!("{ind}_{name}_arr = ({s} * len({name}))(*{name})")]
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => {
+            TypeRef::I8
+            | TypeRef::I16
+            | TypeRef::I32
+            | TypeRef::U8
+            | TypeRef::U16
+            | TypeRef::U32
+            | TypeRef::I64
+            | TypeRef::U64
+            | TypeRef::F32
+            | TypeRef::F64
+            | TypeRef::Handle => {
                 let s = py_ctypes_scalar(inner);
                 vec![format!(
                     "{ind}_{name}_c = ctypes.byref({s}({name})) if {name} is not None else None"
@@ -1375,7 +1569,17 @@ fn py_param_conversion(name: &str, ty: &TypeRef, ind: &str) -> Vec<String> {
 
 fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
     match ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => {
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::U64
+        | TypeRef::F32
+        | TypeRef::F64
+        | TypeRef::Handle => {
             vec![name.to_string()]
         }
         TypeRef::Bool => vec![format!("1 if {name} else 0")],
@@ -1427,7 +1631,17 @@ fn py_read_element(expr: &str, ty: &TypeRef) -> String {
 
 fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
     match ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => {
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::U64
+        | TypeRef::F32
+        | TypeRef::F64
+        | TypeRef::Handle => {
             out.push_str(&format!("{ind}return _result\n"));
         }
         TypeRef::Bool => {
@@ -1725,7 +1939,11 @@ fn render_pyi_module(api: &Api, strip_module_prefix: bool, input_basename: &str)
     );
     for m in &model.modules {
         for e in &m.enums {
-            render_pyi_enum(&mut out, e);
+            if e.is_rich() {
+                render_pyi_rich_enum(&mut out, e);
+            } else {
+                render_pyi_enum(&mut out, e);
+            }
         }
         for s in &m.structs {
             render_pyi_struct(&mut out, s);
@@ -1749,6 +1967,51 @@ fn render_pyi_enum(out: &mut String, e: &EnumBinding) {
     for v in &e.variants {
         emit_doc(out, &v.doc, "    ");
         out.push_str(&format!("    {}: int\n", v.name));
+    }
+}
+
+/// `.pyi` stub for a rich (algebraic) enum: a class with a nested `Tag`
+/// `IntEnum`, the `tag` reader, a factory classmethod per variant, and the
+/// namespaced per-variant field properties — mirroring [`render_rich_enum`].
+fn render_pyi_rich_enum(out: &mut String, e: &EnumBinding) {
+    let Some(rich) = e.rich.as_ref() else {
+        return;
+    };
+    out.push('\n');
+    emit_doc(out, &e.doc, "");
+    out.push_str(&format!("class {}:\n", e.name));
+    out.push_str("    class Tag(IntEnum):\n");
+    for v in &e.variants {
+        emit_doc(out, &v.doc, "        ");
+        out.push_str(&format!("        {}: int\n", v.name));
+    }
+    out.push_str("    @property\n    def tag(self) -> int: ...\n");
+    for v in &rich.variants {
+        let factory = v.name.to_snake_case();
+        let params: Vec<String> = v
+            .fields
+            .iter()
+            .map(|f| format!("{}: {}", f.name, py_type_hint(&f.ty)))
+            .collect();
+        let sig = if params.is_empty() {
+            "cls".to_string()
+        } else {
+            format!("cls, {}", params.join(", "))
+        };
+        out.push_str(&format!(
+            "    @classmethod\n    def {factory}({sig}) -> \"{}\": ...\n",
+            e.name
+        ));
+    }
+    for v in &rich.variants {
+        let variant_snake = v.name.to_snake_case();
+        for f in &v.fields {
+            out.push_str(&format!(
+                "    @property\n    def {variant_snake}_{}(self) -> {}: ...\n",
+                f.name,
+                py_type_hint(&f.ty)
+            ));
+        }
     }
 }
 
@@ -1835,7 +2098,7 @@ mod tests {
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules,
             generators: None,
             package: None,
@@ -2098,16 +2361,19 @@ mod tests {
                         name: "Red".into(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Green".into(),
                         value: 1,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Blue".into(),
                         value: 2,
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }],
@@ -2242,7 +2508,7 @@ mod tests {
     #[test]
     fn python_builder_generated() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![],
@@ -2722,11 +2988,13 @@ mod tests {
                         name: "Personal".into(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Work".into(),
                         value: 1,
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }],
@@ -3018,11 +3286,13 @@ mod tests {
                         name: "Personal".into(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Work".into(),
                         value: 1,
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }],
@@ -3361,16 +3631,19 @@ mod tests {
                         name: "Personal".into(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Work".into(),
                         value: 1,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Other".into(),
                         value: 2,
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }],
@@ -3705,16 +3978,19 @@ mod tests {
                         name: "Personal".into(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Work".into(),
                         value: 1,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Other".into(),
                         value: 2,
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }],
@@ -3861,16 +4137,19 @@ mod tests {
                         name: "Personal".into(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Work".into(),
                         value: 1,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Other".into(),
                         value: 2,
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }],
@@ -4462,16 +4741,19 @@ mod tests {
                         name: "Red".into(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Green".into(),
                         value: 1,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Blue".into(),
                         value: 2,
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }],
@@ -4490,7 +4772,7 @@ mod tests {
     #[test]
     fn python_typed_handle_type() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![Function {
@@ -4803,6 +5085,7 @@ mod tests {
                     name: "Info".into(),
                     value: 0,
                     doc: None,
+                    fields: vec![],
                 }],
             }],
             callbacks: vec![CallbackDef {
@@ -5161,6 +5444,7 @@ mod tests {
                     name: "Small".into(),
                     value: 0,
                     doc: Some("A small one".into()),
+                    fields: vec![],
                 }],
             }],
             callbacks: vec![],

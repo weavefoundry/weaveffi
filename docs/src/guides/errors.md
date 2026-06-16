@@ -27,7 +27,7 @@ Reach for this guide when:
 ### Define an error domain in the IDL
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: contacts
     errors:

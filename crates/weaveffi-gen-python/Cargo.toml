@@ -13,6 +13,7 @@ categories = ["development-tools::ffi"]
 weaveffi-core = { path = "../weaveffi-core", version = "0.9.0" }
 weaveffi-ir = { path = "../weaveffi-ir", version = "0.9.0" }
 camino = { workspace = true }
+heck = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]

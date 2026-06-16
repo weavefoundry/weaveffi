@@ -113,6 +113,7 @@ fn validation_error_code(err: &ValidationError) -> &'static str {
         ValidationError::DuplicateEnumName { .. } => "DuplicateEnumName",
         ValidationError::EmptyEnum { .. } => "EmptyEnum",
         ValidationError::DuplicateEnumVariant { .. } => "DuplicateEnumVariant",
+        ValidationError::DuplicateEnumVariantField { .. } => "DuplicateEnumVariantField",
         ValidationError::DuplicateEnumValue { .. } => "DuplicateEnumValue",
         ValidationError::UnknownTypeRef { .. } => "UnknownTypeRef",
         ValidationError::InvalidMapKey { .. } => "InvalidMapKey",
@@ -190,6 +191,15 @@ fn validation_error_to_json(err: &ValidationError) -> serde_json::Value {
         ValidationError::DuplicateEnumVariant { enum_name, variant } => {
             obj.insert("enum".into(), Value::String(enum_name.clone()));
             obj.insert("variant".into(), Value::String(variant.clone()));
+        }
+        ValidationError::DuplicateEnumVariantField {
+            enum_name,
+            variant,
+            field,
+        } => {
+            obj.insert("enum".into(), Value::String(enum_name.clone()));
+            obj.insert("variant".into(), Value::String(variant.clone()));
+            obj.insert("field".into(), Value::String(field.clone()));
         }
         ValidationError::DuplicateEnumValue { enum_name, value } => {
             obj.insert("enum".into(), Value::String(enum_name.clone()));

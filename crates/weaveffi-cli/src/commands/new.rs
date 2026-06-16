@@ -24,7 +24,7 @@ pub(crate) fn cmd_new(name: &str, quiet: bool) -> Result<()> {
     let idl_path = project_dir.join("weaveffi.yml");
     let idl_contents = format!(
         concat!(
-            "version: \"0.3.0\"\n",
+            "version: \"0.4.0\"\n",
             "package:\n",
             "  name: {name}\n",
             "  version: \"0.1.0\"\n",

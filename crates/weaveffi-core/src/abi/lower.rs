@@ -75,15 +75,23 @@ fn typed_handle_ctype(name: &str, current_module: &str) -> CType {
 /// collapse to their innermost element; maps collapse to `void*`.
 pub fn element_ctype(ty: &TypeRef, module: &str) -> CType {
     match ty {
+        TypeRef::I8 => CType::Int8,
+        TypeRef::I16 => CType::Int16,
         TypeRef::I32 => CType::Int32,
-        TypeRef::U32 => CType::Uint32,
         TypeRef::I64 => CType::Int64,
+        TypeRef::U8 => CType::Uint8,
+        TypeRef::U16 => CType::Uint16,
+        TypeRef::U32 => CType::Uint32,
+        TypeRef::U64 => CType::Uint64,
+        TypeRef::F32 => CType::Float,
         TypeRef::F64 => CType::Double,
         TypeRef::Bool => CType::Bool,
         TypeRef::Handle => CType::Handle,
         TypeRef::TypedHandle(n) => typed_handle_ctype(n, module),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => CType::const_ptr(CType::Char),
         TypeRef::Bytes | TypeRef::BorrowedBytes => CType::const_ptr(CType::Uint8),
+        // A struct or rich (algebraic) enum crosses the ABI as an opaque object
+        // pointer; both are spelled `TypeRef::Struct` after resolution.
         TypeRef::Struct(s) => CType::ptr(struct_tag(s, module)),
         TypeRef::Enum(e) => enum_ctype(e, module),
         TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
@@ -101,9 +109,15 @@ pub fn lower_param(name: &str, ty: &TypeRef, module: &str, mutable: bool) -> Vec
         ConstPos::West
     };
     match ty {
+        TypeRef::I8 => vec![AbiParam::new(name, CType::Int8)],
+        TypeRef::I16 => vec![AbiParam::new(name, CType::Int16)],
         TypeRef::I32 => vec![AbiParam::new(name, CType::Int32)],
-        TypeRef::U32 => vec![AbiParam::new(name, CType::Uint32)],
         TypeRef::I64 => vec![AbiParam::new(name, CType::Int64)],
+        TypeRef::U8 => vec![AbiParam::new(name, CType::Uint8)],
+        TypeRef::U16 => vec![AbiParam::new(name, CType::Uint16)],
+        TypeRef::U32 => vec![AbiParam::new(name, CType::Uint32)],
+        TypeRef::U64 => vec![AbiParam::new(name, CType::Uint64)],
+        TypeRef::F32 => vec![AbiParam::new(name, CType::Float)],
         TypeRef::F64 => vec![AbiParam::new(name, CType::Double)],
         TypeRef::Bool => vec![AbiParam::new(name, CType::Bool)],
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![AbiParam::new(
@@ -125,6 +139,7 @@ pub fn lower_param(name: &str, ty: &TypeRef, module: &str, mutable: bool) -> Vec
         ],
         TypeRef::Handle => vec![AbiParam::new(name, CType::Handle)],
         TypeRef::TypedHandle(n) => vec![AbiParam::new(name, typed_handle_ctype(n, module))],
+        // A struct or rich enum is passed as a (const) pointer to its opaque tag.
         TypeRef::Struct(s) => vec![AbiParam::new(
             name,
             CType::Ptr {
@@ -212,9 +227,15 @@ pub fn lower_return(ty: &TypeRef, module: &str) -> AbiReturn {
         out_params: vec![],
     };
     match ty {
+        TypeRef::I8 => no_out(CType::Int8),
+        TypeRef::I16 => no_out(CType::Int16),
         TypeRef::I32 => no_out(CType::Int32),
-        TypeRef::U32 => no_out(CType::Uint32),
         TypeRef::I64 => no_out(CType::Int64),
+        TypeRef::U8 => no_out(CType::Uint8),
+        TypeRef::U16 => no_out(CType::Uint16),
+        TypeRef::U32 => no_out(CType::Uint32),
+        TypeRef::U64 => no_out(CType::Uint64),
+        TypeRef::F32 => no_out(CType::Float),
         TypeRef::F64 => no_out(CType::Double),
         TypeRef::Bool => no_out(CType::Bool),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => no_out(CType::const_ptr(CType::Char)),
@@ -224,6 +245,7 @@ pub fn lower_return(ty: &TypeRef, module: &str) -> AbiReturn {
         },
         TypeRef::Handle => no_out(CType::Handle),
         TypeRef::TypedHandle(n) => no_out(typed_handle_ctype(n, module)),
+        // A struct or rich enum is returned as an owning pointer to its tag.
         TypeRef::Struct(s) => no_out(CType::ptr(struct_tag(s, module))),
         TypeRef::Enum(e) => no_out(enum_ctype(e, module)),
         TypeRef::Optional(inner) => {

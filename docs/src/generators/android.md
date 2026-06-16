@@ -25,12 +25,19 @@ layer bridges them to the C ABI.
 | `u32`          | `Long`                 | `Long`                | `jlong`        |
 | `i64`          | `Long`                 | `Long`                | `jlong`        |
 | `f64`          | `Double`               | `Double`              | `jdouble`      |
+| `i8`           | `Byte`                 | `Byte`                | `jbyte`        |
+| `i16`          | `Short`                | `Short`               | `jshort`       |
+| `u8`           | `Byte`                 | `Byte`                | `jbyte`        |
+| `u16`          | `Short`                | `Short`               | `jshort`       |
+| `u64`          | `Long`                 | `Long`                | `jlong`        |
+| `f32`          | `Float`                | `Float`               | `jfloat`       |
 | `bool`         | `Boolean`              | `Boolean`             | `jboolean`     |
 | `string`       | `String`               | `String`              | `jstring`      |
 | `bytes`        | `ByteArray`            | `ByteArray`           | `jbyteArray`   |
 | `handle`       | `Long`                 | `Long`                | `jlong`        |
 | `StructName`   | `Long`                 | `StructName`          | `jlong`        |
-| `EnumName`     | `Int`                  | `EnumName`            | `jint`         |
+| `EnumName` (plain) | `Int`              | `EnumName`            | `jint`         |
+| `EnumName` (rich)  | `Long`             | `EnumName`            | `jlong`        |
 | `T?`           | `T?`                   | `T?`                  | `jobject`      |
 | `[i32]`        | `IntArray`             | `IntArray`            | `jintArray`    |
 | `[i64]`        | `LongArray`            | `LongArray`           | `jlongArray`   |
@@ -40,7 +47,7 @@ layer bridges them to the C ABI.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: contacts
     enums:
@@ -176,6 +183,126 @@ project(weaveffi)
 add_library(weaveffi SHARED weaveffi_jni.c)
 target_include_directories(weaveffi PRIVATE ../../../../c)
 ```
+
+## Rich (algebraic) enums
+
+A *rich* (algebraic) enum — a sum type whose variants carry associated
+data — lowers to an **opaque object handle** at the C ABI, exactly like a
+struct, and shares the same ownership model as the struct wrappers above.
+The Kotlin wrapper is a `Closeable` class holding a `Long` handle, with
+one static factory per variant, a nested `Tag` discriminant `enum class`,
+and per-variant field getters. (A plain C-style enum with no payloads
+stays a Kotlin `enum class` backed by an `Int` — see above.)
+
+For the `shapes` module's `Shape` enum — `Empty`, `Circle { radius: f64 }`,
+`Rectangle { width: f32, height: f32 }`, and
+`Labeled { label: string, count: u8 }` — the generator emits (abridged):
+
+```kotlin
+/** An algebraic shape (sum type with associated data) */
+class Shape internal constructor(internal var handle: Long) : java.io.Closeable {
+    companion object {
+        init { System.loadLibrary("weaveffi") }
+
+        @JvmStatic external fun nativeTag(handle: Long): Int
+        @JvmStatic external fun nativeDestroy(handle: Long)
+        @JvmStatic external fun nativeNewEmpty(): Long
+        @JvmStatic external fun nativeNewCircle(radius: Double): Long
+        @JvmStatic external fun nativeNewRectangle(width: Float, height: Float): Long
+        @JvmStatic external fun nativeNewLabeled(label: String, count: Byte): Long
+        @JvmStatic external fun nativeGetCircleRadius(handle: Long): Double
+        @JvmStatic external fun nativeGetLabeledCount(handle: Long): Byte
+
+        /** The empty shape */
+        fun empty(): Shape = Shape(nativeNewEmpty())
+        /** A circle with a radius */
+        fun circle(radius: Double): Shape = Shape(nativeNewCircle(radius))
+        /** An axis-aligned rectangle */
+        fun rectangle(width: Float, height: Float): Shape = Shape(nativeNewRectangle(width, height))
+        /** A labeled shape with a small count */
+        fun labeled(label: String, count: Byte): Shape = Shape(nativeNewLabeled(label, count))
+    }
+
+    enum class Tag(val value: Int) {
+        Empty(0),
+        Circle(1),
+        Rectangle(2),
+        Labeled(3);
+
+        companion object {
+            fun fromValue(value: Int): Tag = entries.first { it.value == value }
+        }
+    }
+
+    val tag: Tag get() = Tag.fromValue(nativeTag(handle))
+
+    /** Radius in points */
+    val circleRadius: Double get() = nativeGetCircleRadius(handle)
+    val labeledCount: Byte get() = nativeGetLabeledCount(handle)
+
+    override fun close() {
+        if (handle != 0L) {
+            nativeDestroy(handle)
+            handle = 0L
+        }
+    }
+
+    protected fun finalize() {
+        close()
+    }
+}
+```
+
+Each `nativeNew*` factory maps to a per-variant constructor
+(`weaveffi_shapes_Shape_<Variant>_new`), `nativeTag` reads the
+discriminant (`weaveffi_shapes_Shape_tag`), the `nativeGet*` getters read
+one variant field (`weaveffi_shapes_Shape_<Variant>_get_<field>`), and
+`nativeDestroy` frees the handle (`weaveffi_shapes_Shape_destroy`). The
+JNI shims that back these `external` methods are named
+`Java_com_weaveffi_Shape_native*`:
+
+```c
+JNIEXPORT jlong JNICALL Java_com_weaveffi_Shape_nativeNewCircle(JNIEnv* env, jclass clazz, jdouble radius) {
+    weaveffi_error err = {0, NULL};
+    weaveffi_shapes_Shape* rv = weaveffi_shapes_Shape_Circle_new((double)radius, &err);
+    if (err.code != 0) {
+        throw_weaveffi_error(env, &err);
+        return 0;
+    }
+    return (jlong)(intptr_t)rv;
+}
+
+JNIEXPORT jint JNICALL Java_com_weaveffi_Shape_nativeTag(JNIEnv* env, jclass clazz, jlong handle) {
+    return (jint)weaveffi_shapes_Shape_tag((const weaveffi_shapes_Shape*)(intptr_t)handle);
+}
+
+JNIEXPORT void JNICALL Java_com_weaveffi_Shape_nativeDestroy(JNIEnv* env, jclass clazz, jlong handle) {
+    weaveffi_shapes_Shape_destroy((weaveffi_shapes_Shape*)(intptr_t)handle);
+}
+```
+
+Free functions that take or return the enum pass the handle across the
+boundary; on the `WeaveFFI` companion they are
+`shapes_describe(shape: Shape): String` and
+`shapes_scale(shape: Shape, factor: Double): Shape`:
+
+```kotlin
+Shape.circle(2.0).use { c ->
+    println(c.tag)            // Tag.Circle
+    println(c.circleRadius)   // 2.0
+    val bigger = WeaveFFI.shapes_scale(c, 3.0)   // returns a new Shape
+    try {
+        println(WeaveFFI.shapes_describe(bigger))
+    } finally {
+        bigger.close()
+    }
+}
+```
+
+**Ownership:** a `Shape` owns its native handle, so call `close()` (or use
+`use { ... }`) on every `Shape` you construct or receive — including the
+new `Shape` returned by `shapes_scale`. The `finalize()` safety net runs
+during GC but is not a substitute for deterministic cleanup.
 
 ## Build instructions
 

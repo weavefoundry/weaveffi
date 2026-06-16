@@ -25,14 +25,21 @@ to a prebuilt binary placed next to it as `index.node`
 |---------------|----------------------|
 | `i32`         | `number`             |
 | `u32`         | `number`             |
+| `i8`          | `number`             |
+| `i16`         | `number`             |
+| `u8`          | `number`             |
+| `u16`         | `number`             |
 | `i64`         | `number`             |
+| `u64`         | `number`             |
 | `f64`         | `number`             |
+| `f32`         | `number`             |
 | `bool`        | `boolean`            |
 | `string`      | `string`             |
 | `bytes`       | `Buffer`             |
 | `handle`      | `bigint`             |
 | `StructName`  | `StructName`         |
-| `EnumName`    | `EnumName`           |
+| `EnumName` (plain, C-style)   | `enum EnumName`                |
+| `EnumName` (rich / algebraic) | wrapper `class` (e.g. `Shape`) |
 | `T?`          | `T \| null`          |
 | `[T]`         | `T[]`                |
 | `{K: V}`      | `Record<K, V>`       |
@@ -41,7 +48,7 @@ to a prebuilt binary placed next to it as `index.node`
 ## Example IDL → generated code
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: contacts
     enums:
@@ -105,6 +112,136 @@ export function contacts_list_contacts(): Contact[]
 export function contacts_set_favorite_color(contact_id: number, color: Color | null): void
 export function contacts_get_tags(contact_id: number): string[]
 ```
+
+## Rich (algebraic) enums
+
+A *rich* (algebraic) enum is a sum type whose variants carry associated
+data. A plain C-style enum stays a numeric TypeScript `enum`, but a rich
+enum lowers to an **opaque object handle** at the C ABI — exactly like a
+struct. The loader layers an idiomatic wrapper `class` on top of the raw
+native bindings, and that class owns the native pointer.
+
+Take a `Shape` enum with variants `Empty`, `Circle { radius: f64 }`,
+`Rectangle { width: f32, height: f32 }`, and
+`Labeled { label: string, count: u8 }`. The generated `index.js` builds
+a `Shape` class with one static factory per variant, a `tag()`
+discriminant reader, a camelCased getter per variant field, and a
+`destroy()` method, backed by a `FinalizationRegistry`:
+
+```js
+class Shape {
+  constructor(handle) {
+    this._handle = handle;
+    Shape._cleanup.register(this, handle, this);
+  }
+  static empty() {
+    return new Shape(addon.shapes_Shape_empty_new());
+  }
+  static circle(radius) {
+    return new Shape(addon.shapes_Shape_circle_new(radius));
+  }
+  static rectangle(width, height) {
+    return new Shape(addon.shapes_Shape_rectangle_new(width, height));
+  }
+  static labeled(label, count) {
+    return new Shape(addon.shapes_Shape_labeled_new(label, count));
+  }
+  tag() {
+    return addon.shapes_Shape_tag(this._handle);
+  }
+  get circleRadius() {
+    return addon.shapes_Shape_circle_get_radius(this._handle);
+  }
+  get rectangleWidth() {
+    return addon.shapes_Shape_rectangle_get_width(this._handle);
+  }
+  get rectangleHeight() {
+    return addon.shapes_Shape_rectangle_get_height(this._handle);
+  }
+  get labeledLabel() {
+    return addon.shapes_Shape_labeled_get_label(this._handle);
+  }
+  get labeledCount() {
+    return addon.shapes_Shape_labeled_get_count(this._handle);
+  }
+  destroy() {
+    if (this._handle) {
+      Shape._cleanup.unregister(this);
+      addon.shapes_Shape_destroy(this._handle);
+      this._handle = 0;
+    }
+  }
+}
+Shape._cleanup = new FinalizationRegistry((handle) => {
+  if (handle) { addon.shapes_Shape_destroy(handle); }
+});
+Shape.Tag = Object.freeze({ Empty: 0, Circle: 1, Rectangle: 2, Labeled: 3 });
+```
+
+The active variant is read with `tag()` and compared against the frozen
+`Shape.Tag` map (`{ Empty: 0, Circle: 1, Rectangle: 2, Labeled: 3 }`).
+Each variant field is a getter named `<variant><Field>` —
+`circleRadius`, `rectangleWidth`, `rectangleHeight`, `labeledLabel`,
+`labeledCount` — delegating to the matching native accessor (e.g.
+`addon.shapes_Shape_circle_get_radius(this._handle)`). Free functions
+that take or return the enum accept the wrapper directly:
+`shapes_describe(shape)` unwraps `shape._handle`, and
+`shapes_scale(shape, factor)` wraps its result back into a new `Shape`.
+
+The generated `types.d.ts` types the wrapper as a real `export class`,
+with the `Shape.Tag` constants in a companion namespace:
+
+```typescript
+export class Shape {
+  static empty(): Shape;
+  static circle(radius: number): Shape;
+  static rectangle(width: number, height: number): Shape;
+  static labeled(label: string, count: number): Shape;
+  tag(): number;
+  get circleRadius(): number;
+  get rectangleWidth(): number;
+  get rectangleHeight(): number;
+  get labeledLabel(): string;
+  get labeledCount(): number;
+  destroy(): void;
+}
+export namespace Shape {
+  const Tag: Readonly<{
+    Empty: 0,
+    Circle: 1,
+    Rectangle: 2,
+    Labeled: 3,
+  }>;
+}
+```
+
+A short round-trip — construct a couple of variants, read the tag and a
+field, call `describe` / `scale`, then release the handles:
+
+```js
+const { Shape, shapes_describe, shapes_scale } = require('./index.js');
+
+const circle = Shape.circle(2.0);
+const label = Shape.labeled('unit', 3);
+
+if (circle.tag() === Shape.Tag.Circle) {
+  console.log(circle.circleRadius); // 2
+}
+
+console.log(shapes_describe(circle)); // native-rendered description
+const bigger = shapes_scale(circle, 3.0); // a fresh Shape
+
+// Done with the handles — release the native objects.
+circle.destroy();
+label.destroy();
+bigger.destroy();
+```
+
+**Ownership:** each `Shape` owns its native object. Call `destroy()` when
+you are finished to free it deterministically; if you forget, the
+`FinalizationRegistry` calls `shapes_Shape_destroy` once the wrapper is
+garbage-collected — but GC timing is not guaranteed, so prefer an
+explicit `destroy()`.
 
 ## Build instructions
 

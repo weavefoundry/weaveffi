@@ -43,7 +43,7 @@ Open `weaveffi.yml` and replace its contents with an IDL that has a struct and
 a function:
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 package:
   name: my-project
   version: "0.1.0"

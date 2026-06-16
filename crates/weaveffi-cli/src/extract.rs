@@ -396,6 +396,7 @@ fn extract_enum(item: &syn::ItemEnum) -> Result<EnumDef> {
                 name: v.ident.to_string(),
                 value: parse_discriminant(expr)?,
                 doc: extract_doc(&v.attrs),
+                fields: vec![],
             })
         })
         .collect::<Result<_>>()?;
@@ -481,7 +482,7 @@ mod tests {
     #[test]
     fn empty_source_produces_no_modules() {
         let api = extract_api_from_rust("").unwrap();
-        assert_eq!(api.version, "0.3.0");
+        assert_eq!(api.version, "0.4.0");
         assert!(api.modules.is_empty());
     }
 

@@ -14,7 +14,8 @@ use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::model::{
     BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
-    IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding, StructBinding,
+    IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding, RichVariantBinding,
+    StructBinding,
 };
 use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::utils::{
@@ -134,9 +135,15 @@ weaveffi_core::impl_generator_via_backend!(DotnetGenerator);
 
 fn cs_type(ty: &TypeRef) -> String {
     match ty {
+        TypeRef::I8 => "sbyte".into(),
+        TypeRef::I16 => "short".into(),
         TypeRef::I32 => "int".into(),
+        TypeRef::U8 => "byte".into(),
+        TypeRef::U16 => "ushort".into(),
         TypeRef::U32 => "uint".into(),
         TypeRef::I64 => "long".into(),
+        TypeRef::U64 => "ulong".into(),
+        TypeRef::F32 => "float".into(),
         TypeRef::F64 => "double".into(),
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string".into(),
@@ -148,9 +155,15 @@ fn cs_type(ty: &TypeRef) -> String {
         TypeRef::Struct(name) => local_type_name(name).into(),
         TypeRef::Enum(name) => local_type_name(name).into(),
         TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::I8 => "sbyte?".into(),
+            TypeRef::I16 => "short?".into(),
             TypeRef::I32 => "int?".into(),
+            TypeRef::U8 => "byte?".into(),
+            TypeRef::U16 => "ushort?".into(),
             TypeRef::U32 => "uint?".into(),
             TypeRef::I64 => "long?".into(),
+            TypeRef::U64 => "ulong?".into(),
+            TypeRef::F32 => "float?".into(),
             TypeRef::F64 => "double?".into(),
             TypeRef::Bool => "bool?".into(),
             TypeRef::Handle => "ulong?".into(),
@@ -168,9 +181,15 @@ fn cs_type(ty: &TypeRef) -> String {
 
 fn pinvoke_type(ty: &TypeRef) -> String {
     match ty {
+        TypeRef::I8 => "sbyte".into(),
+        TypeRef::I16 => "short".into(),
         TypeRef::I32 => "int".into(),
+        TypeRef::U8 => "byte".into(),
+        TypeRef::U16 => "ushort".into(),
         TypeRef::U32 => "uint".into(),
         TypeRef::I64 => "long".into(),
+        TypeRef::U64 => "ulong".into(),
+        TypeRef::F32 => "float".into(),
         TypeRef::F64 => "double".into(),
         TypeRef::Bool => "int".into(),
         TypeRef::StringUtf8
@@ -198,9 +217,13 @@ fn cs_pinvoke_ctype(ty: &CType) -> String {
         CType::Int64 => "long".into(),
         CType::Uint64 | CType::Handle => "ulong".into(),
         CType::Double => "double".into(),
+        CType::Float => "float".into(),
         CType::Size => "UIntPtr".into(),
         CType::Void => "void".into(),
+        CType::Int8 => "sbyte".into(),
+        CType::Int16 => "short".into(),
         CType::Uint8 => "byte".into(),
+        CType::Uint16 => "ushort".into(),
         CType::Char => "sbyte".into(),
         CType::Ptr { .. }
         | CType::StructTag { .. }
@@ -473,7 +496,13 @@ fn render_csharp(
 
     for m in &model.modules {
         for e in &m.enums {
-            render_enum(&mut out, e);
+            // Rich (algebraic) enums are opaque-object wrappers, emitted as a
+            // class mirroring a struct; only plain C-style enums map to `enum`.
+            if e.is_rich() {
+                render_rich_enum_class(&mut out, e);
+            } else {
+                render_enum(&mut out, e);
+            }
         }
         for s in &m.structs {
             render_struct_class(&mut out, s);
@@ -546,6 +575,12 @@ fn render_helpers_class(out: &mut String) {
 }
 
 fn render_enum(out: &mut String, e: &EnumBinding) {
+    // A rich (algebraic) enum is not a plain C# `enum`; it surfaces as an
+    // opaque-object class via `render_rich_enum_class`. Guard here so this
+    // path only ever emits C-style enums.
+    if e.is_rich() {
+        return;
+    }
     emit_doc(out, &e.doc, "    ");
     out.push_str(&format!("    public enum {}\n    {{\n", e.name));
     for v in &e.variants {
@@ -590,14 +625,146 @@ fn render_struct_class(out: &mut String, s: &StructBinding) {
     out.push_str("    }\n\n");
 }
 
+/// Render a rich (algebraic) enum as an opaque-object `IDisposable` class,
+/// mirroring the struct wrapper: it owns the `IntPtr` handle and frees it via
+/// the enum's `_destroy` (same Dispose + finalizer, so no double free). Surface:
+/// a nested `enum Tag` + `GetTag()` reader, one static factory per variant
+/// (`Shape.Circle(2.5)`) using the struct/builder error-handling convention,
+/// and per-variant field accessors namespaced as `{Variant}{Field}` properties
+/// that reuse the struct-getter marshalling. Because resolution leaves a
+/// rich-enum reference as `TypeRef::Struct`, functions taking/returning the
+/// enum flow through the existing struct param/return path unchanged.
+fn render_rich_enum_class(out: &mut String, e: &EnumBinding) {
+    let Some(rich) = e.rich.as_ref() else {
+        return;
+    };
+    let name = &e.name;
+
+    emit_doc(out, &e.doc, "    ");
+    out.push_str(&format!("    public class {name} : IDisposable\n    {{\n"));
+    out.push_str("        private IntPtr _handle;\n");
+    out.push_str("        private bool _disposed;\n\n");
+    out.push_str(&format!(
+        "        internal {name}(IntPtr handle)\n        {{\n            _handle = handle;\n        }}\n\n"
+    ));
+    out.push_str("        internal IntPtr Handle => _handle;\n\n");
+
+    // Nested discriminant enum + typed reader. `Tag` is a nested type, so the
+    // reader is `GetTag()` (a `Tag` property would collide with the type name).
+    out.push_str("        public enum Tag\n        {\n");
+    for v in &e.variants {
+        emit_doc(out, &v.doc, "            ");
+        out.push_str(&format!("            {} = {},\n", v.name, v.value));
+    }
+    out.push_str("        }\n\n");
+    out.push_str("        public Tag GetTag()\n        {\n");
+    out.push_str(&format!(
+        "            return (Tag)NativeMethods.{}(_handle);\n",
+        rich.tag_symbol
+    ));
+    out.push_str("        }\n\n");
+
+    // One static factory per variant.
+    for v in &rich.variants {
+        render_rich_variant_factory(out, name, v);
+    }
+
+    // Per-variant field accessors, namespaced by variant to avoid collisions
+    // (`CircleRadius`, `RectangleWidth`, ...). Same marshalling as struct fields.
+    for v in &rich.variants {
+        let variant_prefix = v.name.to_upper_camel_case();
+        for f in &v.fields {
+            let prop_name = format!("{}{}", variant_prefix, f.name.to_upper_camel_case());
+            render_field_getter(out, &prop_name, f);
+        }
+    }
+
+    out.push_str("        public void Dispose()\n        {\n");
+    out.push_str("            if (!_disposed)\n            {\n");
+    out.push_str(&format!(
+        "                NativeMethods.{}(_handle);\n",
+        rich.destroy_symbol
+    ));
+    out.push_str("                _disposed = true;\n");
+    out.push_str("            }\n");
+    out.push_str("            GC.SuppressFinalize(this);\n");
+    out.push_str("        }\n\n");
+    out.push_str(&format!(
+        "        ~{name}()\n        {{\n            Dispose();\n        }}\n"
+    ));
+    out.push_str("    }\n\n");
+}
+
+/// One static factory for a rich-enum variant (`Shape.Circle(double radius)`).
+/// Marshals each payload field through the same helpers as a struct's `create`
+/// (builder `Build()`), invoking `{tag}_{V}_new(<slots>, ref err)` and wrapping
+/// the returned handle. A unit variant takes no parameters.
+fn render_rich_variant_factory(out: &mut String, enum_name: &str, v: &RichVariantBinding) {
+    let params: Vec<ParamBinding> = v.fields.iter().map(field_as_param).collect();
+    let params_sig: Vec<String> = params
+        .iter()
+        .map(|p| format!("{} {}", cs_type(&p.ty), safe_cs_name(&p.name)))
+        .collect();
+
+    emit_doc(out, &v.doc, "        ");
+    out.push_str(&format!(
+        "        public static {enum_name} {}({})\n        {{\n",
+        v.name,
+        params_sig.join(", ")
+    ));
+    out.push_str("            var err = new WeaveFFIError();\n");
+
+    let needs_try = params.iter().any(|p| param_needs_marshal(&p.ty));
+    let call_args = build_call_args(&params);
+    let args_part = if call_args.is_empty() {
+        String::new()
+    } else {
+        format!("{call_args}, ")
+    };
+    let call = format!(
+        "var result = NativeMethods.{}({args_part}ref err);",
+        v.create.symbol
+    );
+
+    if needs_try {
+        for p in &params {
+            render_marshal_setup(out, p, "            ");
+        }
+        out.push_str("            try\n            {\n");
+        out.push_str(&format!("                {call}\n"));
+        out.push_str("                WeaveFFIError.Check(err);\n");
+        out.push_str(&format!(
+            "                return new {enum_name}(result);\n"
+        ));
+        out.push_str("            }\n            finally\n            {\n");
+        for p in &params {
+            render_marshal_cleanup(out, p, "                ");
+        }
+        out.push_str("            }\n");
+    } else {
+        out.push_str(&format!("            {call}\n"));
+        out.push_str("            WeaveFFIError.Check(err);\n");
+        out.push_str(&format!("            return new {enum_name}(result);\n"));
+    }
+    out.push_str("        }\n\n");
+}
+
 /// The builder slot's storage type and zero-value default. Scalars start at
 /// 0/false/""/empty, collections empty, optionals absent — the same contract
 /// as the other backends, so unset fields lower to valid C arguments.
 fn cs_field_default(ty: &TypeRef) -> (String, String) {
     let t = cs_type(ty);
     match ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle => (t, "0".into()),
-        TypeRef::F64 => (t, "0.0".into()),
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::U64
+        | TypeRef::Handle => (t, "0".into()),
+        TypeRef::F32 | TypeRef::F64 => (t, "0.0".into()),
         TypeRef::Bool => (t, "false".into()),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => (t, "\"\"".into()),
         TypeRef::Bytes | TypeRef::BorrowedBytes => (t, "Array.Empty<byte>()".into()),
@@ -698,6 +865,15 @@ fn render_builder_class(out: &mut String, s: &StructBinding) {
 
 fn render_struct_getter(out: &mut String, field: &FieldBinding) {
     let prop_name = field.name.to_upper_camel_case();
+    render_field_getter(out, &prop_name, field);
+}
+
+/// Emit a `public {T} {prop_name} { get { ... } }` property reading one C
+/// getter (`field.getter_symbol`) over the implicit `_handle`, applying the
+/// marshal-and-free convention each field type requires. Shared by struct field
+/// getters and rich-enum per-variant accessors (which pass a variant-namespaced
+/// `prop_name`), so both project associated data identically.
+fn render_field_getter(out: &mut String, prop_name: &str, field: &FieldBinding) {
     let getter_sym = &field.getter_symbol;
     let cs = cs_type(&field.ty);
 
@@ -707,7 +883,17 @@ fn render_struct_getter(out: &mut String, field: &FieldBinding) {
     ));
 
     match &field.ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => {
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::U64
+        | TypeRef::F32
+        | TypeRef::F64
+        | TypeRef::Handle => {
             out.push_str(&format!(
                 "                return NativeMethods.{getter_sym}(_handle);\n"
             ));
@@ -800,6 +986,30 @@ fn render_struct_getter(out: &mut String, field: &FieldBinding) {
                 TypeRef::F64 => {
                     out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
                     out.push_str("                return BitConverter.Int64BitsToDouble(Marshal.ReadInt64(ptr));\n");
+                }
+                TypeRef::I8 => {
+                    out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
+                    out.push_str("                return (sbyte)Marshal.ReadByte(ptr);\n");
+                }
+                TypeRef::U8 => {
+                    out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
+                    out.push_str("                return (byte)Marshal.ReadByte(ptr);\n");
+                }
+                TypeRef::I16 => {
+                    out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
+                    out.push_str("                return Marshal.ReadInt16(ptr);\n");
+                }
+                TypeRef::U16 => {
+                    out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
+                    out.push_str("                return (ushort)Marshal.ReadInt16(ptr);\n");
+                }
+                TypeRef::U64 => {
+                    out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
+                    out.push_str("                return (ulong)Marshal.ReadInt64(ptr);\n");
+                }
+                TypeRef::F32 => {
+                    out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
+                    out.push_str("                return BitConverter.Int32BitsToSingle(Marshal.ReadInt32(ptr));\n");
                 }
                 TypeRef::Bool => {
                     out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
@@ -904,6 +1114,13 @@ fn render_native_methods(out: &mut String, model: &BindingModel) {
     );
 
     for m in &model.modules {
+        for e in &m.enums {
+            // Plain enums lower by value and need no P/Invoke; rich enums need
+            // the opaque-object symbol set (tag, destroy, per-variant new/get).
+            if e.is_rich() {
+                render_rich_enum_pinvoke(out, e);
+            }
+        }
         for s in &m.structs {
             render_struct_pinvoke(out, s);
         }
@@ -1008,6 +1225,64 @@ fn render_struct_pinvoke(out: &mut String, s: &StructBinding) {
             "        internal static extern {ret_type} {getter_sym}({});\n\n",
             params.join(", ")
         ));
+    }
+}
+
+/// Emit the `[DllImport]` set backing a rich (algebraic) enum, mirroring
+/// `render_struct_pinvoke`: the `_tag` reader, the `_destroy`, and per variant a
+/// `_{V}_new` constructor (field slots + `ref err`, returns the opaque `IntPtr`)
+/// plus a `_{V}_get_{f}` getter per field (return/extra slots lowered exactly
+/// like struct field getters: string -> `IntPtr`, bytes/list add `out UIntPtr`).
+fn render_rich_enum_pinvoke(out: &mut String, e: &EnumBinding) {
+    let Some(rich) = e.rich.as_ref() else {
+        return;
+    };
+
+    let tag_sym = &rich.tag_symbol;
+    out.push_str(&format!(
+        "        [DllImport(LibName, EntryPoint = \"{tag_sym}\", CallingConvention = CallingConvention.Cdecl)]\n"
+    ));
+    out.push_str(&format!(
+        "        internal static extern int {tag_sym}(IntPtr ptr);\n\n"
+    ));
+
+    let destroy_sym = &rich.destroy_symbol;
+    out.push_str(&format!(
+        "        [DllImport(LibName, EntryPoint = \"{destroy_sym}\", CallingConvention = CallingConvention.Cdecl)]\n"
+    ));
+    out.push_str(&format!(
+        "        internal static extern void {destroy_sym}(IntPtr ptr);\n\n"
+    ));
+
+    for v in &rich.variants {
+        let new_sym = &v.create.symbol;
+        let mut new_params: Vec<String> = v
+            .fields
+            .iter()
+            .flat_map(|f| pinvoke_param_list(&field_as_param(f)))
+            .collect();
+        new_params.push("ref WeaveFFIError err".into());
+        out.push_str(&format!(
+            "        [DllImport(LibName, EntryPoint = \"{new_sym}\", CallingConvention = CallingConvention.Cdecl)]\n"
+        ));
+        out.push_str(&format!(
+            "        internal static extern IntPtr {new_sym}({});\n\n",
+            new_params.join(", ")
+        ));
+
+        for f in &v.fields {
+            let getter_sym = &f.getter_symbol;
+            let (ret_type, extra_params) = pinvoke_return_info(&f.ty);
+            out.push_str(&format!(
+                "        [DllImport(LibName, EntryPoint = \"{getter_sym}\", CallingConvention = CallingConvention.Cdecl)]\n"
+            ));
+            let mut params = vec!["IntPtr ptr".into()];
+            params.extend(extra_params);
+            out.push_str(&format!(
+                "        internal static extern {ret_type} {getter_sym}({});\n\n",
+                params.join(", ")
+            ));
+        }
     }
 }
 
@@ -1149,7 +1424,16 @@ fn render_cb_arg(out: &mut String, p: &ParamBinding, idx: usize, indent: &str) -
     let slots = abi::lower_param(&p.name, &p.ty, "", false);
     let n0 = safe_cs_name(&slots[0].name);
     match &p.ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 => n0,
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::U64
+        | TypeRef::F32
+        | TypeRef::F64 => n0,
         TypeRef::Handle => n0,
         TypeRef::Bool => format!("{n0} != 0"),
         TypeRef::Enum(name) => format!("({}){n0}", local_type_name(name)),
@@ -1208,6 +1492,24 @@ fn render_cb_arg(out: &mut String, p: &ParamBinding, idx: usize, indent: &str) -
             ),
             TypeRef::F64 => format!(
                 "{n0} == IntPtr.Zero ? (double?)null : BitConverter.Int64BitsToDouble(Marshal.ReadInt64({n0}))"
+            ),
+            TypeRef::I8 => {
+                format!("{n0} == IntPtr.Zero ? (sbyte?)null : (sbyte)Marshal.ReadByte({n0})")
+            }
+            TypeRef::U8 => {
+                format!("{n0} == IntPtr.Zero ? (byte?)null : (byte)Marshal.ReadByte({n0})")
+            }
+            TypeRef::I16 => {
+                format!("{n0} == IntPtr.Zero ? (short?)null : Marshal.ReadInt16({n0})")
+            }
+            TypeRef::U16 => format!(
+                "{n0} == IntPtr.Zero ? (ushort?)null : (ushort)Marshal.ReadInt16({n0})"
+            ),
+            TypeRef::U64 => format!(
+                "{n0} == IntPtr.Zero ? (ulong?)null : (ulong)Marshal.ReadInt64({n0})"
+            ),
+            TypeRef::F32 => format!(
+                "{n0} == IntPtr.Zero ? (float?)null : BitConverter.Int32BitsToSingle(Marshal.ReadInt32({n0}))"
             ),
             TypeRef::Bool => {
                 format!("{n0} == IntPtr.Zero ? (bool?)null : Marshal.ReadInt32({n0}) != 0")
@@ -1426,9 +1728,15 @@ fn param_needs_marshal(ty: &TypeRef) -> bool {
                 | TypeRef::BorrowedStr
                 | TypeRef::Bytes
                 | TypeRef::BorrowedBytes
+                | TypeRef::I8
+                | TypeRef::I16
                 | TypeRef::I32
+                | TypeRef::U8
+                | TypeRef::U16
                 | TypeRef::U32
                 | TypeRef::I64
+                | TypeRef::U64
+                | TypeRef::F32
                 | TypeRef::F64
                 | TypeRef::Bool
                 | TypeRef::Handle
@@ -1518,9 +1826,17 @@ fn render_wrapper_method(
 /// to `yield return`.
 fn iterator_item_conversion(out: &mut String, elem: &TypeRef, indent: &str) -> String {
     match elem {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => {
-            "out_item".into()
-        }
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::U64
+        | TypeRef::F32
+        | TypeRef::F64
+        | TypeRef::Handle => "out_item".into(),
         TypeRef::Bool => "out_item != 0".into(),
         TypeRef::Enum(name) => format!("({})out_item", local_type_name(name)),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
@@ -1857,7 +2173,7 @@ fn render_marshal_setup(out: &mut String, p: &ParamBinding, indent: &str) {
                 ));
                 out.push_str(&format!("{indent}}}\n"));
             }
-            TypeRef::I64 | TypeRef::Handle | TypeRef::F64 => {
+            TypeRef::I64 | TypeRef::U64 | TypeRef::Handle | TypeRef::F64 => {
                 out.push_str(&format!("{indent}var {name}Ptr = IntPtr.Zero;\n"));
                 out.push_str(&format!("{indent}if ({name}.HasValue)\n{indent}{{\n"));
                 out.push_str(&format!(
@@ -1865,6 +2181,7 @@ fn render_marshal_setup(out: &mut String, p: &ParamBinding, indent: &str) {
                 ));
                 let val = match inner.as_ref() {
                     TypeRef::Handle => format!("(long){name}.Value"),
+                    TypeRef::U64 => format!("(long){name}.Value"),
                     TypeRef::F64 => {
                         format!("BitConverter.DoubleToInt64Bits({name}.Value)")
                     }
@@ -1872,6 +2189,39 @@ fn render_marshal_setup(out: &mut String, p: &ParamBinding, indent: &str) {
                 };
                 out.push_str(&format!(
                     "{indent}    Marshal.WriteInt64({name}Ptr, {val});\n"
+                ));
+                out.push_str(&format!("{indent}}}\n"));
+            }
+            TypeRef::I8 | TypeRef::U8 => {
+                out.push_str(&format!("{indent}var {name}Ptr = IntPtr.Zero;\n"));
+                out.push_str(&format!("{indent}if ({name}.HasValue)\n{indent}{{\n"));
+                out.push_str(&format!(
+                    "{indent}    {name}Ptr = Marshal.AllocHGlobal(sizeof(byte));\n"
+                ));
+                out.push_str(&format!(
+                    "{indent}    Marshal.WriteByte({name}Ptr, (byte){name}.Value);\n"
+                ));
+                out.push_str(&format!("{indent}}}\n"));
+            }
+            TypeRef::I16 | TypeRef::U16 => {
+                out.push_str(&format!("{indent}var {name}Ptr = IntPtr.Zero;\n"));
+                out.push_str(&format!("{indent}if ({name}.HasValue)\n{indent}{{\n"));
+                out.push_str(&format!(
+                    "{indent}    {name}Ptr = Marshal.AllocHGlobal(sizeof(short));\n"
+                ));
+                out.push_str(&format!(
+                    "{indent}    Marshal.WriteInt16({name}Ptr, (short){name}.Value);\n"
+                ));
+                out.push_str(&format!("{indent}}}\n"));
+            }
+            TypeRef::F32 => {
+                out.push_str(&format!("{indent}var {name}Ptr = IntPtr.Zero;\n"));
+                out.push_str(&format!("{indent}if ({name}.HasValue)\n{indent}{{\n"));
+                out.push_str(&format!(
+                    "{indent}    {name}Ptr = Marshal.AllocHGlobal(sizeof(float));\n"
+                ));
+                out.push_str(&format!(
+                    "{indent}    Marshal.WriteInt32({name}Ptr, BitConverter.SingleToInt32Bits({name}.Value));\n"
                 ));
                 out.push_str(&format!("{indent}}}\n"));
             }
@@ -1952,9 +2302,15 @@ fn cs_elem_array_slot(elem: &TypeRef, expr: &str) -> (String, String) {
         ),
         TypeRef::Enum(_) => ("int".into(), format!("(int){expr}")),
         TypeRef::Bool => ("int".into(), format!("{expr} ? 1 : 0")),
+        TypeRef::I8 => ("sbyte".into(), expr.into()),
+        TypeRef::I16 => ("short".into(), expr.into()),
         TypeRef::I32 => ("int".into(), expr.into()),
+        TypeRef::U8 => ("byte".into(), expr.into()),
+        TypeRef::U16 => ("ushort".into(), expr.into()),
         TypeRef::U32 => ("uint".into(), expr.into()),
         TypeRef::I64 => ("long".into(), expr.into()),
+        TypeRef::U64 => ("ulong".into(), expr.into()),
+        TypeRef::F32 => ("float".into(), expr.into()),
         TypeRef::F64 => ("double".into(), expr.into()),
         TypeRef::Handle => ("ulong".into(), expr.into()),
         // Validation (`UnsupportedElementType`) rejects other element shapes.
@@ -1983,9 +2339,15 @@ fn render_marshal_cleanup(out: &mut String, p: &ParamBinding, indent: &str) {
                     "{indent}if ({name}Ptr != IntPtr.Zero) Marshal.FreeCoTaskMem({name}Ptr);\n"
                 ));
             }
-            TypeRef::I32
+            TypeRef::I8
+            | TypeRef::I16
+            | TypeRef::I32
+            | TypeRef::U8
+            | TypeRef::U16
             | TypeRef::U32
             | TypeRef::I64
+            | TypeRef::U64
+            | TypeRef::F32
             | TypeRef::F64
             | TypeRef::Bool
             | TypeRef::Handle
@@ -2097,9 +2459,15 @@ fn build_call_args(params: &[ParamBinding]) -> String {
                     ],
                     TypeRef::StringUtf8
                     | TypeRef::BorrowedStr
+                    | TypeRef::I8
+                    | TypeRef::I16
                     | TypeRef::I32
+                    | TypeRef::U8
+                    | TypeRef::U16
                     | TypeRef::U32
                     | TypeRef::I64
+                    | TypeRef::U64
+                    | TypeRef::F32
                     | TypeRef::F64
                     | TypeRef::Bool
                     | TypeRef::Handle
@@ -2236,6 +2604,50 @@ fn render_optional_return_conversion(out: &mut String, inner: &TypeRef, indent: 
                 "{indent}return BitConverter.Int64BitsToDouble(Marshal.ReadInt64(result));\n"
             ));
         }
+        TypeRef::I8 => {
+            out.push_str(&format!(
+                "{indent}if (result == IntPtr.Zero) return null;\n"
+            ));
+            out.push_str(&format!(
+                "{indent}return (sbyte)Marshal.ReadByte(result);\n"
+            ));
+        }
+        TypeRef::U8 => {
+            out.push_str(&format!(
+                "{indent}if (result == IntPtr.Zero) return null;\n"
+            ));
+            out.push_str(&format!("{indent}return (byte)Marshal.ReadByte(result);\n"));
+        }
+        TypeRef::I16 => {
+            out.push_str(&format!(
+                "{indent}if (result == IntPtr.Zero) return null;\n"
+            ));
+            out.push_str(&format!("{indent}return Marshal.ReadInt16(result);\n"));
+        }
+        TypeRef::U16 => {
+            out.push_str(&format!(
+                "{indent}if (result == IntPtr.Zero) return null;\n"
+            ));
+            out.push_str(&format!(
+                "{indent}return (ushort)Marshal.ReadInt16(result);\n"
+            ));
+        }
+        TypeRef::U64 => {
+            out.push_str(&format!(
+                "{indent}if (result == IntPtr.Zero) return null;\n"
+            ));
+            out.push_str(&format!(
+                "{indent}return (ulong)Marshal.ReadInt64(result);\n"
+            ));
+        }
+        TypeRef::F32 => {
+            out.push_str(&format!(
+                "{indent}if (result == IntPtr.Zero) return null;\n"
+            ));
+            out.push_str(&format!(
+                "{indent}return BitConverter.Int32BitsToSingle(Marshal.ReadInt32(result));\n"
+            ));
+        }
         TypeRef::Bool => {
             out.push_str(&format!(
                 "{indent}if (result == IntPtr.Zero) return null;\n"
@@ -2309,11 +2721,23 @@ fn render_map_return_call(
 
 fn marshal_read_element(ty: &TypeRef, arr: &str, idx: &str) -> String {
     match ty {
+        TypeRef::I8 => format!("(sbyte)Marshal.ReadByte({arr} + {idx} * 1)"),
+        TypeRef::U8 => format!("(byte)Marshal.ReadByte({arr} + {idx} * 1)"),
+        TypeRef::I16 => format!("Marshal.ReadInt16({arr} + {idx} * sizeof(short))"),
+        TypeRef::U16 => {
+            format!("(ushort)Marshal.ReadInt16({arr} + {idx} * sizeof(short))")
+        }
         TypeRef::I32 => format!("Marshal.ReadInt32({arr} + {idx} * sizeof(int))"),
         TypeRef::U32 => {
             format!("(uint)Marshal.ReadInt32({arr} + {idx} * sizeof(int))")
         }
         TypeRef::I64 => format!("Marshal.ReadInt64({arr} + {idx} * sizeof(long))"),
+        TypeRef::U64 => {
+            format!("(ulong)Marshal.ReadInt64({arr} + {idx} * sizeof(long))")
+        }
+        TypeRef::F32 => format!(
+            "BitConverter.Int32BitsToSingle(Marshal.ReadInt32({arr} + {idx} * sizeof(int)))"
+        ),
         TypeRef::F64 => format!(
             "BitConverter.Int64BitsToDouble(Marshal.ReadInt64({arr} + {idx} * sizeof(long)))"
         ),
@@ -2365,7 +2789,7 @@ mod tests {
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules,
             generators: None,
             package: None,
@@ -2516,7 +2940,7 @@ mod tests {
     #[test]
     fn dotnet_builder_generated() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![],
@@ -2837,16 +3261,19 @@ mod tests {
                         name: "Red".into(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Green".into(),
                         value: 1,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Blue".into(),
                         value: 2,
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }],
@@ -3553,11 +3980,13 @@ mod tests {
                         name: "Personal".into(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Work".into(),
                         value: 1,
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }],
@@ -3921,21 +4350,25 @@ mod tests {
                         name: "Low".into(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Medium".into(),
                         value: 1,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "High".into(),
                         value: 2,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Critical".into(),
                         value: 3,
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }],
@@ -4200,16 +4633,19 @@ mod tests {
                         name: "Personal".into(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Business".into(),
                         value: 1,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Government".into(),
                         value: 2,
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }],
@@ -4819,16 +5255,19 @@ mod tests {
                         name: "Red".into(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Green".into(),
                         value: 1,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Blue".into(),
                         value: 2,
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }],
@@ -4854,7 +5293,7 @@ mod tests {
     #[test]
     fn dotnet_typed_handle_type() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![Function {
@@ -5309,6 +5748,7 @@ mod tests {
                     name: "Small".into(),
                     value: 0,
                     doc: Some("A small one".into()),
+                    fields: vec![],
                 }],
             }],
             callbacks: vec![],
@@ -5441,6 +5881,285 @@ mod tests {
         assert!(
             cs.contains("weaveffi_free_string"),
             "runtime ABI helper must stay literal: {cs}"
+        );
+    }
+
+    fn shapes_api() -> Api {
+        let shape = EnumDef {
+            name: "Shape".into(),
+            doc: Some("An algebraic shape".into()),
+            variants: vec![
+                EnumVariant {
+                    name: "Empty".into(),
+                    value: 0,
+                    doc: None,
+                    fields: vec![],
+                },
+                EnumVariant {
+                    name: "Circle".into(),
+                    value: 1,
+                    doc: None,
+                    fields: vec![StructField {
+                        name: "radius".into(),
+                        ty: TypeRef::F64,
+                        doc: None,
+                        default: None,
+                    }],
+                },
+                EnumVariant {
+                    name: "Rectangle".into(),
+                    value: 2,
+                    doc: None,
+                    fields: vec![
+                        StructField {
+                            name: "width".into(),
+                            ty: TypeRef::F32,
+                            doc: None,
+                            default: None,
+                        },
+                        StructField {
+                            name: "height".into(),
+                            ty: TypeRef::F32,
+                            doc: None,
+                            default: None,
+                        },
+                    ],
+                },
+                EnumVariant {
+                    name: "Labeled".into(),
+                    value: 3,
+                    doc: None,
+                    fields: vec![
+                        StructField {
+                            name: "label".into(),
+                            ty: TypeRef::StringUtf8,
+                            doc: None,
+                            default: None,
+                        },
+                        StructField {
+                            name: "count".into(),
+                            ty: TypeRef::U8,
+                            doc: None,
+                            default: None,
+                        },
+                    ],
+                },
+            ],
+        };
+        let channel = EnumDef {
+            name: "Channel".into(),
+            doc: None,
+            variants: vec![
+                EnumVariant {
+                    name: "Red".into(),
+                    value: 0,
+                    doc: None,
+                    fields: vec![],
+                },
+                EnumVariant {
+                    name: "Green".into(),
+                    value: 1,
+                    doc: None,
+                    fields: vec![],
+                },
+            ],
+        };
+        make_api(vec![Module {
+            name: "shapes".into(),
+            functions: vec![
+                Function {
+                    name: "describe".into(),
+                    params: vec![Param {
+                        name: "shape".into(),
+                        ty: TypeRef::Struct("Shape".into()),
+                        mutable: false,
+                        doc: None,
+                    }],
+                    returns: Some(TypeRef::StringUtf8),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "scale".into(),
+                    params: vec![
+                        Param {
+                            name: "shape".into(),
+                            ty: TypeRef::Struct("Shape".into()),
+                            mutable: false,
+                            doc: None,
+                        },
+                        Param {
+                            name: "factor".into(),
+                            ty: TypeRef::F64,
+                            mutable: false,
+                            doc: None,
+                        },
+                    ],
+                    returns: Some(TypeRef::Struct("Shape".into())),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "sum_bytes".into(),
+                    params: vec![Param {
+                        name: "values".into(),
+                        ty: TypeRef::List(Box::new(TypeRef::U8)),
+                        mutable: false,
+                        doc: None,
+                    }],
+                    returns: Some(TypeRef::U64),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+            ],
+            structs: vec![],
+            enums: vec![shape, channel],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }])
+    }
+
+    #[test]
+    fn rich_enum_generates_opaque_wrapper() {
+        let cs = render_csharp(
+            &shapes_api(),
+            "Shapes",
+            false,
+            "weaveffi",
+            "shapes.yml",
+            "Shapes.cs",
+        );
+
+        // Rich enum becomes an IDisposable opaque-object class, not a C# enum.
+        assert!(
+            cs.contains("public class Shape : IDisposable"),
+            "rich enum must be a class: {cs}"
+        );
+        assert!(
+            !cs.contains("public enum Shape"),
+            "rich enum must not be a plain enum: {cs}"
+        );
+        // Plain enum is still a value enum.
+        assert!(
+            cs.contains("public enum Channel"),
+            "plain enum must stay an enum: {cs}"
+        );
+
+        // Nested discriminant enum + typed reader.
+        assert!(cs.contains("public enum Tag"), "nested Tag enum: {cs}");
+        assert!(
+            cs.contains("Empty = 0,") && cs.contains("Labeled = 3,"),
+            "Tag values: {cs}"
+        );
+        assert!(
+            cs.contains("public Tag GetTag()")
+                && cs.contains("return (Tag)NativeMethods.weaveffi_shapes_Shape_tag(_handle);"),
+            "tag reader: {cs}"
+        );
+
+        // Static factories per variant with the struct error convention.
+        assert!(
+            cs.contains("public static Shape Empty()"),
+            "Empty factory: {cs}"
+        );
+        assert!(
+            cs.contains("public static Shape Circle(double radius)"),
+            "Circle factory: {cs}"
+        );
+        assert!(
+            cs.contains("public static Shape Rectangle(float width, float height)"),
+            "Rectangle factory: {cs}"
+        );
+        assert!(
+            cs.contains("public static Shape Labeled(string label, byte count)"),
+            "Labeled factory: {cs}"
+        );
+        assert!(
+            cs.contains("NativeMethods.weaveffi_shapes_Shape_Circle_new(radius, ref err);")
+                && cs.contains("return new Shape(result);"),
+            "Circle ctor call + wrap: {cs}"
+        );
+        // String payload factory marshals + frees in try/finally.
+        assert!(
+            cs.contains("Marshal.StringToCoTaskMemUTF8(label)")
+                && cs.contains("Marshal.FreeCoTaskMem(labelPtr);"),
+            "Labeled string marshalling: {cs}"
+        );
+
+        // Per-variant accessors, namespaced by variant.
+        assert!(
+            cs.contains("public double CircleRadius"),
+            "CircleRadius: {cs}"
+        );
+        assert!(
+            cs.contains("public float RectangleWidth")
+                && cs.contains("public float RectangleHeight"),
+            "Rectangle accessors: {cs}"
+        );
+        assert!(
+            cs.contains("public string LabeledLabel"),
+            "LabeledLabel: {cs}"
+        );
+        assert!(
+            cs.contains("public byte LabeledCount"),
+            "LabeledCount: {cs}"
+        );
+        // String getter frees the producer-owned buffer.
+        assert!(
+            cs.contains("NativeMethods.weaveffi_free_string(ptr);"),
+            "string getter free: {cs}"
+        );
+
+        // Disposal frees via the enum's destroy, with a finalizer (no double free).
+        assert!(
+            cs.contains("NativeMethods.weaveffi_shapes_Shape_destroy(_handle);")
+                && cs.contains("GC.SuppressFinalize(this);")
+                && cs.contains("~Shape()"),
+            "dispose + finalizer: {cs}"
+        );
+
+        // P/Invoke declarations for the full symbol set.
+        for sym in [
+            "internal static extern int weaveffi_shapes_Shape_tag(IntPtr ptr);",
+            "internal static extern void weaveffi_shapes_Shape_destroy(IntPtr ptr);",
+            "internal static extern IntPtr weaveffi_shapes_Shape_Empty_new(ref WeaveFFIError err);",
+            "internal static extern IntPtr weaveffi_shapes_Shape_Circle_new(double radius, ref WeaveFFIError err);",
+            "internal static extern IntPtr weaveffi_shapes_Shape_Rectangle_new(float width, float height, ref WeaveFFIError err);",
+            "internal static extern IntPtr weaveffi_shapes_Shape_Labeled_new(IntPtr label, byte count, ref WeaveFFIError err);",
+            "internal static extern double weaveffi_shapes_Shape_Circle_get_radius(IntPtr ptr);",
+            "internal static extern float weaveffi_shapes_Shape_Rectangle_get_width(IntPtr ptr);",
+            "internal static extern byte weaveffi_shapes_Shape_Labeled_get_count(IntPtr ptr);",
+            "internal static extern IntPtr weaveffi_shapes_Shape_Labeled_get_label(IntPtr ptr);",
+        ] {
+            assert!(cs.contains(sym), "missing P/Invoke `{sym}`: {cs}");
+        }
+
+        // Functions taking/returning the enum flow through the struct path:
+        // pass `.Handle`, wrap returns in `new Shape(...)`.
+        assert!(
+            cs.contains("public static string ShapesDescribe(Shape shape)")
+                && cs.contains("weaveffi_shapes_describe(shape.Handle, ref err)"),
+            "describe via struct path: {cs}"
+        );
+        assert!(
+            cs.contains("public static Shape ShapesScale(Shape shape, double factor)"),
+            "scale via struct path: {cs}"
+        );
+        // Numerics smoke: list<u8> in, u64 out (plain function path).
+        assert!(
+            cs.contains("public static ulong ShapesSumBytes(byte[] values)"),
+            "sum_bytes wrapper: {cs}"
         );
     }
 }

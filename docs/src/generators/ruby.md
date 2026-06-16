@@ -32,12 +32,19 @@ named `events` produces `lib/events.rb` and `events.gemspec`;
 | `u32`        | `Integer`          | `:uint32`                      |
 | `i64`        | `Integer`          | `:int64`                       |
 | `f64`        | `Float`            | `:double`                      |
+| `i8`         | `Integer`          | `:int8`                        |
+| `i16`        | `Integer`          | `:int16`                       |
+| `u8`         | `Integer`          | `:uint8`                       |
+| `u16`        | `Integer`          | `:uint16`                      |
+| `u64`        | `Integer`          | `:uint64`                      |
+| `f32`        | `Float`            | `:float`                       |
 | `bool`       | `true`/`false`     | `:int32` (0/1 conversion)      |
 | `string`     | `String`           | `:string` (param) / `:pointer` (return) |
 | `bytes`      | `String` (binary)  | `:pointer` + `:size_t`         |
 | `handle`     | `Integer`          | `:uint64`                      |
 | `Struct`     | `StructName`       | `:pointer`                     |
-| `Enum`       | `Integer`          | `:int32`                       |
+| `Enum` (plain) | `Integer`        | `:int32`                       |
+| `Enum` (rich)  | `EnumName`       | `:pointer`                     |
 | `T?`         | `T` or `nil`       | `:pointer` for scalars; same pointer for strings/structs |
 | `[T]`        | `Array`            | `:pointer` + `:size_t`         |
 | `{K: V}`     | `Hash`             | key/value pointer arrays + `:size_t` |
@@ -49,7 +56,7 @@ directions.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: contacts
     enums:
@@ -205,6 +212,104 @@ rescue WeaveFFI::Error => e
   puts "Error #{e.code}: #{e.message}"
 end
 ```
+
+## Rich (algebraic) enums
+
+A rich (algebraic) enum is a sum type whose variants carry associated
+data. A plain C-style `Enum` crosses as a bare `:int32` discriminant; a
+rich enum instead lowers to an **opaque object handle**, so the
+generator emits a wrapper class with the same ownership model as a
+struct wrapper — an `FFI::AutoPointer` (`ShapePtr`) that calls the C
+`_destroy` on garbage collection.
+
+For a `Shape` enum with variants `Empty`, `Circle { radius: f64 }`,
+`Rectangle { width: f32, height: f32 }`, and `Labeled { label: string,
+count: u8 }`, the generated class carries one discriminant constant per
+variant, a `tag` reader, a `self.<variant>` factory per variant, and a
+field reader per payload:
+
+```ruby
+class ShapePtr < FFI::AutoPointer
+  def self.release(ptr)
+    WeaveFFI.weaveffi_shapes_Shape_destroy(ptr)
+  end
+end
+
+# An algebraic shape (sum type with associated data)
+class Shape
+  attr_reader :handle
+
+  def initialize(handle)
+    @handle = ShapePtr.new(handle)
+  end
+
+  # Variant discriminants returned by #tag
+  EMPTY = 0
+  CIRCLE = 1
+  RECTANGLE = 2
+  LABELED = 3
+
+  def tag
+    WeaveFFI.weaveffi_shapes_Shape_tag(@handle)
+  end
+
+  # A circle with a radius
+  def self.circle(radius)
+    err = WeaveFFI::ErrorStruct.new
+    result = WeaveFFI.weaveffi_shapes_Shape_Circle_new(radius, err)
+    WeaveFFI.check_error!(err)
+    new(result)
+  end
+
+  # A labeled shape with a small count
+  def self.labeled(label, count)
+    err = WeaveFFI::ErrorStruct.new
+    result = WeaveFFI.weaveffi_shapes_Shape_Labeled_new(label, count, err)
+    WeaveFFI.check_error!(err)
+    new(result)
+  end
+
+  # Radius in points
+  def circle_radius
+    WeaveFFI.weaveffi_shapes_Shape_Circle_get_radius(@handle)
+  end
+
+  def labeled_count
+    WeaveFFI.weaveffi_shapes_Shape_Labeled_get_count(@handle)
+  end
+end
+```
+
+The remaining surface follows the same pattern: factories
+`Shape.empty`, `Shape.circle`, `Shape.rectangle`, and `Shape.labeled`;
+readers `circle_radius`, `rectangle_width`, `rectangle_height`,
+`labeled_label`, and `labeled_count`. Each maps to a
+`weaveffi_shapes_Shape_<Variant>_new` /
+`weaveffi_shapes_Shape_<Variant>_get_<field>` symbol, and
+`weaveffi_shapes_Shape_tag` returns the discriminant.
+
+Construct a couple of variants, read the tag and a field, then pass the
+wrapper to a module function:
+
+```ruby
+require 'weaveffi'
+
+circle = WeaveFFI::Shape.circle(2.0)
+labeled = WeaveFFI::Shape.labeled('unit', 3)
+
+if circle.tag == WeaveFFI::Shape::CIRCLE
+  puts circle.circle_radius          # 2.0
+end
+puts labeled.labeled_count           # 3
+
+puts WeaveFFI.describe(circle)       # render via the C ABI
+bigger = WeaveFFI.scale(circle, 3.0) # returns a new Shape
+```
+
+**Ownership:** the `ShapePtr` `FFI::AutoPointer` calls
+`weaveffi_shapes_Shape_destroy` when Ruby garbage-collects the wrapper;
+call `#destroy` for deterministic cleanup. The `Shape` returned by
+`WeaveFFI.scale` is managed the same way.
 
 ## Build instructions
 

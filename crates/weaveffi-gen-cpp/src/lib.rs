@@ -8,7 +8,7 @@
 //! pipeline.
 
 use camino::Utf8Path;
-use heck::ToUpperCamelCase;
+use heck::{ToSnakeCase, ToUpperCamelCase};
 use serde::{Deserialize, Serialize};
 use weaveffi_core::abi::{self, AbiParam};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
@@ -24,7 +24,7 @@ use weaveffi_core::utils::{
     c_abi_struct_name, local_type_name, render_abi_prefix_aliases, render_prelude, render_trailer,
     CommentStyle,
 };
-use weaveffi_ir::ir::{Api, ErrorCode, Function, Module, StructDef, StructField, TypeRef};
+use weaveffi_ir::ir::{Api, EnumDef, ErrorCode, Function, Module, StructDef, StructField, TypeRef};
 
 /// Idiomatic C++ exception class name for an error code: PascalCase with a
 /// single `Error` suffix (`KEY_NOT_FOUND` → `KeyNotFoundError`), instead of the
@@ -246,13 +246,33 @@ fn render_cpp_header(
     }
     // Wrapper classes in dependency order: a getter that returns another wrapper
     // type constructs it inline, which needs that class complete. Topological
-    // ordering makes parent<->child cross-module references compile.
-    let struct_entries: Vec<(&StructDef, String)> = walk_modules_with_path(&api.modules)
-        .flat_map(|(m, path)| m.structs.iter().map(move |s| (s, path.clone())))
+    // ordering makes parent<->child cross-module references compile. Structs and
+    // rich (algebraic) enums are both opaque-object wrappers and can reference
+    // one another (a struct field of enum type, a variant payload of struct
+    // type), so they share a single ordering.
+    let wrapper_entries: Vec<(WrapperDef, String)> = walk_modules_with_path(&api.modules)
+        .flat_map(|(m, path)| {
+            let struct_path = path.clone();
+            let structs = m
+                .structs
+                .iter()
+                .map(move |s| (WrapperDef::Struct(s), struct_path.clone()));
+            let enums = m
+                .enums
+                .iter()
+                .filter(|e| e.is_rich())
+                .map(move |e| (WrapperDef::RichEnum(e), path.clone()));
+            structs.chain(enums)
+        })
         .collect();
-    for idx in topo_order_structs(&struct_entries) {
-        let (s, abi_module) = &struct_entries[idx];
-        render_cpp_class(&mut out, s, abi_module, c_prefix);
+    for idx in topo_order_wrappers(&wrapper_entries) {
+        let (w, abi_module) = &wrapper_entries[idx];
+        match w {
+            WrapperDef::Struct(s) => render_cpp_class(&mut out, s, abi_module, c_prefix),
+            WrapperDef::RichEnum(e) => {
+                render_cpp_rich_enum_class(&mut out, e, abi_module, c_prefix)
+            }
+        }
     }
     // Free functions last: every wrapper class is defined, so a function may
     // accept or return any of them by value.
@@ -306,9 +326,15 @@ fn render_extern_c(out: &mut String, api: &Api, prefix: &str) {
 
 fn cpp_type(ty: &TypeRef) -> String {
     match ty {
+        TypeRef::I8 => "int8_t".into(),
+        TypeRef::I16 => "int16_t".into(),
         TypeRef::I32 => "int32_t".into(),
+        TypeRef::U8 => "uint8_t".into(),
+        TypeRef::U16 => "uint16_t".into(),
         TypeRef::U32 => "uint32_t".into(),
         TypeRef::I64 => "int64_t".into(),
+        TypeRef::U64 => "uint64_t".into(),
+        TypeRef::F32 => "float".into(),
         TypeRef::F64 => "double".into(),
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "std::string".into(),
@@ -371,6 +397,11 @@ fn render_cpp_error_classes(out: &mut String, error_codes: &[&ErrorCode]) {
 
 fn render_cpp_enums(out: &mut String, module: &Module) {
     for e in &module.enums {
+        // Rich (algebraic) enums are opaque-object wrappers, emitted as classes
+        // alongside structs; only plain C-style enums map to `enum class`.
+        if e.is_rich() {
+            continue;
+        }
         emit_doc(out, &e.doc, "");
         out.push_str(&format!("enum class {} : int32_t {{\n", e.name));
         for (i, v) in e.variants.iter().enumerate() {
@@ -443,6 +474,122 @@ fn render_cpp_class(out: &mut String, s: &StructDef, abi_module: &str, prefix: &
     }
 }
 
+/// Render a rich (algebraic) enum as an opaque-object RAII class: move-only
+/// ownership of the C handle, a nested `Tag` enum + `tag()` reader, one static
+/// factory per variant (`Shape::Circle(2.0)`), and per-variant field accessors
+/// named `{variant_snake}_{field}()`. Mirrors the struct wrapper so the existing
+/// function-wrapper machinery (`x.handle()`, `T(result)`) works unchanged.
+fn render_cpp_rich_enum_class(out: &mut String, e: &EnumDef, abi_module: &str, prefix: &str) {
+    let tag = format!("{prefix}_{}_{}", abi_module, e.name);
+    let name = &e.name;
+
+    emit_doc(out, &e.doc, "");
+    out.push_str(&format!("class {name} {{\n"));
+    out.push_str("    void* handle_;\n\n");
+    out.push_str("public:\n");
+    out.push_str(&format!(
+        "    explicit {name}(void* h) : handle_(h) {{}}\n\n"
+    ));
+
+    // Destructor / move-only ownership (identical contract to a struct wrapper).
+    out.push_str(&format!("    ~{name}() {{\n"));
+    out.push_str(&format!(
+        "        if (handle_) {tag}_destroy(static_cast<{tag}*>(handle_));\n"
+    ));
+    out.push_str("    }\n\n");
+    out.push_str(&format!("    {name}(const {name}&) = delete;\n"));
+    out.push_str(&format!(
+        "    {name}& operator=(const {name}&) = delete;\n\n"
+    ));
+    out.push_str(&format!(
+        "    {name}({name}&& other) noexcept : handle_(other.handle_) {{\n"
+    ));
+    out.push_str("        other.handle_ = nullptr;\n");
+    out.push_str("    }\n\n");
+    out.push_str(&format!(
+        "    {name}& operator=({name}&& other) noexcept {{\n"
+    ));
+    out.push_str("        if (this != &other) {\n");
+    out.push_str(&format!(
+        "            if (handle_) {tag}_destroy(static_cast<{tag}*>(handle_));\n"
+    ));
+    out.push_str("            handle_ = other.handle_;\n");
+    out.push_str("            other.handle_ = nullptr;\n");
+    out.push_str("        }\n");
+    out.push_str("        return *this;\n");
+    out.push_str("    }\n\n");
+    out.push_str("    void* handle() const { return handle_; }\n\n");
+
+    // Nested tag enum + reader.
+    out.push_str("    enum class Tag : int32_t {\n");
+    for (i, v) in e.variants.iter().enumerate() {
+        let comma = if i + 1 < e.variants.len() { "," } else { "" };
+        out.push_str(&format!("        {} = {}{}\n", v.name, v.value, comma));
+    }
+    out.push_str("    };\n\n");
+    out.push_str("    Tag tag() const {\n");
+    out.push_str(&format!(
+        "        return static_cast<Tag>({tag}_tag(static_cast<const {tag}*>(handle_)));\n"
+    ));
+    out.push_str("    }\n\n");
+
+    // One static factory per variant.
+    for v in &e.variants {
+        let decls: Vec<String> = v
+            .fields
+            .iter()
+            .map(|f| cpp_param_decl(&f.ty, &f.name))
+            .collect();
+        emit_doc(out, &v.doc, "    ");
+        out.push_str(&format!(
+            "    static {name} {}({}) {{\n",
+            v.name,
+            decls.join(", ")
+        ));
+        let mut setup = Vec::new();
+        let mut c_args = Vec::new();
+        for f in &v.fields {
+            let (s, a) = param_to_c_args(&f.ty, &f.name, abi_module, prefix);
+            setup.extend(s);
+            c_args.extend(a);
+        }
+        c_args.push("&err".into());
+        for line in &setup {
+            out.push_str(&format!("        {line}\n"));
+        }
+        out.push_str(&format!("        {prefix}_error err{{}};\n"));
+        out.push_str(&format!(
+            "        auto* result = {tag}_{}_new({});\n",
+            v.name,
+            c_args.join(", ")
+        ));
+        out.push_str("        if (err.code != 0) {\n");
+        out.push_str(
+            "            std::string msg(err.message ? err.message : \"unknown error\");\n",
+        );
+        out.push_str("            int32_t code = err.code;\n");
+        out.push_str(&format!("            {prefix}_error_clear(&err);\n"));
+        out.push_str("            throw WeaveFFIError(code, msg);\n");
+        out.push_str("        }\n");
+        out.push_str(&format!("        return {name}(result);\n"));
+        out.push_str("    }\n\n");
+    }
+
+    // Per-variant field accessors, namespaced by variant to avoid collisions.
+    for v in &e.variants {
+        let cast = format!("static_cast<const {tag}*>(handle_)");
+        for f in &v.fields {
+            let getter = format!("{tag}_{}_get_{}", v.name, f.name);
+            let method = format!("{}_{}", v.name.to_snake_case(), f.name);
+            emit_cpp_getter_method(
+                out, &method, &getter, &cast, &f.ty, &f.doc, abi_module, prefix,
+            );
+        }
+    }
+
+    out.push_str("};\n\n");
+}
+
 /// Collect the local class names of any wrapper types (`struct`/`handle<T>`)
 /// reachable from `ty`, recursing through optional/list/map/iterator wrappers.
 ///
@@ -463,9 +610,44 @@ fn collect_struct_deps(ty: &TypeRef, deps: &mut Vec<String>) {
     }
 }
 
-fn topo_visit(
+/// An opaque-object wrapper type: a struct or a rich (algebraic) enum. Both are
+/// emitted as RAII classes and may reference one another (a struct field of enum
+/// type, a variant payload of struct type), so they are ordered together.
+enum WrapperDef<'a> {
+    Struct(&'a StructDef),
+    RichEnum(&'a EnumDef),
+}
+
+impl WrapperDef<'_> {
+    fn name(&self) -> &str {
+        match self {
+            WrapperDef::Struct(s) => &s.name,
+            WrapperDef::RichEnum(e) => &e.name,
+        }
+    }
+
+    /// Local class names of other wrapper types this one references by value.
+    fn collect_deps(&self, deps: &mut Vec<String>) {
+        match self {
+            WrapperDef::Struct(s) => {
+                for f in &s.fields {
+                    collect_struct_deps(&f.ty, deps);
+                }
+            }
+            WrapperDef::RichEnum(e) => {
+                for v in &e.variants {
+                    for f in &v.fields {
+                        collect_struct_deps(&f.ty, deps);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn topo_visit_wrappers(
     i: usize,
-    entries: &[(&StructDef, String)],
+    entries: &[(WrapperDef, String)],
     name_to_idx: &std::collections::HashMap<String, usize>,
     state: &mut [u8],
     order: &mut Vec<usize>,
@@ -476,13 +658,11 @@ fn topo_visit(
     }
     state[i] = 1;
     let mut deps = Vec::new();
-    for f in &entries[i].0.fields {
-        collect_struct_deps(&f.ty, &mut deps);
-    }
+    entries[i].0.collect_deps(&mut deps);
     for d in &deps {
         if let Some(&j) = name_to_idx.get(d) {
             if j != i {
-                topo_visit(j, entries, name_to_idx, state, order);
+                topo_visit_wrappers(j, entries, name_to_idx, state, order);
             }
         }
     }
@@ -490,21 +670,22 @@ fn topo_visit(
     order.push(i);
 }
 
-/// Order all wrapper structs so that any struct a getter returns by value is
-/// emitted before the struct returning it. This lets a parent module's class
-/// reference a child module's class (and vice versa) regardless of declaration
-/// order. Pure DFS post-order; original walk order is the stable tiebreaker.
-fn topo_order_structs(entries: &[(&StructDef, String)]) -> Vec<usize> {
+/// Order all opaque-object wrappers (structs + rich enums) so that any wrapper a
+/// getter or factory returns by value is emitted before the wrapper returning
+/// it. This lets a parent module's class reference a child module's class (and
+/// vice versa) regardless of declaration order. Pure DFS post-order; original
+/// walk order is the stable tiebreaker.
+fn topo_order_wrappers(entries: &[(WrapperDef, String)]) -> Vec<usize> {
     let mut name_to_idx = std::collections::HashMap::new();
-    for (i, (s, _)) in entries.iter().enumerate() {
+    for (i, (w, _)) in entries.iter().enumerate() {
         // First definition wins if two modules share a local name (the flattened
         // C++ namespace can't hold duplicates anyway).
-        name_to_idx.entry(s.name.clone()).or_insert(i);
+        name_to_idx.entry(w.name().to_string()).or_insert(i);
     }
     let mut state = vec![0u8; entries.len()];
     let mut order = Vec::with_capacity(entries.len());
     for i in 0..entries.len() {
-        topo_visit(i, entries, &name_to_idx, &mut state, &mut order);
+        topo_visit_wrappers(i, entries, &name_to_idx, &mut state, &mut order);
     }
     order
 }
@@ -592,13 +773,50 @@ fn render_cpp_getter(
     let tag = format!("{prefix}_{module}_{struct_name}");
     let getter = format!("{tag}_get_{}", field.name);
     let cast = format!("static_cast<const {tag}*>(handle_)");
-    let ret_type = cpp_type(&field.ty);
+    emit_cpp_getter_method(
+        out,
+        &field.name,
+        &getter,
+        &cast,
+        &field.ty,
+        &field.doc,
+        module,
+        prefix,
+    );
+}
 
-    emit_doc(out, &field.doc, "    ");
-    out.push_str(&format!("    {ret_type} {}() const {{\n", field.name));
+/// Emit one `RetType method() const { ... }` accessor that reads an opaque
+/// object's field through C getter `getter`, casting `handle_` via `cast`. Shared
+/// by struct field getters and rich-enum per-variant field getters (which differ
+/// only in the C symbol and the C++ method name).
+#[allow(clippy::too_many_arguments)]
+fn emit_cpp_getter_method(
+    out: &mut String,
+    method_name: &str,
+    getter: &str,
+    cast: &str,
+    ty: &TypeRef,
+    doc: &Option<String>,
+    module: &str,
+    prefix: &str,
+) {
+    let ret_type = cpp_type(ty);
 
-    match &field.ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Bool => {
+    emit_doc(out, doc, "    ");
+    out.push_str(&format!("    {ret_type} {method_name}() const {{\n"));
+
+    match ty {
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::U64
+        | TypeRef::F32
+        | TypeRef::F64
+        | TypeRef::Bool => {
             out.push_str(&format!("        return {getter}({cast});\n"));
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
@@ -632,15 +850,15 @@ fn render_cpp_getter(
             ));
         }
         TypeRef::Optional(inner) => {
-            render_getter_optional(out, inner, &getter, &cast, prefix);
+            render_getter_optional(out, inner, getter, cast, prefix);
         }
         TypeRef::List(inner) => {
-            render_getter_list(out, inner, &getter, &cast);
+            render_getter_list(out, inner, getter, cast);
         }
         TypeRef::Map(k, v) => {
-            render_getter_map(out, k, v, &getter, &cast, module, prefix);
+            render_getter_map(out, k, v, getter, cast, module, prefix);
         }
-        TypeRef::Iterator(_) => unreachable!("iterator not valid as struct field"),
+        TypeRef::Iterator(_) => unreachable!("iterator not valid as enum/struct field"),
     }
 
     out.push_str("    }\n\n");
@@ -828,9 +1046,15 @@ fn cpp_cb_arg(
     let slots = abi::lower_param(&p.name, &p.ty, abi_module, false);
     let n0 = slots[0].name.clone();
     match &p.ty {
-        TypeRef::I32
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::U8
+        | TypeRef::U16
         | TypeRef::U32
         | TypeRef::I64
+        | TypeRef::U64
+        | TypeRef::F32
         | TypeRef::F64
         | TypeRef::Bool
         | TypeRef::Handle => n0,
@@ -982,9 +1206,17 @@ fn param_to_c_args(
     prefix: &str,
 ) -> (Vec<String>, Vec<String>) {
     match ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Bool => {
-            (vec![], vec![name.into()])
-        }
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::U64
+        | TypeRef::F32
+        | TypeRef::F64
+        | TypeRef::Bool => (vec![], vec![name.into()]),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => (vec![], vec![format!("{name}.c_str()")]),
         TypeRef::Bytes | TypeRef::BorrowedBytes => (
             vec![],
@@ -1389,7 +1621,17 @@ fn render_cpp_iterator_function(
 
 fn render_cpp_return(out: &mut String, ty: &TypeRef, prefix: &str) {
     match ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Bool => {
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::U64
+        | TypeRef::F32
+        | TypeRef::F64
+        | TypeRef::Bool => {
             out.push_str("    return result;\n");
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
@@ -1588,7 +1830,17 @@ fn render_cpp_async_function(out: &mut String, func: &Function, abi_module: &str
 
 fn render_async_set_value(out: &mut String, ty: &TypeRef, prefix: &str) {
     match ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Bool => {
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::U64
+        | TypeRef::F32
+        | TypeRef::F64
+        | TypeRef::Bool => {
             out.push_str("            p->set_value(result);\n");
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
@@ -1730,7 +1982,7 @@ mod tests {
 
     fn minimal_api() -> Api {
         Api {
-            version: "0.3.0".to_string(),
+            version: "0.4.0".to_string(),
             modules: vec![Module {
                 name: "calculator".to_string(),
                 functions: vec![Function {
@@ -1772,7 +2024,7 @@ mod tests {
     fn listeners_generate_register_unregister() {
         use weaveffi_ir::ir::{CallbackDef, ListenerDef};
         let api = Api {
-            version: "0.3.0".to_string(),
+            version: "0.4.0".to_string(),
             modules: vec![Module {
                 name: "events".to_string(),
                 functions: vec![],
@@ -1830,7 +2082,7 @@ mod tests {
 
     fn contacts_api() -> Api {
         Api {
-            version: "0.3.0".to_string(),
+            version: "0.4.0".to_string(),
             modules: vec![Module {
                 name: "contacts".to_string(),
                 enums: vec![EnumDef {
@@ -1841,11 +2093,13 @@ mod tests {
                             name: "Personal".to_string(),
                             value: 0,
                             doc: None,
+                            fields: vec![],
                         },
                         EnumVariant {
                             name: "Work".to_string(),
                             value: 1,
                             doc: None,
+                            fields: vec![],
                         },
                     ],
                 }],
@@ -2372,7 +2626,7 @@ mod tests {
     #[test]
     fn cpp_string_param_function() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "io".into(),
                 functions: vec![Function {
@@ -2415,7 +2669,7 @@ mod tests {
     #[test]
     fn cpp_list_return_function() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "store".into(),
                 functions: vec![Function {
@@ -2456,7 +2710,7 @@ mod tests {
     #[test]
     fn cpp_optional_i32_return() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "store".into(),
                 functions: vec![Function {
@@ -2499,7 +2753,7 @@ mod tests {
     #[test]
     fn cpp_enum_param_function() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "paint".into(),
                 functions: vec![Function {
@@ -2526,11 +2780,13 @@ mod tests {
                             name: "Red".into(),
                             value: 0,
                             doc: None,
+                            fields: vec![],
                         },
                         EnumVariant {
                             name: "Green".into(),
                             value: 1,
                             doc: None,
+                            fields: vec![],
                         },
                     ],
                 }],
@@ -2560,7 +2816,7 @@ mod tests {
     #[test]
     fn cpp_list_struct_return() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![Function {
@@ -2607,7 +2863,7 @@ mod tests {
     #[test]
     fn cpp_map_return_function() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "store".into(),
                 functions: vec![Function {
@@ -2647,7 +2903,7 @@ mod tests {
     #[test]
     fn cpp_struct_getter_list() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "m".into(),
                 functions: vec![],
@@ -2681,7 +2937,7 @@ mod tests {
     #[test]
     fn cpp_struct_getter_map() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "m".into(),
                 functions: vec![],
@@ -2781,7 +3037,7 @@ mod tests {
     #[test]
     fn cpp_bytes_return_function() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "io".into(),
                 functions: vec![Function {
@@ -2815,7 +3071,7 @@ mod tests {
     #[test]
     fn cpp_typed_handle_param() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "db".into(),
                 functions: vec![Function {
@@ -2883,7 +3139,7 @@ mod tests {
     #[test]
     fn cpp_error_domains_generate_subclasses() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "auth".into(),
                 functions: vec![Function {
@@ -3054,7 +3310,7 @@ mod tests {
     #[test]
     fn generate_cpp_with_structs() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "db".into(),
                 functions: vec![],
@@ -3127,7 +3383,7 @@ mod tests {
     #[test]
     fn cpp_builder_struct_emits_extern_and_wrapper() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "geo".into(),
                 functions: vec![],
@@ -3178,7 +3434,7 @@ mod tests {
     #[test]
     fn generate_cpp_with_enums() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "status".into(),
                 functions: vec![],
@@ -3191,16 +3447,19 @@ mod tests {
                             name: "Low".into(),
                             value: 0,
                             doc: None,
+                            fields: vec![],
                         },
                         EnumVariant {
                             name: "Medium".into(),
                             value: 1,
                             doc: None,
+                            fields: vec![],
                         },
                         EnumVariant {
                             name: "High".into(),
                             value: 2,
                             doc: None,
+                            fields: vec![],
                         },
                     ],
                 }],
@@ -3233,9 +3492,80 @@ mod tests {
     }
 
     #[test]
+    fn generate_cpp_rich_enum_class() {
+        let api = Api {
+            version: "0.4.0".into(),
+            modules: vec![Module {
+                name: "shapes".into(),
+                functions: vec![],
+                structs: vec![],
+                enums: vec![EnumDef {
+                    name: "Shape".into(),
+                    doc: None,
+                    variants: vec![
+                        EnumVariant {
+                            name: "Empty".into(),
+                            value: 0,
+                            doc: None,
+                            fields: vec![],
+                        },
+                        EnumVariant {
+                            name: "Circle".into(),
+                            value: 1,
+                            doc: None,
+                            fields: vec![StructField {
+                                name: "radius".into(),
+                                ty: TypeRef::F64,
+                                doc: None,
+                                default: None,
+                            }],
+                        },
+                    ],
+                }],
+                callbacks: vec![],
+                listeners: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+            generators: None,
+            package: None,
+        };
+        let h = render_cpp_header(&api, "weaveffi", "weaveffi", "weaveffi.yml", "weaveffi.hpp");
+
+        // A rich enum is an opaque-object class, never an `enum class`.
+        assert!(
+            !h.contains("enum class Shape : int32_t {"),
+            "rich enum must not be a plain enum class: {h}"
+        );
+        assert!(h.contains("class Shape {"), "missing rich enum class: {h}");
+        assert!(
+            h.contains("enum class Tag : int32_t {"),
+            "missing nested Tag enum: {h}"
+        );
+        assert!(
+            h.contains("static Shape Empty() {"),
+            "missing unit factory: {h}"
+        );
+        assert!(
+            h.contains("static Shape Circle(double radius) {"),
+            "missing data factory: {h}"
+        );
+        assert!(
+            h.contains("double circle_radius() const {"),
+            "missing per-variant getter: {h}"
+        );
+        assert!(
+            h.contains(
+                "weaveffi_shapes_Shape_destroy(static_cast<weaveffi_shapes_Shape*>(handle_))"
+            ),
+            "rich enum class must own + destroy its handle: {h}"
+        );
+    }
+
+    #[test]
     fn generate_cpp_with_optionals() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "store".into(),
                 functions: vec![Function {
@@ -3292,7 +3622,7 @@ mod tests {
     #[test]
     fn generate_cpp_with_lists() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "data".into(),
                 functions: vec![Function {
@@ -3355,7 +3685,7 @@ mod tests {
     #[test]
     fn generate_cpp_with_maps() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "kv".into(),
                 functions: vec![Function {
@@ -3410,7 +3740,7 @@ mod tests {
     #[test]
     fn generate_cpp_with_typed_handle() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "session".into(),
                 functions: vec![Function {
@@ -3539,7 +3869,7 @@ mod tests {
     #[test]
     fn cpp_async_returns_future() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "tasks".into(),
                 functions: vec![Function {
@@ -3595,7 +3925,7 @@ mod tests {
     #[test]
     fn cpp_async_uses_promise() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "tasks".into(),
                 functions: vec![
@@ -3670,7 +4000,7 @@ mod tests {
     #[test]
     fn cpp_async_pins_callback_for_lifetime() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "tasks".into(),
                 functions: vec![Function {
@@ -3714,7 +4044,7 @@ mod tests {
     #[test]
     fn cpp_no_double_free_on_error() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 structs: vec![StructDef {
@@ -3787,7 +4117,7 @@ mod tests {
     #[test]
     fn cpp_null_check_on_optional_return() {
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![Function {
@@ -3841,7 +4171,7 @@ mod tests {
 
     fn doc_api() -> Api {
         Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "docs".into(),
                 functions: vec![Function {
@@ -3877,6 +4207,7 @@ mod tests {
                         name: "Small".into(),
                         value: 0,
                         doc: Some("A small one".into()),
+                        fields: vec![],
                     }],
                 }],
                 callbacks: vec![],

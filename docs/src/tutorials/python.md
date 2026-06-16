@@ -20,7 +20,7 @@ script.
 Save as `greeter.yml`:
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: greeter
     structs:

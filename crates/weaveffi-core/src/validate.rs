@@ -86,6 +86,15 @@ pub enum ValidationError {
     #[error("duplicate enum variant in enum '{enum_name}': {variant}")]
     #[diagnostic(help("variant names must be unique within an enum; rename the duplicate"))]
     DuplicateEnumVariant { enum_name: String, variant: String },
+    #[error("duplicate field '{field}' in variant '{variant}' of enum '{enum_name}'")]
+    #[diagnostic(help(
+        "associated field names must be unique within an enum variant; rename the duplicate"
+    ))]
+    DuplicateEnumVariantField {
+        enum_name: String,
+        variant: String,
+        field: String,
+    },
     #[error("duplicate enum value in enum '{enum_name}': {value}")]
     #[diagnostic(help(
         "variant numeric values must be unique within an enum; assign a different value"

@@ -8,7 +8,7 @@ use weaveffi_ir::parse::parse_api_str;
 
 fn calculator_api() -> Api {
     Api {
-        version: "0.3.0".to_string(),
+        version: "0.4.0".to_string(),
         modules: vec![Module {
             name: "calculator".to_string(),
             functions: vec![
@@ -150,16 +150,19 @@ fn large_api() -> Api {
                             name: "Alpha".to_string(),
                             value: 0,
                             doc: None,
+                            fields: vec![],
                         },
                         EnumVariant {
                             name: "Beta".to_string(),
                             value: 1,
                             doc: None,
+                            fields: vec![],
                         },
                         EnumVariant {
                             name: "Gamma".to_string(),
                             value: 2,
                             doc: None,
+                            fields: vec![],
                         },
                     ],
                 })
@@ -213,7 +216,7 @@ fn large_api() -> Api {
         .collect();
 
     Api {
-        version: "0.3.0".to_string(),
+        version: "0.4.0".to_string(),
         modules,
         generators: None,
         package: None,

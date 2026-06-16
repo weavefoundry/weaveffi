@@ -57,7 +57,7 @@ impl Generator for CountingGenerator {
 
 fn test_api() -> Api {
     Api {
-        version: "0.3.0".to_string(),
+        version: "0.4.0".to_string(),
         modules: vec![Module {
             name: "math".to_string(),
             functions: vec![Function {

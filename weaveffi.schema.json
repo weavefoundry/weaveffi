@@ -222,7 +222,7 @@
     },
     "TypeRef": {
       "title": "TypeRef",
-      "description": "Reference to a type. Encoded as a string with custom syntax: primitives (`i32`, `u32`, `i64`, `f64`, `bool`, `string`, `bytes`, `handle`), borrowed types (`&str`, `&[u8]`), typed handles (`handle<{name}>`), iterators (`iter<{T}>`), lists (`[{T}]`), maps (`{{K:V}}`), optionals (`{T}?`), or any user-defined struct/enum name.",
+      "description": "Reference to a type. Encoded as a string with custom syntax: primitives (`i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64`, `bool`, `string`, `bytes`, `handle`), borrowed types (`&str`, `&[u8]`), typed handles (`handle<{name}>`), iterators (`iter<{T}>`), lists (`[{T}]`), maps (`{{K:V}}`), optionals (`{T}?`), or any user-defined struct/enum name.",
       "type": "string"
     },
     "StructDef": {
@@ -276,6 +276,7 @@
       }
     },
     "EnumDef": {
+      "description": "An enum type. C-style when every variant is a bare discriminant; an algebraic sum type when any variant declares fields.",
       "type": "object",
       "required": [
         "name",
@@ -300,6 +301,7 @@
       }
     },
     "EnumVariant": {
+      "description": "`Eq` is omitted because `StructField::default` may contain `serde_yaml::Value`.",
       "type": "object",
       "required": [
         "name",
@@ -318,6 +320,13 @@
             "string",
             "null"
           ]
+        },
+        "fields": {
+          "description": "Associated data carried by this variant. Empty for a unit variant or a C-style enum; non-empty makes the owning enum a sum type (see [`EnumDef::is_rich`]). Variant fields reuse [`StructField`] but ignore the `default` slot (a sum-type payload has no defaultable fields).",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/StructField"
+          }
         }
       }
     },

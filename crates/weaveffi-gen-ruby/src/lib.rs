@@ -16,7 +16,7 @@ use weaveffi_core::codegen::common::{
 };
 use weaveffi_core::model::{
     AsyncBinding, BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
-    IteratorBinding, ListenerBinding, ModuleBinding, StructBinding,
+    IteratorBinding, ListenerBinding, ModuleBinding, RichVariantBinding, StructBinding,
 };
 use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::utils::{local_type_name, render_prelude, render_trailer, CommentStyle};
@@ -125,10 +125,15 @@ weaveffi_core::impl_generator_via_backend!(RubyGenerator);
 /// must stay `:pointer` so the caller can free them.
 fn rb_ffi_type(ty: &CType, string_as_pointer: bool) -> &'static str {
     match ty {
+        CType::Int8 => ":int8",
+        CType::Int16 => ":int16",
         CType::Int32 | CType::Bool | CType::Enum { .. } => ":int32",
+        CType::Uint8 => ":uint8",
+        CType::Uint16 => ":uint16",
         CType::Uint32 => ":uint32",
         CType::Int64 => ":int64",
         CType::Uint64 => ":uint64",
+        CType::Float => ":float",
         CType::Double => ":double",
         CType::Handle => ":uint64",
         CType::Size => ":size_t",
@@ -154,9 +159,15 @@ fn rb_return_out_params(ty: &TypeRef) -> Vec<&'static str> {
 
 fn rb_read_method(ty: &TypeRef) -> &'static str {
     match ty {
+        TypeRef::I8 => "read_int8",
+        TypeRef::I16 => "read_int16",
         TypeRef::I32 | TypeRef::Bool | TypeRef::Enum(_) => "read_int32",
+        TypeRef::U8 => "read_uint8",
+        TypeRef::U16 => "read_uint16",
         TypeRef::U32 => "read_uint32",
         TypeRef::I64 => "read_int64",
+        TypeRef::U64 => "read_uint64",
+        TypeRef::F32 => "read_float",
         TypeRef::F64 => "read_double",
         TypeRef::Handle => "read_uint64",
         _ => "read_pointer",
@@ -165,9 +176,15 @@ fn rb_read_method(ty: &TypeRef) -> &'static str {
 
 fn rb_mem_type(ty: &TypeRef) -> &'static str {
     match ty {
+        TypeRef::I8 => ":int8",
+        TypeRef::I16 => ":int16",
         TypeRef::I32 | TypeRef::Bool | TypeRef::Enum(_) => ":int32",
+        TypeRef::U8 => ":uint8",
+        TypeRef::U16 => ":uint16",
         TypeRef::U32 => ":uint32",
         TypeRef::I64 => ":int64",
+        TypeRef::U64 => ":uint64",
+        TypeRef::F32 => ":float",
         TypeRef::F64 => ":double",
         TypeRef::Handle => ":uint64",
         _ => ":pointer",
@@ -176,9 +193,15 @@ fn rb_mem_type(ty: &TypeRef) -> &'static str {
 
 fn rb_write_method(ty: &TypeRef) -> &'static str {
     match ty {
+        TypeRef::I8 => "write_int8",
+        TypeRef::I16 => "write_int16",
         TypeRef::I32 | TypeRef::Bool | TypeRef::Enum(_) => "write_int32",
+        TypeRef::U8 => "write_uint8",
+        TypeRef::U16 => "write_uint16",
         TypeRef::U32 => "write_uint32",
         TypeRef::I64 => "write_int64",
+        TypeRef::U64 => "write_uint64",
+        TypeRef::F32 => "write_float",
         TypeRef::F64 => "write_double",
         TypeRef::Handle => "write_uint64",
         _ => "write_pointer",
@@ -187,9 +210,15 @@ fn rb_write_method(ty: &TypeRef) -> &'static str {
 
 fn rb_array_reader(ty: &TypeRef) -> &'static str {
     match ty {
+        TypeRef::I8 => "read_array_of_int8",
+        TypeRef::I16 => "read_array_of_int16",
         TypeRef::I32 | TypeRef::Bool | TypeRef::Enum(_) => "read_array_of_int32",
+        TypeRef::U8 => "read_array_of_uint8",
+        TypeRef::U16 => "read_array_of_uint16",
         TypeRef::U32 => "read_array_of_uint32",
         TypeRef::I64 => "read_array_of_int64",
+        TypeRef::U64 => "read_array_of_uint64",
+        TypeRef::F32 => "read_array_of_float",
         TypeRef::F64 => "read_array_of_double",
         TypeRef::Handle => "read_array_of_uint64",
         _ => "read_array_of_pointer",
@@ -198,9 +227,15 @@ fn rb_array_reader(ty: &TypeRef) -> &'static str {
 
 fn rb_array_writer(ty: &TypeRef) -> &'static str {
     match ty {
+        TypeRef::I8 => "write_array_of_int8",
+        TypeRef::I16 => "write_array_of_int16",
         TypeRef::I32 | TypeRef::Enum(_) => "write_array_of_int32",
+        TypeRef::U8 => "write_array_of_uint8",
+        TypeRef::U16 => "write_array_of_uint16",
         TypeRef::U32 => "write_array_of_uint32",
         TypeRef::I64 => "write_array_of_int64",
+        TypeRef::U64 => "write_array_of_uint64",
+        TypeRef::F32 => "write_array_of_float",
         TypeRef::F64 => "write_array_of_double",
         TypeRef::Handle => "write_array_of_uint64",
         _ => "write_array_of_pointer",
@@ -217,9 +252,15 @@ fn get_map_kv(ty: &TypeRef) -> Option<(&TypeRef, &TypeRef)> {
 
 fn rb_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
     match ty {
-        TypeRef::I32
-        | TypeRef::U32
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
         | TypeRef::I64
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::U64
+        | TypeRef::F32
         | TypeRef::F64
         | TypeRef::Handle
         | TypeRef::Enum(_)
@@ -291,7 +332,14 @@ fn render_ruby_module(
     for m in &model.modules {
         out.push_str(&format!("\n  # === Module: {} ===\n", m.path));
         for e in &m.enums {
-            render_enum(&mut out, e);
+            // A plain C-style enum is a module of integer constants; a rich
+            // (algebraic) enum is an opaque-object wrapper like a struct, so it
+            // emits FFI bindings here and a wrapper class further down.
+            if e.is_rich() {
+                render_rich_enum_ffi(&mut out, e);
+            } else {
+                render_enum(&mut out, e);
+            }
         }
         for s in &m.structs {
             render_struct_ffi(&mut out, s);
@@ -304,6 +352,11 @@ fn render_ruby_module(
         }
         for f in &m.functions {
             render_attach_function(&mut out, f);
+        }
+        for e in &m.enums {
+            if e.is_rich() {
+                render_rich_enum_class(&mut out, e, module_name);
+            }
         }
         for s in &m.structs {
             render_struct_class(&mut out, s, module_name);
@@ -435,6 +488,51 @@ fn render_struct_ffi(out: &mut String, s: &StructBinding) {
     }
 }
 
+/// Declare the FFI bindings for a rich (algebraic) enum: the tag getter, the
+/// destructor, and — per variant — the constructor and one getter per
+/// associated field. Mirrors [`render_struct_ffi`]; the field getters lower
+/// exactly like struct field getters (string getters return an owned
+/// `:pointer`, bytes/list getters take a trailing `out_len`).
+fn render_rich_enum_ffi(out: &mut String, e: &EnumBinding) {
+    let rich = e
+        .rich
+        .as_ref()
+        .expect("render_rich_enum_ffi requires a rich enum");
+    out.push('\n');
+    out.push_str(&format!(
+        "  attach_function :{}, [:pointer], :int32\n",
+        rich.tag_symbol
+    ));
+    out.push_str(&format!(
+        "  attach_function :{}, [:pointer], :void\n",
+        rich.destroy_symbol
+    ));
+    for v in &rich.variants {
+        // Constructor: the variant's field value slots, then out_err, returning
+        // the opaque object pointer (a unit variant takes only out_err).
+        out.push_str(&format!(
+            "  attach_function :{}, [{}], :pointer\n",
+            v.create.symbol,
+            rb_abi_types(&v.create.params, false).join(", ")
+        ));
+        for field in &v.fields {
+            let getter = &field.getter_symbol;
+            let mut argtypes = vec![":pointer".to_string()];
+            argtypes.extend(
+                rb_return_out_params(&field.ty)
+                    .iter()
+                    .map(|s| s.to_string()),
+            );
+            let restype = rb_return_ffi_type(&field.ty);
+            emit_doc(out, &field.doc, "  ");
+            out.push_str(&format!(
+                "  attach_function :{getter}, [{}], {restype}\n",
+                argtypes.join(", ")
+            ));
+        }
+    }
+}
+
 /// Map lowered ABI slots onto Ruby FFI type tokens. `string_as_pointer`
 /// applies to top-level `char*` slots (owned returns stay `:pointer` so the
 /// wrapper can free them; borrowed inputs use `:string` auto-marshalling).
@@ -546,7 +644,7 @@ fn render_struct_class(out: &mut String, s: &StructBinding, rb_module_name: &str
     );
 
     for field in &s.fields {
-        render_getter(out, field, rb_module_name);
+        render_getter(out, &field.name, field, rb_module_name);
     }
 
     out.push_str("  end\n");
@@ -606,8 +704,17 @@ fn render_ruby_builder_class(out: &mut String, s: &StructBinding, rb_module_name
 /// The zero-value default for one Ruby builder slot.
 fn rb_field_default(ty: &TypeRef) -> &'static str {
     match ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::Enum(_) => "0",
-        TypeRef::F64 => "0.0",
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::I64
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::U64
+        | TypeRef::Handle
+        | TypeRef::Enum(_) => "0",
+        TypeRef::F32 | TypeRef::F64 => "0.0",
         TypeRef::Bool => "false",
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "\"\"",
         TypeRef::Bytes | TypeRef::BorrowedBytes => "\"\".b",
@@ -619,13 +726,13 @@ fn rb_field_default(ty: &TypeRef) -> &'static str {
     }
 }
 
-fn render_getter(out: &mut String, field: &FieldBinding, rb_module_name: &str) {
+fn render_getter(out: &mut String, method: &str, field: &FieldBinding, rb_module_name: &str) {
     let getter = &field.getter_symbol;
     let ind = "      ";
 
     out.push('\n');
     emit_doc(out, &field.doc, "    ");
-    out.push_str(&format!("    def {}\n", field.name));
+    out.push_str(&format!("    def {}\n", method));
 
     let out_params = rb_return_out_params(&field.ty);
     let is_map = get_map_kv(&field.ty).is_some();
@@ -657,6 +764,107 @@ fn render_getter(out: &mut String, field: &FieldBinding, rb_module_name: &str) {
         render_return_code(out, &field.ty, ind, Some(rb_module_name));
     }
 
+    out.push_str("    end\n");
+}
+
+/// Render a rich (algebraic) enum as an opaque-object wrapper class, mirroring
+/// the struct wrapper: an `FFI::AutoPointer` subclass that frees the handle on
+/// GC, an `attr_reader :handle` + `initialize`/`create`/`destroy` matching the
+/// struct contract (so the existing function-wrapper marshalling — `x.handle`
+/// in, `Shape.new(result)` out — works unchanged), integer tag constants and a
+/// `tag` reader, one factory class method per variant (`Shape.circle(2.5)`),
+/// and per-variant field accessors namespaced by variant (`circle_radius`).
+fn render_rich_enum_class(out: &mut String, e: &EnumBinding, rb_module_name: &str) {
+    let rich = e
+        .rich
+        .as_ref()
+        .expect("render_rich_enum_class requires a rich enum");
+
+    // AutoPointer releases the handle through the enum's C destructor on GC —
+    // the same ownership contract a struct wrapper uses.
+    out.push_str(&format!("\n  class {}Ptr < FFI::AutoPointer\n", e.name));
+    out.push_str(&format!(
+        "    def self.release(ptr)\n      {rb_module_name}.{}(ptr)\n    end\n",
+        rich.destroy_symbol
+    ));
+    out.push_str("  end\n\n");
+
+    emit_doc(out, &e.doc, "  ");
+    out.push_str(&format!("  class {}\n", e.name));
+    out.push_str("    attr_reader :handle\n\n");
+    out.push_str(&format!(
+        "    def initialize(handle)\n      @handle = {}Ptr.new(handle)\n    end\n\n",
+        e.name
+    ));
+    out.push_str("    def self.create(handle)\n      new(handle)\n    end\n\n");
+    out.push_str(
+        "    def destroy\n      return if @handle.nil?\n      @handle.free\n      @handle = nil\n    end\n\n",
+    );
+
+    // Tag constants (one per variant) plus the active-variant reader.
+    for v in &e.variants {
+        emit_doc(out, &v.doc, "    ");
+        out.push_str(&format!(
+            "    {} = {}\n",
+            v.name.to_shouty_snake_case(),
+            v.value
+        ));
+    }
+    out.push('\n');
+    out.push_str(&format!(
+        "    def tag\n      {rb_module_name}.{}(@handle)\n    end\n",
+        rich.tag_symbol
+    ));
+
+    // One factory class method per variant.
+    for v in &rich.variants {
+        render_rich_variant_factory(out, v, rb_module_name);
+    }
+
+    // Per-variant field accessors, namespaced by variant (`circle_radius`) to
+    // avoid collisions, reusing the struct getter marshalling verbatim.
+    for v in &rich.variants {
+        for field in &v.fields {
+            let method = format!("{}_{}", v.name.to_snake_case(), field.name);
+            render_getter(out, &method, field, rb_module_name);
+        }
+    }
+
+    out.push_str("  end\n");
+}
+
+/// Render one variant factory as a class method (`Shape.circle(radius)`). Marshals
+/// each field with the same lowering struct `create`/builder calls use, invokes
+/// the variant constructor with a shared `ErrorStruct`, raises on error, and
+/// wraps the returned handle.
+fn render_rich_variant_factory(out: &mut String, v: &RichVariantBinding, rb_module_name: &str) {
+    let ind = "      ";
+    let factory = v.name.to_snake_case();
+    let params: Vec<String> = v.fields.iter().map(|f| f.name.to_snake_case()).collect();
+
+    out.push('\n');
+    emit_doc(out, &v.doc, "    ");
+    if params.is_empty() {
+        out.push_str(&format!("    def self.{factory}\n"));
+    } else {
+        out.push_str(&format!("    def self.{factory}({})\n", params.join(", ")));
+    }
+    out.push_str(&format!("{ind}err = {rb_module_name}::ErrorStruct.new\n"));
+    for f in &v.fields {
+        render_param_conversion(out, &f.name.to_snake_case(), &f.ty, ind);
+    }
+    let mut call_args: Vec<String> = Vec::new();
+    for f in &v.fields {
+        call_args.extend(rb_call_args(&f.name.to_snake_case(), &f.ty));
+    }
+    call_args.push("err".into());
+    out.push_str(&format!(
+        "{ind}result = {rb_module_name}.{}({})\n",
+        v.create.symbol,
+        call_args.join(", ")
+    ));
+    out.push_str(&format!("{ind}{rb_module_name}.check_error!(err)\n"));
+    out.push_str(&format!("{ind}new(result)\n"));
     out.push_str("    end\n");
 }
 
@@ -731,7 +939,17 @@ fn render_listener_wrapper(out: &mut String, module: &ModuleBinding, l: &Listene
 /// derive from the parameter name, mirroring [`abi::lower_param`].
 fn rb_cb_arg_expr(n: &str, ty: &TypeRef) -> String {
     match ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => n.into(),
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::I64
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::U64
+        | TypeRef::F32
+        | TypeRef::F64
+        | TypeRef::Handle => n.into(),
         TypeRef::Bool => format!("({n} != 0)"),
         // `:string` slots arrive as Ruby Strings (copied by ffi) or nil.
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => n.into(),
@@ -982,7 +1200,17 @@ fn render_async_result_push(out: &mut String, ret: &Option<TypeRef>, ind: &str) 
         return;
     };
     match ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => {
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::I64
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::U64
+        | TypeRef::F32
+        | TypeRef::F64
+        | TypeRef::Handle => {
             out.push_str(&format!("{ind}queue << result\n"));
         }
         TypeRef::Bool => {
@@ -1322,9 +1550,15 @@ fn render_map_buf(out: &mut String, name: &str, k: &TypeRef, v: &TypeRef, ind: &
 fn render_return_code(out: &mut String, ty: &TypeRef, ind: &str, qualifier: Option<&str>) {
     let m = qualifier.map(|q| format!("{q}.")).unwrap_or_default();
     match ty {
-        TypeRef::I32
-        | TypeRef::U32
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
         | TypeRef::I64
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::U64
+        | TypeRef::F32
         | TypeRef::F64
         | TypeRef::Handle
         | TypeRef::Enum(_) => {
@@ -1551,7 +1785,7 @@ mod tests {
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.3.0".to_string(),
+            version: "0.4.0".to_string(),
             modules,
             generators: None,
             package: None,
@@ -1687,11 +1921,13 @@ mod tests {
                         name: "Red".into(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "DarkBlue".into(),
                         value: 1,
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }],
@@ -2400,7 +2636,7 @@ mod tests {
 
     fn contacts_api() -> Api {
         Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![
@@ -2535,16 +2771,19 @@ mod tests {
                             name: "Personal".into(),
                             value: 0,
                             doc: None,
+                            fields: vec![],
                         },
                         EnumVariant {
                             name: "Work".into(),
                             value: 1,
                             doc: None,
+                            fields: vec![],
                         },
                         EnumVariant {
                             name: "Other".into(),
                             value: 2,
                             doc: None,
+                            fields: vec![],
                         },
                     ],
                 }],
@@ -2699,16 +2938,19 @@ mod tests {
                         name: "Personal".into(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Work".into(),
                         value: 1,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Other".into(),
                         value: 2,
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }],
@@ -3099,6 +3341,7 @@ mod tests {
                     name: "Small".into(),
                     value: 0,
                     doc: Some("A small one".into()),
+                    fields: vec![],
                 }],
             }],
             callbacks: vec![],
@@ -3211,6 +3454,280 @@ mod tests {
         assert!(
             code.contains("weaveffi_error_clear"),
             "runtime ABI helper must stay literal: {code}"
+        );
+    }
+
+    fn shapes_api() -> Api {
+        make_api(vec![Module {
+            name: "shapes".into(),
+            functions: vec![
+                Function {
+                    name: "describe".into(),
+                    params: vec![Param {
+                        name: "shape".into(),
+                        ty: TypeRef::Struct("Shape".into()),
+                        mutable: false,
+                        doc: None,
+                    }],
+                    returns: Some(TypeRef::StringUtf8),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "scale".into(),
+                    params: vec![
+                        Param {
+                            name: "shape".into(),
+                            ty: TypeRef::Struct("Shape".into()),
+                            mutable: false,
+                            doc: None,
+                        },
+                        Param {
+                            name: "factor".into(),
+                            ty: TypeRef::F64,
+                            mutable: false,
+                            doc: None,
+                        },
+                    ],
+                    returns: Some(TypeRef::Struct("Shape".into())),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+            ],
+            structs: vec![],
+            enums: vec![
+                EnumDef {
+                    name: "Shape".into(),
+                    doc: Some("An algebraic shape".into()),
+                    variants: vec![
+                        EnumVariant {
+                            name: "Empty".into(),
+                            value: 0,
+                            doc: None,
+                            fields: vec![],
+                        },
+                        EnumVariant {
+                            name: "Circle".into(),
+                            value: 1,
+                            doc: None,
+                            fields: vec![StructField {
+                                name: "radius".into(),
+                                ty: TypeRef::F64,
+                                doc: None,
+                                default: None,
+                            }],
+                        },
+                        EnumVariant {
+                            name: "Rectangle".into(),
+                            value: 2,
+                            doc: None,
+                            fields: vec![
+                                StructField {
+                                    name: "width".into(),
+                                    ty: TypeRef::F32,
+                                    doc: None,
+                                    default: None,
+                                },
+                                StructField {
+                                    name: "height".into(),
+                                    ty: TypeRef::F32,
+                                    doc: None,
+                                    default: None,
+                                },
+                            ],
+                        },
+                        EnumVariant {
+                            name: "Labeled".into(),
+                            value: 3,
+                            doc: None,
+                            fields: vec![
+                                StructField {
+                                    name: "label".into(),
+                                    ty: TypeRef::StringUtf8,
+                                    doc: None,
+                                    default: None,
+                                },
+                                StructField {
+                                    name: "count".into(),
+                                    ty: TypeRef::U8,
+                                    doc: None,
+                                    default: None,
+                                },
+                            ],
+                        },
+                    ],
+                },
+                EnumDef {
+                    name: "Channel".into(),
+                    doc: None,
+                    variants: vec![
+                        EnumVariant {
+                            name: "Red".into(),
+                            value: 0,
+                            doc: None,
+                            fields: vec![],
+                        },
+                        EnumVariant {
+                            name: "Green".into(),
+                            value: 1,
+                            doc: None,
+                            fields: vec![],
+                        },
+                    ],
+                },
+            ],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }])
+    }
+
+    #[test]
+    fn rich_enum_renders_opaque_wrapper_class() {
+        let code = render_ruby_module(
+            &shapes_api(),
+            "Shapes",
+            "weaveffi",
+            "shapes.rb",
+            "shapes.yml",
+        );
+
+        // A rich enum is an opaque-object class, never a plain constants module.
+        assert!(
+            !code.contains("module Shape\n"),
+            "rich enum must not be a plain enum module: {code}"
+        );
+        assert!(code.contains("class Shape\n"), "rich enum class: {code}");
+
+        // AutoPointer ownership + struct-compatible surface.
+        assert!(
+            code.contains("class ShapePtr < FFI::AutoPointer"),
+            "AutoPointer: {code}"
+        );
+        assert!(
+            code.contains("Shapes.weaveffi_shapes_Shape_destroy(ptr)"),
+            "release via destroy: {code}"
+        );
+        assert!(code.contains("attr_reader :handle"), "handle attr: {code}");
+        assert!(
+            code.contains("@handle = ShapePtr.new(handle)"),
+            "init wraps handle: {code}"
+        );
+
+        // Tag constants + reader.
+        assert!(code.contains("EMPTY = 0"), "tag const EMPTY: {code}");
+        assert!(code.contains("CIRCLE = 1"), "tag const CIRCLE: {code}");
+        assert!(code.contains("LABELED = 3"), "tag const LABELED: {code}");
+        assert!(
+            code.contains("def tag\n      Shapes.weaveffi_shapes_Shape_tag(@handle)"),
+            "tag reader: {code}"
+        );
+
+        // Plain sibling enum still renders as a constants module.
+        assert!(
+            code.contains("module Channel"),
+            "plain enum still a module: {code}"
+        );
+    }
+
+    #[test]
+    fn rich_enum_factories_and_getters() {
+        let code = render_ruby_module(
+            &shapes_api(),
+            "Shapes",
+            "weaveffi",
+            "shapes.rb",
+            "shapes.yml",
+        );
+
+        // FFI bindings for tag, destroy, constructors, and field getters.
+        assert!(
+            code.contains("attach_function :weaveffi_shapes_Shape_tag, [:pointer], :int32"),
+            "tag attach: {code}"
+        );
+        assert!(
+            code.contains("attach_function :weaveffi_shapes_Shape_Empty_new, [:pointer], :pointer"),
+            "unit ctor attach (out_err only): {code}"
+        );
+        assert!(
+            code.contains(
+                "attach_function :weaveffi_shapes_Shape_Circle_new, [:double, :pointer], :pointer"
+            ),
+            "circle ctor attach: {code}"
+        );
+        assert!(
+            code.contains(
+                "attach_function :weaveffi_shapes_Shape_Rectangle_new, [:float, :float, :pointer], :pointer"
+            ),
+            "rectangle ctor attach: {code}"
+        );
+        assert!(
+            code.contains(
+                "attach_function :weaveffi_shapes_Shape_Labeled_new, [:string, :uint8, :pointer], :pointer"
+            ),
+            "labeled ctor attach: {code}"
+        );
+        assert!(
+            code.contains(
+                "attach_function :weaveffi_shapes_Shape_Labeled_get_label, [:pointer], :pointer"
+            ),
+            "string getter attach: {code}"
+        );
+
+        // Idiomatic factory class methods.
+        assert!(code.contains("def self.empty\n"), "empty factory: {code}");
+        assert!(
+            code.contains("def self.circle(radius)"),
+            "circle factory: {code}"
+        );
+        assert!(
+            code.contains("def self.rectangle(width, height)"),
+            "rectangle factory: {code}"
+        );
+        assert!(
+            code.contains("def self.labeled(label, count)"),
+            "labeled factory: {code}"
+        );
+        assert!(
+            code.contains("result = Shapes.weaveffi_shapes_Shape_Circle_new(radius, err)"),
+            "circle ctor call: {code}"
+        );
+        assert!(
+            code.contains("Shapes.check_error!(err)"),
+            "factory checks error: {code}"
+        );
+        assert!(code.contains("new(result)"), "factory wraps handle: {code}");
+
+        // Variant-namespaced getters; string getter still frees the owned C string.
+        assert!(code.contains("def circle_radius"), "circle_radius: {code}");
+        assert!(
+            code.contains("def rectangle_width") && code.contains("def rectangle_height"),
+            "rectangle getters: {code}"
+        );
+        assert!(
+            code.contains("def labeled_label") && code.contains("def labeled_count"),
+            "labeled getters: {code}"
+        );
+        assert!(
+            code.contains("Shapes.weaveffi_free_string(result)"),
+            "string getter frees: {code}"
+        );
+
+        // Functions taking/returning the rich enum reuse the struct path.
+        assert!(
+            code.contains("def self.describe(shape)") && code.contains("shape.handle"),
+            "describe passes handle: {code}"
+        );
+        assert!(
+            code.contains("Shape.new(result)"),
+            "scale wraps returned Shape: {code}"
         );
     }
 }

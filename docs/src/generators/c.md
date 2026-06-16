@@ -21,13 +21,20 @@ way to inspect what the IDL compiles to.
 | `i32`        | `int32_t`                               | `int32_t`                          |
 | `u32`        | `uint32_t`                              | `uint32_t`                         |
 | `i64`        | `int64_t`                               | `int64_t`                          |
+| `u64`        | `uint64_t`                              | `uint64_t`                         |
+| `i8`         | `int8_t`                                | `int8_t`                           |
+| `i16`        | `int16_t`                               | `int16_t`                          |
+| `u8`         | `uint8_t`                               | `uint8_t`                          |
+| `u16`        | `uint16_t`                              | `uint16_t`                         |
+| `f32`        | `float`                                 | `float`                            |
 | `f64`        | `double`                                | `double`                           |
 | `bool`       | `bool`                                  | `bool`                             |
 | `string`     | `const char*` (NUL-terminated UTF-8)    | `const char*`                      |
 | `bytes`      | `const uint8_t* ptr, size_t len`        | `const uint8_t*` + `size_t* out_len`|
 | `handle`     | `weaveffi_handle_t`                     | `weaveffi_handle_t`                |
 | `Struct`     | `const weaveffi_m_S*`                   | `weaveffi_m_S*`                    |
-| `Enum`       | `weaveffi_m_E`                          | `weaveffi_m_E`                     |
+| `Enum` (plain) | `weaveffi_m_E`                        | `weaveffi_m_E`                     |
+| `Enum` (rich)  | `const weaveffi_m_E*`                 | `weaveffi_m_E*`                    |
 | `T?` (value) | `const T*` (NULL = absent)              | `T*` (NULL = absent)               |
 | `[T]`        | `const T* items, size_t items_len`      | `T*` + `size_t* out_len`           |
 | `iter<T>`    | —                                       | opaque iterator handle — see [Iterators](#iterators) |
@@ -61,7 +68,7 @@ helpers — is rewritten with the new prefix.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: contacts
     enums:
@@ -177,6 +184,66 @@ if (err.code != 0) {
     return 1;
 }
 ```
+
+## Rich (algebraic) enums
+
+An enum whose variants declare `fields` is a *rich* (algebraic) enum — a sum
+type with associated data. Unlike a plain C-style enum (a bare `int32_t`
+discriminant), a rich enum crosses the ABI as an **opaque object pointer**,
+exactly like a struct: the producer owns the payload and the consumer holds a
+handle. A plain `_Tag` enum names the discriminants, then constructors, a tag
+reader, per-variant getters, and a destructor operate on the handle. From the
+`shapes` sample (`Shape` = `Empty | Circle{radius} | Rectangle{width,height} |
+Labeled{label,count}`):
+
+```c
+typedef enum {
+    weaveffi_shapes_Shape_Empty = 0,
+    weaveffi_shapes_Shape_Circle = 1,
+    weaveffi_shapes_Shape_Rectangle = 2,
+    weaveffi_shapes_Shape_Labeled = 3
+} weaveffi_shapes_Shape_Tag;
+
+typedef struct weaveffi_shapes_Shape weaveffi_shapes_Shape;
+
+int32_t weaveffi_shapes_Shape_tag(const weaveffi_shapes_Shape* self);
+
+weaveffi_shapes_Shape* weaveffi_shapes_Shape_Empty_new(weaveffi_error* out_err);
+weaveffi_shapes_Shape* weaveffi_shapes_Shape_Circle_new(double radius, weaveffi_error* out_err);
+weaveffi_shapes_Shape* weaveffi_shapes_Shape_Rectangle_new(float width, float height, weaveffi_error* out_err);
+weaveffi_shapes_Shape* weaveffi_shapes_Shape_Labeled_new(const char* label, uint8_t count, weaveffi_error* out_err);
+
+double weaveffi_shapes_Shape_Circle_get_radius(const weaveffi_shapes_Shape* self);
+float weaveffi_shapes_Shape_Rectangle_get_width(const weaveffi_shapes_Shape* self);
+float weaveffi_shapes_Shape_Rectangle_get_height(const weaveffi_shapes_Shape* self);
+const char* weaveffi_shapes_Shape_Labeled_get_label(const weaveffi_shapes_Shape* self);
+uint8_t weaveffi_shapes_Shape_Labeled_get_count(const weaveffi_shapes_Shape* self);
+
+void weaveffi_shapes_Shape_destroy(weaveffi_shapes_Shape* self);
+```
+
+Read `_tag`, then call only the matching variant's getters. A getter that
+returns a `const char*` hands back Rust-owned memory to free with
+`weaveffi_free_string`:
+
+```c
+weaveffi_error err = {0, NULL};
+weaveffi_shapes_Shape* shape = weaveffi_shapes_Shape_Circle_new(2.0, &err);
+
+if (weaveffi_shapes_Shape_tag(shape) == weaveffi_shapes_Shape_Circle) {
+    printf("radius = %f\n", weaveffi_shapes_Shape_Circle_get_radius(shape));
+}
+
+const char* text = weaveffi_shapes_describe(shape, &err);
+printf("%s\n", text);
+weaveffi_free_string(text);
+
+weaveffi_shapes_Shape_destroy(shape);
+```
+
+The consumer owns every `weaveffi_shapes_Shape*` returned by a constructor or by
+a function such as `weaveffi_shapes_scale`; release each one with
+`weaveffi_shapes_Shape_destroy`.
 
 ## Build instructions
 

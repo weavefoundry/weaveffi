@@ -1,0 +1,86 @@
+version: "0.4.0"
+modules:
+  - name: shapes
+    doc: Rich (algebraic) enums and the expanded numeric primitives.
+    enums:
+      - name: Shape
+        doc: An algebraic shape (sum type with associated data)
+        variants:
+          - name: Empty
+            value: 0
+            doc: The empty shape (a unit variant)
+          - name: Circle
+            value: 1
+            doc: A circle with a radius
+            fields:
+              - { name: radius, type: f64, doc: Radius in points }
+          - name: Rectangle
+            value: 2
+            doc: An axis-aligned rectangle
+            fields:
+              - { name: width, type: f32 }
+              - { name: height, type: f32 }
+          - name: Bounded
+            value: 3
+            doc: An integer-bounded shape (exercises narrow + wide ints)
+            fields:
+              - { name: min, type: i16 }
+              - { name: max, type: i16 }
+              - { name: weight, type: u64 }
+          - name: Labeled
+            value: 4
+            doc: A labeled shape with a small count
+            fields:
+              - { name: label, type: string }
+              - { name: count, type: u8 }
+      - name: Channel
+        doc: A plain C-style enum (no payloads)
+        variants:
+          - { name: Red, value: 0 }
+          - { name: Green, value: 1 }
+          - { name: Blue, value: 2 }
+    structs:
+      - name: Numerics
+        doc: One field per supported numeric primitive
+        fields:
+          - { name: a, type: i8 }
+          - { name: b, type: i16 }
+          - { name: c, type: i32 }
+          - { name: d, type: i64 }
+          - { name: e, type: u8 }
+          - { name: f, type: u16 }
+          - { name: g, type: u32 }
+          - { name: h, type: u64 }
+          - { name: i, type: f32 }
+          - { name: j, type: f64 }
+    functions:
+      - name: describe
+        doc: Render a shape to a string
+        params:
+          - { name: shape, type: Shape }
+        return: string
+      - name: scale
+        doc: Scale a shape by a factor, returning a new shape
+        params:
+          - { name: shape, type: Shape }
+          - { name: factor, type: f64 }
+        return: Shape
+      - name: sum_bytes
+        doc: Sum a list of bytes into a wide integer (numerics smoke)
+        params:
+          - { name: values, type: "[u8]" }
+        return: u64
+      - name: make_numerics
+        doc: Build a Numerics struct from every numeric primitive
+        params:
+          - { name: a, type: i8 }
+          - { name: b, type: i16 }
+          - { name: c, type: i32 }
+          - { name: d, type: i64 }
+          - { name: e, type: u8 }
+          - { name: f, type: u16 }
+          - { name: g, type: u32 }
+          - { name: h, type: u64 }
+          - { name: i, type: f32 }
+          - { name: j, type: f64 }
+        return: Numerics

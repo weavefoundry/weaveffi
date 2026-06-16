@@ -1,4 +1,4 @@
-version: "0.3.0"
+version: "0.4.0"
 # Exercises multi-level nested modules and type references that cross nesting
 # boundaries in every direction:
 #   * parent  -> nested child   (graphics.Canvas.root : shapes.Shape)

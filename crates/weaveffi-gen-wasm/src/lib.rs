@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use camino::Utf8Path;
-use heck::ToUpperCamelCase;
+use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use serde::{Deserialize, Serialize};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::{self, TargetCapabilities};
@@ -18,13 +18,13 @@ use weaveffi_core::codegen::common::{
 };
 use weaveffi_core::model::{
     BindingModel, CallShape, EnumBinding, FieldBinding, FnBinding, IteratorBinding,
-    ListenerBinding, ModuleBinding, StructBinding,
+    ListenerBinding, ModuleBinding, RichEnumBinding, RichVariantBinding, StructBinding,
 };
 use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::utils::{
     local_type_name, render_json_prelude, render_prelude, render_trailer, CommentStyle,
 };
-use weaveffi_ir::ir::{Api, Module, TypeRef};
+use weaveffi_ir::ir::{Api, EnumDef, Module, TypeRef};
 
 pub struct WasmGenerator;
 
@@ -163,13 +163,22 @@ fn render_wasm_package_json(
 
 fn wasm_type(ty: &TypeRef) -> &'static str {
     match ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::Bool | TypeRef::Enum(_) => "i32",
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::Bool
+        | TypeRef::Enum(_) => "i32",
         TypeRef::I64
+        | TypeRef::U64
         | TypeRef::Handle
         | TypeRef::TypedHandle(_)
         | TypeRef::Struct(_)
         | TypeRef::Iterator(_)
         | TypeRef::Map(_, _) => "i64",
+        TypeRef::F32 => "f32",
         TypeRef::F64 => "f64",
         TypeRef::StringUtf8
         | TypeRef::BorrowedStr
@@ -189,9 +198,15 @@ fn wasm_type(ty: &TypeRef) -> &'static str {
 
 fn wasm_type_note(ty: &TypeRef) -> &'static str {
     match ty {
+        TypeRef::I8 => "8-bit signed mapped to i32",
+        TypeRef::I16 => "16-bit signed mapped to i32",
         TypeRef::I32 => "native WASM i32",
+        TypeRef::U8 => "8-bit unsigned mapped to i32",
+        TypeRef::U16 => "16-bit unsigned mapped to i32",
         TypeRef::U32 => "unsigned mapped to i32",
         TypeRef::I64 => "native WASM i64",
+        TypeRef::U64 => "unsigned mapped to i64",
+        TypeRef::F32 => "native WASM f32",
         TypeRef::F64 => "native WASM f64",
         TypeRef::Bool => "0 = false, 1 = true",
         TypeRef::StringUtf8 | TypeRef::BorrowedStr | TypeRef::Bytes | TypeRef::BorrowedBytes => {
@@ -216,9 +231,15 @@ fn wasm_type_note(ty: &TypeRef) -> &'static str {
 
 fn type_display(ty: &TypeRef) -> String {
     match ty {
+        TypeRef::I8 => "i8".into(),
+        TypeRef::I16 => "i16".into(),
         TypeRef::I32 => "i32".into(),
+        TypeRef::U8 => "u8".into(),
+        TypeRef::U16 => "u16".into(),
         TypeRef::U32 => "u32".into(),
         TypeRef::I64 => "i64".into(),
+        TypeRef::U64 => "u64".into(),
+        TypeRef::F32 => "f32".into(),
         TypeRef::F64 => "f64".into(),
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string".into(),
@@ -447,11 +468,41 @@ fn render_enum_ref(out: &mut String, e: &EnumBinding) {
         out.push_str("\n\n");
     }
 
+    if let Some(rich) = &e.rich {
+        render_rich_enum_ref(out, rich);
+        return;
+    }
+
     out.push_str("Passed as `i32` discriminant.\n\n");
     out.push_str("| Variant | Value |\n");
     out.push_str("|---------|-------|\n");
     for v in &e.variants {
         out.push_str(&format!("| `{}` | `{}` |\n", v.name, v.value));
+    }
+}
+
+/// Document a rich (algebraic) enum: an opaque handle constructed via per-variant
+/// factories, with a `tag` discriminant reader and namespaced field getters —
+/// not a by-value `i32` discriminant like a plain enum.
+fn render_rich_enum_ref(out: &mut String, rich: &RichEnumBinding) {
+    out.push_str(
+        "Rich (algebraic) enum — passed as an **opaque handle** (`i64`). Construct one with a \
+         per-variant factory, read the active variant via the `tag` discriminant, and access \
+         associated data through the namespaced getters.\n\n",
+    );
+    out.push_str("| Variant | Tag | Fields |\n");
+    out.push_str("|---------|-----|--------|\n");
+    for v in &rich.variants {
+        let fields = if v.fields.is_empty() {
+            "—".to_string()
+        } else {
+            v.fields
+                .iter()
+                .map(|f| format!("`{}: {}`", f.name, type_display(&f.ty)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        out.push_str(&format!("| `{}` | `{}` | {} |\n", v.name, v.value, fields));
     }
 }
 
@@ -484,6 +535,14 @@ fn api_deep_any(api: &Api, pred: &dyn Fn(&TypeRef) -> bool) -> bool {
             .structs
             .iter()
             .any(|s| s.fields.iter().any(|f| deep(&f.ty, pred)))
+            // Rich (algebraic) enums marshal their variant fields exactly like
+            // struct fields, so a string/bytes/list living only inside a variant
+            // payload still pulls in the corresponding linear-memory helpers.
+            || m.enums.iter().any(|e| {
+                e.variants
+                    .iter()
+                    .any(|v| v.fields.iter().any(|f| deep(&f.ty, pred)))
+            })
             || m.modules.iter().any(|sub| module_any(sub, pred))
     }
     api.modules.iter().any(|m| module_any(m, pred))
@@ -493,8 +552,9 @@ fn api_deep_any(api: &Api, pred: &dyn Fn(&TypeRef) -> bool) -> bool {
 /// (wasm32: pointers and 32-bit scalars are 4 bytes, 64-bit values 8, bool 1).
 fn wasm_stride(ty: &TypeRef) -> u32 {
     match ty {
-        TypeRef::Bool => 1,
-        TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => 8,
+        TypeRef::Bool | TypeRef::I8 | TypeRef::U8 => 1,
+        TypeRef::I16 | TypeRef::U16 => 2,
+        TypeRef::I64 | TypeRef::U64 | TypeRef::F64 | TypeRef::Handle => 8,
         _ => 4,
     }
 }
@@ -507,10 +567,15 @@ fn wasm_read_scalar_elem(ty: &TypeRef, dv: &str, base: &str, idx: &str) -> Strin
     let off = format!("{base} + {idx} * {stride}");
     match ty {
         TypeRef::Bool => format!("{dv}.getUint8({off}) !== 0"),
+        TypeRef::I8 => format!("{dv}.getInt8({off})"),
+        TypeRef::U8 => format!("{dv}.getUint8({off})"),
+        TypeRef::I16 => format!("{dv}.getInt16({off}, true)"),
+        TypeRef::U16 => format!("{dv}.getUint16({off}, true)"),
         TypeRef::U32 => format!("{dv}.getUint32({off}, true)"),
         TypeRef::I32 | TypeRef::Enum(_) => format!("{dv}.getInt32({off}, true)"),
         TypeRef::I64 => format!("{dv}.getBigInt64({off}, true)"),
-        TypeRef::Handle => format!("{dv}.getBigUint64({off}, true)"),
+        TypeRef::U64 | TypeRef::Handle => format!("{dv}.getBigUint64({off}, true)"),
+        TypeRef::F32 => format!("{dv}.getFloat32({off}, true)"),
         TypeRef::F64 => format!("{dv}.getFloat64({off}, true)"),
         _ => format!("{dv}.getInt32({off}, true)"),
     }
@@ -519,8 +584,9 @@ fn wasm_read_scalar_elem(ty: &TypeRef, dv: &str, base: &str, idx: &str) -> Strin
 /// Byte width of a scalar `ty` when boxed by pointer (optional-scalar ABI).
 fn scalar_width(ty: &TypeRef) -> u32 {
     match ty {
-        TypeRef::Bool => 1,
-        TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => 8,
+        TypeRef::Bool | TypeRef::I8 | TypeRef::U8 => 1,
+        TypeRef::I16 | TypeRef::U16 => 2,
+        TypeRef::I64 | TypeRef::U64 | TypeRef::F64 | TypeRef::Handle => 8,
         _ => 4,
     }
 }
@@ -529,10 +595,17 @@ fn scalar_width(ty: &TypeRef) -> u32 {
 fn emit_write_scalar(out: &mut String, indent: &str, ty: &TypeRef, dv: &str, off: &str, val: &str) {
     let stmt = match ty {
         TypeRef::Bool => format!("{dv}.setUint8({off}, {val} ? 1 : 0);"),
+        TypeRef::I8 => format!("{dv}.setInt8({off}, {val});"),
+        TypeRef::U8 => format!("{dv}.setUint8({off}, {val});"),
+        TypeRef::I16 => format!("{dv}.setInt16({off}, {val}, true);"),
+        TypeRef::U16 => format!("{dv}.setUint16({off}, {val}, true);"),
         TypeRef::U32 => format!("{dv}.setUint32({off}, {val}, true);"),
         TypeRef::I32 | TypeRef::Enum(_) => format!("{dv}.setInt32({off}, {val}, true);"),
         TypeRef::I64 => format!("{dv}.setBigInt64({off}, BigInt({val}), true);"),
-        TypeRef::Handle => format!("{dv}.setBigUint64({off}, BigInt({val}), true);"),
+        TypeRef::U64 | TypeRef::Handle => {
+            format!("{dv}.setBigUint64({off}, BigInt({val}), true);")
+        }
+        TypeRef::F32 => format!("{dv}.setFloat32({off}, {val}, true);"),
         TypeRef::F64 => format!("{dv}.setFloat64({off}, {val}, true);"),
         _ => format!("{dv}.setInt32({off}, {val}, true);"),
     };
@@ -544,7 +617,7 @@ fn emit_write_scalar(out: &mut String, indent: &str, ty: &TypeRef, dv: &str, off
 fn js_arg_scalar(ty: &TypeRef, val: &str) -> String {
     match ty {
         TypeRef::Bool => format!("{val} ? 1 : 0"),
-        TypeRef::I64 | TypeRef::Handle => format!("BigInt({val})"),
+        TypeRef::I64 | TypeRef::U64 | TypeRef::Handle => format!("BigInt({val})"),
         _ => val.to_string(),
     }
 }
@@ -585,9 +658,15 @@ fn emit_stage_input(
             args.push(format!("{value}._handle"));
         }
         TypeRef::Bool
+        | TypeRef::I8
+        | TypeRef::I16
         | TypeRef::I32
+        | TypeRef::U8
+        | TypeRef::U16
         | TypeRef::U32
         | TypeRef::I64
+        | TypeRef::U64
+        | TypeRef::F32
         | TypeRef::F64
         | TypeRef::Handle
         | TypeRef::Enum(_) => {
@@ -886,9 +965,15 @@ fn emit_decode_value(out: &mut String, indent: &str, ret: Option<&TypeRef>, r: &
         TypeRef::Bool => {
             let _ = writeln!(out, "{indent}return {r} !== 0;");
         }
-        TypeRef::I32
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::U8
+        | TypeRef::U16
         | TypeRef::U32
         | TypeRef::I64
+        | TypeRef::U64
+        | TypeRef::F32
         | TypeRef::F64
         | TypeRef::Handle
         | TypeRef::Enum(_) => {
@@ -954,11 +1039,19 @@ fn emit_decode_value(out: &mut String, indent: &str, ret: Option<&TypeRef>, r: &
 
 fn ts_type_for(ty: &TypeRef) -> String {
     match ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 => "number".into(),
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::F32
+        | TypeRef::I64
+        | TypeRef::F64 => "number".into(),
         TypeRef::Bool => "boolean".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "Buffer".into(),
-        TypeRef::Handle => "bigint".into(),
+        TypeRef::U64 | TypeRef::Handle => "bigint".into(),
         // Structs, enums, and typed handles surface as bare local TS names; a
         // cross-module typed handle (resolved to e.g. `kv.Store`) must name the
         // local `Store`, not the qualified IR name which is undeclared here.
@@ -1072,6 +1165,12 @@ fn render_wasm_dts(api: &Api, module_name: &str, input_basename: &str, filename:
         }
 
         for e in &m.enums {
+            // A rich (algebraic) enum is an opaque-object wrapper class, not a
+            // by-value discriminant constant.
+            if e.is_rich() {
+                emit_dts_rich_enum_class(&mut out, e);
+                continue;
+            }
             emit_doc(&mut out, &e.doc, "");
             out.push_str(&format!("export declare const {}: Readonly<{{\n", e.name));
             for v in &e.variants {
@@ -1097,6 +1196,41 @@ fn render_wasm_dts(api: &Api, module_name: &str, input_basename: &str, filename:
     ));
     out.push_str(&render_trailer(CommentStyle::DoubleSlash, filename));
     out
+}
+
+/// Emit the TypeScript declaration for a rich (algebraic) enum: an opaque
+/// handle wrapper `class` exposing the `tag` discriminant reader, a frozen
+/// `Tag` map, one static factory per variant (`Shape.circle(...)`), the
+/// camelCase namespaced field getters, and `free()`. Mirrors the runtime JS
+/// class emitted by [`emit_rich_enum_class`].
+fn emit_dts_rich_enum_class(out: &mut String, e: &EnumDef) {
+    emit_doc(out, &e.doc, "");
+    let name = &e.name;
+    let _ = writeln!(out, "export declare class {name} {{");
+    let _ = writeln!(out, "  get tag(): number;");
+    let _ = writeln!(out, "  static readonly Tag: Readonly<{{");
+    for v in &e.variants {
+        let _ = writeln!(out, "    {}: {};", v.name, v.value);
+    }
+    let _ = writeln!(out, "  }}>;");
+    for v in &e.variants {
+        emit_doc(out, &v.doc, "  ");
+        let factory = v.name.to_lower_camel_case();
+        let params: Vec<String> = v
+            .fields
+            .iter()
+            .map(|f| format!("{}: {}", f.name, ts_type_for(&f.ty)))
+            .collect();
+        let _ = writeln!(out, "  static {factory}({}): {name};", params.join(", "));
+    }
+    for v in &e.variants {
+        for f in &v.fields {
+            let js_name = format!("{}_{}", v.name, f.name).to_lower_camel_case();
+            let _ = writeln!(out, "  get {js_name}(): {};", ts_type_for(&f.ty));
+        }
+    }
+    let _ = writeln!(out, "  free(): void;");
+    let _ = writeln!(out, "}}\n");
 }
 
 fn render_dts_module_interface(out: &mut String, m: &Module, module_path: &str, indent: &str) {
@@ -1159,9 +1293,17 @@ fn render_wasm_js_stub(
 
     let has_functions = model.modules.iter().any(|m| !m.functions.is_empty());
     let has_async = model.functions().any(|(_, f)| f.is_async);
-    // Error messages always cross as C strings, so any sample with functions
-    // needs the string-read helpers regardless of its declared types.
-    let needs_strings = has_functions || api_deep_any(api, &|t| is_string_type(t));
+    // Opaque-object wrappers (structs and rich/algebraic enums) construct via a
+    // fallible `*_new`/`*_create` that threads an `out_err`, so they need the
+    // error helpers even in a module that declares no free functions.
+    let has_opaque = model
+        .modules
+        .iter()
+        .any(|m| !m.structs.is_empty() || m.enums.iter().any(|e| e.is_rich()));
+    let needs_err = has_functions || has_opaque;
+    // Error messages always cross as C strings, so anything needing the error
+    // helpers also needs the string-read helpers regardless of declared types.
+    let needs_strings = needs_err || api_deep_any(api, &|t| is_string_type(t));
     let needs_bytes = api_deep_any(api, &|t| {
         matches!(t, TypeRef::Bytes | TypeRef::BorrowedBytes)
     });
@@ -1249,7 +1391,7 @@ fn render_wasm_js_stub(
         out.push_str("}\n\n");
     }
 
-    if has_functions {
+    if needs_err {
         out.push_str("// Allocate a zeroed {i32 code, i32 message} error slot.\n");
         out.push_str("function _allocErr(wasm) {\n");
         out.push_str("  const ptr = wasm.weaveffi_alloc(8);\n");
@@ -1300,6 +1442,13 @@ fn render_wasm_js_stub(
 
     for (module, _path) in walk_modules_with_path(&api.modules) {
         for e in &module.enums {
+            // Rich (algebraic) enums cross the ABI as opaque object handles, so
+            // they are emitted as wrapper classes below — never as a plain
+            // by-value discriminant object (which would also collide with the
+            // class declaration of the same name).
+            if e.is_rich() {
+                continue;
+            }
             out.push_str(&format!("export const {} = Object.freeze({{\n", e.name));
             for v in &e.variants {
                 out.push_str(&format!("  {}: {},\n", v.name, v.value));
@@ -1311,6 +1460,11 @@ fn render_wasm_js_stub(
     for module in &model.modules {
         for s in &module.structs {
             emit_struct_class(&mut out, s);
+        }
+        for e in &module.enums {
+            if e.is_rich() {
+                emit_rich_enum_class(&mut out, e);
+            }
         }
     }
 
@@ -1418,7 +1572,10 @@ fn module_tree_has_content(
     by_path: &HashMap<&str, &ModuleBinding>,
 ) -> bool {
     let here = by_path.get(path).is_some_and(|mb| {
-        !mb.functions.is_empty() || !mb.structs.is_empty() || !mb.listeners.is_empty()
+        !mb.functions.is_empty()
+            || !mb.structs.is_empty()
+            || !mb.listeners.is_empty()
+            || mb.enums.iter().any(|e| e.is_rich())
     });
     here || m
         .modules
@@ -1451,6 +1608,11 @@ fn render_js_module_object(
     }
     for s in &mb.structs {
         emit_js_struct_factory(out, s, &inner);
+    }
+    for e in &mb.enums {
+        if e.is_rich() {
+            emit_js_rich_enum_factory(out, e, &inner);
+        }
     }
     for sub in &m.modules {
         let sub_path = format!("{module_path}_{}", sub.name);
@@ -1490,6 +1652,26 @@ fn emit_js_struct_factory(out: &mut String, s: &StructBinding, indent: &str) {
     if s.builder.is_some() {
         let _ = writeln!(out, "{indent}  builder: () => new {}Builder(wasm),", s.name);
     }
+    let _ = writeln!(out, "{indent}}},");
+}
+
+/// Expose a rich (algebraic) enum on the module object: one per-variant factory
+/// (`api.shapes.Shape.circle(2.5)`) plus the `Tag` discriminant map
+/// (`api.shapes.Shape.Tag.Circle`), all bound to the loaded `wasm` instance.
+fn emit_js_rich_enum_factory(out: &mut String, e: &EnumBinding, indent: &str) {
+    let Some(rich) = e.rich.as_ref() else {
+        return;
+    };
+    let name = &e.name;
+    let _ = writeln!(out, "{indent}{name}: {{");
+    for v in &rich.variants {
+        let factory = v.name.to_lower_camel_case();
+        let _ = writeln!(
+            out,
+            "{indent}  {factory}: (...args) => {name}.{factory}(wasm, ...args),"
+        );
+    }
+    let _ = writeln!(out, "{indent}  Tag: {name}.Tag,");
     let _ = writeln!(out, "{indent}}},");
 }
 
@@ -1615,7 +1797,11 @@ fn async_cb_wasm_params(returns: Option<&TypeRef>) -> Vec<&'static str> {
     match returns {
         None => {}
         Some(
-            TypeRef::I32
+            TypeRef::I8
+            | TypeRef::I16
+            | TypeRef::I32
+            | TypeRef::U8
+            | TypeRef::U16
             | TypeRef::U32
             | TypeRef::Bool
             | TypeRef::Enum(_)
@@ -1627,8 +1813,11 @@ fn async_cb_wasm_params(returns: Option<&TypeRef>) -> Vec<&'static str> {
         ) => {
             params.push("i32");
         }
-        Some(TypeRef::I64 | TypeRef::Handle) => {
+        Some(TypeRef::I64 | TypeRef::U64 | TypeRef::Handle) => {
             params.push("i64");
+        }
+        Some(TypeRef::F32) => {
+            params.push("f32");
         }
         Some(TypeRef::F64) => {
             params.push("f64");
@@ -1677,9 +1866,15 @@ fn emit_async_unwrap(out: &mut String, indent: &str, ret: Option<&TypeRef>) {
         TypeRef::Bool => {
             let _ = writeln!(out, "{open}(w, r) => r !== 0 }});");
         }
-        TypeRef::I32
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::U8
+        | TypeRef::U16
         | TypeRef::U32
         | TypeRef::I64
+        | TypeRef::U64
+        | TypeRef::F32
         | TypeRef::F64
         | TypeRef::Handle
         | TypeRef::Enum(_) => {
@@ -1799,6 +1994,116 @@ fn emit_struct_class(out: &mut String, s: &StructBinding) {
     }
 }
 
+/// Emit the module-level `class` for a rich (algebraic) enum: an opaque-handle
+/// wrapper mirroring [`emit_struct_class`]. Adds a `tag` discriminant reader, a
+/// frozen `Tag` map (`Shape.Tag.Circle`), one static factory per variant
+/// (`Shape.circle(...)`), per-variant field getters namespaced in camelCase
+/// (`circleRadius`), and an explicit `free()` releasing the handle once. The
+/// constructor signature and `_handle` field match the struct wrapper, so the
+/// existing function-wrapper marshalling (`x._handle` in, `new Shape(wasm, r)`
+/// out — a rich enum lowers to `TypeRef::Struct`) works unchanged.
+fn emit_rich_enum_class(out: &mut String, e: &EnumBinding) {
+    let Some(rich) = e.rich.as_ref() else {
+        return;
+    };
+    let cls = &e.name;
+    let _ = writeln!(out, "class {cls} {{");
+    let _ = writeln!(out, "  constructor(wasm, handle) {{");
+    let _ = writeln!(out, "    this._wasm = wasm;");
+    let _ = writeln!(out, "    this._handle = handle;");
+    let _ = writeln!(out, "  }}");
+
+    // Active variant discriminant (an i32, comparable to the `Tag` members).
+    let _ = writeln!(out, "  get tag() {{");
+    let _ = writeln!(out, "    const wasm = this._wasm;");
+    emit_return_decode(
+        out,
+        "    ",
+        Some(&TypeRef::I32),
+        &rich.tag_symbol,
+        &["this._handle".to_string()],
+        &[],
+        false,
+    );
+    let _ = writeln!(out, "  }}");
+
+    // One static factory per variant (`Shape.circle(2.5)`).
+    for v in &rich.variants {
+        emit_rich_enum_factory(out, &e.name, v);
+    }
+
+    // Per-variant field getters, namespaced in camelCase to avoid collisions.
+    // Reuse the struct getter renderer by projecting the camelCase name onto the
+    // field's precomputed getter symbol (identical marshalling).
+    for v in &rich.variants {
+        for f in &v.fields {
+            let mut namespaced = f.clone();
+            namespaced.name = format!("{}_{}", v.name, f.name).to_lower_camel_case();
+            emit_struct_getter(out, &namespaced);
+        }
+    }
+
+    // Explicit cleanup: release the producer-owned handle exactly once.
+    let _ = writeln!(out, "  free() {{");
+    let _ = writeln!(out, "    if (this._handle !== 0) {{");
+    let _ = writeln!(
+        out,
+        "      this._wasm.{}(this._handle);",
+        rich.destroy_symbol
+    );
+    let _ = writeln!(out, "      this._handle = 0;");
+    let _ = writeln!(out, "    }}");
+    let _ = writeln!(out, "  }}");
+    let _ = writeln!(out, "}}");
+
+    // Frozen discriminant map (`Shape.Tag.Circle === 1`).
+    let _ = writeln!(out, "{cls}.Tag = Object.freeze({{");
+    for v in &e.variants {
+        let _ = writeln!(out, "  {}: {},", v.name, v.value);
+    }
+    let _ = writeln!(out, "}});");
+    out.push('\n');
+}
+
+/// Emit `static <variant>(wasm, <fields...>)` for one rich-enum variant: stage
+/// each associated-data field (reusing the struct-field input marshalling),
+/// invoke the variant constructor, and return the wrapped instance. A unit
+/// variant takes only `wasm`.
+fn emit_rich_enum_factory(out: &mut String, enum_name: &str, v: &RichVariantBinding) {
+    let factory = v.name.to_lower_camel_case();
+    let params: Vec<String> = v.fields.iter().map(|f| f.name.clone()).collect();
+    let sig = if params.is_empty() {
+        "wasm".to_string()
+    } else {
+        format!("wasm, {}", params.join(", "))
+    };
+    let _ = writeln!(out, "  static {factory}({sig}) {{");
+    let mut args = Vec::new();
+    let mut cleanup = Vec::new();
+    for (i, f) in v.fields.iter().enumerate() {
+        emit_stage_input(
+            out,
+            "    ",
+            &f.ty,
+            &f.name,
+            &format!("a{i}"),
+            &mut args,
+            &mut cleanup,
+        );
+    }
+    let ret = TypeRef::Struct(enum_name.to_string());
+    emit_return_decode(
+        out,
+        "    ",
+        Some(&ret),
+        &v.create.symbol,
+        &args,
+        &cleanup,
+        true,
+    );
+    let _ = writeln!(out, "  }}");
+}
+
 /// Emit one `get field() { ... }` accessor that decodes the C getter's return.
 fn emit_struct_getter(out: &mut String, field: &FieldBinding) {
     let _ = writeln!(out, "  get {}() {{", field.name);
@@ -1904,7 +2209,7 @@ mod tests {
 
     fn empty_api() -> Api {
         Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![],
             generators: None,
             package: None,
@@ -1913,7 +2218,7 @@ mod tests {
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules,
             generators: None,
             package: None,
@@ -1973,16 +2278,19 @@ mod tests {
                         name: "Red".into(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Green".into(),
                         value: 1,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Blue".into(),
                         value: 2,
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }],
@@ -2827,16 +3135,19 @@ mod tests {
                         name: "Red".into(),
                         value: 0,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Green".into(),
                         value: 1,
                         doc: None,
+                        fields: vec![],
                     },
                     EnumVariant {
                         name: "Blue".into(),
                         value: 2,
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }],
@@ -3280,6 +3591,7 @@ mod tests {
                     name: "Small".into(),
                     value: 0,
                     doc: Some("A small one".into()),
+                    fields: vec![],
                 }],
             }],
             callbacks: vec![],
@@ -3371,6 +3683,368 @@ mod tests {
         assert!(
             js.contains("weaveffi_error_clear"),
             "runtime error_clear helper must stay literal: {js}"
+        );
+    }
+
+    /// A rich (algebraic) enum mirroring `samples/shapes`: a unit variant, an
+    /// f64 payload, two f32 payloads, and a string + u8 payload — plus a plain
+    /// sibling enum and free functions taking/returning the rich enum (already
+    /// lowered to `TypeRef::Struct`) so the handle marshalling is exercised too.
+    fn rich_enum_api() -> Api {
+        fn field(name: &str, ty: TypeRef) -> StructField {
+            StructField {
+                name: name.into(),
+                ty,
+                doc: None,
+                default: None,
+            }
+        }
+        make_api(vec![Module {
+            name: "shapes".into(),
+            functions: vec![
+                Function {
+                    name: "describe".into(),
+                    params: vec![Param {
+                        name: "shape".into(),
+                        ty: TypeRef::Struct("Shape".into()),
+                        mutable: false,
+                        doc: None,
+                    }],
+                    returns: Some(TypeRef::StringUtf8),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "scale".into(),
+                    params: vec![
+                        Param {
+                            name: "shape".into(),
+                            ty: TypeRef::Struct("Shape".into()),
+                            mutable: false,
+                            doc: None,
+                        },
+                        Param {
+                            name: "factor".into(),
+                            ty: TypeRef::F64,
+                            mutable: false,
+                            doc: None,
+                        },
+                    ],
+                    returns: Some(TypeRef::Struct("Shape".into())),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "sum_bytes".into(),
+                    params: vec![Param {
+                        name: "values".into(),
+                        ty: TypeRef::List(Box::new(TypeRef::U8)),
+                        mutable: false,
+                        doc: None,
+                    }],
+                    returns: Some(TypeRef::U64),
+                    doc: None,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+            ],
+            structs: vec![],
+            enums: vec![
+                EnumDef {
+                    name: "Shape".into(),
+                    doc: Some("An algebraic shape".into()),
+                    variants: vec![
+                        EnumVariant {
+                            name: "Empty".into(),
+                            value: 0,
+                            doc: Some("The empty shape".into()),
+                            fields: vec![],
+                        },
+                        EnumVariant {
+                            name: "Circle".into(),
+                            value: 1,
+                            doc: None,
+                            fields: vec![field("radius", TypeRef::F64)],
+                        },
+                        EnumVariant {
+                            name: "Rectangle".into(),
+                            value: 2,
+                            doc: None,
+                            fields: vec![
+                                field("width", TypeRef::F32),
+                                field("height", TypeRef::F32),
+                            ],
+                        },
+                        EnumVariant {
+                            name: "Labeled".into(),
+                            value: 3,
+                            doc: None,
+                            fields: vec![
+                                field("label", TypeRef::StringUtf8),
+                                field("count", TypeRef::U8),
+                            ],
+                        },
+                    ],
+                },
+                EnumDef {
+                    name: "Channel".into(),
+                    doc: None,
+                    variants: vec![
+                        EnumVariant {
+                            name: "Red".into(),
+                            value: 0,
+                            doc: None,
+                            fields: vec![],
+                        },
+                        EnumVariant {
+                            name: "Green".into(),
+                            value: 1,
+                            doc: None,
+                            fields: vec![],
+                        },
+                    ],
+                },
+            ],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }])
+    }
+
+    #[test]
+    fn wasm_rich_enum_emits_wrapper_class() {
+        let js = render_wasm_js_stub(
+            &rich_enum_api(),
+            DEFAULT_MODULE_NAME,
+            "weaveffi",
+            "weaveffi.yml",
+            "weaveffi_wasm.js",
+        );
+        // Opaque-handle wrapper class, like a struct.
+        assert!(
+            js.contains("class Shape {"),
+            "missing rich enum class: {js}"
+        );
+        assert!(
+            js.contains("  constructor(wasm, handle) {"),
+            "rich enum must wrap a handle: {js}"
+        );
+        // Tag reader + frozen discriminant map.
+        assert!(js.contains("  get tag() {"), "missing tag reader: {js}");
+        assert!(
+            js.contains("wasm.weaveffi_shapes_Shape_tag(this._handle)"),
+            "tag reader must call the tag symbol: {js}"
+        );
+        assert!(
+            js.contains("Shape.Tag = Object.freeze({"),
+            "missing Tag map: {js}"
+        );
+        // One static factory per variant; unit variant takes only wasm.
+        assert!(js.contains("static empty(wasm) {"), "missing empty(): {js}");
+        assert!(
+            js.contains("static circle(wasm, radius) {"),
+            "missing circle(radius): {js}"
+        );
+        assert!(
+            js.contains("static rectangle(wasm, width, height) {"),
+            "missing rectangle(width, height): {js}"
+        );
+        assert!(
+            js.contains("static labeled(wasm, label, count) {"),
+            "missing labeled(label, count): {js}"
+        );
+        assert!(
+            js.contains("wasm.weaveffi_shapes_Shape_Circle_new(radius, _err)"),
+            "circle factory must call the variant constructor: {js}"
+        );
+        // String payload staged via the shared _cstr helper.
+        assert!(
+            js.contains("_cstr(wasm, label)"),
+            "labeled factory must stage its string payload: {js}"
+        );
+        // Per-variant getters, namespaced in camelCase.
+        assert!(
+            js.contains("  get circleRadius() {"),
+            "missing circleRadius getter: {js}"
+        );
+        assert!(
+            js.contains("  get rectangleWidth() {") && js.contains("  get rectangleHeight() {"),
+            "missing rectangle getters: {js}"
+        );
+        assert!(
+            js.contains("  get labeledLabel() {") && js.contains("  get labeledCount() {"),
+            "missing labeled getters: {js}"
+        );
+        assert!(
+            js.contains("wasm.weaveffi_shapes_Shape_Circle_get_radius(this._handle)"),
+            "getter must call the field getter symbol: {js}"
+        );
+        // Explicit cleanup via the destroy symbol.
+        assert!(js.contains("  free() {"), "missing free(): {js}");
+        assert!(
+            js.contains("this._wasm.weaveffi_shapes_Shape_destroy(this._handle)"),
+            "free must call the destroy symbol: {js}"
+        );
+    }
+
+    #[test]
+    fn wasm_rich_enum_not_emitted_as_plain_enum_object() {
+        let js = render_wasm_js_stub(
+            &rich_enum_api(),
+            DEFAULT_MODULE_NAME,
+            "weaveffi",
+            "weaveffi.yml",
+            "weaveffi_wasm.js",
+        );
+        // The rich enum must NOT be emitted as a by-value discriminant object
+        // (which would also collide with the class declaration).
+        assert!(
+            !js.contains("export const Shape = Object.freeze("),
+            "rich enum must not be a plain enum object: {js}"
+        );
+        // A plain sibling enum is still emitted the by-value way.
+        assert!(
+            js.contains("export const Channel = Object.freeze("),
+            "plain enum should still be a frozen object: {js}"
+        );
+    }
+
+    #[test]
+    fn wasm_rich_enum_module_factory_and_tag() {
+        let js = render_wasm_js_stub(
+            &rich_enum_api(),
+            DEFAULT_MODULE_NAME,
+            "weaveffi",
+            "weaveffi.yml",
+            "weaveffi_wasm.js",
+        );
+        assert!(
+            js.contains("Shape: {"),
+            "missing module factory object: {js}"
+        );
+        assert!(
+            js.contains("circle: (...args) => Shape.circle(wasm, ...args),"),
+            "missing variant factory binding: {js}"
+        );
+        assert!(
+            js.contains("empty: (...args) => Shape.empty(wasm, ...args),"),
+            "missing unit-variant factory binding: {js}"
+        );
+        assert!(
+            js.contains("Tag: Shape.Tag,"),
+            "module factory should expose the Tag map: {js}"
+        );
+    }
+
+    #[test]
+    fn wasm_rich_enum_function_marshals_handle() {
+        let js = render_wasm_js_stub(
+            &rich_enum_api(),
+            DEFAULT_MODULE_NAME,
+            "weaveffi",
+            "weaveffi.yml",
+            "weaveffi_wasm.js",
+        );
+        // A rich enum lowers to TypeRef::Struct, so functions pass the handle in
+        // and wrap the returned handle out — identical to a struct.
+        assert!(
+            js.contains("wasm.weaveffi_shapes_describe(shape._handle, _err)"),
+            "describe must pass the enum handle: {js}"
+        );
+        assert!(
+            js.contains("wasm.weaveffi_shapes_scale(shape._handle, factor, _err)"),
+            "scale must pass the enum handle: {js}"
+        );
+        assert!(
+            js.contains("return new Shape(wasm, _r);"),
+            "scale must wrap the returned handle: {js}"
+        );
+        // Errors are checked before the result wrapper is constructed.
+        let check = js
+            .find("_checkErr(wasm, _err)")
+            .expect("scale should check the error slot");
+        let wrap = js
+            .find("return new Shape(wasm, _r);")
+            .expect("scale should wrap the result");
+        assert!(check < wrap, "errors must be checked before wrapping: {js}");
+    }
+
+    #[test]
+    fn wasm_rich_enum_dts_class() {
+        let dts = render_wasm_dts(
+            &rich_enum_api(),
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.d.ts",
+        );
+        assert!(
+            dts.contains("export declare class Shape {"),
+            "missing rich enum class declaration: {dts}"
+        );
+        assert!(
+            dts.contains("  get tag(): number;"),
+            "missing tag type: {dts}"
+        );
+        assert!(
+            dts.contains("  static readonly Tag: Readonly<{"),
+            "missing Tag map type: {dts}"
+        );
+        assert!(
+            dts.contains("  static empty(): Shape;"),
+            "missing empty factory type: {dts}"
+        );
+        assert!(
+            dts.contains("  static circle(radius: number): Shape;"),
+            "missing circle factory type: {dts}"
+        );
+        assert!(
+            dts.contains("  static labeled(label: string, count: number): Shape;"),
+            "missing labeled factory type: {dts}"
+        );
+        assert!(
+            dts.contains("  get circleRadius(): number;"),
+            "missing circleRadius type: {dts}"
+        );
+        assert!(
+            dts.contains("  get labeledLabel(): string;"),
+            "missing labeledLabel type: {dts}"
+        );
+        assert!(dts.contains("  free(): void;"), "missing free type: {dts}");
+        // Not a by-value const, and the function signatures reference the class.
+        assert!(
+            !dts.contains("export declare const Shape"),
+            "rich enum must not be a const map in d.ts: {dts}"
+        );
+        assert!(
+            dts.contains("scale(shape: Shape, factor: number): Shape"),
+            "functions should reference the Shape class type: {dts}"
+        );
+    }
+
+    #[test]
+    fn wasm_rich_enum_readme() {
+        let readme = render_wasm_readme(&rich_enum_api(), "weaveffi", "weaveffi.yml");
+        assert!(readme.contains("##### `Shape`"), "{readme}");
+        assert!(
+            readme.contains("Rich (algebraic) enum"),
+            "rich enum readme should call it out: {readme}"
+        );
+        assert!(
+            readme.contains("| Variant | Tag | Fields |"),
+            "rich enum readme should tabulate variants: {readme}"
+        );
+        assert!(
+            readme.contains("`radius: f64`"),
+            "rich enum readme should list field types: {readme}"
         );
     }
 }

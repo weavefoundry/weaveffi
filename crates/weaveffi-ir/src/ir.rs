@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// See [`docs/src/stability.md`](https://github.com/weavefoundry/weaveffi/blob/main/docs/src/stability.md)
 /// for the full schema policy and the surfaces covered by SemVer.
-pub const CURRENT_SCHEMA_VERSION: &str = "0.3.0";
+pub const CURRENT_SCHEMA_VERSION: &str = "0.4.0";
 
 pub const SUPPORTED_VERSIONS: &[&str] = &[CURRENT_SCHEMA_VERSION];
 
@@ -149,16 +149,32 @@ pub struct ListenerDef {
 /// cannot represent uniformly.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeRef {
+    I8,
+    I16,
     I32,
-    U32,
     I64,
+    U8,
+    U16,
+    U32,
+    U64,
+    F32,
     F64,
     Bool,
     StringUtf8,
     Bytes,
     Handle,
     TypedHandle(String),
+    /// A user struct *or* an algebraic (rich) enum. Both cross the C ABI as an
+    /// opaque object pointer, so a reference to either is represented the same
+    /// way here; whether the referent is a struct or a sum type is recovered
+    /// from its definition (`module.structs` vs `module.enums` /
+    /// [`EnumDef::is_rich`]) when a generator emits its *declaration*.
+    ///
+    /// The resolution pass leaves a rich-enum reference as `Struct` (it only
+    /// rewrites *C-style* enum references into [`Enum`](Self::Enum), which lower
+    /// by value); see `weaveffi_core::validate::resolve`.
     Struct(String),
+    /// A C-style integer enum (no variant payloads). Lowers by value.
     Enum(String),
     BorrowedStr,
     BorrowedBytes,
@@ -202,9 +218,15 @@ pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
         return parse_type_ref(inner).map(|t| TypeRef::Iterator(Box::new(t)));
     }
     match s {
+        "i8" => Ok(TypeRef::I8),
+        "i16" => Ok(TypeRef::I16),
         "i32" => Ok(TypeRef::I32),
-        "u32" => Ok(TypeRef::U32),
         "i64" => Ok(TypeRef::I64),
+        "u8" => Ok(TypeRef::U8),
+        "u16" => Ok(TypeRef::U16),
+        "u32" => Ok(TypeRef::U32),
+        "u64" => Ok(TypeRef::U64),
+        "f32" => Ok(TypeRef::F32),
         "f64" => Ok(TypeRef::F64),
         "bool" => Ok(TypeRef::Bool),
         "string" => Ok(TypeRef::StringUtf8),
@@ -218,9 +240,15 @@ pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
 
 fn type_ref_to_string(ty: &TypeRef) -> String {
     match ty {
+        TypeRef::I8 => "i8".to_string(),
+        TypeRef::I16 => "i16".to_string(),
         TypeRef::I32 => "i32".to_string(),
-        TypeRef::U32 => "u32".to_string(),
         TypeRef::I64 => "i64".to_string(),
+        TypeRef::U8 => "u8".to_string(),
+        TypeRef::U16 => "u16".to_string(),
+        TypeRef::U32 => "u32".to_string(),
+        TypeRef::U64 => "u64".to_string(),
+        TypeRef::F32 => "f32".to_string(),
         TypeRef::F64 => "f64".to_string(),
         TypeRef::Bool => "bool".to_string(),
         TypeRef::StringUtf8 => "string".to_string(),
@@ -278,7 +306,8 @@ impl JsonSchema for TypeRef {
         meta.title = Some("TypeRef".to_string());
         meta.description = Some(
             "Reference to a type. Encoded as a string with custom syntax: \
-             primitives (`i32`, `u32`, `i64`, `f64`, `bool`, `string`, `bytes`, `handle`), \
+             primitives (`i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, \
+             `f32`, `f64`, `bool`, `string`, `bytes`, `handle`), \
              borrowed types (`&str`, `&[u8]`), typed handles (`handle<{name}>`), \
              iterators (`iter<{T}>`), lists (`[{T}]`), maps (`{{K:V}}`), \
              optionals (`{T}?`), or any user-defined struct/enum name."
@@ -288,7 +317,12 @@ impl JsonSchema for TypeRef {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// `Eq` is omitted because a variant field's `default` may contain
+/// `serde_yaml::Value` (an `f64`), matching [`StructDef`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(
+    description = "An enum type. C-style when every variant is a bare discriminant; an algebraic sum type when any variant declares fields."
+)]
 pub struct EnumDef {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -296,12 +330,30 @@ pub struct EnumDef {
     pub variants: Vec<EnumVariant>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+impl EnumDef {
+    /// `true` when this is an *algebraic* enum (a sum type): at least one
+    /// variant carries associated data. Such enums lower across the C ABI as
+    /// opaque objects (a tag getter plus per-variant constructors and field
+    /// getters); a C-style enum (every variant a bare discriminant) lowers by
+    /// value as an integer.
+    pub fn is_rich(&self) -> bool {
+        self.variants.iter().any(|v| !v.fields.is_empty())
+    }
+}
+
+/// `Eq` is omitted because `StructField::default` may contain `serde_yaml::Value`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct EnumVariant {
     pub name: String,
     pub value: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
+    /// Associated data carried by this variant. Empty for a unit variant or a
+    /// C-style enum; non-empty makes the owning enum a sum type (see
+    /// [`EnumDef::is_rich`]). Variant fields reuse [`StructField`] but ignore
+    /// the `default` slot (a sum-type payload has no defaultable fields).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<StructField>,
 }
 
 /// `Eq` is omitted because `StructField::default` contains `serde_yaml::Value`.
@@ -350,7 +402,7 @@ mod tests {
     #[test]
     fn struct_def_round_trip_yaml() {
         let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: geometry
     functions: []
@@ -381,7 +433,7 @@ modules:
     #[test]
     fn struct_def_round_trip_json() {
         let json = r#"{
-            "version": "0.3.0",
+            "version": "0.4.0",
             "modules": [{
                 "name": "geo",
                 "functions": [],
@@ -404,7 +456,7 @@ modules:
     #[test]
     fn structs_default_to_empty() {
         let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: math
     functions: []
@@ -416,7 +468,7 @@ modules:
     #[test]
     fn package_block_round_trips_yaml() {
         let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 package:
   name: kvstore
   version: 1.2.0
@@ -455,7 +507,7 @@ modules:
     #[test]
     fn package_is_optional() {
         let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: math
     functions: []
@@ -470,7 +522,7 @@ modules:
     #[test]
     fn package_minimal_requires_name_and_version() {
         let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 package:
   name: tiny
   version: 0.0.1
@@ -516,7 +568,7 @@ modules: []
     #[test]
     fn enum_def_round_trip_yaml() {
         let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: graphics
     functions: []
@@ -552,7 +604,7 @@ modules:
     #[test]
     fn enum_def_round_trip_json() {
         let json = r#"{
-            "version": "0.3.0",
+            "version": "0.4.0",
             "modules": [{
                 "name": "status",
                 "functions": [],
@@ -576,7 +628,7 @@ modules:
     #[test]
     fn enums_default_to_empty() {
         let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: math
     functions: []
@@ -602,15 +654,46 @@ modules:
                     name: "North".to_string(),
                     value: 0,
                     doc: None,
+                    fields: vec![],
                 },
                 EnumVariant {
                     name: "South".to_string(),
                     value: 1,
                     doc: None,
+                    fields: vec![],
                 },
             ],
         };
         assert_eq!(e, e.clone());
+        assert!(!e.is_rich());
+    }
+
+    #[test]
+    fn enum_def_is_rich_when_a_variant_has_fields() {
+        let e = EnumDef {
+            name: "Shape".to_string(),
+            doc: None,
+            variants: vec![
+                EnumVariant {
+                    name: "Circle".to_string(),
+                    value: 0,
+                    doc: None,
+                    fields: vec![StructField {
+                        name: "radius".to_string(),
+                        ty: TypeRef::F64,
+                        doc: None,
+                        default: None,
+                    }],
+                },
+                EnumVariant {
+                    name: "Empty".to_string(),
+                    value: 1,
+                    doc: None,
+                    fields: vec![],
+                },
+            ],
+        };
+        assert!(e.is_rich());
     }
 
     #[test]
@@ -780,7 +863,7 @@ modules:
     #[test]
     fn typeref_optional_yaml_deser() {
         let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: contacts
     functions:
@@ -803,7 +886,7 @@ modules:
     #[test]
     fn typeref_list_yaml_deser() {
         let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: contacts
     functions:
@@ -896,7 +979,7 @@ modules:
     #[test]
     fn typeref_map_yaml_deser() {
         let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: contacts
     functions:
@@ -1045,7 +1128,7 @@ modules:
     #[test]
     fn typeref_borrowed_yaml_deser() {
         let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: io
     functions:
@@ -1074,7 +1157,7 @@ modules:
     #[test]
     fn generators_field_parses_from_yaml() {
         let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: math
     functions: []
@@ -1095,7 +1178,7 @@ generators:
     #[test]
     fn generators_defaults_to_none() {
         let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: math
     functions: []
@@ -1116,7 +1199,7 @@ modules:
     #[test]
     fn callback_def_round_trip_yaml() {
         let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: events
     functions: []
@@ -1141,7 +1224,7 @@ modules:
     #[test]
     fn listener_def_round_trip_yaml() {
         let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: events
     functions: []
@@ -1165,7 +1248,7 @@ modules:
     #[test]
     fn callbacks_and_listeners_default_to_empty() {
         let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: math
     functions: []
@@ -1207,7 +1290,7 @@ modules:
     #[test]
     fn builder_defaults_to_false() {
         let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: contacts
     functions: []
@@ -1224,7 +1307,7 @@ modules:
     #[test]
     fn builder_true_round_trip() {
         let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: contacts
     functions: []
@@ -1246,7 +1329,7 @@ modules:
     #[test]
     fn builder_false_explicit() {
         let json = r#"{
-            "version": "0.3.0",
+            "version": "0.4.0",
             "modules": [{
                 "name": "geo",
                 "functions": [],
@@ -1264,7 +1347,7 @@ modules:
     #[test]
     fn param_mutable_defaults_to_false() {
         let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: io
     functions:
@@ -1280,7 +1363,7 @@ modules:
     #[test]
     fn param_mutable_true_round_trip() {
         let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: io
     functions:
@@ -1301,7 +1384,7 @@ modules:
     #[test]
     fn param_mutable_false_explicit() {
         let json = r#"{
-            "version": "0.3.0",
+            "version": "0.4.0",
             "modules": [{
                 "name": "io",
                 "functions": [{
@@ -1317,7 +1400,7 @@ modules:
     #[test]
     fn deprecated_and_since_default_to_none() {
         let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: math
     functions:
@@ -1333,7 +1416,7 @@ modules:
     #[test]
     fn deprecated_and_since_round_trip() {
         let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: math
     functions:
@@ -1357,7 +1440,7 @@ modules:
     #[test]
     fn struct_field_default_value_round_trip() {
         let yaml = r#"
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: contacts
     functions: []
@@ -1385,7 +1468,7 @@ modules:
         // default must serialize without emitting those fields, so the
         // canonical IDL produced by `weaveffi format`/`extract` stays terse.
         let api = Api {
-            version: "0.3.0".into(),
+            version: "0.4.0".into(),
             modules: vec![Module {
                 name: "calc".into(),
                 functions: vec![Function {

@@ -153,7 +153,7 @@ JSON Schema export rely on it.
 
 ### Schema versioning
 
-`CURRENT_SCHEMA_VERSION` (currently `"0.3.0"`) lives in
+`CURRENT_SCHEMA_VERSION` (currently `"0.4.0"`) lives in
 [`crates/weaveffi-ir/src/ir.rs`][ir-source]. Pre-1.0, `SUPPORTED_VERSIONS`
 contains exactly the current version — older schema revisions are rejected
 by validation with an actionable error. When you change the schema:

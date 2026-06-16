@@ -27,13 +27,18 @@ producer thread, **callbacks and listeners are not supported** — see
 | IDL type     | WASM boundary | JavaScript surface |
 |--------------|---------------|--------------------|
 | `i32` / `u32`| `i32`         | `number`           |
+| `i8` / `i16` | `i32`         | `number`           |
+| `u8` / `u16` | `i32`         | `number`           |
 | `i64`        | `i64`         | `BigInt`           |
+| `u64`        | `i64`         | `BigInt`           |
 | `f64`        | `f64`         | `number`           |
+| `f32`        | `f32`         | `number`           |
 | `bool`       | `i32`         | `boolean` (0/1 at the boundary) |
 | `string`     | `i32` pointer (NUL-terminated UTF-8) | `string`, staged via `weaveffi_alloc` |
 | `bytes`      | `i32` pointer + `i32` length | `Uint8Array` copy |
 | `handle` / `StructName` | `i32` pointer into linear memory (0 = null) | struct wrapper class with getters |
-| `EnumName`   | `i32` discriminant | `number` |
+| `EnumName` (plain, C-style)   | `i32` discriminant | `number` |
+| `EnumName` (rich / algebraic) | `i32` pointer into linear memory (0 = null) | wrapper `class` (e.g. `Shape`) |
 | `T?`         | 0 / null pointer; scalars boxed by pointer | `T \| null` |
 | `[T]`        | `i32` pointer + `i32` length | `Array` copy |
 | `iter<T>`    | iterator handle + `next` out-param | drained into an `Array` |
@@ -88,6 +93,151 @@ export interface WeaveffiWasmModule {
 
 export function loadWeaveffiWasm(url: string): Promise<WeaveffiWasmModule>;
 ```
+
+## Rich (algebraic) enums
+
+A *rich* (algebraic) enum is a sum type whose variants carry associated
+data. A plain C-style enum stays an `i32` discriminant (surfaced as a
+`number` plus a frozen constants object), but a rich enum lowers to an
+**opaque object handle** — an `i32` pointer into linear memory, exactly
+like a struct wrapper. The loader wraps it in a `Shape` class that owns
+that handle for the lifetime of the module instance.
+
+For a `Shape` enum with variants `Empty`, `Circle { radius: f64 }`,
+`Rectangle { width: f32, height: f32 }`, and
+`Labeled { label: string, count: u8 }`, the generated `Shape` class has
+one static factory per variant, a `tag` getter, a getter per variant
+field, and an explicit `free()` (there is no `FinalizationRegistry` on
+this target):
+
+```js
+class Shape {
+  constructor(wasm, handle) {
+    this._wasm = wasm;
+    this._handle = handle;
+  }
+  get tag() {
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_shapes_Shape_tag(this._handle);
+    return _r;
+  }
+  static empty(wasm) {
+    const _err = _allocErr(wasm);
+    const _r = wasm.weaveffi_shapes_Shape_Empty_new(_err);
+    _checkErr(wasm, _err);
+    _freeErr(wasm, _err);
+    return new Shape(wasm, _r);
+  }
+  static circle(wasm, radius) {
+    const _err = _allocErr(wasm);
+    const _r = wasm.weaveffi_shapes_Shape_Circle_new(radius, _err);
+    _checkErr(wasm, _err);
+    _freeErr(wasm, _err);
+    return new Shape(wasm, _r);
+  }
+  // ... rectangle(wasm, width, height), labeled(wasm, label, count) ...
+  get circleRadius() {
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_shapes_Shape_Circle_get_radius(this._handle);
+    return _r;
+  }
+  get labeledLabel() {
+    const wasm = this._wasm;
+    const _r = wasm.weaveffi_shapes_Shape_Labeled_get_label(this._handle);
+    return _takeCStr(wasm, _r);
+  }
+  // ... rectangleWidth, rectangleHeight, labeledCount ...
+  free() {
+    if (this._handle !== 0) {
+      this._wasm.weaveffi_shapes_Shape_destroy(this._handle);
+      this._handle = 0;
+    }
+  }
+}
+Shape.Tag = Object.freeze({
+  Empty: 0,
+  Circle: 1,
+  Rectangle: 2,
+  Labeled: 3,
+});
+```
+
+The `wasm` instance is bound for you by the loader, so on the returned
+API the factories take only their declared arguments. Under
+`api.shapes.Shape` you get `empty()`, `circle(radius)`,
+`rectangle(width, height)`, `labeled(label, count)`, plus the frozen
+`Tag` map:
+
+```js
+shapes: {
+  // ...
+  Shape: {
+    empty: (...args) => Shape.empty(wasm, ...args),
+    circle: (...args) => Shape.circle(wasm, ...args),
+    rectangle: (...args) => Shape.rectangle(wasm, ...args),
+    labeled: (...args) => Shape.labeled(wasm, ...args),
+    Tag: Shape.Tag,
+  },
+},
+```
+
+The active variant is read through the `tag` getter (no call
+parentheses) and compared against `api.shapes.Shape.Tag`. Each variant
+field is a camelCased getter — `circleRadius`, `rectangleWidth`,
+`rectangleHeight`, `labeledLabel`, `labeledCount`. Functions that take
+or return the enum pass the wrapper directly: `describe(shape)` reads
+`shape._handle`, and `scale(shape, factor)` returns a fresh `Shape`.
+
+The generated `weaveffi_wasm.d.ts` types the wrapper as an
+`export declare class`:
+
+```typescript
+export declare class Shape {
+  get tag(): number;
+  static readonly Tag: Readonly<{
+    Empty: 0;
+    Circle: 1;
+    Rectangle: 2;
+    Labeled: 3;
+  }>;
+  static empty(): Shape;
+  static circle(radius: number): Shape;
+  static rectangle(width: number, height: number): Shape;
+  static labeled(label: string, count: number): Shape;
+  get circleRadius(): number;
+  get rectangleWidth(): number;
+  get rectangleHeight(): number;
+  get labeledLabel(): string;
+  get labeledCount(): number;
+  free(): void;
+}
+```
+
+A short round-trip — construct a couple of variants, read the tag and a
+field, call `describe` / `scale`, then free the handles:
+
+```js
+const api = await loadWeaveffiWasm('/shapes.wasm');
+
+const circle = api.shapes.Shape.circle(2.0);
+const label = api.shapes.Shape.labeled('unit', 3);
+
+if (circle.tag === api.shapes.Shape.Tag.Circle) {
+  console.log(circle.circleRadius); // 2
+}
+
+console.log(api.shapes.describe(circle)); // native-rendered description
+const bigger = api.shapes.scale(circle, 3.0); // a fresh Shape
+
+// No FinalizationRegistry on this target — free handles yourself.
+circle.free();
+label.free();
+bigger.free();
+```
+
+**Ownership:** a `Shape` owns its native object. JavaScript has no
+deterministic destructors here, so call `free()` when you are done;
+otherwise the allocation lives until the module instance is dropped.
 
 ## Async support
 

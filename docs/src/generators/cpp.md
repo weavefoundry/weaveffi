@@ -24,13 +24,20 @@ into any CMake build.
 | `i32`        | `int32_t`                            | `int32_t`                   |
 | `u32`        | `uint32_t`                           | `uint32_t`                  |
 | `i64`        | `int64_t`                            | `int64_t`                   |
+| `u64`        | `uint64_t`                           | `uint64_t`                  |
+| `i8`         | `int8_t`                             | `int8_t`                    |
+| `i16`        | `int16_t`                            | `int16_t`                   |
+| `u8`         | `uint8_t`                            | `uint8_t`                   |
+| `u16`        | `uint16_t`                           | `uint16_t`                  |
+| `f32`        | `float`                              | `float`                     |
 | `f64`        | `double`                             | `double`                    |
 | `bool`       | `bool`                               | `bool`                      |
 | `string`     | `std::string`                        | `const std::string&`        |
 | `bytes`      | `std::vector<uint8_t>`               | `const std::vector<uint8_t>&` |
 | `handle`     | `void*`                              | `void*`                     |
 | `StructName` | `StructName`                         | `const StructName&`         |
-| `EnumName`   | `EnumName` (`enum class`)            | `EnumName`                  |
+| `EnumName` (plain) | `EnumName` (`enum class`)      | `EnumName`                  |
+| `EnumName` (rich)  | `EnumName` (RAII class)        | `const EnumName&`           |
 | `T?`         | `std::optional<T>`                   | `const std::optional<T>&`   |
 | `[T]`        | `std::vector<T>`                     | `const std::vector<T>&`     |
 | `{K: V}`     | `std::unordered_map<K, V>`           | `const std::unordered_map<K, V>&` |
@@ -39,7 +46,7 @@ into any CMake build.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: contacts
     enums:
@@ -168,6 +175,61 @@ try {
     std::cerr << "Error " << e.code() << ": " << e.what() << '\n';
 }
 ```
+
+## Rich (algebraic) enums
+
+An enum whose variants declare `fields` is a *rich* (algebraic) enum — a sum
+type with associated data. Plain C-style enums stay `enum class`; a rich enum
+instead becomes an opaque RAII wrapper class with the same ownership model as a
+struct wrapper, plus a nested `Tag`, static factory methods, and per-variant
+getters. From the `shapes` sample:
+
+```cpp
+namespace weaveffi {
+
+class Shape {
+    void* handle_;
+public:
+    enum class Tag : int32_t { Empty = 0, Circle = 1, Rectangle = 2, Labeled = 3 };
+    Tag tag() const;
+
+    static Shape Empty();
+    static Shape Circle(double radius);
+    static Shape Rectangle(float width, float height);
+    static Shape Labeled(const std::string& label, uint8_t count);
+
+    double circle_radius() const;
+    float rectangle_width() const;
+    float rectangle_height() const;
+    std::string labeled_label() const;
+    uint8_t labeled_count() const;
+
+    ~Shape();                       // calls weaveffi_shapes_Shape_destroy
+    Shape(const Shape&) = delete;   // move-only, like struct wrappers
+    Shape(Shape&&) noexcept;
+};
+
+} // namespace weaveffi
+```
+
+Build a variant with its factory, switch on `tag()`, and read only the
+matching getters. Free functions take and return the wrapper by `const&` /
+by value:
+
+```cpp
+weaveffi::Shape shape = weaveffi::Shape::Circle(2.0);
+
+if (shape.tag() == weaveffi::Shape::Tag::Circle) {
+    std::cout << "radius = " << shape.circle_radius() << '\n';
+}
+
+std::cout << weaveffi::shapes_describe(shape) << '\n';
+weaveffi::Shape bigger = weaveffi::shapes_scale(shape, 3.0);
+```
+
+Ownership follows the struct-wrapper rules: the destructor calls
+`weaveffi_shapes_Shape_destroy`, copies are deleted, and moves transfer the
+handle — no manual free required.
 
 ## Build instructions
 

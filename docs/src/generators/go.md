@@ -24,12 +24,19 @@ methods plus an explicit `Close()`.
 | `u32`        | `uint32`      | `C.uint32_t`               |
 | `i64`        | `int64`       | `C.int64_t`                |
 | `f64`        | `float64`     | `C.double`                 |
+| `i8`         | `int8`        | `C.int8_t`                 |
+| `i16`        | `int16`       | `C.int16_t`                |
+| `u8`         | `uint8`       | `C.uint8_t`                |
+| `u16`        | `uint16`      | `C.uint16_t`               |
+| `u64`        | `uint64`      | `C.uint64_t`               |
+| `f32`        | `float32`     | `C.float`                  |
 | `bool`       | `bool`        | `C._Bool`                  |
 | `string`     | `string`      | `*C.char` (via `C.CString`/`C.GoString`) |
 | `bytes`      | `[]byte`      | `*C.uint8_t` + `C.size_t`  |
 | `handle`     | `int64`       | `C.weaveffi_handle_t`      |
 | `Struct`     | `*StructName` | `*C.weaveffi_mod_Struct`   |
-| `Enum`       | `EnumName`    | `C.weaveffi_mod_Enum`      |
+| `Enum` (plain) | `EnumName`  | `C.weaveffi_mod_Enum`      |
+| `Enum` (rich)  | `*EnumName` | `*C.weaveffi_mod_Enum`     |
 | `T?`         | `*T`          | pointer to scalar; nil-able pointer for strings/structs |
 | `[T]`        | `[]T`         | pointer + `C.size_t`       |
 | `{K: V}`     | `map[K]V`     | key/value arrays + `C.size_t` |
@@ -40,7 +47,7 @@ Booleans map to `C._Bool`, matching CGo's representation of `_Bool`.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: contacts
     enums:
@@ -176,7 +183,7 @@ The Go module path defaults to `weaveffi`; override it via the
 generator config:
 
 ```yaml
-version: "0.3.0"
+version: "0.4.0"
 modules:
   - name: math
     functions:
@@ -189,6 +196,120 @@ generators:
   go:
     module_path: "github.com/myorg/mylib"
 ```
+
+## Rich (algebraic) enums
+
+A *rich* (algebraic) enum — a sum type whose variants carry associated
+data — lowers to an **opaque object pointer** at the C ABI, exactly like a
+struct, and shares the same ownership model as the struct wrappers above.
+The Go wrapper is a struct holding a typed C pointer, with one
+`New<Enum><Variant>` constructor per variant, a `Tag()` method returning
+the `int32` discriminant, per-variant field getter methods, and an
+explicit `Close()`. (A plain C-style enum with no payloads stays a typed
+`int32` alias with `const` values — see above.)
+
+For the `shapes` module's `Shape` enum — `Empty`, `Circle { radius: f64 }`,
+`Rectangle { width: f32, height: f32 }`, and
+`Labeled { label: string, count: u8 }` — the generator emits (abridged):
+
+```go
+// Shape: An algebraic shape (sum type with associated data)
+type Shape struct {
+	ptr *C.weaveffi_shapes_Shape
+}
+
+const (
+	// ShapeEmpty: The empty shape
+	ShapeEmpty int32 = 0
+	// ShapeCircle: A circle with a radius
+	ShapeCircle int32 = 1
+	// ShapeRectangle: An axis-aligned rectangle
+	ShapeRectangle int32 = 2
+	// ShapeLabeled: A labeled shape with a small count
+	ShapeLabeled int32 = 3
+)
+
+func (s *Shape) Tag() int32 {
+	return int32(C.weaveffi_shapes_Shape_tag(s.ptr))
+}
+
+// NewShapeCircle: A circle with a radius
+func NewShapeCircle(radius float64) (*Shape, error) {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_shapes_Shape_Circle_new(C.double(radius), &cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return nil, goErr
+	}
+	return &Shape{ptr: result}, nil
+}
+
+// NewShapeLabeled: A labeled shape with a small count
+func NewShapeLabeled(label string, count uint8) (*Shape, error) {
+	cLabel := C.CString(label)
+	defer C.free(unsafe.Pointer(cLabel))
+	var cErr C.weaveffi_error
+	result := C.weaveffi_shapes_Shape_Labeled_new(cLabel, C.uint8_t(count), &cErr)
+	if cErr.code != 0 {
+		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
+		C.weaveffi_error_clear(&cErr)
+		return nil, goErr
+	}
+	return &Shape{ptr: result}, nil
+}
+
+// CircleRadius: Radius in points
+func (s *Shape) CircleRadius() float64 {
+	return float64(C.weaveffi_shapes_Shape_Circle_get_radius(s.ptr))
+}
+
+func (s *Shape) LabeledCount() uint8 {
+	return uint8(C.weaveffi_shapes_Shape_Labeled_get_count(s.ptr))
+}
+
+func (s *Shape) Close() {
+	if s.ptr != nil {
+		C.weaveffi_shapes_Shape_destroy(s.ptr)
+		s.ptr = nil
+	}
+}
+```
+
+Each `NewShape<Variant>` calls a per-variant constructor
+(`weaveffi_shapes_Shape_<Variant>_new`); `Tag()` reads the discriminant
+(`weaveffi_shapes_Shape_tag`) and can be compared against the package
+constants `ShapeEmpty`/`ShapeCircle`/`ShapeRectangle`/`ShapeLabeled`; the
+getter methods read one variant field
+(`weaveffi_shapes_Shape_<Variant>_get_<field>`); and `Close()` frees the
+pointer (`weaveffi_shapes_Shape_destroy`). Free functions that take or
+return the enum pass the wrapper's pointer across the boundary
+(`ShapesDescribe(*Shape)`, `ShapesScale(*Shape, float64)`):
+
+```go
+c, err := NewShapeCircle(2.0)
+if err != nil {
+	return err
+}
+defer c.Close()
+fmt.Println(c.Tag() == ShapeCircle) // true
+fmt.Println(c.CircleRadius())       // 2
+
+bigger, err := ShapesScale(c, 3.0) // returns a new *Shape
+if err != nil {
+	return err
+}
+defer bigger.Close()
+desc, err := ShapesDescribe(bigger)
+if err != nil {
+	return err
+}
+fmt.Println(desc)
+```
+
+**Ownership:** a `*Shape` owns its native pointer. Go has no deterministic
+destructors, so pair every constructor (and every `*Shape` returned by
+`ShapesScale`) with `defer s.Close()`.
 
 ## Build instructions
 
