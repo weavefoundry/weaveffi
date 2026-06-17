@@ -80,7 +80,7 @@ object and loads the JNI library on first use. Function names are
 prefixed with the module name. Where a parameter or return value needs
 wrapping (enums, structs), the external entry is a private `...Jni`
 function with lowered types and a public wrapper converts at the
-boundary — struct returns come back as handles and are wrapped in the
+boundary. Struct returns come back as handles and are wrapped in the
 struct class; `[Contact]` stays a `LongArray` of handles:
 
 ```kotlin
@@ -186,17 +186,17 @@ target_include_directories(weaveffi PRIVATE ../../../../c)
 
 ## Rich (algebraic) enums
 
-A *rich* (algebraic) enum — a sum type whose variants carry associated
-data — lowers to an **opaque object handle** at the C ABI, exactly like a
+A *rich* (algebraic) enum, a sum type whose variants carry associated
+data, lowers to an **opaque object handle** at the C ABI, exactly like a
 struct, and shares the same ownership model as the struct wrappers above.
 The Kotlin wrapper is a `Closeable` class holding a `Long` handle, with
 one static factory per variant, a nested `Tag` discriminant `enum class`,
 and per-variant field getters. (A plain C-style enum with no payloads
-stays a Kotlin `enum class` backed by an `Int` — see above.)
+stays a Kotlin `enum class` backed by an `Int`; see above.)
 
-For the `shapes` module's `Shape` enum — `Empty`, `Circle { radius: f64 }`,
+For the `shapes` module's `Shape` enum (`Empty`, `Circle { radius: f64 }`,
 `Rectangle { width: f32, height: f32 }`, and
-`Labeled { label: string, count: u8 }` — the generator emits (abridged):
+`Labeled { label: string, count: u8 }`), the generator emits (abridged):
 
 ```kotlin
 /** An algebraic shape (sum type with associated data) */
@@ -300,7 +300,7 @@ Shape.circle(2.0).use { c ->
 ```
 
 **Ownership:** a `Shape` owns its native handle, so call `close()` (or use
-`use { ... }`) on every `Shape` you construct or receive — including the
+`use { ... }`) on every `Shape` you construct or receive, including the
 new `Shape` returned by `shapes_scale`. The `finalize()` safety net runs
 during GC but is not a substitute for deterministic cleanup.
 
@@ -409,7 +409,7 @@ For functions marked `cancellable: true`, the C ABI takes an extra
 `weaveffi_cancel_token*` parameter. The private external launcher
 carries it as `cancelToken: Long` and the shim casts it to
 `weaveffi_cancel_token*`, but the public suspend wrapper currently
-passes `0L` (no token) — coroutine cancellation is not wired to the
+passes `0L` (no token); coroutine cancellation isn't wired to the
 native cancel token:
 
 ```kotlin
@@ -484,7 +484,7 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_events_1register_1message_1li
 }
 ```
 
-The callback runs on the producer's thread — whichever thread the
+The callback runs on the producer's thread, whichever thread the
 native side fires the event from. For UI work, hop to the main thread
 yourself (e.g. `withContext(Dispatchers.Main)` or `Handler.post`).
 
@@ -515,15 +515,15 @@ weaveffi_events_GetMessagesIterator_destroy(_iter);
 
 ## Troubleshooting
 
-- **`UnsatisfiedLinkError: Couldn't find libweaveffi.so`** — the
+- **`UnsatisfiedLinkError: Couldn't find libweaveffi.so`**: the
   Rust-built cdylib was not packaged inside the AAR. Place it under
   `src/main/jniLibs/<abi>/` and rebuild.
-- **`UnsatisfiedLinkError` for the JNI symbol itself** — Kotlin
+- **`UnsatisfiedLinkError` for the JNI symbol itself**: Kotlin
   external function names must match the JNI signature, including the
   `_1` escape for underscores. Re-run `weaveffi generate` if you
   hand-edited either side.
-- **Crashes when releasing strings** — the JNI shim is responsible for
+- **Crashes when releasing strings**: the JNI shim is responsible for
   calling `ReleaseStringUTFChars` on every `GetStringUTFChars`. If you
   edit the shim, keep the pairing intact.
-- **R8/ProGuard removes `WeaveFFI` symbols** — keep the wrapper class
+- **R8/ProGuard removes `WeaveFFI` symbols**: keep the wrapper class
   with `-keep class com.weaveffi.** { *; }` in your ProGuard rules.

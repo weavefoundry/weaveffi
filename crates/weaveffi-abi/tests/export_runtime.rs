@@ -2,7 +2,7 @@
 //!
 //! This integration test lives in a separate compilation unit (it is
 //! linked as a Rust test binary, not a cdylib) so it cannot easily
-//! observe the `#[no_mangle]` symbols' linker visibility — but it
+//! observe the `#[no_mangle]` symbols' linker visibility, but it
 //! *can* prove that the macro expands to valid Rust that compiles,
 //! that the generated free functions are callable with realistic
 //! arguments, and that the symbol names match what the WeaveFFI

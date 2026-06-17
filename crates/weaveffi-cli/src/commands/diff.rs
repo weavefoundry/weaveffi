@@ -1,4 +1,4 @@
-//! `weaveffi diff` — regenerate into a temp directory and compare against
+//! `weaveffi diff`: regenerate into a temp directory and compare against
 //! the on-disk output (`--check` for CI gating with distinct exit codes).
 
 use crate::config::{merge_inline_generators, CliConfig};

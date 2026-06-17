@@ -34,8 +34,8 @@ cd my-project
 
 This creates a `my-project/` directory containing:
 
-- `weaveffi.yml` — an example IDL with `add`, `mul`, and `echo` functions
-- `README.md` — quick-start notes
+- `weaveffi.yml`: an example IDL with `add`, `mul`, and `echo` functions
+- `README.md`: quick-start notes
 
 ## 3) Define your IDL
 
@@ -165,7 +165,7 @@ crate-type = ["cdylib"]
 weaveffi-abi = { version = "0.1" }
 ```
 
-**src/lib.rs** — implement the `add` function (struct lifecycle omitted for
+**src/lib.rs**, implementing the `add` function (struct lifecycle omitted for
 brevity):
 
 ```rust
@@ -196,7 +196,7 @@ Key points:
 - `out_err` must always be cleared on success with `abi::error_set_ok`.
 - On error, call `abi::error_set(out_err, code, message)` and return a
   zero/null value.
-- The library must export the WeaveFFI runtime symbols — invoke
+- The library must export the WeaveFFI runtime symbols: invoke
   [`weaveffi_abi::export_runtime!()`][export-runtime-doc] to emit all of
   them in one line instead of writing each `#[no_mangle]` thunk by hand.
 

@@ -155,7 +155,7 @@ fn roundtrip_kitchen_sink() {
         assert_eq!(a.name, b.name);
         assert_types_equivalent(&a.ty, &b.ty, &format!("Item.{}", b.name));
         assert_eq!(a.doc, b.doc, "Item.{} doc mismatch", b.name);
-        // a.default may legitimately differ — the fixture cannot recover
+        // a.default may legitimately differ; the fixture cannot recover
         // struct field defaults from Rust syntax (documented gap).
     }
 
@@ -202,7 +202,7 @@ fn roundtrip_kitchen_sink() {
                 "{} param {} mutable mismatch",
                 orig.name, b.name
             );
-            // Param.doc is allowed to differ — documented gap.
+            // Param.doc is allowed to differ (documented gap).
         }
         match (&extracted.returns, &orig.returns) {
             (Some(a), Some(b)) => assert_types_equivalent(a, b, &format!("{} return", orig.name)),
@@ -221,7 +221,7 @@ fn roundtrip_kitchen_sink() {
             orig.name
         );
         // `since` without an accompanying `#[deprecated(since = ...)]` is
-        // not recoverable — `new_op` has `since: 0.3.0` in the IDL but no
+        // not recoverable: `new_op` has `since: 0.3.0` in the IDL but no
         // way to express that in Rust syntax alone.
         if orig.deprecated.is_some() {
             assert_eq!(

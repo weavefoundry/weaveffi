@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml/badge.svg)](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT) [![crates.io](https://img.shields.io/crates/v/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli) [![Schema](https://img.shields.io/badge/schema-0.4.0-orange)](./weaveffi.schema.json) [![downloads](https://img.shields.io/crates/d/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli)
 
-WeaveFFI generates type-safe bindings for 11 languages from a single IDL —
+WeaveFFI generates type-safe bindings for 11 languages from a single IDL:
 no hand-written JNI, no duplicate implementations, no unsafe boilerplate.
 Define your API once in YAML, JSON, or TOML; ship idiomatic packages for
 C, C++, Swift, Kotlin/Android, Node.js, WebAssembly, Python, .NET, Dart,
@@ -54,7 +54,7 @@ weaveffi generate contacts.yml -o generated --target c,swift,python,node,dart
 Click each block below to see what WeaveFFI emits.
 
 <details>
-<summary><strong>C</strong> — <code>generated/c/weaveffi.h</code></summary>
+<summary><strong>C</strong>: <code>generated/c/weaveffi.h</code></summary>
 
 ```c
 typedef struct weaveffi_contacts_Contact weaveffi_contacts_Contact;
@@ -81,7 +81,7 @@ weaveffi_contacts_Contact** weaveffi_contacts_list_contacts(
 </details>
 
 <details>
-<summary><strong>Swift</strong> — <code>generated/swift/Sources/WeaveFFI/WeaveFFI.swift</code></summary>
+<summary><strong>Swift</strong>: <code>generated/swift/Sources/WeaveFFI/WeaveFFI.swift</code></summary>
 
 ```swift
 public class Contact {
@@ -118,7 +118,7 @@ public enum Contacts {
 </details>
 
 <details>
-<summary><strong>Python</strong> — <code>generated/python/weaveffi/weaveffi.pyi</code></summary>
+<summary><strong>Python</strong>: <code>generated/python/weaveffi/weaveffi.pyi</code></summary>
 
 ```python
 from typing import List, Optional
@@ -138,7 +138,7 @@ def contacts_list_contacts() -> List["Contact"]: ...
 </details>
 
 <details>
-<summary><strong>TypeScript</strong> — <code>generated/node/types.d.ts</code></summary>
+<summary><strong>TypeScript</strong>: <code>generated/node/types.d.ts</code></summary>
 
 ```typescript
 export interface Contact {
@@ -158,7 +158,7 @@ export function contacts_list_contacts(): Contact[];
 </details>
 
 <details>
-<summary><strong>Dart</strong> — <code>generated/dart/lib/weaveffi.dart</code></summary>
+<summary><strong>Dart</strong>: <code>generated/dart/lib/weaveffi.dart</code></summary>
 
 ```dart
 class Contact {
@@ -182,20 +182,20 @@ List<Contact> listContacts() { /* ... */ }
 
 - **One IDL, eleven languages.** Describe your API once and ship packages to
   npm, SwiftPM, Maven, PyPI, NuGet, pub.dev, RubyGems, and Go modules. Each
-  package is standalone — consumers don't need WeaveFFI installed.
+  package is standalone: consumers don't need WeaveFFI installed.
 - **Stable C ABI underneath.** Every target speaks to the same `extern "C"`
   contract, so adding a new platform later is a code-gen change, not a
   rewrite. Works with any backend that can expose a C ABI: Rust (with
   first-class scaffolding via `--scaffold`), C, C++, or Zig.
 - **Idiomatic per-target output.** No lowest-common-denominator surface area.
   Swift gets `async/await` and `throws`, Kotlin gets `suspend` and JNI glue,
-  Python gets typed `.pyi` stubs, TypeScript gets `Promise`s, Dart gets
-  `dart:ffi` — all from the same definition.
+  Python gets typed `.pyi` stubs, TypeScript gets `Promise`s, and Dart gets
+  `dart:ffi`, all from the same definition.
 - **The whole IDL surface, on every target.** Async functions, iterators,
   callbacks, and event listeners work across all eleven languages (WASM
   excepts callbacks/listeners and says so loudly). Generators declare
-  their capabilities and `weaveffi generate` fails with a clear error —
-  never a silent skip — if a target can't deliver a feature you use. See
+  their capabilities and `weaveffi generate` fails with a clear error
+  (never a silent skip) if a target can't deliver a feature you use. See
   the [feature matrix](docs/src/generators/README.md#feature-support-matrix).
 
 ## How does it compare?
@@ -229,7 +229,7 @@ cargo install weaveffi-cli
 ```
 
 **Pre-built binaries** for macOS, Linux, and Windows are attached to every
-[GitHub release](https://github.com/weavefoundry/weaveffi/releases) — download
+[GitHub release](https://github.com/weavefoundry/weaveffi/releases). Download
 the archive for your platform, extract the `weaveffi` binary, and put it on
 your `PATH`.
 
@@ -272,18 +272,18 @@ Regenerate the schema with `weaveffi schema --format json-schema > weaveffi.sche
 Full documentation lives at <https://docs.weaveffi.com/> (sources under
 [`docs/`](./docs/)). Key pages:
 
-- [Introduction](docs/src/intro.md) — what WeaveFFI is and why it exists
-- [Getting Started](docs/src/getting-started.md) — install → IDL → generate → call from C
-- [Comparison](docs/src/comparison.md) — feature matrix vs UniFFI, cbindgen, diplomat, SWIG, autocxx
-- [FAQ](docs/src/faq.md) — top questions about scope, runtime cost, and platform support
-- [Generators](docs/src/generators/) — per-target reference for each of the eleven languages
-- [Guides](docs/src/guides/) — memory ownership, error handling, async, configuration
+- [Introduction](docs/src/intro.md): what WeaveFFI is and why it exists
+- [Getting Started](docs/src/getting-started.md): install → IDL → generate → call from C
+- [Comparison](docs/src/comparison.md): feature matrix vs UniFFI, cbindgen, diplomat, SWIG, autocxx
+- [FAQ](docs/src/faq.md): top questions about scope, runtime cost, and platform support
+- [Generators](docs/src/generators/): per-target reference for each of the eleven languages
+- [Guides](docs/src/guides/): memory ownership, error handling, async, configuration
 
 ## Status
 
 WeaveFFI is in active `0.x` development. Following [Semantic
-Versioning](https://semver.org/), the public surface — the CLI, the IDL
-schema, the generated code, and the `weaveffi-abi` runtime symbols — may
+Versioning](https://semver.org/), the public surface (the CLI, the IDL
+schema, the generated code, and the `weaveffi-abi` runtime symbols) may
 change between minor releases while the project is pre-1.0, and only the
 current IDL schema version is accepted. See [Stability and
 Versioning](docs/src/stability.md) for what that means in practice and the

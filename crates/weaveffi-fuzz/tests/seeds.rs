@@ -7,7 +7,7 @@
 //!      APIs in `weaveffi-ir` and `weaveffi-core`.
 //!
 //! If a parser or validator signature changes, this file is what should
-//! break first — long before a nightly fuzz run.
+//! break first, long before a nightly fuzz run.
 
 use std::path::PathBuf;
 

@@ -94,7 +94,7 @@ A complete, validating example lives at the bottom of this page in the
 ## Package metadata
 
 The optional top-level `package` block is the single source of truth for the
-publishable identity stamped into every generated ecosystem manifest —
+publishable identity stamped into every generated ecosystem manifest:
 `package.json` (Node/WASM), `pyproject.toml`/`setup.py` (Python),
 `*.gemspec` (Ruby), `*.csproj`/`*.nuspec` (.NET), `pubspec.yaml` (Dart),
 `Package.swift` (Swift), `go.mod` (Go), `settings.gradle` (Android), and
@@ -126,7 +126,7 @@ non-empty wins):
 4. the built-in default `weaveffi`.
 
 The version resolves from `package.version`, falling back to `0.1.0`. Names
-are normalized per ecosystem — e.g. a Python import package or Ruby `require`
+are normalized per ecosystem, e.g. a Python import package or Ruby `require`
 path lowercases and replaces non-alphanumerics with `_` (`my-kv.store` →
 `my_kv_store`), while the published distribution name keeps the original
 spelling.
@@ -134,7 +134,7 @@ spelling.
 > Code-level identity that has no manifest of its own still follows the
 > package where it is unambiguous: the Swift module name defaults to the
 > PascalCased `package.name` (`async-demo` → `AsyncDemo`). The stable C ABI
-> symbol prefix is **not** affected — it stays `weaveffi` (or your global
+> symbol prefix is **not** affected: it stays `weaveffi` (or your global
 > `c_prefix`) so the generated bindings keep calling the symbols the producer
 > exports.
 
@@ -255,19 +255,19 @@ modules:
       - name: write_fast
         params:
           - { name: data, type: "&str" }
-        doc: "Borrowed string — no copy at the FFI boundary"
+        doc: "Borrowed string: no copy at the FFI boundary"
 
       - name: send_raw
         params:
           - { name: payload, type: "&[u8]" }
-        doc: "Borrowed byte slice — no copy at the FFI boundary"
+        doc: "Borrowed byte slice: no copy at the FFI boundary"
 ```
 
 ### Typed handles
 
 `handle<T>` is a typed variant of `handle` that associates the opaque
 identifier with a named type `T`. This gives generators type-safety
-information — for example, generating a distinct wrapper class per handle
+information, for example, generating a distinct wrapper class per handle
 type. `T` must be a struct defined in the same module so the generator
 knows how to spell the handle's type. At the C ABI level, `handle<T>` is
 still a `uint64_t`.
@@ -381,7 +381,7 @@ modules:
         return: Rect
 ```
 
-Struct fields may reference other structs, enums, optionals, or lists — any
+Struct fields may reference other structs, enums, optionals, or lists: any
 valid `TypeRef`.
 
 ---
@@ -406,7 +406,7 @@ Each variant:
 | `name`   | string           | yes      | Variant name (e.g. `Red`)                    |
 | `value`  | i32              | yes      | Integer discriminant                         |
 | `doc`    | string           | no       | Documentation string                         |
-| `fields` | array of Field   | no       | Associated data — makes the enum a *sum type* |
+| `fields` | array of Field   | no       | Associated data: makes the enum a *sum type* |
 
 ### Enum example
 
@@ -437,7 +437,7 @@ modules:
 Variant values must be unique within an enum, and variant names must be unique
 within an enum.
 
-### Rich (algebraic) enums — sum types
+### Rich (algebraic) enums: sum types
 
 When one or more variants declare `fields`, the enum becomes a *rich* enum: an
 algebraic sum type whose variants carry associated data (like a Rust `enum` or a
@@ -471,7 +471,7 @@ modules:
 ```
 
 Unlike a plain C-style enum (which crosses the ABI by value as an integer), a
-rich enum crosses as an **opaque object pointer** — exactly like a struct. The C
+rich enum crosses as an **opaque object pointer**, exactly like a struct. The C
 ABI gains a tag reader, a per-variant constructor and field getters, and a
 destructor; each backend wraps these into an idiomatic owned type:
 
@@ -577,7 +577,7 @@ modules:
 ## Map types
 
 Wrap a key-value pair in `{K:V}` braces to declare a map (dictionary /
-associative array). Keys must be primitive types or enums — structs, lists,
+associative array). Keys must be primitive types or enums; structs, lists,
 and maps are not valid key types. Values may be any valid `TypeRef`.
 
 | Syntax            | Meaning                               |
@@ -864,7 +864,7 @@ C ABI symbols for nested modules use underscores to join the path:
 
 Type references to structs and enums must resolve within the same module
 (including its parent chain). Cross-module references between sibling
-modules are not currently supported — define shared types in a common
+modules are not currently supported. Define shared types in a common
 parent module or duplicate the definition.
 
 ---

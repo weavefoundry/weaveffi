@@ -22,10 +22,10 @@ use weaveffi_gen_wasm::{WasmConfig, WasmGenerator};
 ///
 /// This macro is the **single source of truth** for the target set. One
 /// invocation (below) expands to:
-///   * the `CliConfig` struct — one typed field per target;
-///   * `build_generators` — the ordered generator list;
-///   * `apply_inline_target` — inline-IDL `generators.<target>` dispatch;
-///   * `stamp_input_basename` / `fan_strip_module_prefix` — the `finalize`
+///   * the `CliConfig` struct: one typed field per target;
+///   * `build_generators`: the ordered generator list;
+///   * `apply_inline_target`: inline-IDL `generators.<target>` dispatch;
+///   * `stamp_input_basename` / `fan_strip_module_prefix`: the `finalize`
 ///     fan-outs.
 ///
 /// Adding a language is therefore a one-line edit here (plus the generator
@@ -92,8 +92,8 @@ macro_rules! cli_targets {
 
             /// Fan the resolved global C ABI `prefix` out to every per-target
             /// config that has not set its own. The C symbol prefix is global
-            /// by nature — every consumer must call the identical exported
-            /// symbols — so a single `[global] c_prefix` (or `[c] prefix`)
+            /// by nature: every consumer must call the identical exported
+            /// symbols, so a single `[global] c_prefix` (or `[c] prefix`)
             /// reaches all eleven languages.
             fn fan_c_prefix(&mut self, resolved: Option<String>) {
                 let Some(p) = resolved else { return };

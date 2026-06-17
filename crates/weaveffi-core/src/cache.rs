@@ -20,6 +20,11 @@ pub const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// keys in deterministic, lexicographic order regardless of the iteration
 /// order of any source maps. This guarantees that two runs over the same
 /// IR always produce the same hash.
+///
+/// # Panics
+///
+/// Panics if `api` cannot be serialized to JSON. This does not happen for a
+/// well-formed [`Api`], whose IR is plain serializable data.
 pub fn hash_api(api: &Api) -> String {
     let value = serde_json::to_value(api).expect("Api serialization should not fail");
     let json = serde_json::to_string(&value).expect("Value serialization should not fail");
@@ -32,6 +37,11 @@ pub fn hash_api(api: &Api) -> String {
 /// Kept for tests and direct callers that only need an IR-keyed digest;
 /// the orchestrator goes through [`hash_generator_inputs`] so that config
 /// and CLI version changes invalidate the cache too.
+///
+/// # Panics
+///
+/// Panics if `api` cannot be serialized to JSON, which does not happen for a
+/// well-formed [`Api`].
 pub fn hash_api_for_generator(api: &Api, generator_name: &str) -> String {
     let value = serde_json::to_value(api).expect("Api serialization should not fail");
     let json = serde_json::to_string(&value).expect("Value serialization should not fail");
@@ -53,6 +63,12 @@ pub fn hash_api_for_generator(api: &Api, generator_name: &str) -> String {
 /// `{out_dir}/.weaveffi-cache/{generator_name}.hash`, so any change to
 /// the IR, generator config, or CLI version invalidates that entry and
 /// triggers a re-run.
+///
+/// # Panics
+///
+/// Panics if `api` cannot be serialized to JSON, which does not happen for a
+/// well-formed [`Api`]. The `config_bytes` are already serialized by the
+/// caller and are hashed as-is.
 pub fn hash_generator_inputs(api: &Api, generator_name: &str, config_bytes: &[u8]) -> String {
     let api_value = serde_json::to_value(api).expect("Api serialization should not fail");
     let api_json = serde_json::to_string(&api_value).expect("Value serialization should not fail");
@@ -88,6 +104,11 @@ pub fn read_generator_cache(out_dir: &Utf8Path, generator_name: &str) -> Option<
 /// Removes a stale legacy `.weaveffi-cache` regular file (written by older
 /// CLI versions that used a single global cache) before creating the new
 /// per-generator directory layout.
+///
+/// # Errors
+///
+/// Returns an error if the legacy cache file cannot be removed, the cache
+/// directory cannot be created, or the hash file cannot be written.
 pub fn write_generator_cache(out_dir: &Utf8Path, generator_name: &str, hash: &str) -> Result<()> {
     let cache_dir = out_dir.join(CACHE_DIR);
     migrate_legacy_cache(out_dir)?;
@@ -102,6 +123,11 @@ pub fn write_generator_cache(out_dir: &Utf8Path, generator_name: &str, hash: &st
 /// Delete every persisted cache entry under `out_dir/.weaveffi-cache/`.
 ///
 /// Called when `--force` is used so subsequent runs always regenerate.
+///
+/// # Errors
+///
+/// Returns an error if the cache directory (or a stale legacy cache file)
+/// exists but cannot be removed.
 pub fn invalidate_all(out_dir: &Utf8Path) -> Result<()> {
     let cache_dir = out_dir.join(CACHE_DIR);
     if cache_dir.is_dir() {
@@ -541,7 +567,7 @@ mod tests {
 
         // Compute the canonical hash, then compute the digest the same way
         // but pretend a different CLI version produced it. The two must
-        // differ — otherwise upgrades silently leave stale output.
+        // differ; otherwise upgrades silently leave stale output.
         let real = hash_generator_inputs(&api, "c", &cfg);
 
         let api_value = serde_json::to_value(&api).unwrap();

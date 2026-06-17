@@ -6,8 +6,8 @@
 // unregister entry points must exist as explicit stubs that throw.
 //
 // Inputs come from the harness:
-//   WV_WASM — path to the compiled events.wasm
-//   WV_JS   — path to the generated weaveffi_wasm.js (ESM)
+//   WV_WASM: path to the compiled events.wasm
+//   WV_JS:   path to the generated weaveffi_wasm.js (ESM)
 
 import fs from 'fs';
 

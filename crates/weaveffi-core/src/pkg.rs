@@ -5,7 +5,7 @@
 //! ecosystem manifest (`package.json`, `pyproject.toml`, `*.gemspec`,
 //! `*.csproj`, `pubspec.yaml`, `Package.swift`, `build.gradle`, `go.mod`).
 //!
-//! This module centralizes the *resolution* rules — precedence and defaults —
+//! This module centralizes the *resolution* rules (precedence and defaults)
 //! so all eleven generators agree on the package identity instead of each one
 //! hardcoding `weaveffi` / `0.1.0`. Generators read [`resolve`] in their
 //! manifest code and map the [`ResolvedPackage`] fields onto whatever their
@@ -27,10 +27,17 @@ pub struct ResolvedPackage {
     pub name: String,
     /// Semantic version stamped into the manifest.
     pub version: String,
+    /// Short package description, or `None` when the IDL omits it. See
+    /// [`description_or_default`](Self::description_or_default) for the fallback.
     pub description: Option<String>,
+    /// License identifier (typically an SPDX expression), or `None` when unset.
     pub license: Option<String>,
+    /// Package authors, taken verbatim from the `package:` block (empty when
+    /// none are declared).
     pub authors: Vec<String>,
+    /// Project homepage URL, or `None` when unset.
     pub homepage: Option<String>,
+    /// Source repository URL, or `None` when unset.
     pub repository: Option<String>,
 }
 

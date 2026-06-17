@@ -3,6 +3,10 @@
 //! Emits a Go module (`go.mod` + package) with CGo bindings over the C
 //! ABI exposed by the underlying cdylib. Implements [`LanguageBackend`];
 //! the shared driver bridges it into the generator pipeline.
+#![deny(missing_docs)]
+#![warn(clippy::missing_errors_doc)]
+#![warn(clippy::missing_panics_doc)]
+#![warn(clippy::doc_markdown)]
 
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
@@ -37,19 +41,25 @@ pub struct GoConfig {
 }
 
 impl GoConfig {
+    /// Returns the configured Go module path, falling back to `"weaveffi"`.
     pub fn module_path(&self) -> &str {
         self.module_path.as_deref().unwrap_or("weaveffi")
     }
 
+    /// Returns the configured C ABI symbol prefix, falling back to `"weaveffi"`.
     pub fn prefix(&self) -> &str {
         self.prefix.as_deref().unwrap_or("weaveffi")
     }
 
+    /// Returns the input IDL basename embedded in generated file headers,
+    /// falling back to `"weaveffi.yml"`.
     pub fn input_basename(&self) -> &str {
         self.input_basename.as_deref().unwrap_or("weaveffi.yml")
     }
 }
 
+/// Go backend: emits a CGo package (`weaveffi.go`, `go.mod`, and a README)
+/// binding the C ABI exposed by the underlying cdylib.
 pub struct GoGenerator;
 
 impl LanguageBackend for GoGenerator {

@@ -37,7 +37,7 @@ way to inspect what the IDL compiles to.
 | `Enum` (rich)  | `const weaveffi_m_E*`                 | `weaveffi_m_E*`                    |
 | `T?` (value) | `const T*` (NULL = absent)              | `T*` (NULL = absent)               |
 | `[T]`        | `const T* items, size_t items_len`      | `T*` + `size_t* out_len`           |
-| `iter<T>`    | —                                       | opaque iterator handle — see [Iterators](#iterators) |
+| `iter<T>`    | n/a                                     | opaque iterator handle (see [Iterators](#iterators)) |
 
 C ABI symbol naming follows a strict convention:
 
@@ -62,8 +62,8 @@ C ABI symbol naming follows a strict convention:
 `{Function}` is the function name converted to PascalCase
 (`get_messages` → `GetMessages`).
 
-When the IDL sets `c_prefix`, every symbol — including the runtime
-helpers — is rewritten with the new prefix.
+When the IDL sets `c_prefix`, every symbol, including the runtime
+helpers, is rewritten with the new prefix.
 
 ## Example IDL → generated code
 
@@ -187,7 +187,7 @@ if (err.code != 0) {
 
 ## Rich (algebraic) enums
 
-An enum whose variants declare `fields` is a *rich* (algebraic) enum — a sum
+An enum whose variants declare `fields` is a *rich* (algebraic) enum, a sum
 type with associated data. Unlike a plain C-style enum (a bare `int32_t`
 discriminant), a rich enum crosses the ABI as an **opaque object pointer**,
 exactly like a struct: the producer owns the payload and the consumer holds a
@@ -346,8 +346,8 @@ weaveffi_events_unregister_message_listener(id);
 ## Async support
 
 Async functions (`async: true`) get no synchronous prototype. Each one
-emits a per-function callback typedef — `(void* context,
-weaveffi_error* err, <result slots>)` — and a launcher with the
+emits a per-function callback typedef, `(void* context,
+weaveffi_error* err, <result slots>)`, and a launcher with the
 `_async` suffix. From the `async-demo` sample:
 
 ```c
@@ -363,13 +363,13 @@ void weaveffi_tasks_run_task_async(
 ```
 
 The launcher returns immediately; WeaveFFI invokes the callback
-exactly once — with either a result or a populated error — from the
+exactly once, with either a result or a populated error, from the
 producer's worker thread.
 
 For `cancellable: true` functions the launcher gains a
 `weaveffi_cancel_token*` slot before the callback, and the runtime
 provides the token lifecycle (from the `kvstore` sample, whose
-function is named `compact_async` — hence the doubled suffix):
+function is named `compact_async`, hence the doubled suffix):
 
 ```c
 void weaveffi_kv_compact_async_async(
@@ -408,7 +408,7 @@ void weaveffi_events_GetMessagesIterator_destroy(
 `_next` writes the next element into the one-slot out-param and
 returns `1`, or returns `0` when exhausted (leaving `*out_item`
 untouched). Failures are reported through `out_err`. Element ownership
-follows the usual return rules — here each `const char*` must be freed
+follows the usual return rules; here each `const char*` must be freed
 with `weaveffi_free_string`. Always call `_destroy` when done, even if
 iteration stopped early:
 
@@ -425,14 +425,14 @@ weaveffi_events_GetMessagesIterator_destroy(iter);
 
 ## Troubleshooting
 
-- **`undefined reference to weaveffi_*`** — make sure the linker sees
+- **`undefined reference to weaveffi_*`**: make sure the linker sees
   the cdylib (`-L target/debug -l<your-crate>`). The header alone is
   not enough.
-- **Crashes inside `weaveffi_free_string`** — the pointer was not
+- **Crashes inside `weaveffi_free_string`**: the pointer wasn't
   Rust-allocated. Only free pointers returned from a generated getter
   or function.
-- **`error: unknown type weaveffi_handle_t`** — the consumer included
+- **`error: unknown type weaveffi_handle_t`**: the consumer included
   the header without `<stdint.h>`. Include order matters; the generated
   header pulls in the standard integer typedefs explicitly.
-- **`weaveffi.c` is empty** — that file is intentionally a placeholder.
+- **`weaveffi.c` is empty**: that file is intentionally a placeholder.
   All declarations live in `weaveffi.h`.

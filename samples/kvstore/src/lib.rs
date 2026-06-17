@@ -1,8 +1,8 @@
 //! Kvstore sample cdylib: a production-quality, in-memory key/value store
-//! that exercises every IDL feature WeaveFFI supports — typed handles,
+//! that exercises every IDL feature WeaveFFI supports: typed handles,
 //! callbacks, listeners, an error domain, optional/list/map/bytes fields,
 //! a builder, an iterator return, a cancellable async function, deprecated
-//! and `since`-tagged functions, and a nested sub-module — over the C ABI.
+//! and `since`-tagged functions, and a nested sub-module, over the C ABI.
 
 #![allow(unsafe_code)]
 #![allow(non_camel_case_types)]

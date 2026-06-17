@@ -1,45 +1,75 @@
+//! Multi-format IDL parsing: turn YAML, JSON, or TOML source text into an
+//! [`Api`].
+//!
+//! [`parse_api_str`] is the entry point. On failure it returns a [`ParseError`]
+//! that carries the source text and, where available, a `miette` span, so the
+//! CLI can render a caret-annotated diagnostic at the offending line and column.
+
 use crate::ir::Api;
 use miette::{Diagnostic, SourceSpan};
 
+/// Everything that can go wrong while turning IDL source text into an [`Api`].
+///
+/// Every variant implements [`miette::Diagnostic`], pairing a message with a
+/// `help` hint and, when the underlying parser reports a location, a labeled
+/// span into the original source so the CLI can render a caret-annotated error.
 #[derive(Debug, thiserror::Error, Diagnostic)]
 pub enum ParseError {
+    /// The requested format wasn't one of `yaml`, `yml`, `json`, or `toml`.
+    /// Carries the unrecognized format string.
     #[error("unsupported format: {0}")]
     #[diagnostic(help("supported formats are 'yaml', 'yml', 'json', and 'toml'"))]
     UnsupportedFormat(String),
+    /// The YAML deserializer rejected the document.
     #[error("YAML parse error at line {line}, column {column}: {message}")]
     #[diagnostic(help(
         "check YAML indentation, quoting, and that all required fields have valid values"
     ))]
     Yaml {
+        /// 1-indexed line of the error, or `0` when the location is unknown.
         line: usize,
+        /// 1-indexed column of the error, or `0` when the location is unknown.
         column: usize,
+        /// Message reported by the underlying deserializer.
         message: String,
+        /// Full source text, retained so the diagnostic can render a snippet.
         #[source_code]
         src: String,
+        /// Byte span of the offending location within `src`, when known.
         #[label("here")]
         span: Option<SourceSpan>,
     },
+    /// The TOML deserializer rejected the document.
     #[error("TOML parse error: {message}")]
     #[diagnostic(help(
         "check TOML syntax: keys, table headers, and that values use the correct types"
     ))]
     Toml {
+        /// Message reported by the underlying deserializer.
         message: String,
+        /// Full source text, retained so the diagnostic can render a snippet.
         #[source_code]
         src: String,
+        /// Byte span of the offending location within `src`, when known.
         #[label("here")]
         span: Option<SourceSpan>,
     },
+    /// The JSON deserializer rejected the document.
     #[error("JSON parse error at line {line}, column {column}: {message}")]
     #[diagnostic(help(
         "check JSON syntax: matching braces/brackets, quoted keys, and trailing commas"
     ))]
     Json {
+        /// 1-indexed line of the error, or `0` when the location is unknown.
         line: usize,
+        /// 1-indexed column of the error, or `0` when the location is unknown.
         column: usize,
+        /// Message reported by the underlying deserializer.
         message: String,
+        /// Full source text, retained so the diagnostic can render a snippet.
         #[source_code]
         src: String,
+        /// Byte span of the offending location within `src`, when known.
         #[label("here")]
         span: Option<SourceSpan>,
     },
@@ -70,6 +100,19 @@ pub fn line_col_to_offset(src: &str, line: usize, col: usize) -> usize {
     src.len()
 }
 
+/// Parse IDL source text in the given format into an [`Api`].
+///
+/// `format` selects the deserializer: `yaml` or `yml` for YAML, `json` for
+/// JSON, and `toml` for TOML. On failure the returned [`ParseError`] captures
+/// the source text and, when the deserializer reports one, a span for a rich
+/// diagnostic.
+///
+/// # Errors
+///
+/// Returns [`ParseError::UnsupportedFormat`] when `format` isn't a recognized
+/// format string, or the matching [`Yaml`](ParseError::Yaml),
+/// [`Json`](ParseError::Json), or [`Toml`](ParseError::Toml) variant when the
+/// source text is malformed or doesn't match the schema.
 pub fn parse_api_str(s: &str, format: &str) -> Result<Api, ParseError> {
     match format {
         "yaml" | "yml" => serde_yaml::from_str(s).map_err(|e| {

@@ -4,6 +4,10 @@
 //! companion N-API addon. Async functions surface as `Promise`-returning
 //! methods. Implements [`LanguageBackend`]; the shared driver bridges it into
 //! the generator pipeline.
+#![deny(missing_docs)]
+#![warn(clippy::missing_errors_doc)]
+#![warn(clippy::missing_panics_doc)]
+#![warn(clippy::doc_markdown)]
 
 use std::collections::{HashMap, HashSet};
 
@@ -44,19 +48,26 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
+    /// Returns the configured npm package name, falling back to `"weaveffi"`.
     pub fn package_name(&self) -> &str {
         self.package_name.as_deref().unwrap_or("weaveffi")
     }
 
+    /// Returns the configured C ABI symbol prefix, falling back to
+    /// `"weaveffi"`.
     pub fn prefix(&self) -> &str {
         self.prefix.as_deref().unwrap_or("weaveffi")
     }
 
+    /// Returns the input IDL basename embedded in generated file headers,
+    /// falling back to `"weaveffi.yml"`.
     pub fn input_basename(&self) -> &str {
         self.input_basename.as_deref().unwrap_or("weaveffi.yml")
     }
 }
 
+/// Node.js backend: emits a JavaScript loader and TypeScript declarations for
+/// the companion N-API addon that wraps the C ABI.
 pub struct NodeGenerator;
 
 impl LanguageBackend for NodeGenerator {
@@ -390,22 +401,22 @@ fn render_addon_c(
 // below are shared by the addon (which exports the native helpers) and the JS
 // loader (whose `Shape` class calls them), so both halves agree by construction.
 
-/// `{Enum}_tag` — the JS-export base for a rich enum's discriminant reader.
+/// `{Enum}_tag`, the JS-export base for a rich enum's discriminant reader.
 fn rich_tag_base(enum_name: &str) -> String {
     format!("{enum_name}_tag")
 }
 
-/// `{Enum}_{variant}_new` — the JS-export base for a variant constructor.
+/// `{Enum}_{variant}_new`, the JS-export base for a variant constructor.
 fn rich_ctor_base(enum_name: &str, variant: &str) -> String {
     format!("{enum_name}_{}_new", variant.to_snake_case())
 }
 
-/// `{Enum}_{variant}_get_{field}` — the JS-export base for a field getter.
+/// `{Enum}_{variant}_get_{field}`, the JS-export base for a field getter.
 fn rich_getter_base(enum_name: &str, variant: &str, field: &str) -> String {
     format!("{enum_name}_{}_get_{field}", variant.to_snake_case())
 }
 
-/// `{Enum}_destroy` — the JS-export base for the destructor.
+/// `{Enum}_destroy`, the JS-export base for the destructor.
 fn rich_destroy_base(enum_name: &str) -> String {
     format!("{enum_name}_destroy")
 }
@@ -1750,7 +1761,7 @@ fn emit_optional_param(
             c_args.push(format!("{name}_ptr"));
         }
         // A typed handle is a nullable opaque pointer, so an optional one maps to
-        // the same pointer with NULL standing in for absence — mirroring structs.
+        // the same pointer with NULL standing in for absence, mirroring structs.
         TypeRef::TypedHandle(s) => {
             let abi = c_abi_struct_name(s, module, prefix);
             out.push_str(&format!("  int64_t {name}_raw = 0;\n"));
@@ -2963,9 +2974,9 @@ fn rich_struct_ref(ty: &TypeRef, rich: &HashSet<String>) -> Option<(String, bool
 
 /// The JS loader (`index.js`). Without rich enums it simply re-exports the
 /// native addon (the historical behavior). With rich enums it layers idiomatic
-/// wrapper classes — opaque-handle objects with per-variant factories, a `tag()`
+/// wrapper classes, opaque-handle objects with per-variant factories, a `tag()`
 /// reader, namespaced field getters, and `destroy()` (plus a
-/// `FinalizationRegistry` safety net) — and rewraps the handful of module
+/// `FinalizationRegistry` safety net), and rewraps the handful of module
 /// functions that take or return a rich enum so they speak the class, not the
 /// raw handle.
 fn render_node_index(api: &Api, prefix: &str, strip: bool, input_basename: &str) -> String {
@@ -3059,8 +3070,8 @@ fn render_node_index(api: &Api, prefix: &str, strip: bool, input_basename: &str)
 }
 
 /// Emit one rich-enum wrapper class onto `wv`. The class owns the opaque handle
-/// and frees it once — via explicit `destroy()` or a `FinalizationRegistry`
-/// safety net — mirroring how the other backends free the same object.
+/// and frees it once, via explicit `destroy()` or a `FinalizationRegistry`
+/// safety net, mirroring how the other backends free the same object.
 fn render_rich_enum_class_js(out: &mut String, e: &EnumBinding, module: &str, strip: bool) {
     let Some(rich) = &e.rich else {
         return;

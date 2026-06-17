@@ -188,8 +188,8 @@ Python generator config to drop it.
 ## Rich (algebraic) enums
 
 A rich (algebraic) enum is a sum type whose variants carry associated
-data. Unlike a plain C-style `Enum` — which crosses the boundary as a
-bare `ctypes.c_int32` discriminant — a rich enum lowers to an **opaque
+data. Unlike a plain C-style `Enum`, which crosses the boundary as a
+bare `ctypes.c_int32` discriminant, a rich enum lowers to an **opaque
 object handle**, so the generator emits a wrapper class with exactly the
 same ownership model as a struct wrapper: a `ctypes.c_void_p` held
 behind `@property` accessors and freed by `__del__`.
@@ -275,8 +275,8 @@ bigger = shapes_scale(circle, 3.0)   # returns a brand-new Shape
 **Ownership:** each `Shape` owns its `ctypes.c_void_p`; `__del__` calls
 `weaveffi_shapes_Shape_destroy` once the last Python reference is
 dropped, and the `Shape` returned by `shapes_scale` is owned the same
-way. The `.pyi` stub mirrors the class — nested `Tag`, `@classmethod`
-constructors, and `@property` getters — for IDE and `mypy` support.
+way. The `.pyi` stub mirrors the class (nested `Tag`, `@classmethod`
+constructors, and `@property` getters) for IDE and `mypy` support.
 
 ## Build instructions
 
@@ -438,15 +438,15 @@ def events_unregister_message_listener(listener_id: int) -> None:
     _listener_refs.pop(listener_id, None)
 ```
 
-- **GC safety** — the ctypes function object is pinned in the
+- **GC safety**: the ctypes function object is pinned in the
   module-level `_listener_refs` dict, keyed by subscription id, so the
   garbage collector cannot reclaim a trampoline the producer may still
   call. Unregistering drops the reference.
-- **Subscription ids** — registration returns the `uint64` id produced
+- **Subscription ids**: registration returns the `uint64` id produced
   by `weaveffi_events_register_message_listener(fn, context)`; pass it
   to `events_unregister_message_listener` to stop delivery and release
   the trampoline.
-- **Threading** — the callback fires on the producer's thread, not the
+- **Threading**: the callback fires on the producer's thread, not the
   thread that registered it. Do not block inside it; if results must
   reach an asyncio loop or UI thread, marshal them yourself (e.g. with
   `loop.call_soon_threadsafe`).
@@ -497,14 +497,14 @@ outlives the call.
 
 ## Troubleshooting
 
-- **`OSError: cannot find ...`** — the loader could not locate the
+- **`OSError: cannot find ...`**: the loader could not locate the
   shared library. Set `DYLD_LIBRARY_PATH` / `LD_LIBRARY_PATH` or copy
   the library next to your script.
-- **`WeaveFFIError: ...`** — the Rust side returned a non-zero error
+- **`WeaveFFIError: ...`**: the Rust side returned a non-zero error
   code. Catch `WeaveFFIError` and inspect `.code` / `.message`.
-- **`AttributeError: ... has no attribute 'argtypes'`** — the wrapper
+- **`AttributeError: ... has no attribute 'argtypes'`**: the wrapper
   sets `argtypes`/`restype` at the call site; ensure you're calling
   the generated function, not reaching into `_lib` directly.
-- **Garbage-collected struct still referenced from Rust** — keep a
+- **Garbage-collected struct still referenced from Rust**: keep a
   Python reference until you're done; Python will call `__del__` only
   after the last reference is dropped.

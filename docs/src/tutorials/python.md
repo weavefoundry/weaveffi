@@ -63,7 +63,7 @@ generated/
 └── scaffold.rs
 ```
 
-The Python target uses ctypes — no native extension to compile on the
+The Python target uses ctypes: no native extension to compile on the
 Python side.
 
 ### 3. Implement the Rust library
@@ -110,7 +110,7 @@ pub extern "C" fn weaveffi_greeter_hello(
 }
 
 // Emit the WeaveFFI C ABI runtime symbols (free_string, free_bytes,
-// error_clear, cancel_token_*) — one line per cdylib.
+// error_clear, cancel_token_*), one line per cdylib.
 abi::export_runtime!();
 ```
 

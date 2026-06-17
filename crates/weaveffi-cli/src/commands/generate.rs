@@ -1,4 +1,4 @@
-//! `weaveffi generate` — parse, validate, and run the selected generators
+//! `weaveffi generate`: parse, validate, and run the selected generators
 //! through the orchestrator (plus `--scaffold` and `--dry-run`).
 
 use crate::config::{merge_inline_generators, CliConfig};

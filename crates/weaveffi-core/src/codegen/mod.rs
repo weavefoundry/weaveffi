@@ -58,7 +58,7 @@ pub trait Generator: Send + Sync {
 
     /// The gated IDL features this target implements. The orchestrator
     /// refuses to run a generator against an API that uses a feature its
-    /// declared capabilities do not cover — a target either generates a
+    /// declared capabilities do not cover: a target either generates a
     /// feature or fails loudly; it never silently omits one.
     fn capabilities(&self) -> TargetCapabilities;
 
@@ -68,13 +68,18 @@ pub trait Generator: Send + Sync {
     /// orchestrator downgrades the capability failure to a loud warning and
     /// the generator must emit an explicit unsupported surface (throwing
     /// stubs, documentation) rather than silently omitting the feature.
-    /// Default: `false` — opting in must always be an explicit config act.
+    /// Default: `false`. Opting in must always be an explicit config act.
     fn allows_unsupported(&self, config: &Self::Config) -> bool {
         let _ = config;
         false
     }
 
     /// Render the bindings under `out_dir`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the target cannot render the API or cannot write its
+    /// output files (for example a filesystem failure).
     fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()>;
 
     /// Files that [`generate`](Generator::generate) would write, relative
@@ -92,12 +97,24 @@ pub trait Generator: Send + Sync {
 /// hold a heterogeneous set of targets whose `Config` types differ.
 /// [`ConfiguredGenerator`] is the canonical adapter.
 pub trait DynGenerator: Send + Sync {
+    /// The target's stable short name. Mirrors [`Generator::name`].
     fn name(&self) -> &'static str;
+    /// The gated features the target implements. Mirrors
+    /// [`Generator::capabilities`].
     fn capabilities(&self) -> TargetCapabilities;
-    /// See [`Generator::allows_unsupported`] — evaluated against the bound
+    /// See [`Generator::allows_unsupported`], evaluated against the bound
     /// config.
     fn allows_unsupported(&self) -> bool;
+    /// Render the bindings under `out_dir`, using the bound config. Mirrors
+    /// [`Generator::generate`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying [`Generator::generate`] fails to
+    /// render or write its output.
     fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()>;
+    /// The files [`generate`](Self::generate) would write. Mirrors
+    /// [`Generator::output_files`].
     fn output_files(&self, api: &Api, out_dir: &Utf8Path) -> Vec<String>;
     /// Canonical-JSON encoding of the bound config, fed into the cache
     /// hash so a config-only change invalidates the entry.
@@ -117,14 +134,17 @@ pub struct ConfiguredGenerator<G: Generator> {
 }
 
 impl<G: Generator> ConfiguredGenerator<G> {
+    /// Pair a typed generator with the concrete config it should run under.
     pub fn new(inner: G, config: G::Config) -> Self {
         Self { inner, config }
     }
 
+    /// Borrow the bound config value.
     pub fn config(&self) -> &G::Config {
         &self.config
     }
 
+    /// Borrow the wrapped typed generator.
     pub fn inner(&self) -> &G {
         &self.inner
     }
@@ -161,25 +181,46 @@ impl<G: Generator> DynGenerator for ConfiguredGenerator<G> {
 /// Global hooks the orchestrator runs around the parallel codegen pass.
 #[derive(Default, Debug, Clone)]
 pub struct OrchestratorHooks {
+    /// Shell command run once before the parallel pass, only when at least one
+    /// target is out of date. `None` skips it.
     pub pre_generate: Option<String>,
+    /// Shell command run once after every target finishes. `None` skips it.
     pub post_generate: Option<String>,
 }
 
+/// Runs a set of configured generators: it capability-gates each target,
+/// skips the ones whose cached hash is still current, and renders the rest in
+/// parallel.
 #[derive(Default)]
 pub struct Orchestrator<'a> {
     generators: Vec<&'a dyn DynGenerator>,
 }
 
 impl<'a> Orchestrator<'a> {
+    /// Create an orchestrator with no targets registered.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Register one erased generator to run, returning `self` for chaining.
     pub fn with_generator(mut self, gen: &'a dyn DynGenerator) -> Self {
         self.generators.push(gen);
         self
     }
 
+    /// Generate every registered target under `out_dir`.
+    ///
+    /// Gates each target against the gated features the API uses, skips targets
+    /// whose cached hash still matches (unless `force` clears the cache first),
+    /// runs the `pre_generate` and `post_generate` hooks around the parallel
+    /// pass, and records a fresh cache entry for each regenerated target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a selected target does not support a feature the IDL
+    /// uses (without `allow_unsupported`), the `force` cache reset fails, a
+    /// `pre_generate` or `post_generate` hook exits non-zero, any generator
+    /// fails while rendering, or a cache entry cannot be written.
     pub fn run(
         &self,
         api: &Api,

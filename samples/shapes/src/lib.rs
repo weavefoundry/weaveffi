@@ -3,7 +3,7 @@
 //!
 //! `Shape` is a sum type whose variants carry associated data, so it crosses
 //! the boundary as an opaque object: a tag reader, per-variant constructors and
-//! field getters, and a destructor — exactly the surface a struct gets. The
+//! field getters, and a destructor, exactly the surface a struct gets. The
 //! symbol names here line up 1:1 with the generated header
 //! (`weaveffi_shapes_Shape_*`); see `weaveffi generate shapes.yml --target c`.
 

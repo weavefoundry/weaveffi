@@ -4,6 +4,10 @@
 //! including module map, `Package.swift`, and Swift `async/await` shims for
 //! functions marked `async: true`. Implements [`LanguageBackend`]; the shared
 //! driver bridges it into the generator pipeline.
+#![deny(missing_docs)]
+#![warn(clippy::missing_errors_doc)]
+#![warn(clippy::missing_panics_doc)]
+#![warn(clippy::doc_markdown)]
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -44,14 +48,20 @@ pub struct SwiftConfig {
 }
 
 impl SwiftConfig {
+    /// Returns the configured SwiftPM module name, falling back to
+    /// `"WeaveFFI"`.
     pub fn module_name(&self) -> &str {
         self.module_name.as_deref().unwrap_or("WeaveFFI")
     }
 
+    /// Returns the configured C ABI symbol prefix, falling back to
+    /// `"weaveffi"`.
     pub fn prefix(&self) -> &str {
         self.prefix.as_deref().unwrap_or("weaveffi")
     }
 
+    /// Returns the input IDL basename embedded in generated file headers,
+    /// falling back to `"weaveffi.yml"`.
     pub fn input_basename(&self) -> &str {
         self.input_basename.as_deref().unwrap_or("weaveffi.yml")
     }
@@ -88,6 +98,8 @@ fn estimate_swift_capacity(modules: &[Module]) -> usize {
         + structs * SWIFT_BYTES_PER_STRUCT
 }
 
+/// Swift backend: emits a SwiftPM package with a thin Swift wrapper (module
+/// map, `Package.swift`, and `async`/`await` shims) over the C ABI.
 pub struct SwiftGenerator;
 
 impl LanguageBackend for SwiftGenerator {
@@ -259,7 +271,7 @@ struct SwiftCtx<'a> {
     c_prefix: &'a str,
     /// SwiftPM module name (e.g. `Kvstore`).
     swift_module: &'a str,
-    /// Every module name in the API, PascalCased — i.e. the set of namespace
+    /// Every module name in the API, PascalCased, i.e. the set of namespace
     /// `enum` names that wrapper-type references can be shadowed by.
     module_names: &'a HashSet<String>,
 }

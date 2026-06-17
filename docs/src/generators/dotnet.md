@@ -185,17 +185,17 @@ internal static class NativeMethods
 
 ## Rich (algebraic) enums
 
-A *rich* (algebraic) enum — a sum type whose variants carry associated
-data — lowers to an **opaque handle** at the C ABI, just like a struct,
+A *rich* (algebraic) enum, a sum type whose variants carry associated
+data, lowers to an **opaque handle** at the C ABI, just like a struct,
 and uses the same `IDisposable` ownership model as the struct wrappers
 above. The generated C# type is a class wrapping an `IntPtr`, with one
 static factory per variant, a nested `Tag` enum for the discriminant, and
 per-variant property getters. (A plain C-style enum with no payloads
-stays a normal C# `enum` backed by `int` — see above.)
+stays a normal C# `enum` backed by `int`; see above.)
 
-For the `shapes` module's `Shape` enum — `Empty`, `Circle { radius: f64 }`,
+For the `shapes` module's `Shape` enum (`Empty`, `Circle { radius: f64 }`,
 `Rectangle { width: f32, height: f32 }`, and
-`Labeled { label: string, count: u8 }` — the generator emits (abridged):
+`Labeled { label: string, count: u8 }`), the generator emits (abridged):
 
 ```csharp
 /// <summary>An algebraic shape (sum type with associated data)</summary>
@@ -316,7 +316,7 @@ Console.WriteLine(Shapes.ShapesDescribe(bigger));
 ```
 
 **Ownership:** a `Shape` owns its native handle, so dispose every `Shape`
-you create or receive — including the one returned by `ShapesScale` — with
+you create or receive, including the one returned by `ShapesScale`, with
 `using` or an explicit `Dispose()`. The finalizer is a safety net that
 runs on a non-deterministic schedule.
 
@@ -345,7 +345,7 @@ runs on a non-deterministic schedule.
    packages, bundle the native cdylib inside the package under
    `runtimes/{rid}/native/`.
 
-4. Make the cdylib findable at runtime — place it next to the built
+4. Make the cdylib findable at runtime: place it next to the built
    DLL, set `LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH`, or include it in
    the NuGet package as above.
 
@@ -369,7 +369,7 @@ runs on a non-deterministic schedule.
 ## Async support
 
 Async IDL functions are exposed as `async Task<T>` methods (named like
-every other wrapper — no extra `Async` suffix is appended). The wrapper
+every other wrapper: no extra `Async` suffix is appended). The wrapper
 wires the C ABI completion callback into a `TaskCompletionSource<T>`
 and keeps the callback delegate alive with a `GCHandle` while the call
 is in flight:
@@ -461,7 +461,7 @@ collection.
 
 Threading caveats:
 
-- The callback runs on the producer's native thread — not on any
+- The callback runs on the producer's native thread, not on any
   captured `SynchronizationContext`. Post to your UI thread or
   dispatcher yourself if needed.
 - Keep callbacks fast and non-throwing; they execute while the native
@@ -469,15 +469,15 @@ Threading caveats:
 
 ## Troubleshooting
 
-- **`DllNotFoundException: Unable to load DLL 'weaveffi'`** — the
+- **`DllNotFoundException: Unable to load DLL 'weaveffi'`**: the
   runtime cannot find the shared library. Place it in the application
   directory or set `LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH`.
-- **`AccessViolationException` on dispose** — the struct has been
+- **`AccessViolationException` on dispose**: the struct has been
   disposed twice. Wrap usage in `using` and avoid passing handles
   around once disposed.
-- **Strings returned with garbage characters** — make sure your
+- **Strings returned with garbage characters**: make sure your
   binding is targeting `UTF8` (`Marshal.PtrToStringUTF8`,
   `StringToCoTaskMemUTF8`); the generated helpers do this for you.
-- **NuGet consumers cannot find the cdylib** — ship it inside the
+- **NuGet consumers cannot find the cdylib**: ship it inside the
   package under `runtimes/{rid}/native/` so the .NET runtime resolves
   it automatically.

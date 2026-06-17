@@ -11,8 +11,8 @@
 // conformance/cpp/shapes.cpp.
 //
 // Inputs come from the harness:
-//   WV_WASM — path to the compiled shapes.wasm
-//   WV_JS   — path to the generated weaveffi_wasm.js (ESM)
+//   WV_WASM: path to the compiled shapes.wasm
+//   WV_JS:   path to the generated weaveffi_wasm.js (ESM)
 
 import fs from 'fs';
 
@@ -69,7 +69,7 @@ expect(labeled.tag === Tag.Labeled, 'labeled.tag === Labeled');
 expect(labeled.labeledLabel === 'hex', 'labeled.labeledLabel == "hex"');
 expect(labeled.labeledCount === 6, 'labeled.labeledCount == 6');
 
-// describe: rich enum in, string out — dispatches on the active variant.
+// describe: rich enum in, string out; dispatches on the active variant.
 expect(api.shapes.describe(circle) === 'circle(r=2.5)', 'describe(circle)');
 
 // scale: rich enum in and out.

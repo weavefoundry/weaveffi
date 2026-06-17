@@ -1,0 +1,30 @@
+# Identifiers that read like code (mixed case or with separators) but are
+# product names, tool/ecosystem names, or naming-convention terms. Without
+# this list `clippy::doc_markdown` demands backticks around them, which would
+# wrongly format prose like "WeaveFFI" or "snake_case" as inline code.
+#
+# The ".." entry preserves clippy's built-in defaults (GitHub, TypeScript,
+# iOS, WebAssembly, and so on); the names below extend that set.
+doc-valid-idents = [
+    "WeaveFFI",
+    "SwiftPM",
+    "CMake",
+    "NuGet",
+    "PyPI",
+    "SemVer",
+    "CGo",
+    "JSDoc",
+    "KDoc",
+    "DataView",
+    "NativeCallable",
+    "napi_value",
+    "PascalCase",
+    "PascalCased",
+    "UpperCamelCase",
+    "snake_case",
+    "camelCase",
+    "lowerCamelCase",
+    "SCREAMING_SNAKE",
+    "SCREAMING_SNAKE_CASE",
+    "..",
+]

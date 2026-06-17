@@ -8,6 +8,10 @@
 //! Like every WeaveFFI backend it renders from the shared
 //! [`weaveffi_core::model::BindingModel`], so symbol names and parameter
 //! lowering are computed once and shared, never re-derived here.
+#![deny(missing_docs)]
+#![warn(clippy::missing_errors_doc)]
+#![warn(clippy::missing_panics_doc)]
+#![warn(clippy::doc_markdown)]
 
 use std::fmt::Write;
 
@@ -38,15 +42,20 @@ pub struct CConfig {
 }
 
 impl CConfig {
+    /// Returns the configured symbol prefix, falling back to `"weaveffi"`.
     pub fn prefix(&self) -> &str {
         self.prefix.as_deref().unwrap_or("weaveffi")
     }
 
+    /// Returns the input IDL basename embedded in generated file headers,
+    /// falling back to `"weaveffi.yml"`.
     pub fn input_basename(&self) -> &str {
         self.input_basename.as_deref().unwrap_or("weaveffi.yml")
     }
 }
 
+/// C backend: emits the canonical `{prefix}.h` header describing the stable
+/// C ABI surface, plus a `{prefix}.c` companion for future wrappers.
 pub struct CGenerator;
 
 impl LanguageBackend for CGenerator {

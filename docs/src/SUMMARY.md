@@ -27,6 +27,7 @@
   - [Ruby](generators/ruby.md)
 - [API](api/README.md)
   - [Rust API (cargo doc)](api/rust.md)
+  - [Doc Comment Style](api/doc-style.md)
 - [Guides](guides/README.md)
   - [Memory Ownership](guides/memory.md)
   - [Error Handling](guides/errors.md)

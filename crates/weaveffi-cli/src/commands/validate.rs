@@ -1,4 +1,4 @@
-//! `weaveffi validate` and `weaveffi lint` — schema validation with
+//! `weaveffi validate` and `weaveffi lint`: schema validation with
 //! human-readable or `--format json` output, and advisory warnings.
 
 use miette::{Report, Result};

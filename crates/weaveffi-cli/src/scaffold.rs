@@ -63,7 +63,7 @@ fn emit_getter(out: &mut String, tag: &str, field: &FieldBinding, prefix: &str) 
 /// Every signature is lowered through the shared [`BindingModel`] and
 /// [`render_rust`](weaveffi_core::abi::CType::render_rust), so a scaffolded
 /// producer matches the generated header (and therefore every language binding)
-/// by construction — there is no second, drift-prone ABI lowering here.
+/// by construction; there is no second, drift-prone ABI lowering here.
 pub fn render_scaffold(api: &Api, c_prefix: &str) -> String {
     let model = BindingModel::build(api, c_prefix);
     let mut out = String::new();
@@ -820,7 +820,7 @@ mod tests {
         // through pointer-to-pointer out-params. These now lower through the
         // canonical `abi::lower_return`, so they match the header
         // (`const char*** out_keys, int32_t** out_values, size_t* out_len`)
-        // exactly — the previous hand-rolled lowering dropped a level of
+        // exactly; the previous hand-rolled lowering dropped a level of
         // indirection on `out_values` and renamed the length to `out_map_len`.
         assert!(
             out.contains("out_keys: *mut *mut *const c_char"),
@@ -932,7 +932,7 @@ mod tests {
             vec![],
         );
         let out = render_scaffold(&api, "weaveffi");
-        // The callback prefix is `(context, err)` — matching the header's
+        // The callback prefix is `(context, err)`, matching the header's
         // `typedef void (*..)(void* context, weaveffi_error* err)`. The earlier
         // hand-rolled scaffold emitted these in the reverse order.
         assert!(

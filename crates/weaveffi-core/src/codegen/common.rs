@@ -157,8 +157,8 @@ pub fn is_c_pointer_type(ty: &TypeRef) -> bool {
 /// Convert a `snake_case` identifier to `PascalCase` by uppercasing the
 /// first character of each `_`-separated segment and preserving the rest.
 ///
-/// This deliberately splits on `_` only — it does **not** re-case interior
-/// letters the way `heck::ToUpperCamelCase` does — so an acronym-bearing
+/// This deliberately splits on `_` only; it does **not** re-case interior
+/// letters the way `heck::ToUpperCamelCase` does, so an acronym-bearing
 /// name like `get_HTTP` becomes `GetHTTP`, not `GetHttp`. It is the single
 /// source of truth for the `snake_to_pascal` / `to_pascal_case` helpers
 /// that the Python, Android, and WASM generators each defined locally.
@@ -382,7 +382,7 @@ mod tests {
     fn emit_doc_trims_outer_whitespace_before_decisions() {
         // A doc that's "single line" after trimming should still
         // collapse to `/** text */` even if it had surrounding blank
-        // lines in the IR — the existing per-generator behaviour we
+        // lines in the IR; the existing per-generator behaviour we
         // are replacing did the same.
         let mut out = String::new();
         emit_doc(

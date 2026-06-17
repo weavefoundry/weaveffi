@@ -68,10 +68,10 @@ target.
 | `hash_kitchen_sink`              | 37.5 µs  | ~27× under         |
 | `full_codegen_calculator`        | 6.92 ms  | ~72× under         |
 | `full_codegen_kitchen_sink`      | 7.27 ms  | ~275× under        |
-| `generate_c_large_api`           | 904 µs   | —                  |
-| `generate_swift_large_api`       | 1.93 ms  | —                  |
-| `generate_all_large_api`         | 24.1 ms  | —                  |
-| `generate_all_kitchen_sink`      | 7.27 ms  | —                  |
+| `generate_c_large_api`           | 904 µs   | n/a                |
+| `generate_swift_large_api`       | 1.93 ms  | n/a                |
+| `generate_all_large_api`         | 24.1 ms  | n/a                |
+| `generate_all_kitchen_sink`      | 7.27 ms  | n/a                |
 
 The `*_large_api` benchmarks operate on a synthetic 10-module × 50-function
 API (500 functions total) that does not have a documented ceiling; they

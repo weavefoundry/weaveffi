@@ -4,6 +4,10 @@
 //! into the C ABI exposed by the underlying cdylib. Implements
 //! [`LanguageBackend`]; the shared driver bridges it into the generator
 //! pipeline.
+#![deny(missing_docs)]
+#![warn(clippy::missing_errors_doc)]
+#![warn(clippy::missing_panics_doc)]
+#![warn(clippy::doc_markdown)]
 
 use camino::Utf8Path;
 use heck::{ToShoutySnakeCase, ToSnakeCase};
@@ -40,23 +44,31 @@ pub struct RubyConfig {
 }
 
 impl RubyConfig {
+    /// Returns the configured top-level Ruby module name, falling back to
+    /// `"WeaveFFI"`.
     pub fn module_name(&self) -> &str {
         self.module_name.as_deref().unwrap_or("WeaveFFI")
     }
 
+    /// Returns the configured C ABI symbol prefix, falling back to `"weaveffi"`.
     pub fn prefix(&self) -> &str {
         self.prefix.as_deref().unwrap_or("weaveffi")
     }
 
+    /// Returns the configured gem name, falling back to `"weaveffi"`.
     pub fn gem_name(&self) -> &str {
         self.gem_name.as_deref().unwrap_or("weaveffi")
     }
 
+    /// Returns the input IDL basename embedded in generated file headers,
+    /// falling back to `"weaveffi.yml"`.
     pub fn input_basename(&self) -> &str {
         self.input_basename.as_deref().unwrap_or("weaveffi.yml")
     }
 }
 
+/// Ruby backend: emits an `ffi`-gem package (a library module, a `.gemspec`,
+/// and a README) binding the C ABI exposed by the underlying cdylib.
 pub struct RubyGenerator;
 
 impl LanguageBackend for RubyGenerator {
@@ -489,7 +501,7 @@ fn render_struct_ffi(out: &mut String, s: &StructBinding) {
 }
 
 /// Declare the FFI bindings for a rich (algebraic) enum: the tag getter, the
-/// destructor, and — per variant — the constructor and one getter per
+/// destructor, and (per variant) the constructor and one getter per
 /// associated field. Mirrors [`render_struct_ffi`]; the field getters lower
 /// exactly like struct field getters (string getters return an owned
 /// `:pointer`, bytes/list getters take a trailing `out_len`).
@@ -770,8 +782,8 @@ fn render_getter(out: &mut String, method: &str, field: &FieldBinding, rb_module
 /// Render a rich (algebraic) enum as an opaque-object wrapper class, mirroring
 /// the struct wrapper: an `FFI::AutoPointer` subclass that frees the handle on
 /// GC, an `attr_reader :handle` + `initialize`/`create`/`destroy` matching the
-/// struct contract (so the existing function-wrapper marshalling — `x.handle`
-/// in, `Shape.new(result)` out — works unchanged), integer tag constants and a
+/// struct contract (so the existing function-wrapper marshalling, `x.handle`
+/// in, `Shape.new(result)` out, works unchanged), integer tag constants and a
 /// `tag` reader, one factory class method per variant (`Shape.circle(2.5)`),
 /// and per-variant field accessors namespaced by variant (`circle_radius`).
 fn render_rich_enum_class(out: &mut String, e: &EnumBinding, rb_module_name: &str) {
@@ -780,7 +792,7 @@ fn render_rich_enum_class(out: &mut String, e: &EnumBinding, rb_module_name: &st
         .as_ref()
         .expect("render_rich_enum_class requires a rich enum");
 
-    // AutoPointer releases the handle through the enum's C destructor on GC —
+    // AutoPointer releases the handle through the enum's C destructor on GC,
     // the same ownership contract a struct wrapper uses.
     out.push_str(&format!("\n  class {}Ptr < FFI::AutoPointer\n", e.name));
     out.push_str(&format!(
@@ -1487,8 +1499,8 @@ fn render_param_conversion(out: &mut String, name: &str, ty: &TypeRef, ind: &str
 
 /// Writes one element list into `{buf_name}_buf`. String/handle elements are
 /// converted to pointers first, and the converted array is kept in a local
-/// (`{buf_name}_ptrs`) so the per-element `MemoryPointer`s stay referenced —
-/// and un-collected — until after the C call.
+/// (`{buf_name}_ptrs`) so the per-element `MemoryPointer`s stay referenced,
+/// and un-collected, until after the C call.
 fn render_element_array_write(
     out: &mut String,
     buf_name: &str,
@@ -2369,7 +2381,7 @@ mod tests {
             ),
             "destroy attach: {code}"
         );
-        // The wrapper drains via the iterator protocol — not the list ABI
+        // The wrapper drains via the iterator protocol, not the list ABI
         // (the old lowering wrongly passed an out_len the symbol lacks).
         assert!(
             code.contains(

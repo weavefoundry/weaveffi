@@ -11,29 +11,48 @@ use weaveffi_ir::ir::{Api, TypeRef};
 /// A non-fatal advisory emitted by [`collect_warnings`].
 #[derive(Debug, Clone)]
 pub enum ValidationWarning {
+    /// An enum has an unusually large number of variants (more than 100).
     LargeEnumVariantCount {
+        /// Enum that tripped the threshold.
         enum_name: String,
+        /// Number of variants the enum declares.
         count: usize,
     },
+    /// A type is nested more deeply than recommended (more than 3 levels).
     DeepNesting {
+        /// Where the deeply nested type appears (a `module::fn::param` path).
         location: String,
+        /// Measured nesting depth.
         depth: usize,
     },
+    /// A module has functions but none of them carry a doc comment.
     EmptyModuleDoc {
+        /// Module with no documented functions.
         module: String,
     },
+    /// An async function declares no return type, which is unusual.
     AsyncVoidFunction {
+        /// Module that contains the function.
         module: String,
+        /// Async function with no return type.
         function: String,
     },
+    /// A `mutable` flag sits on a value-type parameter, where it has no effect.
     MutableOnValueType {
+        /// Module that contains the function.
         module: String,
+        /// Function that declares the parameter.
         function: String,
+        /// Parameter that carries the no-op `mutable` flag.
         param: String,
     },
+    /// A function is marked deprecated; the message is surfaced to consumers.
     DeprecatedFunction {
+        /// Module that contains the function.
         module: String,
+        /// Deprecated function.
         function: String,
+        /// Deprecation message declared in the IDL.
         message: String,
     },
 }

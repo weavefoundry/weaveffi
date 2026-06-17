@@ -10,7 +10,7 @@ wrapper classes with getters, thrown `Error`s instead of error slots,
 linear memory. TypeScript declarations describe the whole surface.
 
 Because a `wasm32-unknown-unknown` module is single-threaded and has no
-producer thread, **callbacks and listeners are not supported** — see
+producer thread, **callbacks and listeners are not supported**; see
 [Capabilities and `allow_unsupported`](#capabilities-and-allow_unsupported).
 
 ## What gets generated
@@ -54,7 +54,7 @@ import { loadWeaveffiWasm } from './weaveffi_wasm.js';
 const api = await loadWeaveffiWasm('/your_library.wasm');
 ```
 
-Functions are grouped by IDL module and have idiomatic signatures —
+Functions are grouped by IDL module and have idiomatic signatures;
 strings, arrays, and error handling are taken care of inside the
 wrapper:
 
@@ -99,7 +99,7 @@ export function loadWeaveffiWasm(url: string): Promise<WeaveffiWasmModule>;
 A *rich* (algebraic) enum is a sum type whose variants carry associated
 data. A plain C-style enum stays an `i32` discriminant (surfaced as a
 `number` plus a frozen constants object), but a rich enum lowers to an
-**opaque object handle** — an `i32` pointer into linear memory, exactly
+**opaque object handle**, an `i32` pointer into linear memory, exactly
 like a struct wrapper. The loader wraps it in a `Shape` class that owns
 that handle for the lifetime of the module instance.
 
@@ -183,7 +183,7 @@ shapes: {
 
 The active variant is read through the `tag` getter (no call
 parentheses) and compared against `api.shapes.Shape.Tag`. Each variant
-field is a camelCased getter — `circleRadius`, `rectangleWidth`,
+field is a camelCased getter: `circleRadius`, `rectangleWidth`,
 `rectangleHeight`, `labeledLabel`, `labeledCount`. Functions that take
 or return the enum pass the wrapper directly: `describe(shape)` reads
 `shape._handle`, and `scale(shape, factor)` returns a fresh `Shape`.
@@ -213,8 +213,8 @@ export declare class Shape {
 }
 ```
 
-A short round-trip — construct a couple of variants, read the tag and a
-field, call `describe` / `scale`, then free the handles:
+A short round-trip that constructs a couple of variants, reads the tag and a
+field, calls `describe` / `scale`, then frees the handles:
 
 ```js
 const api = await loadWeaveffiWasm('/shapes.wasm');
@@ -229,7 +229,7 @@ if (circle.tag === api.shapes.Shape.Tag.Circle) {
 console.log(api.shapes.describe(circle)); // native-rendered description
 const bigger = api.shapes.scale(circle, 3.0); // a fresh Shape
 
-// No FinalizationRegistry on this target — free handles yourself.
+// No FinalizationRegistry on this target. Free handles yourself.
 circle.free();
 label.free();
 bigger.free();
@@ -299,8 +299,8 @@ generators:
 ```
 
 With the opt-in, unsupported entry points are generated as **explicit
-throwing stubs** — calling `register_message_listener` throws an
-`Error` explaining that listeners need a native target — so the gap is
+throwing stubs** (calling `register_message_listener` throws an
+`Error` explaining that listeners need a native target), so the gap is
 visible at the call site instead of failing silently.
 
 ## Build instructions
@@ -326,7 +326,7 @@ Serve it over HTTP and load it with the generated helper:
 
 - The wrapper stages strings, bytes, and arrays into linear memory with
   the exported `weaveffi_alloc` / `weaveffi_dealloc` and releases them
-  after the call — you do not manage buffers for typed calls.
+  after the call; you don't manage buffers for typed calls.
 - Producer-owned returns (strings, arrays, struct fields) are copied to
   JavaScript values and freed via `weaveffi_free_string` /
   `weaveffi_dealloc` inside the wrapper.
@@ -341,18 +341,18 @@ Serve it over HTTP and load it with the generated helper:
 
 ## Troubleshooting
 
-- **`WebAssembly.Function is not a constructor`** — the runtime lacks
+- **`WebAssembly.Function is not a constructor`**: the runtime lacks
   JS Type Reflection. Use a current Chrome/Firefox/Node/Deno, or avoid
   async IDL functions for this target.
-- **`LinkError: import object field 'env' is not a Function`** — the
+- **`LinkError: import object field 'env' is not a Function`**: the
   loader instantiates with an empty imports object. If your Rust crate
   imports host functions, extend `loadWeaveffiWasm` to pass them in.
-- **An async call never settles** — the producer must invoke the
+- **An async call never settles**: the producer must invoke the
   completion callback on the same thread; `std::thread::spawn` does not
   exist on `wasm32-unknown-unknown`.
-- **Out-of-memory after many `_raw` calls** — every pointer returned
+- **Out-of-memory after many `_raw` calls**: every pointer returned
   from the module must be deallocated; the typed wrappers do this for
   you, raw calls do not.
-- **The `.wasm` file fails to instantiate** — the build artifact must
+- **The `.wasm` file fails to instantiate**: the build artifact must
   be `wasm32-unknown-unknown`. `wasm32-wasi` modules require WASI
   imports and cannot run in the browser without a polyfill.

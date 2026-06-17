@@ -138,7 +138,7 @@ modules:
 generators:
   # The wasm target cannot deliver producer-initiated callbacks/listeners
   # (single-threaded, no producer thread); opt in to generating the rest of
-  # the surface — the on_change listener becomes an explicit throwing stub.
+  # the surface; the on_change listener becomes an explicit throwing stub.
   wasm:
     allow_unsupported: true
   ruby:

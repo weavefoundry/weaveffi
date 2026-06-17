@@ -1,8 +1,8 @@
 // Conformance consumer: shapes sample, C target.
 //
 // Includes the *generated* C header and links the shapes cdylib, exercising
-// rich (algebraic) enums — opaque object + tag reader + per-variant
-// constructors and field getters + destructor — plus the expanded numeric set
+// rich (algebraic) enums (opaque object + tag reader + per-variant
+// constructors and field getters + destructor) plus the expanded numeric set
 // (f32 fields, u8 field, u64 return). Exits 0 on success; aborts on any failed
 // assertion.
 

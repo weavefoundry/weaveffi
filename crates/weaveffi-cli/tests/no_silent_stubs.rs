@@ -1,6 +1,6 @@
 //! CI gate: no silent stubs, in either the generators or their output.
 //!
-//! The pre-overhaul backends shipped bindings that compiled but lied — builder
+//! The pre-overhaul backends shipped bindings that compiled but lied: builder
 //! `build()` methods that threw "requires FFI backing", `unimplemented!()`
 //! paths for whole call shapes, features skipped without a word. These tests
 //! make that class of regression a build failure:
@@ -10,7 +10,7 @@
 //! 2. The full generated output for the feature-complete sample IDLs must not
 //!    contain stub markers. A target that cannot support a feature must either
 //!    fail generation loudly (the capability gate) or emit an *explicit*
-//!    "not supported by this target" surface — never a fake implementation.
+//!    "not supported by this target" surface, never a fake implementation.
 
 use std::fs;
 use std::path::{Path, PathBuf};

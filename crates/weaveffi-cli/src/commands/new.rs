@@ -1,4 +1,4 @@
-//! `weaveffi new` — scaffold a fresh producer project: starter IDL,
+//! `weaveffi new` scaffolds a fresh producer project: starter IDL,
 //! `Cargo.toml`, `src/lib.rs` (via the scaffold renderer), and a README.
 
 use crate::scaffold;

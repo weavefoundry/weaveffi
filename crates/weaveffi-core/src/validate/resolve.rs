@@ -6,9 +6,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use weaveffi_ir::ir::{Api, Module, TypeRef};
 
 /// How a bare type name resolves: a struct, a C-style enum, or an algebraic
-/// (rich) enum. The two enum kinds differ in their C ABI lowering — a C-style
+/// (rich) enum. The two enum kinds differ in their C ABI lowering: a C-style
 /// enum is a by-value integer ([`TypeRef::Enum`]) while a rich enum is an
-/// opaque object pointer ([`TypeRef::RichEnum`]) — so the resolver must know
+/// opaque object pointer ([`TypeRef::RichEnum`]), so the resolver must know
 /// which to emit for every reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TypeKind {
@@ -17,6 +17,11 @@ enum TypeKind {
     RichEnum,
 }
 
+/// Resolve every type reference in `api` in place.
+///
+/// Bare names that refer to C-style enums are rewritten to [`TypeRef::Enum`]
+/// (by-value lowering), and cross-module references are qualified with the
+/// owning module's dot-joined path. Runs after the rule checks pass.
 pub fn resolve_type_refs(api: &mut Api) {
     let mut global_types: BTreeMap<String, (String, TypeKind)> = BTreeMap::new();
     for module in &api.modules {
@@ -67,7 +72,7 @@ fn resolve_module_type_refs(
     let module_path = join_module_path(parent_path, &module.name);
     // Only *C-style* enums are rewritten to `TypeRef::Enum` (by-value lowering).
     // A rich (algebraic) enum is left as `TypeRef::Struct` because it crosses
-    // the ABI as an opaque object pointer, exactly like a struct — so it does
+    // the ABI as an opaque object pointer, exactly like a struct, so it does
     // not belong in `local_enum_names`.
     let local_enum_names: BTreeSet<String> = module
         .enums
@@ -175,6 +180,11 @@ fn resolve_single_type_ref(ty: &mut TypeRef, ctx: &ResolveCtx<'_>) {
     }
 }
 
+/// Locate a struct or enum by its bare `name` anywhere in `api`.
+///
+/// Returns the owning module's dot-joined path and a boolean that is `true`
+/// when the match is an enum and `false` when it is a struct, or `None` if no
+/// type with that name exists. The first match wins on a name clash.
 pub fn find_type_in_api(api: &Api, name: &str) -> Option<(String, bool)> {
     fn search(module: &Module, parent_path: &str, name: &str) -> Option<(String, bool)> {
         let path = join_module_path(parent_path, &module.name);

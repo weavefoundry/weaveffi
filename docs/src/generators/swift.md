@@ -16,7 +16,7 @@ Swift module (`WeaveFFI`) that wraps the C ABI in idiomatic Swift with
 | `generated/swift/Sources/WeaveFFI/WeaveFFI.swift` | Swift wrapper: enums, struct classes, namespaced module functions |
 
 The module name shown above (`WeaveFFI`) is the default. It is overridden by
-`[swift] module_name`, or — failing that — by the IDL
+`[swift] module_name` or, failing that, by the IDL
 [`package:` name](../reference/idl.md#package-metadata) PascalCased
 (`async-demo` → `AsyncDemo`). The Swift wrapper, its `Sources/<Module>/`
 directory, the system-library target, and its `Sources/C<Module>/` module map
@@ -154,7 +154,7 @@ ids.withUnsafeBufferPointer { buf in
 
 ## Rich (algebraic) enums
 
-An enum whose variants declare `fields` is a *rich* (algebraic) enum — a sum
+An enum whose variants declare `fields` is a *rich* (algebraic) enum, a sum
 type with associated data. Plain C-style enums stay Swift `enum`s backed by
 `UInt32`; a rich enum instead becomes a wrapper `class` around an
 `OpaquePointer` (same ownership model as a struct class) with a nested `Tag`,
@@ -204,7 +204,7 @@ let bigger = try Shapes.shapes_scale(shape, 3.0)
 
 Ownership matches struct classes: the `Shape` `deinit` calls
 `weaveffi_shapes_Shape_destroy`, so ARC frees the handle when the last
-reference goes away — no manual free required.
+reference goes away, no manual free required.
 
 ## Build instructions
 
@@ -251,7 +251,7 @@ of an XCFramework or bundled `.dylib`/`.so`.
 - Returned strings are copied into Swift `String` and the raw pointer is
   freed via `weaveffi_free_string` immediately.
 - `withUnsafeBufferPointer` and `withOptionalPointer` keep input buffers
-  alive only for the duration of the C call — there is no copy.
+  alive only for the duration of the C call; there's no copy.
 - For `bytes` parameters, the wrapper copies the `Data` into a
   `[UInt8]` array and passes it via `withUnsafeBufferPointer`; returned
   `bytes` are copied into `Data` and the Rust buffer is freed with
@@ -263,7 +263,7 @@ Async IDL functions (`async: true`) are exposed as `async throws`
 methods that bridge the C ABI completion callback into Swift structured
 concurrency via `withCheckedThrowingContinuation`. The continuation is
 boxed in a `ContinuationRef`, retained with `Unmanaged.passRetained`,
-and released exactly once — by `takeRetainedValue()` inside the C
+and released exactly once, by `takeRetainedValue()` inside the C
 completion callback. From the `async-demo` sample:
 
 ```swift
@@ -297,8 +297,8 @@ public static func tasks_run_task(_ name: String) async throws -> TaskResult {
 
 For functions marked `cancellable: true`, the C ABI takes an extra
 `weaveffi_cancel_token*` parameter. The Swift wrapper passes `nil` for
-that slot — cancellation is not surfaced in Swift, and Swift `Task`
-cancellation does not propagate to the native operation:
+that slot; cancellation isn't surfaced in Swift, and Swift `Task`
+cancellation doesn't propagate to the native operation:
 
 ```swift
 weaveffi_kv_compact_async_async(store.ptr, nil, { context, err, result in
@@ -355,7 +355,7 @@ public static func events_unregister_message_listener(_ id: UInt64) {
 }
 ```
 
-The callback runs on the producer's thread — whichever thread the
+The callback runs on the producer's thread, whichever thread the
 native side fires the event from. For UI work, hop to the main thread
 yourself (e.g. `DispatchQueue.main.async` or `await MainActor.run`).
 
@@ -387,17 +387,17 @@ public static func events_get_messages() throws -> [String] {
 
 ## Troubleshooting
 
-- **`module 'CWeaveFFI' not found`** — Xcode/SwiftPM did not pick up
+- **`module 'CWeaveFFI' not found`**: Xcode/SwiftPM didn't pick up
   the generated `module.modulemap`. Make sure
   `Sources/CWeaveFFI/module.modulemap` is on disk and the package
   declares `systemLibrary(name: "CWeaveFFI")`.
-- **`Library not loaded: libweaveffi.dylib`** — set
+- **`Library not loaded: libweaveffi.dylib`**: set
   `DYLD_LIBRARY_PATH` for development or embed the dylib in your
   application bundle for distribution.
-- **Crashes after `deinit`** — never reuse an `OpaquePointer` after the
+- **Crashes after `deinit`**: never reuse an `OpaquePointer` after the
   owning Swift wrapper goes out of scope. The C side has already freed
   it.
-- **Optional struct ends up `nil` even when present** — the C function
+- **Optional struct ends up `nil` even when present**: the C function
   is allowed to return a null pointer to indicate absence; double-check
   the Rust implementation actually returns `Some(_)` for the case you
   expect.

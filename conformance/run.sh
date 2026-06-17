@@ -412,7 +412,7 @@ kotlin_shapes()  { kotlin_consumer shapes shapes.kt; }
 
 # WASM: compile the producer to wasm32-unknown-unknown and drive the generated
 # ESM bindings from Node. The generated JS glue expects weaveffi_alloc/dealloc
-# plus an exported, growable __indirect_function_table — wired by the workspace
+# plus an exported, growable __indirect_function_table, wired by the workspace
 # .cargo/config.toml (--export-table/--growable-table). Async wrappers build host
 # trampolines with WebAssembly.Function, which needs the type-reflection flag.
 # Unlike the cdylib lanes there is no FFI library to load: the .wasm is fully

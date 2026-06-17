@@ -191,8 +191,8 @@ the keys are identical.
 > participate are `[swift] module_name`, `[node] package_name`,
 > `[python] package_name`, `[dart] package_name`, `[go] module_path`,
 > `[ruby] gem_name`, and `[dotnet] namespace` (which also sets the NuGet
-> package id). Manifests with no dedicated key — Android `rootProject.name`,
-> the WASM `package.json`, and the C++ `CMakeLists.txt` version — follow the
+> package id). Manifests with no dedicated key (Android `rootProject.name`,
+> the WASM `package.json`, and the C++ `CMakeLists.txt` version) follow the
 > same identity, and the published version comes from `package.version`
 > (default `0.1.0`). All other keys (e.g. `[c] prefix`, `[cpp] namespace`,
 > `[android] package`, `[ruby] module_name`, `[wasm] module_name`) keep the
@@ -263,22 +263,22 @@ The alias `[weaveffi]` is accepted for the `[global]` section.
 
 ## Pitfalls
 
-- **Inline value overrides TOML silently** — there is no warning when
+- **Inline value overrides TOML silently**: there is no warning when
   both are set. If a TOML override "doesn't take", check for an inline
   block in the IDL.
-- **`[c] prefix` rewrites every generator** — picking a custom prefix
+- **`[c] prefix` rewrites every generator**: picking a custom prefix
   also rewrites the runtime symbols (`{prefix}_free_string`, ...). The
   Rust cdylib must be built with the same prefix. The C++ wrapper picks
   it up automatically; if you set both `[c] prefix` and
   `[cpp] c_prefix` make sure they agree.
-- **`strip_module_prefix = true` flattens names** — collisions across
+- **`strip_module_prefix = true` flattens names**: collisions across
   modules become possible. Pick one or the other consistently.
-- **Hooks run shell commands as-is** — `pre_generate` and
+- **Hooks run shell commands as-is**: `pre_generate` and
   `post_generate` are passed straight to `sh -c`. Quote them
   carefully and never include untrusted input.
-- **Cache covers IR, generator name, generator config, and CLI version** —
+- **Cache covers IR, generator name, generator config, and CLI version**:
   changing the IR, any generator config field, or upgrading the CLI
   invalidates the per-generator cache and triggers re-emission.
-- **Older CLIs ignore unknown keys** — adding a new generator key
+- **Older CLIs ignore unknown keys**: adding a new generator key
   with a project-wide implication does not error out on older
   toolchains. Pin the CLI version in CI when you need that guarantee.

@@ -2,7 +2,7 @@
 //
 // Exercises a context-carrying callback, a register/unregister listener pair
 // (returning a uint64_t subscription id), and an opaque iterator driven by the
-// `int32_t next(iter, &out_item, &err)` contract — the three features whose ABI
+// `int32_t next(iter, &out_item, &err)` contract: the three features whose ABI
 // historically drifted between generators and hand-written consumers.
 
 #include <assert.h>

@@ -110,7 +110,7 @@ pub extern "C" fn weaveffi_greeter_hello(
 }
 
 // Emit the WeaveFFI C ABI runtime symbols (free_string, free_bytes,
-// error_clear, cancel_token_*) — one line per cdylib.
+// error_clear, cancel_token_*), one line per cdylib.
 abi::export_runtime!();
 ```
 
@@ -186,11 +186,11 @@ struct ContentView: View {
 
 The generated `WeaveFFI` module exposes:
 
-- `Greeter.hello(_:)` — returns `String`.
-- `Greeter.greeting(_:_:)` — returns a `Greeting` instance with
+- `Greeter.hello(_:)`: returns `String`.
+- `Greeter.greeting(_:_:)`: returns a `Greeting` instance with
   `.message` and `.lang` properties; `deinit` calls the Rust
   destructor automatically.
-- `Greeting` — the wrapper class around the opaque Rust pointer.
+- `Greeting`: the wrapper class around the opaque Rust pointer.
 
 ## Verification
 

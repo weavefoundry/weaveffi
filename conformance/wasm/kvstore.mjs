@@ -10,8 +10,8 @@
 // the async, i64-returning compact_async via the callback trampoline.
 //
 // Inputs come from the harness:
-//   WV_WASM — path to the compiled kvstore.wasm
-//   WV_JS   — path to the generated weaveffi_wasm.js (ESM)
+//   WV_WASM: path to the compiled kvstore.wasm
+//   WV_JS:   path to the generated weaveffi_wasm.js (ESM)
 // Run with: node --experimental-wasm-type-reflection (for WebAssembly.Function).
 
 import fs from 'fs';
