@@ -9,6 +9,7 @@
   ],
   "properties": {
     "version": {
+      "description": "IR schema version this document targets (for example `0.4.0`). Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].",
       "type": "string"
     },
     "package": {
@@ -23,12 +24,14 @@
       ]
     },
     "modules": {
+      "description": "Top-level modules that make up the API surface. Each is an independent namespace; modules may nest further through [`Module::modules`].",
       "type": "array",
       "items": {
         "$ref": "#/definitions/Module"
       }
     },
     "generators": {
+      "description": "Per-generator configuration keyed by backend name (for example `swift` or `python`). The opaque [`toml::Value`] payload is interpreted by each generator, so unrecognized keys pass through untouched. `None` when the IDL declares no `generators:` block.",
       "type": [
         "object",
         "null"
@@ -54,30 +57,35 @@
           "type": "string"
         },
         "description": {
+          "description": "Short summary written into each manifest's description field. Omitted from generated manifests when absent.",
           "type": [
             "string",
             "null"
           ]
         },
         "license": {
+          "description": "License identifier, typically an SPDX expression such as `MIT` or `Apache-2.0`, written into each manifest's license field.",
           "type": [
             "string",
             "null"
           ]
         },
         "authors": {
+          "description": "Package authors, each commonly formatted as `Name <email>`, mapped to whatever author or maintainer field the target ecosystem uses. Empty by default.",
           "type": "array",
           "items": {
             "type": "string"
           }
         },
         "homepage": {
+          "description": "Project homepage URL recorded in manifests that expose one.",
           "type": [
             "string",
             "null"
           ]
         },
         "repository": {
+          "description": "Source repository URL recorded in manifests that expose one.",
           "type": [
             "string",
             "null"
@@ -94,39 +102,46 @@
       ],
       "properties": {
         "name": {
+          "description": "Module name, used as a namespace segment and a symbol-prefix component in generated code (for example `contacts`).",
           "type": "string"
         },
         "functions": {
+          "description": "Free functions this module exports across the FFI boundary.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/Function"
           }
         },
         "structs": {
+          "description": "Record (struct) types declared in this module.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/StructDef"
           }
         },
         "enums": {
+          "description": "Enum types, C-style or algebraic, declared in this module.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/EnumDef"
           }
         },
         "callbacks": {
+          "description": "Callback signatures this module's functions and listeners can invoke.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/CallbackDef"
           }
         },
         "listeners": {
+          "description": "Event listeners (subscribe and unsubscribe endpoints) this module exposes.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/ListenerDef"
           }
         },
         "errors": {
+          "description": "Optional error domain: the named codes this module's fallible functions report. `None` when the module declares no errors.",
           "anyOf": [
             {
               "$ref": "#/definitions/ErrorDomain"
@@ -137,6 +152,7 @@
           ]
         },
         "modules": {
+          "description": "Nested submodules, forming a tree that mirrors a package hierarchy.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/Module"
@@ -145,6 +161,7 @@
       }
     },
     "Function": {
+      "description": "A function exported across the FFI boundary.\n\nEach function becomes a C ABI entry point plus an idiomatic wrapper in every target language. The `async` and `cancellable` flags change how the symbol is lowered (a completion callback, an extra cancel-token parameter) without altering the parameter and return shape declared here.",
       "type": "object",
       "required": [
         "name",
@@ -152,15 +169,18 @@
       ],
       "properties": {
         "name": {
+          "description": "Function name, lowered to a per-language symbol (for example `create_contact`).",
           "type": "string"
         },
         "params": {
+          "description": "Ordered parameter list; order is preserved in every generated signature.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/Param"
           }
         },
         "return": {
+          "description": "Return type, or `None` for a function that returns nothing. Serialized under the IDL key `return`.",
           "anyOf": [
             {
               "$ref": "#/definitions/TypeRef"
@@ -171,24 +191,29 @@
           ]
         },
         "doc": {
+          "description": "Human-readable documentation, propagated to the generated bindings' doc comments. `None` when undocumented.",
           "type": [
             "string",
             "null"
           ]
         },
         "async": {
+          "description": "Whether the function is asynchronous, lowering to a completion-callback form rather than a blocking call. Serialized under the IDL key `async`.",
           "type": "boolean"
         },
         "cancellable": {
+          "description": "Whether an async call accepts a cancellation token so callers can request that an in-flight operation stop early. Defaults to `false`.",
           "type": "boolean"
         },
         "deprecated": {
+          "description": "Deprecation notice; when set, generators emit a deprecation annotation carrying this message. `None` means the function is current.",
           "type": [
             "string",
             "null"
           ]
         },
         "since": {
+          "description": "Version in which the function was introduced (for example `0.2.0`), surfaced as a \"since\" annotation where the target language supports one.",
           "type": [
             "string",
             "null"
@@ -197,6 +222,7 @@
       }
     },
     "Param": {
+      "description": "A single parameter of a [`Function`] or [`CallbackDef`].",
       "type": "object",
       "required": [
         "name",
@@ -204,15 +230,23 @@
       ],
       "properties": {
         "name": {
+          "description": "Parameter name as it appears in generated signatures (for example `id`).",
           "type": "string"
         },
         "type": {
-          "$ref": "#/definitions/TypeRef"
+          "description": "Parameter type. Serialized under the IDL key `type`.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TypeRef"
+            }
+          ]
         },
         "mutable": {
+          "description": "Whether the callee may write back through this parameter (for example a buffer filled in place). Defaults to `false`.",
           "type": "boolean"
         },
         "doc": {
+          "description": "Human-readable documentation for the parameter, propagated to the generated bindings. `None` when undocumented.",
           "type": [
             "string",
             "null"
@@ -234,26 +268,31 @@
       ],
       "properties": {
         "name": {
+          "description": "Struct type name (for example `Contact`).",
           "type": "string"
         },
         "doc": {
+          "description": "Human-readable documentation, propagated to the generated bindings. `None` when undocumented.",
           "type": [
             "string",
             "null"
           ]
         },
         "fields": {
+          "description": "The fields in declaration order; order is preserved in the generated type and its constructors.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/StructField"
           }
         },
         "builder": {
+          "description": "Whether to also emit a builder API for constructing the struct field by field, alongside the all-fields constructor. Defaults to `false`.",
           "type": "boolean"
         }
       }
     },
     "StructField": {
+      "description": "A named field of a [`StructDef`], or the payload of an algebraic [`EnumVariant`].",
       "type": "object",
       "required": [
         "name",
@@ -261,18 +300,27 @@
       ],
       "properties": {
         "name": {
+          "description": "Field name (for example `email`).",
           "type": "string"
         },
         "type": {
-          "$ref": "#/definitions/TypeRef"
+          "description": "Field type. Serialized under the IDL key `type`.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TypeRef"
+            }
+          ]
         },
         "doc": {
+          "description": "Human-readable documentation, propagated to the generated bindings. `None` when undocumented.",
           "type": [
             "string",
             "null"
           ]
         },
-        "default": true
+        "default": {
+          "description": "Default value used when the field is omitted, kept as a raw YAML value so any literal the field's type accepts can be expressed. Ignored for algebraic [`EnumVariant`] payloads, which aren't defaultable. `None` when the field has no default."
+        }
       }
     },
     "EnumDef": {
@@ -284,15 +332,18 @@
       ],
       "properties": {
         "name": {
+          "description": "Enum type name (for example `Color`).",
           "type": "string"
         },
         "doc": {
+          "description": "Human-readable documentation, propagated to the generated bindings. `None` when undocumented.",
           "type": [
             "string",
             "null"
           ]
         },
         "variants": {
+          "description": "The variants in declaration order. Whether any of them carries fields decides if this is a C-style or an algebraic enum.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/EnumVariant"
@@ -301,7 +352,7 @@
       }
     },
     "EnumVariant": {
-      "description": "`Eq` is omitted because `StructField::default` may contain `serde_yaml::Value`.",
+      "description": "A single variant of an [`EnumDef`].",
       "type": "object",
       "required": [
         "name",
@@ -309,13 +360,16 @@
       ],
       "properties": {
         "name": {
+          "description": "Variant name (for example `Red`).",
           "type": "string"
         },
         "value": {
+          "description": "Integer discriminant. Doubles as the C-style enum value and as the runtime tag that distinguishes the variants of an algebraic enum.",
           "type": "integer",
           "format": "int32"
         },
         "doc": {
+          "description": "Human-readable documentation, propagated to the generated bindings. `None` when undocumented.",
           "type": [
             "string",
             "null"
@@ -331,6 +385,7 @@
       }
     },
     "CallbackDef": {
+      "description": "A callback signature: a function shape the host implements and native code invokes.\n\nCallbacks are declared at module scope rather than as a [`TypeRef`] so the C ABI can represent them uniformly as a function pointer plus a context pointer. A [`ListenerDef`] references one by name to model an event stream.",
       "type": "object",
       "required": [
         "name",
@@ -338,15 +393,18 @@
       ],
       "properties": {
         "name": {
+          "description": "Callback name, used to name the generated function-pointer type and referenced by [`ListenerDef::event_callback`] (for example `on_message`).",
           "type": "string"
         },
         "params": {
+          "description": "Parameters passed to the callback each time it fires.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/Param"
           }
         },
         "doc": {
+          "description": "Human-readable documentation, propagated to the generated bindings. `None` when undocumented.",
           "type": [
             "string",
             "null"
@@ -355,6 +413,7 @@
       }
     },
     "ListenerDef": {
+      "description": "An event listener: a subscribe and unsubscribe endpoint that delivers events through a [`CallbackDef`].\n\nGenerators expand a listener into register and unregister functions; the register call takes the named callback and returns a subscription id the caller later hands to unregister.",
       "type": "object",
       "required": [
         "event_callback",
@@ -362,12 +421,15 @@
       ],
       "properties": {
         "name": {
+          "description": "Listener name, lowered into the generated `register_*` and `unregister_*` function names (for example `messages`).",
           "type": "string"
         },
         "event_callback": {
+          "description": "Name of the [`CallbackDef`] invoked for each event. Must match a callback declared on the same [`Module`].",
           "type": "string"
         },
         "doc": {
+          "description": "Human-readable documentation, propagated to the generated bindings. `None` when undocumented.",
           "type": [
             "string",
             "null"
@@ -376,6 +438,7 @@
       }
     },
     "ErrorDomain": {
+      "description": "A module's error domain: the named set of error codes its fallible functions can report.",
       "type": "object",
       "required": [
         "codes",
@@ -383,9 +446,11 @@
       ],
       "properties": {
         "name": {
+          "description": "Error domain name, used to name the generated error type (for example `ContactErrors`).",
           "type": "string"
         },
         "codes": {
+          "description": "The error codes that belong to this domain.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/ErrorCode"
@@ -394,6 +459,7 @@
       }
     },
     "ErrorCode": {
+      "description": "A single named error within an [`ErrorDomain`].",
       "type": "object",
       "required": [
         "code",
@@ -402,16 +468,20 @@
       ],
       "properties": {
         "name": {
+          "description": "Error code name, lowered to a variant or constant on the generated error type (for example `not_found`).",
           "type": "string"
         },
         "code": {
+          "description": "Stable numeric value carried across the C ABI to identify this error.",
           "type": "integer",
           "format": "int32"
         },
         "message": {
+          "description": "Default human-readable message describing the error.",
           "type": "string"
         },
         "doc": {
+          "description": "Human-readable documentation, propagated to the generated bindings. `None` when undocumented.",
           "type": [
             "string",
             "null"
