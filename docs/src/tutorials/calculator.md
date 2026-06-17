@@ -30,11 +30,11 @@ weaveffi generate samples/calculator/calculator.yml -o generated
 
 The output appears under `generated/`:
 
-- `generated/c` — C header and convenience C file
-- `generated/swift` — SwiftPM System Library (`CWeaveFFI`) and Swift wrapper (`WeaveFFI`)
-- `generated/android` — Kotlin wrapper, JNI shims, and Gradle skeleton
-- `generated/node` — N-API loader and `.d.ts`
-- `generated/wasm` — minimal WASM loader
+- `generated/c`: C header and convenience C file
+- `generated/swift`: SwiftPM System Library (`CWeaveFFI`) and Swift wrapper (`WeaveFFI`)
+- `generated/android`: Kotlin wrapper, JNI shims, and Gradle skeleton
+- `generated/node`: N-API loader and `.d.ts`
+- `generated/wasm`: minimal WASM loader
 
 ### 2. Build the Rust sample
 

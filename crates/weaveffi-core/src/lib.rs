@@ -1,4 +1,8 @@
 //! Core logic: Generator trait, codegen orchestration, validation, and shared utilities.
+#![deny(missing_docs)]
+#![warn(clippy::missing_errors_doc)]
+#![warn(clippy::missing_panics_doc)]
+#![warn(clippy::doc_markdown)]
 
 pub mod abi;
 pub mod backend;

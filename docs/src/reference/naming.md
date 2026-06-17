@@ -54,9 +54,9 @@ Rationale: condensed top-level slugs unify handles across registries and are erg
 
 ### Writing guidelines
 
-- In prose, prefer the condensed brand names: “WeaveFFI”, “WeaveHeap”.
+- In prose, prefer the condensed brand names: "WeaveFFI", "WeaveHeap".
 - In code snippets, follow the host language conventions above.
-- For cross-language docs, show both the repo/package slug and the language-appropriate identifier on first mention, e.g., “Install `weaveffi` (import as `weaveffi`, Swift module `WeaveFFI`). For subpackages, install `weaveffi-core` (import as `weaveffi_core`).”
+- For cross-language docs, show both the repo/package slug and the language-appropriate identifier on first mention, e.g., "Install `weaveffi` (import as `weaveffi`, Swift module `WeaveFFI`). For subpackages, install `weaveffi-core` (import as `weaveffi_core`)."
 
 ### Migration guidance
 

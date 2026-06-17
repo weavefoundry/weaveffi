@@ -4,7 +4,7 @@ use weaveffi_ir::ir::{
     StructField, TypeRef,
 };
 
-/// `weaveffi extract` — CLI glue around [`extract_api_from_rust`]: read the
+/// `weaveffi extract` is CLI glue around [`extract_api_from_rust`]: read the
 /// annotated Rust source, extract the [`Api`], validate, and serialize to the
 /// requested format.
 ///
@@ -214,7 +214,7 @@ fn type_path_ident(ty: &syn::Type) -> Option<String> {
 fn map_type(ty: &syn::Type) -> Result<TypeRef> {
     match ty {
         syn::Type::Reference(r) => {
-            // `&str`, `&[u8]`, `&mut T`, `&T` — `&str` and `&[u8]` map to
+            // `&str`, `&[u8]`, `&mut T`, `&T`: `&str` and `&[u8]` map to
             // borrowed IR variants; everything else delegates to the inner
             // type so `&mut Foo` becomes `Struct(Foo)` (the `mutable` flag is
             // captured separately by the caller).

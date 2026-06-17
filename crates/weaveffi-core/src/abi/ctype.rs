@@ -21,19 +21,28 @@ pub enum ConstPos {
 /// prefix (applied at render time by [`CType::render_c`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CType {
+    /// `int8_t` (the `i8` primitive).
     Int8,
+    /// `int16_t` (the `i16` primitive).
     Int16,
+    /// `int32_t` (the `i32` primitive).
     Int32,
+    /// `int64_t` (the `i64` primitive).
     Int64,
     /// `uint8_t` as a standalone scalar (the `u8` primitive). Also used as the
     /// pointee of a byte-buffer pointer.
     Uint8,
+    /// `uint16_t` (the `u16` primitive).
     Uint16,
+    /// `uint32_t` (the `u32` primitive).
     Uint32,
+    /// `uint64_t` (the `u64` primitive).
     Uint64,
     /// `float` (the `f32` primitive).
     Float,
+    /// `double` (the `f64` primitive).
     Double,
+    /// `bool` (from `<stdbool.h>`).
     Bool,
     /// `size_t`.
     Size,
@@ -49,12 +58,16 @@ pub enum CType {
     Error,
     /// An enum value type: `{prefix}_{module}_{name}`.
     Enum {
+        /// Underscore-joined symbol path of the module that declares the enum.
         module: String,
+        /// The enum's bare type name.
         name: String,
     },
     /// A user struct / typed-handle tag: `{prefix}_{module}_{name}`.
     StructTag {
+        /// Underscore-joined symbol path of the module that declares the type.
         module: String,
+        /// The struct or typed-handle's bare type name.
         name: String,
     },
     /// A prefixed named type emitted elsewhere in the header (callback
@@ -63,7 +76,9 @@ pub enum CType {
     Named(String),
     /// A pointer to `pointee` with the given `const` placement.
     Ptr {
+        /// Where the `const` qualifier sits, if any.
         konst: ConstPos,
+        /// The type the pointer refers to.
         pointee: Box<CType>,
     },
 }

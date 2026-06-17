@@ -1,4 +1,4 @@
-//! `weaveffi watch` — regenerate whenever the IDL file changes, with a
+//! `weaveffi watch`: regenerate whenever the IDL file changes, with a
 //! debounce window so editor save bursts trigger a single regeneration.
 
 use super::generate::cmd_generate;

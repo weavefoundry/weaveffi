@@ -31,6 +31,32 @@ mdbook serve docs -p 3000 -n 127.0.0.1
 
 Open <http://127.0.0.1:3000>.
 
+## Documentation
+
+WeaveFFI has two layers of documentation, and CI checks both:
+
+- **Prose docs** (this book) live under `docs/src/` and build with
+  [mdBook](https://rust-lang.github.io/mdBook/). New generators must add a
+  `docs/src/generators/<lang>.md` page and link it from
+  `docs/src/SUMMARY.md`.
+- **API docs** are generated from Rust doc comments by `cargo doc`. Every
+  public item in the library crates carries a doc comment; this is enforced
+  by `#![deny(missing_docs)]` plus the Clippy doc lints
+  (`missing_errors_doc`, `missing_panics_doc`, `missing_safety_doc`, and
+  `doc_markdown`). See the
+  [doc comment style guide](docs/src/api/doc-style.md) for the conventions,
+  the standard `# Errors`/`# Panics`/`# Safety` sections, and examples.
+
+Check both locally before pushing:
+
+```bash
+# Lint everything; clippy -D warnings also enforces the doc lints.
+just check
+
+# Build the API docs (rustdoc) and the book.
+just doc
+```
+
 ## Running specific tests
 
 ```bash
@@ -90,7 +116,7 @@ for each pending snapshot. Inspect every diff carefully:
 - Press `a` (or run `cargo insta accept`) to promote `.snap.new` files into
   their final `.snap` form when the change is correct.
 - Press `r` (or run `cargo insta reject`) to delete the `.snap.new` files
-  when the diff exposes a bug — fix the generator before re-running.
+  when the diff exposes a bug; fix the generator before re-running.
 - Press `s` to skip a snapshot and decide later.
 
 After accepting, **commit the resulting `.snap` files in the same commit as
@@ -225,7 +251,7 @@ BREAKING CHANGE: JS bindings now return Promises instead of using callbacks; upd
 - Commit types that trigger a release: `feat` (minor), `fix` and `perf` (patch), `BREAKING CHANGE` (minor while pre-1.0). All other types (`build`, `chore`, `ci`, `docs`, `refactor`, `revert`, `style`, `test`) are recorded in the changelog but do **not** trigger a release on their own.
 - **Pre-1.0 breaking changes**: The `{ "breaking": true, "release": "minor" }` rule in `.releaserc.json` caps breaking changes to a minor bump. When the project is ready for 1.0.0, remove that rule so breaking changes bump major as normal.
 - Tag format: `v`-prefixed (e.g., `v0.1.0`).
-- Manual version bumps are no longer needed — just merge PRs with valid Conventional Commit titles. For ad-hoc runs, use the workflow's **Run workflow** button (`workflow_dispatch`).
+- Manual version bumps are no longer needed; just merge PRs with valid Conventional Commit titles. For ad-hoc runs, use the workflow's **Run workflow** button (`workflow_dispatch`).
 
 ### Branching rules
 

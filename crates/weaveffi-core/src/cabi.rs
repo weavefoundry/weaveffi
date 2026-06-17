@@ -4,7 +4,7 @@
 //! Both the C generator (which emits the canonical `{prefix}.h`) and the C++
 //! generator (whose idiomatic wrapper opens an `extern "C"` block re-declaring
 //! the same symbols) render their C declarations through this module. Before it
-//! existed the two re-derived the ABI independently and drifted — most visibly,
+//! existed the two re-derived the ABI independently and drifted. Most visibly,
 //! the C++ `extern "C"` block lowered `iter<T>` as a list and omitted callbacks
 //! and listeners entirely. Routing both through one model-driven renderer makes
 //! that class of drift impossible.
@@ -196,7 +196,7 @@ fn render_struct_fn_decls(out: &mut String, s: &StructBinding, prefix: &str) {
     }
 }
 
-/// Phase 1a — enum definitions for one module. Enums reference no other types,
+/// Phase 1a: enum definitions for one module. Enums reference no other types,
 /// so they are emitted first across all modules.
 pub fn render_module_enum_defs(out: &mut String, module: &ModuleBinding) {
     for e in &module.enums {
@@ -208,7 +208,7 @@ pub fn render_module_enum_defs(out: &mut String, module: &ModuleBinding) {
     }
 }
 
-/// Phase 1b — opaque struct/builder/iterator forward typedefs for one module.
+/// Phase 1b: opaque struct/builder/iterator forward typedefs for one module.
 /// Pointers to these are all the C ABI ever uses, so a forward typedef is
 /// sufficient and lets declarations in any module reference any struct.
 pub fn render_module_type_tags(out: &mut String, module: &ModuleBinding) {
@@ -230,7 +230,7 @@ pub fn render_module_type_tags(out: &mut String, module: &ModuleBinding) {
     }
 }
 
-/// Phase 1c — callback / async-callback function-pointer typedefs for one
+/// Phase 1c: callback / async-callback function-pointer typedefs for one
 /// module. These may reference enums (by value) and structs (by pointer), so
 /// they are emitted after every module's enums and type tags.
 pub fn render_module_callback_types(out: &mut String, module: &ModuleBinding, prefix: &str) {
@@ -255,7 +255,7 @@ pub fn render_module_callback_types(out: &mut String, module: &ModuleBinding, pr
     }
 }
 
-/// Phase 2 — every function prototype for one module: struct create/destroy/
+/// Phase 2: every function prototype for one module: struct create/destroy/
 /// getters and builders, listeners, then sync/async/iterator functions. All
 /// type tags and callback typedefs are assumed already emitted (phases 1a–1c).
 /// Caller controls the leading `// Module:` comment and any framing.
@@ -306,7 +306,7 @@ pub fn render_module_fn_decls(out: &mut String, module: &ModuleBinding, prefix: 
 /// dependency-safe order: all enum definitions, then all opaque type tags, then
 /// all callback typedefs, then per-module function prototypes. Emitting every
 /// type tag before any function lets a parent module's function reference a
-/// child module's struct — cross-module forward references the previous
+/// child module's struct: cross-module forward references the previous
 /// per-module interleaving could not express.
 ///
 /// The runtime decls (`handle_t`, `error`, `free_*`, cancel token) are *not*

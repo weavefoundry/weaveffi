@@ -199,18 +199,18 @@ generators:
 
 ## Rich (algebraic) enums
 
-A *rich* (algebraic) enum — a sum type whose variants carry associated
-data — lowers to an **opaque object pointer** at the C ABI, exactly like a
+A *rich* (algebraic) enum, a sum type whose variants carry associated
+data, lowers to an **opaque object pointer** at the C ABI, exactly like a
 struct, and shares the same ownership model as the struct wrappers above.
 The Go wrapper is a struct holding a typed C pointer, with one
 `New<Enum><Variant>` constructor per variant, a `Tag()` method returning
 the `int32` discriminant, per-variant field getter methods, and an
 explicit `Close()`. (A plain C-style enum with no payloads stays a typed
-`int32` alias with `const` values — see above.)
+`int32` alias with `const` values; see above.)
 
-For the `shapes` module's `Shape` enum — `Empty`, `Circle { radius: f64 }`,
+For the `shapes` module's `Shape` enum (`Empty`, `Circle { radius: f64 }`,
 `Rectangle { width: f32, height: f32 }`, and
-`Labeled { label: string, count: u8 }` — the generator emits (abridged):
+`Labeled { label: string, count: u8 }`), the generator emits (abridged):
 
 ```go
 // Shape: An algebraic shape (sum type with associated data)
@@ -409,7 +409,7 @@ crosses the boundary. The bindings keep a mutex-guarded registry
 (`wvCallbacks`, written through `wvCallbackStore`) and hand C two
 things: a `//export`ed trampoline (`goWv_weaveffi_events_OnMessage_fn`,
 declared `extern` in the CGo preamble) as the function pointer, and
-the registry key as the `void* context` — an integer id cast via
+the registry key as the `void* context`, an integer id cast via
 `unsafe.Pointer(uintptr(ctxID))` that the C side never dereferences.
 When the event fires, the trampoline looks the closure up and calls it:
 
@@ -435,8 +435,8 @@ func goWv_weaveffi_events_OnMessage_fn(message *C.char, context unsafe.Pointer) 
   registry key) to delete the stored closure so it can be collected. A
   leaked subscription pins the closure forever.
 - **Threading:** the callback runs as a CGo callback on whatever thread
-  the producer fires it from — in the events sample, synchronously
-  inside `EventsSendMessage`. Don't block in it; forward to a channel
+the producer fires it from (in the events sample, synchronously
+inside `EventsSendMessage`). Don't block in it; forward to a channel
   or goroutine if handling is slow.
 
 ## Async support
@@ -474,7 +474,7 @@ that want concurrency run the call from a goroutine of their own.
 
 For functions marked `cancellable: true` the C launcher gains a
 `weaveffi_cancel_token*` parameter. The Go wrapper passes `nil` for it
-and does not expose the token — only the C, C++, and Kotlin targets
+and doesn't expose the token; only the C, C++, and Kotlin targets
 surface cancellation tokens.
 
 ## Iterators
@@ -510,13 +510,13 @@ destroyed by the deferred `_destroy` call.
 
 ## Troubleshooting
 
-- **`undefined reference to weaveffi_*`** — `CGO_LDFLAGS` is missing
+- **`undefined reference to weaveffi_*`**: `CGO_LDFLAGS` is missing
   the `-l` flag or `-L` directory. Recheck the environment exports.
-- **`could not determine kind of name` in CGo** — ensure
+- **`could not determine kind of name` in CGo**: ensure
   `CGO_CFLAGS` points at the directory containing `weaveffi.h`.
-- **Crashes after struct goes out of scope** — Go does not call
+- **Crashes after struct goes out of scope**: Go doesn't call
   `Close()` for you. Either `defer s.Close()` or wrap usage in a
   helper that takes a closure.
-- **`go: cannot find module providing package weaveffi`** — change
+- **`go: cannot find module providing package weaveffi`**: change
   the generator config so `go.mod` declares the module path you
   actually import, e.g. `github.com/myorg/mylib`.

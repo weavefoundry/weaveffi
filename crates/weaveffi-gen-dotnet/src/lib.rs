@@ -4,6 +4,10 @@
 //! and idiomatic wrappers over the C ABI. Async functions surface as
 //! `Task<T>`-returning methods. Implements [`LanguageBackend`]; the shared
 //! driver bridges it into the generator pipeline.
+#![deny(missing_docs)]
+#![warn(clippy::missing_errors_doc)]
+#![warn(clippy::missing_panics_doc)]
+#![warn(clippy::doc_markdown)]
 
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
@@ -43,19 +47,26 @@ pub struct DotnetConfig {
 }
 
 impl DotnetConfig {
+    /// Returns the configured C# namespace, falling back to `"WeaveFFI"`.
     pub fn namespace(&self) -> &str {
         self.namespace.as_deref().unwrap_or("WeaveFFI")
     }
 
+    /// Returns the configured C ABI symbol prefix, falling back to `"weaveffi"`.
     pub fn prefix(&self) -> &str {
         self.prefix.as_deref().unwrap_or("weaveffi")
     }
 
+    /// Returns the input IDL basename embedded in generated file headers,
+    /// falling back to `"weaveffi.yml"`.
     pub fn input_basename(&self) -> &str {
         self.input_basename.as_deref().unwrap_or("weaveffi.yml")
     }
 }
 
+/// .NET backend: emits a C# project (`.csproj` and `.nuspec`) of P/Invoke
+/// declarations and idiomatic wrappers over the C ABI exposed by the
+/// underlying cdylib.
 pub struct DotnetGenerator;
 
 impl LanguageBackend for DotnetGenerator {
@@ -750,7 +761,7 @@ fn render_rich_variant_factory(out: &mut String, enum_name: &str, v: &RichVarian
 }
 
 /// The builder slot's storage type and zero-value default. Scalars start at
-/// 0/false/""/empty, collections empty, optionals absent — the same contract
+/// 0/false/""/empty, collections empty, optionals absent, the same contract
 /// as the other backends, so unset fields lower to valid C arguments.
 fn cs_field_default(ty: &TypeRef) -> (String, String) {
     let t = cs_type(ty);

@@ -4,7 +4,7 @@
 // `Shape` handle-wrapper class, its per-variant factories (`Shape.circle(...)`),
 // the nested `Tag` discriminant + `tag` reader, and the per-variant field
 // getters (`circleRadius`, `rectangleWidth`/`rectangleHeight`, `labeledLabel`/
-// `labeledCount`) over every variant — unit (`Empty`), f64 (`Circle`), two f32
+// `labeledCount`) over every variant: unit (`Empty`), f64 (`Circle`), two f32
 // (`Rectangle`), and string + u8 (`Labeled`). Also drives the free functions
 // that take and return a `Shape` by opaque handle (`describe`, `scale`) plus the
 // expanded numerics (`sum_bytes`: list<u8> in, u64 out). Mirrors the C and C++

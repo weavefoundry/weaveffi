@@ -10,10 +10,19 @@ generate: build
 test:
     cargo test --workspace
 
-# Check formatting and lints
+# Check formatting and lints (clippy -D warnings also enforces the doc lints:
+# missing_docs, missing_errors_doc, missing_panics_doc, missing_safety_doc,
+# and doc_markdown)
 check:
     cargo fmt --all --check
     cargo clippy --workspace --all-targets -- -D warnings
+
+# Build the Rust API docs (rustdoc) and the mdBook site. Uses the same
+# RUSTDOCFLAGS as the CI rustdoc job so broken intra-doc links and missing
+# crate-level docs fail locally too.
+doc:
+    RUSTDOCFLAGS="-D rustdoc::all -D rustdoc::missing_crate_level_docs" cargo doc --workspace --no-deps
+    mdbook build docs
 
 # Format all code
 fmt:

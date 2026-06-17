@@ -2,8 +2,8 @@
 
 WeaveFFI follows [Semantic Versioning](https://semver.org/) once it reaches
 1.0.0. Until then it is in active pre-1.0 development and **any** surface area
-may change between minor versions. This page documents exactly what is — and
-isn't — covered, what the deprecation policy will look like post-1.0, and how
+may change between minor versions. This page documents exactly what is and
+isn't covered, what the deprecation policy will look like post-1.0, and how
 to bind your CI to a stable WeaveFFI workflow today.
 
 ## What semver covers (post-1.0)
@@ -64,7 +64,7 @@ Once we reach 1.0.0, breaking changes will follow this path:
    generators emit a native deprecation marker where the target language
    supports one (`#[deprecated]` in Rust, `@Deprecated` in Kotlin/Java,
    `@available(*, deprecated:)` in Swift, `[Obsolete]` in .NET, JSDoc
-   `@deprecated` in TypeScript, and so on — driven by the existing IDL
+   `@deprecated` in TypeScript, and so on, driven by the existing IDL
    `deprecated:` field).
 2. The deprecated feature continues to work for **at least one full minor
    version**.
@@ -86,7 +86,7 @@ in `crates/weaveffi-ir/src/ir.rs` is the source of truth.
 Pre-1.0, **only the current schema version is accepted**
 (`SUPPORTED_VERSIONS` contains exactly `CURRENT_SCHEMA_VERSION`). When a
 schema bump lands, update the `version` field in your IDL and adjust the
-document to the new schema — the changes are documented in `CHANGELOG.md`
+document to the new schema; the changes are documented in `CHANGELOG.md`
 with a "Migration" section. Post-1.0, schema bumps will ship with an
 automated migration tool and a widened `SUPPORTED_VERSIONS` window.
 
@@ -112,7 +112,7 @@ Practical consequences:
   same bytes for the same WeaveFFI version.
 
 If you ever observe non-determinism, please file an issue with the IDL
-that triggers it — it's a bug, not a quirk.
+that triggers it. It's a bug, not a quirk.
 
 ## The `weaveffi diff --check` workflow for downstream CI
 
@@ -130,7 +130,7 @@ weaveffi diff path/to/api.yml --out generated/ --check
 - **2** when at least one file differs (modified content),
 - **3** when files are missing or extra (a target was added/removed).
 
-It prints only the summary `+ N added, - M removed, ~ K modified` —
+It prints only the summary `+ N added, - M removed, ~ K modified`,
 suitable for CI logs without flooding the output.
 
 A typical GitHub Actions step:
@@ -148,7 +148,7 @@ guard.
 
 ## See also
 
-- [IDL Schema](reference/idl.md) — the type system the schema version
+- [IDL Schema](reference/idl.md): the type system the schema version
   governs.
-- [Getting Started](getting-started.md) — installation and the basic
+- [Getting Started](getting-started.md): installation and the basic
   workflow `diff --check` plugs into.

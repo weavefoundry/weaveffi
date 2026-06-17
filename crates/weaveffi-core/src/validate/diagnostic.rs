@@ -11,8 +11,13 @@ use miette::{Diagnostic, NamedSource, SourceSpan};
 /// underline the offending identifier in the input.
 #[derive(Debug)]
 pub struct ValidationDiagnostic {
+    /// The underlying validation error being rendered.
     pub error: ValidationError,
+    /// Named source snippet (filename plus contents), when an on-disk IDL was
+    /// supplied. `None` for in-memory APIs.
     pub src: Option<NamedSource<String>>,
+    /// Best-effort byte range of the offending identifier within `src`, used
+    /// to underline it. `None` when no span could be located.
     pub span: Option<SourceSpan>,
 }
 

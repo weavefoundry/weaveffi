@@ -6,6 +6,10 @@
 //! [`weaveffi-gen-c`](../weaveffi_gen_c/index.html). Implements
 //! [`LanguageBackend`]; the shared driver bridges it into the generator
 //! pipeline.
+#![deny(missing_docs)]
+#![warn(clippy::missing_errors_doc)]
+#![warn(clippy::missing_panics_doc)]
+#![warn(clippy::doc_markdown)]
 
 use camino::Utf8Path;
 use heck::{ToSnakeCase, ToUpperCamelCase};
@@ -53,27 +57,38 @@ pub struct CppConfig {
 }
 
 impl CppConfig {
+    /// Returns the configured C++ namespace, falling back to `"weaveffi"`.
     pub fn namespace(&self) -> &str {
         self.namespace.as_deref().unwrap_or("weaveffi")
     }
 
+    /// Returns the emitted header's filename, falling back to
+    /// `"weaveffi.hpp"`.
     pub fn header_name(&self) -> &str {
         self.header_name.as_deref().unwrap_or("weaveffi.hpp")
     }
 
+    /// Returns the C++ standard advertised in the generated `CMakeLists.txt`,
+    /// falling back to `"17"`.
     pub fn standard(&self) -> &str {
         self.standard.as_deref().unwrap_or("17")
     }
 
+    /// Returns the C ABI symbol prefix the C++ wrappers call into, falling
+    /// back to `"weaveffi"`.
     pub fn prefix(&self) -> &str {
         self.prefix.as_deref().unwrap_or("weaveffi")
     }
 
+    /// Returns the input IDL basename embedded in generated file headers,
+    /// falling back to `"weaveffi.yml"`.
     pub fn input_basename(&self) -> &str {
         self.input_basename.as_deref().unwrap_or("weaveffi.yml")
     }
 }
 
+/// C++ backend: emits an idiomatic RAII wrapper header (`weaveffi.hpp` by
+/// default) plus a `CMakeLists.txt` skeleton over the C ABI.
 pub struct CppGenerator;
 
 impl LanguageBackend for CppGenerator {
@@ -312,8 +327,8 @@ fn c_callback_result_params(ty: &TypeRef, module: &str, prefix: &str) -> Vec<Str
 
 // ── extern "C" block ──
 //
-// Rendered from the shared [`weaveffi_core::cabi`] model renderer — the exact
-// same declarations the C generator emits — so the C++ wrapper can never drift
+// Rendered from the shared [`weaveffi_core::cabi`] model renderer, the exact
+// same declarations the C generator emits, so the C++ wrapper can never drift
 // from the ABI it binds (iterators as opaque handles, listeners present, etc.).
 
 fn render_extern_c(out: &mut String, api: &Api, prefix: &str) {
@@ -595,7 +610,7 @@ fn render_cpp_rich_enum_class(out: &mut String, e: &EnumDef, abi_module: &str, p
 ///
 /// A C++ wrapper getter that returns one of these constructs it inline (e.g.
 /// `return Shape(...)`), which requires the returned class to be a *complete*
-/// type at that point — so the returned class must be defined first.
+/// type at that point, so the returned class must be defined first.
 fn collect_struct_deps(ty: &TypeRef, deps: &mut Vec<String>) {
     match ty {
         TypeRef::Struct(n) | TypeRef::TypedHandle(n) => deps.push(local_type_name(n).to_string()),

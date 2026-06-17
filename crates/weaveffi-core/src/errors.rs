@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use heck::{ToLowerCamelCase, ToShoutySnakeCase, ToUpperCamelCase};
 use weaveffi_ir::ir::{Api, Module};
 
-/// Canonical brand stem. Always `WeaveFFI` (uppercase `FFI`) — never the
+/// Canonical brand stem. Always `WeaveFFI` (uppercase `FFI`), never the
 /// `heck`-derived `Weaveffi` that several generators used to emit.
 pub const BRAND_STEM: &str = "WeaveFFI";
 

@@ -111,7 +111,7 @@ pub extern "C" fn weaveffi_greeter_hello(
 }
 
 // Emit the WeaveFFI C ABI runtime symbols (free_string, free_bytes,
-// error_clear, cancel_token_*) — one line per cdylib.
+// error_clear, cancel_token_*), one line per cdylib.
 abi::export_runtime!();
 ```
 
@@ -214,7 +214,7 @@ The generated `WeaveFFI` companion object loads the cdylib lazily and
 exposes:
 
 - `WeaveFFI.hello(name: String): String`
-- `WeaveFFI.greeting(name: String, lang: String): Long` — opaque
+- `WeaveFFI.greeting(name: String, lang: String): Long`: opaque
   handle that the `Greeting` wrapper consumes.
 
 `Greeting` implements `Closeable`; either call `.close()` or use
@@ -250,7 +250,7 @@ generated bindings around.
 
 - See the [Android generator reference](../generators/android.md) for
   the full type mapping and JNI conventions.
-- Read [Error Handling](../guides/errors.md) — JNI shims convert C
+- Read [Error Handling](../guides/errors.md): JNI shims convert C
   errors to `RuntimeException` automatically.
 - Try the [Calculator tutorial](calculator.md) for a simpler
   end-to-end walkthrough or [Swift iOS](swift.md) for a sibling

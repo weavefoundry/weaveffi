@@ -4,6 +4,10 @@
 //! bindings over the C ABI for use in Flutter and Dart projects.
 //! Implements [`LanguageBackend`]; the shared driver bridges it into the
 //! generator pipeline.
+#![deny(missing_docs)]
+#![warn(clippy::missing_errors_doc)]
+#![warn(clippy::missing_panics_doc)]
+#![warn(clippy::doc_markdown)]
 
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToSnakeCase, ToUpperCamelCase};
@@ -37,19 +41,26 @@ pub struct DartConfig {
 }
 
 impl DartConfig {
+    /// Returns the configured Dart package name, falling back to `"weaveffi"`.
     pub fn package_name(&self) -> &str {
         self.package_name.as_deref().unwrap_or("weaveffi")
     }
 
+    /// Returns the configured C ABI symbol prefix, falling back to
+    /// `"weaveffi"`.
     pub fn prefix(&self) -> &str {
         self.prefix.as_deref().unwrap_or("weaveffi")
     }
 
+    /// Returns the input IDL basename embedded in generated file headers,
+    /// falling back to `"weaveffi.yml"`.
     pub fn input_basename(&self) -> &str {
         self.input_basename.as_deref().unwrap_or("weaveffi.yml")
     }
 }
 
+/// Dart backend: emits a Dart package (`pubspec.yaml` plus library) with
+/// `dart:ffi` bindings over the C ABI.
 pub struct DartGenerator;
 
 impl LanguageBackend for DartGenerator {
@@ -880,8 +891,8 @@ fn emit_field_getter_typedef(out: &mut String, field: &FieldBinding) {
 }
 
 /// Emit the idiomatic Dart getter for one opaque-object field. The member name
-/// comes from `field.name` — so a rich enum can namespace it per variant (e.g.
-/// `circleRadius`) by passing a renamed [`FieldBinding`] — while the FFI lookup
+/// comes from `field.name`, so a rich enum can namespace it per variant (e.g.
+/// `circleRadius`) by passing a renamed [`FieldBinding`], while the FFI lookup
 /// stays keyed on the precomputed `getter_symbol`. Receiver is the wrapper's
 /// `_handle`, common to both the struct and rich-enum classes.
 fn emit_field_getter_method(out: &mut String, field: &FieldBinding) {
@@ -1024,7 +1035,7 @@ fn render_dart_builder(out: &mut String, s: &StructBinding) {
 
 /// Render a rich (algebraic) enum as an opaque-object wrapper, mirroring the
 /// Dart struct wrapper: it owns the C handle behind a private `_handle` (so the
-/// existing function marshalling — `x._handle` in, `Name._(result)` out — keeps
+/// existing function marshalling, `x._handle` in, `Name._(result)` out, keeps
 /// working unchanged, since a rich enum lowers to `TypeRef::Struct`), frees it
 /// once in `dispose()`, and exposes a `tag` discriminant reader, one `factory`
 /// per variant (`Shape.circle(2.5)`), and per-variant field getters namespaced
@@ -1130,7 +1141,7 @@ fn render_rich_enum_tag(out: &mut String, e: &EnumBinding, tag_name: &str) {
 /// Project a variant's fields into [`FieldBinding`]s whose Dart member name is
 /// namespaced by the variant (`circle` + `radius` -> `circle_radius`, rendered
 /// `circleRadius`). The precomputed `getter_symbol` is left untouched, so the
-/// FFI lookup still targets the correct per-variant C symbol — this is what lets
+/// FFI lookup still targets the correct per-variant C symbol; this is what lets
 /// the rich enum reuse the struct field-getter renderers verbatim.
 fn namespaced_variant_fields(v: &RichVariantBinding) -> Vec<FieldBinding> {
     let variant = v.name.to_snake_case();

@@ -21,8 +21,8 @@ use weaveffi_ir::ir::{Api, Module, TypeRef};
 
 /// An IDL feature whose support varies (or could vary) per target.
 ///
-/// Core types — scalars, strings, bytes, structs, enums, optionals, lists,
-/// maps, handles — are mandatory for every backend and are not gated.
+/// Core types (scalars, strings, bytes, structs, enums, optionals, lists,
+/// maps, handles) are mandatory for every backend and are not gated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Feature {
     /// `async: true` functions (callback-completed launchers).
@@ -36,6 +36,7 @@ pub enum Feature {
 }
 
 impl Feature {
+    /// Every gated feature, for exhaustive iteration in checks and tests.
     pub const ALL: [Feature; 4] = [
         Feature::AsyncFunctions,
         Feature::Callbacks,
@@ -68,9 +69,13 @@ impl fmt::Display for Feature {
 /// supports explicitly so a new gated feature cannot be claimed by omission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TargetCapabilities {
+    /// Whether the target generates `async: true` functions.
     pub async_functions: bool,
+    /// Whether the target generates module-level callback typedefs.
     pub callbacks: bool,
+    /// Whether the target generates listener register/unregister pairs.
     pub listeners: bool,
+    /// Whether the target generates `iter<T>` returns.
     pub iterators: bool,
 }
 
@@ -86,6 +91,7 @@ impl TargetCapabilities {
         }
     }
 
+    /// Whether this set includes `feature`.
     pub const fn supports(&self, feature: Feature) -> bool {
         match feature {
             Feature::AsyncFunctions => self.async_functions,
@@ -171,6 +177,13 @@ impl fmt::Display for UnsupportedFeatures {
 
 /// Check `api` against one target's declared capabilities. `Ok(())` when the
 /// target supports every feature the API uses.
+///
+/// # Errors
+///
+/// Returns [`UnsupportedFeatures`] when `api` uses one or more gated features
+/// that `caps` does not declare support for. The error carries every offending
+/// feature paired with the IDL paths that use it, so the caller can report all
+/// violations at once.
 pub fn check(
     api: &Api,
     target: &str,

@@ -41,7 +41,7 @@ into any CMake build.
 | `T?`         | `std::optional<T>`                   | `const std::optional<T>&`   |
 | `[T]`        | `std::vector<T>`                     | `const std::vector<T>&`     |
 | `{K: V}`     | `std::unordered_map<K, V>`           | `const std::unordered_map<K, V>&` |
-| `iter<T>`    | `std::vector<T>` (return only; see [Iterators](#iterators)) | — |
+| `iter<T>`    | `std::vector<T>` (return only; see [Iterators](#iterators)) | n/a |
 
 ## Example IDL → generated code
 
@@ -178,7 +178,7 @@ try {
 
 ## Rich (algebraic) enums
 
-An enum whose variants declare `fields` is a *rich* (algebraic) enum — a sum
+An enum whose variants declare `fields` is a *rich* (algebraic) enum, a sum
 type with associated data. Plain C-style enums stay `enum class`; a rich enum
 instead becomes an opaque RAII wrapper class with the same ownership model as a
 struct wrapper, plus a nested `Tag`, static factory methods, and per-variant
@@ -229,7 +229,7 @@ weaveffi::Shape bigger = weaveffi::shapes_scale(shape, 3.0);
 
 Ownership follows the struct-wrapper rules: the destructor calls
 `weaveffi_shapes_Shape_destroy`, copies are deleted, and moves transfer the
-handle — no manual free required.
+handle, no manual free required.
 
 ## Build instructions
 
@@ -407,19 +407,19 @@ inline std::vector<std::string> events_get_messages() {
 }
 ```
 
-Iteration is eager — the full sequence is materialized before the
+Iteration is eager; the full sequence is materialized before the
 wrapper returns. Drop to the C ABI (`_next`/`_destroy`) if you need
 streaming consumption.
 
 ## Troubleshooting
 
-- **`undefined reference to weaveffi_*`** — link against the Rust
+- **`undefined reference to weaveffi_*`**: link against the Rust
   cdylib. The header alone is not enough.
-- **Double-free crashes** — RAII wrappers delete copy operators on
+- **Double-free crashes**: RAII wrappers delete copy operators on
   purpose. If you see double-frees, somewhere you have a manual copy or
   a raw `void*` shared between wrappers.
-- **Exceptions not caught across DLL boundaries on MSVC** — build the
+- **Exceptions not caught across DLL boundaries on MSVC**: build the
   consumer and the dynamically loaded library with the same
   `_HAS_EXCEPTIONS` setting and CRT.
-- **`std::optional` is missing** — the header requires C++17. Add
+- **`std::optional` is missing**: the header requires C++17. Add
   `target_compile_features(... cxx_std_17)` to your CMake target.

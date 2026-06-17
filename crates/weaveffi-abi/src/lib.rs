@@ -1,4 +1,8 @@
 //! C ABI runtime: error struct, memory helpers, and utility functions.
+#![deny(missing_docs)]
+#![warn(clippy::missing_errors_doc)]
+#![warn(clippy::missing_panics_doc)]
+#![warn(clippy::doc_markdown)]
 #![allow(non_camel_case_types)]
 #![allow(unsafe_code)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -25,7 +29,10 @@ pub type weaveffi_handle_t = u64;
 #[repr(C)]
 #[derive(Debug)]
 pub struct weaveffi_error {
+    /// Status code. `0` means success; any non-zero value indicates failure.
     pub code: i32,
+    /// Owned, NUL-terminated UTF-8 message describing the failure, or null when
+    /// [`code`](Self::code) is `0`. Freed by `weaveffi_error_clear`.
     pub message: *const c_char,
 }
 
@@ -54,6 +61,9 @@ pub fn error_set_ok(out_err: *mut weaveffi_error) {
 }
 
 /// Populate an error with the given code and message (copying message).
+// `CString::new` is infallible here because interior NUL bytes are stripped
+// from `message` immediately below, so there is no reachable panic to document.
+#[allow(clippy::missing_panics_doc)]
 pub fn error_set(out_err: *mut weaveffi_error, code: i32, message: &str) {
     if out_err.is_null() {
         return;
@@ -89,6 +99,9 @@ pub fn result_to_out_err<T, E: std::fmt::Display>(
 
 /// Allocate a new C string from a Rust string, returning an owned pointer.
 /// Caller must later free with `weaveffi_free_string` or `weaveffi_error_clear`.
+// `CString::new` is infallible here because interior NUL bytes are stripped
+// before the call, so there is no reachable panic to document.
+#[allow(clippy::missing_panics_doc)]
 pub fn string_to_c_ptr(s: impl AsRef<str>) -> *const c_char {
     let s = s.as_ref();
     let sanitized = if s.as_bytes().contains(&0) {

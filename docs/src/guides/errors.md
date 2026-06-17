@@ -164,7 +164,7 @@ value after each call:
 ```javascript
 const result = instance.exports.weaveffi_contacts_get_contact(id);
 if (result === 0) {
-    console.error("call failed — inspect log");
+    console.error("call failed: inspect log");
 }
 ```
 
@@ -205,18 +205,18 @@ on `err.message`.
 
 ## Pitfalls
 
-- **Forgetting to call `weaveffi_error_clear`** — the message is
+- **Forgetting to call `weaveffi_error_clear`**: the message is
   Rust-allocated. Skipping the clear leaks the string.
-- **Reading `err.message` after clearing** — the pointer is invalid as
+- **Reading `err.message` after clearing**: the pointer is invalid as
   soon as `weaveffi_error_clear` returns.
-- **Using `code = 0` as a domain value** — the validator rejects this
+- **Using `code = 0` as a domain value**: the validator rejects this
   because `0` always means success.
 - **Reusing custom codes across modules and assuming they are
-  unique** — error domains are scoped to a single module. Document
+  unique**: error domains are scoped to a single module. Document
   cross-module conventions if you need them.
-- **Not initialising the struct** — always start with
+- **Not initialising the struct**: always start with
   `{0, NULL}` (or the language equivalent). Stale `code` values from
   earlier calls produce confusing failures.
-- **Ignoring the return value when `code != 0`** — Rust does not
+- **Ignoring the return value when `code != 0`**: Rust does not
   promise the return value is meaningful on failure. For pointer
   returns it is typically `NULL`; do not free it.

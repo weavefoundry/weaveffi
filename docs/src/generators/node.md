@@ -117,7 +117,7 @@ export function contacts_get_tags(contact_id: number): string[]
 
 A *rich* (algebraic) enum is a sum type whose variants carry associated
 data. A plain C-style enum stays a numeric TypeScript `enum`, but a rich
-enum lowers to an **opaque object handle** at the C ABI — exactly like a
+enum lowers to an **opaque object handle** at the C ABI, exactly like a
 struct. The loader layers an idiomatic wrapper `class` on top of the raw
 native bindings, and that class owns the native pointer.
 
@@ -180,9 +180,9 @@ Shape.Tag = Object.freeze({ Empty: 0, Circle: 1, Rectangle: 2, Labeled: 3 });
 
 The active variant is read with `tag()` and compared against the frozen
 `Shape.Tag` map (`{ Empty: 0, Circle: 1, Rectangle: 2, Labeled: 3 }`).
-Each variant field is a getter named `<variant><Field>` —
-`circleRadius`, `rectangleWidth`, `rectangleHeight`, `labeledLabel`,
-`labeledCount` — delegating to the matching native accessor (e.g.
+Each variant field is a getter named `<variant><Field>`
+(`circleRadius`, `rectangleWidth`, `rectangleHeight`, `labeledLabel`,
+`labeledCount`), delegating to the matching native accessor (e.g.
 `addon.shapes_Shape_circle_get_radius(this._handle)`). Free functions
 that take or return the enum accept the wrapper directly:
 `shapes_describe(shape)` unwraps `shape._handle`, and
@@ -215,8 +215,8 @@ export namespace Shape {
 }
 ```
 
-A short round-trip — construct a couple of variants, read the tag and a
-field, call `describe` / `scale`, then release the handles:
+A short round-trip that constructs a couple of variants, reads the tag and a
+field, calls `describe` / `scale`, then releases the handles:
 
 ```js
 const { Shape, shapes_describe, shapes_scale } = require('./index.js');
@@ -231,7 +231,7 @@ if (circle.tag() === Shape.Tag.Circle) {
 console.log(shapes_describe(circle)); // native-rendered description
 const bigger = shapes_scale(circle, 3.0); // a fresh Shape
 
-// Done with the handles — release the native objects.
+// Done with the handles, release the native objects.
 circle.destroy();
 label.destroy();
 bigger.destroy();
@@ -240,7 +240,7 @@ bigger.destroy();
 **Ownership:** each `Shape` owns its native object. Call `destroy()` when
 you are finished to free it deterministically; if you forget, the
 `FinalizationRegistry` calls `shapes_Shape_destroy` once the wrapper is
-garbage-collected — but GC timing is not guaranteed, so prefer an
+garbage-collected, but GC timing isn't guaranteed, so prefer an
 explicit `destroy()`.
 
 ## Build instructions
@@ -383,15 +383,15 @@ Threading caveats:
 
 ## Troubleshooting
 
-- **`Error: Cannot find module './index.node'`** — no addon binary was
+- **`Error: Cannot find module './index.node'`**: no addon binary was
   found at either loader path. Run `npm install` in `generated/node/`
   to build the generated addon with node-gyp, or copy a prebuilt
   binary in as `index.node`.
-- **`dlopen: ... image not found`** — the addon links against the
+- **`dlopen: ... image not found`**: the addon links against the
   Rust cdylib at runtime; set `DYLD_LIBRARY_PATH` /
   `LD_LIBRARY_PATH` or copy the cdylib next to `index.node`.
-- **`BigInt` errors with `handle`** — handles are 64-bit; pass them as
+- **`BigInt` errors with `handle`**: handles are 64-bit; pass them as
   `bigint`, not `number`.
-- **TypeScript complains about missing types** — point `tsconfig`'s
+- **TypeScript complains about missing types**: point `tsconfig`'s
   `paths` at `generated/node/types.d.ts` or include the generated
   package in `compilerOptions.types`.

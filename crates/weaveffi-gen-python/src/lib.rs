@@ -4,6 +4,10 @@
 //! `.pyi` type stubs over the C ABI. Async functions surface as
 //! `async def` wrappers. Implements [`LanguageBackend`]; the shared driver
 //! bridges it into the generator pipeline.
+#![deny(missing_docs)]
+#![warn(clippy::missing_errors_doc)]
+#![warn(clippy::missing_panics_doc)]
+#![warn(clippy::doc_markdown)]
 
 use camino::Utf8Path;
 use heck::ToSnakeCase;
@@ -44,19 +48,25 @@ pub struct PythonConfig {
 }
 
 impl PythonConfig {
+    /// Returns the configured Python package name, falling back to `"weaveffi"`.
     pub fn package_name(&self) -> &str {
         self.package_name.as_deref().unwrap_or("weaveffi")
     }
 
+    /// Returns the configured C ABI symbol prefix, falling back to `"weaveffi"`.
     pub fn prefix(&self) -> &str {
         self.prefix.as_deref().unwrap_or("weaveffi")
     }
 
+    /// Returns the input IDL basename embedded in generated file headers,
+    /// falling back to `"weaveffi.yml"`.
     pub fn input_basename(&self) -> &str {
         self.input_basename.as_deref().unwrap_or("weaveffi.yml")
     }
 }
 
+/// Python backend: emits a pip-installable package of `ctypes` bindings and
+/// `.pyi` type stubs over the C ABI exposed by the underlying cdylib.
 pub struct PythonGenerator;
 
 impl PythonGenerator {
@@ -90,7 +100,7 @@ impl PythonGenerator {
             );
         }
         // The model is a flat, pre-order list of modules, each carrying its
-        // joined symbol path — the same traversal order the recursive walk
+        // joined symbol path, the same traversal order the recursive walk
         // produced.
         for m in &model.modules {
             out.push_str(&format!("\n\n# === Module: {} ===", m.path));
@@ -1972,7 +1982,7 @@ fn render_pyi_enum(out: &mut String, e: &EnumBinding) {
 
 /// `.pyi` stub for a rich (algebraic) enum: a class with a nested `Tag`
 /// `IntEnum`, the `tag` reader, a factory classmethod per variant, and the
-/// namespaced per-variant field properties — mirroring [`render_rich_enum`].
+/// namespaced per-variant field properties, mirroring [`render_rich_enum`].
 fn render_pyi_rich_enum(out: &mut String, e: &EnumBinding) {
     let Some(rich) = e.rich.as_ref() else {
         return;

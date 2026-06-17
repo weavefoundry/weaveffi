@@ -1,7 +1,7 @@
 //! The canonical WeaveFFI C ABI model.
 //!
 //! This module is the single source of truth for *how a validated `Api`
-//! lowers onto the stable C ABI* — which symbols exist, the exact ordered
+//! lowers onto the stable C ABI*: which symbols exist, the exact ordered
 //! parameter list of each, and how every [`TypeRef`] crosses the boundary
 //! (by value, as a pointer, as `ptr`+`len`, as parallel `keys`/`values`
 //! arrays, with a trailing `out_err`, …).
@@ -29,7 +29,10 @@ use weaveffi_ir::ir::{Function, Param, TypeRef};
 /// C return type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbiSig {
+    /// Ordered C parameter slots, including any trailing out-parameters and the
+    /// final `out_err`.
     pub params: Vec<AbiParam>,
+    /// The C return type.
     pub ret: CType,
 }
 

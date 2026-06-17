@@ -3,8 +3,8 @@
 ## Overview
 
 The Ruby target produces pure-Ruby FFI bindings using the
-[ffi](https://github.com/ffi/ffi) gem to call the C ABI directly. There
-is no native extension to compile — `gem install ffi` is the only
+[ffi](https://github.com/ffi/ffi) gem to call the C ABI directly. There's
+no native extension to compile; `gem install ffi` is the only
 prerequisite. The generator emits a single `.rb` file plus a `gemspec`
 ready for `gem build` and `gem install`.
 
@@ -219,7 +219,7 @@ A rich (algebraic) enum is a sum type whose variants carry associated
 data. A plain C-style `Enum` crosses as a bare `:int32` discriminant; a
 rich enum instead lowers to an **opaque object handle**, so the
 generator emits a wrapper class with the same ownership model as a
-struct wrapper — an `FFI::AutoPointer` (`ShapePtr`) that calls the C
+struct wrapper, an `FFI::AutoPointer` (`ShapePtr`) that calls the C
 `_destroy` on garbage collection.
 
 For a `Shape` enum with variants `Empty`, `Circle { radius: f64 }`,
@@ -412,7 +412,7 @@ mid-flight.
 
 For functions marked `cancellable: true` the C launcher takes an extra
 cancel-token parameter. The wrapper always passes `FFI::Pointer::NULL`
-for it — the token is not exposed (the generated comment reads
+for it. The token isn't exposed (the generated comment reads
 "cancellation token not exposed; pass-through is NULL"). Cancellation
 tokens are currently surfaced only by the C, C++, and Kotlin targets.
 
@@ -459,15 +459,15 @@ def self.unregister_message_listener(listener_id)
 end
 ```
 
-- **GC safety** — the `FFI::Function` trampoline is pinned in a
+- **GC safety**: the `FFI::Function` trampoline is pinned in a
   module-level registry (`@listener_refs`), keyed by subscription id,
   so it cannot be garbage-collected while the producer may still call
   it. Unregistering deletes the registry entry.
-- **Subscription ids** — registration returns the `uint64` id produced
+- **Subscription ids**: registration returns the `uint64` id produced
   by `weaveffi_events_register_message_listener(fn, context)`; pass it
   to `unregister_message_listener` to stop delivery and release the
   trampoline.
-- **Threading** — the callback fires on the producer's thread, not the
+- **Threading**: the callback fires on the producer's thread, not the
   thread that registered it. Do not block inside it; marshal results
   to your own thread or event loop (a `Queue` works well).
 
@@ -484,7 +484,7 @@ WeaveFFI.unregister_message_listener(id)
 Functions returning `iter<T>` receive an opaque iterator handle from
 the C ABI. The wrapper drains it eagerly with the generated `_next`
 binding, frees each returned string, destroys the handle, and returns
-a fully materialised `Array` — there is no lazy `Enumerator`:
+a fully materialised `Array`; there's no lazy `Enumerator`:
 
 ```ruby
 attach_function :weaveffi_events_get_messages, [:pointer], :pointer
@@ -521,18 +521,18 @@ handle is destroyed before the array is returned.
 
 ## Troubleshooting
 
-- **`LoadError: Could not open library 'libweaveffi.dylib'`** — the
+- **`LoadError: Could not open library 'libweaveffi.dylib'`**: the
   cdylib is not on the loader path. Set `DYLD_LIBRARY_PATH` /
   `LD_LIBRARY_PATH` or copy the library next to your script.
-- **`FFI::NotFoundError: Function 'weaveffi_*' not found`** — the
+- **`FFI::NotFoundError: Function 'weaveffi_*' not found`**: the
   cdylib does not export the symbol. Rebuild the Rust crate after
   regenerating the IDL.
-- **Segmentation faults on Ruby exit** — the generated wrappers pin
+- **Segmentation faults on Ruby exit**: the generated wrappers pin
   listener trampolines in `@listener_refs` and keep async completion
   callbacks referenced until they fire. If you call the
   `attach_function` bindings directly, keep your own `FFI::Function`
   objects alive for the lifetime of the call; letting them be
   garbage-collected mid-call corrupts the C side.
-- **Strings come back as binary garbage** — UTF-8 strings should round
+- **Strings come back as binary garbage**: UTF-8 strings should round
   trip through `read_string`; for binary data use
   `read_bytes(length)` with the `out_len` returned by the C ABI.

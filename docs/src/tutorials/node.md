@@ -105,12 +105,12 @@ pub extern "C" fn weaveffi_greeter_hello(
 }
 
 // Emit the WeaveFFI C ABI runtime symbols (free_string, free_bytes,
-// error_clear, cancel_token_*) — one line per cdylib.
+// error_clear, cancel_token_*), one line per cdylib.
 abi::export_runtime!();
 ```
 
 Use `scaffold.rs` for the rest of the API. You also need an N-API
-addon crate that bridges Node's runtime to the C ABI — see
+addon crate that bridges Node's runtime to the C ABI. See
 `samples/node-addon` in the WeaveFFI repository for a working example
 to copy.
 

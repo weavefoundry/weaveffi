@@ -62,7 +62,7 @@ return String(cString: raw!)
 ### Byte buffers
 
 Byte buffers are returned as `const uint8_t*` plus an `out_len`. Free
-them with `weaveffi_free_bytes(ptr, len)` — the length must match what
+them with `weaveffi_free_bytes(ptr, len)`; the length must match what
 the C ABI returned.
 
 ```c
@@ -87,7 +87,7 @@ Structs are opaque on the consumer side. The lifecycle is:
    `f64`, `bool`) return values directly. String/bytes getters return
    **new owned copies** that must be freed.
 
-Functions that take a `handle<T>` parameter always **borrow** it — the
+Functions that take a `handle<T>` parameter always **borrow** it: the
 producer must never free a handle it receives, even for `close`-style
 functions. The only function that frees a handle is its `*_destroy`
 symbol. Generated wrappers call `*_destroy` automatically (Swift
@@ -159,7 +159,7 @@ exceptions (`throw`, `raise`, `Result::Err`).
 Generated FFI functions are expected to be called from a **single
 thread** unless the module's documentation says otherwise. Concurrent
 calls from multiple threads can cause data races and undefined
-behaviour. Synchronise externally — for example with a mutex or a
+behaviour. Synchronise externally, for example with a mutex or a
 serial dispatch queue:
 
 ```swift
@@ -181,20 +181,20 @@ queue.sync {
 
 ## Pitfalls
 
-- **Use-after-free** — reading a string after freeing it, or accessing
+- **Use-after-free**: reading a string after freeing it, or accessing
   a struct after `_destroy`. Once the consumer frees something, the
   pointer is invalid.
-- **Double-free** — freeing the same pointer twice (e.g. calling
+- **Double-free**: freeing the same pointer twice (e.g. calling
   `weaveffi_free_string` twice or invoking `_destroy` after the wrapper
   has already done so).
-- **Wrong length to `weaveffi_free_bytes`** — always free with the
+- **Wrong length to `weaveffi_free_bytes`**: always free with the
   exact length the C ABI returned in `out_len`.
-- **Forgetting to clear error structs** — `err.message` is
+- **Forgetting to clear error structs**: `err.message` is
   Rust-allocated; failing to call `weaveffi_error_clear` after a
   non-zero code leaks that string.
-- **Calling FFI from multiple threads without synchronisation** — the
+- **Calling FFI from multiple threads without synchronisation**: the
   default contract is single-threaded; synchronise externally if you
   need parallelism.
-- **Manually freeing pointers passed in as borrowed parameters** —
+- **Manually freeing pointers passed in as borrowed parameters**:
   borrowed inputs (`&str`, `&[u8]`, `const T*`) are owned by the
   caller and must not be passed to `weaveffi_free_*`.

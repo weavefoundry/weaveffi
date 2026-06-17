@@ -16,9 +16,9 @@ real-world pattern for a new generator.
 **What it demonstrates:**
 
 - Typed handles (`handle<Store>`) for opaque resource lifecycle
-- A struct (`Entry`) with every primitive — `i64`, `string`, `bytes`, optional
+- A struct (`Entry`) with every primitive: `i64`, `string`, `bytes`, optional
   field (`expires_at: i64?`), list field (`tags: [string]`), and map field
-  (`metadata: {string:string}`) — plus per-field doc strings and `builder: true`
+  (`metadata: {string:string}`), plus per-field doc strings and `builder: true`
 - A documented enum (`EntryKind` with `Volatile`, `Persistent`, `Encrypted`)
 - A documented error domain (`KvError` with `KEY_NOT_FOUND`, `EXPIRED`,
   `STORE_FULL`, `IO_ERROR`)
@@ -51,16 +51,16 @@ bindings and the produced `libkvstore` cdylib; see `examples/run_all.sh`.
 
 Path: `samples/shapes`
 
-The reference sample for **rich (algebraic) enums** — sum types whose variants
-carry associated data — and the **expanded numeric primitives**. Use it when
+The reference sample for **rich (algebraic) enums** (sum types whose variants
+carry associated data) and the **expanded numeric primitives**. Use it when
 learning how a tagged union crosses the C ABI as an opaque object and how each
 backend wraps it.
 
 **What it demonstrates:**
 
 - A rich enum (`Shape`) with a data-less variant (`Empty`) and three payload
-  variants — `Circle { radius: f64 }`, `Rectangle { width: f32, height: f32 }`,
-  and `Labeled { label: string, count: u8 }` — lowered to an opaque object with
+  variants (`Circle { radius: f64 }`, `Rectangle { width: f32, height: f32 }`,
+  and `Labeled { label: string, count: u8 }`) lowered to an opaque object with
   per-variant constructors, a `tag` reader, per-variant field getters, and a
   destructor
 - A plain C-style enum (`Channel`) alongside the rich enum, showing both enum
@@ -86,7 +86,7 @@ constructs each variant, reads the tag and fields back, and round-trips through
 
 Path: `samples/calculator`
 
-The simplest sample — a single module with four functions that exercise
+The simplest sample: a single module with four functions that exercise
 primitive types (`i32`) and string passing. Good starting point for
 understanding the basic C ABI contract.
 

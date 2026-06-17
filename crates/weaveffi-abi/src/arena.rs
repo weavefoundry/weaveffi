@@ -9,6 +9,7 @@ pub struct HandleArena {
 }
 
 impl HandleArena {
+    /// Create an empty arena with no registered handles.
     pub fn new() -> Self {
         Self {
             handles: Vec::new(),

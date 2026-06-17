@@ -1,4 +1,4 @@
-//! `weaveffi doctor` — probe the host for the toolchains each language target
+//! `weaveffi doctor`: probe the host for the toolchains each language target
 //! needs (compilers, SDKs, Rust cross-targets, …) and report what is present.
 //!
 //! Each probe yields a [`DoctorCheck`]; `--format json` serializes the raw

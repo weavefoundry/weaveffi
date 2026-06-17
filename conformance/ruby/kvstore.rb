@@ -5,7 +5,7 @@
 # (Store), optional struct returns (Entry or nil) with bytes / optional-scalar
 # / list / map getters, the fluent EntryBuilder (list + map *input*
 # marshalling), the iterator-backed list_keys, the *cross-module*
-# `Kvstore.get_stats(store)` (Stats lives in kv.stats, store is a kv.Store —
+# `Kvstore.get_stats(store)` (Stats lives in kv.stats, store is a kv.Store;
 # the wrapper must dispatch to `weaveffi_kv_stats_get_stats`), the
 # FFI::Function eviction listener (register -> fire on delete -> unregister),
 # and the blocking thread+queue compact_async bridge. The cdylib is selected

@@ -5,7 +5,7 @@
 Instead of hand-writing an IDL, you can annotate your Rust source with
 WeaveFFI marker attributes and let `weaveffi extract` produce the IDL
 for you. The result keeps the IDL co-located with the implementation
-and eliminates drift between the two — change the Rust signatures and
+and eliminates drift between the two: change the Rust signatures and
 re-run extract.
 
 ## When to use
@@ -20,7 +20,7 @@ Reach for `weaveffi extract` when:
 
 Skip extraction when:
 
-- You want to design the API before any Rust exists — author the IDL
+- You want to design the API before any Rust exists: author the IDL
   directly.
 - You need iterator return types (`iter<T>`), error domains, struct
   field defaults, or `since:` without an accompanying `#[deprecated]`
@@ -30,7 +30,7 @@ Skip extraction when:
 
 ### 1. Annotate the Rust source
 
-WeaveFFI recognises a small family of marker attributes by name only —
+WeaveFFI recognises a small family of marker attributes by name only;
 there is no proc-macro crate. Define them as no-op attribute macros, or
 add `#![allow(unused_attributes)]` and ignore the warning.
 
@@ -119,7 +119,7 @@ weaveffi extract src/api.rs | weaveffi generate -o generated
 ```
 
 The extracted IDL is validated automatically and **extraction fails
-loudly** if the result would not generate — for example a `handle<T>`
+loudly** if the result would not generate, for example a `handle<T>`
 whose target type the source never declares, a duplicate name, or a
 listener pointing at a missing callback. This prevents `extract` from
 emitting a silently-broken IDL. Pass `--warn` to downgrade those errors
@@ -208,7 +208,7 @@ Doc comments (`///`) on items, fields, and enum variants become the
 | `&mut T` (other)     | inner type, `mutable`    | `T`              |
 | Any other identifier | `Struct(name)`           | `name`           |
 
-Compositions work recursively — `Option<Vec<i32>>` becomes `[i32]?`
+Compositions work recursively: `Option<Vec<i32>>` becomes `[i32]?`
 and `Vec<Option<String>>` becomes `[string?]`.
 
 `&mut T` parameters are reduced to `T` and the surrounding [`Param`]

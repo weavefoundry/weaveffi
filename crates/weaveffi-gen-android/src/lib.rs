@@ -4,6 +4,10 @@
 //! bridge layer that calls into the C ABI. `suspend fun` shims are emitted
 //! for async functions. Implements [`LanguageBackend`]; the shared driver
 //! bridges it into the generator pipeline.
+#![deny(missing_docs)]
+#![warn(clippy::missing_errors_doc)]
+#![warn(clippy::missing_panics_doc)]
+#![warn(clippy::doc_markdown)]
 
 use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
@@ -45,19 +49,27 @@ pub struct AndroidConfig {
 }
 
 impl AndroidConfig {
+    /// Returns the configured JVM package, falling back to `"com.weaveffi"`.
     pub fn package(&self) -> &str {
         self.package.as_deref().unwrap_or("com.weaveffi")
     }
 
+    /// Returns the configured C ABI symbol prefix, falling back to
+    /// `"weaveffi"`.
     pub fn prefix(&self) -> &str {
         self.prefix.as_deref().unwrap_or("weaveffi")
     }
 
+    /// Returns the input IDL basename embedded in generated file headers,
+    /// falling back to `"weaveffi.yml"`.
     pub fn input_basename(&self) -> &str {
         self.input_basename.as_deref().unwrap_or("weaveffi.yml")
     }
 }
 
+/// Android backend: emits a Gradle project with a Kotlin wrapper over a JNI
+/// bridge layer that calls into the C ABI. `suspend fun` shims wrap async
+/// functions.
 pub struct AndroidGenerator;
 
 impl LanguageBackend for AndroidGenerator {
@@ -452,7 +464,7 @@ fn kotlin_public_type(t: &TypeRef) -> String {
 
 /// JNI exports map a Java identifier to a C symbol by escaping `_` to `_1`
 /// (plus `;`->`_2`, `[`->`_3`, and non-ASCII to `_0xxxx`). Our function names
-/// are snake_case, so the runtime lookup of `Java_<pkg>_<Class>_<method>` only
+/// are `snake_case`, so the runtime lookup of `Java_<pkg>_<Class>_<method>` only
 /// resolves when the `<method>` component is mangled this way.
 fn jni_mangle(ident: &str) -> String {
     let mut out = String::with_capacity(ident.len());
@@ -472,7 +484,7 @@ fn jni_mangle(ident: &str) -> String {
 
 /// Lower-camelCase an identifier (e.g. a PascalCase variant name) for use as a
 /// Kotlin factory method / property-prefix. Reuses [`pascal_case`] (which also
-/// normalizes snake_case) and then lowercases only the leading character, so
+/// normalizes `snake_case`) and then lowercases only the leading character, so
 /// `Circle` → `circle`, `rich_variant` → `richVariant`.
 fn lower_camel(s: &str) -> String {
     let pascal = pascal_case(s);
@@ -483,7 +495,7 @@ fn lower_camel(s: &str) -> String {
     }
 }
 
-/// True if `t` is a typed handle or struct, or an optional wrapping one —
+/// True if `t` is a typed handle or struct, or an optional wrapping one:
 /// the return shapes that re-wrap a raw JNI `Long` into a Kotlin class.
 fn is_class_wrapped_return(t: &TypeRef) -> bool {
     match t {
@@ -724,7 +736,7 @@ fn render_kotlin(
 
 fn render_kotlin_async_fun(out: &mut String, f: &FnBinding, func_name: &str) {
     // The private external launcher crosses into JNI C, which declares raw
-    // JNI types (`jlong` for handles/structs, `jint` for enums) — so the
+    // JNI types (`jlong` for handles/structs, `jint` for enums), so the
     // external signature must use the lowered types and the public suspend
     // wrapper must unwrap (`.handle` / `.value`) exactly like the sync path.
     // Passing a wrapper object where the C side reads a `jlong` is undefined
@@ -3751,7 +3763,7 @@ fn render_jni_struct(
     // during field/parameter marshalling.
     let prefix = &s.c_tag;
 
-    // nativeCreate — shared opaque-object constructor emitter (also used by rich
+    // nativeCreate: shared opaque-object constructor emitter (also used by rich
     // enums, one constructor per variant).
     render_jni_object_constructor(
         out,
@@ -3781,7 +3793,7 @@ fn render_jni_struct(
         let _ = writeln!(out, "}}\n");
     }
 
-    // nativeGet{Field} for each field — shared opaque-object getter emitter
+    // nativeGet{Field} for each field: shared opaque-object getter emitter
     // (also used by rich enums, namespaced per variant).
     for f in &s.fields {
         render_jni_object_getter(

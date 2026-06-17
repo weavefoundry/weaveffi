@@ -15,17 +15,17 @@ evaluate against it: **UniFFI**, **cbindgen**, **diplomat**, **SWIG**, and
 | Source language                    | Rust / C / C++ / Zig (anything with a C ABI) | Rust | Rust | Rust | C / C++ | C++ |
 | Input format                       | YAML / JSON / TOML IDL | UDL or proc-macro on Rust | Rust source (annotated) | Rust source (annotated) | C/C++ headers + `.i` interface | C++ headers |
 | **Languages**                      |              |            |              |              |          |             |
-| C                                  | ✓            | —          | ✓            | ✓            | ✓        | —           |
-| C++                                | ✓ (RAII, `std::optional/vector/unordered_map`) | — | ✓ (header) | ✓            | ✓        | ✓ (its purpose) |
-| Swift                              | ✓ (SwiftPM, `async/await`, `throws`) | ✓ | — | ✓ | — | — |
-| Kotlin / Android (JNI)             | ✓ (Kotlin + JNI shim + Gradle) | ✓ | — | — | ✓ (Java via JNI) | — |
-| Node.js                            | ✓ (N-API + `.d.ts`) | community add-on | — | — | ✓ (JavaScriptCore/V8) | — |
-| WebAssembly                        | ✓ (loader + `.d.ts`) | — | — | ✓ (JS via WASM) | — | — |
-| Python                             | ✓ (`ctypes` + `.pyi`) | ✓ | — | — | ✓ | — |
-| .NET / C#                          | ✓ (P/Invoke + `.csproj`) | ✓ (community) | — | — | ✓ | — |
-| Dart / Flutter                     | ✓ (`dart:ffi`)         | community | — | ✓ | — | — |
-| Go                                 | ✓ (CGo)                 | community | — | — | ✓ | — |
-| Ruby                               | ✓ (FFI gem)             | — | — | — | ✓ | — |
+| C                                  | ✓            | ✗          | ✓            | ✓            | ✓        | ✗           |
+| C++                                | ✓ (RAII, `std::optional/vector/unordered_map`) | ✗ | ✓ (header) | ✓            | ✓        | ✓ (its purpose) |
+| Swift                              | ✓ (SwiftPM, `async/await`, `throws`) | ✓ | ✗ | ✓ | ✗ | ✗ |
+| Kotlin / Android (JNI)             | ✓ (Kotlin + JNI shim + Gradle) | ✓ | ✗ | ✗ | ✓ (Java via JNI) | ✗ |
+| Node.js                            | ✓ (N-API + `.d.ts`) | community add-on | ✗ | ✗ | ✓ (JavaScriptCore/V8) | ✗ |
+| WebAssembly                        | ✓ (loader + `.d.ts`) | ✗ | ✗ | ✓ (JS via WASM) | ✗ | ✗ |
+| Python                             | ✓ (`ctypes` + `.pyi`) | ✓ | ✗ | ✗ | ✓ | ✗ |
+| .NET / C#                          | ✓ (P/Invoke + `.csproj`) | ✓ (community) | ✗ | ✗ | ✓ | ✗ |
+| Dart / Flutter                     | ✓ (`dart:ffi`)         | community | ✗ | ✓ | ✗ | ✗ |
+| Go                                 | ✓ (CGo)                 | community | ✗ | ✗ | ✓ | ✗ |
+| Ruby                               | ✓ (FFI gem)             | ✗ | ✗ | ✗ | ✓ | ✗ |
 | **Type system**                    |              |            |              |              |          |             |
 | Primitives + `string`              | ✓            | ✓          | ✓            | ✓            | ✓        | ✓           |
 | `bytes` / byte slices              | ✓            | ✓          | ✓ (raw)      | ✓            | partial  | ✓           |
@@ -33,29 +33,29 @@ evaluate against it: **UniFFI**, **cbindgen**, **diplomat**, **SWIG**, and
 | Enums w/ explicit discriminants    | ✓            | ✓          | ✓            | ✓            | ✓        | ✓           |
 | Optionals                          | ✓ (`T?`)     | ✓          | partial      | ✓            | partial  | ✓           |
 | Lists                              | ✓ (`[T]`)    | ✓          | partial      | ✓            | ✓        | ✓           |
-| Maps                               | ✓ (`{K:V}`)  | ✓          | —            | ✓            | partial  | partial     |
-| Typed handles (`handle<T>`)        | ✓            | ✓ (objects) | —          | ✓ (opaque)   | partial  | —           |
-| Borrowed types (`&str`, `&[u8]`)   | ✓            | partial    | ✓            | ✓            | —        | ✓           |
-| Iterators (`iter<T>`)              | ✓            | ✓ (callbacks) | —         | partial      | partial  | —           |
-| Async functions                    | ✓ (callback ABI + `async/await`/`Promise`/`suspend`/`Task<T>`) | ✓ | — | partial | — | — |
-| Cancellable futures                | ✓ (`weaveffi_cancel_token`) | partial | — | — | — | — |
-| Callbacks / event listeners        | ✓ (module-level) | ✓     | — (raw fn ptrs) | partial   | partial  | partial     |
+| Maps                               | ✓ (`{K:V}`)  | ✓          | ✗            | ✓            | partial  | partial     |
+| Typed handles (`handle<T>`)        | ✓            | ✓ (objects) | ✗          | ✓ (opaque)   | partial  | ✗           |
+| Borrowed types (`&str`, `&[u8]`)   | ✓            | partial    | ✓            | ✓            | ✗        | ✓           |
+| Iterators (`iter<T>`)              | ✓            | ✓ (callbacks) | ✗         | partial      | partial  | ✗           |
+| Async functions                    | ✓ (callback ABI + `async/await`/`Promise`/`suspend`/`Task<T>`) | ✓ | ✗ | partial | ✗ | ✗ |
+| Cancellable futures                | ✓ (`weaveffi_cancel_token`) | partial | ✗ | ✗ | ✗ | ✗ |
+| Callbacks / event listeners        | ✓ (module-level) | ✓     | ✗ (raw fn ptrs) | partial   | partial  | partial     |
 | Cross-module type references       | ✓            | ✓          | n/a          | ✓            | ✓        | ✓           |
 | Nested modules                     | ✓            | partial    | n/a          | ✓            | ✓        | ✓           |
 | **Workflow**                       |              |            |              |              |          |             |
 | Single-binary CLI install          | ✓ (`cargo install weaveffi-cli`) | ✓ | ✓ | ✓ | system package | ✓ |
 | Standalone publishable packages    | ✓ (npm, SwiftPM, pub.dev, NuGet, gem, etc.) | partial | n/a | partial | partial | n/a |
-| JSON Schema for IDL editor support | ✓            | —          | n/a          | n/a          | —        | n/a         |
+| JSON Schema for IDL editor support | ✓            | ✗          | n/a          | n/a          | ✗        | n/a         |
 | `extract` from annotated source    | ✓ (Rust)     | ✓ (proc-macro) | ✓ (Rust) | ✓ (Rust)    | n/a      | ✓ (C++)     |
-| `watch` mode                       | ✓            | —          | ✓ (`--watch`) | —          | —        | partial     |
-| `format` IDL canonicalizer         | ✓            | —          | n/a          | n/a          | —        | n/a         |
-| Custom template overrides          | —            | partial (Mako) | —        | partial      | ✓ (`%typemap`) | partial |
+| `watch` mode                       | ✓            | ✗          | ✓ (`--watch`) | ✗          | ✗        | partial     |
+| `format` IDL canonicalizer         | ✓            | ✗          | n/a          | n/a          | ✗        | n/a         |
+| Custom template overrides          | ✗            | partial (Mako) | ✗        | partial      | ✓ (`%typemap`) | partial |
 | Snapshot-tested generator output   | ✓            | ✓          | ✓            | ✓            | partial  | ✓           |
 | Maturity                           | pre-1.0      | 1.0+ in Mozilla shipping products | 1.0+ widely deployed | pre-1.0 | 30+ years, ubiquitous | pre-1.0 |
 | License                            | MIT OR Apache-2.0 | MPL-2.0 | MPL-2.0 | BSD-3-Clause | GPL with FOSS exception | MIT OR Apache-2.0 |
 
 Legend: ✓ = first-class support; *partial* = supported with caveats or via
-extensions; — = not supported; *n/a* = not applicable to that tool's scope.
+extensions; ✗ = not supported; *n/a* = not applicable to that tool's scope.
 
 ## Where competitors are stronger
 
@@ -66,7 +66,7 @@ We try hard to be honest about the trade-offs. Pick the right tool for the job:
   desktop. If you only need Swift, Kotlin, and Python today and you are
   comfortable with a UDL-or-proc-macro workflow, UniFFI is the safer choice.
 - **cbindgen is simpler if all you want is a C header.** WeaveFFI generates
-  a C header *and* ten other targets — if you only consume the C surface
+  a C header *and* ten other targets. If you only consume the C surface
   from C/C++ code, cbindgen has less ceremony, no IDL file, and a smaller
   dependency footprint.
 - **diplomat has a more polished C++ story.** Its C++ output uses richer
@@ -74,8 +74,8 @@ We try hard to be honest about the trade-offs. Pick the right tool for the job:
   C++ output is RAII-based and includes a `CMakeLists.txt`, but it's
   optimized for greenfield projects, not for slotting into a 20-year-old
   C++ build system.
-- **SWIG covers languages WeaveFFI doesn't.** Lua, Tcl, R, Octave, Perl, PHP
-  — if your target is exotic, SWIG probably has a generator. SWIG also
+- **SWIG covers languages WeaveFFI doesn't.** Lua, Tcl, R, Octave, Perl, PHP:
+  if your target is exotic, SWIG probably has a generator. SWIG also
   natively understands C and C++ headers, so you don't need to author an
   IDL at all.
 - **autocxx is unmatched for "wrap an existing C++ library."** It reads
@@ -96,20 +96,20 @@ WeaveFFI is the right pick when you want:
 
 1. **One source of truth for many languages.** If your library has to land
    in npm *and* SwiftPM *and* PyPI *and* NuGet *and* pub.dev *and* RubyGems
-   *and* a Go module *and* a Gradle artifact — that's the WeaveFFI sweet
+   *and* a Go module *and* a Gradle artifact, that's the WeaveFFI sweet
    spot. UniFFI covers a smaller subset out of the box; cbindgen and
    autocxx don't try.
 2. **Standalone, publishable consumer packages.** Generated packages are
    self-contained: a Swift consumer adds your `.xcframework` + a SwiftPM
    manifest and is done. No "install WeaveFFI" step on the consumer side.
 3. **A native library that isn't (only) Rust.** WeaveFFI works against
-   anything that exposes a stable C ABI — Rust (with `--scaffold`
+   anything that exposes a stable C ABI: Rust (with `--scaffold`
    convenience), C, C++, Zig, etc. UniFFI and diplomat assume Rust;
    autocxx assumes C++.
 4. **Idiomatic per-target output, not a lowest-common-denominator API.**
    Async functions become `async/await` in Swift, `Promise`s in Node,
-   `suspend fun` in Kotlin, `async def` in Python, and `Task<T>` in C#
-   — all from the same `async: true` flag in the IDL.
+   `suspend fun` in Kotlin, `async def` in Python, and `Task<T>` in C#,
+   all from the same `async: true` flag in the IDL.
 5. **A CLI workflow with `validate`, `lint`, `diff`, `watch`, and
    `format`.** WeaveFFI is built for monorepos and CI: every sub-command
    has a `--format json` output mode, and `diff --check` and
@@ -121,14 +121,14 @@ WeaveFFI is the right pick when you want:
 
 ## When to choose something else
 
-- **You only need Swift + Kotlin + Python and want maximum stability** —
+- **You only need Swift + Kotlin + Python and want maximum stability**:
   use UniFFI.
-- **You only need a C header for a Rust crate** — use cbindgen.
-- **You're wrapping a large existing C++ codebase** — use autocxx (or
+- **You only need a C header for a Rust crate**: use cbindgen.
+- **You're wrapping a large existing C++ codebase**: use autocxx (or
   cxx + bindgen directly).
-- **Your target language is Lua, Tcl, R, Octave, Perl, or PHP** — use SWIG.
+- **Your target language is Lua, Tcl, R, Octave, Perl, or PHP**: use SWIG.
 - **You need a battle-tested C++ binding generator with rich template
-  support** — use diplomat or SWIG.
+  support**: use diplomat or SWIG.
 
 ## Migrating to / from WeaveFFI
 

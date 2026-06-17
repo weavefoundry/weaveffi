@@ -87,9 +87,13 @@ pub struct IteratorBinding {
 /// One IR parameter, retained with its lowered ABI slots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParamBinding {
+    /// The parameter name as written in the IDL.
     pub name: String,
+    /// The idiomatic IR type a backend renders the parameter as.
     pub ty: TypeRef,
+    /// Whether the parameter is mutable (drops the `const` on its pointer slots).
     pub mutable: bool,
+    /// Optional doc comment carried from the IDL.
     pub doc: Option<String>,
     /// The ordered C ABI slots this single parameter expands into.
     pub abi: Vec<AbiParam>,
@@ -98,11 +102,17 @@ pub struct ParamBinding {
 /// A function, fully lowered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FnBinding {
+    /// The function name as written in the IDL.
     pub name: String,
+    /// Optional doc comment carried from the IDL.
     pub doc: Option<String>,
+    /// Deprecation message when the function is marked deprecated, else `None`.
     pub deprecated: Option<String>,
+    /// The version the function was introduced, when the IDL records one.
     pub since: Option<String>,
+    /// Whether an async function accepts a trailing `cancel_token` slot.
     pub cancellable: bool,
+    /// Whether the function is `async` (lowered as a callback-completed launcher).
     pub is_async: bool,
     /// IR input parameters with their lowered slots.
     pub params: Vec<ParamBinding>,
@@ -119,8 +129,11 @@ pub struct FnBinding {
 /// A struct field, retained with its getter symbol and lowered return.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldBinding {
+    /// The field name as written in the IDL.
     pub name: String,
+    /// Optional doc comment carried from the IDL.
     pub doc: Option<String>,
+    /// The idiomatic IR type of the field.
     pub ty: TypeRef,
     /// `{c_tag}_get_{field}`. Receiver is an implicit `const {c_tag}* ptr`; any
     /// `out_*` slots are in [`getter_out_params`](Self::getter_out_params).
@@ -153,10 +166,13 @@ pub struct BuilderBinding {
 /// A struct, fully lowered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructBinding {
+    /// The struct name as written in the IDL.
     pub name: String,
+    /// Optional doc comment carried from the IDL.
     pub doc: Option<String>,
-    /// `{prefix}_{module_path}_{name}` — the opaque tag.
+    /// `{prefix}_{module_path}_{name}`, the opaque tag.
     pub c_tag: String,
+    /// The struct's fields, each with its getter symbol and lowered slots.
     pub fields: Vec<FieldBinding>,
     /// `{c_tag}_create(<field slots>, error* out_err) -> {c_tag}*`.
     pub create: AbiFn,
@@ -170,13 +186,15 @@ pub struct StructBinding {
 ///
 /// A *C-style* enum (every variant a bare discriminant) carries only
 /// [`variants`](Self::variants) and crosses the ABI by value as an integer. An
-/// *algebraic* (sum-type) enum — at least one variant with associated data —
+/// *algebraic* (sum-type) enum, at least one variant with associated data,
 /// additionally carries [`rich`](Self::rich) and crosses the ABI as an opaque
 /// object pointer (tag getter + per-variant constructors and field getters +
 /// destructor), exactly like a struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumBinding {
+    /// The enum name as written in the IDL.
     pub name: String,
+    /// Optional doc comment carried from the IDL.
     pub doc: Option<String>,
     /// `{prefix}_{module_path}_{name}`.
     pub c_tag: String,
@@ -197,8 +215,11 @@ impl EnumBinding {
 /// A single enum variant with its precomputed C constant name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumVariantBinding {
+    /// The variant name as written in the IDL.
     pub name: String,
+    /// The variant's integer discriminant.
     pub value: i32,
+    /// Optional doc comment carried from the IDL.
     pub doc: Option<String>,
     /// `{enum_c_tag}_{variant}`.
     pub c_const: String,
@@ -208,7 +229,7 @@ pub struct EnumVariantBinding {
 /// how each variant is constructed and projected, and how the object is freed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RichEnumBinding {
-    /// `int32_t {tag_symbol}(const {c_tag}* self)` — returns the active
+    /// `int32_t {tag_symbol}(const {c_tag}* self)`: returns the active
     /// variant's discriminant (matching the per-variant
     /// [`c_const`](EnumVariantBinding::c_const) values).
     pub tag_symbol: String,
@@ -223,11 +244,13 @@ pub struct RichEnumBinding {
 /// associated data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RichVariantBinding {
+    /// The variant name as written in the IDL.
     pub name: String,
+    /// Optional doc comment carried from the IDL.
     pub doc: Option<String>,
     /// The variant's discriminant value (matches the tag getter's result).
     pub value: i32,
-    /// `{enum_c_tag}_{variant}` — the discriminant constant.
+    /// `{enum_c_tag}_{variant}`, the discriminant constant.
     pub c_const: String,
     /// `{c_tag}_{variant}_new(<field slots>, error* out_err) -> {c_tag}*`.
     /// A unit variant's constructor takes only `out_err`.
@@ -240,7 +263,9 @@ pub struct RichVariantBinding {
 /// A callback function-pointer typedef declared at module scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallbackBinding {
+    /// The callback name as written in the IDL.
     pub name: String,
+    /// Optional doc comment carried from the IDL.
     pub doc: Option<String>,
     /// `{prefix}_{module_path}_{name}_fn`.
     pub c_fn_type: String,
@@ -253,7 +278,9 @@ pub struct CallbackBinding {
 /// A listener: a register/unregister pair bound to a callback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListenerBinding {
+    /// The listener name as written in the IDL.
     pub name: String,
+    /// Optional doc comment carried from the IDL.
     pub doc: Option<String>,
     /// The callback this listener fires (name within the same module).
     pub event_callback: String,
@@ -268,16 +295,23 @@ pub struct ListenerBinding {
 /// One module, flattened with its underscore-joined symbol path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleBinding {
+    /// The module name (its final path segment).
     pub name: String,
     /// Path segments from the root (e.g. `["outer", "inner"]`).
     pub segments: Vec<String>,
     /// Underscore-joined path used as the C symbol segment (e.g. `outer_inner`).
     pub path: String,
+    /// Module doc, taken from the first documented function in the module.
     pub doc: Option<String>,
+    /// Enums declared in this module, fully lowered.
     pub enums: Vec<EnumBinding>,
+    /// Structs declared in this module, fully lowered.
     pub structs: Vec<StructBinding>,
+    /// Callback typedefs declared in this module.
     pub callbacks: Vec<CallbackBinding>,
+    /// Listeners declared in this module.
     pub listeners: Vec<ListenerBinding>,
+    /// Functions declared in this module, fully lowered.
     pub functions: Vec<FnBinding>,
 }
 

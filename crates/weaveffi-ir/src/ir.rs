@@ -1,3 +1,13 @@
+//! In-memory intermediate representation: the data model a parsed WeaveFFI IDL
+//! document becomes.
+//!
+//! Backends read this tree, never the raw IDL text. [`Api`] is the root and
+//! owns a forest of [`Module`]s, each grouping [`Function`]s, [`StructDef`]s,
+//! [`EnumDef`]s, [`CallbackDef`]s, [`ListenerDef`]s, and an optional
+//! [`ErrorDomain`]. Types are referenced throughout by [`TypeRef`], which
+//! (de)serializes as a compact string (`i32`, `[string]`, `{string:i32}`,
+//! `Contact?`, and so on) rather than as a tagged object.
+
 use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
@@ -8,7 +18,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Pre-1.0 there is exactly one supported schema version: the current one.
 /// Older schema revisions (0.1.0, 0.2.0) are not accepted and have no
-/// automated migration path — update the `version` field and adjust the
+/// automated migration path: update the `version` field and adjust the
 /// document to the current schema by hand. Post-1.0, schema bumps will ship
 /// with a migration tool and [`SUPPORTED_VERSIONS`] will widen accordingly.
 ///
@@ -16,6 +26,11 @@ use serde::{Deserialize, Serialize};
 /// for the full schema policy and the surfaces covered by SemVer.
 pub const CURRENT_SCHEMA_VERSION: &str = "0.4.0";
 
+/// Every IR schema version the current tools accept.
+///
+/// Pre-1.0 this holds exactly one entry, [`CURRENT_SCHEMA_VERSION`]; a document
+/// declaring any other `version` is rejected. Post-1.0 it widens as migrations
+/// land, letting the parser accept a range of historical schema revisions.
 pub const SUPPORTED_VERSIONS: &[&str] = &[CURRENT_SCHEMA_VERSION];
 
 /// `skip_serializing_if` predicate for `bool` fields that default to `false`.
@@ -26,10 +41,18 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// `Eq` is omitted because `toml::Value` contains `f64`.
+/// Top-level WeaveFFI API definition: the root of a parsed IDL document.
+///
+/// This is the value an entire `.yml`, `.json`, or `.toml` IDL file
+/// deserializes into (see [`crate::parse`]) and the single input every code
+/// generator consumes. It pairs the schema version with the module forest,
+/// optional package identity, and any per-generator overrides.
+// `Eq` is omitted because `generators` holds `toml::Value`, which contains `f64`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Top-level WeaveFFI API definition.")]
 pub struct Api {
+    /// IR schema version this document targets (for example `0.4.0`).
+    /// Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].
     pub version: String,
     /// Package identity used to name, version, and describe every generated
     /// consumer package (npm, PyPI, gem, NuGet, pub.dev, SwiftPM, Gradle, Go).
@@ -37,7 +60,13 @@ pub struct Api {
     /// `0.1.0`, but publishable artifacts should always set this explicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package: Option<Package>,
+    /// Top-level modules that make up the API surface. Each is an independent
+    /// namespace; modules may nest further through [`Module::modules`].
     pub modules: Vec<Module>,
+    /// Per-generator configuration keyed by backend name (for example `swift`
+    /// or `python`). The opaque [`toml::Value`] payload is interpreted by each
+    /// generator, so unrecognized keys pass through untouched. `None` when the
+    /// IDL declares no `generators:` block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<BTreeMap<String, serde_json::Value>>")]
     pub generators: Option<BTreeMap<String, toml::Value>>,
@@ -59,81 +88,158 @@ pub struct Package {
     pub name: String,
     /// Semantic version stamped into every manifest (e.g. `1.2.0`).
     pub version: String,
+    /// Short summary written into each manifest's description field. Omitted
+    /// from generated manifests when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// License identifier, typically an SPDX expression such as `MIT` or
+    /// `Apache-2.0`, written into each manifest's license field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub license: Option<String>,
+    /// Package authors, each commonly formatted as `Name <email>`, mapped to
+    /// whatever author or maintainer field the target ecosystem uses. Empty by
+    /// default.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub authors: Vec<String>,
+    /// Project homepage URL recorded in manifests that expose one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub homepage: Option<String>,
+    /// Source repository URL recorded in manifests that expose one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<String>,
 }
 
-/// `Eq` is omitted because `StructField::default` contains `serde_yaml::Value`.
+/// A module: a named namespace grouping related functions, types, callbacks,
+/// listeners, and an error domain.
+///
+/// Modules are the IDL's unit of organization and map onto each target
+/// language's natural grouping construct (a namespace, a submodule, a symbol
+/// prefix, and so on). They may nest through [`modules`](Self::modules) to
+/// mirror a package hierarchy.
+// `Eq` is omitted because a nested `StructField::default` holds `serde_yaml::Value` (an `f64`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[schemars(
     description = "A WeaveFFI module: a named group of functions, types, callbacks, listeners, and errors."
 )]
 pub struct Module {
+    /// Module name, used as a namespace segment and a symbol-prefix component
+    /// in generated code (for example `contacts`).
     pub name: String,
+    /// Free functions this module exports across the FFI boundary.
     pub functions: Vec<Function>,
+    /// Record (struct) types declared in this module.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub structs: Vec<StructDef>,
+    /// Enum types, C-style or algebraic, declared in this module.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enums: Vec<EnumDef>,
+    /// Callback signatures this module's functions and listeners can invoke.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub callbacks: Vec<CallbackDef>,
+    /// Event listeners (subscribe and unsubscribe endpoints) this module exposes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub listeners: Vec<ListenerDef>,
+    /// Optional error domain: the named codes this module's fallible functions
+    /// report. `None` when the module declares no errors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub errors: Option<ErrorDomain>,
+    /// Nested submodules, forming a tree that mirrors a package hierarchy.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modules: Vec<Module>,
 }
 
+/// A function exported across the FFI boundary.
+///
+/// Each function becomes a C ABI entry point plus an idiomatic wrapper in every
+/// target language. The `async` and `cancellable` flags change how the symbol
+/// is lowered (a completion callback, an extra cancel-token parameter) without
+/// altering the parameter and return shape declared here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Function {
+    /// Function name, lowered to a per-language symbol (for example
+    /// `create_contact`).
     pub name: String,
+    /// Ordered parameter list; order is preserved in every generated signature.
     pub params: Vec<Param>,
+    /// Return type, or `None` for a function that returns nothing. Serialized
+    /// under the IDL key `return`.
     #[serde(rename = "return", default, skip_serializing_if = "Option::is_none")]
     pub returns: Option<TypeRef>,
+    /// Human-readable documentation, propagated to the generated bindings' doc
+    /// comments. `None` when undocumented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
+    /// Whether the function is asynchronous, lowering to a completion-callback
+    /// form rather than a blocking call. Serialized under the IDL key `async`.
     #[serde(default, rename = "async", skip_serializing_if = "is_false")]
     pub r#async: bool,
+    /// Whether an async call accepts a cancellation token so callers can request
+    /// that an in-flight operation stop early. Defaults to `false`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cancellable: bool,
+    /// Deprecation notice; when set, generators emit a deprecation annotation
+    /// carrying this message. `None` means the function is current.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deprecated: Option<String>,
+    /// Version in which the function was introduced (for example `0.2.0`),
+    /// surfaced as a "since" annotation where the target language supports one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<String>,
 }
 
+/// A single parameter of a [`Function`] or [`CallbackDef`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Param {
+    /// Parameter name as it appears in generated signatures (for example `id`).
     pub name: String,
+    /// Parameter type. Serialized under the IDL key `type`.
     #[serde(rename = "type")]
     pub ty: TypeRef,
+    /// Whether the callee may write back through this parameter (for example a
+    /// buffer filled in place). Defaults to `false`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub mutable: bool,
+    /// Human-readable documentation for the parameter, propagated to the
+    /// generated bindings. `None` when undocumented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
 }
 
+/// A callback signature: a function shape the host implements and native code
+/// invokes.
+///
+/// Callbacks are declared at module scope rather than as a [`TypeRef`] so the C
+/// ABI can represent them uniformly as a function pointer plus a context
+/// pointer. A [`ListenerDef`] references one by name to model an event stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CallbackDef {
+    /// Callback name, used to name the generated function-pointer type and
+    /// referenced by [`ListenerDef::event_callback`] (for example `on_message`).
     pub name: String,
+    /// Parameters passed to the callback each time it fires.
     pub params: Vec<Param>,
+    /// Human-readable documentation, propagated to the generated bindings.
+    /// `None` when undocumented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
 }
 
+/// An event listener: a subscribe and unsubscribe endpoint that delivers events
+/// through a [`CallbackDef`].
+///
+/// Generators expand a listener into register and unregister functions; the
+/// register call takes the named callback and returns a subscription id the
+/// caller later hands to unregister.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ListenerDef {
+    /// Listener name, lowered into the generated `register_*` and
+    /// `unregister_*` function names (for example `messages`).
     pub name: String,
+    /// Name of the [`CallbackDef`] invoked for each event. Must match a callback
+    /// declared on the same [`Module`].
     pub event_callback: String,
+    /// Human-readable documentation, propagated to the generated bindings.
+    /// `None` when undocumented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
 }
@@ -149,20 +255,38 @@ pub struct ListenerDef {
 /// cannot represent uniformly.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeRef {
+    /// Signed 8-bit integer (`i8`).
     I8,
+    /// Signed 16-bit integer (`i16`).
     I16,
+    /// Signed 32-bit integer (`i32`).
     I32,
+    /// Signed 64-bit integer (`i64`).
     I64,
+    /// Unsigned 8-bit integer (`u8`).
     U8,
+    /// Unsigned 16-bit integer (`u16`).
     U16,
+    /// Unsigned 32-bit integer (`u32`).
     U32,
+    /// Unsigned 64-bit integer (`u64`).
     U64,
+    /// 32-bit IEEE 754 floating-point number (`f32`).
     F32,
+    /// 64-bit IEEE 754 floating-point number (`f64`).
     F64,
+    /// Boolean (`bool`).
     Bool,
+    /// Owned UTF-8 string (`string`).
     StringUtf8,
+    /// Owned byte buffer (`bytes`).
     Bytes,
+    /// Opaque, untyped resource handle (`handle`). See
+    /// [`TypedHandle`](Self::TypedHandle) for the form tagged with a referent
+    /// name.
     Handle,
+    /// Opaque resource handle tagged with the name of what it refers to
+    /// (`handle<Name>`), giving generators a distinct type per resource kind.
     TypedHandle(String),
     /// A user struct *or* an algebraic (rich) enum. Both cross the C ABI as an
     /// opaque object pointer, so a reference to either is represented the same
@@ -176,14 +300,38 @@ pub enum TypeRef {
     Struct(String),
     /// A C-style integer enum (no variant payloads). Lowers by value.
     Enum(String),
+    /// Borrowed string slice (`&str`): a non-owning view valid only for the
+    /// duration of a call, used to pass input without copying.
     BorrowedStr,
+    /// Borrowed byte slice (`&[u8]`): a non-owning view valid only for the
+    /// duration of a call.
     BorrowedBytes,
+    /// Optional value (`T?`): either the inner type or nothing.
     Optional(Box<TypeRef>),
+    /// Homogeneous list (`[T]`) of the inner element type.
     List(Box<TypeRef>),
+    /// Map (`{K:V}`) from a key type to a value type. Crosses the C ABI as
+    /// parallel key and value arrays.
     Map(Box<TypeRef>, Box<TypeRef>),
+    /// Lazy sequence (`iter<T>`) of the inner type, lowered to a next/destroy
+    /// iterator object rather than a materialized collection.
     Iterator(Box<TypeRef>),
 }
 
+/// Parse the IDL's compact type syntax into a [`TypeRef`].
+///
+/// Handles primitive names (`i32`, `string`, `bytes`, `handle`, and so on),
+/// borrowed forms (`&str`, `&[u8]`), typed handles (`handle<Name>`), iterators
+/// (`iter<T>`), lists (`[T]`), maps (`{K:V}`), and the optional suffix (`T?`).
+/// Any other bare identifier is taken to be a user-defined struct or enum name
+/// and returned as [`TypeRef::Struct`]; the struct-versus-enum distinction is
+/// resolved later against the module's declarations.
+///
+/// # Errors
+///
+/// Returns an error message when `s` is empty or only whitespace, or when a map
+/// type (`{K:V}`) is missing its `:` separator. The same errors propagate up
+/// from a malformed inner type of a list, map, optional, or iterator.
 pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -317,16 +465,27 @@ impl JsonSchema for TypeRef {
     }
 }
 
-/// `Eq` is omitted because a variant field's `default` may contain
-/// `serde_yaml::Value` (an `f64`), matching [`StructDef`].
+/// An enum type. C-style when every variant is a bare discriminant; an
+/// algebraic sum type when any variant declares fields (see
+/// [`is_rich`](Self::is_rich)).
+///
+/// A C-style enum lowers across the C ABI by value as an integer, while an
+/// algebraic enum lowers as an opaque object with a tag getter plus per-variant
+/// constructors and field getters.
+// `Eq` is omitted because a variant field's `default` may hold `serde_yaml::Value` (an `f64`), matching `StructDef`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[schemars(
     description = "An enum type. C-style when every variant is a bare discriminant; an algebraic sum type when any variant declares fields."
 )]
 pub struct EnumDef {
+    /// Enum type name (for example `Color`).
     pub name: String,
+    /// Human-readable documentation, propagated to the generated bindings.
+    /// `None` when undocumented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
+    /// The variants in declaration order. Whether any of them carries fields
+    /// decides if this is a C-style or an algebraic enum.
     pub variants: Vec<EnumVariant>,
 }
 
@@ -341,11 +500,17 @@ impl EnumDef {
     }
 }
 
-/// `Eq` is omitted because `StructField::default` may contain `serde_yaml::Value`.
+/// A single variant of an [`EnumDef`].
+// `Eq` is omitted because a variant field's `default` may hold `serde_yaml::Value` (an `f64`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct EnumVariant {
+    /// Variant name (for example `Red`).
     pub name: String,
+    /// Integer discriminant. Doubles as the C-style enum value and as the
+    /// runtime tag that distinguishes the variants of an algebraic enum.
     pub value: i32,
+    /// Human-readable documentation, propagated to the generated bindings.
+    /// `None` when undocumented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
     /// Associated data carried by this variant. Empty for a unit variant or a
@@ -356,41 +521,71 @@ pub struct EnumVariant {
     pub fields: Vec<StructField>,
 }
 
-/// `Eq` is omitted because `StructField::default` contains `serde_yaml::Value`.
+/// A struct (record) type with named fields.
+// `Eq` is omitted because `StructField::default` holds `serde_yaml::Value` (an `f64`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "A struct (record) type with named fields.")]
 pub struct StructDef {
+    /// Struct type name (for example `Contact`).
     pub name: String,
+    /// Human-readable documentation, propagated to the generated bindings.
+    /// `None` when undocumented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
+    /// The fields in declaration order; order is preserved in the generated
+    /// type and its constructors.
     pub fields: Vec<StructField>,
+    /// Whether to also emit a builder API for constructing the struct field by
+    /// field, alongside the all-fields constructor. Defaults to `false`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub builder: bool,
 }
 
+/// A named field of a [`StructDef`], or the payload of an algebraic
+/// [`EnumVariant`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct StructField {
+    /// Field name (for example `email`).
     pub name: String,
+    /// Field type. Serialized under the IDL key `type`.
     #[serde(rename = "type")]
     pub ty: TypeRef,
+    /// Human-readable documentation, propagated to the generated bindings.
+    /// `None` when undocumented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
+    /// Default value used when the field is omitted, kept as a raw YAML value so
+    /// any literal the field's type accepts can be expressed. Ignored for
+    /// algebraic [`EnumVariant`] payloads, which aren't defaultable. `None` when
+    /// the field has no default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<serde_json::Value>")]
     pub default: Option<serde_yaml::Value>,
 }
 
+/// A module's error domain: the named set of error codes its fallible functions
+/// can report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorDomain {
+    /// Error domain name, used to name the generated error type (for example
+    /// `ContactErrors`).
     pub name: String,
+    /// The error codes that belong to this domain.
     pub codes: Vec<ErrorCode>,
 }
 
+/// A single named error within an [`ErrorDomain`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorCode {
+    /// Error code name, lowered to a variant or constant on the generated error
+    /// type (for example `not_found`).
     pub name: String,
+    /// Stable numeric value carried across the C ABI to identify this error.
     pub code: i32,
+    /// Default human-readable message describing the error.
     pub message: String,
+    /// Human-readable documentation, propagated to the generated bindings.
+    /// `None` when undocumented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
 }

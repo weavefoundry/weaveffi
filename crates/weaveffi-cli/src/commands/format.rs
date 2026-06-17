@@ -1,4 +1,4 @@
-//! `weaveffi format` — rewrite an IDL file in canonical form (sorted keys,
+//! `weaveffi format`: rewrite an IDL file in canonical form (sorted keys,
 //! defaults omitted), with `--check` for CI.
 
 use camino::Utf8Path;

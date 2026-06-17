@@ -5,7 +5,7 @@
 //! → functions), dispatches each function on its [`CallShape`], and writes a
 //! primary source file plus a handful of package manifests. Before this module
 //! existed, all eleven generators hand-rolled that walk, that dispatch, that
-//! file I/O, and their own copy of the [`Generator`] glue — and they drifted.
+//! file I/O, and their own copy of the [`Generator`] glue; they drifted.
 //!
 //! [`LanguageBackend`] captures the common structure as a trait whose hooks a
 //! backend implements, and the free [`run`]/[`output_files`] functions plus the
@@ -35,11 +35,14 @@ use crate::model::{
 /// the driver creates parent directories and writes them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputFile {
+    /// Full path to write, under (or anchored at) the output directory.
     pub path: Utf8PathBuf,
+    /// The rendered file contents.
     pub contents: String,
 }
 
 impl OutputFile {
+    /// Pair a destination path with its rendered contents.
     pub fn new(path: impl Into<Utf8PathBuf>, contents: impl Into<String>) -> Self {
         Self {
             path: path.into(),
@@ -60,14 +63,14 @@ impl OutputFile {
 /// Backends whose primary file is a straightforward per-module walk override
 /// the per-entity hooks (`render_enum`, `render_struct`, `render_function`, and
 /// optionally `render_callback`/`render_listener`) and call the provided
-/// [`emit_members`](Self::emit_members) from inside their module scoping — that
+/// [`emit_members`](Self::emit_members) from inside their module scoping; that
 /// is what removes the hand-rolled walk + call-shape dispatch each generator
 /// used to carry. Multi-pass backends (Ruby, .NET, Node, Android) instead build
 /// their own layout directly in [`files`](Self::files) and leave the hooks at
 /// their no-op defaults.
 ///
 /// Each hook renders into a `String` (matching how generators accumulate
-/// output) and is responsible for emitting its own doc comments — doc-comment
+/// output) and is responsible for emitting its own doc comments; doc-comment
 /// shape varies too much between targets (docstrings, `///`, KDoc, `<summary>`)
 /// to centralise here, but every backend shares
 /// [`emit_doc`](crate::codegen::common::emit_doc) for the line/block flavours.
@@ -80,7 +83,7 @@ pub trait LanguageBackend: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// The gated IDL features this backend implements (async functions,
-    /// callbacks, listeners, iterators). Required — declaring capabilities
+    /// callbacks, listeners, iterators). Required: declaring capabilities
     /// explicitly is what lets the orchestrator fail loudly instead of a
     /// backend silently skipping a feature it never implemented.
     fn capabilities(&self) -> TargetCapabilities;
@@ -202,6 +205,11 @@ pub trait LanguageBackend: Send + Sync {
 ///
 /// This is the body of the [`Generator::generate`](crate::codegen::Generator)
 /// impl that [`impl_generator_via_backend!`](crate::impl_generator_via_backend) generates.
+///
+/// # Errors
+///
+/// Returns an error if a parent directory cannot be created or any file the
+/// backend produced cannot be written.
 pub fn run<B: LanguageBackend>(
     backend: &B,
     api: &Api,
@@ -234,7 +242,7 @@ fn forward_slashes(path: Utf8PathBuf) -> String {
     }
 }
 
-/// The sorted list of paths a backend would write — the body of the
+/// The sorted list of paths a backend would write, the body of the
 /// [`Generator::output_files`](crate::codegen::Generator::output_files) impl
 /// that [`impl_generator_via_backend!`](crate::impl_generator_via_backend) generates. Used by `--dry-run` and
 /// `weaveffi diff`. Paths are normalised to `/` separators so the listing is

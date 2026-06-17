@@ -4,6 +4,10 @@
 //! `wasm32-unknown-unknown` cdylib build of the same Rust source.
 //! Implements [`LanguageBackend`]; the shared driver bridges it into the
 //! generator pipeline.
+#![deny(missing_docs)]
+#![warn(clippy::missing_errors_doc)]
+#![warn(clippy::missing_panics_doc)]
+#![warn(clippy::doc_markdown)]
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -26,6 +30,9 @@ use weaveffi_core::utils::{
 };
 use weaveffi_ir::ir::{Api, EnumDef, Module, TypeRef};
 
+/// WebAssembly backend: emits a JavaScript loader stub and TypeScript
+/// declarations targeting a `wasm32-unknown-unknown` cdylib build of the same
+/// Rust source.
 pub struct WasmGenerator;
 
 const DEFAULT_MODULE_NAME: &str = "weaveffi_wasm";
@@ -53,14 +60,20 @@ pub struct WasmConfig {
 }
 
 impl WasmConfig {
+    /// Returns the configured module name used for the emitted `<name>.js`
+    /// loader and `<name>.d.ts`, falling back to `"weaveffi_wasm"`.
     pub fn module_name(&self) -> &str {
         self.module_name.as_deref().unwrap_or(DEFAULT_MODULE_NAME)
     }
 
+    /// Returns the configured C ABI symbol prefix, falling back to
+    /// `"weaveffi"`.
     pub fn prefix(&self) -> &str {
         self.prefix.as_deref().unwrap_or("weaveffi")
     }
 
+    /// Returns the input IDL basename embedded in generated file headers,
+    /// falling back to `"weaveffi.yml"`.
     pub fn input_basename(&self) -> &str {
         self.input_basename.as_deref().unwrap_or("weaveffi.yml")
     }
@@ -288,8 +301,8 @@ fn render_wasm_readme(api: &Api, prefix: &str, input_basename: &str) -> String {
     out.push_str("The generated JS wrappers automatically handle errors by passing an error\n");
     out.push_str("pointer as the last argument to each WASM function. Your WASM module must\n");
     out.push_str("export the following functions:\n\n");
-    out.push_str("- `weaveffi_alloc(size: i32) -> i32` — allocate `size` bytes in linear memory\n");
-    out.push_str("- `weaveffi_error_clear(err_ptr: i32)` — clear and free error resources\n");
+    out.push_str("- `weaveffi_alloc(size: i32) -> i32`: allocate `size` bytes in linear memory\n");
+    out.push_str("- `weaveffi_error_clear(err_ptr: i32)`: clear and free error resources\n");
 
     render_unsupported_section(&mut out, api);
 
@@ -304,7 +317,7 @@ fn render_wasm_readme(api: &Api, prefix: &str, input_basename: &str) -> String {
 }
 
 /// When the IDL uses features the wasm target does not support (callbacks,
-/// listeners — generation only proceeds under `allow_unsupported`), document
+/// listeners; generation only proceeds under `allow_unsupported`), document
 /// exactly what is missing and how it behaves, listing each declaration.
 fn render_unsupported_section(out: &mut String, api: &Api) {
     let used = capabilities::used_features(api);
@@ -482,11 +495,11 @@ fn render_enum_ref(out: &mut String, e: &EnumBinding) {
 }
 
 /// Document a rich (algebraic) enum: an opaque handle constructed via per-variant
-/// factories, with a `tag` discriminant reader and namespaced field getters —
+/// factories, with a `tag` discriminant reader and namespaced field getters,
 /// not a by-value `i32` discriminant like a plain enum.
 fn render_rich_enum_ref(out: &mut String, rich: &RichEnumBinding) {
     out.push_str(
-        "Rich (algebraic) enum — passed as an **opaque handle** (`i64`). Construct one with a \
+        "Rich (algebraic) enum, passed as an **opaque handle** (`i64`). Construct one with a \
          per-variant factory, read the active variant via the `tag` discriminant, and access \
          associated data through the namespaced getters.\n\n",
     );
@@ -494,7 +507,7 @@ fn render_rich_enum_ref(out: &mut String, rich: &RichEnumBinding) {
     out.push_str("|---------|-----|--------|\n");
     for v in &rich.variants {
         let fields = if v.fields.is_empty() {
-            "—".to_string()
+            "(none)".to_string()
         } else {
             v.fields
                 .iter()
@@ -1443,7 +1456,7 @@ fn render_wasm_js_stub(
     for (module, _path) in walk_modules_with_path(&api.modules) {
         for e in &module.enums {
             // Rich (algebraic) enums cross the ABI as opaque object handles, so
-            // they are emitted as wrapper classes below — never as a plain
+            // they are emitted as wrapper classes below, never as a plain
             // by-value discriminant object (which would also collide with the
             // class declaration of the same name).
             if e.is_rich() {
@@ -2001,7 +2014,7 @@ fn emit_struct_class(out: &mut String, s: &StructBinding) {
 /// (`circleRadius`), and an explicit `free()` releasing the handle once. The
 /// constructor signature and `_handle` field match the struct wrapper, so the
 /// existing function-wrapper marshalling (`x._handle` in, `new Shape(wasm, r)`
-/// out — a rich enum lowers to `TypeRef::Struct`) works unchanged.
+/// out; a rich enum lowers to `TypeRef::Struct`) works unchanged.
 fn emit_rich_enum_class(out: &mut String, e: &EnumBinding) {
     let Some(rich) = e.rich.as_ref() else {
         return;
@@ -3687,7 +3700,7 @@ mod tests {
     }
 
     /// A rich (algebraic) enum mirroring `samples/shapes`: a unit variant, an
-    /// f64 payload, two f32 payloads, and a string + u8 payload — plus a plain
+    /// f64 payload, two f32 payloads, and a string + u8 payload, plus a plain
     /// sibling enum and free functions taking/returning the rich enum (already
     /// lowered to `TypeRef::Struct`) so the handle marshalling is exercised too.
     fn rich_enum_api() -> Api {
@@ -3955,7 +3968,7 @@ mod tests {
             "weaveffi_wasm.js",
         );
         // A rich enum lowers to TypeRef::Struct, so functions pass the handle in
-        // and wrap the returned handle out — identical to a struct.
+        // and wrap the returned handle out, identical to a struct.
         assert!(
             js.contains("wasm.weaveffi_shapes_describe(shape._handle, _err)"),
             "describe must pass the enum handle: {js}"

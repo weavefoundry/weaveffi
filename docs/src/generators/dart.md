@@ -5,8 +5,8 @@
 The Dart target produces a pure-Dart FFI package that wraps the C ABI
 using [`dart:ffi`](https://dart.dev/interop/c-interop). It opens the
 shared library with `DynamicLibrary.open` and resolves each symbol via
-`lookupFunction`. There is no native compilation step or `ffigen` run
-required — the generated `.dart` file is ready to import.
+`lookupFunction`. There's no native compilation step or `ffigen` run
+required; the generated `.dart` file is ready to import.
 
 ## What gets generated
 
@@ -175,7 +175,7 @@ A rich (algebraic) enum is a sum type whose variants carry associated
 data. A plain C-style enum surfaces as a Dart `enum` and crosses as an
 `Int32`; a rich enum instead lowers to an **opaque object handle**, so
 the generator emits a wrapper class with the same ownership model as a
-struct wrapper — a `Pointer<Void>` freed by an explicit `dispose()`.
+struct wrapper, a `Pointer<Void>` freed by an explicit `dispose()`.
 
 For a `Shape` enum with variants `Empty`, `Circle { radius: f64 }`,
 `Rectangle { width: f32, height: f32 }`, and `Labeled { label: string,
@@ -372,8 +372,8 @@ void unregisterMessageListener(int id) {
   `_listenerCallables` keyed by subscription id; that reference keeps
   the native thunk and the captured closure alive. Unregistering
   removes the entry and `close()`s the callable. The C `void* context`
-  slot is unused (`nullptr`) — the closure travels inside the callable,
-  so no registry id needs to cross the boundary.
+slot is unused (`nullptr`); the closure travels inside the callable,
+so no registry id needs to cross the boundary.
 - **Threading.** Listener trampolines are
   `NativeCallable.isolateLocal`, not `.listener`: WeaveFFI listeners
   fire synchronously on the thread calling the producer API (here,
@@ -439,7 +439,7 @@ at least one async function.
 
 For functions marked `cancellable: true` the C launcher gains a
 `weaveffi_cancel_token*` parameter. The Dart wrapper passes `nullptr`
-for it and does not expose the token — only the C, C++, and Kotlin
+for it and doesn't expose the token; only the C, C++, and Kotlin
 targets surface cancellation tokens.
 
 ## Iterators
@@ -473,15 +473,15 @@ Iterable<String> getMessages() {
 
 ## Troubleshooting
 
-- **`Invalid argument(s): Failed to load dynamic library`** — the
+- **`Invalid argument(s): Failed to load dynamic library`**: the
   cdylib is not on the search path. Set `DYLD_LIBRARY_PATH` /
   `LD_LIBRARY_PATH` or copy the library next to your executable.
-- **`UnsupportedError: Unsupported platform`** — the loader maps to
+- **`UnsupportedError: Unsupported platform`**: the loader maps to
   `darwin`, `linux`, and `windows`. Other platforms (Android, iOS) use
   the Flutter integration where the framework opens the library.
-- **`MissingPluginException` in Flutter** — that error is unrelated to
+- **`MissingPluginException` in Flutter**: that error is unrelated to
   WeaveFFI; double-check that you depend on the generated package and
   haven't shadowed it with a different `weaveffi` dependency.
-- **Strings appear truncated** — Rust strings are not nul-terminated;
+- **Strings appear truncated**: Rust strings aren't nul-terminated;
   make sure `toDartString()` is reading the pointer returned from a
   generated getter, not a raw pointer.

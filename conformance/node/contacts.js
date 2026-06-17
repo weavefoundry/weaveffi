@@ -2,7 +2,7 @@
 //
 // Drives the compiled addon end to end: enum-as-int params, UTF-8 string params,
 // optional strings (null email), the struct-return materialization (a real JS
-// object with id/first_name/last_name/email/contact_type, matching types.d.ts —
+// object with id/first_name/last_name/email/contact_type, matching types.d.ts;
 // previously the addon leaked a raw handle number), list-of-struct returns,
 // the bool return, and the thrown-error path. The built addon path comes in via
 // WV_ADDON; its dependent cdylib is resolved by absolute install name.

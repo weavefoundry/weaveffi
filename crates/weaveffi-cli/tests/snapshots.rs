@@ -740,8 +740,8 @@ snapshot_test!(
 );
 
 // Rich (algebraic) enums + the expanded numeric primitives, across every
-// backend (fixture 10). Locks the rich-enum wrapper surface — opaque object,
-// per-variant constructors and field getters, tag reader, destructor — into the
+// backend (fixture 10). Locks the rich-enum wrapper surface (opaque object,
+// per-variant constructors and field getters, tag reader, destructor) into the
 // snapshot oracle for all 11 generators.
 snapshot_test!(snapshot_c_shapes, CGenerator, "shapes", "10_shapes.yml");
 snapshot_test!(snapshot_cpp_shapes, CppGenerator, "shapes", "10_shapes.yml");

@@ -11,11 +11,14 @@ use crate::codegen::common::is_c_pointer_type;
 /// A named C parameter slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbiParam {
+    /// The C parameter name (e.g. `out_err`, `data_ptr`, `m_keys`).
     pub name: String,
+    /// The C type of the slot.
     pub ty: CType,
 }
 
 impl AbiParam {
+    /// Build a parameter slot from a name and its C type.
     pub fn new(name: impl Into<String>, ty: CType) -> Self {
         Self {
             name: name.into(),
@@ -29,7 +32,10 @@ impl AbiParam {
 /// for maps).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbiReturn {
+    /// The C return type, or `void` when the value is delivered entirely
+    /// through [`out_params`](Self::out_params).
     pub ret: CType,
+    /// Trailing out-parameter slots appended after the function's inputs.
     pub out_params: Vec<AbiParam>,
 }
 

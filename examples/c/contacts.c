@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include "../../generated/c/weaveffi.h"
 
-/* Contacts sample ABI — declarations that match samples/contacts/src/lib.rs */
+/* Contacts sample ABI: declarations that match samples/contacts/src/lib.rs */
 typedef struct weaveffi_contacts_Contact weaveffi_contacts_Contact;
 
 weaveffi_handle_t weaveffi_contacts_create_contact(
