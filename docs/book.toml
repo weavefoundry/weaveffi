@@ -11,13 +11,13 @@ extra-watch-dirs = []
 default-theme = "ayu"
 preferred-dark-theme = "ayu"
 git-repository-url = "https://github.com/weavefoundry/weaveffi"
-site-url = "https://docs.weaveffi.com/"
+site-url = "https://weaveffi.com/"
 
 [output.linkcheck2]
 follow-web-links = false
 warning-policy = "error"
 exclude = [
-    'docs\.weaveffi\.com',
+    'weaveffi\.com',
     'github\.com/weavefoundry/weaveffi',
     'crates\.io',
 ]

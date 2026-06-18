@@ -46,7 +46,7 @@ jobs:
           mkdir -p site/api/rust
           cp -r target/doc/* site/api/rust/
           touch site/.nojekyll
-          printf "docs.weaveffi.com" > site/CNAME
+          printf "weaveffi.com" > site/CNAME
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
