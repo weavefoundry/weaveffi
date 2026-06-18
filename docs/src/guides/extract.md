@@ -171,11 +171,11 @@ attributes are not currently recognised; use the underscore form
 | `#[weaveffi_listener(event_callback = "Name")]`    | free `fn`                      | Emits a [`ListenerDef`] referencing the named callback.                                  |
 | `#[deprecated(since = "...", note = "...")]`       | exported `fn`                  | Populates `since` and `deprecated`. Bare `#[deprecated]` sets `deprecated = "deprecated"`.|
 
-[`Function`]: https://docs.weaveffi.com/api/rust/weaveffi_ir/struct.Function.html
-[`StructDef`]: https://docs.weaveffi.com/api/rust/weaveffi_ir/struct.StructDef.html
-[`EnumDef`]: https://docs.weaveffi.com/api/rust/weaveffi_ir/struct.EnumDef.html
-[`CallbackDef`]: https://docs.weaveffi.com/api/rust/weaveffi_ir/struct.CallbackDef.html
-[`ListenerDef`]: https://docs.weaveffi.com/api/rust/weaveffi_ir/struct.ListenerDef.html
+[`Function`]: https://weaveffi.com/api/rust/weaveffi_ir/struct.Function.html
+[`StructDef`]: https://weaveffi.com/api/rust/weaveffi_ir/struct.StructDef.html
+[`EnumDef`]: https://weaveffi.com/api/rust/weaveffi_ir/struct.EnumDef.html
+[`CallbackDef`]: https://weaveffi.com/api/rust/weaveffi_ir/struct.CallbackDef.html
+[`ListenerDef`]: https://weaveffi.com/api/rust/weaveffi_ir/struct.ListenerDef.html
 
 Doc comments (`///`) on items, fields, and enum variants become the
 `doc` field in the IR.
@@ -215,7 +215,7 @@ and `Vec<Option<String>>` becomes `[string?]`.
 record gets `mutable: true`. `&T` for any non-`str`/`[u8]` type is
 also reduced to `T` with `mutable: false`.
 
-[`Param`]: https://docs.weaveffi.com/api/rust/weaveffi_ir/struct.Param.html
+[`Param`]: https://weaveffi.com/api/rust/weaveffi_ir/struct.Param.html
 
 ### Round-trip integrity
 

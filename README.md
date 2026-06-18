@@ -269,7 +269,7 @@ Regenerate the schema with `weaveffi schema --format json-schema > weaveffi.sche
 
 ## Documentation
 
-Full documentation lives at <https://docs.weaveffi.com/> (sources under
+Full documentation lives at <https://weaveffi.com/> (sources under
 [`docs/`](./docs/)). Key pages:
 
 - [Introduction](docs/src/intro.md): what WeaveFFI is and why it exists
