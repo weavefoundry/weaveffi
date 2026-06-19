@@ -1,3 +1,9 @@
+## [0.12.0](https://github.com/weavefoundry/weaveffi/compare/v0.11.0...v0.12.0) (2026-06-19)
+
+### Features
+
+* add weaveffi package command for native distribution ([#20](https://github.com/weavefoundry/weaveffi/issues/20)) ([089fe1b](https://github.com/weavefoundry/weaveffi/commit/089fe1ba678412f1fe831ca2d013f0ee409873a1))
+
 ## [0.11.0](https://github.com/weavefoundry/weaveffi/compare/v0.10.0...v0.11.0) (2026-06-16)
 
 ### ⚠ BREAKING CHANGES
