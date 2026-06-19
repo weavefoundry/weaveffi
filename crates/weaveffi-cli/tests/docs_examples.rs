@@ -592,6 +592,7 @@ fn readme_cli_reference_lists_every_subcommand() {
     for cmd in [
         "weaveffi new",
         "weaveffi generate",
+        "weaveffi package",
         "weaveffi validate",
         "weaveffi lint",
         "weaveffi diff",

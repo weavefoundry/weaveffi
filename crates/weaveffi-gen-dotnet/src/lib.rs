@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use weaveffi_core::abi::{self, AbiParam, CType};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
+use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::model::{
     BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
     IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding, RichVariantBinding,
@@ -93,23 +94,7 @@ impl LanguageBackend for DotnetGenerator {
     ) -> Vec<OutputFile> {
         let namespace = config.namespace();
         let input_basename = config.input_basename();
-        let package = {
-            let mut p = pkg::resolve(
-                api,
-                config.namespace.as_deref(),
-                config.input_basename.as_deref(),
-            );
-            // The C# namespace doubles as the file basename; when nothing
-            // identifies the package, keep the PascalCase brand as the NuGet
-            // id so `WeaveFFI.csproj` and `<PackageId>` stay consistent.
-            if api.package.is_none()
-                && config.namespace.is_none()
-                && config.input_basename.is_none()
-            {
-                p.name = namespace.to_string();
-            }
-            p
-        };
+        let package = resolve_dotnet_package(api, config);
         let dir = out_dir.join("dotnet");
         let cs_filename = format!("{namespace}.cs");
         let csproj_filename = format!("{namespace}.csproj");
@@ -140,9 +125,141 @@ impl LanguageBackend for DotnetGenerator {
             ),
         ]
     }
+
+    fn package(
+        &self,
+        api: &Api,
+        _model: &BindingModel,
+        ctx: &PackageContext,
+        out_dir: &Utf8Path,
+        config: &Self::Config,
+    ) -> Option<Vec<PackagedFile>> {
+        let namespace = config.namespace();
+        let input_basename = config.input_basename();
+        let package = resolve_dotnet_package(api, config);
+        let dir = out_dir.join("dotnet");
+        let lib_name = &ctx.binaries.lib_name;
+
+        let cs_filename = format!("{namespace}.cs");
+        let csproj_filename = format!("{namespace}.csproj");
+        let nuspec_filename = format!("{namespace}.nuspec");
+
+        // Rebind the P/Invoke library name from the WeaveFFI brand to the
+        // bundled library's base name so `[DllImport]` resolves the file we
+        // ship under `runtimes/<rid>/native/`.
+        let cs = render_csharp(
+            api,
+            namespace,
+            config.strip_module_prefix,
+            config.prefix(),
+            input_basename,
+            &cs_filename,
+        )
+        .replace(
+            "private const string LibName = \"weaveffi\";",
+            &format!("private const string LibName = \"{lib_name}\";"),
+        );
+
+        let native_assets = "  <ItemGroup>\n    \
+             <Content Include=\"runtimes/**\" Pack=\"true\" PackagePath=\"runtimes/\">\n      \
+             <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>\n    \
+             </Content>\n  </ItemGroup>\n";
+
+        let mut files = vec![
+            PackagedFile::text(dir.join(&cs_filename), cs),
+            PackagedFile::text(
+                dir.join(&csproj_filename),
+                render_csproj_with_assets(&package, input_basename, &csproj_filename, native_assets),
+            ),
+            PackagedFile::text(
+                dir.join(&nuspec_filename),
+                render_nuspec(&package, input_basename, &nuspec_filename),
+            ),
+            PackagedFile::text(
+                dir.join("README.md"),
+                render_packaged_readme(&package, ctx, input_basename),
+            ),
+        ];
+
+        // Bundle each prebuilt library under the NuGet `runtimes/<rid>/native/`
+        // layout NuGet auto-resolves at restore time.
+        for nb in &ctx.binaries.binaries {
+            let dest = dir
+                .join("runtimes")
+                .join(nb.platform.nuget_rid())
+                .join("native")
+                .join(ctx.binaries.bundled_filename(nb.platform));
+            files.push(PackagedFile::copy(dest, nb.source.clone()));
+        }
+
+        Some(files)
+    }
 }
 
 weaveffi_core::impl_generator_via_backend!(DotnetGenerator);
+
+/// Resolve the NuGet/package identity for the .NET target, applying the
+/// namespace-as-name fallback when nothing else identifies the package.
+fn resolve_dotnet_package(api: &Api, config: &DotnetConfig) -> ResolvedPackage {
+    let namespace = config.namespace();
+    let mut p = pkg::resolve(
+        api,
+        config.namespace.as_deref(),
+        config.input_basename.as_deref(),
+    );
+    // The C# namespace doubles as the file basename; when nothing identifies
+    // the package, keep the PascalCase brand as the NuGet id so
+    // `WeaveFFI.csproj` and `<PackageId>` stay consistent.
+    if api.package.is_none() && config.namespace.is_none() && config.input_basename.is_none() {
+        p.name = namespace.to_string();
+    }
+    p
+}
+
+/// Render the README for a packaged .NET artifact, listing the bundled
+/// runtime identifiers so consumers know which platforms ship prebuilt.
+fn render_packaged_readme(
+    package: &ResolvedPackage,
+    ctx: &PackageContext,
+    input_basename: &str,
+) -> String {
+    let prelude = render_prelude(CommentStyle::Xml, input_basename);
+    let trailer = render_trailer(CommentStyle::Xml, "README.md");
+    let name = &package.name;
+    let rids: Vec<String> = ctx
+        .binaries
+        .platforms()
+        .map(|p| format!("- `{}`", p.nuget_rid()))
+        .collect();
+    let rid_list = rids.join("\n");
+    format!(
+        r#"{prelude}# {name} (.NET)
+
+Auto-generated P/Invoke bindings for the WeaveFFI native library, with a
+prebuilt native library bundled for each supported runtime under `runtimes/`.
+
+## Install
+
+```bash
+dotnet add package {name}
+```
+
+The native library loads automatically; no extra setup is required on a
+bundled platform.
+
+## Bundled runtimes
+
+{rid_list}
+
+## Pack
+
+```bash
+dotnet pack -c Release
+```
+
+{trailer}"#,
+    )
+}
 
 fn cs_type(ty: &TypeRef) -> String {
     match ty {
@@ -290,6 +407,19 @@ fn xml_escape(s: &str) -> String {
 }
 
 fn render_csproj(package: &ResolvedPackage, input_basename: &str, filename: &str) -> String {
+    render_csproj_with_assets(package, input_basename, filename, "")
+}
+
+/// Render the `.csproj`, optionally injecting extra `<ItemGroup>` blocks
+/// (`native_assets`) after the main `<PropertyGroup>`. The `weaveffi package`
+/// path passes the `runtimes/**` native-asset item group here; `generate`
+/// passes an empty string.
+fn render_csproj_with_assets(
+    package: &ResolvedPackage,
+    input_basename: &str,
+    filename: &str,
+    native_assets: &str,
+) -> String {
     let prelude = render_prelude(CommentStyle::Xml, input_basename);
     let trailer = render_trailer(CommentStyle::Xml, filename);
     let id = &package.name;
@@ -323,7 +453,7 @@ fn render_csproj(package: &ResolvedPackage, input_basename: &str, filename: &str
     <Version>{version}</Version>
 {extra}    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
-
+{native_assets}
 </Project>
 
 {trailer}"#,
@@ -2797,6 +2927,69 @@ mod tests {
     use super::*;
     use weaveffi_core::codegen::Generator;
     use weaveffi_ir::ir::{EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField};
+
+    #[test]
+    fn package_emits_runtimes_and_rebinds_libname() {
+        use camino::Utf8Path;
+        use weaveffi_core::package::{FileContent, PackageContext};
+        use weaveffi_core::platform::{BinarySet, Platform};
+
+        let api = make_api(vec![simple_module(vec![Function {
+            name: "ping".into(),
+            params: vec![],
+            returns: None,
+            doc: None,
+            r#async: false,
+            cancellable: false,
+            deprecated: None,
+            since: None,
+        }])]);
+        let model = BindingModel::build(&api, "weaveffi");
+        let mut bins = BinarySet::new("calculator");
+        bins.insert(Platform::MacosArm64, "/s/darwin-arm64/libcalculator.dylib");
+        bins.insert(Platform::WindowsX64, "/s/windows-x64/calculator.dll");
+        let ctx = PackageContext {
+            binaries: &bins,
+            input_basename: Some("calculator.yml"),
+        };
+        let files = LanguageBackend::package(
+            &DotnetGenerator,
+            &api,
+            &model,
+            &ctx,
+            Utf8Path::new("/out"),
+            &DotnetConfig::default(),
+        )
+        .expect("dotnet supports packaging");
+
+        // NuGet `runtimes/<rid>/native/` layout.
+        assert!(files
+            .iter()
+            .any(|f| f.path.as_str().ends_with("runtimes/osx-arm64/native/libcalculator.dylib")));
+        assert!(files
+            .iter()
+            .any(|f| f.path.as_str().ends_with("runtimes/win-x64/native/calculator.dll")));
+        // The P/Invoke library name is rebound to the bundled base name.
+        let cs = files
+            .iter()
+            .find(|f| f.path.as_str().ends_with(".cs"))
+            .expect("C# source present");
+        let FileContent::Text(src) = &cs.content else {
+            panic!("C# source is text");
+        };
+        assert!(
+            src.contains("private const string LibName = \"calculator\";"),
+            "DllImport name not rebound: {src}"
+        );
+        let csproj = files
+            .iter()
+            .find(|f| f.path.as_str().ends_with(".csproj"))
+            .expect("csproj present");
+        let FileContent::Text(proj) = &csproj.content else {
+            panic!("csproj is text");
+        };
+        assert!(proj.contains("runtimes/**"), "native asset item group missing: {proj}");
+    }
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {

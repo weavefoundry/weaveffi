@@ -19,7 +19,9 @@ use weaveffi_core::model::{
     AsyncBinding, BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
     ListenerBinding, ModuleBinding, ParamBinding, RichVariantBinding, StructBinding,
 };
+use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg;
+use weaveffi_core::platform::Platform;
 use weaveffi_core::utils::{
     c_abi_struct_name, local_type_name, render_prelude, render_trailer, CommentStyle,
 };
@@ -106,9 +108,109 @@ impl LanguageBackend for GoGenerator {
             OutputFile::new(dir.join("README.md"), render_readme(input_basename)),
         ]
     }
+
+    fn package(
+        &self,
+        api: &Api,
+        _model: &BindingModel,
+        ctx: &PackageContext,
+        out_dir: &Utf8Path,
+        config: &Self::Config,
+    ) -> Option<Vec<PackagedFile>> {
+        let dir = out_dir.join("go");
+        let input_basename = config.input_basename();
+        let prefix = config.prefix();
+        let link_name = pkg::resolve(api, None, Some(input_basename)).ident_name();
+        let module_path = pkg::resolve(
+            api,
+            config.module_path.as_deref(),
+            config.input_basename.as_deref(),
+        )
+        .name;
+
+        // Expand the single generate-mode `#cgo LDFLAGS` line into a
+        // self-contained, relocatable set: a header include path plus per
+        // GOOS/GOARCH library search + rpath directives (all `${SRCDIR}`
+        // relative). cgo selects the matching line at build time.
+        let original = format!("#cgo LDFLAGS: -l{link_name}\n");
+        let mut cgo = String::from("#cgo CFLAGS: -I${SRCDIR}/../c/include\n");
+        for nb in &ctx.binaries.binaries {
+            let (goos, goarch) = go_build_tags(nb.platform);
+            let id = nb.platform.id();
+            if nb.platform == Platform::WindowsX64 {
+                cgo.push_str(&format!(
+                    "#cgo {goos},{goarch} LDFLAGS: -L${{SRCDIR}}/lib/{id}\n"
+                ));
+            } else {
+                cgo.push_str(&format!(
+                    "#cgo {goos},{goarch} LDFLAGS: -L${{SRCDIR}}/lib/{id} -Wl,-rpath,${{SRCDIR}}/lib/{id}\n"
+                ));
+            }
+        }
+        cgo.push_str(&format!("#cgo LDFLAGS: -l{link_name}\n"));
+        let go_src = render_go(api, prefix, input_basename).replace(&original, &cgo);
+
+        let mut files = vec![
+            PackagedFile::text(dir.join("weaveffi.go"), go_src),
+            PackagedFile::text(dir.join("go.mod"), render_go_mod(&module_path, input_basename)),
+            PackagedFile::text(
+                dir.join("README.md"),
+                render_packaged_readme(ctx, input_basename),
+            ),
+        ];
+        for nb in &ctx.binaries.binaries {
+            let dest = dir
+                .join("lib")
+                .join(nb.platform.id())
+                .join(ctx.binaries.bundled_filename(nb.platform));
+            files.push(PackagedFile::copy(dest, nb.source.clone()));
+        }
+        Some(files)
+    }
 }
 
 weaveffi_core::impl_generator_via_backend!(GoGenerator);
+
+/// The `(GOOS, GOARCH)` build-constraint tokens for a [`Platform`], used on
+/// `#cgo` directive lines.
+fn go_build_tags(p: Platform) -> (&'static str, &'static str) {
+    match p {
+        Platform::MacosArm64 => ("darwin", "arm64"),
+        Platform::MacosX64 => ("darwin", "amd64"),
+        Platform::LinuxX64 => ("linux", "amd64"),
+        Platform::LinuxArm64 => ("linux", "arm64"),
+        Platform::WindowsX64 => ("windows", "amd64"),
+    }
+}
+
+/// README for a packaged Go module that bundles per-platform libraries.
+fn render_packaged_readme(ctx: &PackageContext, input_basename: &str) -> String {
+    let prelude = render_prelude(CommentStyle::Xml, input_basename);
+    let trailer = render_trailer(CommentStyle::Xml, "README.md");
+    let platforms: Vec<String> = ctx
+        .binaries
+        .platforms()
+        .map(|p| format!("- `lib/{}/`", p.id()))
+        .collect();
+    let platform_list = platforms.join("\n");
+    format!(
+        r#"{prelude}# WeaveFFI (Go)
+
+Auto-generated cgo bindings with a prebuilt shared library bundled for each
+platform under `lib/<platform>/`. The cgo preamble adds the matching
+`${{SRCDIR}}`-relative library search path and rpath per GOOS/GOARCH, so
+`go build` links the right library with no manual `CGO_LDFLAGS`.
+
+The C ABI header is expected at `../c/include/` (package the `c` target
+alongside Go, for example `weaveffi package --target c,go`).
+
+## Bundled platforms
+
+{platform_list}
+
+{trailer}"#,
+    )
+}
 
 // ── Type mapping ──
 
@@ -2069,6 +2171,52 @@ mod tests {
     use super::*;
     use camino::Utf8Path;
     use weaveffi_core::codegen::Generator;
+
+    #[test]
+    fn package_rewrites_cgo_and_bundles_libs() {
+        use weaveffi_core::package::{FileContent, PackageContext};
+        use weaveffi_core::platform::{BinarySet, Platform};
+
+        let api = calculator_api();
+        let model = BindingModel::build(&api, "weaveffi");
+        let mut bins = BinarySet::new("calculator");
+        bins.insert(Platform::MacosArm64, "/s/darwin-arm64/libcalculator.dylib");
+        bins.insert(Platform::WindowsX64, "/s/windows-x64/calculator.dll");
+        let ctx = PackageContext {
+            binaries: &bins,
+            input_basename: Some("calculator.yml"),
+        };
+        // Mirror the CLI: the config basename drives the `-l<name>` link name,
+        // which must match the bundled library's base name.
+        let cfg = GoConfig {
+            input_basename: Some("calculator.yml".into()),
+            ..GoConfig::default()
+        };
+        let files = LanguageBackend::package(
+            &GoGenerator,
+            &api,
+            &model,
+            &ctx,
+            Utf8Path::new("/out"),
+            &cfg,
+        )
+        .expect("go supports packaging");
+
+        assert_eq!(files.iter().filter(|f| f.is_binary()).count(), 2);
+        let go = files
+            .iter()
+            .find(|f| f.path.as_str().ends_with("go/weaveffi.go"))
+            .expect("go source present");
+        let FileContent::Text(src) = &go.content else {
+            panic!("go source is text");
+        };
+        assert!(
+            src.contains("#cgo darwin,arm64 LDFLAGS: -L${SRCDIR}/lib/darwin-arm64"),
+            "cgo preamble not rewritten: {src}"
+        );
+        assert!(src.contains("#cgo windows,amd64 LDFLAGS: -L${SRCDIR}/lib/windows-x64"));
+        assert!(src.contains("#cgo LDFLAGS: -lcalculator"));
+    }
     use weaveffi_ir::ir::{
         Api, CallbackDef, EnumDef, EnumVariant, Function, ListenerDef, Module, Param, StructDef,
         StructField, TypeRef,

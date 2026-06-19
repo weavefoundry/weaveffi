@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
+use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::model::{
     BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
     IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding, RichVariantBinding,
@@ -117,9 +118,149 @@ impl LanguageBackend for DartGenerator {
             ),
         ]
     }
+
+    fn package(
+        &self,
+        api: &Api,
+        _model: &BindingModel,
+        ctx: &PackageContext,
+        out_dir: &Utf8Path,
+        config: &Self::Config,
+    ) -> Option<Vec<PackagedFile>> {
+        let input_basename = config.input_basename();
+        let package = pkg::resolve(
+            api,
+            config.package_name.as_deref(),
+            config.input_basename.as_deref(),
+        );
+        // The lib base in the generated source follows the same rule the
+        // module uses (`pkg::resolve(api, None, basename)`), so reconstruct it
+        // identically to swap the loader.
+        let lib_base = pkg::resolve(api, None, Some(input_basename)).ident_name();
+        let lib = &ctx.binaries.lib_name;
+
+        let module_src = render_dart_module(api, config.prefix(), input_basename)
+            .replace(&dart_loader_original(&lib_base), &dart_loader_packaged(lib));
+
+        let dart_dir = out_dir.join("dart");
+        let mut files = vec![
+            PackagedFile::text(dart_dir.join("lib").join("weaveffi.dart"), module_src),
+            PackagedFile::text(
+                dart_dir.join("pubspec.yaml"),
+                render_pubspec(&package, input_basename),
+            ),
+            PackagedFile::text(
+                dart_dir.join("README.md"),
+                render_packaged_readme(&package, ctx, input_basename),
+            ),
+        ];
+        // Bundle every prebuilt library under native/<platform-id>/.
+        for nb in &ctx.binaries.binaries {
+            let dest = dart_dir
+                .join("native")
+                .join(nb.platform.id())
+                .join(ctx.binaries.bundled_filename(nb.platform));
+            files.push(PackagedFile::copy(dest, nb.source.clone()));
+        }
+        Some(files)
+    }
 }
 
 weaveffi_core::impl_generator_via_backend!(DartGenerator);
+
+/// Reproduce the exact `_openLibrary` block `render_dart_module` emits in
+/// `generate` mode for `lib_base`, so the packager can swap it.
+fn dart_loader_original(lib_base: &str) -> String {
+    let mut out = String::new();
+    out.push_str("DynamicLibrary _openLibrary() {\n");
+    out.push_str("  // An explicit path in WEAVEFFI_LIBRARY wins, so callers can point at a\n");
+    out.push_str("  // specific build artifact regardless of its file name or location.\n");
+    out.push_str("  final override = Platform.environment['WEAVEFFI_LIBRARY'];\n");
+    out.push_str(
+        "  if (override != null && override.isNotEmpty) return DynamicLibrary.open(override);\n",
+    );
+    out.push_str(&format!(
+        "  if (Platform.isMacOS) return DynamicLibrary.open('lib{lib_base}.dylib');\n"
+    ));
+    out.push_str(&format!(
+        "  if (Platform.isLinux) return DynamicLibrary.open('lib{lib_base}.so');\n"
+    ));
+    out.push_str(&format!(
+        "  if (Platform.isWindows) return DynamicLibrary.open('{lib_base}.dll');\n"
+    ));
+    out.push_str(
+        "  throw UnsupportedError('Unsupported platform: ${Platform.operatingSystem}');\n",
+    );
+    out.push_str("}\n");
+    out
+}
+
+/// The packaged `_openLibrary` for `lib`: try the bundled `native/<platform>/`
+/// libraries (relative to the working directory) before the bare system name.
+/// `WEAVEFFI_LIBRARY` still overrides.
+fn dart_loader_packaged(lib: &str) -> String {
+    let mut out = String::new();
+    out.push_str("DynamicLibrary _openLibrary() {\n");
+    out.push_str("  final override = Platform.environment['WEAVEFFI_LIBRARY'];\n");
+    out.push_str(
+        "  if (override != null && override.isNotEmpty) return DynamicLibrary.open(override);\n",
+    );
+    out.push_str("  final candidates = <String>[];\n");
+    out.push_str("  if (Platform.isMacOS) {\n");
+    out.push_str(&format!(
+        "    candidates.addAll(['native/darwin-arm64/lib{lib}.dylib', 'native/darwin-x64/lib{lib}.dylib', 'lib{lib}.dylib']);\n"
+    ));
+    out.push_str("  } else if (Platform.isWindows) {\n");
+    out.push_str(&format!(
+        "    candidates.addAll(['native/windows-x64/{lib}.dll', '{lib}.dll']);\n"
+    ));
+    out.push_str("  } else {\n");
+    out.push_str(&format!(
+        "    candidates.addAll(['native/linux-x64/lib{lib}.so', 'native/linux-arm64/lib{lib}.so', 'lib{lib}.so']);\n"
+    ));
+    out.push_str("  }\n");
+    out.push_str("  for (final candidate in candidates) {\n");
+    out.push_str("    try {\n");
+    out.push_str("      return DynamicLibrary.open(candidate);\n");
+    out.push_str("    } catch (_) {}\n");
+    out.push_str("  }\n");
+    out.push_str(
+        "  throw UnsupportedError('Could not load the native library for ${Platform.operatingSystem}');\n",
+    );
+    out.push_str("}\n");
+    out
+}
+
+/// README for a packaged Dart artifact that bundles native libraries.
+fn render_packaged_readme(
+    package: &ResolvedPackage,
+    ctx: &PackageContext,
+    input_basename: &str,
+) -> String {
+    let prelude = render_prelude(CommentStyle::Xml, input_basename);
+    let trailer = render_trailer(CommentStyle::Xml, "README.md");
+    let name = package.name.clone();
+    let platforms: Vec<String> = ctx
+        .binaries
+        .platforms()
+        .map(|p| format!("- `native/{}/`", p.id()))
+        .collect();
+    let platform_list = platforms.join("\n");
+    format!(
+        r#"{prelude}# {name} (Dart)
+
+Auto-generated `dart:ffi` bindings with prebuilt native libraries bundled under
+`native/<platform>/`. The loader prefers a bundled library (resolved relative to
+the working directory) and falls back to the system search path;
+`WEAVEFFI_LIBRARY` overrides both.
+
+## Bundled platforms
+
+{platform_list}
+
+{trailer}"#,
+    )
+}
 
 fn dart_type(ty: &TypeRef) -> String {
     match ty {
@@ -1960,6 +2101,57 @@ mod tests {
     use super::*;
     use camino::Utf8Path;
     use weaveffi_core::codegen::Generator;
+
+    #[test]
+    fn package_bundles_native_and_rewrites_loader() {
+        use weaveffi_core::package::{FileContent, PackageContext};
+        use weaveffi_core::platform::{BinarySet, Platform};
+
+        let api = make_api(vec![simple_module(vec![Function {
+            name: "ping".into(),
+            params: vec![],
+            returns: None,
+            doc: None,
+            r#async: false,
+            cancellable: false,
+            deprecated: None,
+            since: None,
+        }])]);
+        let model = BindingModel::build(&api, "weaveffi");
+        let mut bins = BinarySet::new("calculator");
+        bins.insert(Platform::MacosArm64, "/s/darwin-arm64/libcalculator.dylib");
+        bins.insert(Platform::LinuxArm64, "/s/linux-arm64/libcalculator.so");
+        let ctx = PackageContext {
+            binaries: &bins,
+            input_basename: Some("calculator.yml"),
+        };
+        let files = LanguageBackend::package(
+            &DartGenerator,
+            &api,
+            &model,
+            &ctx,
+            Utf8Path::new("/out"),
+            &DartConfig::default(),
+        )
+        .expect("dart supports packaging");
+
+        assert_eq!(files.iter().filter(|f| f.is_binary()).count(), 2);
+        assert!(files
+            .iter()
+            .any(|f| f.path.as_str().ends_with("dart/native/linux-arm64/libcalculator.so")));
+        let module = files
+            .iter()
+            .find(|f| f.path.as_str().ends_with("dart/lib/weaveffi.dart"))
+            .expect("module present");
+        let FileContent::Text(src) = &module.content else {
+            panic!("module is text");
+        };
+        assert!(
+            src.contains("final candidates = <String>[]")
+                && src.contains("native/darwin-arm64/libcalculator.dylib"),
+            "packaged loader not applied: {src}"
+        );
+    }
     use weaveffi_ir::ir::{
         Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
     };

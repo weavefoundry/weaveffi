@@ -23,6 +23,7 @@ use weaveffi_core::model::{
     BindingModel, CallShape, EnumBinding, FieldBinding, FnBinding, ListenerBinding, ModuleBinding,
     ParamBinding, RichVariantBinding, StructBinding,
 };
+use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::utils::{
     local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
 };
@@ -190,9 +191,137 @@ let package = Package(\n    \
             ),
         ]
     }
+
+    fn package(
+        &self,
+        api: &Api,
+        _model: &BindingModel,
+        ctx: &PackageContext,
+        out_dir: &Utf8Path,
+        config: &Self::Config,
+    ) -> Option<Vec<PackagedFile>> {
+        let module_name_owned = config
+            .module_name
+            .clone()
+            .or_else(|| api.package.as_ref().map(|p| p.name.to_upper_camel_case()))
+            .unwrap_or_else(|| "WeaveFFI".to_string());
+        let module_name = module_name_owned.as_str();
+        let prefix = config.prefix();
+        let input_basename = config.input_basename();
+        let dir = out_dir.join("swift");
+        let c_module = format!("C{module_name}");
+        let xcframework = format!("{c_module}.xcframework");
+
+        let prelude = render_prelude(CommentStyle::DoubleSlash, input_basename);
+        // The packaged manifest consumes a prebuilt `binaryTarget` xcframework
+        // instead of a `systemLibrary`, so installation needs no system lib on
+        // the search path.
+        let package_swift = format!(
+            "// swift-tools-version:5.7\n\
+{prelude}import PackageDescription\n\n\
+let package = Package(\n    \
+    name: \"{name}\",\n    \
+    platforms: [.macOS(.v10_15), .iOS(.v13), .tvOS(.v13), .watchOS(.v6)],\n    \
+    products: [\n        \
+        .library(name: \"{name}\", targets: [\"{name}\"]),\n    \
+    ],\n    \
+    targets: [\n        \
+        .binaryTarget(name: \"{c_name}\", path: \"{xcframework}\"),\n        \
+        .target(name: \"{name}\", dependencies: [\"{c_name}\"]),\n    \
+    ]\n\
+)\n\n\
+{trailer}",
+            name = module_name,
+            c_name = c_module,
+            xcframework = xcframework,
+            trailer = render_trailer(CommentStyle::DoubleSlash, "Package.swift"),
+        );
+
+        let src_dir = dir.join("Sources").join(module_name);
+        let swift_filename = format!("{module_name}.swift");
+        let wrapper = render_swift_wrapper(
+            api,
+            prefix,
+            config.strip_module_prefix,
+            input_basename,
+            &swift_filename,
+        );
+
+        let mut files = vec![
+            PackagedFile::text(dir.join("Package.swift"), package_swift),
+            PackagedFile::text(src_dir.join(&swift_filename), wrapper),
+            PackagedFile::text(
+                dir.join("README.md"),
+                render_packaged_readme(module_name, &c_module, prefix, ctx, input_basename),
+            ),
+        ];
+        // Bundle the prebuilt libraries as xcframework-ready slices.
+        for nb in &ctx.binaries.binaries {
+            let dest = dir
+                .join("lib")
+                .join(nb.platform.id())
+                .join(ctx.binaries.bundled_filename(nb.platform));
+            files.push(PackagedFile::copy(dest, nb.source.clone()));
+        }
+        Some(files)
+    }
 }
 
 weaveffi_core::impl_generator_via_backend!(SwiftGenerator);
+
+/// README for a packaged Swift artifact: it documents assembling the
+/// `binaryTarget` xcframework from the bundled per-platform slices, the one
+/// step that requires Apple tooling (`lipo` + `xcodebuild`).
+fn render_packaged_readme(
+    module_name: &str,
+    c_module: &str,
+    prefix: &str,
+    ctx: &PackageContext,
+    input_basename: &str,
+) -> String {
+    let prelude = render_prelude(CommentStyle::Xml, input_basename);
+    let trailer = render_trailer(CommentStyle::Xml, "README.md");
+    let platforms: Vec<String> = ctx
+        .binaries
+        .platforms()
+        .map(|p| format!("- `lib/{}/`", p.id()))
+        .collect();
+    let platform_list = platforms.join("\n");
+    format!(
+        r#"{prelude}# {module_name} (Swift)
+
+A SwiftPM package whose C ABI is consumed through a prebuilt `binaryTarget`
+xcframework named `{c_module}.xcframework`.
+
+The prebuilt libraries are bundled under `lib/<platform>/`. Assembling them into
+an xcframework is the one step that needs Apple tooling (run on macOS):
+
+```bash
+# Fuse the macOS arm64 and x86_64 dylibs into one universal binary.
+lipo -create \
+  lib/darwin-arm64/lib{prefix}.dylib \
+  lib/darwin-x64/lib{prefix}.dylib \
+  -output lib{prefix}.dylib
+
+# Headers/ must contain {prefix}.h and a module map naming the module {c_module}.
+mkdir -p Headers
+cp ../c/include/{prefix}.h Headers/
+printf 'module {c_module} {{\n  header "{prefix}.h"\n  export *\n}}\n' > Headers/module.modulemap
+
+xcodebuild -create-xcframework \
+  -library lib{prefix}.dylib -headers Headers \
+  -output {c_module}.xcframework
+```
+
+Then `swift build` resolves the binary target with no further setup.
+
+## Bundled platforms
+
+{platform_list}
+
+{trailer}"#,
+    )
+}
 
 /// Emits a `///`-prefixed Swift doc comment at `indent`. Each line of the
 /// (possibly multi-line) doc gets its own `///` prefix.
@@ -2874,6 +3003,61 @@ mod tests {
             generators: None,
             package: None,
         }
+    }
+
+    fn empty_module(name: &str) -> Module {
+        Module {
+            name: name.into(),
+            functions: vec![],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }
+    }
+
+    #[test]
+    fn package_uses_binary_target_and_bundles_slices() {
+        use camino::Utf8Path;
+        use weaveffi_core::package::{FileContent, PackageContext};
+        use weaveffi_core::platform::{BinarySet, Platform};
+
+        let api = make_api(vec![empty_module("calc")]);
+        let model = BindingModel::build(&api, "weaveffi");
+        let mut bins = BinarySet::new("calculator");
+        bins.insert(Platform::MacosArm64, "/s/darwin-arm64/libcalculator.dylib");
+        bins.insert(Platform::MacosX64, "/s/darwin-x64/libcalculator.dylib");
+        let ctx = PackageContext {
+            binaries: &bins,
+            input_basename: Some("calculator.yml"),
+        };
+        let files = LanguageBackend::package(
+            &SwiftGenerator,
+            &api,
+            &model,
+            &ctx,
+            Utf8Path::new("/out"),
+            &SwiftConfig::default(),
+        )
+        .expect("swift supports packaging");
+
+        assert_eq!(files.iter().filter(|f| f.is_binary()).count(), 2);
+        assert!(files
+            .iter()
+            .any(|f| f.path.as_str().ends_with("swift/lib/darwin-arm64/libcalculator.dylib")));
+        let pkg = files
+            .iter()
+            .find(|f| f.path.as_str().ends_with("swift/Package.swift"))
+            .expect("Package.swift present");
+        let FileContent::Text(txt) = &pkg.content else {
+            panic!("Package.swift is text");
+        };
+        assert!(
+            txt.contains(".binaryTarget(") && txt.contains(".xcframework"),
+            "binaryTarget xcframework missing: {txt}"
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@ use serde::Serialize;
 use std::collections::BTreeSet;
 use std::env;
 use std::process::Command;
+use weaveffi_core::platform::Platform;
 
 /// A single toolchain check produced by `cmd_doctor`. Serialized as JSON when
 /// the user passes `--format json` and grouped into sections for the
@@ -110,6 +111,7 @@ fn collect_doctor_checks() -> Vec<DoctorCheck> {
     ));
 
     checks.extend(cross_target_checks());
+    checks.extend(packaging_target_checks());
 
     checks.push(tool_check(
         "wasm-pack",
@@ -295,18 +297,31 @@ fn ndk_check() -> DoctorCheck {
     }
 }
 
-fn cross_target_checks() -> Vec<DoctorCheck> {
-    let installed = Command::new("rustup")
+/// The raw output of `rustup target list --installed`, or `None` when rustup
+/// is unavailable. Shared by the cross-compilation and packaging probes so the
+/// command shells out to rustup at most once.
+fn installed_rust_targets() -> Option<String> {
+    Command::new("rustup")
         .args(["target", "list", "--installed"])
         .output()
         .ok()
         .and_then(|out| {
-            if out.status.success() {
-                Some(String::from_utf8_lossy(&out.stdout).to_string())
-            } else {
-                None
-            }
-        });
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        })
+}
+
+/// True when `target` appears in an installed-target listing produced by
+/// [`installed_rust_targets`].
+fn has_rust_target(installed: Option<&String>, target: &str) -> bool {
+    installed
+        .map(|s| s.lines().any(|line| line.trim() == target))
+        .unwrap_or(false)
+}
+
+fn cross_target_checks() -> Vec<DoctorCheck> {
+    let installed = installed_rust_targets();
 
     let targets: [(&str, &str, &str, Vec<&'static str>); 3] = [
         (
@@ -332,10 +347,7 @@ fn cross_target_checks() -> Vec<DoctorCheck> {
     targets
         .into_iter()
         .map(|(id, target, name, applies_to)| {
-            let ok = installed
-                .as_ref()
-                .map(|s| s.lines().any(|line| line.trim() == target))
-                .unwrap_or(false);
+            let ok = has_rust_target(installed.as_ref(), target);
             let hint = if ok {
                 None
             } else {
@@ -348,6 +360,38 @@ fn cross_target_checks() -> Vec<DoctorCheck> {
                 version: None,
                 hint,
                 applies_to,
+            }
+        })
+        .collect()
+}
+
+/// Probe the Rust cross-targets `weaveffi package --build` needs to produce a
+/// native library for every platform in the v1 packaging matrix. These checks
+/// apply to the `package` pseudo-target so `weaveffi doctor --target package`
+/// can gate a cross-build in CI; only the host platform's target is needed when
+/// building locally for a single platform.
+fn packaging_target_checks() -> Vec<DoctorCheck> {
+    let installed = installed_rust_targets();
+    Platform::ALL
+        .into_iter()
+        .map(|platform| {
+            let target = platform.rust_target();
+            let ok = has_rust_target(installed.as_ref(), target);
+            DoctorCheck {
+                id: format!("pkg_target_{}", platform.id().replace('-', "_")),
+                name: format!("{} producer target ({target})", platform.display_name()),
+                ok,
+                version: None,
+                hint: if ok {
+                    None
+                } else {
+                    Some(format!(
+                        "needed only for `weaveffi package --build` targeting {}; \
+                         install with `rustup target add {target}`",
+                        platform.id()
+                    ))
+                },
+                applies_to: vec!["package"],
             }
         })
         .collect()
@@ -418,6 +462,16 @@ fn print_doctor_human(checks: &[DoctorCheck]) {
         (
             "Cross-compilation targets",
             &["target_ios", "target_android", "target_wasm"],
+        ),
+        (
+            "Packaging producer targets (--build)",
+            &[
+                "pkg_target_darwin_arm64",
+                "pkg_target_darwin_x64",
+                "pkg_target_linux_x64",
+                "pkg_target_linux_arm64",
+                "pkg_target_windows_x64",
+            ],
         ),
         ("WebAssembly tools", &["wasm-pack", "wasm-bindgen"]),
         ("C++", &["cmake", "cxx_compiler"]),

@@ -68,6 +68,32 @@ enum Commands {
         #[arg(long)]
         format: Option<String>,
     },
+    Package {
+        /// Input IDL/IR file (yaml|yml|json|toml)
+        input: String,
+        /// Output directory for the packaged artifacts
+        #[arg(short, long, default_value = "./dist")]
+        out: String,
+        /// Comma-separated list of targets to package (e.g. node,python,dotnet)
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Path to a TOML configuration file for generator options
+        #[arg(long)]
+        config: Option<String>,
+        /// Directory of prebuilt native libraries laid out as <dir>/<platform>/<lib>
+        /// (platform ids: darwin-arm64, darwin-x64, linux-x64, linux-arm64, windows-x64)
+        #[arg(long)]
+        binaries: Option<String>,
+        /// Cargo package to cross-compile as the native producer (one cdylib per platform)
+        #[arg(long)]
+        build: Option<String>,
+        /// Comma-separated platform ids to target (defaults to the full v1 matrix)
+        #[arg(long)]
+        platforms: Option<String>,
+        /// Print non-fatal warnings after validation
+        #[arg(long)]
+        warn: bool,
+    },
     Extract {
         /// Path to a Rust source file to extract API definitions from
         input: String,
@@ -103,7 +129,7 @@ enum Commands {
         check: bool,
     },
     Doctor {
-        /// Only run checks whose `applies_to` includes this target (e.g. `dart`, `swift`)
+        /// Only run checks whose `applies_to` includes this target (e.g. `dart`, `swift`, or `package` for the cross-build producer targets)
         #[arg(long)]
         target: Option<String>,
         /// Output format: `json` for machine-readable output, otherwise human-readable
@@ -194,6 +220,26 @@ fn main() -> Result<()> {
             warn,
             format,
         } => commands::validate::cmd_validate(&input, warn, format.as_deref(), quiet)?,
+        Commands::Package {
+            input,
+            out,
+            target,
+            config,
+            binaries,
+            build,
+            platforms,
+            warn,
+        } => commands::package::cmd_package(
+            &input,
+            &out,
+            target.as_deref(),
+            config.as_deref(),
+            binaries.as_deref(),
+            build.as_deref(),
+            platforms.as_deref(),
+            warn,
+            quiet,
+        )?,
         Commands::Extract {
             input,
             output,

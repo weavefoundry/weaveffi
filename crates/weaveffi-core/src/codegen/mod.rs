@@ -15,6 +15,7 @@ use weaveffi_ir::ir::Api;
 
 use crate::cache;
 use crate::capabilities::{self, TargetCapabilities};
+use crate::package::{PackageContext, PackagedFile};
 
 pub mod common;
 
@@ -89,6 +90,21 @@ pub trait Generator: Send + Sync {
     fn output_files(&self, _api: &Api, _out_dir: &Utf8Path, _config: &Self::Config) -> Vec<String> {
         vec![]
     }
+
+    /// Assemble a distributable package that bundles the prebuilt native
+    /// libraries in `ctx`, anchored under `out_dir`, or `None` when this target
+    /// does not support packaging. Mirrors
+    /// [`LanguageBackend::package`](crate::backend::LanguageBackend::package);
+    /// the default returns `None`.
+    fn package(
+        &self,
+        _api: &Api,
+        _ctx: &PackageContext,
+        _out_dir: &Utf8Path,
+        _config: &Self::Config,
+    ) -> Option<Vec<PackagedFile>> {
+        None
+    }
 }
 
 /// Object-safe view of a [`Generator`] paired with a concrete config.
@@ -116,6 +132,15 @@ pub trait DynGenerator: Send + Sync {
     /// The files [`generate`](Self::generate) would write. Mirrors
     /// [`Generator::output_files`].
     fn output_files(&self, api: &Api, out_dir: &Utf8Path) -> Vec<String>;
+    /// Assemble the distributable package for this target, using the bound
+    /// config. Mirrors [`Generator::package`]; returns `None` when the target
+    /// does not support packaging.
+    fn package(
+        &self,
+        api: &Api,
+        ctx: &PackageContext,
+        out_dir: &Utf8Path,
+    ) -> Option<Vec<PackagedFile>>;
     /// Canonical-JSON encoding of the bound config, fed into the cache
     /// hash so a config-only change invalidates the entry.
     fn config_hash_input(&self) -> Vec<u8>;
@@ -169,6 +194,15 @@ impl<G: Generator> DynGenerator for ConfiguredGenerator<G> {
 
     fn output_files(&self, api: &Api, out_dir: &Utf8Path) -> Vec<String> {
         self.inner.output_files(api, out_dir, &self.config)
+    }
+
+    fn package(
+        &self,
+        api: &Api,
+        ctx: &PackageContext,
+        out_dir: &Utf8Path,
+    ) -> Option<Vec<PackagedFile>> {
+        self.inner.package(api, ctx, out_dir, &self.config)
     }
 
     fn config_hash_input(&self) -> Vec<u8> {

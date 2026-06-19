@@ -18,6 +18,8 @@ use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, is_c_pointer_type, DocCommentStyle,
 };
+use weaveffi_core::package::{PackageContext, PackagedFile};
+use weaveffi_core::platform::Platform;
 use weaveffi_core::model::{
     AsyncBinding, BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
     IteratorBinding, ListenerBinding, ModuleBinding, RichVariantBinding, StructBinding,
@@ -124,9 +126,181 @@ impl LanguageBackend for RubyGenerator {
             ),
         ]
     }
+
+    fn package(
+        &self,
+        api: &Api,
+        _model: &BindingModel,
+        ctx: &PackageContext,
+        out_dir: &Utf8Path,
+        config: &Self::Config,
+    ) -> Option<Vec<PackagedFile>> {
+        let input_basename = config.input_basename();
+        let package = pkg::resolve(
+            api,
+            config.gem_name.as_deref(),
+            config.input_basename.as_deref(),
+        );
+        let lib_file = format!("{}.rb", package.ident_name());
+        let gem_file = format!("{}.gemspec", package.name);
+
+        // Render the FFI module once with the bundled-first loader.
+        let module_src = render_ruby_module(
+            api,
+            config.module_name(),
+            config.prefix(),
+            &lib_file,
+            input_basename,
+        )
+        .replace(
+            RUBY_LOADER_ORIGINAL,
+            &ruby_loader_packaged(&ctx.binaries.lib_name),
+        );
+        let readme = render_packaged_readme(&package, input_basename);
+
+        let ruby_dir = out_dir.join("ruby");
+        let mut files = Vec::new();
+        for nb in &ctx.binaries.binaries {
+            let platform = nb.platform;
+            let gem_dir = ruby_dir.join(platform.id());
+            let lib_dir = gem_dir.join("lib");
+            files.push(PackagedFile::text(lib_dir.join(&lib_file), module_src.clone()));
+            files.push(PackagedFile::copy(
+                lib_dir
+                    .join("native")
+                    .join(ctx.binaries.bundled_filename(platform)),
+                nb.source.clone(),
+            ));
+            files.push(PackagedFile::text(
+                gem_dir.join(&gem_file),
+                render_packaged_gemspec(&package, &gem_file, platform, input_basename),
+            ));
+            files.push(PackagedFile::text(gem_dir.join("README.md"), readme.clone()));
+        }
+        Some(files)
+    }
 }
 
 weaveffi_core::impl_generator_via_backend!(RubyGenerator);
+
+/// The exact `ffi_lib` loader block `render_ruby_module` emits in `generate`
+/// mode, so the packager can swap it for a bundled-first variant.
+const RUBY_LOADER_ORIGINAL: &str = r#"  # An explicit path in WEAVEFFI_LIBRARY wins, so callers can point at a
+  # specific build artifact regardless of its file name or location.
+  _wv_override = ENV['WEAVEFFI_LIBRARY']
+  if _wv_override && !_wv_override.empty?
+    ffi_lib _wv_override
+  else
+    case FFI::Platform::OS
+    when /darwin/
+      ffi_lib 'libweaveffi.dylib'
+    when /mswin|mingw/
+      ffi_lib 'weaveffi.dll'
+    else
+      ffi_lib 'libweaveffi.so'
+    end
+  end"#;
+
+/// The packaged `ffi_lib` loader for `lib`: prefer the per-platform library
+/// bundled under `lib/native/`, then `WEAVEFFI_LIBRARY`, then the system path.
+fn ruby_loader_packaged(lib: &str) -> String {
+    format!(
+        r#"  # A bundled per-platform library ships inside this gem; prefer it so the gem
+  # works with no external setup. WEAVEFFI_LIBRARY still overrides.
+  _wv_override = ENV['WEAVEFFI_LIBRARY']
+  if _wv_override && !_wv_override.empty?
+    ffi_lib _wv_override
+  else
+    case FFI::Platform::OS
+    when /darwin/
+      _wv_name = 'lib{lib}.dylib'
+    when /mswin|mingw/
+      _wv_name = '{lib}.dll'
+    else
+      _wv_name = 'lib{lib}.so'
+    end
+    _wv_bundled = File.join(__dir__, 'native', _wv_name)
+    ffi_lib(File.exist?(_wv_bundled) ? _wv_bundled : _wv_name)
+  end"#
+    )
+}
+
+/// Render a platform gemspec: it stamps `s.platform` and ships the bundled
+/// native library alongside the Ruby sources.
+fn render_packaged_gemspec(
+    package: &ResolvedPackage,
+    gem_file: &str,
+    platform: Platform,
+    input_basename: &str,
+) -> String {
+    let prelude = render_prelude(CommentStyle::Hash, input_basename);
+    let trailer = render_trailer(CommentStyle::Hash, gem_file);
+    let name = &package.name;
+    let version = &package.version;
+    let summary = package.description_or_default().replace('\'', "\\'");
+    let ruby_platform = platform.ruby_platform();
+    let mut extra = String::new();
+    if !package.authors.is_empty() {
+        let authors = package
+            .authors
+            .iter()
+            .map(|a| format!("'{}'", a.replace('\'', "\\'")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        extra.push_str(&format!("  s.authors     = [{authors}]\n"));
+    }
+    if let Some(license) = &package.license {
+        extra.push_str(&format!("  s.license     = '{license}'\n"));
+    }
+    if let Some(homepage) = package.homepage.as_ref().or(package.repository.as_ref()) {
+        extra.push_str(&format!("  s.homepage    = '{homepage}'\n"));
+    }
+    format!(
+        "{prelude}Gem::Specification.new do |s|
+  s.name        = '{name}'
+  s.version     = '{version}'
+  s.platform    = '{ruby_platform}'
+  s.summary     = '{summary}'
+{extra}  s.files       = Dir['lib/**/*.rb'] + Dir['lib/**/*.{{so,dylib,dll}}']
+  s.require_paths = ['lib']
+
+  s.add_dependency 'ffi', '~> 1.15'
+end
+
+{trailer}"
+    )
+}
+
+/// README for a packaged Ruby platform gem.
+fn render_packaged_readme(package: &ResolvedPackage, input_basename: &str) -> String {
+    let prelude = render_prelude(CommentStyle::Xml, input_basename);
+    let trailer = render_trailer(CommentStyle::Xml, "README.md");
+    let name = &package.name;
+    let version = &package.version;
+    let require_name = package.ident_name();
+    format!(
+        r#"{prelude}# {name} (Ruby)
+
+Auto-generated Ruby bindings using the [ffi](https://github.com/ffi/ffi) gem,
+with the native library bundled for this platform. The library loads
+automatically; no external setup is required.
+
+## Install
+
+```bash
+gem build {name}.gemspec
+gem install {name}-{version}-*.gem
+```
+
+## Usage
+
+```ruby
+require '{require_name}'
+```
+
+{trailer}"#
+    )
+}
 
 // ── Type helpers ──
 
@@ -1791,6 +1965,70 @@ mod tests {
     use super::*;
     use camino::Utf8Path;
     use weaveffi_core::codegen::Generator;
+
+    #[test]
+    fn package_emits_platform_gems_and_swaps_loader() {
+        use weaveffi_core::package::{FileContent, PackageContext};
+        use weaveffi_core::platform::{BinarySet, Platform};
+
+        let api = make_api(vec![simple_module(
+            "calc",
+            vec![Function {
+                name: "ping".into(),
+                params: vec![],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+        )]);
+        let model = BindingModel::build(&api, "weaveffi");
+        let mut bins = BinarySet::new("calculator");
+        bins.insert(Platform::MacosArm64, "/s/darwin-arm64/libcalculator.dylib");
+        bins.insert(Platform::LinuxX64, "/s/linux-x64/libcalculator.so");
+        let ctx = PackageContext {
+            binaries: &bins,
+            input_basename: Some("calculator.yml"),
+        };
+        let files = LanguageBackend::package(
+            &RubyGenerator,
+            &api,
+            &model,
+            &ctx,
+            Utf8Path::new("/out"),
+            &RubyConfig::default(),
+        )
+        .expect("ruby supports packaging");
+
+        assert_eq!(files.iter().filter(|f| f.is_binary()).count(), 2);
+        // Bundled under lib/native/ inside each per-platform gem dir.
+        assert!(files
+            .iter()
+            .any(|f| f.path.as_str().ends_with("ruby/darwin-arm64/lib/native/libcalculator.dylib")));
+        // The gemspec stamps the RubyGems platform string.
+        let gemspec = files
+            .iter()
+            .find(|f| f.path.as_str().ends_with("darwin-arm64/weaveffi.gemspec"))
+            .expect("gemspec present");
+        let FileContent::Text(spec) = &gemspec.content else {
+            panic!("gemspec is text");
+        };
+        assert!(spec.contains("s.platform    = 'arm64-darwin'"), "platform: {spec}");
+        // The loader was rewritten to prefer the bundled library.
+        let rb = files
+            .iter()
+            .find(|f| f.path.as_str().ends_with("darwin-arm64/lib/weaveffi.rb"))
+            .expect("library module present");
+        let FileContent::Text(src) = &rb.content else {
+            panic!("module is text");
+        };
+        assert!(
+            src.contains("File.exist?") && src.contains("libcalculator.dylib"),
+            "packaged loader not applied: {src}"
+        );
+    }
     use weaveffi_ir::ir::{
         Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
     };
