@@ -34,6 +34,7 @@
   - [Async Functions](guides/async.md)
   - [Annotated Rust Extraction](guides/extract.md)
   - [Generator Configuration](guides/config.md)
+  - [Packaging and Distribution](guides/packaging.md)
 - [Tutorials](tutorials/README.md)
   - [Calculator](tutorials/calculator.md)
   - [Swift iOS](tutorials/swift.md)

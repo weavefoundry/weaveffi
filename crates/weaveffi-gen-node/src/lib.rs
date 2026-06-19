@@ -22,6 +22,7 @@ use weaveffi_core::model::{
     BindingModel, CallbackBinding, EnumBinding, FnBinding, ListenerBinding, ParamBinding,
     StructBinding,
 };
+use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::utils::{
     c_abi_struct_name, local_type_name, render_json_prelude, render_prelude, render_trailer,
@@ -123,9 +124,203 @@ impl LanguageBackend for NodeGenerator {
             ),
         ]
     }
+
+    fn package(
+        &self,
+        api: &Api,
+        _model: &BindingModel,
+        ctx: &PackageContext,
+        out_dir: &Utf8Path,
+        config: &Self::Config,
+    ) -> Option<Vec<PackagedFile>> {
+        let dir = out_dir.join("node");
+        let input_basename = config.input_basename();
+        let prefix = config.prefix();
+        let strip = config.strip_module_prefix;
+        let package = pkg::resolve(
+            api,
+            config.package_name.as_deref(),
+            config.input_basename.as_deref(),
+        );
+        let lib = &ctx.binaries.lib_name;
+
+        // The per-platform package names follow the esbuild/swc convention:
+        // `<pkg>-<node-os>-<node-cpu>` constrained by npm `os`/`cpu`, so npm
+        // installs only the matching one.
+        let platform_pkgs: Vec<(weaveffi_core::platform::Platform, String)> = ctx
+            .binaries
+            .platforms()
+            .map(|p| {
+                (
+                    p,
+                    format!("{}-{}-{}", package.name, p.node_os(), p.node_cpu()),
+                )
+            })
+            .collect();
+
+        let mut files = vec![
+            PackagedFile::text(
+                dir.join("index.js"),
+                render_node_index(api, prefix, strip, input_basename),
+            ),
+            PackagedFile::text(
+                dir.join("types.d.ts"),
+                render_node_dts(api, prefix, strip, input_basename),
+            ),
+            PackagedFile::text(
+                dir.join("package.json"),
+                render_packaged_package_json(&package, &platform_pkgs, input_basename),
+            ),
+            PackagedFile::text(
+                dir.join("binding.gyp"),
+                render_packaged_binding_gyp(&package.name, lib, input_basename),
+            ),
+            PackagedFile::text(
+                dir.join("weaveffi_addon.c"),
+                render_addon_c(api, prefix, strip, input_basename),
+            ),
+            PackagedFile::text(
+                dir.join("README.md"),
+                render_packaged_readme(&package, ctx, input_basename),
+            ),
+        ];
+
+        // Each platform package bundles its prebuilt library and is gated by
+        // npm `os`/`cpu` so only the matching one installs.
+        for (platform, pkg_name) in &platform_pkgs {
+            let pkg_dir = dir.join("npm").join(pkg_name);
+            files.push(PackagedFile::text(
+                pkg_dir.join("package.json"),
+                render_platform_package_json(pkg_name, &package.version, *platform),
+            ));
+            let nb = ctx.binaries.get(*platform).expect("platform has a binary");
+            files.push(PackagedFile::copy(
+                pkg_dir.join(ctx.binaries.bundled_filename(*platform)),
+                nb.source.clone(),
+            ));
+        }
+        Some(files)
+    }
 }
 
 weaveffi_core::impl_generator_via_backend!(NodeGenerator);
+
+/// Render the main package's `package.json` with `optionalDependencies` on the
+/// per-platform native packages.
+fn render_packaged_package_json(
+    package: &ResolvedPackage,
+    platform_pkgs: &[(weaveffi_core::platform::Platform, String)],
+    input_basename: &str,
+) -> String {
+    let prelude = render_json_prelude(input_basename);
+    let name = &package.name;
+    let version = &package.version;
+    let description = package.description_or_default();
+    let mut optional = String::new();
+    if let Some(license) = &package.license {
+        optional.push_str(&format!("  \"license\": \"{license}\",\n"));
+    }
+    if let Some(author) = package.authors.first() {
+        optional.push_str(&format!("  \"author\": \"{author}\",\n"));
+    }
+    if let Some(homepage) = &package.homepage {
+        optional.push_str(&format!("  \"homepage\": \"{homepage}\",\n"));
+    }
+    if let Some(repository) = &package.repository {
+        optional.push_str(&format!(
+            "  \"repository\": {{ \"type\": \"git\", \"url\": \"{repository}\" }},\n"
+        ));
+    }
+    let deps = platform_pkgs
+        .iter()
+        .map(|(_, pkg_name)| format!("    \"{pkg_name}\": \"{version}\""))
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!(
+        "{{\n{prelude}  \"name\": \"{name}\",\n  \"version\": \"{version}\",\n  \"description\": \"{description}\",\n{optional}  \"main\": \"index.js\",\n  \"types\": \"types.d.ts\",\n  \"gypfile\": true,\n  \"scripts\": {{\n    \"install\": \"node-gyp rebuild\"\n  }},\n  \"optionalDependencies\": {{\n{deps}\n  }}\n}}\n"
+    )
+}
+
+/// Render a per-platform native package's `package.json`, gated by npm `os` and
+/// `cpu` so npm installs only the matching one.
+fn render_platform_package_json(
+    pkg_name: &str,
+    version: &str,
+    platform: weaveffi_core::platform::Platform,
+) -> String {
+    let os = platform.node_os();
+    let cpu = platform.node_cpu();
+    format!(
+        "{{\n  \"name\": \"{pkg_name}\",\n  \"version\": \"{version}\",\n  \"description\": \"Prebuilt WeaveFFI native library for {os}/{cpu}\",\n  \"os\": [\"{os}\"],\n  \"cpu\": [\"{cpu}\"]\n}}\n"
+    )
+}
+
+/// Render the packaged `binding.gyp`: it links the prebuilt library resolved
+/// from the installed per-platform package (selected by npm `os`/`cpu`) and
+/// sets an rpath so the addon finds it at runtime.
+fn render_packaged_binding_gyp(pkg_name: &str, lib: &str, input_basename: &str) -> String {
+    let prelude = render_prelude(CommentStyle::Hash, input_basename);
+    let trailer = render_trailer(CommentStyle::Hash, "binding.gyp");
+    let resolve = format!(
+        "<!(node -p \"require('path').dirname(require.resolve('{pkg_name}-' + process.platform + '-' + process.arch + '/package.json'))\")"
+    );
+    let mut out = String::new();
+    out.push_str(&prelude);
+    out.push_str("{\n");
+    out.push_str("  \"variables\": {\n");
+    out.push_str(&format!("    \"wv_native_dir%\": \"{resolve}\"\n"));
+    out.push_str("  },\n");
+    out.push_str("  \"targets\": [\n");
+    out.push_str("    {\n");
+    out.push_str("      \"target_name\": \"weaveffi\",\n");
+    out.push_str("      \"sources\": [\"weaveffi_addon.c\"],\n");
+    out.push_str("      \"include_dirs\": [\"../c\"],\n");
+    out.push_str("      \"library_dirs\": [\"<(wv_native_dir)\"],\n");
+    out.push_str(&format!("      \"libraries\": [\"-l{lib}\"],\n"));
+    out.push_str("      \"conditions\": [\n");
+    out.push_str("        [\"OS=='mac'\", { \"xcode_settings\": { \"OTHER_LDFLAGS\": [\"-Wl,-rpath,<(wv_native_dir)\"] } }],\n");
+    out.push_str("        [\"OS=='linux'\", { \"ldflags\": [\"-Wl,-rpath,<(wv_native_dir)\"] }]\n");
+    out.push_str("      ]\n");
+    out.push_str("    }\n");
+    out.push_str("  ]\n");
+    out.push_str("}\n\n");
+    out.push_str(&trailer);
+    out
+}
+
+/// README for a packaged Node artifact using `optionalDependencies`.
+fn render_packaged_readme(
+    package: &ResolvedPackage,
+    ctx: &PackageContext,
+    input_basename: &str,
+) -> String {
+    let prelude = render_prelude(CommentStyle::Xml, input_basename);
+    let trailer = render_trailer(CommentStyle::Xml, "README.md");
+    let name = &package.name;
+    let platforms: Vec<String> = ctx
+        .binaries
+        .platforms()
+        .map(|p| format!("- `{}-{}-{}`", name, p.node_os(), p.node_cpu()))
+        .collect();
+    let platform_list = platforms.join("\n");
+    format!(
+        r#"{prelude}# {name} (Node.js)
+
+Auto-generated N-API bindings. The prebuilt native library is published as a set
+of per-platform packages and selected automatically through
+`optionalDependencies` (npm installs only the package matching the host
+`os`/`cpu`):
+
+{platform_list}
+
+The thin N-API addon is compiled at install time (`node-gyp rebuild`) and links
+the prebuilt library from the selected platform package, so no Rust toolchain is
+needed. A C compiler and the generated C header (`../c`) are required to build
+the addon.
+
+{trailer}"#,
+    )
+}
 
 fn render_package_json(package: &ResolvedPackage, input_basename: &str) -> String {
     let prelude = render_json_prelude(input_basename);
@@ -3250,6 +3445,59 @@ mod tests {
     use super::*;
     use weaveffi_core::codegen::Generator;
     use weaveffi_ir::ir::{EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField};
+
+    #[test]
+    fn package_uses_optional_dependencies_per_platform() {
+        use camino::Utf8Path;
+        use weaveffi_core::package::{FileContent, PackageContext};
+        use weaveffi_core::platform::{BinarySet, Platform};
+
+        let api = make_api(vec![make_module("calc")]);
+        let model = BindingModel::build(&api, "weaveffi");
+        let mut bins = BinarySet::new("calculator");
+        bins.insert(Platform::MacosArm64, "/s/darwin-arm64/libcalculator.dylib");
+        bins.insert(Platform::WindowsX64, "/s/windows-x64/calculator.dll");
+        let ctx = PackageContext {
+            binaries: &bins,
+            input_basename: Some("calculator.yml"),
+        };
+        let files = LanguageBackend::package(
+            &NodeGenerator,
+            &api,
+            &model,
+            &ctx,
+            Utf8Path::new("/out"),
+            &NodeConfig::default(),
+        )
+        .expect("node supports packaging");
+
+        assert_eq!(files.iter().filter(|f| f.is_binary()).count(), 2);
+        let main = files
+            .iter()
+            .find(|f| f.path.as_str().ends_with("node/package.json"))
+            .expect("main package.json present");
+        let FileContent::Text(pkg) = &main.content else {
+            panic!("package.json is text");
+        };
+        assert!(pkg.contains("\"optionalDependencies\""));
+        assert!(pkg.contains("weaveffi-darwin-arm64") && pkg.contains("weaveffi-win32-x64"));
+        // The per-platform native package is gated by npm os/cpu.
+        let plat = files
+            .iter()
+            .find(|f| {
+                f.path
+                    .as_str()
+                    .ends_with("npm/weaveffi-win32-x64/package.json")
+            })
+            .expect("platform package present");
+        let FileContent::Text(pp) = &plat.content else {
+            panic!("platform package.json is text");
+        };
+        assert!(
+            pp.contains("\"os\": [\"win32\"]") && pp.contains("\"cpu\": [\"x64\"]"),
+            "os/cpu gating missing: {pp}"
+        );
+    }
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {

@@ -29,6 +29,7 @@ use crate::model::{
     BindingModel, CallbackBinding, EnumBinding, FnBinding, ListenerBinding, ModuleBinding,
     StructBinding,
 };
+use crate::package::{PackageContext, PackagedFile};
 
 /// A single generated file: its full path (under the output directory) and the
 /// rendered contents. Backends return these from [`LanguageBackend::files`];
@@ -199,6 +200,31 @@ pub trait LanguageBackend: Send + Sync {
         out_dir: &Utf8Path,
         config: &Self::Config,
     ) -> Vec<OutputFile>;
+
+    /// Assemble a distributable package that bundles a prebuilt native library
+    /// for each platform in `ctx.binaries`, returning `None` when this target
+    /// does not support packaging yet.
+    ///
+    /// This is the `weaveffi package` analogue of [`files`](Self::files): it
+    /// returns [`PackagedFile`]s (rendered manifests, loaders, and binding
+    /// source as [`FileContent::Text`](crate::package::FileContent::Text), plus
+    /// the bundled libraries as
+    /// [`FileContent::Copy`](crate::package::FileContent::Copy)) anchored under
+    /// `out_dir`, and the [`write_package`](crate::package::write_package)
+    /// driver does the I/O. Override this to emit the ecosystem's idiomatic
+    /// per-platform layout (npm `optionalDependencies`, a NuGet `runtimes/`
+    /// tree, platform-tagged Python wheels, …). The default returns `None`.
+    fn package(
+        &self,
+        api: &Api,
+        model: &BindingModel,
+        ctx: &PackageContext,
+        out_dir: &Utf8Path,
+        config: &Self::Config,
+    ) -> Option<Vec<PackagedFile>> {
+        let _ = (api, model, ctx, out_dir, config);
+        None
+    }
 }
 
 /// Build the model and write every file a backend produces.
@@ -263,6 +289,21 @@ pub fn output_files<B: LanguageBackend>(
     paths
 }
 
+/// Build the model and assemble the package a backend produces, the body of
+/// the [`Generator::package`](crate::codegen::Generator::package) impl that
+/// [`impl_generator_via_backend!`](crate::impl_generator_via_backend)
+/// generates. Returns `None` when the backend does not support packaging.
+pub fn package_files<B: LanguageBackend>(
+    backend: &B,
+    api: &Api,
+    ctx: &PackageContext,
+    out_dir: &Utf8Path,
+    config: &B::Config,
+) -> Option<Vec<PackagedFile>> {
+    let model = BindingModel::build(api, backend.prefix(config));
+    backend.package(api, &model, ctx, out_dir, config)
+}
+
 /// Re-export of `anyhow` so [`impl_generator_via_backend!`](crate::impl_generator_via_backend)
 /// can name the `Generator::generate` return type in its expansion without
 /// forcing every backend crate to declare a direct `anyhow` dependency it never
@@ -312,6 +353,16 @@ macro_rules! impl_generator_via_backend {
                 config: &Self::Config,
             ) -> ::std::vec::Vec<::std::string::String> {
                 $crate::backend::output_files(self, api, out_dir, config)
+            }
+
+            fn package(
+                &self,
+                api: &::weaveffi_ir::ir::Api,
+                ctx: &$crate::package::PackageContext,
+                out_dir: &::camino::Utf8Path,
+                config: &Self::Config,
+            ) -> ::core::option::Option<::std::vec::Vec<$crate::package::PackagedFile>> {
+                $crate::backend::package_files(self, api, ctx, out_dir, config)
             }
         }
     };

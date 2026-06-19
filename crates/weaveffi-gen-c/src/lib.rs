@@ -21,6 +21,7 @@ use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::cabi;
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::model::BindingModel;
+use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::utils::{
     render_abi_prefix_aliases, render_prelude, render_trailer, CommentStyle,
 };
@@ -96,9 +97,125 @@ impl LanguageBackend for CGenerator {
             ),
         ]
     }
+
+    fn package(
+        &self,
+        _api: &Api,
+        model: &BindingModel,
+        ctx: &PackageContext,
+        out_dir: &Utf8Path,
+        config: &Self::Config,
+    ) -> Option<Vec<PackagedFile>> {
+        let prefix = config.prefix();
+        let input_basename = config.input_basename();
+        let dir = out_dir.join("c");
+        let header_name = format!("{prefix}.h");
+        let lib = &ctx.binaries.lib_name;
+
+        let mut files = vec![
+            PackagedFile::text(
+                dir.join("include").join(&header_name),
+                render_c_header_from_model(model, input_basename, &header_name),
+            ),
+            PackagedFile::text(
+                dir.join("CMakeLists.txt"),
+                render_packaged_cmake(lib, input_basename),
+            ),
+            PackagedFile::text(
+                dir.join("README.md"),
+                render_packaged_readme(lib, &header_name, ctx, input_basename),
+            ),
+        ];
+        for nb in &ctx.binaries.binaries {
+            let dest = dir
+                .join("lib")
+                .join(nb.platform.id())
+                .join(ctx.binaries.bundled_filename(nb.platform));
+            files.push(PackagedFile::copy(dest, nb.source.clone()));
+        }
+        Some(files)
+    }
 }
 
 weaveffi_core::impl_generator_via_backend!(CGenerator);
+
+/// Render a `CMakeLists.txt` that exposes the bundled per-platform library as
+/// an `IMPORTED` target (`<lib>::<lib>`) with the header's include directory,
+/// selecting the right library for the host platform and architecture.
+fn render_packaged_cmake(lib: &str, input_basename: &str) -> String {
+    let prelude = render_prelude(CommentStyle::Hash, input_basename);
+    let trailer = render_trailer(CommentStyle::Hash, "CMakeLists.txt");
+    let body = r#"cmake_minimum_required(VERSION 3.15)
+project(@LIB@ C)
+
+# Select the prebuilt library bundled for the host platform and architecture.
+if(APPLE)
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+    set(_wv_plat "darwin-arm64")
+  else()
+    set(_wv_plat "darwin-x64")
+  endif()
+  set(_wv_libfile "lib@LIB@.dylib")
+elseif(WIN32)
+  set(_wv_plat "windows-x64")
+  set(_wv_libfile "@LIB@.dll")
+else()
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    set(_wv_plat "linux-arm64")
+  else()
+    set(_wv_plat "linux-x64")
+  endif()
+  set(_wv_libfile "lib@LIB@.so")
+endif()
+
+add_library(@LIB@ SHARED IMPORTED GLOBAL)
+set_target_properties(@LIB@ PROPERTIES
+  IMPORTED_LOCATION "${CMAKE_CURRENT_LIST_DIR}/lib/${_wv_plat}/${_wv_libfile}"
+  INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_LIST_DIR}/include")
+add_library(@LIB@::@LIB@ ALIAS @LIB@)
+"#
+    .replace("@LIB@", lib);
+    format!("{prelude}{body}\n{trailer}")
+}
+
+/// README for a packaged C artifact bundling the header and per-platform libs.
+fn render_packaged_readme(
+    lib: &str,
+    header_name: &str,
+    ctx: &PackageContext,
+    input_basename: &str,
+) -> String {
+    let prelude = render_prelude(CommentStyle::Xml, input_basename);
+    let trailer = render_trailer(CommentStyle::Xml, "README.md");
+    let platforms: Vec<String> = ctx
+        .binaries
+        .platforms()
+        .map(|p| format!("- `lib/{}/`", p.id()))
+        .collect();
+    let platform_list = platforms.join("\n");
+    format!(
+        r#"{prelude}# {lib} (C)
+
+The stable C ABI header (`include/{header_name}`) plus a prebuilt shared library
+for each supported platform under `lib/<platform>/`.
+
+## Use with CMake
+
+```cmake
+add_subdirectory(path/to/{lib})
+target_link_libraries(your_app PRIVATE {lib}::{lib})
+```
+
+`CMakeLists.txt` selects the right library for the host platform and exposes the
+include directory automatically.
+
+## Bundled platforms
+
+{platform_list}
+
+{trailer}"#,
+    )
+}
 
 /// Render the complete `{prefix}.h` for `api` using `prefix` for every symbol.
 ///
@@ -167,6 +284,57 @@ mod tests {
         CallbackDef, EnumDef, EnumVariant, Function, ListenerDef, Module, Param, StructDef,
         StructField, TypeRef,
     };
+
+    #[test]
+    fn package_bundles_header_libs_and_cmake() {
+        use camino::Utf8Path;
+        use weaveffi_core::package::{FileContent, PackageContext};
+        use weaveffi_core::platform::{BinarySet, Platform};
+
+        let api = Api {
+            version: "0.4.0".into(),
+            modules: vec![module("calc")],
+            generators: None,
+            package: None,
+        };
+        let model = BindingModel::build(&api, "weaveffi");
+        let mut bins = BinarySet::new("calculator");
+        bins.insert(Platform::MacosArm64, "/s/darwin-arm64/libcalculator.dylib");
+        bins.insert(Platform::LinuxX64, "/s/linux-x64/libcalculator.so");
+        let ctx = PackageContext {
+            binaries: &bins,
+            input_basename: Some("calculator.yml"),
+        };
+        let files = LanguageBackend::package(
+            &CGenerator,
+            &api,
+            &model,
+            &ctx,
+            Utf8Path::new("/out"),
+            &CConfig::default(),
+        )
+        .expect("c supports packaging");
+
+        assert_eq!(files.iter().filter(|f| f.is_binary()).count(), 2);
+        assert!(files
+            .iter()
+            .any(|f| f.path.as_str().ends_with("c/include/weaveffi.h")));
+        assert!(files.iter().any(|f| f
+            .path
+            .as_str()
+            .ends_with("c/lib/darwin-arm64/libcalculator.dylib")));
+        let cmake = files
+            .iter()
+            .find(|f| f.path.as_str().ends_with("c/CMakeLists.txt"))
+            .expect("CMakeLists present");
+        let FileContent::Text(txt) = &cmake.content else {
+            panic!("CMakeLists is text");
+        };
+        assert!(
+            txt.contains("IMPORTED") && txt.contains("calculator::calculator"),
+            "imported target missing: {txt}"
+        );
+    }
 
     fn param(name: &str, ty: TypeRef) -> Param {
         Param {

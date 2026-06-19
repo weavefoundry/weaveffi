@@ -5,6 +5,7 @@ pub(crate) mod diff;
 pub(crate) mod format;
 pub(crate) mod generate;
 pub(crate) mod new;
+pub(crate) mod package;
 pub(crate) mod validate;
 pub(crate) mod watch;
 

@@ -22,6 +22,7 @@ use weaveffi_core::model::{
     BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
     ListenerBinding, ModuleBinding, ParamBinding, RichVariantBinding, StructBinding,
 };
+use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::utils::{
     local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
@@ -222,9 +223,193 @@ impl LanguageBackend for PythonGenerator {
             ),
         ]
     }
+
+    fn package(
+        &self,
+        api: &Api,
+        model: &BindingModel,
+        ctx: &PackageContext,
+        out_dir: &Utf8Path,
+        config: &Self::Config,
+    ) -> Option<Vec<PackagedFile>> {
+        let package = pkg::resolve(
+            api,
+            config.package_name.as_deref(),
+            config.input_basename.as_deref(),
+        );
+        let import_name = package.ident_name();
+        let input_basename = config.input_basename();
+        let hash = CommentStyle::Hash;
+
+        // Render the binding source once with the bundled-first loader, then
+        // reuse it across every per-platform wheel tree.
+        let py_source = self
+            .render_py_source(model, config.strip_module_prefix, input_basename)
+            .replace(
+                PY_LOADER_ORIGINAL,
+                &py_loader_packaged(&ctx.binaries.lib_name),
+            );
+        let init_py = format!(
+            "{}from .weaveffi import *  # noqa: F401,F403\n\n{}",
+            render_prelude(hash, input_basename),
+            render_trailer(hash, "__init__.py"),
+        );
+        let pyi = render_pyi_module(api, config.strip_module_prefix, input_basename);
+        let setup_py = render_packaged_setup_py(&package, &import_name, input_basename);
+        let pyproject = render_pyproject_toml(&package, &import_name, input_basename);
+
+        let py_dir = out_dir.join("python");
+        let mut files = Vec::new();
+        for nb in &ctx.binaries.binaries {
+            let platform = nb.platform;
+            let tree = py_dir.join(platform.id());
+            let pkg_dir = tree.join(&import_name);
+            files.push(PackagedFile::text(
+                pkg_dir.join("__init__.py"),
+                init_py.clone(),
+            ));
+            files.push(PackagedFile::text(
+                pkg_dir.join("weaveffi.py"),
+                py_source.clone(),
+            ));
+            files.push(PackagedFile::text(
+                pkg_dir.join("weaveffi.pyi"),
+                pyi.clone(),
+            ));
+            files.push(PackagedFile::copy(
+                pkg_dir.join(ctx.binaries.bundled_filename(platform)),
+                nb.source.clone(),
+            ));
+            files.push(PackagedFile::text(
+                tree.join("pyproject.toml"),
+                pyproject.clone(),
+            ));
+            files.push(PackagedFile::text(tree.join("setup.py"), setup_py.clone()));
+            files.push(PackagedFile::text(
+                tree.join("README.md"),
+                render_packaged_readme(&package, &import_name, platform, input_basename),
+            ));
+        }
+        Some(files)
+    }
 }
 
 weaveffi_core::impl_generator_via_backend!(PythonGenerator);
+
+/// The exact `_load_library` block `render_py_source` emits in `generate`
+/// mode, so the packager can swap it for a bundled-first variant.
+const PY_LOADER_ORIGINAL: &str = r#"def _load_library() -> ctypes.CDLL:
+    # An explicit path in WEAVEFFI_LIBRARY wins, so callers can point at a
+    # specific build artifact regardless of its file name or location.
+    override = os.environ.get("WEAVEFFI_LIBRARY")
+    if override:
+        return ctypes.CDLL(override)
+    system = platform.system()
+    if system == "Darwin":
+        name = "libweaveffi.dylib"
+    elif system == "Windows":
+        name = "weaveffi.dll"
+    else:
+        name = "libweaveffi.so"
+    return ctypes.CDLL(name)"#;
+
+/// The packaged `_load_library` for `lib`: prefer the per-platform library
+/// bundled next to the module, then `WEAVEFFI_LIBRARY`, then the system path.
+fn py_loader_packaged(lib: &str) -> String {
+    format!(
+        r#"def _load_library() -> ctypes.CDLL:
+    # A bundled per-platform library ships next to this module; prefer it so the
+    # package works with no external setup. WEAVEFFI_LIBRARY still overrides.
+    override = os.environ.get("WEAVEFFI_LIBRARY")
+    if override:
+        return ctypes.CDLL(override)
+    here = os.path.dirname(os.path.abspath(__file__))
+    system = platform.system()
+    if system == "Darwin":
+        name = "lib{lib}.dylib"
+    elif system == "Windows":
+        name = "{lib}.dll"
+    else:
+        name = "lib{lib}.so"
+    bundled = os.path.join(here, name)
+    if os.path.exists(bundled):
+        return ctypes.CDLL(bundled)
+    return ctypes.CDLL(name)"#
+    )
+}
+
+/// Render a `setup.py` for a packaged wheel: it ships the bundled library as
+/// package data and forces a non-pure (platform-tagged) wheel.
+fn render_packaged_setup_py(
+    package: &ResolvedPackage,
+    import_name: &str,
+    input_basename: &str,
+) -> String {
+    let prelude = render_prelude(CommentStyle::Hash, input_basename);
+    let trailer = render_trailer(CommentStyle::Hash, "setup.py");
+    let name = &package.name;
+    let version = &package.version;
+    format!(
+        r#"{prelude}from setuptools import setup
+from setuptools.dist import Distribution
+
+
+class _BinaryDistribution(Distribution):
+    # Force a non-pure, platform-tagged wheel: the package bundles a native
+    # shared library, so it is not portable across platforms.
+    def has_ext_modules(self):
+        return True
+
+
+setup(
+    name="{name}",
+    version="{version}",
+    packages=["{import_name}"],
+    package_data={{"{import_name}": ["*.so", "*.dylib", "*.dll"]}},
+    include_package_data=True,
+    distclass=_BinaryDistribution,
+)
+
+{trailer}"#,
+    )
+}
+
+/// README for a packaged per-platform Python wheel tree.
+fn render_packaged_readme(
+    package: &ResolvedPackage,
+    import_name: &str,
+    platform: weaveffi_core::platform::Platform,
+    input_basename: &str,
+) -> String {
+    let prelude = render_prelude(CommentStyle::Xml, input_basename);
+    let trailer = render_trailer(CommentStyle::Xml, "README.md");
+    let name = &package.name;
+    let tag = platform.python_platform_tag();
+    format!(
+        r#"{prelude}# {name} (Python, {plat})
+
+Auto-generated Python bindings with the native library bundled for `{plat}`.
+The library loads automatically; no external setup is required.
+
+## Build the wheel
+
+```bash
+python -m build --wheel
+```
+
+Tag the resulting wheel for this platform with `{tag}` (for example via
+`wheel tags --platform-tag {tag} dist/*.whl`) before publishing.
+
+## Usage
+
+```python
+from {import_name} import *
+```
+
+{trailer}"#,
+        plat = platform.id(),
+    )
+}
 
 // ── Type helpers ──
 
@@ -2131,6 +2316,79 @@ mod tests {
     #[test]
     fn generator_name_is_python() {
         assert_eq!(Generator::name(&PythonGenerator), "python");
+    }
+
+    fn ping_api() -> Api {
+        make_api(vec![simple_module(vec![Function {
+            name: "ping".into(),
+            params: vec![],
+            returns: None,
+            doc: None,
+            r#async: false,
+            cancellable: false,
+            deprecated: None,
+            since: None,
+        }])])
+    }
+
+    #[test]
+    fn package_emits_per_platform_trees_and_swaps_loader() {
+        use weaveffi_core::package::{FileContent, PackageContext};
+        use weaveffi_core::platform::{BinarySet, Platform};
+
+        let api = ping_api();
+        let model = BindingModel::build(&api, "weaveffi");
+        let mut bins = BinarySet::new("calculator");
+        bins.insert(
+            Platform::MacosArm64,
+            "/src/darwin-arm64/libcalculator.dylib",
+        );
+        bins.insert(Platform::LinuxX64, "/src/linux-x64/libcalculator.so");
+        let ctx = PackageContext {
+            binaries: &bins,
+            input_basename: Some("calculator.yml"),
+        };
+        let files = LanguageBackend::package(
+            &PythonGenerator,
+            &api,
+            &model,
+            &ctx,
+            Utf8Path::new("/out"),
+            &PythonConfig::default(),
+        )
+        .expect("python supports packaging");
+
+        // A complete wheel tree per bundled platform.
+        assert!(files
+            .iter()
+            .any(|f| f.path.as_str().contains("python/darwin-arm64/")));
+        assert!(files
+            .iter()
+            .any(|f| f.path.as_str().contains("python/linux-x64/")));
+        // Exactly one bundled binary per platform, materialized as copies.
+        assert_eq!(files.iter().filter(|f| f.is_binary()).count(), 2);
+
+        // The loader was rewritten to prefer the bundled library (the fragile
+        // string replace must keep matching the generator's loader block).
+        let py = files
+            .iter()
+            .find(|f| {
+                f.path
+                    .as_str()
+                    .ends_with("darwin-arm64/weaveffi/weaveffi.py")
+            })
+            .expect("weaveffi.py present");
+        let FileContent::Text(src) = &py.content else {
+            panic!("weaveffi.py should be text");
+        };
+        assert!(
+            src.contains("os.path.exists") && src.contains("libcalculator.dylib"),
+            "packaged loader not applied: {src}"
+        );
+        assert!(
+            !src.contains("\"libweaveffi.dylib\""),
+            "generate-mode loader leaked into the package"
+        );
     }
 
     #[test]

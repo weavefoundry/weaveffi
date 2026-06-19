@@ -192,3 +192,47 @@ fn doctor_target_filter_runs_subset() {
         "--target dart should include the always-run rustc/cargo checks, got ids: {ids:?}"
     );
 }
+
+/// `--target package` is the pseudo-target for `weaveffi package --build`: it
+/// should surface a producer cross-target check for every platform in the v1
+/// matrix (plus the always-run rustc/cargo checks) and nothing language
+/// specific.
+#[test]
+fn doctor_target_package_lists_producer_targets() {
+    let output = cargo_bin()
+        .args(["doctor", "--target", "package", "--format", "json"])
+        .output()
+        .expect("failed to run --target package doctor");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).expect("package doctor JSON should parse");
+    let ids: Vec<&str> = value
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|c| c["id"].as_str())
+        .collect();
+
+    for id in [
+        "pkg_target_darwin_arm64",
+        "pkg_target_darwin_x64",
+        "pkg_target_linux_x64",
+        "pkg_target_linux_arm64",
+        "pkg_target_windows_x64",
+    ] {
+        assert!(
+            ids.contains(&id),
+            "--target package should include '{id}', got ids: {ids:?}"
+        );
+    }
+    assert!(
+        ids.contains(&"rustc") && ids.contains(&"cargo"),
+        "--target package should include the always-run rustc/cargo checks, got ids: {ids:?}"
+    );
+    for unrelated in ["node", "dart", "ruby", "dotnet", "go", "target_wasm"] {
+        assert!(
+            !ids.contains(&unrelated),
+            "--target package should not include '{unrelated}', got ids: {ids:?}"
+        );
+    }
+}
