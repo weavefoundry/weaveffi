@@ -150,7 +150,12 @@ impl LanguageBackend for NodeGenerator {
         let platform_pkgs: Vec<(weaveffi_core::platform::Platform, String)> = ctx
             .binaries
             .platforms()
-            .map(|p| (p, format!("{}-{}-{}", package.name, p.node_os(), p.node_cpu())))
+            .map(|p| {
+                (
+                    p,
+                    format!("{}-{}-{}", package.name, p.node_os(), p.node_cpu()),
+                )
+            })
             .collect();
 
         let mut files = vec![
@@ -3479,7 +3484,11 @@ mod tests {
         // The per-platform native package is gated by npm os/cpu.
         let plat = files
             .iter()
-            .find(|f| f.path.as_str().ends_with("npm/weaveffi-win32-x64/package.json"))
+            .find(|f| {
+                f.path
+                    .as_str()
+                    .ends_with("npm/weaveffi-win32-x64/package.json")
+            })
             .expect("platform package present");
         let FileContent::Text(pp) = &plat.content else {
             panic!("platform package.json is text");

@@ -110,10 +110,7 @@ pub(crate) fn cmd_package(
 
     if !quiet {
         let plats: Vec<&str> = binary_set.platforms().map(Platform::id).collect();
-        println!(
-            "Packaging '{lib_name}' for platforms: {}",
-            plats.join(", ")
-        );
+        println!("Packaging '{lib_name}' for platforms: {}", plats.join(", "));
     }
 
     let mut packaged = 0usize;
@@ -163,7 +160,10 @@ fn parse_platforms(platforms: Option<&str>) -> Result<Vec<Platform>> {
     for token in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         let p = Platform::from_id(token).ok_or_else(|| {
             let known: Vec<&str> = Platform::ALL.iter().map(|p| p.id()).collect();
-            miette!("unknown platform '{token}'; expected one of: {}", known.join(", "))
+            miette!(
+                "unknown platform '{token}'; expected one of: {}",
+                known.join(", ")
+            )
         })?;
         if !out.contains(&p) {
             out.push(p);

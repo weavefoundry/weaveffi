@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 use weaveffi_core::abi::{self, CType};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
-use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, is_c_pointer_type, pascal_case, DocCommentStyle,
 };
@@ -23,6 +22,7 @@ use weaveffi_core::model::{
     BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
     ListenerBinding, ModuleBinding, ParamBinding, RichVariantBinding, StructBinding,
 };
+use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::utils::{
     local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
@@ -272,12 +272,18 @@ impl LanguageBackend for PythonGenerator {
                 pkg_dir.join("weaveffi.py"),
                 py_source.clone(),
             ));
-            files.push(PackagedFile::text(pkg_dir.join("weaveffi.pyi"), pyi.clone()));
+            files.push(PackagedFile::text(
+                pkg_dir.join("weaveffi.pyi"),
+                pyi.clone(),
+            ));
             files.push(PackagedFile::copy(
                 pkg_dir.join(ctx.binaries.bundled_filename(platform)),
                 nb.source.clone(),
             ));
-            files.push(PackagedFile::text(tree.join("pyproject.toml"), pyproject.clone()));
+            files.push(PackagedFile::text(
+                tree.join("pyproject.toml"),
+                pyproject.clone(),
+            ));
             files.push(PackagedFile::text(tree.join("setup.py"), setup_py.clone()));
             files.push(PackagedFile::text(
                 tree.join("README.md"),
@@ -2333,7 +2339,10 @@ mod tests {
         let api = ping_api();
         let model = BindingModel::build(&api, "weaveffi");
         let mut bins = BinarySet::new("calculator");
-        bins.insert(Platform::MacosArm64, "/src/darwin-arm64/libcalculator.dylib");
+        bins.insert(
+            Platform::MacosArm64,
+            "/src/darwin-arm64/libcalculator.dylib",
+        );
         bins.insert(Platform::LinuxX64, "/src/linux-x64/libcalculator.so");
         let ctx = PackageContext {
             binaries: &bins,
@@ -2363,7 +2372,11 @@ mod tests {
         // string replace must keep matching the generator's loader block).
         let py = files
             .iter()
-            .find(|f| f.path.as_str().ends_with("darwin-arm64/weaveffi/weaveffi.py"))
+            .find(|f| {
+                f.path
+                    .as_str()
+                    .ends_with("darwin-arm64/weaveffi/weaveffi.py")
+            })
             .expect("weaveffi.py present");
         let FileContent::Text(src) = &py.content else {
             panic!("weaveffi.py should be text");

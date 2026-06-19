@@ -152,7 +152,10 @@ impl LanguageBackend for GoGenerator {
 
         let mut files = vec![
             PackagedFile::text(dir.join("weaveffi.go"), go_src),
-            PackagedFile::text(dir.join("go.mod"), render_go_mod(&module_path, input_basename)),
+            PackagedFile::text(
+                dir.join("go.mod"),
+                render_go_mod(&module_path, input_basename),
+            ),
             PackagedFile::text(
                 dir.join("README.md"),
                 render_packaged_readme(ctx, input_basename),

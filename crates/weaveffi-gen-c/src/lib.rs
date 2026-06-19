@@ -316,10 +316,13 @@ mod tests {
         .expect("c supports packaging");
 
         assert_eq!(files.iter().filter(|f| f.is_binary()).count(), 2);
-        assert!(files.iter().any(|f| f.path.as_str().ends_with("c/include/weaveffi.h")));
         assert!(files
             .iter()
-            .any(|f| f.path.as_str().ends_with("c/lib/darwin-arm64/libcalculator.dylib")));
+            .any(|f| f.path.as_str().ends_with("c/include/weaveffi.h")));
+        assert!(files.iter().any(|f| f
+            .path
+            .as_str()
+            .ends_with("c/lib/darwin-arm64/libcalculator.dylib")));
         let cmake = files
             .iter()
             .find(|f| f.path.as_str().ends_with("c/CMakeLists.txt"))

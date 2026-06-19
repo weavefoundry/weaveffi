@@ -18,13 +18,13 @@ use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, is_c_pointer_type, DocCommentStyle,
 };
-use weaveffi_core::package::{PackageContext, PackagedFile};
-use weaveffi_core::platform::Platform;
 use weaveffi_core::model::{
     AsyncBinding, BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
     IteratorBinding, ListenerBinding, ModuleBinding, RichVariantBinding, StructBinding,
 };
+use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg::{self, ResolvedPackage};
+use weaveffi_core::platform::Platform;
 use weaveffi_core::utils::{local_type_name, render_prelude, render_trailer, CommentStyle};
 use weaveffi_ir::ir::{Api, TypeRef};
 
@@ -164,7 +164,10 @@ impl LanguageBackend for RubyGenerator {
             let platform = nb.platform;
             let gem_dir = ruby_dir.join(platform.id());
             let lib_dir = gem_dir.join("lib");
-            files.push(PackagedFile::text(lib_dir.join(&lib_file), module_src.clone()));
+            files.push(PackagedFile::text(
+                lib_dir.join(&lib_file),
+                module_src.clone(),
+            ));
             files.push(PackagedFile::copy(
                 lib_dir
                     .join("native")
@@ -175,7 +178,10 @@ impl LanguageBackend for RubyGenerator {
                 gem_dir.join(&gem_file),
                 render_packaged_gemspec(&package, &gem_file, platform, input_basename),
             ));
-            files.push(PackagedFile::text(gem_dir.join("README.md"), readme.clone()));
+            files.push(PackagedFile::text(
+                gem_dir.join("README.md"),
+                readme.clone(),
+            ));
         }
         Some(files)
     }
@@ -2004,9 +2010,10 @@ mod tests {
 
         assert_eq!(files.iter().filter(|f| f.is_binary()).count(), 2);
         // Bundled under lib/native/ inside each per-platform gem dir.
-        assert!(files
-            .iter()
-            .any(|f| f.path.as_str().ends_with("ruby/darwin-arm64/lib/native/libcalculator.dylib")));
+        assert!(files.iter().any(|f| f
+            .path
+            .as_str()
+            .ends_with("ruby/darwin-arm64/lib/native/libcalculator.dylib")));
         // The gemspec stamps the RubyGems platform string.
         let gemspec = files
             .iter()
@@ -2015,7 +2022,10 @@ mod tests {
         let FileContent::Text(spec) = &gemspec.content else {
             panic!("gemspec is text");
         };
-        assert!(spec.contains("s.platform    = 'arm64-darwin'"), "platform: {spec}");
+        assert!(
+            spec.contains("s.platform    = 'arm64-darwin'"),
+            "platform: {spec}"
+        );
         // The loader was rewritten to prefer the bundled library.
         let rb = files
             .iter()

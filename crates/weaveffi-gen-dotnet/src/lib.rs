@@ -16,12 +16,12 @@ use std::collections::HashMap;
 use weaveffi_core::abi::{self, AbiParam, CType};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
-use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::model::{
     BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
     IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding, RichVariantBinding,
     StructBinding,
 };
+use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::utils::{
     local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
@@ -169,7 +169,12 @@ impl LanguageBackend for DotnetGenerator {
             PackagedFile::text(dir.join(&cs_filename), cs),
             PackagedFile::text(
                 dir.join(&csproj_filename),
-                render_csproj_with_assets(&package, input_basename, &csproj_filename, native_assets),
+                render_csproj_with_assets(
+                    &package,
+                    input_basename,
+                    &csproj_filename,
+                    native_assets,
+                ),
             ),
             PackagedFile::text(
                 dir.join(&nuspec_filename),
@@ -2963,12 +2968,14 @@ mod tests {
         .expect("dotnet supports packaging");
 
         // NuGet `runtimes/<rid>/native/` layout.
-        assert!(files
-            .iter()
-            .any(|f| f.path.as_str().ends_with("runtimes/osx-arm64/native/libcalculator.dylib")));
-        assert!(files
-            .iter()
-            .any(|f| f.path.as_str().ends_with("runtimes/win-x64/native/calculator.dll")));
+        assert!(files.iter().any(|f| f
+            .path
+            .as_str()
+            .ends_with("runtimes/osx-arm64/native/libcalculator.dylib")));
+        assert!(files.iter().any(|f| f
+            .path
+            .as_str()
+            .ends_with("runtimes/win-x64/native/calculator.dll")));
         // The P/Invoke library name is rebound to the bundled base name.
         let cs = files
             .iter()
@@ -2988,7 +2995,10 @@ mod tests {
         let FileContent::Text(proj) = &csproj.content else {
             panic!("csproj is text");
         };
-        assert!(proj.contains("runtimes/**"), "native asset item group missing: {proj}");
+        assert!(
+            proj.contains("runtimes/**"),
+            "native asset item group missing: {proj}"
+        );
     }
 
     fn make_api(modules: Vec<Module>) -> Api {

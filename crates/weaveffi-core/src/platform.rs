@@ -121,7 +121,9 @@ impl Platform {
     /// Resolve a [`Platform`] from a Rust target triple, returning `None` for a
     /// triple outside the support matrix.
     pub fn from_rust_target(triple: &str) -> Option<Platform> {
-        Platform::ALL.into_iter().find(|p| p.rust_target() == triple)
+        Platform::ALL
+            .into_iter()
+            .find(|p| p.rust_target() == triple)
     }
 
     /// The shared-library filename prefix: `"lib"` on Unix, empty on Windows.
@@ -305,9 +307,18 @@ mod tests {
 
     #[test]
     fn lib_filenames_are_platform_correct() {
-        assert_eq!(Platform::MacosArm64.lib_filename("contacts"), "libcontacts.dylib");
-        assert_eq!(Platform::LinuxX64.lib_filename("contacts"), "libcontacts.so");
-        assert_eq!(Platform::WindowsX64.lib_filename("contacts"), "contacts.dll");
+        assert_eq!(
+            Platform::MacosArm64.lib_filename("contacts"),
+            "libcontacts.dylib"
+        );
+        assert_eq!(
+            Platform::LinuxX64.lib_filename("contacts"),
+            "libcontacts.so"
+        );
+        assert_eq!(
+            Platform::WindowsX64.lib_filename("contacts"),
+            "contacts.dll"
+        );
     }
 
     #[test]
@@ -317,7 +328,10 @@ mod tests {
         assert_eq!(Platform::MacosX64.node_os(), "darwin");
         assert_eq!(Platform::MacosX64.node_cpu(), "x64");
         assert_eq!(Platform::WindowsX64.node_os(), "win32");
-        assert_eq!(Platform::LinuxArm64.python_platform_tag(), "manylinux2014_aarch64");
+        assert_eq!(
+            Platform::LinuxArm64.python_platform_tag(),
+            "manylinux2014_aarch64"
+        );
         assert_eq!(Platform::MacosArm64.ruby_platform(), "arm64-darwin");
         assert_eq!(Platform::LinuxX64.ruby_platform(), "x86_64-linux");
     }

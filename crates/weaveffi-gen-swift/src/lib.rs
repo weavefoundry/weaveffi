@@ -3044,9 +3044,10 @@ mod tests {
         .expect("swift supports packaging");
 
         assert_eq!(files.iter().filter(|f| f.is_binary()).count(), 2);
-        assert!(files
-            .iter()
-            .any(|f| f.path.as_str().ends_with("swift/lib/darwin-arm64/libcalculator.dylib")));
+        assert!(files.iter().any(|f| f
+            .path
+            .as_str()
+            .ends_with("swift/lib/darwin-arm64/libcalculator.dylib")));
         let pkg = files
             .iter()
             .find(|f| f.path.as_str().ends_with("swift/Package.swift"))

@@ -15,12 +15,12 @@ use serde::{Deserialize, Serialize};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
-use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::model::{
     BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
     IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding, RichVariantBinding,
     StructBinding,
 };
+use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::utils::{local_type_name, render_prelude, render_trailer, CommentStyle};
 use weaveffi_ir::ir::{Api, TypeRef};
@@ -2136,9 +2136,10 @@ mod tests {
         .expect("dart supports packaging");
 
         assert_eq!(files.iter().filter(|f| f.is_binary()).count(), 2);
-        assert!(files
-            .iter()
-            .any(|f| f.path.as_str().ends_with("dart/native/linux-arm64/libcalculator.so")));
+        assert!(files.iter().any(|f| f
+            .path
+            .as_str()
+            .ends_with("dart/native/linux-arm64/libcalculator.so")));
         let module = files
             .iter()
             .find(|f| f.path.as_str().ends_with("dart/lib/weaveffi.dart"))

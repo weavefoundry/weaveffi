@@ -152,7 +152,8 @@ impl LanguageBackend for CppGenerator {
         let dir = out_dir.join("cpp");
         let header_name = config.header_name();
         let input_basename = config.input_basename();
-        let version = weaveffi_core::pkg::resolve(api, None, config.input_basename.as_deref()).version;
+        let version =
+            weaveffi_core::pkg::resolve(api, None, config.input_basename.as_deref()).version;
         let lib = &ctx.binaries.lib_name;
 
         // The C++ header inlines the `extern "C"` declarations, so the package
@@ -2174,9 +2175,10 @@ mod tests {
         assert!(files
             .iter()
             .any(|f| f.path.as_str().ends_with("cpp/include/weaveffi.hpp")));
-        assert!(files
-            .iter()
-            .any(|f| f.path.as_str().ends_with("cpp/lib/linux-x64/libcalculator.so")));
+        assert!(files.iter().any(|f| f
+            .path
+            .as_str()
+            .ends_with("cpp/lib/linux-x64/libcalculator.so")));
         let cmake = files
             .iter()
             .find(|f| f.path.as_str().ends_with("cpp/CMakeLists.txt"))
