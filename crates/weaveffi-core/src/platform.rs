@@ -11,7 +11,7 @@
 //! * the NuGet runtime identifier (`osx-arm64`, …);
 //! * the Node.js `process.platform`/`process.arch` tokens;
 //! * the Python wheel platform tag (`macosx_11_0_arm64`, …); and
-//! * the `RubyGems` platform string (`arm64-darwin`, …).
+//! * the RubyGems platform string (`arm64-darwin`, …).
 //!
 //! A [`BinarySet`] pairs each [`Platform`] with the on-disk path to its
 //! prebuilt library; the [`crate::package`] driver and every packaging backend
@@ -191,7 +191,7 @@ impl Platform {
         }
     }
 
-    /// The `RubyGems` platform string used for a precompiled platform gem, for
+    /// The RubyGems platform string used for a precompiled platform gem, for
     /// example `arm64-darwin` or `x86_64-linux`.
     pub fn ruby_platform(self) -> &'static str {
         match self {

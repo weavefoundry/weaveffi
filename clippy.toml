@@ -11,6 +11,7 @@ doc-valid-idents = [
     "CMake",
     "NuGet",
     "PyPI",
+    "RubyGems",
     "SemVer",
     "CGo",
     "JSDoc",
