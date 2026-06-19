@@ -54,8 +54,8 @@ pub struct PackagedFile {
 impl PackagedFile {
     /// A file whose contents are rendered text.
     ///
-    /// `path` separators are normalized to `/` regardless of host (see the note
-    /// on [`normalize_separators`]).
+    /// `path` separators are normalized to `/` on every host, so package
+    /// layouts stay identical across platforms.
     pub fn text(path: impl Into<Utf8PathBuf>, contents: impl Into<String>) -> Self {
         Self {
             path: normalize_separators(path.into()),
