@@ -44,7 +44,8 @@ pub enum FileContent {
 /// [`files`](crate::backend::LanguageBackend::files).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackagedFile {
-    /// Full destination path, anchored under the package output directory.
+    /// Full destination path, anchored under the package output directory, with
+    /// `/` separators on every host (see [`text`](Self::text)).
     pub path: Utf8PathBuf,
     /// What to materialize at `path`.
     pub content: FileContent,
@@ -52,17 +53,23 @@ pub struct PackagedFile {
 
 impl PackagedFile {
     /// A file whose contents are rendered text.
+    ///
+    /// `path` separators are normalized to `/` regardless of host (see the note
+    /// on [`normalize_separators`]).
     pub fn text(path: impl Into<Utf8PathBuf>, contents: impl Into<String>) -> Self {
         Self {
-            path: path.into(),
+            path: normalize_separators(path.into()),
             content: FileContent::Text(contents.into()),
         }
     }
 
     /// A file copied from a prebuilt native library at `source`.
+    ///
+    /// The destination `path` is normalized to `/` separators; `source` is left
+    /// as-is, since it is a host path read directly off disk.
     pub fn copy(path: impl Into<Utf8PathBuf>, source: impl Into<Utf8PathBuf>) -> Self {
         Self {
-            path: path.into(),
+            path: normalize_separators(path.into()),
             content: FileContent::Copy(source.into()),
         }
     }
@@ -70,6 +77,23 @@ impl PackagedFile {
     /// True when this entry copies in a native binary rather than writing text.
     pub fn is_binary(&self) -> bool {
         matches!(self.content, FileContent::Copy(_))
+    }
+}
+
+/// Normalize a package destination path to use `/` separators on every host.
+///
+/// Backends build paths with `out_dir.join(...)`, which uses the host separator
+/// (`\` on Windows). A package layout is logically `/`-separated, though: it is
+/// published and consumed identically on every OS, and `std::fs` accepts `/` on
+/// Windows so [`write_package`] still writes correctly. Doing this once here
+/// keeps [`PackagedFile::path`] stable across platforms (so package layouts are
+/// snapshot-testable like generated source) and mirrors how
+/// [`output_files`](crate::backend::output_files) presents generated paths.
+fn normalize_separators(path: Utf8PathBuf) -> Utf8PathBuf {
+    if cfg!(windows) {
+        Utf8PathBuf::from(path.into_string().replace('\\', "/"))
+    } else {
+        path
     }
 }
 
@@ -160,6 +184,25 @@ mod tests {
             b"\x00native\x01"
         );
         assert_eq!(summarize(&files), (1, 1));
+    }
+
+    #[test]
+    fn destination_paths_are_forward_slashed() {
+        // Built with `join` (host separator on Windows) but stored
+        // `/`-normalized, so a package layout matches on every OS. On Windows
+        // this exercises the `\` -> `/` rewrite; elsewhere it confirms the
+        // happy path is left intact.
+        let text = PackagedFile::text(Utf8Path::new("out").join("dotnet").join("x.cs"), "x");
+        assert_eq!(text.path.as_str(), "out/dotnet/x.cs");
+
+        let copied = PackagedFile::copy(
+            Utf8Path::new("out")
+                .join("runtimes")
+                .join("osx-arm64")
+                .join("native"),
+            "/src/libcalculator.dylib",
+        );
+        assert_eq!(copied.path.as_str(), "out/runtimes/osx-arm64/native");
     }
 
     #[test]
