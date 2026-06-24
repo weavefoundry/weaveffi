@@ -1,3 +1,13 @@
+## [0.13.0](https://github.com/weavefoundry/weaveffi/compare/v0.12.0...v0.13.0) (2026-06-24)
+
+### ⚠ BREAKING CHANGES
+
+* generate the full IDL feature set from the producer macro (#21)
+
+### Features
+
+* generate the full IDL feature set from the producer macro ([#21](https://github.com/weavefoundry/weaveffi/issues/21)) ([43caafc](https://github.com/weavefoundry/weaveffi/commit/43caafc6dd427217695d8c941c4fa5f5440baa15))
+
 ## [0.12.0](https://github.com/weavefoundry/weaveffi/compare/v0.11.0...v0.12.0) (2026-06-19)
 
 ### Features
