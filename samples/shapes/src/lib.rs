@@ -1,39 +1,48 @@
 //! Shapes sample cdylib: exercises WeaveFFI's rich (algebraic) enums and the
 //! expanded numeric type set over the stable C ABI.
 //!
-//! `Shape` is a sum type whose variants carry associated data, so it crosses
-//! the boundary as an opaque object: a tag reader, per-variant constructors and
-//! field getters, and a destructor, exactly the surface a struct gets. The
-//! symbol names here line up 1:1 with the generated header
-//! (`weaveffi_shapes_Shape_*`); see `weaveffi generate shapes.yml --target c`.
+//! `Shape` is a sum type whose variants carry associated data, so the
+//! `#[weaveffi::module]` expansion crosses it as an opaque object: a tag
+//! reader, per-variant constructors and field getters, and a destructor,
+//! exactly the surface a struct gets. `Channel` is a plain C-style enum that
+//! crosses as its `i32` discriminant. The producer writes only safe Rust; the
+//! macro emits the `weaveffi_shapes_*` thunks that line up 1:1 with the
+//! generated header (see `weaveffi generate shapes.yml --target c`).
 
-#![allow(unsafe_code)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
-
-use std::os::raw::c_char;
-use weaveffi_abi::{self as abi, weaveffi_error};
-
-/// The algebraic shape. Discriminants match the IDL (`Empty=0 … Labeled=3`).
-#[derive(Debug, Clone, PartialEq)]
-pub enum Shape {
-    Empty,
-    Circle { radius: f64 },
-    Rectangle { width: f32, height: f32 },
-    Labeled { label: String, count: u8 },
-}
-
-impl Shape {
-    fn tag(&self) -> i32 {
-        match self {
-            Shape::Empty => 0,
-            Shape::Circle { .. } => 1,
-            Shape::Rectangle { .. } => 2,
-            Shape::Labeled { .. } => 3,
-        }
+/// Rich-enum + numerics smoke test
+#[weaveffi::module]
+pub mod shapes {
+    /// An algebraic shape (sum type with associated data)
+    #[weaveffi::enumeration]
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Shape {
+        /// The empty shape
+        Empty,
+        /// A circle with a radius
+        Circle {
+            /// Radius in points
+            radius: f64,
+        },
+        /// An axis-aligned rectangle
+        Rectangle { width: f32, height: f32 },
+        /// A labeled shape with a small count
+        Labeled { label: String, count: u8 },
     }
 
-    fn describe(&self) -> String {
-        match self {
+    /// A plain C-style enum (no payloads)
+    #[weaveffi::enumeration]
+    #[repr(i32)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Channel {
+        Red = 0,
+        Green = 1,
+        Blue = 2,
+    }
+
+    /// Render a shape to a string
+    #[weaveffi::export]
+    pub fn describe(shape: &Shape) -> String {
+        match shape {
             Shape::Empty => "empty".to_string(),
             Shape::Circle { radius } => format!("circle(r={radius})"),
             Shape::Rectangle { width, height } => format!("rectangle({width}x{height})"),
@@ -41,8 +50,10 @@ impl Shape {
         }
     }
 
-    fn scaled(&self, factor: f64) -> Shape {
-        match self {
+    /// Scale a shape by a factor, returning a new shape
+    #[weaveffi::export]
+    pub fn scale(shape: &Shape, factor: f64) -> Shape {
+        match shape {
             Shape::Empty => Shape::Empty,
             Shape::Circle { radius } => Shape::Circle {
                 radius: radius * factor,
@@ -57,167 +68,20 @@ impl Shape {
             },
         }
     }
-}
 
-fn boxed(shape: Shape) -> *mut Shape {
-    Box::into_raw(Box::new(shape))
-}
-
-// --- Rich-enum constructors ---
-
-#[no_mangle]
-pub extern "C" fn weaveffi_shapes_Shape_Empty_new(out_err: *mut weaveffi_error) -> *mut Shape {
-    abi::error_set_ok(out_err);
-    boxed(Shape::Empty)
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_shapes_Shape_Circle_new(
-    radius: f64,
-    out_err: *mut weaveffi_error,
-) -> *mut Shape {
-    abi::error_set_ok(out_err);
-    boxed(Shape::Circle { radius })
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_shapes_Shape_Rectangle_new(
-    width: f32,
-    height: f32,
-    out_err: *mut weaveffi_error,
-) -> *mut Shape {
-    abi::error_set_ok(out_err);
-    boxed(Shape::Rectangle { width, height })
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_shapes_Shape_Labeled_new(
-    label: *const c_char,
-    count: u8,
-    out_err: *mut weaveffi_error,
-) -> *mut Shape {
-    let label = match abi::c_ptr_to_string(label) {
-        Some(s) => s,
-        None => {
-            abi::error_set(out_err, 1, "label is null or invalid UTF-8");
-            return std::ptr::null_mut();
-        }
-    };
-    abi::error_set_ok(out_err);
-    boxed(Shape::Labeled { label, count })
-}
-
-// --- Tag reader + destructor ---
-
-#[no_mangle]
-pub extern "C" fn weaveffi_shapes_Shape_tag(ptr: *const Shape) -> i32 {
-    assert!(!ptr.is_null());
-    unsafe { &*ptr }.tag()
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_shapes_Shape_destroy(ptr: *mut Shape) {
-    if ptr.is_null() {
-        return;
-    }
-    unsafe { drop(Box::from_raw(ptr)) };
-}
-
-// --- Per-variant field getters ---
-
-#[no_mangle]
-pub extern "C" fn weaveffi_shapes_Shape_Circle_get_radius(ptr: *const Shape) -> f64 {
-    assert!(!ptr.is_null());
-    match unsafe { &*ptr } {
-        Shape::Circle { radius } => *radius,
-        _ => 0.0,
+    /// Sum a list of bytes into a wide integer (numerics smoke)
+    #[weaveffi::export]
+    pub fn sum_bytes(values: Vec<u8>) -> u64 {
+        values.iter().map(|b| u64::from(*b)).sum()
     }
 }
 
-#[no_mangle]
-pub extern "C" fn weaveffi_shapes_Shape_Rectangle_get_width(ptr: *const Shape) -> f32 {
-    assert!(!ptr.is_null());
-    match unsafe { &*ptr } {
-        Shape::Rectangle { width, .. } => *width,
-        _ => 0.0,
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_shapes_Shape_Rectangle_get_height(ptr: *const Shape) -> f32 {
-    assert!(!ptr.is_null());
-    match unsafe { &*ptr } {
-        Shape::Rectangle { height, .. } => *height,
-        _ => 0.0,
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_shapes_Shape_Labeled_get_label(ptr: *const Shape) -> *const c_char {
-    assert!(!ptr.is_null());
-    match unsafe { &*ptr } {
-        Shape::Labeled { label, .. } => abi::string_to_c_ptr(label),
-        _ => std::ptr::null(),
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_shapes_Shape_Labeled_get_count(ptr: *const Shape) -> u8 {
-    assert!(!ptr.is_null());
-    match unsafe { &*ptr } {
-        Shape::Labeled { count, .. } => *count,
-        _ => 0,
-    }
-}
-
-// --- Module functions ---
-
-#[no_mangle]
-pub extern "C" fn weaveffi_shapes_describe(
-    shape: *const Shape,
-    out_err: *mut weaveffi_error,
-) -> *const c_char {
-    if shape.is_null() {
-        abi::error_set(out_err, 1, "shape is null");
-        return std::ptr::null();
-    }
-    abi::error_set_ok(out_err);
-    abi::string_to_c_ptr(unsafe { &*shape }.describe())
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_shapes_scale(
-    shape: *const Shape,
-    factor: f64,
-    out_err: *mut weaveffi_error,
-) -> *mut Shape {
-    if shape.is_null() {
-        abi::error_set(out_err, 1, "shape is null");
-        return std::ptr::null_mut();
-    }
-    abi::error_set_ok(out_err);
-    boxed(unsafe { &*shape }.scaled(factor))
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_shapes_sum_bytes(
-    values: *const u8,
-    values_len: usize,
-    out_err: *mut weaveffi_error,
-) -> u64 {
-    abi::error_set_ok(out_err);
-    if values.is_null() || values_len == 0 {
-        return 0;
-    }
-    let slice = unsafe { std::slice::from_raw_parts(values, values_len) };
-    slice.iter().map(|b| u64::from(*b)).sum()
-}
-
-abi::export_runtime!();
+weaveffi::export_runtime!();
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::shapes::*;
+    use weaveffi::abi::{self, weaveffi_error};
 
     fn new_err() -> weaveffi_error {
         weaveffi_error::default()

@@ -1,974 +1,444 @@
-//! Kvstore sample cdylib: a production-quality, in-memory key/value store
-//! that exercises every IDL feature WeaveFFI supports: typed handles,
-//! callbacks, listeners, an error domain, optional/list/map/bytes fields,
-//! a builder, an iterator return, a cancellable async function, deprecated
-//! and `since`-tagged functions, and a nested sub-module, over the C ABI.
+//! Kvstore sample cdylib: a production-quality, in-memory key/value store that
+//! exercises every IDL feature WeaveFFI supports through the
+//! `#[weaveffi::module]` macro: typed handles, callbacks, listeners, a producer
+//! error domain (via [`weaveffi::ErrorReport`]), optional/list/map/bytes record
+//! fields, a fluent builder, an iterator return, a cancellable async function,
+//! deprecated and nested-submodule surface, all over the C ABI.
+//!
+//! Because `Store` crosses the ABI as an opaque `handle<Store>` whose record
+//! facet exposes only its `id`, the store's rich state (its entries and the
+//! monotonic entry-id counter) lives in a process-global registry keyed by that
+//! id rather than inside the handle itself. Every operation resolves its store
+//! by reading the handle's `id` and looking the state up in the registry.
 
 #![allow(unsafe_code)]
-#![allow(non_camel_case_types)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::collections::BTreeMap;
-use std::ffi::c_void;
-use std::os::raw::c_char;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-#[cfg(not(target_arch = "wasm32"))]
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+/// An embedded key-value store API with TTLs, iteration, and async compaction.
+#[weaveffi::module]
+pub mod kv {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::Mutex;
+    #[cfg(not(target_arch = "wasm32"))]
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-use parking_lot::Mutex;
-use weaveffi_abi::{self as abi, weaveffi_cancel_token, weaveffi_error};
+    use weaveffi::ErrorReport;
 
-// ── Error codes (KvError domain) ───────────────────────────
+    /// No entry exists for the requested key.
+    pub const KV_KEY_NOT_FOUND: i32 = 1001;
+    /// The entry exists but its TTL has elapsed.
+    pub const KV_EXPIRED: i32 = 1002;
+    /// The store has reached its capacity limit.
+    pub const KV_STORE_FULL: i32 = 1003;
+    /// Underlying storage reported an I/O failure.
+    pub const KV_IO_ERROR: i32 = 1004;
 
-pub const KV_KEY_NOT_FOUND: i32 = 1001;
-pub const KV_EXPIRED: i32 = 1002;
-pub const KV_STORE_FULL: i32 = 1003;
-pub const KV_IO_ERROR: i32 = 1004;
+    /// The largest number of live entries one store will hold before `put`
+    /// rejects a new key with [`KvError::StoreFull`].
+    const STORE_CAPACITY: usize = 1_000_000;
 
-const STORE_CAPACITY: usize = 1_000_000;
-
-// ── EntryKind enum ──────────────────────────────────────────
-
-#[repr(i32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EntryKind {
-    Volatile = 0,
-    Persistent = 1,
-    Encrypted = 2,
-}
-
-impl EntryKind {
-    fn from_i32(v: i32) -> Option<Self> {
-        match v {
-            0 => Some(Self::Volatile),
-            1 => Some(Self::Persistent),
-            2 => Some(Self::Encrypted),
-            _ => None,
-        }
-    }
-}
-
-// ── Entry struct ────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub struct Entry {
-    pub id: i64,
-    pub key: String,
-    pub value: Vec<u8>,
-    pub kind: EntryKind,
-    pub created_at: i64,
-    pub expires_at: Option<i64>,
-    pub tags: Vec<String>,
-    pub metadata: BTreeMap<String, String>,
-}
-
-impl Entry {
-    fn is_expired(&self, now: i64) -> bool {
-        matches!(self.expires_at, Some(t) if t <= now)
-    }
-}
-
-// ── Stats struct (kv.stats sub-module) ──────────────────────
-
-#[derive(Debug, Clone)]
-pub struct Stats {
-    pub total_entries: i64,
-    pub total_bytes: i64,
-    pub expired_entries: i64,
-}
-
-// ── Store: opaque handle target type ────────────────────────
-
-pub struct Store {
-    id: i64,
-    entries: Mutex<BTreeMap<String, Entry>>,
-    next_entry_id: AtomicI64,
-}
-
-static NEXT_STORE_ID: AtomicI64 = AtomicI64::new(1);
-
-// ── Eviction listener registry ──────────────────────────────
-
-struct ListenerSlot {
-    callback: extern "C" fn(*const c_char, *mut c_void),
-    context: usize,
-    id: u64,
-}
-
-unsafe impl Send for ListenerSlot {}
-
-static LISTENER: Mutex<Option<ListenerSlot>> = Mutex::new(None);
-static NEXT_LISTENER_ID: AtomicU64 = AtomicU64::new(1);
-
-#[cfg(not(target_arch = "wasm32"))]
-fn now_unix_seconds() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-// `wasm32-unknown-unknown` has no wall clock; `SystemTime::now()` traps. Use a
-// fixed epoch so TTL arithmetic stays deterministic and entries never appear
-// spuriously expired when the bindings are exercised from JavaScript.
-#[cfg(target_arch = "wasm32")]
-fn now_unix_seconds() -> i64 {
-    1_700_000_000
-}
-
-fn fire_eviction(key: &str) {
-    let slot = LISTENER.lock();
-    if let Some(l) = slot.as_ref() {
-        let cb = l.callback;
-        let ctx = l.context as *mut c_void;
-        let key_ptr = abi::string_to_c_ptr(key);
-        cb(key_ptr, ctx);
-        abi::free_string(key_ptr);
-    }
-}
-
-// ── Listener register/unregister ────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_register_eviction_listener(
-    callback: extern "C" fn(*const c_char, *mut c_void),
-    context: *mut c_void,
-) -> u64 {
-    let id = NEXT_LISTENER_ID.fetch_add(1, Ordering::Relaxed);
-    *LISTENER.lock() = Some(ListenerSlot {
-        callback,
-        context: context as usize,
-        id,
-    });
-    id
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_unregister_eviction_listener(id: u64) {
-    let mut slot = LISTENER.lock();
-    if let Some(l) = slot.as_ref() {
-        if l.id == id {
-            *slot = None;
-        }
-    }
-}
-
-// ── Store lifecycle ─────────────────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_open_store(
-    path: *const c_char,
-    out_err: *mut weaveffi_error,
-) -> *mut Store {
-    if abi::c_ptr_to_string(path).is_none() {
-        abi::error_set(out_err, KV_IO_ERROR, "path is null or invalid UTF-8");
-        return std::ptr::null_mut();
-    }
-    let store = Store {
-        id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
-        entries: Mutex::new(BTreeMap::new()),
-        next_entry_id: AtomicI64::new(1),
-    };
-    abi::error_set_ok(out_err);
-    Box::into_raw(Box::new(store))
-}
-
-/// Releases the store's in-memory contents but NOT the handle itself.
-/// Handle params are always borrowed across the C ABI; the wrapper (or the
-/// C consumer) frees the handle exactly once via `weaveffi_kv_Store_destroy`.
-/// Freeing here would double-free under GC'd wrappers (Python/Ruby/Swift/...).
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_close_store(store: *mut Store, out_err: *mut weaveffi_error) {
-    if !store.is_null() {
-        let s = unsafe { &*store };
-        s.entries.lock().clear();
-    }
-    abi::error_set_ok(out_err);
-}
-
-// ── put / get / delete ──────────────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_put(
-    store: *mut Store,
-    key: *const c_char,
-    value_ptr: *const u8,
-    value_len: usize,
-    kind: i32,
-    ttl_seconds: *const i64,
-    out_err: *mut weaveffi_error,
-) -> bool {
-    if store.is_null() {
-        abi::error_set(out_err, KV_IO_ERROR, "store is null");
-        return false;
-    }
-    let key = match abi::c_ptr_to_string(key) {
-        Some(s) => s,
-        None => {
-            abi::error_set(out_err, KV_IO_ERROR, "key is null or invalid UTF-8");
-            return false;
-        }
-    };
-    let kind = match EntryKind::from_i32(kind) {
-        Some(k) => k,
-        None => {
-            abi::error_set(out_err, KV_IO_ERROR, "invalid EntryKind value");
-            return false;
-        }
-    };
-    let value = if value_ptr.is_null() || value_len == 0 {
-        Vec::new()
-    } else {
-        unsafe { std::slice::from_raw_parts(value_ptr, value_len) }.to_vec()
-    };
-
-    let s = unsafe { &*store };
-    let mut entries = s.entries.lock();
-    if entries.len() >= STORE_CAPACITY && !entries.contains_key(&key) {
-        abi::error_set(out_err, KV_STORE_FULL, "store has reached capacity");
-        return false;
+    /// The store's error domain. Each variant maps to one of the `KvError`
+    /// codes the IDL declares; [`ErrorReport`] carries that code and a message
+    /// across the ABI's `out_err` slot.
+    pub enum KvError {
+        /// No entry exists for the requested key (`KV_KEY_NOT_FOUND`).
+        KeyNotFound,
+        /// The entry exists but its TTL has elapsed (`KV_EXPIRED`).
+        Expired,
+        /// The store has reached its capacity limit (`KV_STORE_FULL`).
+        StoreFull,
+        /// An I/O-style failure carrying a human-readable reason (`KV_IO_ERROR`).
+        Io(String),
     }
 
-    let now = now_unix_seconds();
-    let expires_at = if ttl_seconds.is_null() {
-        None
-    } else {
-        Some(now + unsafe { *ttl_seconds })
-    };
-    let id = s.next_entry_id.fetch_add(1, Ordering::Relaxed);
-    let entry = Entry {
-        id,
-        key: key.clone(),
-        value,
-        kind,
-        created_at: now,
-        expires_at,
-        tags: Vec::new(),
-        metadata: BTreeMap::new(),
-    };
-    entries.insert(key, entry);
-    abi::error_set_ok(out_err);
-    true
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_get(
-    store: *mut Store,
-    key: *const c_char,
-    out_err: *mut weaveffi_error,
-) -> *mut Entry {
-    if store.is_null() {
-        abi::error_set(out_err, KV_IO_ERROR, "store is null");
-        return std::ptr::null_mut();
-    }
-    let key = match abi::c_ptr_to_string(key) {
-        Some(s) => s,
-        None => {
-            abi::error_set(out_err, KV_IO_ERROR, "key is null or invalid UTF-8");
-            return std::ptr::null_mut();
-        }
-    };
-    let s = unsafe { &*store };
-    let mut entries = s.entries.lock();
-    let now = now_unix_seconds();
-    if let Some(entry) = entries.get(&key) {
-        if entry.is_expired(now) {
-            let removed = entries.remove(&key);
-            drop(entries);
-            if let Some(e) = removed {
-                fire_eviction(&e.key);
+    impl ErrorReport for KvError {
+        fn code(&self) -> i32 {
+            match self {
+                KvError::KeyNotFound => KV_KEY_NOT_FOUND,
+                KvError::Expired => KV_EXPIRED,
+                KvError::StoreFull => KV_STORE_FULL,
+                KvError::Io(_) => KV_IO_ERROR,
             }
-            abi::error_set(out_err, KV_EXPIRED, "entry expired");
-            return std::ptr::null_mut();
         }
-        let cloned = entry.clone();
-        abi::error_set_ok(out_err);
-        return Box::into_raw(Box::new(cloned));
-    }
-    abi::error_set(out_err, KV_KEY_NOT_FOUND, "key not found");
-    std::ptr::null_mut()
-}
 
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_delete(
-    store: *mut Store,
-    key: *const c_char,
-    out_err: *mut weaveffi_error,
-) -> bool {
-    if store.is_null() {
-        abi::error_set(out_err, KV_IO_ERROR, "store is null");
-        return false;
-    }
-    let key = match abi::c_ptr_to_string(key) {
-        Some(s) => s,
-        None => {
-            abi::error_set(out_err, KV_IO_ERROR, "key is null or invalid UTF-8");
-            return false;
-        }
-    };
-    let s = unsafe { &*store };
-    let removed = s.entries.lock().remove(&key);
-    abi::error_set_ok(out_err);
-    if let Some(e) = removed {
-        fire_eviction(&e.key);
-        true
-    } else {
-        false
-    }
-}
-
-// ── list_keys: streaming iterator ───────────────────────────
-
-pub struct ListKeysIterator {
-    keys: Vec<String>,
-    index: usize,
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_list_keys(
-    store: *mut Store,
-    prefix: *const c_char,
-    out_err: *mut weaveffi_error,
-) -> *mut ListKeysIterator {
-    if store.is_null() {
-        abi::error_set(out_err, KV_IO_ERROR, "store is null");
-        return std::ptr::null_mut();
-    }
-    let prefix_filter = abi::c_ptr_to_string(prefix);
-    let s = unsafe { &*store };
-    let entries = s.entries.lock();
-    let now = now_unix_seconds();
-    let keys: Vec<String> = entries
-        .iter()
-        .filter(|(_, e)| !e.is_expired(now))
-        .filter(|(k, _)| match &prefix_filter {
-            Some(p) => k.starts_with(p),
-            None => true,
-        })
-        .map(|(k, _)| k.clone())
-        .collect();
-    abi::error_set_ok(out_err);
-    Box::into_raw(Box::new(ListKeysIterator { keys, index: 0 }))
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_ListKeysIterator_next(
-    iter: *mut ListKeysIterator,
-    out_item: *mut *const c_char,
-    out_err: *mut weaveffi_error,
-) -> i32 {
-    if iter.is_null() || out_item.is_null() {
-        abi::error_set(out_err, KV_IO_ERROR, "iterator or out_item is null");
-        return 0;
-    }
-    let it = unsafe { &mut *iter };
-    if it.index >= it.keys.len() {
-        unsafe { *out_item = std::ptr::null() };
-        abi::error_set_ok(out_err);
-        return 0;
-    }
-    let key = &it.keys[it.index];
-    it.index += 1;
-    unsafe { *out_item = abi::string_to_c_ptr(key) };
-    abi::error_set_ok(out_err);
-    1
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_ListKeysIterator_destroy(iter: *mut ListKeysIterator) {
-    if !iter.is_null() {
-        unsafe { drop(Box::from_raw(iter)) };
-    }
-}
-
-// ── count / clear ───────────────────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_count(store: *mut Store, out_err: *mut weaveffi_error) -> i64 {
-    if store.is_null() {
-        abi::error_set(out_err, KV_IO_ERROR, "store is null");
-        return 0;
-    }
-    let s = unsafe { &*store };
-    let entries = s.entries.lock();
-    let now = now_unix_seconds();
-    let count = entries.values().filter(|e| !e.is_expired(now)).count() as i64;
-    abi::error_set_ok(out_err);
-    count
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_clear(store: *mut Store, out_err: *mut weaveffi_error) {
-    if store.is_null() {
-        abi::error_set(out_err, KV_IO_ERROR, "store is null");
-        return;
-    }
-    let s = unsafe { &*store };
-    s.entries.lock().clear();
-    abi::error_set_ok(out_err);
-}
-
-// ── compact_async: async + cancellable ──────────────────────
-
-pub type weaveffi_kv_compact_async_callback =
-    extern "C" fn(context: *mut c_void, err: *mut weaveffi_error, result: i64);
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_compact_async_async(
-    store: *mut Store,
-    cancel_token: *mut weaveffi_cancel_token,
-    callback: weaveffi_kv_compact_async_callback,
-    context: *mut c_void,
-) {
-    // Single-threaded wasm has no `std::thread`; run the compaction inline and
-    // invoke the callback synchronously. The JS Promise still resolves on its
-    // microtask queue, so the async surface behaves identically to callers.
-    #[cfg(target_arch = "wasm32")]
-    {
-        if abi::cancel_token_is_cancelled(cancel_token as *const _) {
-            let mut err = weaveffi_error::default();
-            abi::error_set(&mut err, KV_IO_ERROR, "compaction cancelled");
-            callback(context, &mut err, 0);
-            abi::error_clear(&mut err);
-            return;
-        }
-        let bytes_reclaimed = if store.is_null() {
-            0
-        } else {
-            let s = unsafe { &*store };
-            let mut entries = s.entries.lock();
-            let now = now_unix_seconds();
-            let expired_keys: Vec<String> = entries
-                .iter()
-                .filter(|(_, e)| e.is_expired(now))
-                .map(|(k, _)| k.clone())
-                .collect();
-            let mut total_bytes = 0i64;
-            for k in expired_keys {
-                if let Some(e) = entries.remove(&k) {
-                    total_bytes += e.value.len() as i64;
-                }
+        fn message(&self) -> String {
+            match self {
+                KvError::KeyNotFound => "key not found".to_string(),
+                KvError::Expired => "entry expired".to_string(),
+                KvError::StoreFull => "store has reached capacity".to_string(),
+                KvError::Io(reason) => reason.clone(),
             }
-            total_bytes
-        };
-        callback(context, std::ptr::null_mut(), bytes_reclaimed);
+        }
     }
+
+    /// Persistence semantics applied to a stored entry.
+    #[weaveffi::enumeration]
+    #[repr(i32)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum EntryKind {
+        /// In-memory only; lost on close.
+        Volatile = 0,
+        /// Flushed to durable storage.
+        Persistent = 1,
+        /// Persistent and encrypted at rest.
+        Encrypted = 2,
+    }
+
+    /// Opaque key-value store handle target type.
+    #[weaveffi::record]
+    #[derive(Debug)]
+    pub struct Store {
+        /// Internal store identifier.
+        pub id: i64,
+    }
+
+    /// A single key-value entry persisted in the store.
+    #[weaveffi::record]
+    #[weaveffi::builder]
+    #[derive(Clone, Debug)]
+    pub struct Entry {
+        /// Stable monotonic identifier assigned on insert.
+        pub id: i64,
+        /// UTF-8 lookup key.
+        pub key: String,
+        /// Opaque binary payload.
+        pub value: Vec<u8>,
+        /// Unix-timestamp seconds when the entry was created.
+        pub created_at: i64,
+        /// Optional unix-timestamp seconds at which the entry expires.
+        pub expires_at: Option<i64>,
+        /// Free-form labels attached to the entry.
+        pub tags: Vec<String>,
+        /// Arbitrary string-valued metadata pairs.
+        pub metadata: BTreeMap<String, String>,
+    }
+
+    impl Entry {
+        /// Whether the entry's TTL has elapsed as of `now` (unix seconds).
+        fn is_expired(&self, now: i64) -> bool {
+            matches!(self.expires_at, Some(t) if t <= now)
+        }
+    }
+
+    /// The rich state behind one `Store` handle, kept out of the record (whose
+    /// only ABI-visible field is `id`) and stored in the global registry.
+    struct StoreState {
+        entries: BTreeMap<String, Entry>,
+        next_entry_id: i64,
+    }
+
+    impl StoreState {
+        fn new() -> Self {
+            StoreState {
+                entries: BTreeMap::new(),
+                next_entry_id: 1,
+            }
+        }
+    }
+
+    impl Default for StoreState {
+        fn default() -> Self {
+            StoreState::new()
+        }
+    }
+
+    /// The process-global registry mapping each `Store.id` to its state. Using a
+    /// registry (rather than fields on the `Store` record) lets the handle stay
+    /// a thin, ABI-stable `{ id }` while the entries live safely in Rust.
+    static STORES: Mutex<BTreeMap<i64, StoreState>> = Mutex::new(BTreeMap::new());
+    static NEXT_STORE_ID: AtomicI64 = AtomicI64::new(1);
 
     #[cfg(not(target_arch = "wasm32"))]
-    {
-        let store_addr = store as usize;
-        let token_addr = cancel_token as usize;
-        let ctx_addr = context as usize;
-        std::thread::spawn(move || {
-            let store_ptr = store_addr as *mut Store;
-            let token_ptr = token_addr as *mut weaveffi_cancel_token;
-            let ctx_ptr = ctx_addr as *mut c_void;
+    fn now_unix_seconds() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
 
-            let mut elapsed = Duration::from_millis(0);
-            let total = Duration::from_millis(50);
-            let step = Duration::from_millis(5);
-            let mut cancelled = false;
-            while elapsed < total {
-                if abi::cancel_token_is_cancelled(token_ptr as *const _) {
-                    cancelled = true;
-                    break;
+    // `wasm32-unknown-unknown` has no wall clock; `SystemTime::now()` traps. Use
+    // a fixed epoch so TTL arithmetic stays deterministic and entries never
+    // appear spuriously expired when the bindings are exercised from JavaScript.
+    #[cfg(target_arch = "wasm32")]
+    fn now_unix_seconds() -> i64 {
+        1_700_000_000
+    }
+
+    /// Read a borrowed `handle<Store>`'s id, rejecting a null handle with an
+    /// I/O-domain error. This is the one place the opaque pointer is touched;
+    /// callers thread the returned id through the registry.
+    fn store_id(store: *const Store) -> Result<i64, KvError> {
+        if store.is_null() {
+            return Err(KvError::Io("store handle is null".to_string()));
+        }
+        Ok(unsafe { (*store).id })
+    }
+
+    /// Fires when an entry is evicted from the store.
+    #[weaveffi::callback]
+    #[allow(non_snake_case, dead_code, unused_variables)]
+    fn OnEvict(key: String) {}
+
+    /// Subscribe to per-key eviction notifications.
+    #[weaveffi::listener(event = "OnEvict")]
+    #[allow(dead_code)]
+    fn eviction_listener() {}
+
+    /// Open (or create) a store backed by the given filesystem path. This demo
+    /// is purely in-memory, so the path is accepted but not used to back the
+    /// data; a fresh registry slot is allocated for the new handle.
+    #[weaveffi::export]
+    pub fn open_store(path: String) -> *mut Store {
+        let _ = path;
+        let id = NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed);
+        STORES.lock().unwrap().insert(id, StoreState::new());
+        Box::into_raw(Box::new(Store { id }))
+    }
+
+    /// Close the store and release all in-memory resources. The handle itself is
+    /// always freed separately (the wrapper or C caller frees it once via
+    /// `weaveffi_kv_Store_destroy`); freeing here would double-free under GC'd
+    /// wrappers, so this only drops the registry state.
+    #[weaveffi::export]
+    pub fn close_store(store: *const Store) {
+        if let Ok(id) = store_id(store) {
+            STORES.lock().unwrap().remove(&id);
+        }
+    }
+
+    /// Insert or replace a value, returning true on success.
+    #[weaveffi::export]
+    pub fn put(
+        store: *const Store,
+        key: String,
+        value: Vec<u8>,
+        kind: EntryKind,
+        ttl_seconds: Option<i64>,
+    ) -> Result<bool, KvError> {
+        // `kind` selects persistence semantics for a real backing store; this
+        // in-memory demo accepts it but does not surface it on the `Entry`
+        // record, so it is intentionally not retained.
+        let _ = kind;
+        let id = store_id(store)?;
+        let now = now_unix_seconds();
+        let mut map = STORES.lock().unwrap();
+        let state = map.entry(id).or_default();
+        if state.entries.len() >= STORE_CAPACITY && !state.entries.contains_key(&key) {
+            return Err(KvError::StoreFull);
+        }
+        let expires_at = ttl_seconds.map(|t| now + t);
+        let entry_id = state.next_entry_id;
+        state.next_entry_id += 1;
+        state.entries.insert(
+            key.clone(),
+            Entry {
+                id: entry_id,
+                key,
+                value,
+                created_at: now,
+                expires_at,
+                tags: Vec::new(),
+                metadata: BTreeMap::new(),
+            },
+        );
+        Ok(true)
+    }
+
+    /// Look up an entry by key; returns null if missing or expired (and reports
+    /// the matching `KvError` code through `out_err`). An expired entry is
+    /// evicted on read, firing the eviction listener.
+    #[weaveffi::export]
+    pub fn get(store: *const Store, key: String) -> Result<Option<Entry>, KvError> {
+        let id = store_id(store)?;
+        let now = now_unix_seconds();
+        let (result, evicted) = {
+            let mut map = STORES.lock().unwrap();
+            let state = map.entry(id).or_default();
+            match state.entries.get(&key) {
+                Some(entry) if entry.is_expired(now) => {
+                    state.entries.remove(&key);
+                    (Err(KvError::Expired), Some(key.clone()))
                 }
-                std::thread::sleep(step);
-                elapsed += step;
+                Some(entry) => (Ok(Some(entry.clone())), None),
+                None => (Err(KvError::KeyNotFound), None),
             }
-
-            if cancelled {
-                let mut err = weaveffi_error::default();
-                abi::error_set(&mut err, KV_IO_ERROR, "compaction cancelled");
-                callback(ctx_ptr, &mut err, 0);
-                abi::error_clear(&mut err);
-                return;
-            }
-
-            let bytes_reclaimed = if store_ptr.is_null() {
-                0
-            } else {
-                let s = unsafe { &*store_ptr };
-                let mut entries = s.entries.lock();
-                let now = now_unix_seconds();
-                let expired_keys: Vec<String> = entries
-                    .iter()
-                    .filter(|(_, e)| e.is_expired(now))
-                    .map(|(k, _)| k.clone())
-                    .collect();
-                let mut total_bytes = 0i64;
-                for k in expired_keys {
-                    if let Some(e) = entries.remove(&k) {
-                        total_bytes += e.value.len() as i64;
-                    }
-                }
-                total_bytes
-            };
-
-            callback(ctx_ptr, std::ptr::null_mut(), bytes_reclaimed);
-        });
-    }
-}
-
-// ── legacy_put (deprecated) ─────────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_legacy_put(
-    store: *mut Store,
-    key: *const c_char,
-    value_ptr: *const u8,
-    value_len: usize,
-    out_err: *mut weaveffi_error,
-) -> bool {
-    weaveffi_kv_put(
-        store,
-        key,
-        value_ptr,
-        value_len,
-        EntryKind::Volatile as i32,
-        std::ptr::null(),
-        out_err,
-    )
-}
-
-// ── kv.stats sub-module: get_stats ──────────────────────────
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_stats_get_stats(
-    store: *mut Store,
-    out_err: *mut weaveffi_error,
-) -> *mut Stats {
-    if store.is_null() {
-        abi::error_set(out_err, KV_IO_ERROR, "store is null");
-        return std::ptr::null_mut();
-    }
-    let s = unsafe { &*store };
-    let entries = s.entries.lock();
-    let now = now_unix_seconds();
-    let total_entries = entries.len() as i64;
-    let total_bytes: i64 = entries.values().map(|e| e.value.len() as i64).sum();
-    let expired_entries = entries.values().filter(|e| e.is_expired(now)).count() as i64;
-    abi::error_set_ok(out_err);
-    Box::into_raw(Box::new(Stats {
-        total_entries,
-        total_bytes,
-        expired_entries,
-    }))
-}
-
-// ── Store struct accessors (generated convention) ───────────
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_Store_create(id: i64, out_err: *mut weaveffi_error) -> *mut Store {
-    abi::error_set_ok(out_err);
-    Box::into_raw(Box::new(Store {
-        id,
-        entries: Mutex::new(BTreeMap::new()),
-        next_entry_id: AtomicI64::new(1),
-    }))
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_Store_destroy(ptr: *mut Store) {
-    if !ptr.is_null() {
-        unsafe { drop(Box::from_raw(ptr)) };
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_Store_get_id(ptr: *const Store) -> i64 {
-    assert!(!ptr.is_null());
-    unsafe { (*ptr).id }
-}
-
-// ── Entry struct accessors ──────────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_Entry_create(
-    id: i64,
-    key: *const c_char,
-    value_ptr: *const u8,
-    value_len: usize,
-    created_at: i64,
-    expires_at: *const i64,
-    tags: *const *const c_char,
-    tags_len: usize,
-    metadata_keys: *const *const c_char,
-    metadata_values: *const *const c_char,
-    metadata_len: usize,
-    out_err: *mut weaveffi_error,
-) -> *mut Entry {
-    let key = match abi::c_ptr_to_string(key) {
-        Some(s) => s,
-        None => {
-            abi::error_set(out_err, KV_IO_ERROR, "key is null or invalid UTF-8");
-            return std::ptr::null_mut();
+        };
+        if let Some(evicted_key) = evicted {
+            emit_eviction_listener(&evicted_key);
         }
-    };
-    let value = if value_ptr.is_null() || value_len == 0 {
-        Vec::new()
-    } else {
-        unsafe { std::slice::from_raw_parts(value_ptr, value_len) }.to_vec()
-    };
-    let expires_at = if expires_at.is_null() {
-        None
-    } else {
-        Some(unsafe { *expires_at })
-    };
-    let mut tag_list = Vec::new();
-    if !tags.is_null() {
-        for i in 0..tags_len {
-            let p = unsafe { *tags.add(i) };
-            if let Some(s) = abi::c_ptr_to_string(p) {
-                tag_list.push(s);
+        result
+    }
+
+    /// Remove the entry for the given key, returning true if it existed. A
+    /// removed entry fires the eviction listener.
+    #[weaveffi::export]
+    pub fn delete(store: *const Store, key: String) -> Result<bool, KvError> {
+        let id = store_id(store)?;
+        let removed = {
+            let mut map = STORES.lock().unwrap();
+            let state = map.entry(id).or_default();
+            state.entries.remove(&key)
+        };
+        match removed {
+            Some(_) => {
+                emit_eviction_listener(&key);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Stream every (non-expired) key, optionally filtered by a prefix. Keys are
+    /// yielded in sorted order (the backing map is a `BTreeMap`).
+    #[weaveffi::export]
+    pub fn list_keys(
+        store: *const Store,
+        prefix: Option<String>,
+    ) -> Result<weaveffi::Iter<String>, KvError> {
+        let id = store_id(store)?;
+        let now = now_unix_seconds();
+        let mut map = STORES.lock().unwrap();
+        let state = map.entry(id).or_default();
+        let keys: Vec<String> = state
+            .entries
+            .iter()
+            .filter(|(_, e)| !e.is_expired(now))
+            .filter(|(k, _)| match &prefix {
+                Some(p) => k.starts_with(p),
+                None => true,
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        Ok(weaveffi::Iter::new(keys))
+    }
+
+    /// Return the number of live (non-expired) entries in the store.
+    #[weaveffi::export]
+    pub fn count(store: *const Store) -> Result<i64, KvError> {
+        let id = store_id(store)?;
+        let now = now_unix_seconds();
+        let mut map = STORES.lock().unwrap();
+        let state = map.entry(id).or_default();
+        let live = state
+            .entries
+            .values()
+            .filter(|e| !e.is_expired(now))
+            .count();
+        Ok(live as i64)
+    }
+
+    /// Drop every entry from the store.
+    #[weaveffi::export]
+    pub fn clear(store: *const Store) -> Result<(), KvError> {
+        let id = store_id(store)?;
+        STORES
+            .lock()
+            .unwrap()
+            .entry(id)
+            .or_default()
+            .entries
+            .clear();
+        Ok(())
+    }
+
+    /// Reclaim space asynchronously; returns the number of bytes reclaimed.
+    /// Honors the caller's cancellation token: a token already cancelled when
+    /// the future runs fails with an I/O-domain error instead of compacting.
+    #[weaveffi::export]
+    #[weaveffi::cancellable]
+    pub async fn compact_async(
+        store: *const Store,
+        cancel: weaveffi::CancelToken,
+    ) -> Result<i64, KvError> {
+        if cancel.is_cancelled() {
+            return Err(KvError::Io("compaction cancelled".to_string()));
+        }
+        let id = store_id(store)?;
+        let now = now_unix_seconds();
+        let mut map = STORES.lock().unwrap();
+        let state = map.entry(id).or_default();
+        let expired: Vec<String> = state
+            .entries
+            .iter()
+            .filter(|(_, e)| e.is_expired(now))
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut reclaimed = 0i64;
+        for key in expired {
+            if let Some(entry) = state.entries.remove(&key) {
+                reclaimed += entry.value.len() as i64;
             }
         }
+        Ok(reclaimed)
     }
-    let mut metadata = BTreeMap::new();
-    if !metadata_keys.is_null() && !metadata_values.is_null() {
-        for i in 0..metadata_len {
-            let kp = unsafe { *metadata_keys.add(i) };
-            let vp = unsafe { *metadata_values.add(i) };
-            if let (Some(k), Some(v)) = (abi::c_ptr_to_string(kp), abi::c_ptr_to_string(vp)) {
-                metadata.insert(k, v);
-            }
+
+    /// Legacy single-shot put kept for compatibility.
+    #[weaveffi::export]
+    #[deprecated(note = "use put() with explicit kind")]
+    pub fn legacy_put(store: *const Store, key: String, value: Vec<u8>) -> Result<bool, KvError> {
+        put(store, key, value, EntryKind::Volatile, None)
+    }
+
+    /// Aggregate store-statistics surface, namespaced under `kv.stats`.
+    #[weaveffi::module]
+    pub mod stats {
+        use super::{store_id, KvError, Store, STORES};
+
+        /// Aggregate store statistics.
+        #[weaveffi::record]
+        #[derive(Clone, Debug)]
+        pub struct Stats {
+            /// Number of live entries.
+            pub total_entries: i64,
+            /// Sum of all value byte lengths.
+            pub total_bytes: i64,
+            /// Number of entries past their TTL but not yet evicted.
+            pub expired_entries: i64,
+        }
+
+        /// Snapshot the current store statistics.
+        #[weaveffi::export]
+        pub fn get_stats(store: *const Store) -> Result<Stats, KvError> {
+            let id = store_id(store)?;
+            let now = super::now_unix_seconds();
+            let mut map = STORES.lock().unwrap();
+            let state = map.entry(id).or_default();
+            let total_entries = state.entries.len() as i64;
+            let total_bytes: i64 = state.entries.values().map(|e| e.value.len() as i64).sum();
+            let expired_entries =
+                state.entries.values().filter(|e| e.is_expired(now)).count() as i64;
+            Ok(Stats {
+                total_entries,
+                total_bytes,
+                expired_entries,
+            })
         }
     }
-    abi::error_set_ok(out_err);
-    Box::into_raw(Box::new(Entry {
-        id,
-        key,
-        value,
-        kind: EntryKind::Volatile,
-        created_at,
-        expires_at,
-        tags: tag_list,
-        metadata,
-    }))
 }
 
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_Entry_destroy(ptr: *mut Entry) {
-    if !ptr.is_null() {
-        unsafe { drop(Box::from_raw(ptr)) };
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_Entry_get_id(ptr: *const Entry) -> i64 {
-    assert!(!ptr.is_null());
-    unsafe { (*ptr).id }
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_Entry_get_key(ptr: *const Entry) -> *const c_char {
-    assert!(!ptr.is_null());
-    abi::string_to_c_ptr(&unsafe { &*ptr }.key)
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_Entry_get_value(ptr: *const Entry, out_len: *mut usize) -> *const u8 {
-    assert!(!ptr.is_null());
-    let v = &unsafe { &*ptr }.value;
-    if !out_len.is_null() {
-        unsafe { *out_len = v.len() };
-    }
-    if v.is_empty() {
-        return std::ptr::null();
-    }
-    let mut copy = v.clone().into_boxed_slice();
-    let p = copy.as_mut_ptr();
-    std::mem::forget(copy);
-    p as *const u8
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_Entry_get_created_at(ptr: *const Entry) -> i64 {
-    assert!(!ptr.is_null());
-    unsafe { (*ptr).created_at }
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_Entry_get_expires_at(ptr: *const Entry) -> *mut i64 {
-    assert!(!ptr.is_null());
-    match unsafe { (*ptr).expires_at } {
-        Some(v) => Box::into_raw(Box::new(v)),
-        None => std::ptr::null_mut(),
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_Entry_get_tags(
-    ptr: *const Entry,
-    out_len: *mut usize,
-) -> *mut *const c_char {
-    assert!(!ptr.is_null());
-    let tags = &unsafe { &*ptr }.tags;
-    if !out_len.is_null() {
-        unsafe { *out_len = tags.len() };
-    }
-    if tags.is_empty() {
-        return std::ptr::null_mut();
-    }
-    let mut ptrs: Vec<*const c_char> = tags.iter().map(abi::string_to_c_ptr).collect();
-    let p = ptrs.as_mut_ptr();
-    std::mem::forget(ptrs);
-    p
-}
-
-/// Map getter: a returned map lowers to two producer-allocated parallel
-/// arrays, so the out-params are pointers to the array base
-/// (`const char*** out_keys` / `const char*** out_values`). We write the base
-/// of each `[*const c_char]` array into `*out_keys` / `*out_values`; the caller
-/// reads `keys[i]` / `vals[i]` for `out_len` entries.
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_Entry_get_metadata(
-    ptr: *const Entry,
-    out_keys: *mut *mut *const c_char,
-    out_values: *mut *mut *const c_char,
-    out_len: *mut usize,
-) {
-    assert!(!ptr.is_null());
-    let map = &unsafe { &*ptr }.metadata;
-    if !out_len.is_null() {
-        unsafe { *out_len = map.len() };
-    }
-    if map.is_empty() {
-        if !out_keys.is_null() {
-            unsafe { *out_keys = std::ptr::null_mut() };
-        }
-        if !out_values.is_null() {
-            unsafe { *out_values = std::ptr::null_mut() };
-        }
-        return;
-    }
-    let mut keys: Vec<*const c_char> = Vec::with_capacity(map.len());
-    let mut vals: Vec<*const c_char> = Vec::with_capacity(map.len());
-    for (k, v) in map {
-        keys.push(abi::string_to_c_ptr(k));
-        vals.push(abi::string_to_c_ptr(v));
-    }
-    let kp = keys.as_mut_ptr();
-    let vp = vals.as_mut_ptr();
-    std::mem::forget(keys);
-    std::mem::forget(vals);
-    if !out_keys.is_null() {
-        unsafe { *out_keys = kp };
-    }
-    if !out_values.is_null() {
-        unsafe { *out_values = vp };
-    }
-}
-
-// ── Entry builder ───────────────────────────────────────────
-
-pub struct EntryBuilder {
-    id: i64,
-    key: String,
-    value: Vec<u8>,
-    created_at: i64,
-    expires_at: Option<i64>,
-    tags: Vec<String>,
-    metadata: BTreeMap<String, String>,
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_Entry_Builder_new() -> *mut EntryBuilder {
-    Box::into_raw(Box::new(EntryBuilder {
-        id: 0,
-        key: String::new(),
-        value: Vec::new(),
-        created_at: now_unix_seconds(),
-        expires_at: None,
-        tags: Vec::new(),
-        metadata: BTreeMap::new(),
-    }))
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_Entry_Builder_set_id(builder: *mut EntryBuilder, value: i64) {
-    assert!(!builder.is_null());
-    unsafe { (*builder).id = value };
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_Entry_Builder_set_key(
-    builder: *mut EntryBuilder,
-    value: *const c_char,
-) {
-    assert!(!builder.is_null());
-    if let Some(s) = abi::c_ptr_to_string(value) {
-        unsafe { (*builder).key = s };
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_Entry_Builder_set_value(
-    builder: *mut EntryBuilder,
-    value_ptr: *const u8,
-    value_len: usize,
-) {
-    assert!(!builder.is_null());
-    let bytes = if value_ptr.is_null() || value_len == 0 {
-        Vec::new()
-    } else {
-        unsafe { std::slice::from_raw_parts(value_ptr, value_len) }.to_vec()
-    };
-    unsafe { (*builder).value = bytes };
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_Entry_Builder_set_created_at(builder: *mut EntryBuilder, value: i64) {
-    assert!(!builder.is_null());
-    unsafe { (*builder).created_at = value };
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_Entry_Builder_set_expires_at(
-    builder: *mut EntryBuilder,
-    value: *const i64,
-) {
-    assert!(!builder.is_null());
-    let v = if value.is_null() {
-        None
-    } else {
-        Some(unsafe { *value })
-    };
-    unsafe { (*builder).expires_at = v };
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_Entry_Builder_set_tags(
-    builder: *mut EntryBuilder,
-    value: *const *const c_char,
-    value_len: usize,
-) {
-    assert!(!builder.is_null());
-    let mut tags = Vec::new();
-    if !value.is_null() {
-        for i in 0..value_len {
-            let p = unsafe { *value.add(i) };
-            if let Some(s) = abi::c_ptr_to_string(p) {
-                tags.push(s);
-            }
-        }
-    }
-    unsafe { (*builder).tags = tags };
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_Entry_Builder_set_metadata(
-    builder: *mut EntryBuilder,
-    value_keys: *const *const c_char,
-    value_values: *const *const c_char,
-    value_len: usize,
-) {
-    assert!(!builder.is_null());
-    let mut map = BTreeMap::new();
-    if !value_keys.is_null() && !value_values.is_null() {
-        for i in 0..value_len {
-            let kp = unsafe { *value_keys.add(i) };
-            let vp = unsafe { *value_values.add(i) };
-            if let (Some(k), Some(v)) = (abi::c_ptr_to_string(kp), abi::c_ptr_to_string(vp)) {
-                map.insert(k, v);
-            }
-        }
-    }
-    unsafe { (*builder).metadata = map };
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_Entry_Builder_build(
-    builder: *mut EntryBuilder,
-    out_err: *mut weaveffi_error,
-) -> *mut Entry {
-    if builder.is_null() {
-        abi::error_set(out_err, KV_IO_ERROR, "builder is null");
-        return std::ptr::null_mut();
-    }
-    let b = unsafe { &*builder };
-    if b.key.is_empty() {
-        abi::error_set(out_err, KV_IO_ERROR, "Entry.key is required");
-        return std::ptr::null_mut();
-    }
-    abi::error_set_ok(out_err);
-    Box::into_raw(Box::new(Entry {
-        id: b.id,
-        key: b.key.clone(),
-        value: b.value.clone(),
-        kind: EntryKind::Volatile,
-        created_at: b.created_at,
-        expires_at: b.expires_at,
-        tags: b.tags.clone(),
-        metadata: b.metadata.clone(),
-    }))
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_Entry_Builder_destroy(builder: *mut EntryBuilder) {
-    if !builder.is_null() {
-        unsafe { drop(Box::from_raw(builder)) };
-    }
-}
-
-// ── Stats struct accessors ──────────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_stats_Stats_create(
-    total_entries: i64,
-    total_bytes: i64,
-    expired_entries: i64,
-    out_err: *mut weaveffi_error,
-) -> *mut Stats {
-    abi::error_set_ok(out_err);
-    Box::into_raw(Box::new(Stats {
-        total_entries,
-        total_bytes,
-        expired_entries,
-    }))
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_stats_Stats_destroy(ptr: *mut Stats) {
-    if !ptr.is_null() {
-        unsafe { drop(Box::from_raw(ptr)) };
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_stats_Stats_get_total_entries(ptr: *const Stats) -> i64 {
-    assert!(!ptr.is_null());
-    unsafe { (*ptr).total_entries }
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_stats_Stats_get_total_bytes(ptr: *const Stats) -> i64 {
-    assert!(!ptr.is_null());
-    unsafe { (*ptr).total_bytes }
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_kv_stats_Stats_get_expired_entries(ptr: *const Stats) -> i64 {
-    assert!(!ptr.is_null());
-    unsafe { (*ptr).expired_entries }
-}
-
-// ── Shared runtime exports ─────────────────────────────────
-abi::export_runtime!();
+weaveffi::export_runtime!();
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
-    use super::*;
-    use std::ffi::CString;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::mpsc;
+    use crate::kv::stats::*;
+    use crate::kv::*;
+    use std::ffi::{c_void, CString};
+    use std::os::raw::c_char;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Mutex};
+    use std::time::Duration;
+    use weaveffi::abi::{self, weaveffi_error};
 
+    // The macro-generated eviction-listener registry is process-global, so the
+    // tests that register a listener are serialized and each unregisters before
+    // releasing the guard; that keeps at most one subscriber live at a time.
     static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
-    fn setup() -> parking_lot::MutexGuard<'static, ()> {
-        let g = TEST_MUTEX.lock();
-        *LISTENER.lock() = None;
-        g
+    fn setup() -> std::sync::MutexGuard<'static, ()> {
+        TEST_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn new_err() -> weaveffi_error {
@@ -1014,9 +484,11 @@ mod tests {
     fn open_store_null_path_errors() {
         let _g = setup();
         let mut err = new_err();
+        // A `string` parameter rejects a null pointer with the macro's generic
+        // input-validation code (1), before `open_store` ever runs.
         let s = weaveffi_kv_open_store(std::ptr::null(), &mut err);
         assert!(s.is_null());
-        assert_eq!(err.code, KV_IO_ERROR);
+        assert_eq!(err.code, 1);
         abi::error_clear(&mut err);
     }
 
@@ -1048,6 +520,8 @@ mod tests {
         let s = open();
         let mut err = new_err();
         let key = CString::new("k").unwrap();
+        // An out-of-range `EntryKind` discriminant is rejected by the macro's
+        // enum lift with the generic input code (1).
         let ok = weaveffi_kv_put(
             s,
             key.as_ptr(),
@@ -1058,7 +532,7 @@ mod tests {
             &mut err,
         );
         assert!(!ok);
-        assert_eq!(err.code, KV_IO_ERROR);
+        assert_eq!(err.code, 1);
         abi::error_clear(&mut err);
         weaveffi_kv_close_store(s, &mut err);
         weaveffi_kv_Store_destroy(s);
@@ -1199,6 +673,9 @@ mod tests {
         let s = open();
         let mut err = new_err();
         let k = CString::new("legacy").unwrap();
+        // The generated thunk calls the `#[deprecated]` producer fn; the call
+        // site here opts in explicitly.
+        #[allow(deprecated)]
         let ok = weaveffi_kv_legacy_put(s, k.as_ptr(), b"v".as_ptr(), 1, &mut err);
         assert!(ok);
         assert_eq!(weaveffi_kv_count(s, &mut err), 1);
@@ -1455,13 +932,15 @@ mod tests {
     }
 
     #[test]
-    fn entry_builder_missing_key_errors() {
+    fn entry_builder_missing_required_field_errors() {
         let _g = setup();
         let b = weaveffi_kv_Entry_Builder_new();
         let mut err = new_err();
+        // No fields set: the generated `build` rejects the first missing
+        // required field with the macro's builder code (-1).
         let entry = weaveffi_kv_Entry_Builder_build(b, &mut err);
         assert!(entry.is_null());
-        assert_eq!(err.code, KV_IO_ERROR);
+        assert_eq!(err.code, -1);
         abi::error_clear(&mut err);
         weaveffi_kv_Entry_Builder_destroy(b);
     }
@@ -1544,11 +1023,11 @@ mod tests {
 
     #[test]
     fn cancel_token_helpers_are_reexported() {
-        let t = weaveffi_cancel_token_create();
+        let t = crate::weaveffi_cancel_token_create();
         assert!(!t.is_null());
-        assert!(!weaveffi_cancel_token_is_cancelled(t));
-        weaveffi_cancel_token_cancel(t);
-        assert!(weaveffi_cancel_token_is_cancelled(t));
-        weaveffi_cancel_token_destroy(t);
+        assert!(!crate::weaveffi_cancel_token_is_cancelled(t));
+        crate::weaveffi_cancel_token_cancel(t);
+        assert!(crate::weaveffi_cancel_token_is_cancelled(t));
+        crate::weaveffi_cancel_token_destroy(t);
     }
 }

@@ -1,17 +1,28 @@
 # Getting Started
 
-This guide walks you through installing WeaveFFI, defining an API, generating
-multi-language bindings, implementing the Rust library, and calling it from C.
+This guide walks you through installing WeaveFFI, defining an API as a
+language-neutral IDL, generating multi-language bindings from it, implementing
+the native library behind the generated C ABI, and calling it from C.
+
+WeaveFFI works with any native library that exposes a C ABI, so the producer
+can be written in Rust, C, C++, Zig, or anything else that can speak C. This
+guide implements it in Rust because that's the quickest to set up. If you're
+writing a Rust producer, you can also let the `#[weaveffi::module]` macro
+generate the C ABI and derive the IDL for you, instead of hand-writing YAML
+(see step 2).
 
 ## Prerequisites
 
-You need the [Rust toolchain](https://rustup.rs/) (stable channel) installed.
-Verify with:
+You need the [Rust toolchain](https://rustup.rs/) (stable channel) to install
+the CLI, and for this guide's Rust producer. Verify with:
 
 ```bash
 rustc --version
 cargo --version
 ```
+
+The CLI is the only hard requirement. The library you generate bindings for can
+be written in any language that exposes a C ABI.
 
 ## 1) Install WeaveFFI
 
@@ -23,29 +34,15 @@ cargo install weaveffi-cli
 
 This puts the `weaveffi` binary on your `PATH`.
 
-## 2) Create a new project
+## 2) Define your API as an IDL
 
-Scaffold a starter project:
-
-```bash
-weaveffi new my-project
-cd my-project
-```
-
-This creates a `my-project/` directory containing:
-
-- `weaveffi.yml`: an example IDL with `add`, `mul`, and `echo` functions
-- `README.md`: quick-start notes
-
-## 3) Define your IDL
-
-Open `weaveffi.yml` and replace its contents with an IDL that has a struct and
-a function:
+Describe the API once in a language-neutral IDL. Create `math.yml` with a
+record and a function:
 
 ```yaml
 version: "0.4.0"
 package:
-  name: my-project
+  name: my-math
   version: "0.1.0"
 modules:
   - name: math
@@ -64,18 +61,28 @@ modules:
 
 The optional `package:` block sets the name and version stamped into every
 generated package manifest (`package.json`, `pyproject.toml`, `Package.swift`,
-and so on); `weaveffi new` scaffolds one for you. The IDL also supports
-primitives (`i32`, `f64`, `bool`, `string`, `bytes`, `handle`), optionals
-(`string?`), and lists (`[i32]`). See the
+and so on). The IDL also supports primitives (`i32`, `f64`, `bool`, `string`,
+`bytes`, `handle`), optionals (`string?`), and lists (`[i32]`). See the
 [IDL Schema](reference/idl.md#package-metadata) reference for the full
 specification.
 
-## 4) Generate bindings
+> **Prefer not to hand-write YAML?** Run `weaveffi new my-project` to scaffold a
+> starter project (an example IDL plus a `Cargo.toml` and `src/lib.rs` stub) you
+> can edit instead.
+
+> **Writing a Rust producer?** You can make annotated Rust the single source of
+> truth instead of a separate IDL: annotate a module with `#[weaveffi::module]`
+> and point the generator straight at the source. The macro emits the C ABI and
+> derives the IDL from your code, so you write no `unsafe` glue. See
+> [The Rust Producer Macro](guides/producer-macro.md). The rest of this guide
+> uses the IDL.
+
+## 3) Generate bindings
 
 Run the generator to produce bindings for all targets:
 
 ```bash
-weaveffi generate weaveffi.yml -o generated --scaffold
+weaveffi generate math.yml -o generated --scaffold
 ```
 
 The `--scaffold` flag also emits a `scaffold.rs` with Rust FFI stubs you can
@@ -91,7 +98,7 @@ generated/
 └── scaffold.rs # Rust FFI function stubs
 ```
 
-## 5) Examine the generated output
+## 4) Examine the generated output
 
 ### C header (`generated/c/weaveffi.h`)
 
@@ -145,28 +152,32 @@ export interface Point {
 export function add(a: number, b: number): number
 ```
 
-## 6) Implement the Rust library
+## 5) Implement the library behind the C ABI
 
-The generated `scaffold.rs` contains `todo!()` stubs for every function.
-Create a Rust library crate and fill in the implementations.
+The generated C header (`generated/c/weaveffi.h`) is the contract your native
+library must satisfy, and it's the same contract every language binding calls
+into. You can implement it in any language that can expose a C ABI; here we use
+Rust, starting from the generated `scaffold.rs`, which already contains a
+`#[no_mangle] extern "C"` stub (with a `todo!()` body) for every symbol in the
+header.
 
-**Cargo.toml:**
+Create a library crate, add the WeaveFFI ABI helpers, and build a `cdylib`:
 
-```toml
-[package]
-name = "my-math"
-version = "0.1.0"
-edition = "2021"
-
-[lib]
-crate-type = ["cdylib"]
-
-[dependencies]
-weaveffi-abi = { version = "0.1" }
+```bash
+cargo new --lib my-math
+cd my-math
+cargo add weaveffi-abi
 ```
 
-**src/lib.rs**, implementing the `add` function (struct lifecycle omitted for
-brevity):
+In `Cargo.toml`:
+
+```toml
+[lib]
+crate-type = ["cdylib"]
+```
+
+Copy `scaffold.rs` into `src/lib.rs` and fill in the bodies. Implementing `add`
+looks like this (struct lifecycle omitted for brevity):
 
 ```rust
 #![allow(unsafe_code)]
@@ -202,6 +213,10 @@ Key points:
 
 [export-runtime-doc]: https://docs.rs/weaveffi-abi/latest/weaveffi_abi/macro.export_runtime.html
 
+> **Tip for Rust producers:** the `#[weaveffi::module]` macro generates these
+> `#[no_mangle] extern "C"` thunks for you from safe Rust, so you never fill in
+> stubs by hand. See [The Rust Producer Macro](guides/producer-macro.md).
+
 Build with:
 
 ```bash
@@ -209,9 +224,10 @@ cargo build
 ```
 
 This produces a shared library (`libmy_math.dylib` on macOS,
-`libmy_math.so` on Linux).
+`libmy_math.so` on Linux, `my_math.dll` on Windows). The exported symbols match
+`generated/c/weaveffi.h` by construction.
 
-## 7) Build and test with C
+## 6) Build and test with C
 
 Write a small C program that calls your library:
 
@@ -257,10 +273,13 @@ add(3, 4) = 7
 ## Next steps
 
 - Run `weaveffi doctor` to check which platform toolchains are available.
-- See the [Calculator tutorial](tutorials/calculator.md) for a full end-to-end
-  walkthrough including Swift and Node.js.
 - Read the [IDL Schema](reference/idl.md) reference for all supported types
   and features.
+- Writing a Rust producer? See
+  [The Rust Producer Macro](guides/producer-macro.md) to skip the scaffold and
+  generate the C ABI directly from annotated Rust.
+- See the [Calculator tutorial](tutorials/calculator.md) for a full end-to-end
+  walkthrough including Swift and Node.js.
 - Explore the [Generators](generators/README.md) section for target-specific
   details.
 

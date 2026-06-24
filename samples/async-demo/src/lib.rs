@@ -1,189 +1,117 @@
-//! Async-demo sample cdylib used to exercise WeaveFFI's `async: true`
-//! function code generation across all targets.
+//! Async-demo sample cdylib used to exercise WeaveFFI's `async: true` function
+//! code generation across all targets.
+//!
+//! The producer writes plain `async fn`s; the `#[weaveffi::module]` expansion
+//! emits the `_async` launcher for each (running the future to completion on a
+//! worker thread, then firing the host completion callback). A small RAII
+//! `ActiveGuard` keeps `active_callbacks` honest: it counts task bodies that
+//! are in flight and returns to zero once every spawned body has completed.
 
-#![allow(unsafe_code)]
-#![allow(non_camel_case_types)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+/// Async/await and cancellation demo across WeaveFFI's async-capable targets.
+#[weaveffi::module]
+pub mod tasks {
+    use std::sync::atomic::{AtomicI64, Ordering};
 
-use std::ffi::c_void;
-use std::os::raw::c_char;
-use std::sync::atomic::{AtomicI64, Ordering};
-use weaveffi_abi::{self as abi, weaveffi_error};
+    static NEXT_TASK_ID: AtomicI64 = AtomicI64::new(1);
+    static ACTIVE_CALLBACKS: AtomicI64 = AtomicI64::new(0);
 
-#[derive(Debug, Clone)]
-pub struct TaskResult {
-    pub id: i64,
-    pub value: String,
-    pub success: bool,
-}
+    /// RAII counter for in-flight async task bodies: increments on construction
+    /// and decrements on drop. Because the `#[weaveffi::module]` expansion drops
+    /// the future (and thus this guard) just before invoking the completion
+    /// callback, `active_callbacks` is back to zero by the time a caller
+    /// observes the callback.
+    struct ActiveGuard;
 
-static NEXT_TASK_ID: AtomicI64 = AtomicI64::new(1);
-static ACTIVE_CALLBACKS: AtomicI64 = AtomicI64::new(0);
+    impl ActiveGuard {
+        fn new() -> Self {
+            ACTIVE_CALLBACKS.fetch_add(1, Ordering::SeqCst);
+            ActiveGuard
+        }
+    }
 
-pub type weaveffi_tasks_run_task_callback =
-    extern "C" fn(context: *mut c_void, err: *mut weaveffi_error, result: *mut TaskResult);
+    impl Drop for ActiveGuard {
+        fn drop(&mut self) {
+            ACTIVE_CALLBACKS.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 
-pub type weaveffi_tasks_run_batch_callback = extern "C" fn(
-    context: *mut c_void,
-    err: *mut weaveffi_error,
-    result: *mut *mut TaskResult,
-    result_len: usize,
-);
+    fn next_id() -> i64 {
+        NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed)
+    }
 
-pub type weaveffi_tasks_run_n_tasks_callback =
-    extern "C" fn(context: *mut c_void, err: *mut weaveffi_error, result: i32);
+    /// The by-value result an async task completes with.
+    #[weaveffi::record]
+    #[derive(Debug, Clone)]
+    pub struct TaskResult {
+        /// The id assigned to the completed task.
+        pub id: i64,
+        /// A human-readable completion message.
+        pub value: String,
+        /// Whether the task succeeded.
+        pub success: bool,
+    }
 
-#[no_mangle]
-pub extern "C" fn weaveffi_tasks_run_task_async(
-    name: *const c_char,
-    callback: weaveffi_tasks_run_task_callback,
-    context: *mut c_void,
-) {
-    let name_str = abi::c_ptr_to_string(name).unwrap_or_default();
-    let ctx = context as usize;
-    ACTIVE_CALLBACKS.fetch_add(1, Ordering::SeqCst);
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let id = NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed);
-        let result = TaskResult {
-            id,
-            value: format!("completed: {name_str}"),
+    /// Run a single named task, completing with its `TaskResult`.
+    #[weaveffi::export]
+    pub async fn run_task(name: String) -> TaskResult {
+        let _guard = ActiveGuard::new();
+        TaskResult {
+            id: next_id(),
+            value: format!("completed: {name}"),
             success: true,
-        };
-        let result_ptr = Box::into_raw(Box::new(result));
-        ACTIVE_CALLBACKS.fetch_sub(1, Ordering::SeqCst);
-        callback(ctx as *mut c_void, std::ptr::null_mut(), result_ptr);
-    });
-}
+        }
+    }
 
-#[no_mangle]
-pub extern "C" fn weaveffi_tasks_run_batch_async(
-    names: *const *const c_char,
-    names_len: usize,
-    callback: weaveffi_tasks_run_batch_callback,
-    context: *mut c_void,
-) {
-    let name_list: Vec<String> = if names.is_null() {
-        Vec::new()
-    } else {
-        (0..names_len)
-            .map(|i| {
-                let ptr = unsafe { *names.add(i) };
-                abi::c_ptr_to_string(ptr).unwrap_or_default()
-            })
-            .collect()
-    };
-    let ctx = context as usize;
-    ACTIVE_CALLBACKS.fetch_add(1, Ordering::SeqCst);
-    std::thread::spawn(move || {
-        let mut results: Vec<*mut TaskResult> = Vec::new();
-        for name in &name_list {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            let id = NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed);
-            let result = TaskResult {
-                id,
+    /// Run a batch of named tasks, completing with one `TaskResult` per name.
+    #[weaveffi::export]
+    pub async fn run_batch(names: Vec<String>) -> Vec<TaskResult> {
+        let _guard = ActiveGuard::new();
+        names
+            .into_iter()
+            .map(|name| TaskResult {
+                id: next_id(),
                 value: format!("completed: {name}"),
                 success: true,
-            };
-            results.push(Box::into_raw(Box::new(result)));
-        }
-        let len = results.len();
-        let ptr = if results.is_empty() {
-            std::ptr::null_mut()
-        } else {
-            let p = results.as_mut_ptr();
-            std::mem::forget(results);
-            p
-        };
-        ACTIVE_CALLBACKS.fetch_sub(1, Ordering::SeqCst);
-        callback(ctx as *mut c_void, std::ptr::null_mut(), ptr, len);
-    });
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_tasks_cancel_task(_id: i64, out_err: *mut weaveffi_error) -> i32 {
-    abi::error_set_ok(out_err);
-    0
-}
-
-/// Async helper for stress tests: spawns a worker that immediately calls back
-/// with `n`. Used by `examples/{target}/async_stress.{ext}` to verify that
-/// the per-target async wrapper correctly pins the user-supplied context and
-/// callback for the duration of the call.
-#[no_mangle]
-pub extern "C" fn weaveffi_tasks_run_n_tasks_async(
-    n: i32,
-    callback: weaveffi_tasks_run_n_tasks_callback,
-    context: *mut c_void,
-) {
-    let ctx = context as usize;
-    ACTIVE_CALLBACKS.fetch_add(1, Ordering::SeqCst);
-    std::thread::spawn(move || {
-        ACTIVE_CALLBACKS.fetch_sub(1, Ordering::SeqCst);
-        callback(ctx as *mut c_void, std::ptr::null_mut(), n);
-    });
-}
-
-/// Returns the number of in-flight async callbacks (workers spawned but not
-/// yet dispatched). After awaiting all outstanding async calls this should
-/// drop back to zero.
-#[no_mangle]
-pub extern "C" fn weaveffi_tasks_active_callbacks(_out_err: *mut weaveffi_error) -> i64 {
-    ACTIVE_CALLBACKS.load(Ordering::SeqCst)
-}
-
-// ── TaskResult getters ──────────────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn weaveffi_tasks_TaskResult_get_id(result: *const TaskResult) -> i64 {
-    assert!(!result.is_null());
-    unsafe { (*result).id }
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_tasks_TaskResult_get_value(result: *const TaskResult) -> *const c_char {
-    assert!(!result.is_null());
-    abi::string_to_c_ptr(&unsafe { &*result }.value)
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_tasks_TaskResult_get_success(result: *const TaskResult) -> i32 {
-    assert!(!result.is_null());
-    unsafe { (*result).success as i32 }
-}
-
-// ── TaskResult lifecycle ────────────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn weaveffi_tasks_TaskResult_destroy(result: *mut TaskResult) {
-    if result.is_null() {
-        return;
+            })
+            .collect()
     }
-    unsafe { drop(Box::from_raw(result)) };
-}
 
-#[no_mangle]
-pub extern "C" fn weaveffi_tasks_TaskResult_list_free(results: *mut *mut TaskResult, len: usize) {
-    if results.is_null() {
-        return;
+    /// Best-effort cancel of a task by id. This demo has no long-running work
+    /// to interrupt, so it always reports "not cancelled".
+    #[weaveffi::export]
+    pub fn cancel_task(id: i64) -> bool {
+        let _ = id;
+        false
     }
-    let ptrs = unsafe { Vec::from_raw_parts(results, len, len) };
-    for ptr in ptrs {
-        if !ptr.is_null() {
-            unsafe { drop(Box::from_raw(ptr)) };
-        }
+
+    /// Complete immediately with `n`. Drives the async stress examples, which
+    /// verify the per-target wrapper pins the caller's context and callback for
+    /// the duration of the call.
+    #[weaveffi::export]
+    pub async fn run_n_tasks(n: i32) -> i32 {
+        let _guard = ActiveGuard::new();
+        n
+    }
+
+    /// The number of async task bodies currently in flight; returns to zero
+    /// once every outstanding task has completed.
+    #[weaveffi::export]
+    pub fn active_callbacks() -> i64 {
+        ACTIVE_CALLBACKS.load(Ordering::SeqCst)
     }
 }
 
-// ── Shared runtime exports ─────────────────────────────────
-abi::export_runtime!();
+weaveffi::export_runtime!();
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
-    use super::*;
+    use crate::tasks::*;
     use std::ffi::CString;
+    use std::os::raw::c_void;
     use std::sync::mpsc;
     use std::time::Duration;
+    use weaveffi::abi::{self, weaveffi_error};
 
     type TaskCbMsg = (bool, *mut TaskResult);
     type BatchCbMsg = (bool, *mut *mut TaskResult, usize);
@@ -195,7 +123,7 @@ mod tests {
     ) {
         let tx = unsafe { &*(context as *const mpsc::Sender<TaskCbMsg>) };
         let had_error = !err.is_null() && unsafe { (*err).code } != 0;
-        tx.send((had_error, result)).unwrap();
+        let _ = tx.send((had_error, result));
     }
 
     extern "C" fn batch_callback(
@@ -206,7 +134,40 @@ mod tests {
     ) {
         let tx = unsafe { &*(context as *const mpsc::Sender<BatchCbMsg>) };
         let had_error = !err.is_null() && unsafe { (*err).code } != 0;
-        tx.send((had_error, results, results_len)).unwrap();
+        let _ = tx.send((had_error, results, results_len));
+    }
+
+    extern "C" fn n_tasks_callback(context: *mut c_void, err: *mut weaveffi_error, result: i32) {
+        let tx = unsafe { &*(context as *const mpsc::Sender<(bool, i32)>) };
+        let had_error = !err.is_null() && unsafe { (*err).code } != 0;
+        let _ = tx.send((had_error, result));
+    }
+
+    /// Free a returned `[TaskResult]`: destroy each element, then reclaim the
+    /// pointer array the launcher allocated (the same shape the conformance
+    /// consumers free a list-of-struct return).
+    fn free_results(results: *mut *mut TaskResult, len: usize) {
+        if results.is_null() {
+            return;
+        }
+        for i in 0..len {
+            weaveffi_tasks_TaskResult_destroy(unsafe { *results.add(i) });
+        }
+        unsafe { drop(Vec::from_raw_parts(results, len, len)) };
+    }
+
+    /// Intentionally leak a callback-context box.
+    ///
+    /// The `#[weaveffi::module]` async launchers invoke the completion callback
+    /// on a detached worker thread, so a worker may still be inside the
+    /// callback's `send` when the test's `recv` returns (the receiver unblocks
+    /// as soon as the message is queued, before `send` finishes). Reclaiming the
+    /// box here would free the `Sender` out from under that in-flight `send`, a
+    /// use-after-free. The test deliberately leaks the context instead, which
+    /// keeps the channel alive for the brief remaining life of any in-flight
+    /// callback; the OS reclaims the memory at process exit.
+    fn leak_ctx<T>(ptr: *mut T) {
+        std::mem::forget(unsafe { Box::from_raw(ptr) });
     }
 
     #[test]
@@ -218,7 +179,7 @@ mod tests {
         weaveffi_tasks_run_task_async(name.as_ptr(), task_callback, tx_ptr as *mut c_void);
 
         let (had_error, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        unsafe { drop(Box::from_raw(tx_ptr)) };
+        leak_ctx(tx_ptr);
         assert!(!had_error);
         assert!(!result.is_null());
 
@@ -238,7 +199,7 @@ mod tests {
         weaveffi_tasks_run_task_async(std::ptr::null(), task_callback, tx_ptr as *mut c_void);
 
         let (had_error, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        unsafe { drop(Box::from_raw(tx_ptr)) };
+        leak_ctx(tx_ptr);
         assert!(!had_error);
         assert!(!result.is_null());
 
@@ -257,7 +218,8 @@ mod tests {
             CString::new("task-b").unwrap(),
             CString::new("task-c").unwrap(),
         ];
-        let name_ptrs: Vec<*const c_char> = names.iter().map(|n| n.as_ptr()).collect();
+        let name_ptrs: Vec<*const std::os::raw::c_char> =
+            names.iter().map(|n| n.as_ptr()).collect();
 
         weaveffi_tasks_run_batch_async(
             name_ptrs.as_ptr(),
@@ -267,14 +229,13 @@ mod tests {
         );
 
         let (had_error, results, results_len) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        unsafe { drop(Box::from_raw(tx_ptr)) };
+        leak_ctx(tx_ptr);
         assert!(!had_error);
         assert_eq!(results_len, 3);
         assert!(!results.is_null());
 
         for i in 0..results_len {
-            let result = unsafe { *results.add(i) };
-            let r = unsafe { &*result };
+            let r = unsafe { &**results.add(i) };
             assert!(r.id > 0);
             assert!(r.success);
         }
@@ -284,7 +245,7 @@ mod tests {
         let r2 = unsafe { &**results.add(2) };
         assert!(r2.value.contains("task-c"));
 
-        weaveffi_tasks_TaskResult_list_free(results, results_len);
+        free_results(results, results_len);
     }
 
     #[test]
@@ -295,7 +256,7 @@ mod tests {
         weaveffi_tasks_run_batch_async(std::ptr::null(), 0, batch_callback, tx_ptr as *mut c_void);
 
         let (had_error, results, results_len) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        unsafe { drop(Box::from_raw(tx_ptr)) };
+        leak_ctx(tx_ptr);
         assert!(!had_error);
         assert_eq!(results_len, 0);
         assert!(results.is_null());
@@ -304,63 +265,35 @@ mod tests {
     #[test]
     fn cancel_task_returns_false() {
         let mut err = weaveffi_error::default();
-        let result = weaveffi_tasks_cancel_task(42, &mut err);
+        let cancelled = weaveffi_tasks_cancel_task(42, &mut err);
         assert_eq!(err.code, 0);
-        assert_eq!(result, 0);
-    }
-
-    #[test]
-    fn cancel_task_stops_execution() {
-        let mut err = weaveffi_error::default();
-        let cancelled = weaveffi_tasks_cancel_task(999, &mut err);
-        assert_eq!(err.code, 0);
-        assert_eq!(cancelled, 0);
-
-        let (tx, rx) = mpsc::channel::<TaskCbMsg>();
-        let tx_ptr = Box::into_raw(Box::new(tx));
-        let name = CString::new("post-cancel").unwrap();
-        weaveffi_tasks_run_task_async(name.as_ptr(), task_callback, tx_ptr as *mut c_void);
-
-        let (had_error, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        unsafe { drop(Box::from_raw(tx_ptr)) };
-        assert!(!had_error);
-        assert!(!result.is_null());
-
-        let r = unsafe { &*result };
-        assert!(r.success);
-        assert!(r.value.contains("post-cancel"));
-
-        weaveffi_tasks_TaskResult_destroy(result);
+        assert!(!cancelled);
     }
 
     #[test]
     fn task_result_getters() {
-        let result = Box::into_raw(Box::new(TaskResult {
-            id: 42,
-            value: "hello".to_string(),
-            success: true,
-        }));
+        let mut err = weaveffi_error::default();
+        let value = CString::new("hello").unwrap();
+        let result = weaveffi_tasks_TaskResult_create(42, value.as_ptr(), true, &mut err);
+        assert_eq!(err.code, 0);
+        assert!(!result.is_null());
 
         assert_eq!(weaveffi_tasks_TaskResult_get_id(result), 42);
-        assert_eq!(weaveffi_tasks_TaskResult_get_success(result), 1);
+        assert!(weaveffi_tasks_TaskResult_get_success(result));
 
-        let value = weaveffi_tasks_TaskResult_get_value(result);
-        assert_eq!(abi::c_ptr_to_string(value).unwrap(), "hello");
-        abi::free_string(value);
+        let got = weaveffi_tasks_TaskResult_get_value(result);
+        assert_eq!(abi::c_ptr_to_string(got).unwrap(), "hello");
+        abi::free_string(got);
 
         weaveffi_tasks_TaskResult_destroy(result);
     }
 
     #[test]
     fn task_result_success_false() {
-        let result = Box::into_raw(Box::new(TaskResult {
-            id: 1,
-            value: "fail".to_string(),
-            success: false,
-        }));
-
-        assert_eq!(weaveffi_tasks_TaskResult_get_success(result), 0);
-
+        let mut err = weaveffi_error::default();
+        let value = CString::new("fail").unwrap();
+        let result = weaveffi_tasks_TaskResult_create(1, value.as_ptr(), false, &mut err);
+        assert!(!weaveffi_tasks_TaskResult_get_success(result));
         weaveffi_tasks_TaskResult_destroy(result);
     }
 
@@ -370,23 +303,12 @@ mod tests {
     }
 
     #[test]
-    fn list_free_null_is_safe() {
-        weaveffi_tasks_TaskResult_list_free(std::ptr::null_mut(), 0);
-    }
-
-    extern "C" fn n_tasks_callback(context: *mut c_void, err: *mut weaveffi_error, result: i32) {
-        let tx = unsafe { &*(context as *const mpsc::Sender<(bool, i32)>) };
-        let had_error = !err.is_null() && unsafe { (*err).code } != 0;
-        tx.send((had_error, result)).unwrap();
-    }
-
-    #[test]
     fn run_n_tasks_invokes_callback_with_n() {
         let (tx, rx) = mpsc::channel::<(bool, i32)>();
         let tx_ptr = Box::into_raw(Box::new(tx));
         weaveffi_tasks_run_n_tasks_async(7, n_tasks_callback, tx_ptr as *mut c_void);
         let (had_error, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        unsafe { drop(Box::from_raw(tx_ptr)) };
+        leak_ctx(tx_ptr);
         assert!(!had_error);
         assert_eq!(result, 7);
     }
@@ -403,7 +325,7 @@ mod tests {
         for _ in 0..16 {
             rx.recv_timeout(Duration::from_secs(5)).unwrap();
         }
-        unsafe { drop(Box::from_raw(tx_ptr)) };
+        leak_ctx(tx_ptr);
 
         for _ in 0..50 {
             if weaveffi_tasks_active_callbacks(&mut err) == 0 {

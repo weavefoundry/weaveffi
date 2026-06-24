@@ -8,7 +8,14 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod arena;
+pub mod convert;
 mod macros;
+
+pub use convert::{
+    lift_byte_slice, lift_bytes, lift_opt_scalar, lift_opt_string, lift_ptr_vec, lift_scalar_vec,
+    lift_string_vec, lower_bytes, lower_opt_scalar, lower_opt_string, lower_ptr_vec,
+    lower_scalar_vec, lower_string_vec, write_map_out,
+};
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -80,8 +87,67 @@ pub fn error_set(out_err: *mut weaveffi_error, code: i32, message: &str) {
     err.message = cstr.into_raw();
 }
 
+/// Maps a producer error onto the ABI's `(code, message)` pair.
+///
+/// A fallible `#[weaveffi::export]` function returning `Result<T, E>` reports
+/// `Err(e)` through its trailing `out_err` slot by writing
+/// [`ErrorReport::code`] and [`ErrorReport::message`] into the caller's
+/// [`weaveffi_error`]. A blanket implementation covers every [`Display`] type,
+/// reporting the generic code `-1`, so `Result<T, String>` and
+/// `Result<T, MyDisplayError>` need no extra code.
+///
+/// To surface the named codes of an IDL error domain so consumers can react to
+/// each case, implement this trait directly on your error type (and do not
+/// implement [`Display`] for it, which would collide with the blanket impl):
+///
+/// ```
+/// use weaveffi_abi::ErrorReport;
+///
+/// enum KvError {
+///     KeyNotFound,
+///     Io(String),
+/// }
+///
+/// impl ErrorReport for KvError {
+///     fn code(&self) -> i32 {
+///         match self {
+///             KvError::KeyNotFound => 1001,
+///             KvError::Io(_) => 1004,
+///         }
+///     }
+///     fn message(&self) -> String {
+///         match self {
+///             KvError::KeyNotFound => "key not found".to_string(),
+///             KvError::Io(detail) => format!("I/O error: {detail}"),
+///         }
+///     }
+/// }
+/// ```
+///
+/// [`Display`]: std::fmt::Display
+pub trait ErrorReport {
+    /// The non-zero status code written to [`weaveffi_error::code`]. Defaults to
+    /// the generic error code `-1`.
+    fn code(&self) -> i32 {
+        -1
+    }
+
+    /// The human-readable message written to [`weaveffi_error::message`].
+    fn message(&self) -> String;
+}
+
+impl<E: std::fmt::Display> ErrorReport for E {
+    fn message(&self) -> String {
+        self.to_string()
+    }
+}
+
 /// Convenience adapter: map a `Result<T, E>` to `Option<T>` by writing into `out_err`.
-pub fn result_to_out_err<T, E: std::fmt::Display>(
+///
+/// `Err(e)` is reported through [`ErrorReport`], so the generic `-1` code is
+/// used for [`Display`](std::fmt::Display) errors and the domain code for types
+/// that implement [`ErrorReport`] directly.
+pub fn result_to_out_err<T, E: ErrorReport>(
     result: Result<T, E>,
     out_err: *mut weaveffi_error,
 ) -> Option<T> {
@@ -91,7 +157,7 @@ pub fn result_to_out_err<T, E: std::fmt::Display>(
             Some(value)
         }
         Err(e) => {
-            error_set(out_err, -1, &e.to_string());
+            error_set(out_err, e.code(), &e.message());
             None
         }
     }
@@ -220,6 +286,133 @@ pub fn cancel_token_destroy(token: *mut weaveffi_cancel_token) {
     unsafe { drop(Box::from_raw(token)) };
 }
 
+/// A safe, `Send` view of a foreign [`weaveffi_cancel_token`] handed to a
+/// cancellable `async fn`.
+///
+/// A producer marks an exported `async fn` `#[weaveffi::cancellable]` and
+/// accepts a `CancelToken` as its final parameter; the `#[weaveffi::module]`
+/// expansion lifts the launcher's `cancel_token` slot into one of these and
+/// moves it onto the worker thread. The function polls [`CancelToken::is_cancelled`]
+/// at safe points and returns early (typically `Err`) when cancellation is observed.
+/// The token carries no parameter in the IDL: it is part of the async calling
+/// convention, not the function's logical signature.
+///
+/// # Safety
+///
+/// The wrapped pointer is owned by the foreign caller, which (per the cancel
+/// token contract) keeps it alive until the completion callback fires, so
+/// reading the atomic flag from the worker thread is sound. The wrapper is
+/// therefore `Send`/`Sync`.
+pub struct CancelToken {
+    raw: *const weaveffi_cancel_token,
+}
+
+// SAFETY: the wrapped token is an atomic flag behind a pointer the foreign
+// caller keeps valid for the whole async operation; reading it from the worker
+// thread the launcher spawns races only on the atomic, which is synchronized.
+unsafe impl Send for CancelToken {}
+// SAFETY: see the `Send` impl; `is_cancelled` is a shared atomic load.
+unsafe impl Sync for CancelToken {}
+
+impl CancelToken {
+    /// Wrap a raw cancel-token pointer. A null pointer is permitted and reads as
+    /// "never cancelled".
+    ///
+    /// This is the entry point the `#[weaveffi::module]` expansion calls; it is
+    /// `#[doc(hidden)]` because producers receive an already-built token.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_raw(raw: *const weaveffi_cancel_token) -> Self {
+        Self { raw }
+    }
+
+    /// Whether the foreign caller has requested cancellation.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        cancel_token_is_cancelled(self.raw)
+    }
+}
+
+/// An owned, type-erased iterator handed across the C ABI boundary.
+///
+/// A producer function whose IDL return type is `iter<T>` returns a
+/// `weaveffi::Iter<T>`, built from any iterator with [`Iter::new`]. The
+/// `#[weaveffi::module]` expansion boxes it behind an opaque iterator handle,
+/// pulls one element per `_next` call, and drops it in `_destroy`. Pulling
+/// elements lazily (rather than materializing a `Vec`) is what distinguishes an
+/// `iter<T>` return from a `[T]` (list) return.
+pub struct Iter<T> {
+    inner: Box<dyn Iterator<Item = T> + Send>,
+}
+
+impl<T> Iter<T> {
+    /// Wrap any `Send + 'static` iterator as a WeaveFFI iterator handle.
+    ///
+    /// Accepts anything `IntoIterator`, so `Iter::new(vec)`, `Iter::new(0..n)`,
+    /// and `Iter::new(map.into_values())` all work.
+    pub fn new<I>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        I::IntoIter: Send + 'static,
+    {
+        Self {
+            inner: Box::new(iter.into_iter()),
+        }
+    }
+}
+
+impl<T> Iterator for Iter<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        self.inner.next()
+    }
+}
+
+/// Drive a future to completion on the current thread, blocking until it
+/// resolves.
+///
+/// This is the minimal, dependency-free executor the `#[weaveffi::module]`
+/// expansion uses to run an exported `async fn` on the worker thread it spawns
+/// for each async launch, then invoke the completion callback with the result.
+/// It parks the thread between polls and wakes on `Waker::wake`, so a future
+/// that yields (for example, one awaiting a channel woken from another thread)
+/// makes progress without busy-spinning. There is no reactor, so a future that
+/// depends on an external runtime's I/O driver (such as Tokio's) will not be
+/// driven by this helper.
+///
+/// # Examples
+///
+/// ```
+/// let n = weaveffi_abi::block_on(async { 1 + 2 });
+/// assert_eq!(n, 3);
+/// ```
+pub fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+    use std::thread::{self, Thread};
+
+    struct ThreadWaker(Thread);
+    impl Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    let mut fut = Box::pin(fut);
+    let waker = Waker::from(Arc::new(ThreadWaker(thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(out) => return out,
+            Poll::Pending => thread::park(),
+        }
+    }
+}
+
 /// Convert a NUL-terminated C string pointer to an owned `String`.
 /// Returns `None` if `ptr` is null or not valid UTF-8.
 pub fn c_ptr_to_string(ptr: *const c_char) -> Option<String> {
@@ -327,6 +520,51 @@ mod tests {
         assert_eq!(err.code, -1);
         let msg = c_ptr_to_string(err.message).unwrap();
         assert_eq!(msg, "bad input");
+        error_clear(&mut err);
+    }
+
+    // A domain error type that does *not* implement `Display`, so it can carry
+    // its own `ErrorReport` impl without colliding with the blanket one.
+    enum DomainError {
+        NotFound,
+        Io(String),
+    }
+
+    impl ErrorReport for DomainError {
+        fn code(&self) -> i32 {
+            match self {
+                DomainError::NotFound => 1001,
+                DomainError::Io(_) => 1004,
+            }
+        }
+        fn message(&self) -> String {
+            match self {
+                DomainError::NotFound => "not found".to_string(),
+                DomainError::Io(detail) => format!("io: {detail}"),
+            }
+        }
+    }
+
+    #[test]
+    fn error_report_blanket_display_uses_generic_code() {
+        let e = "boom".to_string();
+        assert_eq!(ErrorReport::code(&e), -1);
+        assert_eq!(ErrorReport::message(&e), "boom");
+    }
+
+    #[test]
+    fn error_report_domain_error_carries_its_code() {
+        let mut err = weaveffi_error::default();
+        let val: Result<i32, DomainError> = Err(DomainError::NotFound);
+        assert_eq!(result_to_out_err(val, &mut err), None);
+        assert_eq!(err.code, 1001);
+        assert_eq!(c_ptr_to_string(err.message).unwrap(), "not found");
+        error_clear(&mut err);
+
+        let val: Result<i32, DomainError> = Err(DomainError::Io("disk".to_string()));
+        assert_eq!(result_to_out_err(val, &mut err), None);
+        assert_eq!(err.code, 1004);
+        assert_eq!(c_ptr_to_string(err.message).unwrap(), "io: disk");
         error_clear(&mut err);
     }
 

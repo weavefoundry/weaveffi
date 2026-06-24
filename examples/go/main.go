@@ -63,10 +63,10 @@ func main() {
 	var getID func(c uintptr) int64
 	purego.RegisterLibFunc(&getID, contacts, "weaveffi_contacts_Contact_get_id")
 
-	var listFree func(items **byte, n uint64)
-	purego.RegisterLibFunc(&listFree, contacts, "weaveffi_contacts_Contact_list_free")
+	var destroy func(c uintptr)
+	purego.RegisterLibFunc(&destroy, contacts, "weaveffi_contacts_Contact_destroy")
 
-	var del func(h uint64, err *weaveffiError) int32
+	var del func(h uint64, err *weaveffiError) bool
 	purego.RegisterLibFunc(&del, contacts, "weaveffi_contacts_delete_contact")
 
 	var count func(err *weaveffiError) int32
@@ -92,12 +92,14 @@ func main() {
 	itemsSlice := unsafe.Slice(items, n)
 	firstPtr := uintptr(unsafe.Pointer(itemsSlice[0]))
 	check(getID(firstPtr) == int64(h), "id mismatch")
-	listFree(items, n)
+	for _, elem := range itemsSlice {
+		destroy(uintptr(unsafe.Pointer(elem)))
+	}
 
 	err = weaveffiError{}
 	deleted := del(h, &err)
 	check(err.code == 0, "delete_contact error")
-	check(deleted == 1, "delete_contact did not return 1")
+	check(deleted, "delete_contact did not return true")
 
 	err = weaveffiError{}
 	check(count(&err) == 0, "store not empty after cleanup")

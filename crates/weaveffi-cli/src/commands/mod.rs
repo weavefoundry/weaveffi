@@ -33,15 +33,25 @@ pub(crate) fn input_format(in_path: &Utf8Path) -> Result<&'static str> {
     }
 }
 
-/// Read and parse the IDL at `input` without validating it. Returns the
-/// parsed [`Api`] and the raw file contents (for snippet-rendered
-/// diagnostics).
+/// Read and parse the API at `input` without validating it. Returns the parsed
+/// [`Api`] and the raw file contents (for snippet-rendered diagnostics).
+///
+/// A `.rs` input is treated as annotated Rust source and lowered to the IR
+/// through [`weaveffi_bridge`] (the same extraction the `#[weaveffi::module]`
+/// macro uses), so generating from a producer's source and building that
+/// producer cannot drift. Any other extension is parsed as an IDL document
+/// (yaml/json/toml).
 pub(crate) fn load_api(input: &str) -> Result<(Api, String)> {
     let in_path = Utf8Path::new(input);
-    let format = input_format(in_path)?;
     let contents = std::fs::read_to_string(in_path.as_std_path())
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to read input file: {}", input))?;
+    if in_path.extension() == Some("rs") {
+        let api = weaveffi_bridge::api_from_src_stringly(&contents)
+            .map_err(|e| miette::miette!("failed to extract API from Rust source {input}:\n{e}"))?;
+        return Ok((api, contents));
+    }
+    let format = input_format(in_path)?;
     let api =
         parse_api_str(&contents, format).map_err(|e| with_named_source(e, input, &contents))?;
     Ok((api, contents))

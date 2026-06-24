@@ -65,15 +65,15 @@ int main() {
                                            weaveffi_error*);
     using ListFn = void** (*)(size_t*, weaveffi_error*);
     using GetIdFn = int64_t (*)(const void*);
-    using ListFreeFn = void (*)(void**, size_t);
-    using DeleteFn = int32_t (*)(weaveffi_handle_t, weaveffi_error*);
+    using DestroyFn = void (*)(void*);
+    using DeleteFn = bool (*)(weaveffi_handle_t, weaveffi_error*);
     using CountFn = int32_t (*)(weaveffi_error*);
 
     auto add = must_sym<AddFn>(calc, "weaveffi_calculator_add");
     auto create = must_sym<CreateFn>(contacts, "weaveffi_contacts_create_contact");
     auto list = must_sym<ListFn>(contacts, "weaveffi_contacts_list_contacts");
     auto get_id = must_sym<GetIdFn>(contacts, "weaveffi_contacts_Contact_get_id");
-    auto list_free = must_sym<ListFreeFn>(contacts, "weaveffi_contacts_Contact_list_free");
+    auto destroy = must_sym<DestroyFn>(contacts, "weaveffi_contacts_Contact_destroy");
     auto del = must_sym<DeleteFn>(contacts, "weaveffi_contacts_delete_contact");
     auto count = must_sym<CountFn>(contacts, "weaveffi_contacts_count_contacts");
 
@@ -94,12 +94,14 @@ int main() {
     ASSERT(len == 1, "list_contacts length != 1");
     ASSERT(items != nullptr, "list_contacts null");
     ASSERT(get_id(items[0]) == static_cast<int64_t>(h), "id mismatch");
-    list_free(items, len);
+    for (size_t i = 0; i < len; i++) {
+        destroy(items[i]);
+    }
 
     err = {};
-    int32_t deleted = del(h, &err);
+    bool deleted = del(h, &err);
     ASSERT(err.code == 0, "delete_contact error");
-    ASSERT(deleted == 1, "delete_contact did not return 1");
+    ASSERT(deleted, "delete_contact did not return true");
 
     err = {};
     ASSERT(count(&err) == 0, "store not empty after cleanup");

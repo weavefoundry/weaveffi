@@ -45,10 +45,11 @@ internal static class Contacts
     internal static extern long weaveffi_contacts_Contact_get_id(IntPtr ptr);
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern void weaveffi_contacts_Contact_list_free(IntPtr items, UIntPtr len);
+    internal static extern void weaveffi_contacts_Contact_destroy(IntPtr ptr);
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern int weaveffi_contacts_delete_contact(ulong id, ref WeaveffiError err);
+    [return: MarshalAs(UnmanagedType.U1)]
+    internal static extern bool weaveffi_contacts_delete_contact(ulong id, ref WeaveffiError err);
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern int weaveffi_contacts_count_contacts(ref WeaveffiError err);
@@ -105,12 +106,16 @@ internal static class Program
         Check(items != IntPtr.Zero, "list_contacts null");
         var firstPtr = Marshal.ReadIntPtr(items);
         Check((ulong)Contacts.weaveffi_contacts_Contact_get_id(firstPtr) == h, "id mismatch");
-        Contacts.weaveffi_contacts_Contact_list_free(items, len);
+        for (ulong i = 0; i < (ulong)len; i++)
+        {
+            var elem = Marshal.ReadIntPtr(items, (int)i * IntPtr.Size);
+            Contacts.weaveffi_contacts_Contact_destroy(elem);
+        }
 
         err = new WeaveffiError();
         var deleted = Contacts.weaveffi_contacts_delete_contact(h, ref err);
         Check(err.Code == 0, "delete_contact error");
-        Check(deleted == 1, "delete_contact did not return 1");
+        Check(deleted, "delete_contact did not return true");
 
         err = new WeaveffiError();
         Check(Contacts.weaveffi_contacts_count_contacts(ref err) == 0,

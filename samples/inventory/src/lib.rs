@@ -1,1214 +1,394 @@
-//! Inventory sample cdylib showcasing maps and lists across the WeaveFFI C ABI.
+//! Inventory sample: a two-module product and order catalog in safe Rust.
+//!
+//! This sample shows how `#[weaveffi::module]` scales past a single namespace.
+//! The `products` module owns the `Product` record and its `Category` enum; the
+//! `orders` module owns `Order`/`OrderItem` and references `products::Product`
+//! across the module boundary. Each module keeps its own in-memory store behind
+//! a `Mutex`, hands out opaque `u64` handles, and lets the macro generate every
+//! `extern "C"` thunk, getter, and list marshalling. No `unsafe` glue is written
+//! by hand.
 
-#![allow(unsafe_code)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+/// Product catalog: the `Product` record, its `Category`, and CRUD functions.
+#[weaveffi::module]
+pub mod products {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::Mutex;
 
-use std::os::raw::c_char;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Mutex;
-use weaveffi_abi::{self as abi, weaveffi_error, weaveffi_handle_t};
-
-// ── Products module ─────────────────────────────────────────
-
-#[repr(i32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Category {
-    Electronics = 0,
-    Clothing = 1,
-    Food = 2,
-    Books = 3,
-}
-
-impl Category {
-    fn from_i32(v: i32) -> Option<Self> {
-        match v {
-            0 => Some(Self::Electronics),
-            1 => Some(Self::Clothing),
-            2 => Some(Self::Food),
-            3 => Some(Self::Books),
-            _ => None,
-        }
+    /// The shelf a product belongs to.
+    #[weaveffi::enumeration]
+    #[repr(i32)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Category {
+        /// Phones, laptops, and other devices.
+        Electronics = 0,
+        /// Apparel and accessories.
+        Clothing = 1,
+        /// Anything edible.
+        Food = 2,
+        /// Printed and digital books.
+        Books = 3,
     }
-}
 
-#[derive(Debug, Clone)]
-pub struct Product {
-    pub id: i64,
-    pub name: String,
-    pub description: Option<String>,
-    pub price: f64,
-    pub category: Category,
-    pub tags: Vec<String>,
-}
-
-static PRODUCT_STORE: Mutex<Vec<Product>> = Mutex::new(Vec::new());
-static NEXT_PRODUCT_ID: AtomicI64 = AtomicI64::new(1);
-
-// ── Products: module functions ──────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn weaveffi_products_create_product(
-    name: *const c_char,
-    price: f64,
-    category: i32,
-    out_err: *mut weaveffi_error,
-) -> weaveffi_handle_t {
-    let name = match abi::c_ptr_to_string(name) {
-        Some(s) => s,
-        None => {
-            abi::error_set(out_err, 1, "name is null or invalid UTF-8");
-            return 0;
-        }
-    };
-    let cat = match Category::from_i32(category) {
-        Some(c) => c,
-        None => {
-            abi::error_set(out_err, 1, "invalid category value");
-            return 0;
-        }
-    };
-
-    let id = NEXT_PRODUCT_ID.fetch_add(1, Ordering::Relaxed);
-    let product = Product {
-        id,
-        name,
-        description: None,
-        price,
-        category: cat,
-        tags: Vec::new(),
-    };
-    PRODUCT_STORE.lock().unwrap().push(product);
-
-    abi::error_set_ok(out_err);
-    id as weaveffi_handle_t
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_products_get_product(
-    id: weaveffi_handle_t,
-    out_err: *mut weaveffi_error,
-) -> *mut Product {
-    let store = PRODUCT_STORE.lock().unwrap();
-    match store.iter().find(|p| p.id == id as i64) {
-        Some(p) => {
-            abi::error_set_ok(out_err);
-            Box::into_raw(Box::new(p.clone()))
-        }
-        None => {
-            abi::error_set(out_err, 1, "product not found");
-            std::ptr::null_mut()
-        }
+    /// A catalog item.
+    #[weaveffi::record]
+    #[derive(Clone, Debug)]
+    pub struct Product {
+        /// Stable identifier assigned on creation.
+        pub id: i64,
+        /// Display name.
+        pub name: String,
+        /// Optional long-form description.
+        pub description: Option<String>,
+        /// Price in the catalog's base currency.
+        pub price: f64,
+        /// Which shelf the product sits on.
+        pub category: Category,
+        /// Free-form search tags.
+        pub tags: Vec<String>,
     }
-}
 
-#[no_mangle]
-pub extern "C" fn weaveffi_products_search_products(
-    category: i32,
-    out_len: *mut usize,
-    out_err: *mut weaveffi_error,
-) -> *mut *mut Product {
-    let cat = match Category::from_i32(category) {
-        Some(c) => c,
-        None => {
-            abi::error_set(out_err, 1, "invalid category value");
-            if !out_len.is_null() {
-                unsafe { *out_len = 0 };
+    static STORE: Mutex<Vec<Product>> = Mutex::new(Vec::new());
+    static NEXT_ID: AtomicI64 = AtomicI64::new(1);
+
+    /// Create a product, returning its opaque handle.
+    #[weaveffi::export]
+    pub fn create_product(name: String, price: f64, category: Category) -> u64 {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        STORE.lock().unwrap().push(Product {
+            id,
+            name,
+            description: None,
+            price,
+            category,
+            tags: Vec::new(),
+        });
+        id as u64
+    }
+
+    /// Look up a product by handle, erroring if none exists.
+    #[weaveffi::export]
+    pub fn get_product(id: u64) -> Result<Product, String> {
+        STORE
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|p| p.id == id as i64)
+            .cloned()
+            .ok_or_else(|| format!("product {id} not found"))
+    }
+
+    /// Return every product on the given shelf.
+    #[weaveffi::export]
+    pub fn search_products(category: Category) -> Vec<Product> {
+        STORE
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.category == category)
+            .cloned()
+            .collect()
+    }
+
+    /// Update a product's price, returning whether the product existed.
+    #[weaveffi::export]
+    pub fn update_price(id: u64, price: f64) -> bool {
+        let mut store = STORE.lock().unwrap();
+        match store.iter_mut().find(|p| p.id == id as i64) {
+            Some(p) => {
+                p.price = price;
+                true
             }
-            return std::ptr::null_mut();
-        }
-    };
-
-    let store = PRODUCT_STORE.lock().unwrap();
-    let matches: Vec<&Product> = store.iter().filter(|p| p.category == cat).collect();
-    let len = matches.len();
-
-    if !out_len.is_null() {
-        unsafe { *out_len = len };
-    }
-
-    if len == 0 {
-        abi::error_set_ok(out_err);
-        return std::ptr::null_mut();
-    }
-
-    let mut ptrs: Vec<*mut Product> = matches
-        .iter()
-        .map(|p| Box::into_raw(Box::new((*p).clone())))
-        .collect();
-    let ptr = ptrs.as_mut_ptr();
-    std::mem::forget(ptrs);
-
-    abi::error_set_ok(out_err);
-    ptr
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_products_update_price(
-    id: weaveffi_handle_t,
-    price: f64,
-    out_err: *mut weaveffi_error,
-) -> i32 {
-    let mut store = PRODUCT_STORE.lock().unwrap();
-    match store.iter_mut().find(|p| p.id == id as i64) {
-        Some(p) => {
-            p.price = price;
-            abi::error_set_ok(out_err);
-            1
-        }
-        None => {
-            abi::error_set_ok(out_err);
-            0
+            None => false,
         }
     }
-}
 
-#[no_mangle]
-pub extern "C" fn weaveffi_products_delete_product(
-    id: weaveffi_handle_t,
-    out_err: *mut weaveffi_error,
-) -> i32 {
-    let mut store = PRODUCT_STORE.lock().unwrap();
-    let before = store.len();
-    store.retain(|p| p.id != id as i64);
-    abi::error_set_ok(out_err);
-    (store.len() < before) as i32
-}
+    /// Delete a product by handle, returning whether it existed.
+    #[weaveffi::export]
+    pub fn delete_product(id: u64) -> bool {
+        let mut store = STORE.lock().unwrap();
+        let before = store.len();
+        store.retain(|p| p.id != id as i64);
+        store.len() < before
+    }
 
-// ── Products: Product getters ───────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn weaveffi_products_Product_get_id(product: *const Product) -> i64 {
-    assert!(!product.is_null());
-    unsafe { (*product).id }
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_products_Product_get_name(product: *const Product) -> *const c_char {
-    assert!(!product.is_null());
-    abi::string_to_c_ptr(&unsafe { &*product }.name)
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_products_Product_get_description(
-    product: *const Product,
-) -> *const c_char {
-    assert!(!product.is_null());
-    match &unsafe { &*product }.description {
-        Some(d) => abi::string_to_c_ptr(d),
-        None => std::ptr::null(),
+    /// Reset the in-memory store. Test-only helper (not part of the ABI).
+    #[cfg(test)]
+    pub(crate) fn reset() {
+        STORE.lock().unwrap().clear();
+        NEXT_ID.store(1, Ordering::Relaxed);
     }
 }
 
-#[no_mangle]
-pub extern "C" fn weaveffi_products_Product_get_price(product: *const Product) -> f64 {
-    assert!(!product.is_null());
-    unsafe { (*product).price }
-}
+/// Order management: the `Order`/`OrderItem` records and order operations,
+/// including one that takes a `products::Product` across the module boundary.
+#[weaveffi::module]
+pub mod orders {
+    use super::products::Product;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::Mutex;
 
-#[no_mangle]
-pub extern "C" fn weaveffi_products_Product_get_category(product: *const Product) -> i32 {
-    assert!(!product.is_null());
-    unsafe { (*product).category as i32 }
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_products_Product_get_tags(
-    product: *const Product,
-    out_len: *mut usize,
-) -> *mut *const c_char {
-    assert!(!product.is_null());
-    let tags = &unsafe { &*product }.tags;
-    let len = tags.len();
-
-    if !out_len.is_null() {
-        unsafe { *out_len = len };
+    /// A single line in an order.
+    #[weaveffi::record]
+    #[derive(Clone, Debug)]
+    pub struct OrderItem {
+        /// Handle of the ordered product.
+        pub product_id: i64,
+        /// How many units were ordered.
+        pub quantity: i32,
+        /// Price charged per unit at order time.
+        pub unit_price: f64,
     }
 
-    if len == 0 {
-        return std::ptr::null_mut();
+    /// A customer order.
+    #[weaveffi::record]
+    #[derive(Clone, Debug)]
+    pub struct Order {
+        /// Stable identifier assigned on creation.
+        pub id: i64,
+        /// The ordered line items.
+        pub items: Vec<OrderItem>,
+        /// Sum of `unit_price * quantity` across the items.
+        pub total: f64,
+        /// Lifecycle status (`pending`, `cancelled`, ...).
+        pub status: String,
     }
 
-    let mut ptrs: Vec<*const c_char> = tags.iter().map(abi::string_to_c_ptr).collect();
-    let ptr = ptrs.as_mut_ptr();
-    std::mem::forget(ptrs);
-    ptr
-}
+    static STORE: Mutex<Vec<Order>> = Mutex::new(Vec::new());
+    static NEXT_ID: AtomicI64 = AtomicI64::new(1);
 
-// ── Products: Product setters ───────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn weaveffi_products_Product_set_id(product: *mut Product, id: i64) {
-    assert!(!product.is_null());
-    unsafe { (*product).id = id };
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_products_Product_set_name(product: *mut Product, name: *const c_char) {
-    assert!(!product.is_null());
-    if let Some(s) = abi::c_ptr_to_string(name) {
-        unsafe { (*product).name = s };
+    /// Create an order from a list of items, returning its opaque handle.
+    #[weaveffi::export]
+    pub fn create_order(items: Vec<OrderItem>) -> u64 {
+        let total = items
+            .iter()
+            .map(|it| it.unit_price * it.quantity as f64)
+            .sum();
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        STORE.lock().unwrap().push(Order {
+            id,
+            items,
+            total,
+            status: "pending".to_string(),
+        });
+        id as u64
     }
-}
 
-#[no_mangle]
-pub extern "C" fn weaveffi_products_Product_set_description(
-    product: *mut Product,
-    description: *const c_char,
-) {
-    assert!(!product.is_null());
-    unsafe { (*product).description = abi::c_ptr_to_string(description) };
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_products_Product_set_price(product: *mut Product, price: f64) {
-    assert!(!product.is_null());
-    unsafe { (*product).price = price };
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_products_Product_set_category(product: *mut Product, category: i32) {
-    assert!(!product.is_null());
-    if let Some(cat) = Category::from_i32(category) {
-        unsafe { (*product).category = cat };
+    /// Look up an order by handle, erroring if none exists.
+    #[weaveffi::export]
+    pub fn get_order(id: u64) -> Result<Order, String> {
+        STORE
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|o| o.id == id as i64)
+            .cloned()
+            .ok_or_else(|| format!("order {id} not found"))
     }
-}
 
-#[no_mangle]
-pub extern "C" fn weaveffi_products_Product_set_tags(
-    product: *mut Product,
-    tags: *const *const c_char,
-    len: usize,
-) {
-    assert!(!product.is_null());
-    let mut new_tags = Vec::new();
-    if !tags.is_null() {
-        for i in 0..len {
-            let ptr = unsafe { *tags.add(i) };
-            if let Some(s) = abi::c_ptr_to_string(ptr) {
-                new_tags.push(s);
+    /// Cancel an order, returning whether this call changed its status (a
+    /// missing or already-cancelled order yields `false`).
+    #[weaveffi::export]
+    pub fn cancel_order(id: u64) -> bool {
+        let mut store = STORE.lock().unwrap();
+        match store.iter_mut().find(|o| o.id == id as i64) {
+            Some(o) if o.status != "cancelled" => {
+                o.status = "cancelled".to_string();
+                true
             }
+            _ => false,
         }
     }
-    unsafe { (*product).tags = new_tags };
-}
 
-// ── Products: Category enum conversions ─────────────────────
-
-#[no_mangle]
-pub extern "C" fn weaveffi_products_Category_from_i32(
-    value: i32,
-    out_err: *mut weaveffi_error,
-) -> i32 {
-    match Category::from_i32(value) {
-        Some(ct) => {
-            abi::error_set_ok(out_err);
-            ct as i32
-        }
-        None => {
-            abi::error_set(out_err, 1, "invalid Category value");
-            -1
-        }
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_products_Category_to_i32(ct: i32) -> i32 {
-    ct
-}
-
-// ── Products: free functions ────────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn weaveffi_products_Product_destroy(product: *mut Product) {
-    if product.is_null() {
-        return;
-    }
-    unsafe { drop(Box::from_raw(product)) };
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_products_Product_list_free(products: *mut *mut Product, len: usize) {
-    if products.is_null() {
-        return;
-    }
-    let ptrs = unsafe { Vec::from_raw_parts(products, len, len) };
-    for ptr in ptrs {
-        if !ptr.is_null() {
-            unsafe { drop(Box::from_raw(ptr)) };
-        }
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_products_string_list_free(strings: *mut *const c_char, len: usize) {
-    if strings.is_null() {
-        return;
-    }
-    let ptrs = unsafe { Vec::from_raw_parts(strings, len, len) };
-    for ptr in ptrs {
-        abi::free_string(ptr);
-    }
-}
-
-// ── Orders module ───────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub struct OrderItem {
-    pub product_id: i64,
-    pub quantity: i32,
-    pub unit_price: f64,
-}
-
-#[derive(Debug, Clone)]
-pub struct Order {
-    pub id: i64,
-    pub items: Vec<OrderItem>,
-    pub total: f64,
-    pub status: String,
-}
-
-static ORDER_STORE: Mutex<Vec<Order>> = Mutex::new(Vec::new());
-static NEXT_ORDER_ID: AtomicI64 = AtomicI64::new(1);
-
-// ── Orders: module functions ────────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn weaveffi_orders_create_order(
-    items: *const *const OrderItem,
-    items_len: usize,
-    out_err: *mut weaveffi_error,
-) -> weaveffi_handle_t {
-    let mut order_items = Vec::new();
-    if !items.is_null() {
-        for i in 0..items_len {
-            let ptr = unsafe { *items.add(i) };
-            if ptr.is_null() {
-                abi::error_set(out_err, 1, "null OrderItem pointer in items array");
-                return 0;
+    /// Append a single unit of `product` to an existing order, returning whether
+    /// the order existed. Demonstrates a cross-module record parameter.
+    #[weaveffi::export]
+    pub fn add_product_to_order(order_id: u64, product: Product) -> bool {
+        let mut store = STORE.lock().unwrap();
+        match store.iter_mut().find(|o| o.id == order_id as i64) {
+            Some(order) => {
+                let item = OrderItem {
+                    product_id: product.id,
+                    quantity: 1,
+                    unit_price: product.price,
+                };
+                order.total += item.unit_price;
+                order.items.push(item);
+                true
             }
-            order_items.push(unsafe { (*ptr).clone() });
+            None => false,
         }
     }
 
-    let total: f64 = order_items
-        .iter()
-        .map(|it| it.unit_price * it.quantity as f64)
-        .sum();
-    let id = NEXT_ORDER_ID.fetch_add(1, Ordering::Relaxed);
-    let order = Order {
-        id,
-        items: order_items,
-        total,
-        status: "pending".to_string(),
-    };
-    ORDER_STORE.lock().unwrap().push(order);
-
-    abi::error_set_ok(out_err);
-    id as weaveffi_handle_t
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_orders_get_order(
-    id: weaveffi_handle_t,
-    out_err: *mut weaveffi_error,
-) -> *mut Order {
-    let store = ORDER_STORE.lock().unwrap();
-    match store.iter().find(|o| o.id == id as i64) {
-        Some(o) => {
-            abi::error_set_ok(out_err);
-            Box::into_raw(Box::new(o.clone()))
-        }
-        None => {
-            abi::error_set(out_err, 1, "order not found");
-            std::ptr::null_mut()
-        }
+    /// Reset the in-memory store. Test-only helper (not part of the ABI).
+    #[cfg(test)]
+    pub(crate) fn reset() {
+        STORE.lock().unwrap().clear();
+        NEXT_ID.store(1, Ordering::Relaxed);
     }
 }
 
-#[no_mangle]
-pub extern "C" fn weaveffi_orders_cancel_order(
-    id: weaveffi_handle_t,
-    out_err: *mut weaveffi_error,
-) -> i32 {
-    let mut store = ORDER_STORE.lock().unwrap();
-    match store.iter_mut().find(|o| o.id == id as i64) {
-        Some(o) => {
-            if o.status == "cancelled" {
-                abi::error_set_ok(out_err);
-                return 0;
-            }
-            o.status = "cancelled".to_string();
-            abi::error_set_ok(out_err);
-            1
-        }
-        None => {
-            abi::error_set_ok(out_err);
-            0
-        }
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_orders_add_product_to_order(
-    order_id: weaveffi_handle_t,
-    product: *const Product,
-    out_err: *mut weaveffi_error,
-) -> i32 {
-    if product.is_null() {
-        abi::error_set(out_err, 1, "product is null");
-        return 0;
-    }
-    let p = unsafe { &*product };
-    let mut store = ORDER_STORE.lock().unwrap();
-    match store.iter_mut().find(|o| o.id == order_id as i64) {
-        Some(order) => {
-            let item = OrderItem {
-                product_id: p.id,
-                quantity: 1,
-                unit_price: p.price,
-            };
-            order.total += item.unit_price;
-            order.items.push(item);
-            abi::error_set_ok(out_err);
-            1
-        }
-        None => {
-            abi::error_set_ok(out_err);
-            0
-        }
-    }
-}
-
-// ── Orders: OrderItem getters ───────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn weaveffi_orders_OrderItem_get_product_id(item: *const OrderItem) -> i64 {
-    assert!(!item.is_null());
-    unsafe { (*item).product_id }
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_orders_OrderItem_get_quantity(item: *const OrderItem) -> i32 {
-    assert!(!item.is_null());
-    unsafe { (*item).quantity }
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_orders_OrderItem_get_unit_price(item: *const OrderItem) -> f64 {
-    assert!(!item.is_null());
-    unsafe { (*item).unit_price }
-}
-
-// ── Orders: OrderItem setters ───────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn weaveffi_orders_OrderItem_set_product_id(item: *mut OrderItem, product_id: i64) {
-    assert!(!item.is_null());
-    unsafe { (*item).product_id = product_id };
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_orders_OrderItem_set_quantity(item: *mut OrderItem, quantity: i32) {
-    assert!(!item.is_null());
-    unsafe { (*item).quantity = quantity };
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_orders_OrderItem_set_unit_price(item: *mut OrderItem, unit_price: f64) {
-    assert!(!item.is_null());
-    unsafe { (*item).unit_price = unit_price };
-}
-
-// ── Orders: Order getters ───────────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn weaveffi_orders_Order_get_id(order: *const Order) -> i64 {
-    assert!(!order.is_null());
-    unsafe { (*order).id }
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_orders_Order_get_items(
-    order: *const Order,
-    out_len: *mut usize,
-) -> *mut *mut OrderItem {
-    assert!(!order.is_null());
-    let items = &unsafe { &*order }.items;
-    let len = items.len();
-
-    if !out_len.is_null() {
-        unsafe { *out_len = len };
-    }
-
-    if len == 0 {
-        return std::ptr::null_mut();
-    }
-
-    let mut ptrs: Vec<*mut OrderItem> = items
-        .iter()
-        .map(|it| Box::into_raw(Box::new(it.clone())))
-        .collect();
-    let ptr = ptrs.as_mut_ptr();
-    std::mem::forget(ptrs);
-    ptr
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_orders_Order_get_total(order: *const Order) -> f64 {
-    assert!(!order.is_null());
-    unsafe { (*order).total }
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_orders_Order_get_status(order: *const Order) -> *const c_char {
-    assert!(!order.is_null());
-    abi::string_to_c_ptr(&unsafe { &*order }.status)
-}
-
-// ── Orders: Order setters ───────────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn weaveffi_orders_Order_set_id(order: *mut Order, id: i64) {
-    assert!(!order.is_null());
-    unsafe { (*order).id = id };
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_orders_Order_set_items(
-    order: *mut Order,
-    items: *const *const OrderItem,
-    len: usize,
-) {
-    assert!(!order.is_null());
-    let mut new_items = Vec::new();
-    if !items.is_null() {
-        for i in 0..len {
-            let ptr = unsafe { *items.add(i) };
-            if !ptr.is_null() {
-                new_items.push(unsafe { (*ptr).clone() });
-            }
-        }
-    }
-    unsafe { (*order).items = new_items };
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_orders_Order_set_total(order: *mut Order, total: f64) {
-    assert!(!order.is_null());
-    unsafe { (*order).total = total };
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_orders_Order_set_status(order: *mut Order, status: *const c_char) {
-    assert!(!order.is_null());
-    if let Some(s) = abi::c_ptr_to_string(status) {
-        unsafe { (*order).status = s };
-    }
-}
-
-// ── Orders: free functions ──────────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn weaveffi_orders_OrderItem_destroy(item: *mut OrderItem) {
-    if item.is_null() {
-        return;
-    }
-    unsafe { drop(Box::from_raw(item)) };
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_orders_OrderItem_list_free(items: *mut *mut OrderItem, len: usize) {
-    if items.is_null() {
-        return;
-    }
-    let ptrs = unsafe { Vec::from_raw_parts(items, len, len) };
-    for ptr in ptrs {
-        if !ptr.is_null() {
-            unsafe { drop(Box::from_raw(ptr)) };
-        }
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_orders_Order_destroy(order: *mut Order) {
-    if order.is_null() {
-        return;
-    }
-    unsafe { drop(Box::from_raw(order)) };
-}
-
-// ── Shared runtime exports ─────────────────────────────────
-abi::export_runtime!();
+weaveffi::export_runtime!();
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::ffi::CString;
+    use super::orders::{add_product_to_order, cancel_order, create_order, get_order, OrderItem};
+    use super::products::{
+        create_product, delete_product, get_product, search_products, update_price, Category,
+    };
+    use std::sync::Mutex;
 
-    static TEST_MUTEX: Mutex<()> = Mutex::new(());
+    // Both stores are process-global, so serialize the tests that touch them.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    fn setup() -> std::sync::MutexGuard<'static, ()> {
-        let guard = TEST_MUTEX.lock().unwrap();
-        PRODUCT_STORE.lock().unwrap().clear();
-        NEXT_PRODUCT_ID.store(1, Ordering::Relaxed);
-        ORDER_STORE.lock().unwrap().clear();
-        NEXT_ORDER_ID.store(1, Ordering::Relaxed);
-        guard
+    fn guard() -> std::sync::MutexGuard<'static, ()> {
+        let g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        super::products::reset();
+        super::orders::reset();
+        g
     }
 
-    fn new_err() -> weaveffi_error {
-        weaveffi_error::default()
-    }
-
-    // ── Product tests ───────────────────────────────────────
+    // ── Products ────────────────────────────────────────────
 
     #[test]
     fn create_and_get_product() {
-        let _g = setup();
-        let mut err = new_err();
-        let name = CString::new("Widget").unwrap();
-
-        let handle = weaveffi_products_create_product(
-            name.as_ptr(),
-            9.99,
-            Category::Electronics as i32,
-            &mut err,
-        );
-        assert_eq!(err.code, 0);
-        assert!(handle > 0);
-
-        let product = weaveffi_products_get_product(handle, &mut err);
-        assert_eq!(err.code, 0);
-        assert!(!product.is_null());
-
-        let p = unsafe { &*product };
+        let _g = guard();
+        let id = create_product("Widget".into(), 9.99, Category::Electronics);
+        assert!(id > 0);
+        let p = get_product(id).expect("product exists");
         assert_eq!(p.name, "Widget");
         assert_eq!(p.price, 9.99);
         assert_eq!(p.category, Category::Electronics);
         assert_eq!(p.description, None);
         assert!(p.tags.is_empty());
-
-        weaveffi_products_Product_destroy(product);
     }
 
     #[test]
-    fn create_product_null_name() {
-        let _g = setup();
-        let mut err = new_err();
-
-        let handle = weaveffi_products_create_product(std::ptr::null(), 9.99, 0, &mut err);
-        assert_eq!(handle, 0);
-        assert_ne!(err.code, 0);
-        abi::error_clear(&mut err);
-    }
-
-    #[test]
-    fn create_product_invalid_category() {
-        let _g = setup();
-        let mut err = new_err();
-        let name = CString::new("Bad").unwrap();
-
-        let handle = weaveffi_products_create_product(name.as_ptr(), 9.99, 99, &mut err);
-        assert_eq!(handle, 0);
-        assert_ne!(err.code, 0);
-        abi::error_clear(&mut err);
-    }
-
-    #[test]
-    fn get_product_not_found() {
-        let _g = setup();
-        let mut err = new_err();
-        let product = weaveffi_products_get_product(999, &mut err);
-        assert!(product.is_null());
-        assert_ne!(err.code, 0);
-        abi::error_clear(&mut err);
+    fn get_missing_product_is_err() {
+        let _g = guard();
+        assert!(get_product(999).is_err());
     }
 
     #[test]
     fn search_products_by_category() {
-        let _g = setup();
-        let mut err = new_err();
-        let n1 = CString::new("Laptop").unwrap();
-        let n2 = CString::new("Shirt").unwrap();
-        let n3 = CString::new("Phone").unwrap();
+        let _g = guard();
+        create_product("Laptop".into(), 999.99, Category::Electronics);
+        create_product("Shirt".into(), 29.99, Category::Clothing);
+        create_product("Phone".into(), 499.99, Category::Electronics);
 
-        weaveffi_products_create_product(
-            n1.as_ptr(),
-            999.99,
-            Category::Electronics as i32,
-            &mut err,
-        );
-        weaveffi_products_create_product(n2.as_ptr(), 29.99, Category::Clothing as i32, &mut err);
-        weaveffi_products_create_product(
-            n3.as_ptr(),
-            499.99,
-            Category::Electronics as i32,
-            &mut err,
-        );
-
-        let mut len: usize = 0;
-        let results =
-            weaveffi_products_search_products(Category::Electronics as i32, &mut len, &mut err);
-        assert_eq!(err.code, 0);
-        assert_eq!(len, 2);
-        assert!(!results.is_null());
-
-        weaveffi_products_Product_list_free(results, len);
+        let electronics = search_products(Category::Electronics);
+        assert_eq!(electronics.len(), 2);
+        assert!(search_products(Category::Books).is_empty());
     }
 
     #[test]
-    fn search_products_empty() {
-        let _g = setup();
-        let mut err = new_err();
-        let mut len: usize = 999;
-        let results = weaveffi_products_search_products(Category::Books as i32, &mut len, &mut err);
-        assert_eq!(err.code, 0);
-        assert_eq!(len, 0);
-        assert!(results.is_null());
+    fn update_and_delete_product() {
+        let _g = guard();
+        let id = create_product("Item".into(), 10.0, Category::Food);
+        assert!(update_price(id, 20.0));
+        assert_eq!(get_product(id).unwrap().price, 20.0);
+        assert!(!update_price(999, 1.0));
+
+        assert!(delete_product(id));
+        assert!(!delete_product(id));
     }
 
-    #[test]
-    fn search_products_invalid_category() {
-        let _g = setup();
-        let mut err = new_err();
-        let mut len: usize = 999;
-        let results = weaveffi_products_search_products(99, &mut len, &mut err);
-        assert_ne!(err.code, 0);
-        assert_eq!(len, 0);
-        assert!(results.is_null());
-        abi::error_clear(&mut err);
-    }
-
-    #[test]
-    fn update_product_price() {
-        let _g = setup();
-        let mut err = new_err();
-        let name = CString::new("Item").unwrap();
-
-        let handle = weaveffi_products_create_product(name.as_ptr(), 10.0, 0, &mut err);
-        assert_eq!(weaveffi_products_update_price(handle, 20.0, &mut err), 1);
-
-        let product = weaveffi_products_get_product(handle, &mut err);
-        assert_eq!(unsafe { (*product).price }, 20.0);
-        weaveffi_products_Product_destroy(product);
-    }
-
-    #[test]
-    fn update_price_not_found() {
-        let _g = setup();
-        let mut err = new_err();
-        assert_eq!(weaveffi_products_update_price(999, 20.0, &mut err), 0);
-    }
-
-    #[test]
-    fn delete_product() {
-        let _g = setup();
-        let mut err = new_err();
-        let name = CString::new("Del").unwrap();
-
-        let handle = weaveffi_products_create_product(name.as_ptr(), 10.0, 0, &mut err);
-        assert_eq!(weaveffi_products_delete_product(handle, &mut err), 1);
-        assert_eq!(weaveffi_products_delete_product(handle, &mut err), 0);
-    }
-
-    #[test]
-    fn product_getters_and_setters() {
-        let _g = setup();
-        let mut err = new_err();
-        let name = CString::new("Test").unwrap();
-
-        let handle =
-            weaveffi_products_create_product(name.as_ptr(), 5.0, Category::Food as i32, &mut err);
-        let product = weaveffi_products_get_product(handle, &mut err);
-        assert!(!product.is_null());
-
-        assert_eq!(weaveffi_products_Product_get_id(product), handle as i64);
-        assert_eq!(weaveffi_products_Product_get_price(product), 5.0);
-        assert_eq!(
-            weaveffi_products_Product_get_category(product),
-            Category::Food as i32
-        );
-
-        let pname = weaveffi_products_Product_get_name(product);
-        assert_eq!(abi::c_ptr_to_string(pname).unwrap(), "Test");
-        abi::free_string(pname);
-
-        assert!(weaveffi_products_Product_get_description(product).is_null());
-
-        let mut tag_len: usize = 0;
-        let tags = weaveffi_products_Product_get_tags(product, &mut tag_len);
-        assert_eq!(tag_len, 0);
-        assert!(tags.is_null());
-
-        // Setters
-        weaveffi_products_Product_set_id(product, 42);
-        assert_eq!(weaveffi_products_Product_get_id(product), 42);
-
-        let new_name = CString::new("Updated").unwrap();
-        weaveffi_products_Product_set_name(product, new_name.as_ptr());
-        let n = weaveffi_products_Product_get_name(product);
-        assert_eq!(abi::c_ptr_to_string(n).unwrap(), "Updated");
-        abi::free_string(n);
-
-        let desc = CString::new("A description").unwrap();
-        weaveffi_products_Product_set_description(product, desc.as_ptr());
-        let d = weaveffi_products_Product_get_description(product);
-        assert_eq!(abi::c_ptr_to_string(d).unwrap(), "A description");
-        abi::free_string(d);
-
-        weaveffi_products_Product_set_description(product, std::ptr::null());
-        assert!(weaveffi_products_Product_get_description(product).is_null());
-
-        weaveffi_products_Product_set_price(product, 99.99);
-        assert_eq!(weaveffi_products_Product_get_price(product), 99.99);
-
-        weaveffi_products_Product_set_category(product, Category::Books as i32);
-        assert_eq!(
-            weaveffi_products_Product_get_category(product),
-            Category::Books as i32
-        );
-
-        let tag1 = CString::new("sale").unwrap();
-        let tag2 = CString::new("new").unwrap();
-        let tag_ptrs: [*const c_char; 2] = [tag1.as_ptr(), tag2.as_ptr()];
-        weaveffi_products_Product_set_tags(product, tag_ptrs.as_ptr(), 2);
-
-        let mut tlen: usize = 0;
-        let tags_out = weaveffi_products_Product_get_tags(product, &mut tlen);
-        assert_eq!(tlen, 2);
-        assert!(!tags_out.is_null());
-
-        let t0 = unsafe { *tags_out };
-        assert_eq!(abi::c_ptr_to_string(t0).unwrap(), "sale");
-        let t1 = unsafe { *tags_out.add(1) };
-        assert_eq!(abi::c_ptr_to_string(t1).unwrap(), "new");
-
-        weaveffi_products_string_list_free(tags_out, tlen);
-        weaveffi_products_Product_destroy(product);
-    }
-
-    #[test]
-    fn category_conversions() {
-        let mut err = new_err();
-        assert_eq!(weaveffi_products_Category_from_i32(0, &mut err), 0);
-        assert_eq!(err.code, 0);
-        assert_eq!(weaveffi_products_Category_from_i32(1, &mut err), 1);
-        assert_eq!(weaveffi_products_Category_from_i32(2, &mut err), 2);
-        assert_eq!(weaveffi_products_Category_from_i32(3, &mut err), 3);
-
-        assert_eq!(weaveffi_products_Category_from_i32(99, &mut err), -1);
-        assert_ne!(err.code, 0);
-        abi::error_clear(&mut err);
-
-        assert_eq!(weaveffi_products_Category_to_i32(0), 0);
-        assert_eq!(weaveffi_products_Category_to_i32(3), 3);
-    }
-
-    #[test]
-    fn free_null_product_is_safe() {
-        weaveffi_products_Product_destroy(std::ptr::null_mut());
-    }
-
-    #[test]
-    fn free_null_product_list_is_safe() {
-        weaveffi_products_Product_list_free(std::ptr::null_mut(), 0);
-    }
-
-    #[test]
-    fn free_null_string_list_is_safe() {
-        weaveffi_products_string_list_free(std::ptr::null_mut(), 0);
-    }
-
-    // ── Order tests ─────────────────────────────────────────
+    // ── Orders ──────────────────────────────────────────────
 
     #[test]
     fn create_and_get_order() {
-        let _g = setup();
-        let mut err = new_err();
-
-        let item1 = Box::into_raw(Box::new(OrderItem {
-            product_id: 1,
-            quantity: 2,
-            unit_price: 10.0,
-        }));
-        let item2 = Box::into_raw(Box::new(OrderItem {
-            product_id: 2,
-            quantity: 1,
-            unit_price: 25.0,
-        }));
-        let items: [*const OrderItem; 2] = [item1, item2];
-
-        let handle = weaveffi_orders_create_order(items.as_ptr(), 2, &mut err);
-        assert_eq!(err.code, 0);
-        assert!(handle > 0);
-
-        let order = weaveffi_orders_get_order(handle, &mut err);
-        assert_eq!(err.code, 0);
-        assert!(!order.is_null());
-
-        let o = unsafe { &*order };
+        let _g = guard();
+        let id = create_order(vec![
+            OrderItem {
+                product_id: 1,
+                quantity: 2,
+                unit_price: 10.0,
+            },
+            OrderItem {
+                product_id: 2,
+                quantity: 1,
+                unit_price: 25.0,
+            },
+        ]);
+        assert!(id > 0);
+        let o = get_order(id).expect("order exists");
         assert_eq!(o.items.len(), 2);
         assert_eq!(o.total, 45.0);
         assert_eq!(o.status, "pending");
-
-        weaveffi_orders_Order_destroy(order);
-        unsafe {
-            drop(Box::from_raw(item1));
-            drop(Box::from_raw(item2));
-        }
     }
 
     #[test]
-    fn create_order_empty_items() {
-        let _g = setup();
-        let mut err = new_err();
+    fn create_empty_order() {
+        let _g = guard();
+        let id = create_order(Vec::new());
+        let o = get_order(id).unwrap();
+        assert!(o.items.is_empty());
+        assert_eq!(o.total, 0.0);
+    }
 
-        let handle = weaveffi_orders_create_order(std::ptr::null(), 0, &mut err);
+    #[test]
+    fn cancel_order_transitions() {
+        let _g = guard();
+        let id = create_order(Vec::new());
+        assert!(cancel_order(id));
+        assert!(!cancel_order(id));
+        assert_eq!(get_order(id).unwrap().status, "cancelled");
+        assert!(!cancel_order(999));
+    }
+
+    // ── Cross-module ────────────────────────────────────────
+
+    #[test]
+    fn add_product_to_order_across_modules() {
+        let _g = guard();
+        let product_id = create_product("Gadget".into(), 49.99, Category::Electronics);
+        let order_id = create_order(Vec::new());
+
+        let product = get_product(product_id).unwrap();
+        assert!(add_product_to_order(order_id, product));
+
+        let o = get_order(order_id).unwrap();
+        assert_eq!(o.items.len(), 1);
+        assert_eq!(o.items[0].product_id, product_id as i64);
+        assert_eq!(o.items[0].unit_price, 49.99);
+        assert_eq!(o.total, 49.99);
+
+        assert!(!add_product_to_order(999, get_product(product_id).unwrap()));
+    }
+
+    // A direct exercise of the generated C ABI thunks. This drives the
+    // list-of-record parameter (`create_order`) through the `extern "C"`
+    // boundary, so it covers the `lift_ptr_vec` marshalling the macro emits.
+    #[test]
+    fn ffi_surface_smoke() {
+        use super::orders::{
+            weaveffi_orders_OrderItem_create, weaveffi_orders_OrderItem_destroy,
+            weaveffi_orders_Order_destroy, weaveffi_orders_Order_get_total,
+            weaveffi_orders_create_order, weaveffi_orders_get_order,
+        };
+        use weaveffi::abi::weaveffi_error;
+
+        let _g = guard();
+        let mut err = weaveffi_error::default();
+
+        // Build two OrderItem objects through their generated constructor.
+        let a = weaveffi_orders_OrderItem_create(1, 2, 10.0, &mut err);
+        assert_eq!(err.code, 0);
+        let b = weaveffi_orders_OrderItem_create(2, 1, 25.0, &mut err);
+        assert_eq!(err.code, 0);
+
+        // Pass them as the array-of-object-pointers slot create_order expects.
+        let items = [a, b];
+        let handle = weaveffi_orders_create_order(items.as_ptr(), items.len(), &mut err);
         assert_eq!(err.code, 0);
         assert!(handle > 0);
 
         let order = weaveffi_orders_get_order(handle, &mut err);
-        let o = unsafe { &*order };
-        assert!(o.items.is_empty());
-        assert_eq!(o.total, 0.0);
-
-        weaveffi_orders_Order_destroy(order);
-    }
-
-    #[test]
-    fn create_order_null_item_pointer() {
-        let _g = setup();
-        let mut err = new_err();
-
-        let items: [*const OrderItem; 1] = [std::ptr::null()];
-        let handle = weaveffi_orders_create_order(items.as_ptr(), 1, &mut err);
-        assert_eq!(handle, 0);
-        assert_ne!(err.code, 0);
-        abi::error_clear(&mut err);
-    }
-
-    #[test]
-    fn get_order_not_found() {
-        let _g = setup();
-        let mut err = new_err();
-        let order = weaveffi_orders_get_order(999, &mut err);
-        assert!(order.is_null());
-        assert_ne!(err.code, 0);
-        abi::error_clear(&mut err);
-    }
-
-    #[test]
-    fn cancel_order() {
-        let _g = setup();
-        let mut err = new_err();
-
-        let handle = weaveffi_orders_create_order(std::ptr::null(), 0, &mut err);
         assert_eq!(err.code, 0);
-
-        assert_eq!(weaveffi_orders_cancel_order(handle, &mut err), 1);
-        assert_eq!(weaveffi_orders_cancel_order(handle, &mut err), 0);
-
-        let order = weaveffi_orders_get_order(handle, &mut err);
-        assert_eq!(unsafe { &*order }.status, "cancelled");
-        weaveffi_orders_Order_destroy(order);
-    }
-
-    #[test]
-    fn cancel_order_not_found() {
-        let _g = setup();
-        let mut err = new_err();
-        assert_eq!(weaveffi_orders_cancel_order(999, &mut err), 0);
-    }
-
-    #[test]
-    fn order_getters_and_setters() {
-        let _g = setup();
-        let mut err = new_err();
-
-        let item = Box::into_raw(Box::new(OrderItem {
-            product_id: 1,
-            quantity: 3,
-            unit_price: 10.0,
-        }));
-        let items: [*const OrderItem; 1] = [item];
-
-        let handle = weaveffi_orders_create_order(items.as_ptr(), 1, &mut err);
-        let order = weaveffi_orders_get_order(handle, &mut err);
         assert!(!order.is_null());
-
-        assert_eq!(weaveffi_orders_Order_get_id(order), handle as i64);
-        assert_eq!(weaveffi_orders_Order_get_total(order), 30.0);
-
-        let status = weaveffi_orders_Order_get_status(order);
-        assert_eq!(abi::c_ptr_to_string(status).unwrap(), "pending");
-        abi::free_string(status);
-
-        let mut items_len: usize = 0;
-        let items_out = weaveffi_orders_Order_get_items(order, &mut items_len);
-        assert_eq!(items_len, 1);
-        assert!(!items_out.is_null());
-        weaveffi_orders_OrderItem_list_free(items_out, items_len);
-
-        weaveffi_orders_Order_set_id(order, 42);
-        assert_eq!(weaveffi_orders_Order_get_id(order), 42);
-
-        weaveffi_orders_Order_set_total(order, 99.99);
-        assert_eq!(weaveffi_orders_Order_get_total(order), 99.99);
-
-        let new_status = CString::new("shipped").unwrap();
-        weaveffi_orders_Order_set_status(order, new_status.as_ptr());
-        let s = weaveffi_orders_Order_get_status(order);
-        assert_eq!(abi::c_ptr_to_string(s).unwrap(), "shipped");
-        abi::free_string(s);
+        assert_eq!(weaveffi_orders_Order_get_total(order), 45.0);
 
         weaveffi_orders_Order_destroy(order);
-        unsafe { drop(Box::from_raw(item)) };
-    }
-
-    #[test]
-    fn order_item_getters() {
-        let item = Box::into_raw(Box::new(OrderItem {
-            product_id: 5,
-            quantity: 2,
-            unit_price: 15.0,
-        }));
-
-        assert_eq!(weaveffi_orders_OrderItem_get_product_id(item), 5);
-        assert_eq!(weaveffi_orders_OrderItem_get_quantity(item), 2);
-        assert_eq!(weaveffi_orders_OrderItem_get_unit_price(item), 15.0);
-
-        weaveffi_orders_OrderItem_set_product_id(item, 10);
-        assert_eq!(weaveffi_orders_OrderItem_get_product_id(item), 10);
-
-        weaveffi_orders_OrderItem_set_quantity(item, 5);
-        assert_eq!(weaveffi_orders_OrderItem_get_quantity(item), 5);
-
-        weaveffi_orders_OrderItem_set_unit_price(item, 20.0);
-        assert_eq!(weaveffi_orders_OrderItem_get_unit_price(item), 20.0);
-
-        weaveffi_orders_OrderItem_destroy(item);
-    }
-
-    #[test]
-    fn free_null_order_is_safe() {
-        weaveffi_orders_Order_destroy(std::ptr::null_mut());
-    }
-
-    #[test]
-    fn free_null_order_item_is_safe() {
-        weaveffi_orders_OrderItem_destroy(std::ptr::null_mut());
-    }
-
-    #[test]
-    fn free_null_order_item_list_is_safe() {
-        weaveffi_orders_OrderItem_list_free(std::ptr::null_mut(), 0);
-    }
-
-    // ── Cross-module tests ──────────────────────────────────
-
-    #[test]
-    fn add_product_to_order_success() {
-        let _g = setup();
-        let mut err = new_err();
-        let name = CString::new("Gadget").unwrap();
-
-        let product_handle = weaveffi_products_create_product(
-            name.as_ptr(),
-            49.99,
-            Category::Electronics as i32,
-            &mut err,
-        );
-        assert_eq!(err.code, 0);
-
-        let order_handle = weaveffi_orders_create_order(std::ptr::null(), 0, &mut err);
-        assert_eq!(err.code, 0);
-
-        let product = weaveffi_products_get_product(product_handle, &mut err);
-        assert!(!product.is_null());
-
-        let result = weaveffi_orders_add_product_to_order(order_handle, product, &mut err);
-        assert_eq!(err.code, 0);
-        assert_eq!(result, 1);
-
-        let order = weaveffi_orders_get_order(order_handle, &mut err);
-        let o = unsafe { &*order };
-        assert_eq!(o.items.len(), 1);
-        assert_eq!(o.items[0].product_id, product_handle as i64);
-        assert_eq!(o.items[0].unit_price, 49.99);
-        assert_eq!(o.items[0].quantity, 1);
-        assert_eq!(o.total, 49.99);
-
-        weaveffi_orders_Order_destroy(order);
-        weaveffi_products_Product_destroy(product);
-    }
-
-    #[test]
-    fn add_product_to_order_not_found() {
-        let _g = setup();
-        let mut err = new_err();
-
-        let product = Box::into_raw(Box::new(Product {
-            id: 1,
-            name: "Test".to_string(),
-            description: None,
-            price: 10.0,
-            category: Category::Electronics,
-            tags: Vec::new(),
-        }));
-
-        let result = weaveffi_orders_add_product_to_order(999, product, &mut err);
-        assert_eq!(err.code, 0);
-        assert_eq!(result, 0);
-
-        weaveffi_products_Product_destroy(product);
-    }
-
-    #[test]
-    fn add_product_to_order_null_product() {
-        let _g = setup();
-        let mut err = new_err();
-
-        let order_handle = weaveffi_orders_create_order(std::ptr::null(), 0, &mut err);
-        assert_eq!(err.code, 0);
-
-        let result = weaveffi_orders_add_product_to_order(order_handle, std::ptr::null(), &mut err);
-        assert_ne!(err.code, 0);
-        assert_eq!(result, 0);
-        abi::error_clear(&mut err);
-    }
-
-    #[test]
-    fn add_multiple_products_to_order() {
-        let _g = setup();
-        let mut err = new_err();
-
-        let n1 = CString::new("Widget").unwrap();
-        let n2 = CString::new("Gizmo").unwrap();
-
-        let h1 = weaveffi_products_create_product(n1.as_ptr(), 10.0, 0, &mut err);
-        let h2 = weaveffi_products_create_product(n2.as_ptr(), 25.0, 1, &mut err);
-
-        let order_handle = weaveffi_orders_create_order(std::ptr::null(), 0, &mut err);
-
-        let p1 = weaveffi_products_get_product(h1, &mut err);
-        let p2 = weaveffi_products_get_product(h2, &mut err);
-
-        assert_eq!(
-            weaveffi_orders_add_product_to_order(order_handle, p1, &mut err),
-            1
-        );
-        assert_eq!(
-            weaveffi_orders_add_product_to_order(order_handle, p2, &mut err),
-            1
-        );
-
-        let order = weaveffi_orders_get_order(order_handle, &mut err);
-        let o = unsafe { &*order };
-        assert_eq!(o.items.len(), 2);
-        assert_eq!(o.total, 35.0);
-
-        weaveffi_orders_Order_destroy(order);
-        weaveffi_products_Product_destroy(p1);
-        weaveffi_products_Product_destroy(p2);
+        weaveffi_orders_OrderItem_destroy(a);
+        weaveffi_orders_OrderItem_destroy(b);
     }
 }

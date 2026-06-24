@@ -11,10 +11,10 @@ Every `weaveffi generate` invocation flows through the same five
 stages, in this order:
 
 ```text
-IDL file (YAML/JSON/TOML)
+Input: annotated Rust (.rs) or an IDL (YAML/JSON/TOML)
    │
    ▼
-Parse        ── weaveffi-ir::parse: produces an `Api` IR
+Parse        ── weaveffi-ir::parse (IDL) | weaveffi-bridge (.rs): builds an `Api` IR
    │
    ▼
 Validate     ── weaveffi-core::validate: rejects errors, collects warnings
@@ -34,6 +34,12 @@ Subcommands like `validate`, `lint`, `diff`, `format`, and `watch` re-use
 the parse and validate stages; `generate`, `diff`, and `watch`
 additionally exercise resolve and generate.
 
+A `.rs` input is lowered to the IR by `weaveffi-bridge`, the same extractor
+the `#[weaveffi::module]` proc-macro uses to build a producer's C ABI glue.
+Because the CLI and the macro share one extraction, the IDL the CLI derives
+and the symbols the macro emits are two views of one parse and cannot drift.
+See [The Rust Producer Macro](guides/producer-macro.md).
+
 ## Crate layout
 
 The workspace is structured as a small set of stable, focused crates.
@@ -41,18 +47,25 @@ The dependency graph is acyclic and shallow:
 
 ```text
 weaveffi-cli ──► weaveffi-core ──► weaveffi-ir
-                      │
-                      ├──► weaveffi-gen-c
-                      ├──► weaveffi-gen-cpp
-                      ├──► weaveffi-gen-swift
-                      ├──► weaveffi-gen-android
-                      ├──► weaveffi-gen-node
-                      ├──► weaveffi-gen-wasm
-                      ├──► weaveffi-gen-python
-                      ├──► weaveffi-gen-dotnet
-                      ├──► weaveffi-gen-dart
-                      ├──► weaveffi-gen-go
-                      └──► weaveffi-gen-ruby
+       │              │
+       │              ├──► weaveffi-gen-c
+       │              ├──► weaveffi-gen-cpp
+       │              ├──► weaveffi-gen-swift
+       │              ├──► weaveffi-gen-android
+       │              ├──► weaveffi-gen-node
+       │              ├──► weaveffi-gen-wasm
+       │              ├──► weaveffi-gen-python
+       │              ├──► weaveffi-gen-dotnet
+       │              ├──► weaveffi-gen-dart
+       │              ├──► weaveffi-gen-go
+       │              └──► weaveffi-gen-ruby
+       └──► weaveffi-bridge ──► weaveffi-ir   (lowers annotated .rs to IR)
+
+Producer side (a Rust cdylib depends on these, not on the CLI):
+
+weaveffi ──► weaveffi-macros ──► weaveffi-bridge, weaveffi-core, weaveffi-ir
+   │
+   └──► weaveffi-abi   (the C ABI runtime, re-exported as `weaveffi::abi`)
 
 weaveffi-abi  ──► (stand-alone, linked at run time by every cdylib that
                   exposes the WeaveFFI C ABI)
@@ -63,17 +76,23 @@ weaveffi-fuzz ──► weaveffi-ir, weaveffi-core (workspace-private; unpublish
 | Crate                | What it owns                                                                                                                                     |
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `weaveffi-ir`        | The IR types (`Api`, `Module`, `Function`, `TypeRef`, …), the `parse_api_str` parser, the `parse_type_ref` mini-grammar, and `CURRENT_SCHEMA_VERSION`. |
-| `weaveffi-abi`       | Stable C ABI runtime symbols: `weaveffi_error`, `weaveffi_error_clear`, `weaveffi_free_string`, `weaveffi_free_bytes`, the arena, cancel tokens. |
+| `weaveffi-abi`       | Stable C ABI runtime symbols: `weaveffi_error`, `weaveffi_error_clear`, `weaveffi_free_string`, `weaveffi_free_bytes`, the arena, cancel tokens, the `lift_*`/`lower_*` marshalling converters the macro calls, and the `export_runtime!` macro. |
+| `weaveffi-bridge`    | The single Rust-to-IR extractor: maps `#[weaveffi::module]`-annotated source (`syn` AST) to an `Api`. Shared by the proc-macro and the CLI's `extract`/`generate <file.rs>`. |
+| `weaveffi-macros`    | The `#[weaveffi::module]` proc-macro family. Lowers an annotated module through `weaveffi-bridge`, builds the `BindingModel`, and emits the `#[no_mangle] extern "C"` thunks (marshalling via `weaveffi-abi`). |
+| `weaveffi`           | The producer facade a Rust cdylib depends on: re-exports the `weaveffi-macros` attributes, `export_runtime!`, and `weaveffi-abi` as `weaveffi::abi`. |
 | `weaveffi-core`      | The `Generator` trait, the `LanguageBackend` framework + driver, the `Orchestrator`, the `abi` C-ABI lowering model, the `BindingModel`, validation rules, generator config resolution, and the per-generator hash cache. |
 | `weaveffi-gen-*`     | Eleven generator crates. Each implements `LanguageBackend` (bridged to `Generator` by `impl_generator_via_backend!`) and produces target-specific output (header, wrapper, package metadata).                    |
 | `weaveffi-cli`       | The `weaveffi` binary. Parses the IDL, applies validation, instantiates every generator (via the `cli_targets!` registry), and dispatches the `Orchestrator`. Self-contained subcommands live in their own modules (`doctor.rs`, `extract.rs`, `scaffold.rs`). |
 | `weaveffi-fuzz`      | `cargo-fuzz` harnesses for the parsers, the validator, and `parse_type_ref`. Workspace-private (not published to crates.io).                     |
 
-Crates that contain `unsafe` code (`weaveffi-abi`, every `samples/*`
-cdylib, `weaveffi-fuzz`, and the scaffold output emitted by
-`weaveffi generate --scaffold`) opt in with
-`#![allow(unsafe_code)]` at the top of their main source file. The
-workspace-wide `unsafe_code = deny` lint forbids it everywhere else.
+Crates that contain `unsafe` code opt in explicitly: `weaveffi-abi`,
+`weaveffi-fuzz`, the scaffold output emitted by `weaveffi generate --scaffold`,
+and any `samples/*` producer that dereferences a raw handle pointer in its own
+helpers (such as `kvstore`) add `#![allow(unsafe_code)]` at the top of
+their main source file. The thunks the `#[weaveffi::module]` macro emits
+instead carry a scoped `#[allow(unsafe_code)]` on each generated function, so
+a macro-based producer needs no crate-level opt-in. The workspace-wide
+`unsafe_code = deny` lint forbids it everywhere else.
 
 ### CLI internals
 
@@ -85,8 +104,8 @@ module:
 | ------------- | --------------------------------------------------------------------- |
 | `main.rs`     | `clap` definitions, the `cli_targets!` registry, and dispatch.        |
 | `doctor.rs`   | `weaveffi doctor`: probes host toolchains per target.                  |
-| `extract.rs`  | `weaveffi extract`: derives an IDL from annotated Rust source.         |
-| `scaffold.rs` | the Rust producer stubs emitted by `weaveffi generate --scaffold`.    |
+| `extract.rs`  | `weaveffi extract`: a thin wrapper over `weaveffi-bridge` that serializes the derived IDL. |
+| `scaffold.rs` | the Rust producer stubs emitted by `weaveffi generate --scaffold` (for non-macro producers). |
 
 #### The `cli_targets!` registry
 

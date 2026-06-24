@@ -8,8 +8,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-weaveffi-abi = { path = "../../crates/weaveffi-abi" }
-parking_lot = "0.12"
+weaveffi = { path = "../../crates/weaveffi" }
 
 [lints]
 workspace = true

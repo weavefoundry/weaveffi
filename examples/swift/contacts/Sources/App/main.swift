@@ -47,7 +47,11 @@ func run() {
             line += " (\(label))"
             print(line)
         }
-        weaveffi_contacts_Contact_list_free(list, len)
+        for i in 0..<len {
+            if let contact = list[i] {
+                weaveffi_contacts_Contact_destroy(contact)
+            }
+        }
     }
 }
 

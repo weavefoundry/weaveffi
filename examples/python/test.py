@@ -58,17 +58,14 @@ contacts.weaveffi_contacts_list_contacts.restype = ctypes.POINTER(ctypes.c_void_
 contacts.weaveffi_contacts_Contact_get_id.argtypes = [ctypes.c_void_p]
 contacts.weaveffi_contacts_Contact_get_id.restype = ctypes.c_int64
 
-contacts.weaveffi_contacts_Contact_list_free.argtypes = [
-    ctypes.POINTER(ctypes.c_void_p),
-    ctypes.c_size_t,
-]
-contacts.weaveffi_contacts_Contact_list_free.restype = None
+contacts.weaveffi_contacts_Contact_destroy.argtypes = [ctypes.c_void_p]
+contacts.weaveffi_contacts_Contact_destroy.restype = None
 
 contacts.weaveffi_contacts_delete_contact.argtypes = [
     ctypes.c_uint64,
     ctypes.POINTER(WeaveffiError),
 ]
-contacts.weaveffi_contacts_delete_contact.restype = ctypes.c_int32
+contacts.weaveffi_contacts_delete_contact.restype = ctypes.c_bool
 
 contacts.weaveffi_contacts_count_contacts.argtypes = [ctypes.POINTER(WeaveffiError)]
 contacts.weaveffi_contacts_count_contacts.restype = ctypes.c_int32
@@ -96,12 +93,13 @@ check(
     contacts.weaveffi_contacts_Contact_get_id(items[0]) == h,
     "id mismatch",
 )
-contacts.weaveffi_contacts_Contact_list_free(items, length.value)
+for _i in range(length.value):
+    contacts.weaveffi_contacts_Contact_destroy(items[_i])
 
 err = WeaveffiError()
 deleted = contacts.weaveffi_contacts_delete_contact(h, ctypes.byref(err))
 check(err.code == 0, "delete_contact error")
-check(deleted == 1, "delete_contact did not return 1")
+check(deleted, "delete_contact did not return true")
 
 err = WeaveffiError()
 remaining = contacts.weaveffi_contacts_count_contacts(ctypes.byref(err))

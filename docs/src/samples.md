@@ -1,8 +1,15 @@
 # Samples
 
 This repo includes sample projects under `samples/` that showcase end-to-end
-usage of the C ABI layer. Each sample contains a YAML IDL and a Rust crate
-that implements the corresponding `weaveffi_*` C ABI functions.
+usage of WeaveFFI. Every producer is written as safe Rust and annotated with the
+`#[weaveffi::module]` family of attributes, so the macro generates its C ABI
+(see [The Rust Producer Macro](guides/producer-macro.md)). The simpler producers
+(`calculator`, `contacts`, and `inventory`) generate bindings straight from
+their annotated source. The advanced samples (`async-demo`, `events`, `kvstore`,
+`shapes`) are macro-annotated too, and they keep a committed YAML IDL as the
+generation source of truth because their interfaces carry metadata the extractor
+does not yet recover from source, such as package and per-generator
+configuration, error domains, and `since` tags.
 
 ## Kvstore (kitchen-sink reference)
 
@@ -86,22 +93,22 @@ constructs each variant, reads the tag and fields back, and round-trips through
 
 Path: `samples/calculator`
 
-The simplest sample: a single module with four functions that exercise
-primitive types (`i32`) and string passing. Good starting point for
-understanding the basic C ABI contract.
+The simplest sample: a single `#[weaveffi::module]` with four functions that
+exercise primitive types (`i32`) and string passing. Good starting point for
+understanding the basic C ABI contract and the macro workflow.
 
 **What it demonstrates:**
 
 - Scalar parameters and return values (`i32`)
 - String parameters and return values (C string ownership)
-- Error propagation via `weaveffi_error` (e.g. division by zero)
-- The `weaveffi_free_string` / `weaveffi_error_clear` lifecycle helpers
+- Error propagation via `Result<i32, String>` (e.g. division by zero)
+- A producer written entirely as safe Rust (no hand-written FFI glue)
 
-**Build and generate bindings:**
+**Build and generate bindings (from the annotated source):**
 
 ```bash
 cargo build -p calculator
-weaveffi generate samples/calculator/calculator.yml -o generated
+weaveffi generate samples/calculator/src/lib.rs -o generated
 ```
 
 This produces target-specific output under `generated/` (C headers, Swift
@@ -112,49 +119,50 @@ that consume the generated output are in `examples/`.
 
 Path: `samples/contacts`
 
-A CRUD-style sample with a single module that exercises richer type-system
-features than the calculator.
+A CRUD-style sample with a single module, written as safe Rust and annotated
+with `#[weaveffi::module]`. It exercises richer type-system features than the
+calculator while writing no `unsafe` glue.
 
 **What it demonstrates:**
 
-- Enum definitions (`ContactType` with `Personal`, `Work`, `Other`)
-- Struct definitions (`Contact` with typed fields)
-- Optional fields (`string?` for the email)
-- List return types (`[Contact]`)
-- Handle-based resource management (`create_contact` returns a handle)
-- Struct getter and setter functions
-- Enum conversion functions (`from_i32` / `to_i32`)
-- Struct destroy and list-free lifecycle functions
+- A `#[weaveffi::enumeration]` (`ContactType` with `Personal`, `Work`, `Other`)
+- A `#[weaveffi::record]` (`Contact`) with generated create/destroy/getters
+- Optional fields (`Option<String>` for the email)
+- List return types (`Vec<Contact>` from `list_contacts`)
+- Opaque `u64` handles into an in-memory store
+- Fallible lookups via `Result<Contact, String>` mapped to the ABI's `out_err`
 
-**Build and generate bindings:**
+**Build and generate bindings (from the annotated source):**
 
 ```bash
 cargo build -p contacts
-weaveffi generate samples/contacts/contacts.yml -o generated
+weaveffi generate samples/contacts/src/lib.rs -o generated
 ```
 
 ## Inventory
 
 Path: `samples/inventory`
 
-A richer, multi-module sample with `products` and `orders` modules that
-exercises cross-module struct references and nested list types.
+A richer, multi-module sample with `products` and `orders` modules, written as
+safe Rust with two `#[weaveffi::module]` blocks. It exercises cross-module
+references and record lists across the macro.
 
 **What it demonstrates:**
 
-- Multiple modules in a single IDL
-- Enums (`Category` with `Electronics`, `Clothing`, `Food`, `Books`)
-- Structs with optional fields, list fields (`[string]` tags), and float types
-- List-returning search functions (`search_products` filtered by category)
-- Cross-module struct passing (`add_product_to_order` takes a `Product`)
-- Nested struct lists (`Order.items` is `[OrderItem]`)
-- Full CRUD operations across both modules
+- Two annotated modules in one crate, each with its own in-memory store
+- A `#[weaveffi::enumeration]` (`Category`) and `#[weaveffi::record]`s
+  (`Product`, `Order`, `OrderItem`)
+- Optional and list fields (`Option<String>`, `Vec<String>` tags)
+- A record-list return (`search_products -> Vec<Product>`) and a record-list
+  parameter (`create_order(items: Vec<OrderItem>)`)
+- A cross-module record parameter (`orders::add_product_to_order` takes a
+  `products::Product`)
 
-**Build and generate bindings:**
+**Build and generate bindings (from the annotated source):**
 
 ```bash
 cargo build -p inventory
-weaveffi generate samples/inventory/inventory.yml -o generated
+weaveffi generate samples/inventory/src/lib.rs -o generated
 ```
 
 ## Async Demo

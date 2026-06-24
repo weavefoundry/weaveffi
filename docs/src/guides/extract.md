@@ -2,107 +2,87 @@
 
 ## Overview
 
-Instead of hand-writing an IDL, you can annotate your Rust source with
-WeaveFFI marker attributes and let `weaveffi extract` produce the IDL
-for you. The result keeps the IDL co-located with the implementation
-and eliminates drift between the two: change the Rust signatures and
-re-run extract.
+One way to drive WeaveFFI is to make annotated Rust your source of truth. The
+`#[weaveffi::module]` proc-macro reads that annotated source to generate the
+producer's C ABI glue (see [The Rust Producer Macro](producer-macro.md)), and
+the CLI reads the
+*same* annotations to derive the IDL and bindings. Both paths call into one
+shared extractor (`weaveffi-bridge`), so the IDL the CLI emits and the symbols
+the macro produces cannot drift.
+
+You can point `weaveffi generate` and `weaveffi extract` straight at a `.rs`
+file. `generate` lowers the source to the IR in memory and runs the generators;
+`extract` writes the derived IDL to disk (handy for review, for committing a
+canonical IDL alongside the source, or for piping into another command).
 
 ## When to use
 
-Reach for `weaveffi extract` when:
+Reach for a `.rs` input when:
 
-- The Rust implementation already exists and you want a starting IDL.
-- The IDL changes whenever signatures change, and you want a single
-  source of truth.
-- You are scaffolding a new module and would rather decorate Rust than
-  write YAML by hand.
+- You want the Rust implementation to be the single source of truth, with no
+  separate IDL to maintain.
+- You want the IDL to track signature changes automatically: edit the Rust,
+  re-run.
 
-Skip extraction when:
+Author an IDL document (YAML/JSON/TOML) directly when:
 
-- You want to design the API before any Rust exists: author the IDL
-  directly.
-- You need iterator return types (`iter<T>`), error domains, struct
-  field defaults, or `since:` without an accompanying `#[deprecated]`
-  attribute. See [Pitfalls](#pitfalls).
+- You want to design the API before any Rust exists.
+- You need a feature the extractor cannot infer from Rust syntax, such as
+  iterator return types (`iter<T>`), error domains, struct field defaults, or
+  `since:` without an accompanying `#[deprecated]`. See [Pitfalls](#pitfalls).
 
 ## Step-by-step
 
 ### 1. Annotate the Rust source
 
-WeaveFFI recognises a small family of marker attributes by name only;
-there is no proc-macro crate. Define them as no-op attribute macros, or
-add `#![allow(unused_attributes)]` and ignore the warning.
+Mark an inline module with `#[weaveffi::module]` and tag the items you want to
+export. The attributes come from the `weaveffi` crate; the same crate's macro
+generates the producer glue when you compile the library.
 
 ```rust
-#![allow(unused_attributes)]
-
-mod inventory {
+/// Catalog operations.
+#[weaveffi::module]
+pub mod inventory {
     /// A product in the catalog.
-    #[weaveffi_struct]
-    #[weaveffi_builder]
-    struct Product {
+    #[weaveffi::record]
+    #[derive(Clone)]
+    pub struct Product {
         /// Stable identifier.
-        id: i32,
-        name: String,
-        price: f64,
-        tags: Vec<String>,
+        pub id: i32,
+        pub name: String,
+        pub price: f64,
+        pub tags: Vec<String>,
     }
 
     /// Product availability.
-    #[weaveffi_enum]
+    #[weaveffi::enumeration]
     #[repr(i32)]
-    enum Availability {
+    #[derive(Clone, Copy)]
+    pub enum Availability {
         InStock = 0,
         OutOfStock = 1,
         Preorder = 2,
     }
 
-    /// Fired when a product is ready for pickup.
-    #[weaveffi_callback]
-    fn OnReady(product_id: i32) {}
-
-    /// Subscribe to OnReady events.
-    #[weaveffi_listener(event_callback = "OnReady")]
-    fn ready_listener() {}
-
     /// Look up a product by ID.
-    #[weaveffi_export]
-    fn get_product(id: i32) -> Option<Product> {
-        todo!()
-    }
-
-    /// Append to a search index.
-    #[weaveffi_export]
-    fn index(buf: &mut SearchIndex, query: &str) {
-        todo!()
-    }
-
-    /// Open a long-lived session handle.
-    #[weaveffi_export]
-    fn open_session() -> *mut Session {
+    #[weaveffi::export]
+    pub fn get_product(id: i32) -> Option<Product> {
         todo!()
     }
 
     /// Replaced by `search_v2` in 0.3.0.
-    #[weaveffi_export]
+    #[weaveffi::export]
     #[deprecated(since = "0.2.0", note = "use search_v2 instead")]
-    fn search(query: String, limit: i32) -> Vec<Product> {
+    pub fn search(query: String, limit: i32) -> Vec<Product> {
         todo!()
     }
 
-    /// Long-running fetch.
-    #[weaveffi_export]
-    #[weaveffi_async]
-    #[weaveffi_cancellable]
-    fn refresh_catalog() -> i32 {
-        todo!()
-    }
-
-    mod nested {
+    /// A nested namespace.
+    #[weaveffi::module]
+    pub mod nested {
         /// Lives inside `inventory::nested`.
-        #[weaveffi_export]
-        fn helper() -> i32 {
+        #[weaveffi::export]
+        pub fn helper() -> i32 {
             0
         }
     }
@@ -112,28 +92,35 @@ mod inventory {
 ### 2. Run `weaveffi extract`
 
 ```sh
-weaveffi extract src/api.rs                   # YAML to stdout
-weaveffi extract src/api.rs -o api.yml         # YAML to file
-weaveffi extract src/api.rs -f json -o api.json  # JSON to file
-weaveffi extract src/api.rs | weaveffi generate -o generated
+weaveffi extract src/lib.rs                    # YAML to stdout
+weaveffi extract src/lib.rs -o api.yml         # YAML to file
+weaveffi extract src/lib.rs -f json -o api.json  # JSON to file
+weaveffi extract src/lib.rs | weaveffi generate -o generated
 ```
 
-The extracted IDL is validated automatically and **extraction fails
-loudly** if the result would not generate, for example a `handle<T>`
-whose target type the source never declares, a duplicate name, or a
-listener pointing at a missing callback. This prevents `extract` from
-emitting a silently-broken IDL. Pass `--warn` to downgrade those errors
-to a `warning:` line on stderr and emit the IDL anyway, which is useful
-when bootstrapping from source that references types you have not
-declared yet:
+The extracted IDL is validated automatically and **extraction fails loudly**
+if the result would not generate, for example a `handle<T>` whose target type
+the source never declares, a duplicate name, or a listener pointing at a
+missing callback. Pass `--warn` to downgrade those errors to a `warning:` line
+on stderr and emit the IDL anyway, which is useful when bootstrapping from
+source that references types you have not declared yet:
 
 ```sh
-weaveffi extract src/api.rs --warn          # best-effort, errors as warnings
+weaveffi extract src/lib.rs --warn          # best-effort, errors as warnings
 ```
 
-### 3. Validate and generate
+### 3. Generate directly, or validate and generate the IDL
+
+Skip the intermediate file and generate from the source:
 
 ```sh
+weaveffi generate src/lib.rs -o generated/
+```
+
+Or commit the derived IDL and feed that to the rest of the toolchain:
+
+```sh
+weaveffi extract src/lib.rs -o api.yml
 weaveffi validate api.yml
 weaveffi generate api.yml -o generated/
 ```
@@ -155,21 +142,22 @@ weaveffi extract <INPUT> [--output <PATH>] [--format <FORMAT>] [--warn]
 
 ### Attribute reference
 
-The extractor matches attributes by their final ident. Path-style
-attributes are not currently recognised; use the underscore form
-(e.g. `#[weaveffi_export]`, not `#[weaveffi::export]`).
+The extractor matches a marker by its final path segment, so both the
+namespaced form (`#[weaveffi::record]`) and a bare form (`#[record]`) resolve
+identically. Prefer the namespaced form: it is what the `#[weaveffi::module]`
+macro consumes, and it reads unambiguously.
 
-| Attribute                                          | Where it goes                  | Effect                                                                                  |
-|----------------------------------------------------|--------------------------------|-----------------------------------------------------------------------------------------|
-| `#[weaveffi_export]`                               | free `fn`                      | Emits a [`Function`] in the enclosing module.                                            |
-| `#[weaveffi_struct]`                               | named-field `struct`           | Emits a [`StructDef`].                                                                   |
-| `#[weaveffi_builder]`                              | `struct` (with `weaveffi_struct`) | Sets `builder: true` on the emitted struct.                                          |
-| `#[weaveffi_enum]` + `#[repr(i32)]`                | `enum`                         | Emits an [`EnumDef`]. Every variant must have an explicit `= N` discriminant.           |
-| `#[weaveffi_async]`                                | exported `fn`                  | Sets `async: true`. The Rust `async fn` keyword has the same effect.                    |
-| `#[weaveffi_cancellable]`                          | exported `fn`                  | Sets `cancellable: true` (typically combined with `#[weaveffi_async]`).                  |
-| `#[weaveffi_callback]`                             | free `fn`                      | Emits a module-level [`CallbackDef`] using the function's name and parameters.          |
-| `#[weaveffi_listener(event_callback = "Name")]`    | free `fn`                      | Emits a [`ListenerDef`] referencing the named callback.                                  |
-| `#[deprecated(since = "...", note = "...")]`       | exported `fn`                  | Populates `since` and `deprecated`. Bare `#[deprecated]` sets `deprecated = "deprecated"`.|
+| Attribute                                       | Where it goes                       | Effect                                                                                   |
+|-------------------------------------------------|-------------------------------------|------------------------------------------------------------------------------------------|
+| `#[weaveffi::module]`                           | inline `mod`                        | Marks an exported namespace. Required: only modules carrying it are extracted. Modules may nest. |
+| `#[weaveffi::export]`                           | free `fn`                           | Emits a [`Function`] in the enclosing module. `async fn` sets `async: true`; a `Result<T, E>` return is fallible (the IDL return type is `T`). |
+| `#[weaveffi::record]`                           | named-field `struct`                | Emits a [`StructDef`].                                                                    |
+| `#[weaveffi::builder]`                          | `struct` (with `#[weaveffi::record]`) | Sets `builder: true` on the emitted struct.                                            |
+| `#[weaveffi::enumeration]` + `#[repr(i32)]`     | `enum`                              | Emits an [`EnumDef`]. Every variant must have an explicit `= N` discriminant.            |
+| `#[weaveffi::cancellable]`                      | exported `async fn`                 | Sets `cancellable: true`.                                                                |
+| `#[weaveffi::callback]`                         | free `fn`                           | Emits a module-level [`CallbackDef`] using the function's name and parameters.           |
+| `#[weaveffi::listener(event = "Name")]`         | free `fn`                           | Emits a [`ListenerDef`] referencing the named callback (the legacy `event_callback` key is also accepted). |
+| `#[deprecated(since = "...", note = "...")]`    | exported `fn`                       | Populates `since` and `deprecated`. Bare `#[deprecated]` sets `deprecated = "deprecated"`. |
 
 [`Function`]: https://weaveffi.com/api/rust/weaveffi_ir/struct.Function.html
 [`StructDef`]: https://weaveffi.com/api/rust/weaveffi_ir/struct.StructDef.html
@@ -177,8 +165,17 @@ attributes are not currently recognised; use the underscore form
 [`CallbackDef`]: https://weaveffi.com/api/rust/weaveffi_ir/struct.CallbackDef.html
 [`ListenerDef`]: https://weaveffi.com/api/rust/weaveffi_ir/struct.ListenerDef.html
 
-Doc comments (`///`) on items, fields, and enum variants become the
-`doc` field in the IR.
+Doc comments (`///`) on items, fields, and enum variants become the `doc`
+field in the IR.
+
+> **Macro versus extraction.** Both the CLI extractor and the
+> `#[weaveffi::module]` proc-macro understand the full annotation surface above,
+> including async, callbacks, listeners, iterators, rich enums, maps, and
+> builders. Extraction additionally preserves IDL-only metadata that source
+> can't yet express (error domains, package and per-generator configuration, and
+> standalone `since` tags), which is why the advanced samples keep a committed
+> YAML IDL for generation. See [Feature
+> support](producer-macro.md#feature-support) for the macro's current matrix.
 
 ### Type mapping
 
@@ -208,12 +205,12 @@ Doc comments (`///`) on items, fields, and enum variants become the
 | `&mut T` (other)     | inner type, `mutable`    | `T`              |
 | Any other identifier | `Struct(name)`           | `name`           |
 
-Compositions work recursively: `Option<Vec<i32>>` becomes `[i32]?`
-and `Vec<Option<String>>` becomes `[string?]`.
+Compositions work recursively: `Option<Vec<i32>>` becomes `[i32]?` and
+`Vec<Option<String>>` becomes `[string?]`.
 
-`&mut T` parameters are reduced to `T` and the surrounding [`Param`]
-record gets `mutable: true`. `&T` for any non-`str`/`[u8]` type is
-also reduced to `T` with `mutable: false`.
+`&mut T` parameters are reduced to `T` and the surrounding [`Param`] record
+gets `mutable: true`. `&T` for any non-`str`/`[u8]` type is also reduced to
+`T` with `mutable: false`.
 
 [`Param`]: https://weaveffi.com/api/rust/weaveffi_ir/struct.Param.html
 
@@ -221,39 +218,36 @@ also reduced to `T` with `mutable: false`.
 
 The `roundtrip_kitchen_sink` integration test in
 `crates/weaveffi-cli/tests/extract_roundtrip.rs` proves that the
-hand-annotated form of the kitchen-sink IDL round-trips through
-`weaveffi extract` and matches the original IR for every supported
-feature: modules, nested modules, structs (including builders), enums,
-callbacks, listeners, every primitive type, borrowed types, typed
-handles, optional/list/map composites, async, cancellable, and
-deprecated/since.
+hand-annotated form of the kitchen-sink IDL round-trips through `weaveffi
+extract` and matches the original IR for every supported feature: modules,
+nested modules, structs (including builders), enums, callbacks, listeners,
+every primitive type, borrowed types, typed handles, optional/list/map
+composites, async, cancellable, and deprecated/since.
 
 ## Pitfalls
 
-The extractor parses syntax, not semantics. The items below cannot be
-inferred from Rust source alone and either must be added to the
-generated IDL by hand or are documented as round-trip gaps.
+The extractor parses syntax, not semantics. The items below cannot be inferred
+from Rust source alone and either must be added to the generated IDL by hand or
+are documented as round-trip gaps.
 
-- **Iterator return types (`iter<T>`).** No equivalent Rust syntax;
-  add the `iter<T>` return manually after extraction.
-- **Error domains (`module.errors`).** The extractor never emits
-  `errors:` blocks; add them by hand.
-- **Struct field default values.** The IDL's `default:` field cannot
-  be derived from Rust syntax (Rust struct fields have no default
-  expressions).
-- **Standalone `since:` without `#[deprecated]`.** `since` is only
-  recovered when paired with `#[deprecated(since = "...")]`. To set
-  `since` on a non-deprecated function, edit the YAML manually.
-- **Doc comments on parameters.** Rust accepts `///` on `fn`
-  parameters but most formatters strip them; when present, the
-  extractor preserves them, but plan for `Param.doc` to be lossy.
-- **Generics, trait `impl` blocks, and macros.** The extractor never
-  resolves generics, walks `impl` blocks, or expands macros. Items
-  produced by proc-macros and declarative macros are invisible.
-- **External `mod foo;` declarations.** Only inline modules
-  (`mod foo { ... }`) are processed; declarations that point to
-  other files are skipped.
-- **Tuple and unit structs.** Only structs with named fields work
-  with `#[weaveffi_struct]`.
-- **Enums must use `#[repr(i32)]` with explicit discriminants.**
-  Rust-style enums with payloads cannot be extracted.
+- **Iterator return types (`iter<T>`).** No equivalent Rust syntax; add the
+  `iter<T>` return manually after extraction.
+- **Error domains (`module.errors`).** The extractor never emits `errors:`
+  blocks; add them by hand.
+- **Struct field default values.** The IDL's `default:` field cannot be
+  derived from Rust syntax (Rust struct fields have no default expressions).
+- **Standalone `since:` without `#[deprecated]`.** `since` is only recovered
+  when paired with `#[deprecated(since = "...")]`. To set `since` on a
+  non-deprecated function, edit the YAML manually.
+- **Doc comments on parameters.** Rust accepts `///` on `fn` parameters but
+  most formatters strip them; when present, the extractor preserves them, but
+  plan for `Param.doc` to be lossy.
+- **Generics, trait `impl` blocks, and macros.** The extractor never resolves
+  generics, walks `impl` blocks, or expands macros. Items produced by
+  proc-macros and declarative macros are invisible.
+- **External `mod foo;` declarations.** Only inline modules (`mod foo { ... }`)
+  are processed; declarations that point to other files are skipped.
+- **Tuple and unit structs.** Only structs with named fields work with
+  `#[weaveffi::record]`.
+- **Enums must use `#[repr(i32)]` with explicit discriminants.** Rust-style
+  enums with payloads (rich enums) cannot be extracted.
