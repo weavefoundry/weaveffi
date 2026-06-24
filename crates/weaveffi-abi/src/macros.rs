@@ -10,7 +10,7 @@
 //! in a transitive `rlib` are not guaranteed to be re-exported from a
 //! cdylib.
 //!
-//! Use [`export_runtime!`] once in your cdylib's `lib.rs` to wire all
+//! Use [`crate::export_runtime!`] once in your cdylib's `lib.rs` to wire all
 //! of them up.
 
 /// Emit `#[no_mangle] extern "C"` thunks for every runtime symbol that

@@ -1,7 +1,7 @@
 # Getting Started
 
-This guide walks you through installing WeaveFFI, defining an API, generating
-multi-language bindings, implementing the Rust library, and calling it from C.
+This guide walks you through installing WeaveFFI, writing an API as safe Rust,
+generating multi-language bindings from it, and calling the result from C.
 
 ## Prerequisites
 
@@ -23,63 +23,76 @@ cargo install weaveffi-cli
 
 This puts the `weaveffi` binary on your `PATH`.
 
-## 2) Create a new project
+## 2) Create a producer crate
 
-Scaffold a starter project:
+Create a library crate and add the `weaveffi` facade:
 
 ```bash
-weaveffi new my-project
-cd my-project
+cargo new --lib my-math
+cd my-math
+cargo add weaveffi
 ```
 
-This creates a `my-project/` directory containing:
+Build a `cdylib` so the C ABI symbols are exported (keep `rlib` if you want to
+unit-test the safe functions in-crate). In `Cargo.toml`:
 
-- `weaveffi.yml`: an example IDL with `add`, `mul`, and `echo` functions
-- `README.md`: quick-start notes
-
-## 3) Define your IDL
-
-Open `weaveffi.yml` and replace its contents with an IDL that has a struct and
-a function:
-
-```yaml
-version: "0.4.0"
-package:
-  name: my-project
-  version: "0.1.0"
-modules:
-  - name: math
-    structs:
-      - name: Point
-        fields:
-          - { name: x, type: f64 }
-          - { name: y, type: f64 }
-    functions:
-      - name: add
-        params:
-          - { name: a, type: i32 }
-          - { name: b, type: i32 }
-        return: i32
+```toml
+[lib]
+crate-type = ["cdylib", "rlib"]
 ```
 
-The optional `package:` block sets the name and version stamped into every
-generated package manifest (`package.json`, `pyproject.toml`, `Package.swift`,
-and so on); `weaveffi new` scaffolds one for you. The IDL also supports
-primitives (`i32`, `f64`, `bool`, `string`, `bytes`, `handle`), optionals
-(`string?`), and lists (`[i32]`). See the
-[IDL Schema](reference/idl.md#package-metadata) reference for the full
-specification.
+## 3) Write your API as safe Rust
+
+Replace `src/lib.rs` with an annotated module that has a record and a function:
+
+```rust
+/// A tiny 2-D math module.
+#[weaveffi::module]
+pub mod math {
+    /// A point in the plane.
+    #[weaveffi::record]
+    #[derive(Clone)]
+    pub struct Point {
+        pub x: f64,
+        pub y: f64,
+    }
+
+    /// Add two integers.
+    #[weaveffi::export]
+    pub fn add(a: i32, b: i32) -> i32 {
+        a + b
+    }
+}
+
+// Emit the fixed C ABI runtime surface once per cdylib.
+weaveffi::export_runtime!();
+```
+
+`#[weaveffi::module]` reads the annotated items and generates the
+`#[no_mangle] extern "C"` thunks that back the C ABI. A `Result<T, E>`-returning
+function is fallible (the error flows through the ABI's `out_err` channel), a
+`u64` is an opaque `handle`, and `String`/`Vec<u8>`/`Option<T>`/`Vec<T>` map to
+`string`/`bytes`/optionals/lists. See
+[The Rust Producer Macro](guides/producer-macro.md) for the full attribute and
+type reference.
+
+> **Prefer to design the contract first?** Run `weaveffi new my-project` to
+> scaffold an IDL-based starter (`weaveffi.yml`) instead, then author the API in
+> YAML/JSON/TOML. The [IDL Schema](reference/idl.md) reference covers that path;
+> the rest of this guide assumes the macro.
 
 ## 4) Generate bindings
 
-Run the generator to produce bindings for all targets:
+Point the generator straight at your source to produce bindings for all
+targets:
 
 ```bash
-weaveffi generate weaveffi.yml -o generated --scaffold
+weaveffi generate src/lib.rs -o generated
 ```
 
-The `--scaffold` flag also emits a `scaffold.rs` with Rust FFI stubs you can
-use as a starting point. The output tree looks like:
+There is no scaffold step: the macro already generated the producer glue, and
+`generate` reads the same annotations to emit the bindings. The output tree
+looks like:
 
 ```text
 generated/
@@ -87,8 +100,7 @@ generated/
 ├── swift/      # SwiftPM package + Swift wrapper
 ├── android/    # Kotlin JNI wrapper + Gradle skeleton
 ├── node/       # N-API loader + TypeScript types
-├── wasm/       # WASM loader stub
-└── scaffold.rs # Rust FFI function stubs
+└── wasm/       # WASM loader stub
 ```
 
 ## 5) Examine the generated output
@@ -145,71 +157,23 @@ export interface Point {
 export function add(a: number, b: number): number
 ```
 
-## 6) Implement the Rust library
+## 6) Build the cdylib
 
-The generated `scaffold.rs` contains `todo!()` stubs for every function.
-Create a Rust library crate and fill in the implementations.
-
-**Cargo.toml:**
-
-```toml
-[package]
-name = "my-math"
-version = "0.1.0"
-edition = "2021"
-
-[lib]
-crate-type = ["cdylib"]
-
-[dependencies]
-weaveffi-abi = { version = "0.1" }
-```
-
-**src/lib.rs**, implementing the `add` function (struct lifecycle omitted for
-brevity):
-
-```rust
-#![allow(unsafe_code)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
-
-use weaveffi_abi::{self as abi, weaveffi_error};
-
-#[no_mangle]
-pub extern "C" fn weaveffi_math_add(
-    a: i32,
-    b: i32,
-    out_err: *mut weaveffi_error,
-) -> i32 {
-    abi::error_set_ok(out_err);
-    a + b
-}
-
-// Emit the fixed WeaveFFI C ABI runtime surface (free_string, free_bytes,
-// error_clear, cancel_token_*) in one line. Call this exactly once per
-// cdylib.
-abi::export_runtime!();
-```
-
-Key points:
-
-- Every exported function uses `#[no_mangle]` and `extern "C"`.
-- `out_err` must always be cleared on success with `abi::error_set_ok`.
-- On error, call `abi::error_set(out_err, code, message)` and return a
-  zero/null value.
-- The library must export the WeaveFFI runtime symbols: invoke
-  [`weaveffi_abi::export_runtime!()`][export-runtime-doc] to emit all of
-  them in one line instead of writing each `#[no_mangle]` thunk by hand.
-
-[export-runtime-doc]: https://docs.rs/weaveffi-abi/latest/weaveffi_abi/macro.export_runtime.html
-
-Build with:
+The macro already emitted every `#[no_mangle] extern "C"` thunk, so there is
+nothing to fill in by hand. Build the shared library:
 
 ```bash
 cargo build
 ```
 
-This produces a shared library (`libmy_math.dylib` on macOS,
-`libmy_math.so` on Linux).
+This produces `libmy_math.dylib` on macOS (`libmy_math.so` on Linux,
+`my_math.dll` on Windows), exporting `weaveffi_math_add`, the
+`weaveffi_math_Point_*` lifecycle and getters, and the runtime symbols from
+`export_runtime!()`. The signatures match `generated/c/weaveffi.h` by
+construction, because the thunks and the header are two views of one annotated
+source. To report a recoverable failure from a function, return
+`Result<T, E>`: the macro routes `Err` to the call's `out_err` parameter and
+returns a zero or null sentinel.
 
 ## 7) Build and test with C
 
@@ -257,6 +221,9 @@ add(3, 4) = 7
 ## Next steps
 
 - Run `weaveffi doctor` to check which platform toolchains are available.
+- Read [The Rust Producer Macro](guides/producer-macro.md) for the full
+  attribute set, the type mapping, cross-module references, and the feature
+  roadmap.
 - See the [Calculator tutorial](tutorials/calculator.md) for a full end-to-end
   walkthrough including Swift and Node.js.
 - Read the [IDL Schema](reference/idl.md) reference for all supported types

@@ -1,0 +1,24 @@
+[package]
+name = "weaveffi-macros"
+version = "0.12.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Procedural macros that turn safe annotated Rust into WeaveFFI C ABI scaffolding"
+keywords = ["ffi", "proc-macro", "codegen", "bindings", "weaveffi"]
+categories = ["development-tools::ffi"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+weaveffi-ir = { path = "../weaveffi-ir" }
+weaveffi-core = { path = "../weaveffi-core" }
+weaveffi-bridge = { path = "../weaveffi-bridge" }
+syn = { workspace = true }
+quote = { workspace = true }
+proc-macro2 = "1.0"
+
+[lints]
+workspace = true

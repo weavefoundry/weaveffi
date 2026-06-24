@@ -29,6 +29,7 @@
   - [Rust API (cargo doc)](api/rust.md)
   - [Doc Comment Style](api/doc-style.md)
 - [Guides](guides/README.md)
+  - [The Rust Producer Macro](guides/producer-macro.md)
   - [Memory Ownership](guides/memory.md)
   - [Error Handling](guides/errors.md)
   - [Async Functions](guides/async.md)

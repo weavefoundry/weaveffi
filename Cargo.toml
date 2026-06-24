@@ -2,6 +2,9 @@
 members = [
     "crates/weaveffi-ir",
     "crates/weaveffi-abi",
+    "crates/weaveffi-bridge",
+    "crates/weaveffi-macros",
+    "crates/weaveffi",
     "crates/weaveffi-core",
     "crates/weaveffi-gen-c",
     "crates/weaveffi-gen-swift",

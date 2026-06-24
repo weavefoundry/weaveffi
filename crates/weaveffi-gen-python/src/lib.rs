@@ -74,7 +74,7 @@ impl PythonGenerator {
     /// Render the primary `weaveffi.py` source by composing the shared
     /// [`LanguageBackend::emit_members`] walk over every module. Shared by the
     /// [`LanguageBackend::files`] hook and the test-facing
-    /// [`render_python_module`] wrapper so there is one assembly path.
+    /// `render_python_module` wrapper so there is one assembly path.
     fn render_py_source(
         &self,
         model: &BindingModel,

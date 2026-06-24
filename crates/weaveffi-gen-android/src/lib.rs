@@ -3993,8 +3993,8 @@ fn render_jni_getter_body(
 /// one constructor per variant (`nativeNew<Variant>`), a shared `nativeTag`
 /// discriminant reader and `nativeDestroy`, and per-variant field getters
 /// (`nativeGet<Variant><Field>`). All opaque-object symbols come from the
-/// precomputed [`crate::RichEnumBinding`], so the marshalling matches the C ABI
-/// the producer implements by construction.
+/// precomputed [`weaveffi_core::model::RichEnumBinding`], so the marshalling
+/// matches the C ABI the producer implements by construction.
 fn render_jni_rich_enum(
     out: &mut String,
     module_name: &str,

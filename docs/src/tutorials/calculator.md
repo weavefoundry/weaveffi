@@ -2,12 +2,12 @@
 
 ## Goal
 
-Take the in-tree `samples/calculator` IDL, generate bindings for every
-target, build the cdylib, and run the calculator from a real consumer
-(C, Node.js, Swift, then optionally Android and WASM). By the end you
-will have produced bindings, executed them on at least one host, and
-seen the same Rust `add(a, b)` answer come back through three different
-runtimes.
+Take the in-tree `samples/calculator` producer (safe Rust annotated with
+`#[weaveffi::module]`), generate bindings for every target, build the cdylib,
+and run the calculator from a real consumer (C, Node.js, Swift, then optionally
+Android and WASM). By the end you will have produced bindings, executed them on
+at least one host, and seen the same Rust `add(a, b)` answer come back through
+three different runtimes.
 
 ## Prerequisites
 
@@ -24,8 +24,11 @@ runtimes.
 
 ### 1. Generate every target
 
+Point the generator at the annotated source (the `calculator.yml` IDL still
+works too, and produces the same bindings):
+
 ```bash
-weaveffi generate samples/calculator/calculator.yml -o generated
+weaveffi generate samples/calculator/src/lib.rs -o generated
 ```
 
 The output appears under `generated/`:

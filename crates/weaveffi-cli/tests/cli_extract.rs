@@ -1,25 +1,32 @@
+//! End-to-end tests for `weaveffi extract`, which reads annotated Rust source
+//! (via the shared `weaveffi-bridge`) and emits the IDL. The annotation scheme
+//! is the one the `#[weaveffi::module]` macro uses: a `#[weaveffi::module]`
+//! marks the exported namespace, and item markers (`#[weaveffi::export]`,
+//! `#[weaveffi::record]`, `#[weaveffi::enumeration]`, ...) tag the surface.
+
 use std::io::Write;
+
+fn write_src(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("failed to create temp dir");
+    let src_path = dir.path().join("lib.rs");
+    let mut f = std::fs::File::create(&src_path).unwrap();
+    f.write_all(contents.as_bytes()).unwrap();
+    (dir, src_path)
+}
 
 #[test]
 fn extract_basic_rust_file() {
-    let dir = tempfile::tempdir().expect("failed to create temp dir");
-    let src_path = dir.path().join("lib.rs");
-
-    {
-        let mut f = std::fs::File::create(&src_path).unwrap();
-        write!(
-            f,
-            r#"
-mod math {{
-    #[weaveffi_export]
-    fn add(a: i32, b: i32) -> i32 {{
+    let (_dir, src_path) = write_src(
+        r#"
+#[weaveffi::module]
+mod math {
+    #[weaveffi::export]
+    fn add(a: i32, b: i32) -> i32 {
         a + b
-    }}
-}}
-"#
-        )
-        .unwrap();
     }
+}
+"#,
+    );
 
     let output = assert_cmd::Command::cargo_bin("weaveffi")
         .expect("binary not found")
@@ -30,20 +37,6 @@ mod math {{
     assert!(output.status.success(), "extract command failed");
 
     let stdout = String::from_utf8(output.stdout).unwrap();
-
-    assert!(
-        stdout.contains("math"),
-        "output should contain module name 'math': {stdout}"
-    );
-    assert!(
-        stdout.contains("add"),
-        "output should contain function name 'add': {stdout}"
-    );
-    assert!(
-        stdout.contains("i32"),
-        "output should contain type 'i32': {stdout}"
-    );
-
     let api: serde_yaml::Value =
         serde_yaml::from_str(&stdout).expect("output should be valid YAML");
     let modules = api["modules"]
@@ -75,39 +68,64 @@ mod math {{
 }
 
 #[test]
-fn extract_with_struct_and_enum() {
-    let dir = tempfile::tempdir().expect("failed to create temp dir");
-    let src_path = dir.path().join("lib.rs");
+fn unmarked_module_is_ignored() {
+    // A module without #[weaveffi::module] exports nothing, even if its items
+    // carry item markers: the module attribute is the opt-in.
+    let (_dir, src_path) = write_src(
+        r#"
+mod plain {
+    #[weaveffi::export]
+    fn add(a: i32) -> i32 { a }
+}
+"#,
+    );
 
-    {
-        let mut f = std::fs::File::create(&src_path).unwrap();
-        write!(
-            f,
-            r#"
-mod shapes {{
-    #[weaveffi_struct]
-    struct Point {{
+    let output = assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args(["extract", src_path.to_str().unwrap()])
+        .output()
+        .expect("failed to run extract");
+
+    assert!(output.status.success(), "extract command failed");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let api: serde_yaml::Value =
+        serde_yaml::from_str(&stdout).expect("output should be valid YAML");
+    assert!(
+        api["modules"]
+            .as_sequence()
+            .map(|m| m.is_empty())
+            .unwrap_or(true),
+        "an unmarked module should produce no exported modules: {stdout}"
+    );
+}
+
+#[test]
+fn extract_with_struct_and_enum() {
+    let (_dir, src_path) = write_src(
+        r#"
+#[weaveffi::module]
+mod shapes {
+    #[weaveffi::record]
+    struct Point {
         x: f64,
         y: f64,
-    }}
+    }
 
-    #[weaveffi_enum]
+    #[weaveffi::enumeration]
     #[repr(i32)]
-    enum Color {{
+    enum Color {
         Red = 0,
         Green = 1,
         Blue = 2,
-    }}
-
-    #[weaveffi_export]
-    fn create_point(x: f64, y: f64) -> Point {{
-        todo!()
-    }}
-}}
-"#
-        )
-        .unwrap();
     }
+
+    #[weaveffi::export]
+    fn create_point(x: f64, y: f64) -> Point {
+        todo!()
+    }
+}
+"#,
+    );
 
     let output = assert_cmd::Command::cargo_bin("weaveffi")
         .expect("binary not found")
@@ -148,24 +166,17 @@ mod shapes {{
 
 #[test]
 fn extract_with_optional_and_list() {
-    let dir = tempfile::tempdir().expect("failed to create temp dir");
-    let src_path = dir.path().join("lib.rs");
-
-    {
-        let mut f = std::fs::File::create(&src_path).unwrap();
-        write!(
-            f,
-            r#"
-mod collections {{
-    #[weaveffi_export]
-    fn process(items: Vec<i32>, label: Option<String>) -> Option<Vec<i32>> {{
+    let (_dir, src_path) = write_src(
+        r#"
+#[weaveffi::module]
+mod collections {
+    #[weaveffi::export]
+    fn process(items: Vec<i32>, label: Option<String>) -> Option<Vec<i32>> {
         todo!()
-    }}
-}}
-"#
-        )
-        .unwrap();
     }
+}
+"#,
+    );
 
     let output = assert_cmd::Command::cargo_bin("weaveffi")
         .expect("binary not found")
@@ -196,24 +207,17 @@ mod collections {{
 
 #[test]
 fn extract_to_json_format() {
-    let dir = tempfile::tempdir().expect("failed to create temp dir");
-    let src_path = dir.path().join("lib.rs");
-
-    {
-        let mut f = std::fs::File::create(&src_path).unwrap();
-        write!(
-            f,
-            r#"
-mod math {{
-    #[weaveffi_export]
-    fn add(a: i32, b: i32) -> i32 {{
+    let (_dir, src_path) = write_src(
+        r#"
+#[weaveffi::module]
+mod math {
+    #[weaveffi::export]
+    fn add(a: i32, b: i32) -> i32 {
         a + b
-    }}
-}}
-"#
-        )
-        .unwrap();
     }
+}
+"#,
+    );
 
     let output = assert_cmd::Command::cargo_bin("weaveffi")
         .expect("binary not found")
@@ -242,26 +246,18 @@ mod math {{
 
 #[test]
 fn extract_async_function() {
-    let dir = tempfile::tempdir().expect("failed to create temp dir");
-    let src_path = dir.path().join("lib.rs");
-
-    {
-        let mut f = std::fs::File::create(&src_path).unwrap();
-        write!(
-            f,
-            r#"
-mod async_demo {{
+    let (_dir, src_path) = write_src(
+        r#"
+#[weaveffi::module]
+mod async_demo {
     /// Fetch data asynchronously.
-    #[weaveffi_export]
-    #[weaveffi_async]
-    fn fetch(url: String) -> String {{
+    #[weaveffi::export]
+    async fn fetch(url: String) -> String {
         todo!()
-    }}
-}}
-"#
-        )
-        .unwrap();
     }
+}
+"#,
+    );
 
     let output = assert_cmd::Command::cargo_bin("weaveffi")
         .expect("binary not found")
@@ -286,24 +282,17 @@ mod async_demo {{
 
 #[test]
 fn extract_typed_handle_param() {
-    let dir = tempfile::tempdir().expect("failed to create temp dir");
-    let src_path = dir.path().join("lib.rs");
-
-    {
-        let mut f = std::fs::File::create(&src_path).unwrap();
-        write!(
-            f,
-            r#"
-mod sessions {{
-    #[weaveffi_export]
-    fn close(session: *mut Session) {{
+    let (_dir, src_path) = write_src(
+        r#"
+#[weaveffi::module]
+mod sessions {
+    #[weaveffi::export]
+    fn close(session: *mut Session) {
         todo!()
-    }}
-}}
-"#
-        )
-        .unwrap();
     }
+}
+"#,
+    );
 
     // `Session` is an opaque handle target the source never declares, so the
     // extracted IDL does not validate; `--warn` emits it anyway for bootstrapping.
@@ -330,23 +319,17 @@ mod sessions {{
 fn extract_fails_loud_on_invalid_api_without_warn() {
     // An undeclared handle target makes the extracted API fail validation.
     // Without `--warn`, `extract` must abort instead of emitting broken IDL.
-    let dir = tempfile::tempdir().expect("failed to create temp dir");
-    let src_path = dir.path().join("lib.rs");
-    {
-        let mut f = std::fs::File::create(&src_path).unwrap();
-        write!(
-            f,
-            r#"
-mod sessions {{
-    #[weaveffi_export]
-    fn close(session: *mut Session) {{
+    let (_dir, src_path) = write_src(
+        r#"
+#[weaveffi::module]
+mod sessions {
+    #[weaveffi::export]
+    fn close(session: *mut Session) {
         todo!()
-    }}
-}}
-"#
-        )
-        .unwrap();
     }
+}
+"#,
+    );
 
     let output = assert_cmd::Command::cargo_bin("weaveffi")
         .expect("binary not found")
@@ -367,27 +350,20 @@ mod sessions {{
 
 #[test]
 fn extract_listener_definition() {
-    let dir = tempfile::tempdir().expect("failed to create temp dir");
-    let src_path = dir.path().join("lib.rs");
-
-    {
-        let mut f = std::fs::File::create(&src_path).unwrap();
-        write!(
-            f,
-            r#"
-mod events {{
+    let (_dir, src_path) = write_src(
+        r#"
+#[weaveffi::module]
+mod events {
     /// Fired when data arrives.
-    #[weaveffi_callback]
-    fn OnData(payload: String) {{}}
+    #[weaveffi::callback]
+    fn OnData(payload: String) {}
 
     /// Subscribe to OnData events.
-    #[weaveffi_listener(event_callback = "OnData")]
-    fn data_listener() {{}}
-}}
-"#
-        )
-        .unwrap();
-    }
+    #[weaveffi::listener(event = "OnData")]
+    fn data_listener() {}
+}
+"#,
+    );
 
     let output = assert_cmd::Command::cargo_bin("weaveffi")
         .expect("binary not found")
@@ -425,26 +401,19 @@ mod events {{
 
 #[test]
 fn extract_deprecated_attribute_to_since() {
-    let dir = tempfile::tempdir().expect("failed to create temp dir");
-    let src_path = dir.path().join("lib.rs");
-
-    {
-        let mut f = std::fs::File::create(&src_path).unwrap();
-        write!(
-            f,
-            r#"
-mod legacy {{
+    let (_dir, src_path) = write_src(
+        r#"
+#[weaveffi::module]
+mod legacy {
     /// Legacy add.
-    #[weaveffi_export]
+    #[weaveffi::export]
     #[deprecated(since = "0.2.0", note = "Use add_v2 instead")]
-    fn add_old(a: i32, b: i32) -> i32 {{
+    fn add_old(a: i32, b: i32) -> i32 {
         a + b
-    }}
-}}
-"#
-        )
-        .unwrap();
     }
+}
+"#,
+    );
 
     let output = assert_cmd::Command::cargo_bin("weaveffi")
         .expect("binary not found")
@@ -466,29 +435,22 @@ mod legacy {{
 
 #[test]
 fn extract_mutable_reference_to_mutable_flag() {
-    let dir = tempfile::tempdir().expect("failed to create temp dir");
-    let src_path = dir.path().join("lib.rs");
-
-    {
-        let mut f = std::fs::File::create(&src_path).unwrap();
-        write!(
-            f,
-            r#"
-mod buffers {{
-    #[weaveffi_struct]
-    struct Buffer {{
+    let (_dir, src_path) = write_src(
+        r#"
+#[weaveffi::module]
+mod buffers {
+    #[weaveffi::record]
+    struct Buffer {
         capacity: i32,
-    }}
-
-    #[weaveffi_export]
-    fn fill(buf: &mut Buffer, value: i32) {{
-        todo!()
-    }}
-}}
-"#
-        )
-        .unwrap();
     }
+
+    #[weaveffi::export]
+    fn fill(buf: &mut Buffer, value: i32) {
+        todo!()
+    }
+}
+"#,
+    );
 
     let output = assert_cmd::Command::cargo_bin("weaveffi")
         .expect("binary not found")
@@ -519,24 +481,17 @@ mod buffers {{
 
 #[test]
 fn extract_to_toml_format() {
-    let dir = tempfile::tempdir().expect("failed to create temp dir");
-    let src_path = dir.path().join("lib.rs");
-
-    {
-        let mut f = std::fs::File::create(&src_path).unwrap();
-        write!(
-            f,
-            r#"
-mod math {{
-    #[weaveffi_export]
-    fn add(a: i32, b: i32) -> i32 {{
+    let (_dir, src_path) = write_src(
+        r#"
+#[weaveffi::module]
+mod math {
+    #[weaveffi::export]
+    fn add(a: i32, b: i32) -> i32 {
         a + b
-    }}
-}}
-"#
-        )
-        .unwrap();
     }
+}
+"#,
+    );
 
     let output = assert_cmd::Command::cargo_bin("weaveffi")
         .expect("binary not found")

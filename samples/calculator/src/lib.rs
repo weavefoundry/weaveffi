@@ -1,48 +1,39 @@
-//! Calculator sample cdylib used as a fixture for the WeaveFFI generators
-//! and the end-to-end consumer examples.
+//! Calculator sample cdylib: the canonical minimal WeaveFFI producer.
+//!
+//! Every exported function is plain, safe Rust. The `#[weaveffi::module]`
+//! attribute reads the annotated items and generates the `#[no_mangle]
+//! extern "C"` thunks that the stable C ABI (and every generated language
+//! binding) calls, marshalling arguments and results through the runtime so
+//! this file contains no `unsafe` glue.
 
-#![allow(unsafe_code)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
-
-use std::os::raw::c_char;
-use weaveffi_abi::{self as abi, weaveffi_error};
-
-#[no_mangle]
-pub extern "C" fn weaveffi_calculator_add(a: i32, b: i32, out_err: *mut weaveffi_error) -> i32 {
-    abi::error_set_ok(out_err);
-    a + b
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_calculator_mul(a: i32, b: i32, out_err: *mut weaveffi_error) -> i32 {
-    abi::error_set_ok(out_err);
-    a * b
-}
-
-#[no_mangle]
-pub extern "C" fn weaveffi_calculator_div(a: i32, b: i32, out_err: *mut weaveffi_error) -> i32 {
-    if b == 0 {
-        abi::error_set(out_err, 2, "division by zero");
-        return 0;
+#[weaveffi::module]
+pub mod calculator {
+    /// Add two integers.
+    #[weaveffi::export]
+    pub fn add(a: i32, b: i32) -> i32 {
+        a + b
     }
-    abi::error_set_ok(out_err);
-    a / b
-}
 
-#[no_mangle]
-pub extern "C" fn weaveffi_calculator_echo(
-    s: *const c_char,
-    out_err: *mut weaveffi_error,
-) -> *const c_char {
-    let input = match abi::c_ptr_to_string(s) {
-        Some(v) => v,
-        None => {
-            abi::error_set(out_err, 1, "s is null or invalid UTF-8");
-            return std::ptr::null();
+    /// Multiply two integers.
+    #[weaveffi::export]
+    pub fn mul(a: i32, b: i32) -> i32 {
+        a * b
+    }
+
+    /// Divide two integers, reporting division by zero through the error channel.
+    #[weaveffi::export]
+    pub fn div(a: i32, b: i32) -> Result<i32, String> {
+        if b == 0 {
+            return Err("division by zero".to_string());
         }
-    };
-    abi::error_set_ok(out_err);
-    abi::string_to_c_ptr(&input)
+        Ok(a / b)
+    }
+
+    /// Echo a string back to the caller.
+    #[weaveffi::export]
+    pub fn echo(s: String) -> String {
+        s
+    }
 }
 
-abi::export_runtime!();
+weaveffi::export_runtime!();

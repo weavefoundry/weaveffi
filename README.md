@@ -2,52 +2,64 @@
 
 [![CI](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml/badge.svg)](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT) [![crates.io](https://img.shields.io/crates/v/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli) [![Schema](https://img.shields.io/badge/schema-0.4.0-orange)](./weaveffi.schema.json) [![downloads](https://img.shields.io/crates/d/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli)
 
-WeaveFFI generates type-safe bindings for 11 languages from a single IDL:
-no hand-written JNI, no duplicate implementations, no unsafe boilerplate.
-Define your API once in YAML, JSON, or TOML; ship idiomatic packages for
-C, C++, Swift, Kotlin/Android, Node.js, WebAssembly, Python, .NET, Dart,
-Go, and Ruby that all talk to the same stable C ABI.
+WeaveFFI turns one safe-Rust definition into type-safe bindings for 11
+languages: no hand-written JNI, no duplicate implementations, no unsafe
+boilerplate. Annotate a normal Rust module with `#[weaveffi::module]` and the
+macro generates the stable C ABI; the same source generates idiomatic packages
+for C, C++, Swift, Kotlin/Android, Node.js, WebAssembly, Python, .NET, Dart,
+Go, and Ruby. Prefer to design the contract first? Author the IDL in YAML,
+JSON, or TOML instead. Both paths share one engine, so they cannot drift.
 
 ## Quickstart
 
-**1. Install the CLI:**
+**1. Install the CLI and add the `weaveffi` crate to your library:**
 
 ```bash
 cargo install weaveffi-cli
+cargo add weaveffi
 ```
 
-**2. Define your API** in `contacts.yml`:
+**2. Write your API** as safe Rust in `src/lib.rs`:
 
-```yaml
-version: "0.4.0"
-modules:
-  - name: contacts
-    structs:
-      - name: Contact
-        fields:
-          - name: id
-            type: i64
-          - name: name
-            type: string
-          - name: email
-            type: "string?"
-    functions:
-      - name: create_contact
-        params:
-          - name: name
-            type: string
-          - name: email
-            type: "string?"
-        return: Contact
-      - name: list_contacts
-        params: []
-        return: "[Contact]"
+```rust
+/// A small address book.
+#[weaveffi::module]
+pub mod contacts {
+    /// An address-book entry.
+    #[weaveffi::record]
+    #[derive(Clone)]
+    pub struct Contact {
+        pub id: i64,
+        pub name: String,
+        pub email: Option<String>,
+    }
+
+    /// Create a contact.
+    #[weaveffi::export]
+    pub fn create_contact(name: String, email: Option<String>) -> Contact {
+        Contact { id: 1, name, email }
+    }
+
+    /// List every stored contact.
+    #[weaveffi::export]
+    pub fn list_contacts() -> Vec<Contact> {
+        Vec::new()
+    }
+}
+
+// Emit the fixed C ABI runtime surface once per cdylib.
+weaveffi::export_runtime!();
 ```
 
-**3. Generate bindings:**
+Building this `cdylib` exports the `extern "C"` symbols the bindings call; you
+write no `unsafe` glue. Prefer an IDL? The same surface as YAML, plus the
+`weaveffi generate contacts.yml` flow, is in
+[Getting Started](docs/src/getting-started.md).
+
+**3. Generate bindings** straight from the annotated source:
 
 ```bash
-weaveffi generate contacts.yml -o generated --target c,swift,python,node,dart
+weaveffi generate src/lib.rs -o generated --target c,swift,python,node,dart
 ```
 
 **4. Use the generated code from any of the eleven supported languages.**
@@ -180,13 +192,15 @@ List<Contact> listContacts() { /* ... */ }
 
 ## Why WeaveFFI?
 
-- **One IDL, eleven languages.** Describe your API once and ship packages to
-  npm, SwiftPM, Maven, PyPI, NuGet, pub.dev, RubyGems, and Go modules. Each
-  package is standalone: consumers don't need WeaveFFI installed.
+- **One definition, eleven languages.** Write the API once (safe Rust or an
+  IDL) and ship packages to npm, SwiftPM, Maven, PyPI, NuGet, pub.dev,
+  RubyGems, and Go modules. Each package is standalone: consumers don't need
+  WeaveFFI installed.
 - **Stable C ABI underneath.** Every target speaks to the same `extern "C"`
   contract, so adding a new platform later is a code-gen change, not a
-  rewrite. Works with any backend that can expose a C ABI: Rust (with
-  first-class scaffolding via `--scaffold`), C, C++, or Zig.
+  rewrite. Rust producers get that C ABI for free from the
+  `#[weaveffi::module]` macro; any other backend that can expose a C ABI (C,
+  C++, Zig) implements the generated header directly.
 - **Idiomatic per-target output.** No lowest-common-denominator surface area.
   Swift gets `async/await` and `throws`, Kotlin gets `suspend` and JNI glue,
   Python gets typed `.pyi` stubs, TypeScript gets `Promise`s, and Dart gets
@@ -245,12 +259,12 @@ weaveffi schema-version    # prints 0.4.0
 | Command | Description |
 |---------|-------------|
 | `weaveffi new <name>` | Scaffold a new project with a starter IDL and `Cargo.toml` |
-| `weaveffi generate <file> -o <dir>` | Generate bindings; `--target c,swift,...` to subset, `--scaffold` to emit Rust FFI stubs, `--config cfg.toml` for generator options, `--dry-run` to preview |
+| `weaveffi generate <file> -o <dir>` | Generate bindings from annotated Rust (`.rs`) or an IDL (`.yml`/`.json`/`.toml`); `--target c,swift,...` to subset, `--config cfg.toml` for options, `--scaffold` to emit Rust FFI stubs (for non-macro producers), `--dry-run` to preview |
 | `weaveffi package <file> -o <dir>` | Assemble publishable, per-platform packages that bundle a prebuilt native library; `--binaries <dir>` for prebuilt libs or `--build <crate>` to cross-compile a Rust producer |
 | `weaveffi validate <file>` | Validate an IDL definition without generating; `--format json` for machine-readable output |
 | `weaveffi lint <file>` | Lint an IDL and report non-fatal warnings |
 | `weaveffi diff <file>` | Show what would change if bindings were regenerated; `--check` for CI |
-| `weaveffi extract <file.rs>` | Extract an IDL from annotated Rust source (alternative to writing IDL by hand) |
+| `weaveffi extract <file.rs>` | Derive an IDL from `#[weaveffi::module]`-annotated Rust source |
 | `weaveffi format <file>` | Rewrite an IDL file in canonical form (sorted keys); `--check` for CI |
 | `weaveffi watch <file>` | Re-run `generate` whenever the IDL file changes |
 | `weaveffi schema --format json-schema` | Print the JSON Schema for the IDL |

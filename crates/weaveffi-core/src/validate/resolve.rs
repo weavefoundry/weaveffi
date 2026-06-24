@@ -8,8 +8,8 @@ use weaveffi_ir::ir::{Api, Module, TypeRef};
 /// How a bare type name resolves: a struct, a C-style enum, or an algebraic
 /// (rich) enum. The two enum kinds differ in their C ABI lowering: a C-style
 /// enum is a by-value integer ([`TypeRef::Enum`]) while a rich enum is an
-/// opaque object pointer ([`TypeRef::RichEnum`]), so the resolver must know
-/// which to emit for every reference.
+/// opaque object pointer (kept as [`TypeRef::Struct`]), so the resolver must
+/// know which to emit for every reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TypeKind {
     Struct,
