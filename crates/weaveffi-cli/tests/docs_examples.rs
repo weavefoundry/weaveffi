@@ -537,7 +537,9 @@ fn read_workspace_file(rel: &str) -> String {
 fn readme_states_value_proposition() {
     let readme = read_workspace_file("README.md");
     assert!(
-        readme.contains("WeaveFFI turns one safe-Rust definition into type-safe bindings for 11"),
+        readme.contains(
+            "WeaveFFI generates type-safe bindings for 11 languages for any native library"
+        ),
         "README missing the canonical value proposition"
     );
     assert!(
@@ -864,7 +866,9 @@ fn summary_md_includes_comparison_and_faq() {
 fn intro_doc_matches_new_value_proposition() {
     let intro = read_workspace_file("docs/src/intro.md");
     assert!(
-        intro.contains("WeaveFFI turns one safe-Rust definition into type-safe bindings for 11"),
+        intro.contains(
+            "WeaveFFI generates type-safe bindings for 11 languages for any native library"
+        ),
         "intro.md should lead with the canonical value proposition"
     );
     assert!(

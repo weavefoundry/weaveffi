@@ -2,9 +2,10 @@
 
 ## Overview
 
-WeaveFFI's source of truth is annotated Rust. The `#[weaveffi::module]`
-proc-macro reads that annotated source to generate the producer's C ABI glue
-(see [The Rust Producer Macro](producer-macro.md)), and the CLI reads the
+One way to drive WeaveFFI is to make annotated Rust your source of truth. The
+`#[weaveffi::module]` proc-macro reads that annotated source to generate the
+producer's C ABI glue (see [The Rust Producer Macro](producer-macro.md)), and
+the CLI reads the
 *same* annotations to derive the IDL and bindings. Both paths call into one
 shared extractor (`weaveffi-bridge`), so the IDL the CLI emits and the symbols
 the macro produces cannot drift.

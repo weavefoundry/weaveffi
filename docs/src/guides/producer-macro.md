@@ -1,8 +1,9 @@
 # The Rust Producer Macro
 
-WeaveFFI's recommended workflow is to write a normal, safe Rust library,
-annotate it with the `#[weaveffi::module]` family of attributes, and let the
-`weaveffi` crate generate the `#[no_mangle] extern "C"` thunks that back the
+If your producer is written in Rust, the most ergonomic workflow is to write a
+normal, safe Rust library, annotate it with the `#[weaveffi::module]` family of
+attributes, and let the `weaveffi` crate generate the `#[no_mangle] extern "C"`
+thunks that back the
 stable C ABI. The same annotated source is what `weaveffi generate src/lib.rs`
 reads to emit the IDL, the C header, and every language binding, so the
 producer you compile and the bindings you ship cannot drift: they are two
@@ -199,6 +200,6 @@ column are working references for each pattern.
 
 ## See also
 
-- [Getting Started](../getting-started.md): the macro-first walkthrough end to end.
+- [Getting Started](../getting-started.md): the end-to-end IDL-first walkthrough; this guide is the Rust-macro alternative to its step 2.
 - [Annotated Rust Extraction](extract.md): the `weaveffi extract`/`generate <file.rs>` CLI and the full attribute and type reference.
 - [Memory Ownership](memory.md) and [Error Handling](errors.md): the ABI contracts the macro upholds for you.

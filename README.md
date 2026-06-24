@@ -2,30 +2,63 @@
 
 [![CI](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml/badge.svg)](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT) [![crates.io](https://img.shields.io/crates/v/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli) [![Schema](https://img.shields.io/badge/schema-0.4.0-orange)](./weaveffi.schema.json) [![downloads](https://img.shields.io/crates/d/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli)
 
-WeaveFFI turns one safe-Rust definition into type-safe bindings for 11
-languages: no hand-written JNI, no duplicate implementations, no unsafe
-boilerplate. Annotate a normal Rust module with `#[weaveffi::module]` and the
-macro generates the stable C ABI; the same source generates idiomatic packages
-for C, C++, Swift, Kotlin/Android, Node.js, WebAssembly, Python, .NET, Dart,
-Go, and Ruby. Prefer to design the contract first? Author the IDL in YAML,
-JSON, or TOML instead. Both paths share one engine, so they cannot drift.
+WeaveFFI generates type-safe bindings for 11 languages for any native library
+that exposes a C ABI, whether it's written in Rust, C, C++, Zig, or anything
+else: no hand-written JNI, no duplicate implementations, no unsafe boilerplate.
+Define your API once as an IDL in YAML, JSON, or TOML and ship idiomatic
+packages for C, C++, Swift, Kotlin/Android, Node.js, WebAssembly, Python, .NET,
+Dart, Go, and Ruby that all talk to the same stable C ABI. Writing your producer
+in Rust? Annotate a normal module with `#[weaveffi::module]` and the macro
+generates both the C ABI and the IDL for you. Every path shares one engine, so
+the library you build and the bindings you ship cannot drift.
 
 ## Quickstart
 
-**1. Install the CLI and add the `weaveffi` crate to your library:**
+**1. Install the CLI:**
 
 ```bash
 cargo install weaveffi-cli
-cargo add weaveffi
 ```
 
-**2. Write your API** as safe Rust in `src/lib.rs`:
+**2. Define your API as an IDL** in `contacts.yml`. Any native library that
+exposes a C ABI (written in C, C++, Zig, Rust, ...) implements the symbols it
+declares:
+
+```yaml
+version: "0.4.0"
+modules:
+  - name: contacts
+    structs:
+      - name: Contact
+        fields:
+          - name: id
+            type: i64
+          - name: name
+            type: string
+          - name: email
+            type: "string?"
+    functions:
+      - name: create_contact
+        params:
+          - name: name
+            type: string
+          - name: email
+            type: "string?"
+        return: Contact
+      - name: list_contacts
+        params: []
+        return: "[Contact]"
+```
+
+**Producing in Rust?** Skip the hand-written IDL: annotate a normal module with
+`#[weaveffi::module]` (after `cargo add weaveffi`) and the macro emits the C ABI
+and derives the IDL for you, so you write no `unsafe` glue. See
+[The Rust Producer Macro](docs/src/guides/producer-macro.md) for the full
+walkthrough.
 
 ```rust
-/// A small address book.
 #[weaveffi::module]
 pub mod contacts {
-    /// An address-book entry.
     #[weaveffi::record]
     #[derive(Clone)]
     pub struct Contact {
@@ -34,13 +67,11 @@ pub mod contacts {
         pub email: Option<String>,
     }
 
-    /// Create a contact.
     #[weaveffi::export]
     pub fn create_contact(name: String, email: Option<String>) -> Contact {
         Contact { id: 1, name, email }
     }
 
-    /// List every stored contact.
     #[weaveffi::export]
     pub fn list_contacts() -> Vec<Contact> {
         Vec::new()
@@ -51,15 +82,13 @@ pub mod contacts {
 weaveffi::export_runtime!();
 ```
 
-Building this `cdylib` exports the `extern "C"` symbols the bindings call; you
-write no `unsafe` glue. Prefer an IDL? The same surface as YAML, plus the
-`weaveffi generate contacts.yml` flow, is in
-[Getting Started](docs/src/getting-started.md).
-
-**3. Generate bindings** straight from the annotated source:
+**3. Generate bindings** from the IDL (or, for a Rust producer, straight from
+the annotated source):
 
 ```bash
-weaveffi generate src/lib.rs -o generated --target c,swift,python,node,dart
+weaveffi generate contacts.yml -o generated --target c,swift,python,node,dart
+# Rust producer: point generate at the annotated source instead
+weaveffi generate src/lib.rs  -o generated --target c,swift,python,node,dart
 ```
 
 **4. Use the generated code from any of the eleven supported languages.**

@@ -1,21 +1,21 @@
 # Introduction
 
-**WeaveFFI turns one safe-Rust definition into type-safe bindings for 11
-languages: no hand-written JNI, no duplicate implementations, no unsafe
+**WeaveFFI generates type-safe bindings for 11 languages for any native library
+that exposes a C ABI, whether it's written in Rust, C, C++, Zig, or another
+language: no hand-written JNI, no duplicate implementations, no unsafe
 boilerplate.**
 
-Annotate a normal Rust module with `#[weaveffi::module]` and the `weaveffi`
-crate generates the stable C ABI for you; the same annotated source generates
+Define your API once as an IDL in YAML, JSON, or TOML, and WeaveFFI generates
 idiomatic packages for C, C++, Swift, Kotlin/Android, Node.js, WebAssembly,
-Python, .NET, Dart, Go, and Ruby. Prefer to design the contract first? Author
-the IDL in YAML, JSON, or TOML instead. Both paths share one engine, so the
-producer you build and the bindings you ship cannot drift.
+Python, .NET, Dart, Go, and Ruby, all talking to the same stable C ABI. Any
+backend that implements the symbols declared in the generated C header can be
+the producer.
 
-WeaveFFI works with any native library that exposes the C ABI, whether it's
-written in Rust, C, C++, Zig, or another language. Rust producers get the C
-ABI for free from the [`#[weaveffi::module]` macro](guides/producer-macro.md);
-other backends implement the symbols declared in the generated C header
-directly.
+Writing your producer in Rust? Annotate a normal module with
+`#[weaveffi::module]` and the macro generates the C ABI and derives the IDL for
+you, so you write no `unsafe` glue and keep no separate IDL in sync. The macro
+is one ergonomic path onto the same engine the IDL uses, so whichever you pick,
+the producer you build and the bindings you ship cannot drift.
 
 ## Why WeaveFFI?
 
@@ -46,7 +46,7 @@ package rather than pulled from a shared runtime dependency.
 
 ## Where to next
 
-- [Getting Started](getting-started.md): install, annotate Rust, generate, and call from C.
+- [Getting Started](getting-started.md): install, define an IDL, generate, and call from C.
 - [The Rust Producer Macro](guides/producer-macro.md): the `#[weaveffi::module]` attribute family, the supported feature set, and the roadmap.
 - [Comparison](comparison.md): feature matrix vs UniFFI, cbindgen, diplomat, SWIG, autocxx, and an honest "when to choose WeaveFFI" guide.
 - [FAQ](faq.md): runtime cost, customization, Windows support, distribution, licensing.
