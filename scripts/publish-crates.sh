@@ -7,6 +7,12 @@ CRATES=(
   weaveffi-ir
   weaveffi-abi
   weaveffi-core
+  # Producer-macro crates. weaveffi-bridge must precede weaveffi-macros and
+  # weaveffi-cli, which both depend on it; the weaveffi facade re-exports
+  # weaveffi-macros, so it follows them.
+  weaveffi-bridge
+  weaveffi-macros
+  weaveffi
   weaveffi-gen-c
   weaveffi-gen-swift
   weaveffi-gen-android
