@@ -65,7 +65,7 @@ contacts.weaveffi_contacts_delete_contact.argtypes = [
     ctypes.c_uint64,
     ctypes.POINTER(WeaveffiError),
 ]
-contacts.weaveffi_contacts_delete_contact.restype = ctypes.c_int32
+contacts.weaveffi_contacts_delete_contact.restype = ctypes.c_bool
 
 contacts.weaveffi_contacts_count_contacts.argtypes = [ctypes.POINTER(WeaveffiError)]
 contacts.weaveffi_contacts_count_contacts.restype = ctypes.c_int32
@@ -99,7 +99,7 @@ for _i in range(length.value):
 err = WeaveffiError()
 deleted = contacts.weaveffi_contacts_delete_contact(h, ctypes.byref(err))
 check(err.code == 0, "delete_contact error")
-check(deleted == 1, "delete_contact did not return 1")
+check(deleted, "delete_contact did not return true")
 
 err = WeaveffiError()
 remaining = contacts.weaveffi_contacts_count_contacts(ctypes.byref(err))

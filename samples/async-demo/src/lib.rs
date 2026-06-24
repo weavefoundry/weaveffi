@@ -123,7 +123,7 @@ mod tests {
     ) {
         let tx = unsafe { &*(context as *const mpsc::Sender<TaskCbMsg>) };
         let had_error = !err.is_null() && unsafe { (*err).code } != 0;
-        tx.send((had_error, result)).unwrap();
+        let _ = tx.send((had_error, result));
     }
 
     extern "C" fn batch_callback(
@@ -134,13 +134,13 @@ mod tests {
     ) {
         let tx = unsafe { &*(context as *const mpsc::Sender<BatchCbMsg>) };
         let had_error = !err.is_null() && unsafe { (*err).code } != 0;
-        tx.send((had_error, results, results_len)).unwrap();
+        let _ = tx.send((had_error, results, results_len));
     }
 
     extern "C" fn n_tasks_callback(context: *mut c_void, err: *mut weaveffi_error, result: i32) {
         let tx = unsafe { &*(context as *const mpsc::Sender<(bool, i32)>) };
         let had_error = !err.is_null() && unsafe { (*err).code } != 0;
-        tx.send((had_error, result)).unwrap();
+        let _ = tx.send((had_error, result));
     }
 
     /// Free a returned `[TaskResult]`: destroy each element, then reclaim the
@@ -156,6 +156,20 @@ mod tests {
         unsafe { drop(Vec::from_raw_parts(results, len, len)) };
     }
 
+    /// Intentionally leak a callback-context box.
+    ///
+    /// The `#[weaveffi::module]` async launchers invoke the completion callback
+    /// on a detached worker thread, so a worker may still be inside the
+    /// callback's `send` when the test's `recv` returns (the receiver unblocks
+    /// as soon as the message is queued, before `send` finishes). Reclaiming the
+    /// box here would free the `Sender` out from under that in-flight `send`, a
+    /// use-after-free. The test deliberately leaks the context instead, which
+    /// keeps the channel alive for the brief remaining life of any in-flight
+    /// callback; the OS reclaims the memory at process exit.
+    fn leak_ctx<T>(ptr: *mut T) {
+        std::mem::forget(unsafe { Box::from_raw(ptr) });
+    }
+
     #[test]
     fn run_task_calls_callback() {
         let (tx, rx) = mpsc::channel::<TaskCbMsg>();
@@ -165,7 +179,7 @@ mod tests {
         weaveffi_tasks_run_task_async(name.as_ptr(), task_callback, tx_ptr as *mut c_void);
 
         let (had_error, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        unsafe { drop(Box::from_raw(tx_ptr)) };
+        leak_ctx(tx_ptr);
         assert!(!had_error);
         assert!(!result.is_null());
 
@@ -185,7 +199,7 @@ mod tests {
         weaveffi_tasks_run_task_async(std::ptr::null(), task_callback, tx_ptr as *mut c_void);
 
         let (had_error, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        unsafe { drop(Box::from_raw(tx_ptr)) };
+        leak_ctx(tx_ptr);
         assert!(!had_error);
         assert!(!result.is_null());
 
@@ -215,7 +229,7 @@ mod tests {
         );
 
         let (had_error, results, results_len) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        unsafe { drop(Box::from_raw(tx_ptr)) };
+        leak_ctx(tx_ptr);
         assert!(!had_error);
         assert_eq!(results_len, 3);
         assert!(!results.is_null());
@@ -242,7 +256,7 @@ mod tests {
         weaveffi_tasks_run_batch_async(std::ptr::null(), 0, batch_callback, tx_ptr as *mut c_void);
 
         let (had_error, results, results_len) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        unsafe { drop(Box::from_raw(tx_ptr)) };
+        leak_ctx(tx_ptr);
         assert!(!had_error);
         assert_eq!(results_len, 0);
         assert!(results.is_null());
@@ -294,7 +308,7 @@ mod tests {
         let tx_ptr = Box::into_raw(Box::new(tx));
         weaveffi_tasks_run_n_tasks_async(7, n_tasks_callback, tx_ptr as *mut c_void);
         let (had_error, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        unsafe { drop(Box::from_raw(tx_ptr)) };
+        leak_ctx(tx_ptr);
         assert!(!had_error);
         assert_eq!(result, 7);
     }
@@ -311,7 +325,7 @@ mod tests {
         for _ in 0..16 {
             rx.recv_timeout(Duration::from_secs(5)).unwrap();
         }
-        unsafe { drop(Box::from_raw(tx_ptr)) };
+        leak_ctx(tx_ptr);
 
         for _ in 0..50 {
             if weaveffi_tasks_active_callbacks(&mut err) == 0 {

@@ -66,7 +66,7 @@ func main() {
 	var destroy func(c uintptr)
 	purego.RegisterLibFunc(&destroy, contacts, "weaveffi_contacts_Contact_destroy")
 
-	var del func(h uint64, err *weaveffiError) int32
+	var del func(h uint64, err *weaveffiError) bool
 	purego.RegisterLibFunc(&del, contacts, "weaveffi_contacts_delete_contact")
 
 	var count func(err *weaveffiError) int32
@@ -99,7 +99,7 @@ func main() {
 	err = weaveffiError{}
 	deleted := del(h, &err)
 	check(err.code == 0, "delete_contact error")
-	check(deleted == 1, "delete_contact did not return 1")
+	check(deleted, "delete_contact did not return true")
 
 	err = weaveffiError{}
 	check(count(&err) == 0, "store not empty after cleanup")

@@ -25,7 +25,7 @@ module Contacts
   attach_function :weaveffi_contacts_list_contacts, [:pointer, :pointer], :pointer
   attach_function :weaveffi_contacts_Contact_get_id, [:pointer], :int64
   attach_function :weaveffi_contacts_Contact_destroy, [:pointer], :void
-  attach_function :weaveffi_contacts_delete_contact, [:uint64, :pointer], :int32
+  attach_function :weaveffi_contacts_delete_contact, [:uint64, :pointer], :bool
   attach_function :weaveffi_contacts_count_contacts, [:pointer], :int32
 end
 
@@ -63,7 +63,7 @@ end
 err = WeaveffiError.new
 deleted = Contacts.weaveffi_contacts_delete_contact(h, err)
 check(err[:code].zero?, 'delete_contact error')
-check(deleted == 1, 'delete_contact did not return 1')
+check(deleted, 'delete_contact did not return true')
 
 err = WeaveffiError.new
 check(Contacts.weaveffi_contacts_count_contacts(err).zero?, 'store not empty after cleanup')

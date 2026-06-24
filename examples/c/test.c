@@ -21,7 +21,7 @@ weaveffi_contacts_Contact** weaveffi_contacts_list_contacts(
     size_t* out_len, weaveffi_error* out_err);
 int64_t weaveffi_contacts_Contact_get_id(const weaveffi_contacts_Contact* ptr);
 void weaveffi_contacts_Contact_destroy(weaveffi_contacts_Contact* ptr);
-int32_t weaveffi_contacts_delete_contact(weaveffi_handle_t id, weaveffi_error* out_err);
+bool weaveffi_contacts_delete_contact(weaveffi_handle_t id, weaveffi_error* out_err);
 int32_t weaveffi_contacts_count_contacts(weaveffi_error* out_err);
 
 #define ASSERT(cond, msg) do { \
@@ -55,9 +55,9 @@ int main(void) {
     }
 
     err = (weaveffi_error){0};
-    int32_t deleted = weaveffi_contacts_delete_contact(h, &err);
+    bool deleted = weaveffi_contacts_delete_contact(h, &err);
     ASSERT(err.code == 0, "delete_contact error");
-    ASSERT(deleted == 1, "delete_contact did not return 1");
+    ASSERT(deleted, "delete_contact did not return true");
 
     err = (weaveffi_error){0};
     ASSERT(weaveffi_contacts_count_contacts(&err) == 0, "store not empty after cleanup");

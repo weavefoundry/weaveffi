@@ -48,7 +48,8 @@ internal static class Contacts
     internal static extern void weaveffi_contacts_Contact_destroy(IntPtr ptr);
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern int weaveffi_contacts_delete_contact(ulong id, ref WeaveffiError err);
+    [return: MarshalAs(UnmanagedType.U1)]
+    internal static extern bool weaveffi_contacts_delete_contact(ulong id, ref WeaveffiError err);
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern int weaveffi_contacts_count_contacts(ref WeaveffiError err);
@@ -114,7 +115,7 @@ internal static class Program
         err = new WeaveffiError();
         var deleted = Contacts.weaveffi_contacts_delete_contact(h, ref err);
         Check(err.Code == 0, "delete_contact error");
-        Check(deleted == 1, "delete_contact did not return 1");
+        Check(deleted, "delete_contact did not return true");
 
         err = new WeaveffiError();
         Check(Contacts.weaveffi_contacts_count_contacts(ref err) == 0,

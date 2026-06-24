@@ -66,7 +66,7 @@ int main() {
     using ListFn = void** (*)(size_t*, weaveffi_error*);
     using GetIdFn = int64_t (*)(const void*);
     using DestroyFn = void (*)(void*);
-    using DeleteFn = int32_t (*)(weaveffi_handle_t, weaveffi_error*);
+    using DeleteFn = bool (*)(weaveffi_handle_t, weaveffi_error*);
     using CountFn = int32_t (*)(weaveffi_error*);
 
     auto add = must_sym<AddFn>(calc, "weaveffi_calculator_add");
@@ -99,9 +99,9 @@ int main() {
     }
 
     err = {};
-    int32_t deleted = del(h, &err);
+    bool deleted = del(h, &err);
     ASSERT(err.code == 0, "delete_contact error");
-    ASSERT(deleted == 1, "delete_contact did not return 1");
+    ASSERT(deleted, "delete_contact did not return true");
 
     err = {};
     ASSERT(count(&err) == 0, "store not empty after cleanup");

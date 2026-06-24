@@ -67,7 +67,7 @@ typealias ListFn = @convention(c) (
 ) -> UnsafeMutablePointer<UnsafeMutableRawPointer?>?
 typealias GetIdFn = @convention(c) (UnsafeRawPointer) -> Int64
 typealias DestroyFn = @convention(c) (UnsafeMutableRawPointer?) -> Void
-typealias DeleteFn = @convention(c) (UInt64, UnsafeMutableRawPointer) -> Int32
+typealias DeleteFn = @convention(c) (UInt64, UnsafeMutableRawPointer) -> Bool
 typealias CountFn = @convention(c) (UnsafeMutableRawPointer) -> Int32
 
 let add = mustSym(calc, "weaveffi_calculator_add", as: AddFn.self)
@@ -111,7 +111,7 @@ for i in 0..<len {
 err.initializeMemory(as: UInt8.self, repeating: 0, count: errorSize)
 let deleted = del(h, err)
 check(errorCode(err) == 0, "delete_contact error")
-check(deleted == 1, "delete_contact did not return 1")
+check(deleted, "delete_contact did not return true")
 
 err.initializeMemory(as: UInt8.self, repeating: 0, count: errorSize)
 check(count(err) == 0, "store not empty after cleanup")

@@ -34,8 +34,8 @@ typedef GetIdDart = int Function(Pointer<Void>);
 typedef DestroyNative = Void Function(Pointer<Void>);
 typedef DestroyDart = void Function(Pointer<Void>);
 
-typedef DeleteNative = Int32 Function(Uint64, Pointer<WeaveffiError>);
-typedef DeleteDart = int Function(int, Pointer<WeaveffiError>);
+typedef DeleteNative = Bool Function(Uint64, Pointer<WeaveffiError>);
+typedef DeleteDart = bool Function(int, Pointer<WeaveffiError>);
 
 typedef CountNative = Int32 Function(Pointer<WeaveffiError>);
 typedef CountDart = int Function(Pointer<WeaveffiError>);
@@ -105,7 +105,7 @@ void main() {
     err.ref.code = 0;
     final deleted = del(h, err);
     check(err.ref.code == 0, 'delete_contact error');
-    check(deleted == 1, 'delete_contact did not return 1');
+    check(deleted, 'delete_contact did not return true');
 
     err.ref.code = 0;
     check(count(err) == 0, 'store not empty after cleanup');
