@@ -21,7 +21,6 @@ path = "src/main.rs"
 clap = { workspace = true }
 clap_complete = { workspace = true }
 tracing-subscriber = { workspace = true }
-color-eyre = { workspace = true }
 miette = { workspace = true }
 camino = { workspace = true }
 serde = { workspace = true }

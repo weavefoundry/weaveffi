@@ -24,7 +24,7 @@ module Contacts
                   [:string, :string, :string, :int32, :pointer], :uint64
   attach_function :weaveffi_contacts_list_contacts, [:pointer, :pointer], :pointer
   attach_function :weaveffi_contacts_Contact_get_id, [:pointer], :int64
-  attach_function :weaveffi_contacts_Contact_list_free, [:pointer, :size_t], :void
+  attach_function :weaveffi_contacts_Contact_destroy, [:pointer], :void
   attach_function :weaveffi_contacts_delete_contact, [:uint64, :pointer], :int32
   attach_function :weaveffi_contacts_count_contacts, [:pointer], :int32
 end
@@ -56,7 +56,9 @@ check(!items.null?, 'list_contacts null')
 
 first_ptr = items.read_pointer
 check(Contacts.weaveffi_contacts_Contact_get_id(first_ptr) == h, 'id mismatch')
-Contacts.weaveffi_contacts_Contact_list_free(items, n)
+items.read_array_of_pointer(n).each do |c|
+  Contacts.weaveffi_contacts_Contact_destroy(c)
+end
 
 err = WeaveffiError.new
 deleted = Contacts.weaveffi_contacts_delete_contact(h, err)

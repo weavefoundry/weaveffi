@@ -66,7 +66,7 @@ typealias ListFn = @convention(c) (
     UnsafeMutablePointer<Int>, UnsafeMutableRawPointer
 ) -> UnsafeMutablePointer<UnsafeMutableRawPointer?>?
 typealias GetIdFn = @convention(c) (UnsafeRawPointer) -> Int64
-typealias ListFreeFn = @convention(c) (UnsafeMutablePointer<UnsafeMutableRawPointer?>?, Int) -> Void
+typealias DestroyFn = @convention(c) (UnsafeMutableRawPointer?) -> Void
 typealias DeleteFn = @convention(c) (UInt64, UnsafeMutableRawPointer) -> Int32
 typealias CountFn = @convention(c) (UnsafeMutableRawPointer) -> Int32
 
@@ -74,7 +74,7 @@ let add = mustSym(calc, "weaveffi_calculator_add", as: AddFn.self)
 let create = mustSym(contacts, "weaveffi_contacts_create_contact", as: CreateFn.self)
 let list = mustSym(contacts, "weaveffi_contacts_list_contacts", as: ListFn.self)
 let getID = mustSym(contacts, "weaveffi_contacts_Contact_get_id", as: GetIdFn.self)
-let listFree = mustSym(contacts, "weaveffi_contacts_Contact_list_free", as: ListFreeFn.self)
+let destroy = mustSym(contacts, "weaveffi_contacts_Contact_destroy", as: DestroyFn.self)
 let del = mustSym(contacts, "weaveffi_contacts_delete_contact", as: DeleteFn.self)
 let count = mustSym(contacts, "weaveffi_contacts_count_contacts", as: CountFn.self)
 
@@ -104,7 +104,9 @@ check(len == 1, "list_contacts length != 1")
 check(items != nil, "list_contacts null")
 let firstPtr = items![0]!
 check(getID(firstPtr) == Int64(h), "id mismatch")
-listFree(items, len)
+for i in 0..<len {
+    destroy(items![i])
+}
 
 err.initializeMemory(as: UInt8.self, repeating: 0, count: errorSize)
 let deleted = del(h, err)

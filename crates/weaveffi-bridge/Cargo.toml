@@ -10,7 +10,7 @@ keywords = ["ffi", "codegen", "proc-macro", "bindings", "weaveffi"]
 categories = ["development-tools::ffi"]
 
 [dependencies]
-weaveffi-ir = { path = "../weaveffi-ir" }
+weaveffi-ir = { path = "../weaveffi-ir", version = "0.12.0" }
 syn = { workspace = true }
 
 [lints]

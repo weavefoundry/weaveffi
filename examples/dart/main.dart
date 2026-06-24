@@ -31,8 +31,8 @@ typedef ListDart = Pointer<Pointer<Void>> Function(
 typedef GetIdNative = Int64 Function(Pointer<Void>);
 typedef GetIdDart = int Function(Pointer<Void>);
 
-typedef ListFreeNative = Void Function(Pointer<Pointer<Void>>, Size);
-typedef ListFreeDart = void Function(Pointer<Pointer<Void>>, int);
+typedef DestroyNative = Void Function(Pointer<Void>);
+typedef DestroyDart = void Function(Pointer<Void>);
 
 typedef DeleteNative = Int32 Function(Uint64, Pointer<WeaveffiError>);
 typedef DeleteDart = int Function(int, Pointer<WeaveffiError>);
@@ -66,8 +66,8 @@ void main() {
       .lookupFunction<ListNative, ListDart>('weaveffi_contacts_list_contacts');
   final getId = contacts
       .lookupFunction<GetIdNative, GetIdDart>('weaveffi_contacts_Contact_get_id');
-  final listFree = contacts.lookupFunction<ListFreeNative, ListFreeDart>(
-      'weaveffi_contacts_Contact_list_free');
+  final destroy = contacts.lookupFunction<DestroyNative, DestroyDart>(
+      'weaveffi_contacts_Contact_destroy');
   final del = contacts
       .lookupFunction<DeleteNative, DeleteDart>('weaveffi_contacts_delete_contact');
   final count = contacts
@@ -98,7 +98,9 @@ void main() {
     check(err.ref.code == 0, 'list_contacts error');
     check(len == 1, 'list_contacts length != 1');
     check(getId(items[0]) == h, 'id mismatch');
-    listFree(items, len);
+    for (var i = 0; i < len; i++) {
+      destroy(items[i]);
+    }
 
     err.ref.code = 0;
     final deleted = del(h, err);

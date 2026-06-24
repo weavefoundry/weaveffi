@@ -17,8 +17,7 @@ const char* weaveffi_contacts_Contact_get_first_name(const weaveffi_contacts_Con
 const char* weaveffi_contacts_Contact_get_last_name(const weaveffi_contacts_Contact* ptr);
 const char* weaveffi_contacts_Contact_get_email(const weaveffi_contacts_Contact* ptr);
 int32_t weaveffi_contacts_Contact_get_contact_type(const weaveffi_contacts_Contact* ptr);
-void weaveffi_contacts_Contact_free(weaveffi_contacts_Contact* ptr);
-void weaveffi_contacts_Contact_list_free(weaveffi_contacts_Contact** list, size_t len);
+void weaveffi_contacts_Contact_destroy(weaveffi_contacts_Contact* ptr);
 
 static const char* type_label(int32_t ct) {
     switch (ct) {
@@ -66,6 +65,8 @@ int main(void) {
         if (email) weaveffi_free_string(email);
     }
 
-    weaveffi_contacts_Contact_list_free(list, len);
+    for (size_t i = 0; i < len; i++) {
+        weaveffi_contacts_Contact_destroy(list[i]);
+    }
     return 0;
 }
