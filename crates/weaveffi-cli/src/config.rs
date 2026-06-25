@@ -479,4 +479,69 @@ mod tests {
         assert_eq!(cfg.android.package(), "com.weaveffi");
         assert!(!cfg.global.strip_module_prefix);
     }
+
+    /// Every registered target's *declared* [`TargetCapabilities`] must match
+    /// the documented feature matrix. This pins the declarations so a backend
+    /// cannot silently claim (or drop) a gated feature: the matrix here, the
+    /// generator's `capabilities()`, and `docs/src/generators/README.md` are
+    /// changed together or this test fails.
+    ///
+    /// Declaration accuracy is only half the contract. The companion guard in
+    /// `tests/no_silent_stubs.rs` proves a *declared* feature is actually
+    /// emitted (no `unimplemented!`/`todo!` source, no stub markers in output),
+    /// and the conformance harness proves it runs. Together they make "declared
+    /// capabilities match reality" enforceable rather than aspirational.
+    #[test]
+    fn declared_capabilities_match_documented_matrix() {
+        use std::collections::BTreeMap;
+        use weaveffi_core::capabilities::TargetCapabilities;
+
+        // Only wasm is partial: the browser sandbox cannot deliver
+        // producer-initiated callbacks/listeners. Every other target is full.
+        let wasm = TargetCapabilities {
+            async_functions: true,
+            callbacks: false,
+            listeners: false,
+            iterators: true,
+        };
+        let expected: &[(&str, TargetCapabilities)] = &[
+            ("c", TargetCapabilities::full()),
+            ("cpp", TargetCapabilities::full()),
+            ("swift", TargetCapabilities::full()),
+            ("android", TargetCapabilities::full()),
+            ("node", TargetCapabilities::full()),
+            ("wasm", wasm),
+            ("python", TargetCapabilities::full()),
+            ("dotnet", TargetCapabilities::full()),
+            ("dart", TargetCapabilities::full()),
+            ("go", TargetCapabilities::full()),
+            ("ruby", TargetCapabilities::full()),
+        ];
+
+        let generators = CliConfig::default().build_generators();
+        let actual: BTreeMap<&str, TargetCapabilities> = generators
+            .iter()
+            .map(|g| (g.name(), g.capabilities()))
+            .collect();
+
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "registry has {} targets but the matrix lists {}; add the new \
+             target to the matrix (and the docs feature table)",
+            actual.len(),
+            expected.len(),
+        );
+        for (name, caps) in expected {
+            let got = actual.get(name).unwrap_or_else(|| {
+                panic!("target '{name}' is missing from the generator registry")
+            });
+            assert_eq!(
+                got, caps,
+                "declared capabilities for '{name}' drifted from the documented \
+                 matrix; reconcile the generator's capabilities(), this table, and \
+                 docs/src/generators/README.md",
+            );
+        }
+    }
 }

@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use weaveffi_core::abi::{self, AbiParam, CType};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
+use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::model::{
     BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
     IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding, RichVariantBinding,
@@ -613,6 +614,24 @@ fn emit_fn_doc(out: &mut String, doc: &Option<String>, params: &[ParamBinding], 
     }
 }
 
+/// Emit [`emit_doc`] at the writer's current depth by rendering into a scratch
+/// buffer and splicing it verbatim, so a [`CodeWriter`]-based renderer can
+/// interleave XML doc comments without re-implementing their formatting.
+fn writer_doc(w: &mut CodeWriter, doc: &Option<String>) {
+    let mut tmp = String::new();
+    emit_doc(&mut tmp, doc, &w.indent_str());
+    w.raw(tmp);
+}
+
+/// Emit [`emit_fn_doc`] at the writer's current depth, splicing the rendered
+/// `<summary>`/`<param>` block in verbatim. The [`CodeWriter`] companion to
+/// [`emit_fn_doc`] used by the method renderers.
+fn writer_fn_doc(w: &mut CodeWriter, doc: &Option<String>, params: &[ParamBinding]) {
+    let mut tmp = String::new();
+    emit_fn_doc(&mut tmp, doc, params, &w.indent_str());
+    w.raw(tmp);
+}
+
 fn render_csharp(
     api: &Api,
     namespace: &str,
@@ -679,45 +698,62 @@ fn render_csharp(
 }
 
 fn render_exception_class(out: &mut String) {
-    out.push_str("    public class WeaveFFIException : Exception\n    {\n");
-    out.push_str("        public int Code { get; }\n\n");
-    out.push_str("        public WeaveFFIException(int code, string message) : base(message)\n");
-    out.push_str("        {\n");
-    out.push_str("            Code = code;\n");
-    out.push_str("        }\n");
-    out.push_str("    }\n\n");
+    let mut w = CodeWriter::four_space().with_depth(1);
+    w.line("public class WeaveFFIException : Exception");
+    w.block("{", "}", |w| {
+        w.line("public int Code { get; }");
+        w.blank();
+        w.line("public WeaveFFIException(int code, string message) : base(message)");
+        w.block("{", "}", |w| {
+            w.line("Code = code;");
+        });
+    });
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 fn render_error_struct(out: &mut String) {
-    out.push_str("    [StructLayout(LayoutKind.Sequential)]\n");
-    out.push_str("    internal struct WeaveFFIError\n    {\n");
-    out.push_str("        public int Code;\n");
-    out.push_str("        public IntPtr Message;\n\n");
-    out.push_str("        internal static void Check(WeaveFFIError err)\n");
-    out.push_str("        {\n");
-    out.push_str("            if (err.Code != 0)\n");
-    out.push_str("            {\n");
-    out.push_str("                var msg = Marshal.PtrToStringUTF8(err.Message) ?? \"\";\n");
-    out.push_str("                throw new WeaveFFIException(err.Code, msg);\n");
-    out.push_str("            }\n");
-    out.push_str("        }\n");
-    out.push_str("    }\n\n");
+    let mut w = CodeWriter::four_space().with_depth(1);
+    w.line("[StructLayout(LayoutKind.Sequential)]");
+    w.line("internal struct WeaveFFIError");
+    w.block("{", "}", |w| {
+        w.line("public int Code;");
+        w.line("public IntPtr Message;");
+        w.blank();
+        w.line("internal static void Check(WeaveFFIError err)");
+        w.block("{", "}", |w| {
+            w.line("if (err.Code != 0)");
+            w.block("{", "}", |w| {
+                w.line("var msg = Marshal.PtrToStringUTF8(err.Message) ?? \"\";");
+                w.line("throw new WeaveFFIException(err.Code, msg);");
+            });
+        });
+    });
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 fn render_helpers_class(out: &mut String) {
-    out.push_str("    internal static class WeaveFFIHelpers\n    {\n");
-    out.push_str("        internal static IntPtr StringToPtr(string? s)\n        {\n");
-    out.push_str(
-        "            return s == null ? IntPtr.Zero : Marshal.StringToCoTaskMemUTF8(s);\n",
-    );
-    out.push_str("        }\n\n");
-    out.push_str("        internal static string? PtrToString(IntPtr ptr)\n        {\n");
-    out.push_str("            return ptr == IntPtr.Zero ? null : Marshal.PtrToStringUTF8(ptr);\n");
-    out.push_str("        }\n\n");
-    out.push_str("        internal static void FreePtr(IntPtr ptr)\n        {\n");
-    out.push_str("            Marshal.FreeCoTaskMem(ptr);\n");
-    out.push_str("        }\n");
-    out.push_str("    }\n\n");
+    let mut w = CodeWriter::four_space().with_depth(1);
+    w.line("internal static class WeaveFFIHelpers");
+    w.block("{", "}", |w| {
+        w.line("internal static IntPtr StringToPtr(string? s)");
+        w.block("{", "}", |w| {
+            w.line("return s == null ? IntPtr.Zero : Marshal.StringToCoTaskMemUTF8(s);");
+        });
+        w.blank();
+        w.line("internal static string? PtrToString(IntPtr ptr)");
+        w.block("{", "}", |w| {
+            w.line("return ptr == IntPtr.Zero ? null : Marshal.PtrToStringUTF8(ptr);");
+        });
+        w.blank();
+        w.line("internal static void FreePtr(IntPtr ptr)");
+        w.block("{", "}", |w| {
+            w.line("Marshal.FreeCoTaskMem(ptr);");
+        });
+    });
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 fn render_enum(out: &mut String, e: &EnumBinding) {
@@ -727,48 +763,60 @@ fn render_enum(out: &mut String, e: &EnumBinding) {
     if e.is_rich() {
         return;
     }
-    emit_doc(out, &e.doc, "    ");
-    out.push_str(&format!("    public enum {}\n    {{\n", e.name));
-    for v in &e.variants {
-        emit_doc(out, &v.doc, "        ");
-        out.push_str(&format!("        {} = {},\n", v.name, v.value));
-    }
-    out.push_str("    }\n\n");
+    let mut w = CodeWriter::four_space().with_depth(1);
+    writer_doc(&mut w, &e.doc);
+    w.line(format!("public enum {}", e.name));
+    w.block("{", "}", |w| {
+        for v in &e.variants {
+            writer_doc(w, &v.doc);
+            w.line(format!("{} = {},", v.name, v.value));
+        }
+    });
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 fn render_struct_class(out: &mut String, s: &StructBinding) {
-    emit_doc(out, &s.doc, "    ");
-    out.push_str(&format!(
-        "    public class {} : IDisposable\n    {{\n",
-        s.name
-    ));
-    out.push_str("        private IntPtr _handle;\n");
-    out.push_str("        private bool _disposed;\n\n");
-    out.push_str(&format!(
-        "        internal {}(IntPtr handle)\n        {{\n            _handle = handle;\n        }}\n\n",
-        s.name
-    ));
-    out.push_str("        internal IntPtr Handle => _handle;\n\n");
+    let mut w = CodeWriter::four_space().with_depth(1);
+    writer_doc(&mut w, &s.doc);
+    w.line(format!("public class {} : IDisposable", s.name));
+    w.line("{");
+    w.indent();
+    w.line("private IntPtr _handle;");
+    w.line("private bool _disposed;");
+    w.blank();
+    w.line(format!("internal {}(IntPtr handle)", s.name));
+    w.block("{", "}", |w| {
+        w.line("_handle = handle;");
+    });
+    w.blank();
+    w.line("internal IntPtr Handle => _handle;");
+    w.blank();
 
     for field in &s.fields {
-        render_struct_getter(out, field);
+        let mut tmp = String::new();
+        render_struct_getter(&mut tmp, field);
+        w.raw(tmp);
     }
 
-    out.push_str("        public void Dispose()\n        {\n");
-    out.push_str("            if (!_disposed)\n            {\n");
-    out.push_str(&format!(
-        "                NativeMethods.{}(_handle);\n",
-        s.destroy_symbol
-    ));
-    out.push_str("                _disposed = true;\n");
-    out.push_str("            }\n");
-    out.push_str("            GC.SuppressFinalize(this);\n");
-    out.push_str("        }\n\n");
-    out.push_str(&format!(
-        "        ~{}()\n        {{\n            Dispose();\n        }}\n",
-        s.name
-    ));
-    out.push_str("    }\n\n");
+    w.line("public void Dispose()");
+    w.block("{", "}", |w| {
+        w.line("if (!_disposed)");
+        w.block("{", "}", |w| {
+            w.line(format!("NativeMethods.{}(_handle);", s.destroy_symbol));
+            w.line("_disposed = true;");
+        });
+        w.line("GC.SuppressFinalize(this);");
+    });
+    w.blank();
+    w.line(format!("~{}()", s.name));
+    w.block("{", "}", |w| {
+        w.line("Dispose();");
+    });
+    w.dedent();
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// Render a rich (algebraic) enum as an opaque-object `IDisposable` class,
@@ -786,33 +834,46 @@ fn render_rich_enum_class(out: &mut String, e: &EnumBinding) {
     };
     let name = &e.name;
 
-    emit_doc(out, &e.doc, "    ");
-    out.push_str(&format!("    public class {name} : IDisposable\n    {{\n"));
-    out.push_str("        private IntPtr _handle;\n");
-    out.push_str("        private bool _disposed;\n\n");
-    out.push_str(&format!(
-        "        internal {name}(IntPtr handle)\n        {{\n            _handle = handle;\n        }}\n\n"
-    ));
-    out.push_str("        internal IntPtr Handle => _handle;\n\n");
+    let mut w = CodeWriter::four_space().with_depth(1);
+    writer_doc(&mut w, &e.doc);
+    w.line(format!("public class {name} : IDisposable"));
+    w.line("{");
+    w.indent();
+    w.line("private IntPtr _handle;");
+    w.line("private bool _disposed;");
+    w.blank();
+    w.line(format!("internal {name}(IntPtr handle)"));
+    w.block("{", "}", |w| {
+        w.line("_handle = handle;");
+    });
+    w.blank();
+    w.line("internal IntPtr Handle => _handle;");
+    w.blank();
 
     // Nested discriminant enum + typed reader. `Tag` is a nested type, so the
     // reader is `GetTag()` (a `Tag` property would collide with the type name).
-    out.push_str("        public enum Tag\n        {\n");
-    for v in &e.variants {
-        emit_doc(out, &v.doc, "            ");
-        out.push_str(&format!("            {} = {},\n", v.name, v.value));
-    }
-    out.push_str("        }\n\n");
-    out.push_str("        public Tag GetTag()\n        {\n");
-    out.push_str(&format!(
-        "            return (Tag)NativeMethods.{}(_handle);\n",
-        rich.tag_symbol
-    ));
-    out.push_str("        }\n\n");
+    w.line("public enum Tag");
+    w.block("{", "}", |w| {
+        for v in &e.variants {
+            writer_doc(w, &v.doc);
+            w.line(format!("{} = {},", v.name, v.value));
+        }
+    });
+    w.blank();
+    w.line("public Tag GetTag()");
+    w.block("{", "}", |w| {
+        w.line(format!(
+            "return (Tag)NativeMethods.{}(_handle);",
+            rich.tag_symbol
+        ));
+    });
+    w.blank();
 
     // One static factory per variant.
     for v in &rich.variants {
-        render_rich_variant_factory(out, name, v);
+        let mut tmp = String::new();
+        render_rich_variant_factory(&mut tmp, name, v);
+        w.raw(tmp);
     }
 
     // Per-variant field accessors, namespaced by variant to avoid collisions
@@ -821,24 +882,30 @@ fn render_rich_enum_class(out: &mut String, e: &EnumBinding) {
         let variant_prefix = v.name.to_upper_camel_case();
         for f in &v.fields {
             let prop_name = format!("{}{}", variant_prefix, f.name.to_upper_camel_case());
-            render_field_getter(out, &prop_name, f);
+            let mut tmp = String::new();
+            render_field_getter(&mut tmp, &prop_name, f);
+            w.raw(tmp);
         }
     }
 
-    out.push_str("        public void Dispose()\n        {\n");
-    out.push_str("            if (!_disposed)\n            {\n");
-    out.push_str(&format!(
-        "                NativeMethods.{}(_handle);\n",
-        rich.destroy_symbol
-    ));
-    out.push_str("                _disposed = true;\n");
-    out.push_str("            }\n");
-    out.push_str("            GC.SuppressFinalize(this);\n");
-    out.push_str("        }\n\n");
-    out.push_str(&format!(
-        "        ~{name}()\n        {{\n            Dispose();\n        }}\n"
-    ));
-    out.push_str("    }\n\n");
+    w.line("public void Dispose()");
+    w.block("{", "}", |w| {
+        w.line("if (!_disposed)");
+        w.block("{", "}", |w| {
+            w.line(format!("NativeMethods.{}(_handle);", rich.destroy_symbol));
+            w.line("_disposed = true;");
+        });
+        w.line("GC.SuppressFinalize(this);");
+    });
+    w.blank();
+    w.line(format!("~{name}()"));
+    w.block("{", "}", |w| {
+        w.line("Dispose();");
+    });
+    w.dedent();
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// One static factory for a rich-enum variant (`Shape.Circle(double radius)`).
@@ -852,13 +919,16 @@ fn render_rich_variant_factory(out: &mut String, enum_name: &str, v: &RichVarian
         .map(|p| format!("{} {}", cs_type(&p.ty), safe_cs_name(&p.name)))
         .collect();
 
-    emit_doc(out, &v.doc, "        ");
-    out.push_str(&format!(
-        "        public static {enum_name} {}({})\n        {{\n",
+    let mut w = CodeWriter::four_space().with_depth(2);
+    writer_doc(&mut w, &v.doc);
+    w.line(format!(
+        "public static {enum_name} {}({})",
         v.name,
         params_sig.join(", ")
     ));
-    out.push_str("            var err = new WeaveFFIError();\n");
+    w.line("{");
+    w.indent();
+    w.line("var err = new WeaveFFIError();");
 
     let needs_try = params.iter().any(|p| param_needs_marshal(&p.ty));
     let call_args = build_call_args(&params);
@@ -874,25 +944,35 @@ fn render_rich_variant_factory(out: &mut String, enum_name: &str, v: &RichVarian
 
     if needs_try {
         for p in &params {
-            render_marshal_setup(out, p, "            ");
+            let mut tmp = String::new();
+            render_marshal_setup(&mut tmp, p, "            ");
+            w.raw(tmp);
         }
-        out.push_str("            try\n            {\n");
-        out.push_str(&format!("                {call}\n"));
-        out.push_str("                WeaveFFIError.Check(err);\n");
-        out.push_str(&format!(
-            "                return new {enum_name}(result);\n"
-        ));
-        out.push_str("            }\n            finally\n            {\n");
+        w.line("try");
+        w.line("{");
+        w.scope(|w| {
+            w.line(call.clone());
+            w.line("WeaveFFIError.Check(err);");
+            w.line(format!("return new {enum_name}(result);"));
+        });
+        w.line("}");
+        w.line("finally");
+        w.line("{");
         for p in &params {
-            render_marshal_cleanup(out, p, "                ");
+            let mut tmp = String::new();
+            render_marshal_cleanup(&mut tmp, p, "                ");
+            w.raw(tmp);
         }
-        out.push_str("            }\n");
+        w.line("}");
     } else {
-        out.push_str(&format!("            {call}\n"));
-        out.push_str("            WeaveFFIError.Check(err);\n");
-        out.push_str(&format!("            return new {enum_name}(result);\n"));
+        w.line(call);
+        w.line("WeaveFFIError.Check(err);");
+        w.line(format!("return new {enum_name}(result);"));
     }
-    out.push_str("        }\n\n");
+    w.dedent();
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// The builder slot's storage type and zero-value default. Scalars start at
@@ -946,36 +1026,41 @@ fn render_builder_class(out: &mut String, s: &StructBinding) {
         return;
     }
     let builder_name = format!("{}Builder", s.name);
-    emit_doc(out, &s.doc, "    ");
-    out.push_str(&format!("    public class {builder_name}\n    {{\n"));
+    let mut w = CodeWriter::four_space().with_depth(1);
+    writer_doc(&mut w, &s.doc);
+    w.line(format!("public class {builder_name}"));
+    w.line("{");
+    w.indent();
     for field in &s.fields {
         let (storage, default) = cs_field_default(&field.ty);
         let fname = safe_cs_name(&field.name);
-        out.push_str(&format!(
-            "        private {storage} _{fname} = {default};\n"
-        ));
+        w.line(format!("private {storage} _{fname} = {default};"));
     }
-    out.push('\n');
+    w.blank();
     for field in &s.fields {
         let pascal = field.name.to_upper_camel_case();
         let param_ty = cs_type(&field.ty);
         let fname = safe_cs_name(&field.name);
-        emit_doc(out, &field.doc, "        ");
-        out.push_str(&format!(
-            "        public {builder_name} With{pascal}({param_ty} value)\n        {{\n            _{fname} = value;\n            return this;\n        }}\n\n"
+        writer_doc(&mut w, &field.doc);
+        w.line(format!(
+            "public {builder_name} With{pascal}({param_ty} value)"
         ));
+        w.block("{", "}", |w| {
+            w.line(format!("_{fname} = value;"));
+            w.line("return this;");
+        });
+        w.blank();
     }
     // Build: marshal every field into the struct's C `create` call with the
     // same lowering used for function parameters, then wrap the handle.
-    out.push_str(&format!(
-        "        public {name} Build()\n        {{\n",
-        name = s.name
-    ));
-    out.push_str("            var err = new WeaveFFIError();\n");
+    w.line(format!("public {} Build()", s.name));
+    w.line("{");
+    w.indent();
+    w.line("var err = new WeaveFFIError();");
     let params: Vec<ParamBinding> = s.fields.iter().map(field_as_param).collect();
     for p in &params {
         let fname = safe_cs_name(&p.name);
-        out.push_str(&format!("            var {fname} = _{fname};\n"));
+        w.line(format!("var {fname} = _{fname};"));
     }
     let needs_try = params.iter().any(|p| param_needs_marshal(&p.ty));
     let call_args = build_call_args(&params);
@@ -990,23 +1075,37 @@ fn render_builder_class(out: &mut String, s: &StructBinding) {
     );
     if needs_try {
         for p in &params {
-            render_marshal_setup(out, p, "            ");
+            let mut tmp = String::new();
+            render_marshal_setup(&mut tmp, p, "            ");
+            w.raw(tmp);
         }
-        out.push_str("            try\n            {\n");
-        out.push_str(&format!("                {call}\n"));
-        out.push_str("                WeaveFFIError.Check(err);\n");
-        out.push_str(&format!("                return new {}(result);\n", s.name));
-        out.push_str("            }\n            finally\n            {\n");
+        w.line("try");
+        w.line("{");
+        w.scope(|w| {
+            w.line(call.clone());
+            w.line("WeaveFFIError.Check(err);");
+            w.line(format!("return new {}(result);", s.name));
+        });
+        w.line("}");
+        w.line("finally");
+        w.line("{");
         for p in &params {
-            render_marshal_cleanup(out, p, "                ");
+            let mut tmp = String::new();
+            render_marshal_cleanup(&mut tmp, p, "                ");
+            w.raw(tmp);
         }
-        out.push_str("            }\n");
+        w.line("}");
     } else {
-        out.push_str(&format!("            {call}\n"));
-        out.push_str("            WeaveFFIError.Check(err);\n");
-        out.push_str(&format!("            return new {}(result);\n", s.name));
+        w.line(call);
+        w.line("WeaveFFIError.Check(err);");
+        w.line(format!("return new {}(result);", s.name));
     }
-    out.push_str("        }\n    }\n\n");
+    w.dedent();
+    w.line("}");
+    w.dedent();
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 fn render_struct_getter(out: &mut String, field: &FieldBinding) {
@@ -1023,10 +1122,14 @@ fn render_field_getter(out: &mut String, prop_name: &str, field: &FieldBinding) 
     let getter_sym = &field.getter_symbol;
     let cs = cs_type(&field.ty);
 
-    emit_doc(out, &field.doc, "        ");
-    out.push_str(&format!(
-        "        public {cs} {prop_name}\n        {{\n            get\n            {{\n"
-    ));
+    let mut w = CodeWriter::four_space().with_depth(2);
+    writer_doc(&mut w, &field.doc);
+    w.line(format!("public {cs} {prop_name}"));
+    w.line("{");
+    w.indent();
+    w.line("get");
+    w.line("{");
+    w.indent();
 
     match &field.ty {
         TypeRef::I8
@@ -1040,179 +1143,165 @@ fn render_field_getter(out: &mut String, prop_name: &str, field: &FieldBinding) 
         | TypeRef::F32
         | TypeRef::F64
         | TypeRef::Handle => {
-            out.push_str(&format!(
-                "                return NativeMethods.{getter_sym}(_handle);\n"
-            ));
+            w.line(format!("return NativeMethods.{getter_sym}(_handle);"));
         }
         TypeRef::TypedHandle(name) => {
             let cn = local_type_name(name);
-            out.push_str(&format!(
-                "                return new {cn}(NativeMethods.{getter_sym}(_handle));\n"
+            w.line(format!(
+                "return new {cn}(NativeMethods.{getter_sym}(_handle));"
             ));
         }
         TypeRef::Bool => {
-            out.push_str(&format!(
-                "                return NativeMethods.{getter_sym}(_handle) != 0;\n"
-            ));
+            w.line(format!("return NativeMethods.{getter_sym}(_handle) != 0;"));
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!(
-                "                var ptr = NativeMethods.{getter_sym}(_handle);\n"
-            ));
-            out.push_str("                var str = WeaveFFIHelpers.PtrToString(ptr);\n");
-            out.push_str("                NativeMethods.weaveffi_free_string(ptr);\n");
-            out.push_str("                return str ?? \"\";\n");
+            w.line(format!("var ptr = NativeMethods.{getter_sym}(_handle);"));
+            w.line("var str = WeaveFFIHelpers.PtrToString(ptr);");
+            w.line("NativeMethods.weaveffi_free_string(ptr);");
+            w.line("return str ?? \"\";");
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            out.push_str(&format!(
-                "                var ptr = NativeMethods.{getter_sym}(_handle, out var len);\n"
+            w.line(format!(
+                "var ptr = NativeMethods.{getter_sym}(_handle, out var len);"
             ));
-            out.push_str("                if (ptr == IntPtr.Zero) return Array.Empty<byte>();\n");
-            out.push_str("                var arr = new byte[(int)len];\n");
-            out.push_str("                Marshal.Copy(ptr, arr, 0, (int)len);\n");
-            out.push_str("                NativeMethods.weaveffi_free_bytes(ptr, len);\n");
-            out.push_str("                return arr;\n");
+            w.line("if (ptr == IntPtr.Zero) return Array.Empty<byte>();");
+            w.line("var arr = new byte[(int)len];");
+            w.line("Marshal.Copy(ptr, arr, 0, (int)len);");
+            w.line("NativeMethods.weaveffi_free_bytes(ptr, len);");
+            w.line("return arr;");
         }
         TypeRef::Enum(name) => {
             // A cross-module enum (e.g. `graphics.Unit`) is emitted as the bare
             // top-level C# type `Unit`; the cast must use that local name, not
             // the qualified IR name (there is no `graphics` namespace).
             let cn = local_type_name(name);
-            out.push_str(&format!(
-                "                return ({cn})NativeMethods.{getter_sym}(_handle);\n"
-            ));
+            w.line(format!("return ({cn})NativeMethods.{getter_sym}(_handle);"));
         }
         TypeRef::Struct(name) => {
             let cn = local_type_name(name);
-            out.push_str(&format!(
-                "                return new {cn}(NativeMethods.{getter_sym}(_handle));\n"
+            w.line(format!(
+                "return new {cn}(NativeMethods.{getter_sym}(_handle));"
             ));
         }
         TypeRef::Optional(inner)
             if matches!(inner.as_ref(), TypeRef::Bytes | TypeRef::BorrowedBytes) =>
         {
-            out.push_str(&format!(
-                "                var ptr = NativeMethods.{getter_sym}(_handle, out var len);\n"
+            w.line(format!(
+                "var ptr = NativeMethods.{getter_sym}(_handle, out var len);"
             ));
-            out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
-            out.push_str("                var arr = new byte[(int)len];\n");
-            out.push_str("                Marshal.Copy(ptr, arr, 0, (int)len);\n");
-            out.push_str("                NativeMethods.weaveffi_free_bytes(ptr, len);\n");
-            out.push_str("                return arr;\n");
+            w.line("if (ptr == IntPtr.Zero) return null;");
+            w.line("var arr = new byte[(int)len];");
+            w.line("Marshal.Copy(ptr, arr, 0, (int)len);");
+            w.line("NativeMethods.weaveffi_free_bytes(ptr, len);");
+            w.line("return arr;");
         }
         TypeRef::Optional(inner) => {
-            out.push_str(&format!(
-                "                var ptr = NativeMethods.{getter_sym}(_handle);\n"
-            ));
+            w.line(format!("var ptr = NativeMethods.{getter_sym}(_handle);"));
             match inner.as_ref() {
                 TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                    out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
-                    out.push_str("                var str = WeaveFFIHelpers.PtrToString(ptr);\n");
-                    out.push_str("                NativeMethods.weaveffi_free_string(ptr);\n");
-                    out.push_str("                return str;\n");
+                    w.line("if (ptr == IntPtr.Zero) return null;");
+                    w.line("var str = WeaveFFIHelpers.PtrToString(ptr);");
+                    w.line("NativeMethods.weaveffi_free_string(ptr);");
+                    w.line("return str;");
                 }
                 TypeRef::Struct(name) => {
                     let cn = local_type_name(name);
-                    out.push_str(&format!(
-                        "                return ptr == IntPtr.Zero ? null : new {cn}(ptr);\n"
-                    ));
+                    w.line(format!("return ptr == IntPtr.Zero ? null : new {cn}(ptr);"));
                 }
                 TypeRef::I32 => {
-                    out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
-                    out.push_str("                return Marshal.ReadInt32(ptr);\n");
+                    w.line("if (ptr == IntPtr.Zero) return null;");
+                    w.line("return Marshal.ReadInt32(ptr);");
                 }
                 TypeRef::U32 => {
-                    out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
-                    out.push_str("                return (uint)Marshal.ReadInt32(ptr);\n");
+                    w.line("if (ptr == IntPtr.Zero) return null;");
+                    w.line("return (uint)Marshal.ReadInt32(ptr);");
                 }
                 TypeRef::I64 => {
-                    out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
-                    out.push_str("                return Marshal.ReadInt64(ptr);\n");
+                    w.line("if (ptr == IntPtr.Zero) return null;");
+                    w.line("return Marshal.ReadInt64(ptr);");
                 }
                 TypeRef::F64 => {
-                    out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
-                    out.push_str("                return BitConverter.Int64BitsToDouble(Marshal.ReadInt64(ptr));\n");
+                    w.line("if (ptr == IntPtr.Zero) return null;");
+                    w.line("return BitConverter.Int64BitsToDouble(Marshal.ReadInt64(ptr));");
                 }
                 TypeRef::I8 => {
-                    out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
-                    out.push_str("                return (sbyte)Marshal.ReadByte(ptr);\n");
+                    w.line("if (ptr == IntPtr.Zero) return null;");
+                    w.line("return (sbyte)Marshal.ReadByte(ptr);");
                 }
                 TypeRef::U8 => {
-                    out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
-                    out.push_str("                return (byte)Marshal.ReadByte(ptr);\n");
+                    w.line("if (ptr == IntPtr.Zero) return null;");
+                    w.line("return (byte)Marshal.ReadByte(ptr);");
                 }
                 TypeRef::I16 => {
-                    out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
-                    out.push_str("                return Marshal.ReadInt16(ptr);\n");
+                    w.line("if (ptr == IntPtr.Zero) return null;");
+                    w.line("return Marshal.ReadInt16(ptr);");
                 }
                 TypeRef::U16 => {
-                    out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
-                    out.push_str("                return (ushort)Marshal.ReadInt16(ptr);\n");
+                    w.line("if (ptr == IntPtr.Zero) return null;");
+                    w.line("return (ushort)Marshal.ReadInt16(ptr);");
                 }
                 TypeRef::U64 => {
-                    out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
-                    out.push_str("                return (ulong)Marshal.ReadInt64(ptr);\n");
+                    w.line("if (ptr == IntPtr.Zero) return null;");
+                    w.line("return (ulong)Marshal.ReadInt64(ptr);");
                 }
                 TypeRef::F32 => {
-                    out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
-                    out.push_str("                return BitConverter.Int32BitsToSingle(Marshal.ReadInt32(ptr));\n");
+                    w.line("if (ptr == IntPtr.Zero) return null;");
+                    w.line("return BitConverter.Int32BitsToSingle(Marshal.ReadInt32(ptr));");
                 }
                 TypeRef::Bool => {
-                    out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
-                    out.push_str("                return Marshal.ReadInt32(ptr) != 0;\n");
+                    w.line("if (ptr == IntPtr.Zero) return null;");
+                    w.line("return Marshal.ReadInt32(ptr) != 0;");
                 }
                 TypeRef::Handle => {
-                    out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
-                    out.push_str("                return (ulong)Marshal.ReadInt64(ptr);\n");
+                    w.line("if (ptr == IntPtr.Zero) return null;");
+                    w.line("return (ulong)Marshal.ReadInt64(ptr);");
                 }
                 TypeRef::TypedHandle(name) => {
                     let cn = local_type_name(name);
-                    out.push_str(&format!(
-                        "                return ptr == IntPtr.Zero ? null : new {cn}(ptr);\n"
-                    ));
+                    w.line(format!("return ptr == IntPtr.Zero ? null : new {cn}(ptr);"));
                 }
                 TypeRef::Enum(name) => {
                     let cn = local_type_name(name);
-                    out.push_str("                if (ptr == IntPtr.Zero) return null;\n");
-                    out.push_str(&format!(
-                        "                return ({cn})Marshal.ReadInt32(ptr);\n"
-                    ));
+                    w.line("if (ptr == IntPtr.Zero) return null;");
+                    w.line(format!("return ({cn})Marshal.ReadInt32(ptr);"));
                 }
                 _ => {
-                    out.push_str("                return ptr;\n");
+                    w.line("return ptr;");
                 }
             }
         }
         TypeRef::List(inner) => {
-            out.push_str(&format!(
-                "                var ptr = NativeMethods.{getter_sym}(_handle, out var len);\n"
+            w.line(format!(
+                "var ptr = NativeMethods.{getter_sym}(_handle, out var len);"
             ));
-            render_list_unmarshal(out, inner, "                ");
+            let mut tmp = String::new();
+            render_list_unmarshal(&mut tmp, inner, "                ");
+            w.raw(tmp);
         }
         TypeRef::Map(k, v) => {
-            out.push_str(&format!(
-                "                NativeMethods.{getter_sym}(_handle, out var outKeys, out var outValues, out var outLen);\n"
+            w.line(format!(
+                "NativeMethods.{getter_sym}(_handle, out var outKeys, out var outValues, out var outLen);"
             ));
             let k_cs = cs_type(k);
             let v_cs = cs_type(v);
-            out.push_str(&format!(
-                "                var dict = new Dictionary<{k_cs}, {v_cs}>();\n"
-            ));
-            out.push_str(
-                "                for (int i = 0; i < (int)outLen; i++)\n                {\n",
-            );
+            w.line(format!("var dict = new Dictionary<{k_cs}, {v_cs}>();"));
             let key_read = marshal_read_element(k, "outKeys", "i");
             let val_read = marshal_read_element(v, "outValues", "i");
-            out.push_str(&format!(
-                "                    dict[{key_read}] = {val_read};\n"
-            ));
-            out.push_str("                }\n");
-            out.push_str("                return dict;\n");
+            w.line("for (int i = 0; i < (int)outLen; i++)");
+            w.block("{", "}", |w| {
+                w.line(format!("dict[{key_read}] = {val_read};"));
+            });
+            w.line("return dict;");
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as struct field"),
     }
 
-    out.push_str("            }\n        }\n\n");
+    w.dedent();
+    w.line("}");
+    w.dedent();
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 fn render_list_unmarshal(out: &mut String, inner: &TypeRef, indent: &str) {
@@ -1224,67 +1313,82 @@ fn render_list_unmarshal(out: &mut String, inner: &TypeRef, indent: &str) {
 /// [`marshal_read_element`].
 fn render_list_decode(out: &mut String, inner: &TypeRef, base: &str, len: &str, indent: &str) {
     let elem = cs_type(inner);
-    out.push_str(&format!(
-        "{indent}if ({base} == IntPtr.Zero) return Array.Empty<{elem}>();\n"
+    let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
+    w.line(format!(
+        "if ({base} == IntPtr.Zero) return Array.Empty<{elem}>();"
     ));
     match inner {
         TypeRef::I32 | TypeRef::I64 | TypeRef::F64 => {
-            out.push_str(&format!("{indent}var arr = new {elem}[(int){len}];\n"));
-            out.push_str(&format!(
-                "{indent}Marshal.Copy({base}, arr, 0, (int){len});\n"
-            ));
-            out.push_str(&format!("{indent}return arr;\n"));
+            w.line(format!("var arr = new {elem}[(int){len}];"));
+            w.line(format!("Marshal.Copy({base}, arr, 0, (int){len});"));
+            w.line("return arr;");
         }
         _ => {
             let read = marshal_read_element(inner, base, "i");
-            out.push_str(&format!("{indent}var arr = new {elem}[(int){len}];\n"));
-            out.push_str(&format!(
-                "{indent}for (int i = 0; i < (int){len}; i++)\n{indent}{{\n"
-            ));
-            out.push_str(&format!("{indent}    arr[i] = {read};\n"));
-            out.push_str(&format!("{indent}}}\n"));
-            out.push_str(&format!("{indent}return arr;\n"));
+            w.line(format!("var arr = new {elem}[(int){len}];"));
+            w.line(format!("for (int i = 0; i < (int){len}; i++)"));
+            w.block("{", "}", |w| {
+                w.line(format!("arr[i] = {read};"));
+            });
+            w.line("return arr;");
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn render_native_methods(out: &mut String, model: &BindingModel) {
-    out.push_str("    internal static class NativeMethods\n    {\n");
-    out.push_str("        private const string LibName = \"weaveffi\";\n\n");
-
-    out.push_str("        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]\n");
-    out.push_str("        internal static extern void weaveffi_free_string(IntPtr ptr);\n\n");
-    out.push_str("        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]\n");
-    out.push_str(
-        "        internal static extern void weaveffi_free_bytes(IntPtr ptr, UIntPtr len);\n\n",
-    );
+    let mut w = CodeWriter::four_space().with_depth(1);
+    w.line("internal static class NativeMethods");
+    w.line("{");
+    w.indent();
+    w.line("private const string LibName = \"weaveffi\";");
+    w.blank();
+    w.line("[DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]");
+    w.line("internal static extern void weaveffi_free_string(IntPtr ptr);");
+    w.blank();
+    w.line("[DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]");
+    w.line("internal static extern void weaveffi_free_bytes(IntPtr ptr, UIntPtr len);");
+    w.blank();
+    w.dedent();
 
     for m in &model.modules {
         for e in &m.enums {
             // Plain enums lower by value and need no P/Invoke; rich enums need
             // the opaque-object symbol set (tag, destroy, per-variant new/get).
             if e.is_rich() {
-                render_rich_enum_pinvoke(out, e);
+                let mut tmp = String::new();
+                render_rich_enum_pinvoke(&mut tmp, e);
+                w.raw(tmp);
             }
         }
         for s in &m.structs {
-            render_struct_pinvoke(out, s);
+            let mut tmp = String::new();
+            render_struct_pinvoke(&mut tmp, s);
+            w.raw(tmp);
         }
         for cb in &m.callbacks {
-            render_callback_pinvoke(out, cb);
+            let mut tmp = String::new();
+            render_callback_pinvoke(&mut tmp, cb);
+            w.raw(tmp);
         }
         for l in &m.listeners {
-            render_listener_pinvoke(out, l);
+            let mut tmp = String::new();
+            render_listener_pinvoke(&mut tmp, l);
+            w.raw(tmp);
         }
         for f in &m.functions {
-            render_function_pinvoke(out, f);
+            let mut tmp = String::new();
+            render_function_pinvoke(&mut tmp, f);
             if f.is_async {
-                render_async_function_pinvoke(out, f);
+                render_async_function_pinvoke(&mut tmp, f);
             }
+            w.raw(tmp);
         }
     }
 
-    out.push_str("    }\n\n");
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// The unmanaged delegate type for one module callback declaration, shared by
@@ -1296,11 +1400,14 @@ fn render_callback_pinvoke(out: &mut String, cb: &CallbackBinding) {
         .iter()
         .map(|slot| format!("{} {}", cs_pinvoke_ctype(&slot.ty), slot.name))
         .collect();
-    out.push_str("        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]\n");
-    out.push_str(&format!(
-        "        internal delegate void {delegate_name}({});\n\n",
+    let mut w = CodeWriter::four_space().with_depth(2);
+    w.line("[UnmanagedFunctionPointer(CallingConvention.Cdecl)]");
+    w.line(format!(
+        "internal delegate void {delegate_name}({});",
         params.join(", ")
     ));
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 fn render_listener_pinvoke(out: &mut String, l: &ListenerBinding) {
@@ -1308,19 +1415,23 @@ fn render_listener_pinvoke(out: &mut String, l: &ListenerBinding) {
     let register_sym = &l.register_symbol;
     let unregister_sym = &l.unregister_symbol;
 
-    out.push_str(&format!(
-        "        [DllImport(LibName, EntryPoint = \"{register_sym}\", CallingConvention = CallingConvention.Cdecl)]\n"
+    let mut w = CodeWriter::four_space().with_depth(2);
+    w.line(format!(
+        "[DllImport(LibName, EntryPoint = \"{register_sym}\", CallingConvention = CallingConvention.Cdecl)]"
     ));
-    out.push_str(&format!(
-        "        internal static extern ulong {register_sym}({delegate_name} callback, IntPtr context);\n\n"
+    w.line(format!(
+        "internal static extern ulong {register_sym}({delegate_name} callback, IntPtr context);"
     ));
+    w.blank();
 
-    out.push_str(&format!(
-        "        [DllImport(LibName, EntryPoint = \"{unregister_sym}\", CallingConvention = CallingConvention.Cdecl)]\n"
+    w.line(format!(
+        "[DllImport(LibName, EntryPoint = \"{unregister_sym}\", CallingConvention = CallingConvention.Cdecl)]"
     ));
-    out.push_str(&format!(
-        "        internal static extern void {unregister_sym}(ulong id);\n\n"
+    w.line(format!(
+        "internal static extern void {unregister_sym}(ulong id);"
     ));
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 fn render_struct_pinvoke(out: &mut String, s: &StructBinding) {
@@ -1343,35 +1454,40 @@ fn render_struct_pinvoke(out: &mut String, s: &StructBinding) {
         .collect();
     create_params.push("ref WeaveFFIError err".into());
 
-    out.push_str(&format!(
-        "        [DllImport(LibName, EntryPoint = \"{create_sym}\", CallingConvention = CallingConvention.Cdecl)]\n"
+    let mut w = CodeWriter::four_space().with_depth(2);
+    w.line(format!(
+        "[DllImport(LibName, EntryPoint = \"{create_sym}\", CallingConvention = CallingConvention.Cdecl)]"
     ));
-    out.push_str(&format!(
-        "        internal static extern IntPtr {create_sym}({});\n\n",
+    w.line(format!(
+        "internal static extern IntPtr {create_sym}({});",
         create_params.join(", ")
     ));
+    w.blank();
 
-    out.push_str(&format!(
-        "        [DllImport(LibName, EntryPoint = \"{destroy_sym}\", CallingConvention = CallingConvention.Cdecl)]\n"
+    w.line(format!(
+        "[DllImport(LibName, EntryPoint = \"{destroy_sym}\", CallingConvention = CallingConvention.Cdecl)]"
     ));
-    out.push_str(&format!(
-        "        internal static extern void {destroy_sym}(IntPtr ptr);\n\n"
+    w.line(format!(
+        "internal static extern void {destroy_sym}(IntPtr ptr);"
     ));
+    w.blank();
 
     for field in &s.fields {
         let getter_sym = &field.getter_symbol;
         let (ret_type, extra_params) = pinvoke_return_info(&field.ty);
 
-        out.push_str(&format!(
-            "        [DllImport(LibName, EntryPoint = \"{getter_sym}\", CallingConvention = CallingConvention.Cdecl)]\n"
+        w.line(format!(
+            "[DllImport(LibName, EntryPoint = \"{getter_sym}\", CallingConvention = CallingConvention.Cdecl)]"
         ));
         let mut params = vec!["IntPtr ptr".into()];
         params.extend(extra_params);
-        out.push_str(&format!(
-            "        internal static extern {ret_type} {getter_sym}({});\n\n",
+        w.line(format!(
+            "internal static extern {ret_type} {getter_sym}({});",
             params.join(", ")
         ));
+        w.blank();
     }
+    out.push_str(&w.finish());
 }
 
 /// Emit the `[DllImport]` set backing a rich (algebraic) enum, mirroring
@@ -1384,21 +1500,22 @@ fn render_rich_enum_pinvoke(out: &mut String, e: &EnumBinding) {
         return;
     };
 
+    let mut w = CodeWriter::four_space().with_depth(2);
     let tag_sym = &rich.tag_symbol;
-    out.push_str(&format!(
-        "        [DllImport(LibName, EntryPoint = \"{tag_sym}\", CallingConvention = CallingConvention.Cdecl)]\n"
+    w.line(format!(
+        "[DllImport(LibName, EntryPoint = \"{tag_sym}\", CallingConvention = CallingConvention.Cdecl)]"
     ));
-    out.push_str(&format!(
-        "        internal static extern int {tag_sym}(IntPtr ptr);\n\n"
-    ));
+    w.line(format!("internal static extern int {tag_sym}(IntPtr ptr);"));
+    w.blank();
 
     let destroy_sym = &rich.destroy_symbol;
-    out.push_str(&format!(
-        "        [DllImport(LibName, EntryPoint = \"{destroy_sym}\", CallingConvention = CallingConvention.Cdecl)]\n"
+    w.line(format!(
+        "[DllImport(LibName, EntryPoint = \"{destroy_sym}\", CallingConvention = CallingConvention.Cdecl)]"
     ));
-    out.push_str(&format!(
-        "        internal static extern void {destroy_sym}(IntPtr ptr);\n\n"
+    w.line(format!(
+        "internal static extern void {destroy_sym}(IntPtr ptr);"
     ));
+    w.blank();
 
     for v in &rich.variants {
         let new_sym = &v.create.symbol;
@@ -1408,28 +1525,31 @@ fn render_rich_enum_pinvoke(out: &mut String, e: &EnumBinding) {
             .flat_map(|f| pinvoke_param_list(&field_as_param(f)))
             .collect();
         new_params.push("ref WeaveFFIError err".into());
-        out.push_str(&format!(
-            "        [DllImport(LibName, EntryPoint = \"{new_sym}\", CallingConvention = CallingConvention.Cdecl)]\n"
+        w.line(format!(
+            "[DllImport(LibName, EntryPoint = \"{new_sym}\", CallingConvention = CallingConvention.Cdecl)]"
         ));
-        out.push_str(&format!(
-            "        internal static extern IntPtr {new_sym}({});\n\n",
+        w.line(format!(
+            "internal static extern IntPtr {new_sym}({});",
             new_params.join(", ")
         ));
+        w.blank();
 
         for f in &v.fields {
             let getter_sym = &f.getter_symbol;
             let (ret_type, extra_params) = pinvoke_return_info(&f.ty);
-            out.push_str(&format!(
-                "        [DllImport(LibName, EntryPoint = \"{getter_sym}\", CallingConvention = CallingConvention.Cdecl)]\n"
+            w.line(format!(
+                "[DllImport(LibName, EntryPoint = \"{getter_sym}\", CallingConvention = CallingConvention.Cdecl)]"
             ));
             let mut params = vec!["IntPtr ptr".into()];
             params.extend(extra_params);
-            out.push_str(&format!(
-                "        internal static extern {ret_type} {getter_sym}({});\n\n",
+            w.line(format!(
+                "internal static extern {ret_type} {getter_sym}({});",
                 params.join(", ")
             ));
+            w.blank();
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn render_function_pinvoke(out: &mut String, f: &FnBinding) {
@@ -1438,10 +1558,6 @@ fn render_function_pinvoke(out: &mut String, f: &FnBinding) {
         return;
     }
     let c_sym = &f.c_base;
-
-    out.push_str(&format!(
-        "        [DllImport(LibName, EntryPoint = \"{c_sym}\", CallingConvention = CallingConvention.Cdecl)]\n"
-    ));
 
     let mut params: Vec<String> = f.params.iter().flat_map(pinvoke_param_list).collect();
 
@@ -1455,10 +1571,16 @@ fn render_function_pinvoke(out: &mut String, f: &FnBinding) {
 
     params.push("ref WeaveFFIError err".into());
 
-    out.push_str(&format!(
-        "        internal static extern {ret_type} {c_sym}({});\n\n",
+    let mut w = CodeWriter::four_space().with_depth(2);
+    w.line(format!(
+        "[DllImport(LibName, EntryPoint = \"{c_sym}\", CallingConvention = CallingConvention.Cdecl)]"
+    ));
+    w.line(format!(
+        "internal static extern {ret_type} {c_sym}({});",
         params.join(", ")
     ));
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// Whether an ABI slot is the trailing `{prefix}_error* out_err`.
@@ -1483,35 +1605,40 @@ fn iterator_slot_param(slot: &AbiParam) -> String {
 /// returning the opaque iterator handle, `_next`, and `_destroy`.
 fn render_iterator_pinvoke(out: &mut String, it: &IteratorBinding) {
     let launch_params: Vec<String> = it.launch.params.iter().map(iterator_slot_param).collect();
-    out.push_str(&format!(
-        "        [DllImport(LibName, EntryPoint = \"{0}\", CallingConvention = CallingConvention.Cdecl)]\n",
+    let mut w = CodeWriter::four_space().with_depth(2);
+    w.line(format!(
+        "[DllImport(LibName, EntryPoint = \"{0}\", CallingConvention = CallingConvention.Cdecl)]",
         it.launch.symbol
     ));
-    out.push_str(&format!(
-        "        internal static extern IntPtr {}({});\n\n",
+    w.line(format!(
+        "internal static extern IntPtr {}({});",
         it.launch.symbol,
         launch_params.join(", ")
     ));
+    w.blank();
 
     let next_params: Vec<String> = it.next.params.iter().map(iterator_slot_param).collect();
-    out.push_str(&format!(
-        "        [DllImport(LibName, EntryPoint = \"{0}\", CallingConvention = CallingConvention.Cdecl)]\n",
+    w.line(format!(
+        "[DllImport(LibName, EntryPoint = \"{0}\", CallingConvention = CallingConvention.Cdecl)]",
         it.next.symbol
     ));
-    out.push_str(&format!(
-        "        internal static extern int {}({});\n\n",
+    w.line(format!(
+        "internal static extern int {}({});",
         it.next.symbol,
         next_params.join(", ")
     ));
+    w.blank();
 
-    out.push_str(&format!(
-        "        [DllImport(LibName, EntryPoint = \"{0}\", CallingConvention = CallingConvention.Cdecl)]\n",
+    w.line(format!(
+        "[DllImport(LibName, EntryPoint = \"{0}\", CallingConvention = CallingConvention.Cdecl)]",
         it.destroy_symbol
     ));
-    out.push_str(&format!(
-        "        internal static extern void {}(IntPtr iter);\n\n",
+    w.line(format!(
+        "internal static extern void {}(IntPtr iter);",
         it.destroy_symbol
     ));
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 fn async_cb_delegate_result_params(ret: &Option<TypeRef>) -> String {
@@ -1543,10 +1670,12 @@ fn render_async_function_pinvoke(out: &mut String, f: &FnBinding) {
     let delegate_name = format!("AsyncCb_{c_sym}");
     let cb_params = async_cb_delegate_result_params(&f.ret);
 
-    out.push_str("        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]\n");
-    out.push_str(&format!(
-        "        internal delegate void {delegate_name}(IntPtr context, IntPtr err{cb_params});\n\n"
+    let mut w = CodeWriter::four_space().with_depth(2);
+    w.line("[UnmanagedFunctionPointer(CallingConvention.Cdecl)]");
+    w.line(format!(
+        "internal delegate void {delegate_name}(IntPtr context, IntPtr err{cb_params});"
     ));
+    w.blank();
 
     let mut params: Vec<String> = f.params.iter().flat_map(pinvoke_param_list).collect();
     if f.cancellable {
@@ -1555,13 +1684,15 @@ fn render_async_function_pinvoke(out: &mut String, f: &FnBinding) {
     params.push(format!("{delegate_name} callback"));
     params.push("IntPtr context".into());
 
-    out.push_str(&format!(
-        "        [DllImport(LibName, EntryPoint = \"{c_sym}_async\", CallingConvention = CallingConvention.Cdecl)]\n"
+    w.line(format!(
+        "[DllImport(LibName, EntryPoint = \"{c_sym}_async\", CallingConvention = CallingConvention.Cdecl)]"
     ));
-    out.push_str(&format!(
-        "        internal static extern void {c_sym}_async({});\n\n",
+    w.line(format!(
+        "internal static extern void {c_sym}_async({});",
         params.join(", ")
     ));
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// Statements (appended to `out`) plus the expression converting one callback
@@ -1569,7 +1700,8 @@ fn render_async_function_pinvoke(out: &mut String, f: &FnBinding) {
 fn render_cb_arg(out: &mut String, p: &ParamBinding, idx: usize, indent: &str) -> String {
     let slots = abi::lower_param(&p.name, &p.ty, "", false);
     let n0 = safe_cs_name(&slots[0].name);
-    match &p.ty {
+    let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
+    let expr = match &p.ty {
         TypeRef::I8
         | TypeRef::I16
         | TypeRef::I32
@@ -1589,11 +1721,9 @@ fn render_cb_arg(out: &mut String, p: &ParamBinding, idx: usize, indent: &str) -
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             let len = safe_cs_name(&slots[1].name);
             let arg = format!("arg{idx}");
-            out.push_str(&format!(
-                "{indent}var {arg} = new byte[(int){len}];\n"
-            ));
-            out.push_str(&format!(
-                "{indent}if ({n0} != IntPtr.Zero && (int){len} > 0) Marshal.Copy({n0}, {arg}, 0, (int){len});\n"
+            w.line(format!("var {arg} = new byte[(int){len}];"));
+            w.line(format!(
+                "if ({n0} != IntPtr.Zero && (int){len} > 0) Marshal.Copy({n0}, {arg}, 0, (int){len});"
             ));
             arg
         }
@@ -1609,17 +1739,14 @@ fn render_cb_arg(out: &mut String, p: &ParamBinding, idx: usize, indent: &str) -
             TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 let len = safe_cs_name(&slots[1].name);
                 let arg = format!("arg{idx}");
-                out.push_str(&format!("{indent}byte[]? {arg} = null;\n"));
-                out.push_str(&format!(
-                    "{indent}if ({n0} != IntPtr.Zero)\n{indent}{{\n"
-                ));
-                out.push_str(&format!(
-                    "{indent}    {arg} = new byte[(int){len}];\n"
-                ));
-                out.push_str(&format!(
-                    "{indent}    if ((int){len} > 0) Marshal.Copy({n0}, {arg}, 0, (int){len});\n"
-                ));
-                out.push_str(&format!("{indent}}}\n"));
+                w.line(format!("byte[]? {arg} = null;"));
+                w.line(format!("if ({n0} != IntPtr.Zero)"));
+                w.block("{", "}", |w| {
+                    w.line(format!("{arg} = new byte[(int){len}];"));
+                    w.line(format!(
+                        "if ((int){len} > 0) Marshal.Copy({n0}, {arg}, 0, (int){len});"
+                    ));
+                });
                 arg
             }
             TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
@@ -1670,20 +1797,17 @@ fn render_cb_arg(out: &mut String, p: &ParamBinding, idx: usize, indent: &str) -
             let len = safe_cs_name(&slots[1].name);
             let arg = format!("arg{idx}");
             let elem = cs_type(inner);
-            out.push_str(&format!(
-                "{indent}var {arg} = new {elem}[(int){len}];\n"
-            ));
-            out.push_str(&format!(
-                "{indent}if ({n0} != IntPtr.Zero)\n{indent}{{\n"
-            ));
-            out.push_str(&format!(
-                "{indent}    for (int i = 0; i < (int){len}; i++)\n{indent}    {{\n"
-            ));
-            out.push_str(&format!(
-                "{indent}        {arg}[i] = {};\n",
-                marshal_read_element(inner, &n0, "i")
-            ));
-            out.push_str(&format!("{indent}    }}\n{indent}}}\n"));
+            w.line(format!("var {arg} = new {elem}[(int){len}];"));
+            w.line(format!("if ({n0} != IntPtr.Zero)"));
+            w.block("{", "}", |w| {
+                w.line(format!("for (int i = 0; i < (int){len}; i++)"));
+                w.block("{", "}", |w| {
+                    w.line(format!(
+                        "{arg}[i] = {};",
+                        marshal_read_element(inner, &n0, "i")
+                    ));
+                });
+            });
             arg
         }
         TypeRef::Map(k, v) => {
@@ -1692,25 +1816,26 @@ fn render_cb_arg(out: &mut String, p: &ParamBinding, idx: usize, indent: &str) -
             let len = safe_cs_name(&slots[2].name);
             let arg = format!("arg{idx}");
             let (k_cs, v_cs) = (cs_type(k), cs_type(v));
-            out.push_str(&format!(
-                "{indent}var {arg} = new Dictionary<{k_cs}, {v_cs}>();\n"
+            w.line(format!("var {arg} = new Dictionary<{k_cs}, {v_cs}>();"));
+            w.line(format!(
+                "if ({keys} != IntPtr.Zero && {vals} != IntPtr.Zero)"
             ));
-            out.push_str(&format!(
-                "{indent}if ({keys} != IntPtr.Zero && {vals} != IntPtr.Zero)\n{indent}{{\n"
-            ));
-            out.push_str(&format!(
-                "{indent}    for (int i = 0; i < (int){len}; i++)\n{indent}    {{\n"
-            ));
-            out.push_str(&format!(
-                "{indent}        {arg}[{}] = {};\n",
-                marshal_read_element(k, &keys, "i"),
-                marshal_read_element(v, &vals, "i")
-            ));
-            out.push_str(&format!("{indent}    }}\n{indent}}}\n"));
+            w.block("{", "}", |w| {
+                w.line(format!("for (int i = 0; i < (int){len}; i++)"));
+                w.block("{", "}", |w| {
+                    w.line(format!(
+                        "{arg}[{}] = {};",
+                        marshal_read_element(k, &keys, "i"),
+                        marshal_read_element(v, &vals, "i")
+                    ));
+                });
+            });
             arg
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as callback parameter"),
-    }
+    };
+    out.push_str(&w.finish());
+    expr
 }
 
 /// The register/unregister method pair for one listener, emitted into the
@@ -1757,50 +1882,64 @@ fn render_listener_methods(
         .map(|slot| safe_cs_name(&slot.name))
         .collect();
 
-    emit_doc(out, &l.doc, "        ");
-    out.push_str(&format!(
-        "        /// <returns>A subscription id for {unregister_name}().</returns>\n"
+    let mut w = CodeWriter::four_space().with_depth(2);
+    writer_doc(&mut w, &l.doc);
+    w.line(format!(
+        "/// <returns>A subscription id for {unregister_name}().</returns>"
     ));
-    out.push_str(&format!(
-        "        public static ulong {register_name}({action_type} callback)\n        {{\n"
+    w.line(format!(
+        "public static ulong {register_name}({action_type} callback)"
     ));
-    out.push_str(&format!(
-        "            {delegate_name} trampoline = ({}) =>\n            {{\n",
-        lambda_formals.join(", ")
-    ));
-    let mut stmts = String::new();
-    let mut args = Vec::new();
-    for (idx, p) in cb.params.iter().enumerate() {
-        args.push(render_cb_arg(&mut stmts, p, idx, "                "));
-    }
-    out.push_str(&stmts);
-    out.push_str(&format!("                callback({});\n", args.join(", ")));
-    out.push_str("            };\n");
-    out.push_str("            ulong id;\n");
-    out.push_str("            lock (_listenerLock)\n            {\n");
-    out.push_str(&format!(
-        "                id = NativeMethods.{}(trampoline, IntPtr.Zero);\n",
-        l.register_symbol
-    ));
-    out.push_str("                _listenerRefs[id] = trampoline;\n");
-    out.push_str("            }\n");
-    out.push_str("            return id;\n");
-    out.push_str("        }\n\n");
+    w.line("{");
+    w.scope(|w| {
+        w.line(format!(
+            "{delegate_name} trampoline = ({}) =>",
+            lambda_formals.join(", ")
+        ));
+        w.line("{");
+        w.scope(|w| {
+            let mut stmts = String::new();
+            let mut args = Vec::new();
+            for (idx, p) in cb.params.iter().enumerate() {
+                args.push(render_cb_arg(&mut stmts, p, idx, "                "));
+            }
+            w.raw(stmts);
+            w.line(format!("callback({});", args.join(", ")));
+        });
+        w.line("};");
+        w.line("ulong id;");
+        w.line("lock (_listenerLock)");
+        w.line("{");
+        w.scope(|w| {
+            w.line(format!(
+                "id = NativeMethods.{}(trampoline, IntPtr.Zero);",
+                l.register_symbol
+            ));
+            w.line("_listenerRefs[id] = trampoline;");
+        });
+        w.line("}");
+        w.line("return id;");
+    });
+    w.line("}");
+    w.blank();
 
-    out.push_str(&format!(
-        "        /// <summary>Unregisters a listener previously registered with {register_name}().</summary>\n"
+    w.line(format!(
+        "/// <summary>Unregisters a listener previously registered with {register_name}().</summary>"
     ));
-    out.push_str(&format!(
-        "        public static void {unregister_name}(ulong id)\n        {{\n"
-    ));
-    out.push_str(&format!(
-        "            NativeMethods.{}(id);\n",
-        l.unregister_symbol
-    ));
-    out.push_str("            lock (_listenerLock)\n            {\n");
-    out.push_str("                _listenerRefs.Remove(id);\n");
-    out.push_str("            }\n");
-    out.push_str("        }\n\n");
+    w.line(format!("public static void {unregister_name}(ulong id)"));
+    w.line("{");
+    w.scope(|w| {
+        w.line(format!("NativeMethods.{}(id);", l.unregister_symbol));
+        w.line("lock (_listenerLock)");
+        w.line("{");
+        w.scope(|w| {
+            w.line("_listenerRefs.Remove(id);");
+        });
+        w.line("}");
+    });
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// Renders one module's static wrapper class, then its submodules as sibling
@@ -1932,46 +2071,60 @@ fn render_wrapper_method(
         .map(|p| format!("{} {}", cs_type(&p.ty), safe_cs_name(&p.name)))
         .collect();
 
-    emit_fn_doc(out, &f.doc, &f.params, "        ");
+    let mut w = CodeWriter::four_space().with_depth(2);
+    writer_fn_doc(&mut w, &f.doc, &f.params);
     if let Some(msg) = &f.deprecated {
-        out.push_str(&format!(
-            "        [Obsolete(\"{}\")]\n",
-            msg.replace('"', "\\\"")
-        ));
+        w.line(format!("[Obsolete(\"{}\")]", msg.replace('"', "\\\"")));
     }
 
-    out.push_str(&format!(
-        "        public static {ret_cs} {method_name}({})\n        {{\n",
+    w.line(format!(
+        "public static {ret_cs} {method_name}({})",
         params_sig.join(", ")
     ));
+    w.line("{");
+    w.scope(|w| {
+        w.line("var err = new WeaveFFIError();");
 
-    out.push_str("            var err = new WeaveFFIError();\n");
+        let needs_try = f.params.iter().any(|p| param_needs_marshal(&p.ty));
 
-    let needs_try = f.params.iter().any(|p| param_needs_marshal(&p.ty));
-
-    if needs_try {
-        for p in &f.params {
-            render_marshal_setup(out, p, "            ");
+        if needs_try {
+            for p in &f.params {
+                let mut tmp = String::new();
+                render_marshal_setup(&mut tmp, p, "            ");
+                w.raw(tmp);
+            }
+            w.line("try");
+            w.line("{");
+            let mut tmp = String::new();
+            render_pinvoke_call_and_return(&mut tmp, f, "                ");
+            w.raw(tmp);
+            w.line("}");
+            w.line("finally");
+            w.line("{");
+            for p in &f.params {
+                let mut tmp = String::new();
+                render_marshal_cleanup(&mut tmp, p, "                ");
+                w.raw(tmp);
+            }
+            w.line("}");
+        } else {
+            let mut tmp = String::new();
+            render_pinvoke_call_and_return(&mut tmp, f, "            ");
+            w.raw(tmp);
         }
-        out.push_str("            try\n            {\n");
-        render_pinvoke_call_and_return(out, f, "                ");
-        out.push_str("            }\n            finally\n            {\n");
-        for p in &f.params {
-            render_marshal_cleanup(out, p, "                ");
-        }
-        out.push_str("            }\n");
-    } else {
-        render_pinvoke_call_and_return(out, f, "            ");
-    }
+    });
 
-    out.push_str("        }\n\n");
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// The statements converting one `_next` out-item into the yielded C# value,
 /// freeing any producer-allocated memory along the way. Returns the expression
 /// to `yield return`.
 fn iterator_item_conversion(out: &mut String, elem: &TypeRef, indent: &str) -> String {
-    match elem {
+    let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
+    let expr = match elem {
         TypeRef::I8
         | TypeRef::I16
         | TypeRef::I32
@@ -1986,22 +2139,14 @@ fn iterator_item_conversion(out: &mut String, elem: &TypeRef, indent: &str) -> S
         TypeRef::Bool => "out_item != 0".into(),
         TypeRef::Enum(name) => format!("({})out_item", local_type_name(name)),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!(
-                "{indent}var item = Marshal.PtrToStringUTF8(out_item) ?? \"\";\n"
-            ));
-            out.push_str(&format!(
-                "{indent}NativeMethods.weaveffi_free_string(out_item);\n"
-            ));
+            w.line("var item = Marshal.PtrToStringUTF8(out_item) ?? \"\";");
+            w.line("NativeMethods.weaveffi_free_string(out_item);");
             "item".into()
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            out.push_str(&format!("{indent}var item = new byte[(int)out_len];\n"));
-            out.push_str(&format!(
-                "{indent}if (out_item != IntPtr.Zero && (int)out_len > 0) Marshal.Copy(out_item, item, 0, (int)out_len);\n"
-            ));
-            out.push_str(&format!(
-                "{indent}NativeMethods.weaveffi_free_bytes(out_item, out_len);\n"
-            ));
+            w.line("var item = new byte[(int)out_len];");
+            w.line("if (out_item != IntPtr.Zero && (int)out_len > 0) Marshal.Copy(out_item, item, 0, (int)out_len);");
+            w.line("NativeMethods.weaveffi_free_bytes(out_item, out_len);");
             "item".into()
         }
         // The consumer owns each yielded wrapper; Dispose() destroys it.
@@ -2009,7 +2154,9 @@ fn iterator_item_conversion(out: &mut String, elem: &TypeRef, indent: &str) -> S
             format!("new {}(out_item)", local_type_name(name))
         }
         _ => "default!".into(),
-    }
+    };
+    out.push_str(&w.finish());
+    expr
 }
 
 /// An `iter<T>` function surfaces as `IEnumerable<T>`: an eager constructor
@@ -2032,20 +2179,6 @@ fn render_iterator_wrapper_method(
         .map(|p| format!("{} {}", cs_type(&p.ty), safe_cs_name(&p.name)))
         .collect();
 
-    emit_fn_doc(out, &f.doc, &f.params, "        ");
-    if let Some(msg) = &f.deprecated {
-        out.push_str(&format!(
-            "        [Obsolete(\"{}\")]\n",
-            msg.replace('"', "\\\"")
-        ));
-    }
-
-    out.push_str(&format!(
-        "        public static IEnumerable<{elem_cs}> {method_name}({})\n        {{\n",
-        params_sig.join(", ")
-    ));
-    out.push_str("            var err = new WeaveFFIError();\n");
-
     let call_args = build_call_args(&f.params);
     let args_part = if call_args.is_empty() {
         String::new()
@@ -2057,30 +2190,51 @@ fn render_iterator_wrapper_method(
         it.launch.symbol
     );
 
-    let needs_try = f.params.iter().any(|p| param_needs_marshal(&p.ty));
-    if needs_try {
-        for p in &f.params {
-            render_marshal_setup(out, p, "            ");
-        }
-        out.push_str("            try\n            {\n");
-        out.push_str(&format!("                {launch_call}\n"));
-        out.push_str("                WeaveFFIError.Check(err);\n");
-        out.push_str(&format!(
-            "                return Enumerate{method_name}(iter);\n"
-        ));
-        out.push_str("            }\n            finally\n            {\n");
-        for p in &f.params {
-            render_marshal_cleanup(out, p, "                ");
-        }
-        out.push_str("            }\n");
-    } else {
-        out.push_str(&format!("            {launch_call}\n"));
-        out.push_str("            WeaveFFIError.Check(err);\n");
-        out.push_str(&format!(
-            "            return Enumerate{method_name}(iter);\n"
-        ));
+    let mut w = CodeWriter::four_space().with_depth(2);
+    writer_fn_doc(&mut w, &f.doc, &f.params);
+    if let Some(msg) = &f.deprecated {
+        w.line(format!("[Obsolete(\"{}\")]", msg.replace('"', "\\\"")));
     }
-    out.push_str("        }\n\n");
+
+    w.line(format!(
+        "public static IEnumerable<{elem_cs}> {method_name}({})",
+        params_sig.join(", ")
+    ));
+    w.line("{");
+    w.scope(|w| {
+        w.line("var err = new WeaveFFIError();");
+
+        let needs_try = f.params.iter().any(|p| param_needs_marshal(&p.ty));
+        if needs_try {
+            for p in &f.params {
+                let mut tmp = String::new();
+                render_marshal_setup(&mut tmp, p, "            ");
+                w.raw(tmp);
+            }
+            w.line("try");
+            w.line("{");
+            w.scope(|w| {
+                w.line(launch_call.clone());
+                w.line("WeaveFFIError.Check(err);");
+                w.line(format!("return Enumerate{method_name}(iter);"));
+            });
+            w.line("}");
+            w.line("finally");
+            w.line("{");
+            for p in &f.params {
+                let mut tmp = String::new();
+                render_marshal_cleanup(&mut tmp, p, "                ");
+                w.raw(tmp);
+            }
+            w.line("}");
+        } else {
+            w.line(launch_call.clone());
+            w.line("WeaveFFIError.Check(err);");
+            w.line(format!("return Enumerate{method_name}(iter);"));
+        }
+    });
+    w.line("}");
+    w.blank();
 
     // The `_next` out-slots after the iterator handle, excluding the error.
     let next_out_args: Vec<String> = it
@@ -2092,35 +2246,49 @@ fn render_iterator_wrapper_method(
         .map(|slot| format!("out var {}", slot.name))
         .collect();
 
-    out.push_str(&format!(
-        "        private static IEnumerable<{elem_cs}> Enumerate{method_name}(IntPtr iter)\n        {{\n"
+    w.line(format!(
+        "private static IEnumerable<{elem_cs}> Enumerate{method_name}(IntPtr iter)"
     ));
-    out.push_str("            try\n            {\n");
-    out.push_str("                while (true)\n                {\n");
-    out.push_str("                    var iterErr = new WeaveFFIError();\n");
-    out.push_str(&format!(
-        "                    if (NativeMethods.{}(iter, {}, ref iterErr) == 0)\n",
-        it.next.symbol,
-        next_out_args.join(", ")
-    ));
-    out.push_str("                    {\n");
-    out.push_str("                        WeaveFFIError.Check(iterErr);\n");
-    out.push_str("                        yield break;\n");
-    out.push_str("                    }\n");
-    out.push_str("                    WeaveFFIError.Check(iterErr);\n");
-    let mut conv = String::new();
-    let item_expr = iterator_item_conversion(&mut conv, &it.elem, "                    ");
-    out.push_str(&conv);
-    out.push_str(&format!("                    yield return {item_expr};\n"));
-    out.push_str("                }\n");
-    out.push_str("            }\n");
-    out.push_str("            finally\n            {\n");
-    out.push_str(&format!(
-        "                NativeMethods.{}(iter);\n",
-        it.destroy_symbol
-    ));
-    out.push_str("            }\n");
-    out.push_str("        }\n\n");
+    w.line("{");
+    w.scope(|w| {
+        w.line("try");
+        w.line("{");
+        w.scope(|w| {
+            w.line("while (true)");
+            w.line("{");
+            w.scope(|w| {
+                w.line("var iterErr = new WeaveFFIError();");
+                w.line(format!(
+                    "if (NativeMethods.{}(iter, {}, ref iterErr) == 0)",
+                    it.next.symbol,
+                    next_out_args.join(", ")
+                ));
+                w.line("{");
+                w.scope(|w| {
+                    w.line("WeaveFFIError.Check(iterErr);");
+                    w.line("yield break;");
+                });
+                w.line("}");
+                w.line("WeaveFFIError.Check(iterErr);");
+                let mut conv = String::new();
+                let item_expr =
+                    iterator_item_conversion(&mut conv, &it.elem, "                    ");
+                w.raw(conv);
+                w.line(format!("yield return {item_expr};"));
+            });
+            w.line("}");
+        });
+        w.line("}");
+        w.line("finally");
+        w.line("{");
+        w.scope(|w| {
+            w.line(format!("NativeMethods.{}(iter);", it.destroy_symbol));
+        });
+        w.line("}");
+    });
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 fn render_async_wrapper_method(
@@ -2147,265 +2315,283 @@ fn render_async_wrapper_method(
         .map(|p| format!("{} {}", cs_type(&p.ty), safe_cs_name(&p.name)))
         .collect();
 
-    emit_fn_doc(out, &f.doc, &f.params, "        ");
+    let mut w = CodeWriter::four_space().with_depth(2);
+    writer_fn_doc(&mut w, &f.doc, &f.params);
     if let Some(msg) = &f.deprecated {
-        out.push_str(&format!(
-            "        [Obsolete(\"{}\")]\n",
-            msg.replace('"', "\\\"")
-        ));
+        w.line(format!("[Obsolete(\"{}\")]", msg.replace('"', "\\\"")));
     }
 
-    out.push_str(&format!(
-        "        public static async {task_ret} {method_name}({})\n        {{\n",
+    w.line(format!(
+        "public static async {task_ret} {method_name}({})",
         params_sig.join(", ")
     ));
-
-    out.push_str(&format!(
-        "            var tcs = new TaskCompletionSource<{tcs_type}>(TaskCreationOptions.RunContinuationsAsynchronously);\n"
-    ));
-
-    let cb_lambda_params = async_cb_lambda_params(&f.ret);
-    out.push_str(&format!(
-        "            {delegate_name} callback = {cb_lambda_params} =>\n            {{\n"
-    ));
-
-    out.push_str("                try\n                {\n");
-    out.push_str("                    if (err != IntPtr.Zero)\n                    {\n");
-    out.push_str(
-        "                        var wErr = Marshal.PtrToStructure<WeaveFFIError>(err);\n",
-    );
-    out.push_str("                        if (wErr.Code != 0)\n                        {\n");
-    out.push_str(
-        "                            var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? \"\";\n",
-    );
-    out.push_str(
-        "                            tcs.SetException(new WeaveFFIException(wErr.Code, msg));\n",
-    );
-    out.push_str("                            return;\n");
-    out.push_str("                        }\n");
-    out.push_str("                    }\n");
-
-    render_async_set_result(out, &f.ret, "                    ");
-
-    out.push_str("                }\n");
-    out.push_str("                finally\n                {\n");
-    out.push_str("                    if (context != IntPtr.Zero)\n");
-    out.push_str("                    {\n");
-    out.push_str("                        GCHandle.FromIntPtr(context).Free();\n");
-    out.push_str("                    }\n");
-    out.push_str("                }\n");
-
-    out.push_str("            };\n");
-    out.push_str("            var gcHandle = GCHandle.Alloc(callback, GCHandleType.Normal);\n");
-    out.push_str("            var ctx = GCHandle.ToIntPtr(gcHandle);\n");
-
-    let needs_try = f.params.iter().any(|p| param_needs_marshal(&p.ty));
-    let call_args = build_call_args(&f.params);
-    let args_part = if call_args.is_empty() {
-        String::new()
-    } else {
-        format!("{call_args}, ")
-    };
-    let cancel_arg = if f.cancellable { "IntPtr.Zero, " } else { "" };
-
-    if needs_try {
-        for p in &f.params {
-            render_marshal_setup(out, p, "            ");
-        }
-        out.push_str("            try\n            {\n");
-        out.push_str("                try\n                {\n");
-        out.push_str(&format!(
-            "                    NativeMethods.{c_sym}_async({args_part}{cancel_arg}callback, ctx);\n"
+    w.line("{");
+    w.scope(|w| {
+        w.line(format!(
+            "var tcs = new TaskCompletionSource<{tcs_type}>(TaskCreationOptions.RunContinuationsAsynchronously);"
         ));
-        out.push_str("                }\n");
-        out.push_str("                catch\n                {\n");
-        out.push_str("                    if (gcHandle.IsAllocated) gcHandle.Free();\n");
-        out.push_str("                    throw;\n");
-        out.push_str("                }\n");
-        out.push_str("            }\n            finally\n            {\n");
-        for p in &f.params {
-            render_marshal_cleanup(out, p, "                ");
+
+        let cb_lambda_params = async_cb_lambda_params(&f.ret);
+        w.line(format!("{delegate_name} callback = {cb_lambda_params} =>"));
+        w.line("{");
+        w.scope(|w| {
+            w.line("try");
+            w.line("{");
+            w.scope(|w| {
+                w.line("if (err != IntPtr.Zero)");
+                w.line("{");
+                w.scope(|w| {
+                    w.line("var wErr = Marshal.PtrToStructure<WeaveFFIError>(err);");
+                    w.line("if (wErr.Code != 0)");
+                    w.line("{");
+                    w.scope(|w| {
+                        w.line("var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? \"\";");
+                        w.line("tcs.SetException(new WeaveFFIException(wErr.Code, msg));");
+                        w.line("return;");
+                    });
+                    w.line("}");
+                });
+                w.line("}");
+
+                let mut tmp = String::new();
+                render_async_set_result(&mut tmp, &f.ret, "                    ");
+                w.raw(tmp);
+            });
+            w.line("}");
+            w.line("finally");
+            w.line("{");
+            w.scope(|w| {
+                w.line("if (context != IntPtr.Zero)");
+                w.line("{");
+                w.scope(|w| {
+                    w.line("GCHandle.FromIntPtr(context).Free();");
+                });
+                w.line("}");
+            });
+            w.line("}");
+        });
+        w.line("};");
+        w.line("var gcHandle = GCHandle.Alloc(callback, GCHandleType.Normal);");
+        w.line("var ctx = GCHandle.ToIntPtr(gcHandle);");
+
+        let needs_try = f.params.iter().any(|p| param_needs_marshal(&p.ty));
+        let call_args = build_call_args(&f.params);
+        let args_part = if call_args.is_empty() {
+            String::new()
+        } else {
+            format!("{call_args}, ")
+        };
+        let cancel_arg = if f.cancellable { "IntPtr.Zero, " } else { "" };
+
+        if needs_try {
+            for p in &f.params {
+                let mut tmp = String::new();
+                render_marshal_setup(&mut tmp, p, "            ");
+                w.raw(tmp);
+            }
+            w.line("try");
+            w.line("{");
+            w.scope(|w| {
+                w.line("try");
+                w.line("{");
+                w.scope(|w| {
+                    w.line(format!(
+                        "NativeMethods.{c_sym}_async({args_part}{cancel_arg}callback, ctx);"
+                    ));
+                });
+                w.line("}");
+                w.line("catch");
+                w.line("{");
+                w.scope(|w| {
+                    w.line("if (gcHandle.IsAllocated) gcHandle.Free();");
+                    w.line("throw;");
+                });
+                w.line("}");
+            });
+            w.line("}");
+            w.line("finally");
+            w.line("{");
+            for p in &f.params {
+                let mut tmp = String::new();
+                render_marshal_cleanup(&mut tmp, p, "                ");
+                w.raw(tmp);
+            }
+            w.line("}");
+        } else {
+            w.line("try");
+            w.line("{");
+            w.scope(|w| {
+                w.line(format!(
+                    "NativeMethods.{c_sym}_async({args_part}{cancel_arg}callback, ctx);"
+                ));
+            });
+            w.line("}");
+            w.line("catch");
+            w.line("{");
+            w.scope(|w| {
+                w.line("if (gcHandle.IsAllocated) gcHandle.Free();");
+                w.line("throw;");
+            });
+            w.line("}");
         }
-        out.push_str("            }\n");
-    } else {
-        out.push_str("            try\n            {\n");
-        out.push_str(&format!(
-            "                NativeMethods.{c_sym}_async({args_part}{cancel_arg}callback, ctx);\n"
-        ));
-        out.push_str("            }\n");
-        out.push_str("            catch\n            {\n");
-        out.push_str("                if (gcHandle.IsAllocated) gcHandle.Free();\n");
-        out.push_str("                throw;\n");
-        out.push_str("            }\n");
-    }
 
-    if f.ret.is_some() {
-        out.push_str("            return await tcs.Task;\n");
-    } else {
-        out.push_str("            await tcs.Task;\n");
-    }
-
-    out.push_str("        }\n\n");
+        if f.ret.is_some() {
+            w.line("return await tcs.Task;");
+        } else {
+            w.line("await tcs.Task;");
+        }
+    });
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 fn render_async_set_result(out: &mut String, ret: &Option<TypeRef>, indent: &str) {
+    let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
     match ret {
         None => {
-            out.push_str(&format!("{indent}tcs.SetResult(true);\n"));
+            w.line("tcs.SetResult(true);");
         }
         Some(TypeRef::Bool) => {
-            out.push_str(&format!("{indent}tcs.SetResult(result != 0);\n"));
+            w.line("tcs.SetResult(result != 0);");
         }
         Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
-            out.push_str(&format!(
-                "{indent}var str = Marshal.PtrToStringUTF8(result);\n"
-            ));
-            out.push_str(&format!(
-                "{indent}NativeMethods.weaveffi_free_string(result);\n"
-            ));
-            out.push_str(&format!("{indent}tcs.SetResult(str);\n"));
+            w.line("var str = Marshal.PtrToStringUTF8(result);");
+            w.line("NativeMethods.weaveffi_free_string(result);");
+            w.line("tcs.SetResult(str);");
         }
         Some(TypeRef::Enum(name)) => {
             let cn = local_type_name(name);
-            out.push_str(&format!("{indent}tcs.SetResult(({cn})result);\n"));
+            w.line(format!("tcs.SetResult(({cn})result);"));
         }
         Some(TypeRef::Struct(name)) => {
             let cn = local_type_name(name);
-            out.push_str(&format!("{indent}tcs.SetResult(new {cn}(result));\n"));
+            w.line(format!("tcs.SetResult(new {cn}(result));"));
         }
         Some(TypeRef::TypedHandle(name)) => {
             let cn = local_type_name(name);
-            out.push_str(&format!("{indent}tcs.SetResult(new {cn}(result));\n"));
+            w.line(format!("tcs.SetResult(new {cn}(result));"));
         }
         _ => {
-            out.push_str(&format!("{indent}tcs.SetResult(result);\n"));
+            w.line("tcs.SetResult(result);");
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn render_marshal_setup(out: &mut String, p: &ParamBinding, indent: &str) {
     let name = safe_cs_name(&p.name);
+    let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
     match &p.ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!(
-                "{indent}var {name}Ptr = Marshal.StringToCoTaskMemUTF8({name});\n"
+            w.line(format!(
+                "var {name}Ptr = Marshal.StringToCoTaskMemUTF8({name});"
             ));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            out.push_str(&format!(
-                "{indent}var {name}Pin = GCHandle.Alloc({name}, GCHandleType.Pinned);\n"
+            w.line(format!(
+                "var {name}Pin = GCHandle.Alloc({name}, GCHandleType.Pinned);"
             ));
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                out.push_str(&format!(
-                    "{indent}var {name}Ptr = {name} != null ? Marshal.StringToCoTaskMemUTF8({name}) : IntPtr.Zero;\n"
+                w.line(format!(
+                    "var {name}Ptr = {name} != null ? Marshal.StringToCoTaskMemUTF8({name}) : IntPtr.Zero;"
                 ));
             }
             TypeRef::I32 | TypeRef::Bool | TypeRef::Enum(_) | TypeRef::U32 => {
-                out.push_str(&format!("{indent}var {name}Ptr = IntPtr.Zero;\n"));
-                out.push_str(&format!("{indent}if ({name}.HasValue)\n{indent}{{\n"));
-                out.push_str(&format!(
-                    "{indent}    {name}Ptr = Marshal.AllocHGlobal(sizeof(int));\n"
-                ));
-                let val = match inner.as_ref() {
-                    TypeRef::Bool => format!("{name}.Value ? 1 : 0"),
-                    TypeRef::Enum(_) => format!("(int){name}.Value"),
-                    TypeRef::U32 => format!("(int){name}.Value"),
-                    _ => format!("{name}.Value"),
-                };
-                out.push_str(&format!(
-                    "{indent}    Marshal.WriteInt32({name}Ptr, {val});\n"
-                ));
-                out.push_str(&format!("{indent}}}\n"));
+                w.line(format!("var {name}Ptr = IntPtr.Zero;"));
+                w.line(format!("if ({name}.HasValue)"));
+                w.block("{", "}", |w| {
+                    w.line(format!("{name}Ptr = Marshal.AllocHGlobal(sizeof(int));"));
+                    let val = match inner.as_ref() {
+                        TypeRef::Bool => format!("{name}.Value ? 1 : 0"),
+                        TypeRef::Enum(_) => format!("(int){name}.Value"),
+                        TypeRef::U32 => format!("(int){name}.Value"),
+                        _ => format!("{name}.Value"),
+                    };
+                    w.line(format!("Marshal.WriteInt32({name}Ptr, {val});"));
+                });
             }
             TypeRef::I64 | TypeRef::U64 | TypeRef::Handle | TypeRef::F64 => {
-                out.push_str(&format!("{indent}var {name}Ptr = IntPtr.Zero;\n"));
-                out.push_str(&format!("{indent}if ({name}.HasValue)\n{indent}{{\n"));
-                out.push_str(&format!(
-                    "{indent}    {name}Ptr = Marshal.AllocHGlobal(sizeof(long));\n"
-                ));
-                let val = match inner.as_ref() {
-                    TypeRef::Handle => format!("(long){name}.Value"),
-                    TypeRef::U64 => format!("(long){name}.Value"),
-                    TypeRef::F64 => {
-                        format!("BitConverter.DoubleToInt64Bits({name}.Value)")
-                    }
-                    _ => format!("{name}.Value"),
-                };
-                out.push_str(&format!(
-                    "{indent}    Marshal.WriteInt64({name}Ptr, {val});\n"
-                ));
-                out.push_str(&format!("{indent}}}\n"));
+                w.line(format!("var {name}Ptr = IntPtr.Zero;"));
+                w.line(format!("if ({name}.HasValue)"));
+                w.block("{", "}", |w| {
+                    w.line(format!("{name}Ptr = Marshal.AllocHGlobal(sizeof(long));"));
+                    let val = match inner.as_ref() {
+                        TypeRef::Handle => format!("(long){name}.Value"),
+                        TypeRef::U64 => format!("(long){name}.Value"),
+                        TypeRef::F64 => {
+                            format!("BitConverter.DoubleToInt64Bits({name}.Value)")
+                        }
+                        _ => format!("{name}.Value"),
+                    };
+                    w.line(format!("Marshal.WriteInt64({name}Ptr, {val});"));
+                });
             }
             TypeRef::I8 | TypeRef::U8 => {
-                out.push_str(&format!("{indent}var {name}Ptr = IntPtr.Zero;\n"));
-                out.push_str(&format!("{indent}if ({name}.HasValue)\n{indent}{{\n"));
-                out.push_str(&format!(
-                    "{indent}    {name}Ptr = Marshal.AllocHGlobal(sizeof(byte));\n"
-                ));
-                out.push_str(&format!(
-                    "{indent}    Marshal.WriteByte({name}Ptr, (byte){name}.Value);\n"
-                ));
-                out.push_str(&format!("{indent}}}\n"));
+                w.line(format!("var {name}Ptr = IntPtr.Zero;"));
+                w.line(format!("if ({name}.HasValue)"));
+                w.block("{", "}", |w| {
+                    w.line(format!("{name}Ptr = Marshal.AllocHGlobal(sizeof(byte));"));
+                    w.line(format!("Marshal.WriteByte({name}Ptr, (byte){name}.Value);"));
+                });
             }
             TypeRef::I16 | TypeRef::U16 => {
-                out.push_str(&format!("{indent}var {name}Ptr = IntPtr.Zero;\n"));
-                out.push_str(&format!("{indent}if ({name}.HasValue)\n{indent}{{\n"));
-                out.push_str(&format!(
-                    "{indent}    {name}Ptr = Marshal.AllocHGlobal(sizeof(short));\n"
-                ));
-                out.push_str(&format!(
-                    "{indent}    Marshal.WriteInt16({name}Ptr, (short){name}.Value);\n"
-                ));
-                out.push_str(&format!("{indent}}}\n"));
+                w.line(format!("var {name}Ptr = IntPtr.Zero;"));
+                w.line(format!("if ({name}.HasValue)"));
+                w.block("{", "}", |w| {
+                    w.line(format!("{name}Ptr = Marshal.AllocHGlobal(sizeof(short));"));
+                    w.line(format!(
+                        "Marshal.WriteInt16({name}Ptr, (short){name}.Value);"
+                    ));
+                });
             }
             TypeRef::F32 => {
-                out.push_str(&format!("{indent}var {name}Ptr = IntPtr.Zero;\n"));
-                out.push_str(&format!("{indent}if ({name}.HasValue)\n{indent}{{\n"));
-                out.push_str(&format!(
-                    "{indent}    {name}Ptr = Marshal.AllocHGlobal(sizeof(float));\n"
-                ));
-                out.push_str(&format!(
-                    "{indent}    Marshal.WriteInt32({name}Ptr, BitConverter.SingleToInt32Bits({name}.Value));\n"
-                ));
-                out.push_str(&format!("{indent}}}\n"));
+                w.line(format!("var {name}Ptr = IntPtr.Zero;"));
+                w.line(format!("if ({name}.HasValue)"));
+                w.block("{", "}", |w| {
+                    w.line(format!("{name}Ptr = Marshal.AllocHGlobal(sizeof(float));"));
+                    w.line(format!(
+                        "Marshal.WriteInt32({name}Ptr, BitConverter.SingleToInt32Bits({name}.Value));"
+                    ));
+                });
             }
             TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                out.push_str(&format!(
-                    "{indent}var {name}Pin = {name} != null ? GCHandle.Alloc({name}, GCHandleType.Pinned) : default;\n"
+                w.line(format!(
+                    "var {name}Pin = {name} != null ? GCHandle.Alloc({name}, GCHandleType.Pinned) : default;"
                 ));
             }
             _ => {}
         },
         TypeRef::List(elem) => {
-            render_array_marshal_setup(out, &name, &format!("{name}.Length"), elem, indent);
+            let mut tmp = String::new();
+            render_array_marshal_setup(&mut tmp, &name, &format!("{name}.Length"), elem, indent);
+            w.raw(tmp);
         }
         TypeRef::Map(k, v) => {
             // Parallel key/value arrays in dictionary iteration order.
             let (k_arr, k_conv) = cs_elem_array_slot(k, "kv.Key");
             let (v_arr, v_conv) = cs_elem_array_slot(v, "kv.Value");
-            out.push_str(&format!(
-                "{indent}var {name}KeysArr = new {k_arr}[{name}.Count];\n"
+            w.line(format!("var {name}KeysArr = new {k_arr}[{name}.Count];"));
+            w.line(format!("var {name}ValsArr = new {v_arr}[{name}.Count];"));
+            w.line(format!("var {name}I = 0;"));
+            w.line(format!("foreach (var kv in {name})"));
+            w.block("{", "}", |w| {
+                w.line(format!("{name}KeysArr[{name}I] = {k_conv};"));
+                w.line(format!("{name}ValsArr[{name}I] = {v_conv};"));
+                w.line(format!("{name}I++;"));
+            });
+            w.line(format!(
+                "var {name}KeysPin = GCHandle.Alloc({name}KeysArr, GCHandleType.Pinned);"
             ));
-            out.push_str(&format!(
-                "{indent}var {name}ValsArr = new {v_arr}[{name}.Count];\n"
-            ));
-            out.push_str(&format!("{indent}var {name}I = 0;\n"));
-            out.push_str(&format!("{indent}foreach (var kv in {name})\n{indent}{{\n"));
-            out.push_str(&format!("{indent}    {name}KeysArr[{name}I] = {k_conv};\n"));
-            out.push_str(&format!("{indent}    {name}ValsArr[{name}I] = {v_conv};\n"));
-            out.push_str(&format!("{indent}    {name}I++;\n"));
-            out.push_str(&format!("{indent}}}\n"));
-            out.push_str(&format!(
-                "{indent}var {name}KeysPin = GCHandle.Alloc({name}KeysArr, GCHandleType.Pinned);\n"
-            ));
-            out.push_str(&format!(
-                "{indent}var {name}ValsPin = GCHandle.Alloc({name}ValsArr, GCHandleType.Pinned);\n"
+            w.line(format!(
+                "var {name}ValsPin = GCHandle.Alloc({name}ValsArr, GCHandleType.Pinned);"
             ));
         }
         _ => {}
     }
+    out.push_str(&w.finish());
 }
 
 /// One pinned native array for a list parameter: `{name}Arr` (the converted
@@ -2418,24 +2604,24 @@ fn render_array_marshal_setup(
     elem: &TypeRef,
     indent: &str,
 ) {
+    let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
     match elem {
         // Blittable element arrays pin in place; no conversion copy needed.
         TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => {
-            out.push_str(&format!("{indent}var {name}Arr = {name};\n"));
+            w.line(format!("var {name}Arr = {name};"));
         }
         _ => {
             let (arr_ty, conv) = cs_elem_array_slot(elem, &format!("{name}[{name}It]"));
-            out.push_str(&format!(
-                "{indent}var {name}Arr = new {arr_ty}[{len_expr}];\n"
-            ));
-            out.push_str(&format!(
-                "{indent}for (var {name}It = 0; {name}It < {len_expr}; {name}It++) {name}Arr[{name}It] = {conv};\n"
+            w.line(format!("var {name}Arr = new {arr_ty}[{len_expr}];"));
+            w.line(format!(
+                "for (var {name}It = 0; {name}It < {len_expr}; {name}It++) {name}Arr[{name}It] = {conv};"
             ));
         }
     }
-    out.push_str(&format!(
-        "{indent}var {name}Pin = GCHandle.Alloc({name}Arr, GCHandleType.Pinned);\n"
+    w.line(format!(
+        "var {name}Pin = GCHandle.Alloc({name}Arr, GCHandleType.Pinned);"
     ));
+    out.push_str(&w.finish());
 }
 
 /// The native array slot type and per-element conversion expression for one
@@ -2472,17 +2658,18 @@ fn cs_elem_allocates(elem: &TypeRef) -> bool {
 
 fn render_marshal_cleanup(out: &mut String, p: &ParamBinding, indent: &str) {
     let name = safe_cs_name(&p.name);
+    let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
     match &p.ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!("{indent}Marshal.FreeCoTaskMem({name}Ptr);\n"));
+            w.line(format!("Marshal.FreeCoTaskMem({name}Ptr);"));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            out.push_str(&format!("{indent}{name}Pin.Free();\n"));
+            w.line(format!("{name}Pin.Free();"));
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                out.push_str(&format!(
-                    "{indent}if ({name}Ptr != IntPtr.Zero) Marshal.FreeCoTaskMem({name}Ptr);\n"
+                w.line(format!(
+                    "if ({name}Ptr != IntPtr.Zero) Marshal.FreeCoTaskMem({name}Ptr);"
                 ));
             }
             TypeRef::I8
@@ -2498,39 +2685,40 @@ fn render_marshal_cleanup(out: &mut String, p: &ParamBinding, indent: &str) {
             | TypeRef::Bool
             | TypeRef::Handle
             | TypeRef::Enum(_) => {
-                out.push_str(&format!(
-                    "{indent}if ({name}Ptr != IntPtr.Zero) Marshal.FreeHGlobal({name}Ptr);\n"
+                w.line(format!(
+                    "if ({name}Ptr != IntPtr.Zero) Marshal.FreeHGlobal({name}Ptr);"
                 ));
             }
             TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                out.push_str(&format!("{indent}if ({name} != null) {name}Pin.Free();\n"));
+                w.line(format!("if ({name} != null) {name}Pin.Free();"));
             }
             _ => {}
         },
         TypeRef::List(elem) => {
-            out.push_str(&format!("{indent}{name}Pin.Free();\n"));
+            w.line(format!("{name}Pin.Free();"));
             if cs_elem_allocates(elem) {
-                out.push_str(&format!(
-                    "{indent}foreach (var {name}P in {name}Arr) Marshal.FreeCoTaskMem({name}P);\n"
+                w.line(format!(
+                    "foreach (var {name}P in {name}Arr) Marshal.FreeCoTaskMem({name}P);"
                 ));
             }
         }
         TypeRef::Map(k, v) => {
-            out.push_str(&format!("{indent}{name}KeysPin.Free();\n"));
-            out.push_str(&format!("{indent}{name}ValsPin.Free();\n"));
+            w.line(format!("{name}KeysPin.Free();"));
+            w.line(format!("{name}ValsPin.Free();"));
             if cs_elem_allocates(k) {
-                out.push_str(&format!(
-                    "{indent}foreach (var {name}KP in {name}KeysArr) Marshal.FreeCoTaskMem({name}KP);\n"
+                w.line(format!(
+                    "foreach (var {name}KP in {name}KeysArr) Marshal.FreeCoTaskMem({name}KP);"
                 ));
             }
             if cs_elem_allocates(v) {
-                out.push_str(&format!(
-                    "{indent}foreach (var {name}VP in {name}ValsArr) Marshal.FreeCoTaskMem({name}VP);\n"
+                w.line(format!(
+                    "foreach (var {name}VP in {name}ValsArr) Marshal.FreeCoTaskMem({name}VP);"
                 ));
             }
         }
         _ => {}
     }
+    out.push_str(&w.finish());
 }
 
 fn render_pinvoke_call_and_return(out: &mut String, f: &FnBinding, indent: &str) {
@@ -2553,6 +2741,7 @@ fn render_pinvoke_call_and_return(out: &mut String, f: &FnBinding, indent: &str)
         )
     });
 
+    let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
     if f.ret.is_some() {
         let args_part = if call_args.is_empty() {
             String::new()
@@ -2560,8 +2749,8 @@ fn render_pinvoke_call_and_return(out: &mut String, f: &FnBinding, indent: &str)
             format!("{call_args}, ")
         };
         let out_len_part = if has_out_len { "out var outLen, " } else { "" };
-        out.push_str(&format!(
-            "{indent}var result = NativeMethods.{c_sym}({args_part}{out_len_part}ref err);\n"
+        w.line(format!(
+            "var result = NativeMethods.{c_sym}({args_part}{out_len_part}ref err);"
         ));
     } else {
         let args_part = if call_args.is_empty() {
@@ -2569,12 +2758,11 @@ fn render_pinvoke_call_and_return(out: &mut String, f: &FnBinding, indent: &str)
         } else {
             format!("{call_args}, ")
         };
-        out.push_str(&format!(
-            "{indent}NativeMethods.{c_sym}({args_part}ref err);\n"
-        ));
+        w.line(format!("NativeMethods.{c_sym}({args_part}ref err);"));
     }
 
-    out.push_str(&format!("{indent}WeaveFFIError.Check(err);\n"));
+    w.line("WeaveFFIError.Check(err);");
+    out.push_str(&w.finish());
 
     if let Some(ret_ty) = &f.ret {
         render_return_conversion(out, ret_ty, indent);
@@ -2637,196 +2825,140 @@ fn build_call_args(params: &[ParamBinding]) -> String {
 }
 
 fn render_return_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
+    let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
     match ty {
         TypeRef::Bool => {
-            out.push_str(&format!("{indent}return result != 0;\n"));
+            w.line("return result != 0;");
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!(
-                "{indent}var str = Marshal.PtrToStringUTF8(result);\n"
-            ));
-            out.push_str(&format!(
-                "{indent}NativeMethods.weaveffi_free_string(result);\n"
-            ));
-            out.push_str(&format!("{indent}return str;\n"));
+            w.line("var str = Marshal.PtrToStringUTF8(result);");
+            w.line("NativeMethods.weaveffi_free_string(result);");
+            w.line("return str;");
         }
         TypeRef::Enum(name) => {
             let cn = local_type_name(name);
-            out.push_str(&format!("{indent}return ({cn})result;\n"));
+            w.line(format!("return ({cn})result;"));
         }
         TypeRef::Struct(name) => {
             let cn = local_type_name(name);
-            out.push_str(&format!("{indent}return new {cn}(result);\n"));
+            w.line(format!("return new {cn}(result);"));
         }
         TypeRef::TypedHandle(name) => {
             let cn = local_type_name(name);
-            out.push_str(&format!("{indent}return new {cn}(result);\n"));
+            w.line(format!("return new {cn}(result);"));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            out.push_str(&format!(
-                "{indent}if (result == IntPtr.Zero) return Array.Empty<byte>();\n"
-            ));
-            out.push_str(&format!("{indent}var arr = new byte[(int)outLen];\n"));
-            out.push_str(&format!(
-                "{indent}Marshal.Copy(result, arr, 0, (int)outLen);\n"
-            ));
-            out.push_str(&format!(
-                "{indent}NativeMethods.weaveffi_free_bytes(result, outLen);\n"
-            ));
-            out.push_str(&format!("{indent}return arr;\n"));
+            w.line("if (result == IntPtr.Zero) return Array.Empty<byte>();");
+            w.line("var arr = new byte[(int)outLen];");
+            w.line("Marshal.Copy(result, arr, 0, (int)outLen);");
+            w.line("NativeMethods.weaveffi_free_bytes(result, outLen);");
+            w.line("return arr;");
         }
         TypeRef::Optional(inner) => {
+            out.push_str(&w.finish());
             render_optional_return_conversion(out, inner, indent);
+            return;
         }
         TypeRef::List(inner) => {
+            out.push_str(&w.finish());
             render_list_return(out, inner, indent);
+            return;
         }
         TypeRef::Iterator(_) => unreachable!("iterator functions render via CallShape::Iterator"),
         TypeRef::Map(_, _) => {}
         _ => {
-            out.push_str(&format!("{indent}return result;\n"));
+            w.line("return result;");
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn render_optional_return_conversion(out: &mut String, inner: &TypeRef, indent: &str) {
+    let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!(
-                "{indent}if (result == IntPtr.Zero) return null;\n"
-            ));
-            out.push_str(&format!(
-                "{indent}var str = Marshal.PtrToStringUTF8(result);\n"
-            ));
-            out.push_str(&format!(
-                "{indent}NativeMethods.weaveffi_free_string(result);\n"
-            ));
-            out.push_str(&format!("{indent}return str;\n"));
+            w.line("if (result == IntPtr.Zero) return null;");
+            w.line("var str = Marshal.PtrToStringUTF8(result);");
+            w.line("NativeMethods.weaveffi_free_string(result);");
+            w.line("return str;");
         }
         TypeRef::Struct(name) => {
             let cn = local_type_name(name);
-            out.push_str(&format!(
-                "{indent}return result == IntPtr.Zero ? null : new {cn}(result);\n"
+            w.line(format!(
+                "return result == IntPtr.Zero ? null : new {cn}(result);"
             ));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            out.push_str(&format!(
-                "{indent}if (result == IntPtr.Zero) return null;\n"
-            ));
-            out.push_str(&format!("{indent}var arr = new byte[(int)outLen];\n"));
-            out.push_str(&format!(
-                "{indent}Marshal.Copy(result, arr, 0, (int)outLen);\n"
-            ));
-            out.push_str(&format!(
-                "{indent}NativeMethods.weaveffi_free_bytes(result, outLen);\n"
-            ));
-            out.push_str(&format!("{indent}return arr;\n"));
+            w.line("if (result == IntPtr.Zero) return null;");
+            w.line("var arr = new byte[(int)outLen];");
+            w.line("Marshal.Copy(result, arr, 0, (int)outLen);");
+            w.line("NativeMethods.weaveffi_free_bytes(result, outLen);");
+            w.line("return arr;");
         }
         TypeRef::I32 => {
-            out.push_str(&format!(
-                "{indent}if (result == IntPtr.Zero) return null;\n"
-            ));
-            out.push_str(&format!("{indent}return Marshal.ReadInt32(result);\n"));
+            w.line("if (result == IntPtr.Zero) return null;");
+            w.line("return Marshal.ReadInt32(result);");
         }
         TypeRef::U32 => {
-            out.push_str(&format!(
-                "{indent}if (result == IntPtr.Zero) return null;\n"
-            ));
-            out.push_str(&format!(
-                "{indent}return (uint)Marshal.ReadInt32(result);\n"
-            ));
+            w.line("if (result == IntPtr.Zero) return null;");
+            w.line("return (uint)Marshal.ReadInt32(result);");
         }
         TypeRef::I64 => {
-            out.push_str(&format!(
-                "{indent}if (result == IntPtr.Zero) return null;\n"
-            ));
-            out.push_str(&format!("{indent}return Marshal.ReadInt64(result);\n"));
+            w.line("if (result == IntPtr.Zero) return null;");
+            w.line("return Marshal.ReadInt64(result);");
         }
         TypeRef::F64 => {
-            out.push_str(&format!(
-                "{indent}if (result == IntPtr.Zero) return null;\n"
-            ));
-            out.push_str(&format!(
-                "{indent}return BitConverter.Int64BitsToDouble(Marshal.ReadInt64(result));\n"
-            ));
+            w.line("if (result == IntPtr.Zero) return null;");
+            w.line("return BitConverter.Int64BitsToDouble(Marshal.ReadInt64(result));");
         }
         TypeRef::I8 => {
-            out.push_str(&format!(
-                "{indent}if (result == IntPtr.Zero) return null;\n"
-            ));
-            out.push_str(&format!(
-                "{indent}return (sbyte)Marshal.ReadByte(result);\n"
-            ));
+            w.line("if (result == IntPtr.Zero) return null;");
+            w.line("return (sbyte)Marshal.ReadByte(result);");
         }
         TypeRef::U8 => {
-            out.push_str(&format!(
-                "{indent}if (result == IntPtr.Zero) return null;\n"
-            ));
-            out.push_str(&format!("{indent}return (byte)Marshal.ReadByte(result);\n"));
+            w.line("if (result == IntPtr.Zero) return null;");
+            w.line("return (byte)Marshal.ReadByte(result);");
         }
         TypeRef::I16 => {
-            out.push_str(&format!(
-                "{indent}if (result == IntPtr.Zero) return null;\n"
-            ));
-            out.push_str(&format!("{indent}return Marshal.ReadInt16(result);\n"));
+            w.line("if (result == IntPtr.Zero) return null;");
+            w.line("return Marshal.ReadInt16(result);");
         }
         TypeRef::U16 => {
-            out.push_str(&format!(
-                "{indent}if (result == IntPtr.Zero) return null;\n"
-            ));
-            out.push_str(&format!(
-                "{indent}return (ushort)Marshal.ReadInt16(result);\n"
-            ));
+            w.line("if (result == IntPtr.Zero) return null;");
+            w.line("return (ushort)Marshal.ReadInt16(result);");
         }
         TypeRef::U64 => {
-            out.push_str(&format!(
-                "{indent}if (result == IntPtr.Zero) return null;\n"
-            ));
-            out.push_str(&format!(
-                "{indent}return (ulong)Marshal.ReadInt64(result);\n"
-            ));
+            w.line("if (result == IntPtr.Zero) return null;");
+            w.line("return (ulong)Marshal.ReadInt64(result);");
         }
         TypeRef::F32 => {
-            out.push_str(&format!(
-                "{indent}if (result == IntPtr.Zero) return null;\n"
-            ));
-            out.push_str(&format!(
-                "{indent}return BitConverter.Int32BitsToSingle(Marshal.ReadInt32(result));\n"
-            ));
+            w.line("if (result == IntPtr.Zero) return null;");
+            w.line("return BitConverter.Int32BitsToSingle(Marshal.ReadInt32(result));");
         }
         TypeRef::Bool => {
-            out.push_str(&format!(
-                "{indent}if (result == IntPtr.Zero) return null;\n"
-            ));
-            out.push_str(&format!("{indent}return Marshal.ReadInt32(result) != 0;\n"));
+            w.line("if (result == IntPtr.Zero) return null;");
+            w.line("return Marshal.ReadInt32(result) != 0;");
         }
         TypeRef::Handle => {
-            out.push_str(&format!(
-                "{indent}if (result == IntPtr.Zero) return null;\n"
-            ));
-            out.push_str(&format!(
-                "{indent}return (ulong)Marshal.ReadInt64(result);\n"
-            ));
+            w.line("if (result == IntPtr.Zero) return null;");
+            w.line("return (ulong)Marshal.ReadInt64(result);");
         }
         TypeRef::TypedHandle(name) => {
             let cn = local_type_name(name);
-            out.push_str(&format!(
-                "{indent}return result == IntPtr.Zero ? null : new {cn}(result);\n"
+            w.line(format!(
+                "return result == IntPtr.Zero ? null : new {cn}(result);"
             ));
         }
         TypeRef::Enum(name) => {
             let cn = local_type_name(name);
-            out.push_str(&format!(
-                "{indent}if (result == IntPtr.Zero) return null;\n"
-            ));
-            out.push_str(&format!(
-                "{indent}return ({cn})Marshal.ReadInt32(result);\n"
-            ));
+            w.line("if (result == IntPtr.Zero) return null;");
+            w.line(format!("return ({cn})Marshal.ReadInt32(result);"));
         }
         _ => {
-            out.push_str(&format!("{indent}return result;\n"));
+            w.line("return result;");
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn render_list_return(out: &mut String, inner: &TypeRef, indent: &str) {
@@ -2848,21 +2980,20 @@ fn render_map_return_call(
     } else {
         format!("{call_args}, ")
     };
-    out.push_str(&format!(
-        "{indent}NativeMethods.{c_sym}({args_part}out var outKeys, out var outValues, out var outLen, ref err);\n"
+    let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
+    w.line(format!(
+        "NativeMethods.{c_sym}({args_part}out var outKeys, out var outValues, out var outLen, ref err);"
     ));
-    out.push_str(&format!("{indent}WeaveFFIError.Check(err);\n"));
-    out.push_str(&format!(
-        "{indent}var dict = new Dictionary<{k_cs}, {v_cs}>();\n"
-    ));
-    out.push_str(&format!(
-        "{indent}for (int i = 0; i < (int)outLen; i++)\n{indent}{{\n"
-    ));
+    w.line("WeaveFFIError.Check(err);");
+    w.line(format!("var dict = new Dictionary<{k_cs}, {v_cs}>();"));
     let key_read = marshal_read_element(k, "outKeys", "i");
     let val_read = marshal_read_element(v, "outValues", "i");
-    out.push_str(&format!("{indent}    dict[{key_read}] = {val_read};\n"));
-    out.push_str(&format!("{indent}}}\n"));
-    out.push_str(&format!("{indent}return dict;\n"));
+    w.line("for (int i = 0; i < (int)outLen; i++)");
+    w.block("{", "}", |w| {
+        w.line(format!("dict[{key_read}] = {val_read};"));
+    });
+    w.line("return dict;");
+    out.push_str(&w.finish());
 }
 
 fn marshal_read_element(ty: &TypeRef, arr: &str, idx: &str) -> String {

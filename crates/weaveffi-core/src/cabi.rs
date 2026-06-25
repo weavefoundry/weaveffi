@@ -13,6 +13,7 @@ use std::fmt::Write;
 
 use crate::abi::AbiParam;
 use crate::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
+use crate::codegen::CodeWriter;
 use crate::model::{AbiFn, CallShape, EnumBinding, ModuleBinding, StructBinding};
 
 /// Emit a `/** ... */` doc comment at `indent`.
@@ -61,27 +62,29 @@ pub fn render_runtime_decls(out: &mut String, prefix: &str) {
 /// Render an enum's discriminant constants as a C `typedef enum` named
 /// `type_name`. Multi-line when any variant is documented.
 fn render_enum_constants(out: &mut String, e: &EnumBinding, type_name: &str) {
-    emit_doc(out, &e.doc, "");
+    let mut w = CodeWriter::four_space();
+    w.doc(&e.doc, DocCommentStyle::Javadoc);
     if e.variants.iter().any(|v| v.doc.is_some()) {
-        out.push_str("typedef enum {\n");
-        for (i, v) in e.variants.iter().enumerate() {
-            emit_doc(out, &v.doc, "    ");
-            let comma = if i + 1 == e.variants.len() { "" } else { "," };
-            let _ = writeln!(out, "    {} = {}{comma}", v.c_const, v.value);
-        }
-        let _ = writeln!(out, "}} {type_name};");
+        w.block("typedef enum {", format!("}} {type_name};"), |w| {
+            let last = e.variants.len();
+            for (i, v) in e.variants.iter().enumerate() {
+                w.doc(&v.doc, DocCommentStyle::Javadoc);
+                let comma = if i + 1 == last { "" } else { "," };
+                w.line(format!("{} = {}{comma}", v.c_const, v.value));
+            }
+        });
     } else {
         let variants: Vec<String> = e
             .variants
             .iter()
             .map(|v| format!("{} = {}", v.c_const, v.value))
             .collect();
-        let _ = writeln!(
-            out,
+        w.line(format!(
             "typedef enum {{ {} }} {type_name};",
             variants.join(", ")
-        );
+        ));
     }
+    out.push_str(&w.finish());
 }
 
 /// Render a C-style enum typedef. Multi-line when any variant is documented.
