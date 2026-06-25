@@ -18,6 +18,9 @@ use crate::capabilities::{self, TargetCapabilities};
 use crate::package::{PackageContext, PackagedFile};
 
 pub mod common;
+pub mod writer;
+
+pub use writer::CodeWriter;
 
 fn run_hook(label: &str, cmd: &str) -> Result<()> {
     let status = if cfg!(target_os = "windows") {

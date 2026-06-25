@@ -15,6 +15,7 @@ use weaveffi_core::abi::{AbiParam, CType, ConstPos};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, walk_modules, DocCommentStyle};
+use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::model::{
     AsyncBinding, BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
     ListenerBinding, ModuleBinding, ParamBinding, RichVariantBinding, StructBinding,
@@ -759,45 +760,50 @@ fn collect_trampoline_externs(model: &BindingModel, prefix: &str) -> Vec<String>
 /// GC stays unaware of C-held references and trampolines recover the Go value
 /// from the map.
 fn render_callback_registry(out: &mut String, has_listeners: bool) {
-    out.push_str("var (\n");
-    out.push_str("\twvCallbackMu  sync.Mutex\n");
-    out.push_str("\twvCallbackSeq uint64\n");
-    out.push_str("\twvCallbacks   = map[uint64]interface{}{}\n");
-    if has_listeners {
-        out.push_str(
-            "\t// Subscription id -> registry id, so unregister can release the Go callback.\n",
-        );
-        out.push_str("\twvListenerCtx = map[uint64]uint64{}\n");
-    }
-    out.push_str(")\n\n");
+    let mut w = CodeWriter::tabs();
+    w.block("var (", ")", |w| {
+        w.line("wvCallbackMu  sync.Mutex");
+        w.line("wvCallbackSeq uint64");
+        w.line("wvCallbacks   = map[uint64]interface{}{}");
+        if has_listeners {
+            w.line("// Subscription id -> registry id, so unregister can release the Go callback.");
+            w.line("wvListenerCtx = map[uint64]uint64{}");
+        }
+    });
+    w.blank();
 
-    out.push_str("func wvCallbackStore(v interface{}) uint64 {\n");
-    out.push_str("\twvCallbackMu.Lock()\n");
-    out.push_str("\tdefer wvCallbackMu.Unlock()\n");
-    out.push_str("\twvCallbackSeq++\n");
-    out.push_str("\twvCallbacks[wvCallbackSeq] = v\n");
-    out.push_str("\treturn wvCallbackSeq\n");
-    out.push_str("}\n\n");
+    w.block("func wvCallbackStore(v interface{}) uint64 {", "}", |w| {
+        w.line("wvCallbackMu.Lock()");
+        w.line("defer wvCallbackMu.Unlock()");
+        w.line("wvCallbackSeq++");
+        w.line("wvCallbacks[wvCallbackSeq] = v");
+        w.line("return wvCallbackSeq");
+    });
+    w.blank();
 
-    out.push_str("func wvCallbackLoad(id uint64) interface{} {\n");
-    out.push_str("\twvCallbackMu.Lock()\n");
-    out.push_str("\tdefer wvCallbackMu.Unlock()\n");
-    out.push_str("\treturn wvCallbacks[id]\n");
-    out.push_str("}\n\n");
+    w.block("func wvCallbackLoad(id uint64) interface{} {", "}", |w| {
+        w.line("wvCallbackMu.Lock()");
+        w.line("defer wvCallbackMu.Unlock()");
+        w.line("return wvCallbacks[id]");
+    });
+    w.blank();
 
-    out.push_str("func wvCallbackTake(id uint64) interface{} {\n");
-    out.push_str("\twvCallbackMu.Lock()\n");
-    out.push_str("\tdefer wvCallbackMu.Unlock()\n");
-    out.push_str("\tv := wvCallbacks[id]\n");
-    out.push_str("\tdelete(wvCallbacks, id)\n");
-    out.push_str("\treturn v\n");
-    out.push_str("}\n\n");
+    w.block("func wvCallbackTake(id uint64) interface{} {", "}", |w| {
+        w.line("wvCallbackMu.Lock()");
+        w.line("defer wvCallbackMu.Unlock()");
+        w.line("v := wvCallbacks[id]");
+        w.line("delete(wvCallbacks, id)");
+        w.line("return v");
+    });
+    w.blank();
 
-    out.push_str("func wvCallbackDelete(id uint64) {\n");
-    out.push_str("\twvCallbackMu.Lock()\n");
-    out.push_str("\tdefer wvCallbackMu.Unlock()\n");
-    out.push_str("\tdelete(wvCallbacks, id)\n");
-    out.push_str("}\n\n");
+    w.block("func wvCallbackDelete(id uint64) {", "}", |w| {
+        w.line("wvCallbackMu.Lock()");
+        w.line("defer wvCallbackMu.Unlock()");
+        w.line("delete(wvCallbacks, id)");
+    });
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// The Go signature of the user-facing callback for a module callback decl,
@@ -822,6 +828,7 @@ fn emit_cb_param_arg(
 ) -> String {
     let arg = format!("arg{idx}");
     let n = &p.abi[0].name;
+    let mut w = CodeWriter::tabs().with_depth(1);
     match &p.ty {
         TypeRef::I8
         | TypeRef::I16
@@ -834,83 +841,94 @@ fn emit_cb_param_arg(
         | TypeRef::Handle
         | TypeRef::F32
         | TypeRef::F64 => {
-            out.push_str(&format!("\t{arg} := {}\n", go_scalar_conv(n, &p.ty)));
+            w.line(format!("{arg} := {}", go_scalar_conv(n, &p.ty)));
         }
         TypeRef::Bool => {
-            out.push_str(&format!("\t{arg} := cToBool({n})\n"));
+            w.line(format!("{arg} := cToBool({n})"));
         }
         TypeRef::Enum(_) => {
-            out.push_str(&format!("\t{arg} := {}\n", go_scalar_conv(n, &p.ty)));
+            w.line(format!("{arg} := {}", go_scalar_conv(n, &p.ty)));
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!("\t{arg} := \"\"\n"));
-            out.push_str(&format!("\tif {n} != nil {{\n"));
-            out.push_str(&format!("\t\t{arg} = C.GoString({n})\n"));
-            out.push_str("\t}\n");
+            w.line(format!("{arg} := \"\""));
+            w.block(format!("if {n} != nil {{"), "}", |w| {
+                w.line(format!("{arg} = C.GoString({n})"));
+            });
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            out.push_str(&format!("\tvar {arg} []byte\n"));
-            out.push_str(&format!("\tif {n} != nil {{\n"));
-            out.push_str(&format!(
-                "\t\t{arg} = C.GoBytes(unsafe.Pointer({n}), C.int({}_len))\n",
-                p.name
-            ));
-            out.push_str("\t}\n");
+            w.line(format!("var {arg} []byte"));
+            w.block(format!("if {n} != nil {{"), "}", |w| {
+                w.line(format!(
+                    "{arg} = C.GoBytes(unsafe.Pointer({n}), C.int({}_len))",
+                    p.name
+                ));
+            });
         }
         // Opaque pointers are borrowed for the duration of the callback; the
         // wrapper must not be Closed by the consumer.
         TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
             let g = local_type_name(name).to_upper_camel_case();
-            out.push_str(&format!("\t{arg} := &{g}{{ptr: {n}}}\n"));
+            w.line(format!("{arg} := &{g}{{ptr: {n}}}"));
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                out.push_str(&format!("\tvar {arg} *string\n"));
-                out.push_str(&format!("\tif {n} != nil {{\n"));
-                out.push_str(&format!("\t\tv{idx} := C.GoString({n})\n"));
-                out.push_str(&format!("\t\t{arg} = &v{idx}\n"));
-                out.push_str("\t}\n");
+                w.line(format!("var {arg} *string"));
+                w.block(format!("if {n} != nil {{"), "}", |w| {
+                    w.line(format!("v{idx} := C.GoString({n})"));
+                    w.line(format!("{arg} = &v{idx}"));
+                });
             }
             TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                out.push_str(&format!("\tvar {arg} []byte\n"));
-                out.push_str(&format!("\tif {n} != nil {{\n"));
-                out.push_str(&format!(
-                    "\t\t{arg} = C.GoBytes(unsafe.Pointer({n}), C.int({}_len))\n",
-                    p.name
-                ));
-                out.push_str("\t}\n");
+                w.line(format!("var {arg} []byte"));
+                w.block(format!("if {n} != nil {{"), "}", |w| {
+                    w.line(format!(
+                        "{arg} = C.GoBytes(unsafe.Pointer({n}), C.int({}_len))",
+                        p.name
+                    ));
+                });
             }
             TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
                 let g = local_type_name(name).to_upper_camel_case();
-                out.push_str(&format!("\tvar {arg} *{g}\n"));
-                out.push_str(&format!("\tif {n} != nil {{\n"));
-                out.push_str(&format!("\t\t{arg} = &{g}{{ptr: {n}}}\n"));
-                out.push_str("\t}\n");
+                w.line(format!("var {arg} *{g}"));
+                w.block(format!("if {n} != nil {{"), "}", |w| {
+                    w.line(format!("{arg} = &{g}{{ptr: {n}}}"));
+                });
             }
             TypeRef::Bool => {
-                out.push_str(&format!("\tvar {arg} *bool\n"));
-                out.push_str(&format!("\tif {n} != nil {{\n"));
-                out.push_str(&format!("\t\tv{idx} := cToBool(*{n})\n"));
-                out.push_str(&format!("\t\t{arg} = &v{idx}\n"));
-                out.push_str("\t}\n");
+                w.line(format!("var {arg} *bool"));
+                w.block(format!("if {n} != nil {{"), "}", |w| {
+                    w.line(format!("v{idx} := cToBool(*{n})"));
+                    w.line(format!("{arg} = &v{idx}"));
+                });
             }
             _ => {
                 let gt = go_type(inner);
-                out.push_str(&format!("\tvar {arg} *{gt}\n"));
-                out.push_str(&format!("\tif {n} != nil {{\n"));
-                out.push_str(&format!("\t\tv{idx} := {gt}(*{n})\n"));
-                out.push_str(&format!("\t\t{arg} = &v{idx}\n"));
-                out.push_str("\t}\n");
+                w.line(format!("var {arg} *{gt}"));
+                w.block(format!("if {n} != nil {{"), "}", |w| {
+                    w.line(format!("v{idx} := {gt}(*{n})"));
+                    w.line(format!("{arg} = &v{idx}"));
+                });
             }
         },
         TypeRef::List(inner) => {
-            out.push_str(&format!("\tcount{idx} := int({}_len)\n", p.name));
-            decode_list(out, &arg, inner, n, &format!("count{idx}"), prefix, module);
+            w.line(format!("count{idx} := int({}_len)", p.name));
+            let mut body = String::new();
+            decode_list(
+                &mut body,
+                &arg,
+                inner,
+                n,
+                &format!("count{idx}"),
+                prefix,
+                module,
+            );
+            w.raw(body);
         }
         TypeRef::Map(k, v) => {
-            out.push_str(&format!("\tcount{idx} := int({}_len)\n", p.name));
+            w.line(format!("count{idx} := int({}_len)", p.name));
+            let mut body = String::new();
             decode_map(
-                out,
+                &mut body,
                 &arg,
                 k,
                 v,
@@ -920,9 +938,11 @@ fn emit_cb_param_arg(
                 prefix,
                 module,
             );
+            w.raw(body);
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as callback parameter"),
     }
+    out.push_str(&w.finish());
     arg
 }
 
@@ -937,17 +957,28 @@ fn render_callback_trampoline(out: &mut String, prefix: &str, module: &str, cb: 
         .map(|s| format!("{} {}", s.name, cgo_slot_type(&s.ty, prefix)))
         .collect();
 
-    out.push_str(&format!("//export {tramp}\n"));
-    out.push_str(&format!("func {tramp}({}) {{\n", formals.join(", ")));
-    out.push_str("\tv := wvCallbackLoad(uint64(uintptr(context)))\n");
-    out.push_str("\tif v == nil {\n\t\treturn\n\t}\n");
-    out.push_str(&format!("\tcb := v.({})\n", go_callback_sig(cb)));
-    let mut args = Vec::new();
-    for (idx, p) in cb.params.iter().enumerate() {
-        args.push(emit_cb_param_arg(out, idx, p, prefix, module));
-    }
-    out.push_str(&format!("\tcb({})\n", args.join(", ")));
-    out.push_str("}\n\n");
+    let mut w = CodeWriter::tabs();
+    w.line(format!("//export {tramp}"));
+    w.block(
+        format!("func {tramp}({}) {{", formals.join(", ")),
+        "}",
+        |w| {
+            w.line("v := wvCallbackLoad(uint64(uintptr(context)))");
+            w.block("if v == nil {", "}", |w| {
+                w.line("return");
+            });
+            w.line(format!("cb := v.({})", go_callback_sig(cb)));
+            let mut args = Vec::new();
+            for (idx, p) in cb.params.iter().enumerate() {
+                let mut body = String::new();
+                args.push(emit_cb_param_arg(&mut body, idx, p, prefix, module));
+                w.raw(body);
+            }
+            w.line(format!("cb({})", args.join(", ")));
+        },
+    );
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// The register/unregister wrapper pair for one listener.
@@ -959,38 +990,43 @@ fn render_listener_api(out: &mut String, m: &ModuleBinding, l: &ListenerBinding)
     let unregister_go = format!("{}_unregister_{}", m.path, l.name).to_upper_camel_case();
     let tramp = trampoline_name(&cb.c_fn_type);
 
-    emit_doc(out, &l.doc, "", Some(&register_go));
-    out.push_str(&format!(
-        "// Returns a subscription id for {unregister_go}.\n"
-    ));
-    out.push_str(&format!(
-        "func {register_go}(callback {}) uint64 {{\n",
-        go_callback_sig(cb)
-    ));
-    out.push_str("\tctxID := wvCallbackStore(callback)\n");
-    out.push_str(&format!(
-        "\tid := uint64(C.{}(C.{}(unsafe.Pointer(C.{tramp})), unsafe.Pointer(uintptr(ctxID))))\n",
-        l.register_symbol, cb.c_fn_type
-    ));
-    out.push_str("\twvCallbackMu.Lock()\n");
-    out.push_str("\twvListenerCtx[id] = ctxID\n");
-    out.push_str("\twvCallbackMu.Unlock()\n");
-    out.push_str("\treturn id\n");
-    out.push_str("}\n\n");
+    let mut w = CodeWriter::tabs();
+    let mut d = String::new();
+    emit_doc(&mut d, &l.doc, "", Some(&register_go));
+    w.raw(d);
+    w.line(format!("// Returns a subscription id for {unregister_go}."));
+    w.block(
+        format!("func {register_go}(callback {}) uint64 {{", go_callback_sig(cb)),
+        "}",
+        |w| {
+            w.line("ctxID := wvCallbackStore(callback)");
+            w.line(format!(
+                "id := uint64(C.{}(C.{}(unsafe.Pointer(C.{tramp})), unsafe.Pointer(uintptr(ctxID))))",
+                l.register_symbol, cb.c_fn_type
+            ));
+            w.line("wvCallbackMu.Lock()");
+            w.line("wvListenerCtx[id] = ctxID");
+            w.line("wvCallbackMu.Unlock()");
+            w.line("return id");
+        },
+    );
+    w.blank();
 
-    out.push_str(&format!(
-        "// {unregister_go} unregisters a listener previously registered with {register_go}.\n"
+    w.line(format!(
+        "// {unregister_go} unregisters a listener previously registered with {register_go}."
     ));
-    out.push_str(&format!("func {unregister_go}(id uint64) {{\n"));
-    out.push_str(&format!("\tC.{}(C.uint64_t(id))\n", l.unregister_symbol));
-    out.push_str("\twvCallbackMu.Lock()\n");
-    out.push_str("\tctxID, ok := wvListenerCtx[id]\n");
-    out.push_str("\tdelete(wvListenerCtx, id)\n");
-    out.push_str("\twvCallbackMu.Unlock()\n");
-    out.push_str("\tif ok {\n");
-    out.push_str("\t\twvCallbackDelete(ctxID)\n");
-    out.push_str("\t}\n");
-    out.push_str("}\n\n");
+    w.block(format!("func {unregister_go}(id uint64) {{"), "}", |w| {
+        w.line(format!("C.{}(C.uint64_t(id))", l.unregister_symbol));
+        w.line("wvCallbackMu.Lock()");
+        w.line("ctxID, ok := wvListenerCtx[id]");
+        w.line("delete(wvListenerCtx, id)");
+        w.line("wvCallbackMu.Unlock()");
+        w.block("if ok {", "}", |w| {
+            w.line("wvCallbackDelete(ctxID)");
+        });
+    });
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// The per-async-function outcome payload type name.
@@ -1010,8 +1046,10 @@ fn emit_async_result_send(
     prefix: &str,
     module: &str,
 ) {
+    let mut w = CodeWriter::tabs().with_depth(1);
     let Some(ty) = ret else {
-        out.push_str(&format!("\tch <- {outcome}{{}}\n"));
+        w.line(format!("ch <- {outcome}{{}}"));
+        out.push_str(&w.finish());
         return;
     };
     match ty {
@@ -1026,85 +1064,88 @@ fn emit_async_result_send(
         | TypeRef::Handle
         | TypeRef::F32
         | TypeRef::F64 => {
-            out.push_str(&format!(
-                "\tch <- {outcome}{{val: {}}}\n",
+            w.line(format!(
+                "ch <- {outcome}{{val: {}}}",
                 go_scalar_conv("result", ty)
             ));
         }
         TypeRef::Bool => {
-            out.push_str(&format!("\tch <- {outcome}{{val: cToBool(result)}}\n"));
+            w.line(format!("ch <- {outcome}{{val: cToBool(result)}}"));
         }
         TypeRef::Enum(_) => {
-            out.push_str(&format!(
-                "\tch <- {outcome}{{val: {}}}\n",
+            w.line(format!(
+                "ch <- {outcome}{{val: {}}}",
                 go_scalar_conv("result", ty)
             ));
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str("\tval := \"\"\n");
-            out.push_str("\tif result != nil {\n");
-            out.push_str("\t\tval = C.GoString(result)\n");
-            out.push_str("\t\tC.weaveffi_free_string(result)\n");
-            out.push_str("\t}\n");
-            out.push_str(&format!("\tch <- {outcome}{{val: val}}\n"));
+            w.line("val := \"\"");
+            w.block("if result != nil {", "}", |w| {
+                w.line("val = C.GoString(result)");
+                w.line("C.weaveffi_free_string(result)");
+            });
+            w.line(format!("ch <- {outcome}{{val: val}}"));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            out.push_str("\tvar val []byte\n");
-            out.push_str("\tif result != nil {\n");
-            out.push_str("\t\tval = C.GoBytes(unsafe.Pointer(result), C.int(result_len))\n");
-            out.push_str("\t\tC.weaveffi_free_bytes(result, result_len)\n");
-            out.push_str("\t}\n");
-            out.push_str(&format!("\tch <- {outcome}{{val: val}}\n"));
+            w.line("var val []byte");
+            w.block("if result != nil {", "}", |w| {
+                w.line("val = C.GoBytes(unsafe.Pointer(result), C.int(result_len))");
+                w.line("C.weaveffi_free_bytes(result, result_len)");
+            });
+            w.line(format!("ch <- {outcome}{{val: val}}"));
         }
         TypeRef::Struct(n) | TypeRef::TypedHandle(n) => {
             let g = local_type_name(n).to_upper_camel_case();
-            out.push_str(&format!("\tch <- {outcome}{{val: &{g}{{ptr: result}}}}\n"));
+            w.line(format!("ch <- {outcome}{{val: &{g}{{ptr: result}}}}"));
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                out.push_str("\tvar val *string\n");
-                out.push_str("\tif result != nil {\n");
-                out.push_str("\t\tv := C.GoString(result)\n");
-                out.push_str("\t\tC.weaveffi_free_string(result)\n");
-                out.push_str("\t\tval = &v\n");
-                out.push_str("\t}\n");
-                out.push_str(&format!("\tch <- {outcome}{{val: val}}\n"));
+                w.line("var val *string");
+                w.block("if result != nil {", "}", |w| {
+                    w.line("v := C.GoString(result)");
+                    w.line("C.weaveffi_free_string(result)");
+                    w.line("val = &v");
+                });
+                w.line(format!("ch <- {outcome}{{val: val}}"));
             }
             TypeRef::Struct(n) | TypeRef::TypedHandle(n) => {
                 let g = local_type_name(n).to_upper_camel_case();
-                out.push_str(&format!("\tvar val *{g}\n"));
-                out.push_str("\tif result != nil {\n");
-                out.push_str(&format!("\t\tval = &{g}{{ptr: result}}\n"));
-                out.push_str("\t}\n");
-                out.push_str(&format!("\tch <- {outcome}{{val: val}}\n"));
+                w.line(format!("var val *{g}"));
+                w.block("if result != nil {", "}", |w| {
+                    w.line(format!("val = &{g}{{ptr: result}}"));
+                });
+                w.line(format!("ch <- {outcome}{{val: val}}"));
             }
             TypeRef::Bool => {
-                out.push_str("\tvar val *bool\n");
-                out.push_str("\tif result != nil {\n");
-                out.push_str("\t\tv := cToBool(*result)\n");
-                out.push_str("\t\tval = &v\n");
-                out.push_str("\t}\n");
-                out.push_str(&format!("\tch <- {outcome}{{val: val}}\n"));
+                w.line("var val *bool");
+                w.block("if result != nil {", "}", |w| {
+                    w.line("v := cToBool(*result)");
+                    w.line("val = &v");
+                });
+                w.line(format!("ch <- {outcome}{{val: val}}"));
             }
             _ => {
                 let gt = go_type(inner);
-                out.push_str(&format!("\tvar val *{gt}\n"));
-                out.push_str("\tif result != nil {\n");
-                out.push_str(&format!("\t\tv := {gt}(*result)\n"));
-                out.push_str("\t\tval = &v\n");
-                out.push_str("\t}\n");
-                out.push_str(&format!("\tch <- {outcome}{{val: val}}\n"));
+                w.line(format!("var val *{gt}"));
+                w.block("if result != nil {", "}", |w| {
+                    w.line(format!("v := {gt}(*result)"));
+                    w.line("val = &v");
+                });
+                w.line(format!("ch <- {outcome}{{val: val}}"));
             }
         },
         TypeRef::List(inner) => {
-            out.push_str("\tcount := int(result_len)\n");
-            decode_list(out, "val", inner, "result", "count", prefix, module);
-            out.push_str(&format!("\tch <- {outcome}{{val: val}}\n"));
+            w.line("count := int(result_len)");
+            let mut body = String::new();
+            decode_list(&mut body, "val", inner, "result", "count", prefix, module);
+            w.raw(body);
+            w.line(format!("ch <- {outcome}{{val: val}}"));
         }
         TypeRef::Map(k, v) => {
-            out.push_str("\tcount := int(result_len)\n");
+            w.line("count := int(result_len)");
+            let mut body = String::new();
             decode_map(
-                out,
+                &mut body,
                 "val",
                 k,
                 v,
@@ -1114,10 +1155,12 @@ fn emit_async_result_send(
                 prefix,
                 module,
             );
-            out.push_str(&format!("\tch <- {outcome}{{val: val}}\n"));
+            w.raw(body);
+            w.line(format!("ch <- {outcome}{{val: val}}"));
         }
         TypeRef::Iterator(_) => unreachable!("async iterator returns are rejected upstream"),
     }
+    out.push_str(&w.finish());
 }
 
 /// An async function: a blocking Go wrapper that launches the C call with a
@@ -1134,13 +1177,16 @@ fn render_async_function(
     let outcome = async_outcome_type(module, f);
     let tramp = trampoline_name(&ab.callback_type);
 
+    let mut w = CodeWriter::tabs();
+
     // Outcome payload: the converted result (if any) or the producer error.
-    out.push_str(&format!("type {outcome} struct {{\n"));
-    if let Some(ret) = &f.ret {
-        out.push_str(&format!("\tval {}\n", go_type(ret)));
-    }
-    out.push_str("\terr error\n");
-    out.push_str("}\n\n");
+    w.block(format!("type {outcome} struct {{"), "}", |w| {
+        if let Some(ret) = &f.ret {
+            w.line(format!("val {}", go_type(ret)));
+        }
+        w.line("err error");
+    });
+    w.blank();
 
     // The exported completion trampoline.
     let formals: Vec<String> = ab
@@ -1148,19 +1194,24 @@ fn render_async_function(
         .iter()
         .map(|s| format!("{} {}", s.name, cgo_slot_type(&s.ty, prefix)))
         .collect();
-    out.push_str(&format!("//export {tramp}\n"));
-    out.push_str(&format!("func {tramp}({}) {{\n", formals.join(", ")));
-    out.push_str("\tv := wvCallbackTake(uint64(uintptr(context)))\n");
-    out.push_str("\tif v == nil {\n\t\treturn\n\t}\n");
-    out.push_str(&format!("\tch := v.(chan {outcome})\n"));
-    out.push_str("\tif err != nil && err.code != 0 {\n");
-    out.push_str("\t\tgoErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(err.message), int(err.code))\n");
-    out.push_str("\t\tC.weaveffi_error_clear(err)\n");
-    out.push_str(&format!("\t\tch <- {outcome}{{err: goErr}}\n"));
-    out.push_str("\t\treturn\n");
-    out.push_str("\t}\n");
-    emit_async_result_send(out, &f.ret, &outcome, prefix, module);
-    out.push_str("}\n\n");
+    let mut tramp_body = String::new();
+    emit_async_result_send(&mut tramp_body, &f.ret, &outcome, prefix, module);
+    w.line(format!("//export {tramp}"));
+    w.block(format!("func {tramp}({}) {{", formals.join(", ")), "}", |w| {
+        w.line("v := wvCallbackTake(uint64(uintptr(context)))");
+        w.block("if v == nil {", "}", |w| {
+            w.line("return");
+        });
+        w.line(format!("ch := v.(chan {outcome})"));
+        w.block("if err != nil && err.code != 0 {", "}", |w| {
+            w.line("goErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(err.message), int(err.code))");
+            w.line("C.weaveffi_error_clear(err)");
+            w.line(format!("ch <- {outcome}{{err: goErr}}"));
+            w.line("return");
+        });
+        w.raw(tramp_body.as_str());
+    });
+    w.blank();
 
     // The blocking wrapper. Cancellation tokens are not surfaced (NULL).
     let go_params: Vec<String> = f
@@ -1172,17 +1223,13 @@ fn render_async_function(
         Some(ret) => format!("({}, error)", go_type(ret)),
         None => "error".into(),
     };
-    emit_fn_doc(out, &f.doc, &f.params, "", &go_name);
-    out.push_str("// Blocks until the async producer completes.\n");
+    let mut doc = String::new();
+    emit_fn_doc(&mut doc, &f.doc, &f.params, "", &go_name);
+    w.raw(doc);
+    w.line("// Blocks until the async producer completes.");
     if let Some(msg) = &f.deprecated {
-        out.push_str(&format!("// Deprecated: {msg}\n"));
+        w.line(format!("// Deprecated: {msg}"));
     }
-    out.push_str(&format!(
-        "func {go_name}({}) {ret_sig} {{\n",
-        go_params.join(", ")
-    ));
-    out.push_str(&format!("\tch := make(chan {outcome}, 1)\n"));
-    out.push_str("\tctxID := wvCallbackStore(ch)\n");
 
     let mut pre = String::new();
     let mut c_args: Vec<String> = Vec::new();
@@ -1201,22 +1248,29 @@ fn render_async_function(
     }
     c_args.push(format!("C.{}(unsafe.Pointer(C.{tramp}))", ab.callback_type));
     c_args.push("unsafe.Pointer(uintptr(ctxID))".into());
-    out.push_str(&pre);
-    out.push_str(&format!(
-        "\tC.{}({})\n",
-        ab.launch.symbol,
-        c_args.join(", ")
-    ));
-    out.push_str("\toutcome := <-ch\n");
-    if let Some(ret) = &f.ret {
-        out.push_str("\tif outcome.err != nil {\n");
-        out.push_str(&format!("\t\treturn {}, outcome.err\n", go_zero(ret)));
-        out.push_str("\t}\n");
-        out.push_str("\treturn outcome.val, nil\n");
-    } else {
-        out.push_str("\treturn outcome.err\n");
-    }
-    out.push_str("}\n\n");
+    let launch_args = c_args.join(", ");
+
+    w.block(
+        format!("func {go_name}({}) {ret_sig} {{", go_params.join(", ")),
+        "}",
+        |w| {
+            w.line(format!("ch := make(chan {outcome}, 1)"));
+            w.line("ctxID := wvCallbackStore(ch)");
+            w.raw(pre.as_str());
+            w.line(format!("C.{}({})", ab.launch.symbol, launch_args));
+            w.line("outcome := <-ch");
+            if let Some(ret) = &f.ret {
+                w.block("if outcome.err != nil {", "}", |w| {
+                    w.line(format!("return {}, outcome.err", go_zero(ret)));
+                });
+                w.line("return outcome.val, nil");
+            } else {
+                w.line("return outcome.err");
+            }
+        },
+    );
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 // ── Enums ──
@@ -1228,15 +1282,23 @@ fn render_enum(out: &mut String, e: &EnumBinding) {
         return;
     }
     let name = e.name.to_upper_camel_case();
-    emit_doc(out, &e.doc, "", Some(&name));
-    out.push_str(&format!("type {name} int32\n\n"));
-    out.push_str("const (\n");
-    for v in &e.variants {
-        let vname = format!("{name}{}", v.name.to_upper_camel_case());
-        emit_doc(out, &v.doc, "\t", Some(&vname));
-        out.push_str(&format!("\t{vname} {name} = {}\n", v.value));
-    }
-    out.push_str(")\n\n");
+    let mut w = CodeWriter::tabs();
+    let mut d = String::new();
+    emit_doc(&mut d, &e.doc, "", Some(&name));
+    w.raw(d);
+    w.line(format!("type {name} int32"));
+    w.blank();
+    w.block("const (", ")", |w| {
+        for v in &e.variants {
+            let vname = format!("{name}{}", v.name.to_upper_camel_case());
+            let mut vd = String::new();
+            emit_doc(&mut vd, &v.doc, "\t", Some(&vname));
+            w.raw(vd);
+            w.line(format!("{vname} {name} = {}", v.value));
+        }
+    });
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// Render a rich (algebraic) enum as an opaque-object wrapper, mirroring the Go
@@ -1256,31 +1318,41 @@ fn render_rich_enum(out: &mut String, prefix: &str, module: &str, e: &EnumBindin
     let name = e.name.to_upper_camel_case();
     let c_tag = &e.c_tag;
 
+    let mut w = CodeWriter::tabs();
     // Opaque-object value type owning the C handle (identical to a struct).
-    emit_doc(out, &e.doc, "", Some(&name));
-    out.push_str(&format!("type {name} struct {{\n"));
-    out.push_str(&format!("\tptr *C.{c_tag}\n"));
-    out.push_str("}\n\n");
+    let mut d = String::new();
+    emit_doc(&mut d, &e.doc, "", Some(&name));
+    w.raw(d);
+    w.block(format!("type {name} struct {{"), "}", |w| {
+        w.line(format!("ptr *C.{c_tag}"));
+    });
+    w.blank();
 
     // Exported discriminant constants in the plain-enum const style. The wrapper
     // type name is taken by the struct above, so these are typed `int32` to
     // match what `Tag` returns (`shape.Tag() == ShapeCircle`).
-    out.push_str("const (\n");
-    for v in &e.variants {
-        let vname = format!("{name}{}", v.name.to_upper_camel_case());
-        emit_doc(out, &v.doc, "\t", Some(&vname));
-        out.push_str(&format!("\t{vname} int32 = {}\n", v.value));
-    }
-    out.push_str(")\n\n");
+    w.block("const (", ")", |w| {
+        for v in &e.variants {
+            let vname = format!("{name}{}", v.name.to_upper_camel_case());
+            let mut vd = String::new();
+            emit_doc(&mut vd, &v.doc, "\t", Some(&vname));
+            w.raw(vd);
+            w.line(format!("{vname} int32 = {}", v.value));
+        }
+    });
+    w.blank();
 
     // Tag reader: the active variant's discriminant.
-    out.push_str(&format!("func (s *{name}) Tag() int32 {{\n"));
-    out.push_str(&format!("\treturn int32(C.{}(s.ptr))\n", rich.tag_symbol));
-    out.push_str("}\n\n");
+    w.block(format!("func (s *{name}) Tag() int32 {{"), "}", |w| {
+        w.line(format!("return int32(C.{}(s.ptr))", rich.tag_symbol));
+    });
+    w.blank();
 
     // One constructor per variant, calling `{tag}_{V}_new`.
     for v in &rich.variants {
-        render_rich_enum_ctor(out, prefix, module, &name, v);
+        let mut c = String::new();
+        render_rich_enum_ctor(&mut c, prefix, module, &name, v);
+        w.raw(c);
     }
 
     // Per-variant field accessors, namespaced by variant to avoid collisions
@@ -1291,17 +1363,21 @@ fn render_rich_enum(out: &mut String, prefix: &str, module: &str, e: &EnumBindin
         for f in &v.fields {
             let mut nf = f.clone();
             nf.name = format!("{}_{}", v.name, f.name);
-            render_getter(out, prefix, module, &name, &nf);
+            let mut g = String::new();
+            render_getter(&mut g, prefix, module, &name, &nf);
+            w.raw(g);
         }
     }
 
     // Cleanup: identical contract to a struct wrapper's `Close`.
-    out.push_str(&format!("func (s *{name}) Close() {{\n"));
-    out.push_str("\tif s.ptr != nil {\n");
-    out.push_str(&format!("\t\tC.{}(s.ptr)\n", rich.destroy_symbol));
-    out.push_str("\t\ts.ptr = nil\n");
-    out.push_str("\t}\n");
-    out.push_str("}\n\n");
+    w.block(format!("func (s *{name}) Close() {{"), "}", |w| {
+        w.block("if s.ptr != nil {", "}", |w| {
+            w.line(format!("C.{}(s.ptr)", rich.destroy_symbol));
+            w.line("s.ptr = nil");
+        });
+    });
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// One rich-enum variant constructor: `New{Enum}{Variant}(<fields>)
@@ -1323,11 +1399,10 @@ fn render_rich_enum_ctor(
         .map(|f| format!("{} {}", f.name.to_lower_camel_case(), go_type(&f.ty)))
         .collect();
 
-    emit_doc(out, &v.doc, "", Some(&ctor));
-    out.push_str(&format!(
-        "func {ctor}({}) (*{enum_name}, error) {{\n",
-        go_params.join(", ")
-    ));
+    let mut w = CodeWriter::tabs();
+    let mut d = String::new();
+    emit_doc(&mut d, &v.doc, "", Some(&ctor));
+    w.raw(d);
 
     let mut pre = String::new();
     let mut c_args: Vec<String> = Vec::new();
@@ -1344,19 +1419,26 @@ fn render_rich_enum_ctor(
     pre.push_str("\tvar cErr C.weaveffi_error\n");
     c_args.push("&cErr".into());
 
-    out.push_str(&pre);
-    out.push_str(&format!(
-        "\tresult := C.{}({})\n",
-        v.create.symbol,
-        c_args.join(", ")
-    ));
-    out.push_str("\tif cErr.code != 0 {\n");
-    out.push_str("\t\tgoErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(cErr.message), int(cErr.code))\n");
-    out.push_str("\t\tC.weaveffi_error_clear(&cErr)\n");
-    out.push_str("\t\treturn nil, goErr\n");
-    out.push_str("\t}\n");
-    out.push_str(&format!("\treturn &{enum_name}{{ptr: result}}, nil\n"));
-    out.push_str("}\n\n");
+    w.block(
+        format!("func {ctor}({}) (*{enum_name}, error) {{", go_params.join(", ")),
+        "}",
+        |w| {
+            w.raw(&pre);
+            w.line(format!(
+                "result := C.{}({})",
+                v.create.symbol,
+                c_args.join(", ")
+            ));
+            w.block("if cErr.code != 0 {", "}", |w| {
+                w.line("goErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(cErr.message), int(cErr.code))");
+                w.line("C.weaveffi_error_clear(&cErr)");
+                w.line("return nil, goErr");
+            });
+            w.line(format!("return &{enum_name}{{ptr: result}}, nil"));
+        },
+    );
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 // ── Structs ──
@@ -1366,21 +1448,29 @@ fn render_struct(out: &mut String, prefix: &str, module: &str, s: &StructBinding
     // The opaque C tag and destroy symbol are precomputed in the shared model.
     let c_tag = &s.c_tag;
 
-    emit_doc(out, &s.doc, "", Some(&name));
-    out.push_str(&format!("type {name} struct {{\n"));
-    out.push_str(&format!("\tptr *C.{c_tag}\n"));
-    out.push_str("}\n\n");
+    let mut w = CodeWriter::tabs();
+    let mut d = String::new();
+    emit_doc(&mut d, &s.doc, "", Some(&name));
+    w.raw(d);
+    w.block(format!("type {name} struct {{"), "}", |w| {
+        w.line(format!("ptr *C.{c_tag}"));
+    });
+    w.blank();
 
     for field in &s.fields {
-        render_getter(out, prefix, module, &name, field);
+        let mut g = String::new();
+        render_getter(&mut g, prefix, module, &name, field);
+        w.raw(g);
     }
 
-    out.push_str(&format!("func (s *{name}) Close() {{\n"));
-    out.push_str("\tif s.ptr != nil {\n");
-    out.push_str(&format!("\t\tC.{}(s.ptr)\n", s.destroy_symbol));
-    out.push_str("\t\ts.ptr = nil\n");
-    out.push_str("\t}\n");
-    out.push_str("}\n\n");
+    w.block(format!("func (s *{name}) Close() {{"), "}", |w| {
+        w.block("if s.ptr != nil {", "}", |w| {
+            w.line(format!("C.{}(s.ptr)", s.destroy_symbol));
+            w.line("s.ptr = nil");
+        });
+    });
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 fn render_go_builder(out: &mut String, prefix: &str, module: &str, s: &StructBinding) {
@@ -1389,36 +1479,49 @@ fn render_go_builder(out: &mut String, prefix: &str, module: &str, s: &StructBin
     // Typed fields (one per struct field) so `Build` can marshal each value into
     // the C `create` call with the same lowering used for function parameters.
     // Optionals/lists/maps default to nil (the C side reads that as "unset").
-    emit_doc(out, &s.doc, "", Some(&builder_name));
-    out.push_str(&format!("type {name}Builder struct {{\n"));
-    for field in &s.fields {
-        let fld = field.name.to_lower_camel_case();
-        out.push_str(&format!("\t{fld} {}\n", go_type(&field.ty)));
-    }
-    out.push_str("}\n\n");
-    out.push_str(&format!("func New{name}Builder() *{name}Builder {{\n"));
-    out.push_str(&format!("\treturn &{name}Builder{{}}\n"));
-    out.push_str("}\n\n");
+    let mut w = CodeWriter::tabs();
+    let mut d = String::new();
+    emit_doc(&mut d, &s.doc, "", Some(&builder_name));
+    w.raw(d);
+    w.block(format!("type {name}Builder struct {{"), "}", |w| {
+        for field in &s.fields {
+            let fld = field.name.to_lower_camel_case();
+            w.line(format!("{fld} {}", go_type(&field.ty)));
+        }
+    });
+    w.blank();
+    w.block(
+        format!("func New{name}Builder() *{name}Builder {{"),
+        "}",
+        |w| {
+            w.line(format!("return &{name}Builder{{}}"));
+        },
+    );
+    w.blank();
 
     for field in &s.fields {
         let method = field.name.to_upper_camel_case();
         let fld = field.name.to_lower_camel_case();
         let gt = go_type(&field.ty);
         let with_name = format!("With{method}");
-        emit_doc(out, &field.doc, "", Some(&with_name));
-        out.push_str(&format!(
-            "func (b *{name}Builder) With{method}(value {gt}) *{name}Builder {{\n"
-        ));
-        out.push_str(&format!("\tb.{fld} = value\n"));
-        out.push_str("\treturn b\n");
-        out.push_str("}\n\n");
+        let mut fd = String::new();
+        emit_doc(&mut fd, &field.doc, "", Some(&with_name));
+        w.raw(fd);
+        w.block(
+            format!("func (b *{name}Builder) With{method}(value {gt}) *{name}Builder {{"),
+            "}",
+            |w| {
+                w.line(format!("b.{fld} = value"));
+                w.line("return b");
+            },
+        );
+        w.blank();
     }
 
     // Build: marshal every field into the struct's `create` call.
-    emit_doc(out, &None, "", Some("Build"));
-    out.push_str(&format!(
-        "func (b *{name}Builder) Build() (*{name}, error) {{\n"
-    ));
+    let mut bd = String::new();
+    emit_doc(&mut bd, &None, "", Some("Build"));
+    w.raw(bd);
     let mut pre = String::new();
     let mut c_args: Vec<String> = Vec::new();
     for field in &s.fields {
@@ -1428,19 +1531,26 @@ fn render_go_builder(out: &mut String, prefix: &str, module: &str, s: &StructBin
     }
     pre.push_str("\tvar cErr C.weaveffi_error\n");
     c_args.push("&cErr".into());
-    out.push_str(&pre);
-    out.push_str(&format!(
-        "\tresult := C.{}({})\n",
-        s.create.symbol,
-        c_args.join(", ")
-    ));
-    out.push_str("\tif cErr.code != 0 {\n");
-    out.push_str("\t\tgoErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(cErr.message), int(cErr.code))\n");
-    out.push_str("\t\tC.weaveffi_error_clear(&cErr)\n");
-    out.push_str("\t\treturn nil, goErr\n");
-    out.push_str("\t}\n");
-    out.push_str(&format!("\treturn &{name}{{ptr: result}}, nil\n"));
-    out.push_str("}\n\n");
+    w.block(
+        format!("func (b *{name}Builder) Build() (*{name}, error) {{"),
+        "}",
+        |w| {
+            w.raw(&pre);
+            w.line(format!(
+                "result := C.{}({})",
+                s.create.symbol,
+                c_args.join(", ")
+            ));
+            w.block("if cErr.code != 0 {", "}", |w| {
+                w.line("goErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(cErr.message), int(cErr.code))");
+                w.line("C.weaveffi_error_clear(&cErr)");
+                w.line("return nil, goErr");
+            });
+            w.line(format!("return &{name}{{ptr: result}}, nil"));
+        },
+    );
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 fn render_getter(
@@ -1454,98 +1564,119 @@ fn render_getter(
     let ret = go_type(&field.ty);
     let getter = format!("C.{}", field.getter_symbol);
 
-    emit_doc(out, &field.doc, "", Some(&method));
-    out.push_str(&format!("func (s *{go_struct}) {method}() {ret} {{\n"));
-
-    match &field.ty {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::F64 => {
-            let conv = go_scalar_conv(&format!("{getter}(s.ptr)"), &field.ty);
-            out.push_str(&format!("\treturn {conv}\n"));
-        }
-        TypeRef::Bool => {
-            out.push_str(&format!("\treturn cToBool({getter}(s.ptr))\n"));
-        }
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!("\treturn C.GoString({getter}(s.ptr))\n"));
-        }
-        TypeRef::Enum(_) => {
-            out.push_str(&format!("\treturn {ret}({getter}(s.ptr))\n"));
-        }
-        TypeRef::TypedHandle(n) => {
-            let inner = local_type_name(n).to_upper_camel_case();
-            out.push_str(&format!("\treturn &{inner}{{ptr: {getter}(s.ptr)}}\n"));
-        }
-        TypeRef::Struct(n) => {
-            let inner = local_type_name(n).to_upper_camel_case();
-            out.push_str(&format!("\treturn &{inner}{{ptr: {getter}(s.ptr)}}\n"));
-        }
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                out.push_str(&format!("\tcStr := {getter}(s.ptr)\n"));
-                out.push_str("\tif cStr == nil {\n\t\treturn nil\n\t}\n");
-                out.push_str("\tv := C.GoString(cStr)\n");
-                out.push_str("\treturn &v\n");
-            }
-            TypeRef::TypedHandle(n) => {
-                let inner_go = local_type_name(n).to_upper_camel_case();
-                out.push_str(&format!("\tcPtr := {getter}(s.ptr)\n"));
-                out.push_str("\tif cPtr == nil {\n\t\treturn nil\n\t}\n");
-                out.push_str(&format!("\treturn &{inner_go}{{ptr: cPtr}}\n"));
-            }
-            TypeRef::Struct(n) => {
-                let inner_go = local_type_name(n).to_upper_camel_case();
-                out.push_str(&format!("\tcPtr := {getter}(s.ptr)\n"));
-                out.push_str("\tif cPtr == nil {\n\t\treturn nil\n\t}\n");
-                out.push_str(&format!("\treturn &{inner_go}{{ptr: cPtr}}\n"));
+    let mut w = CodeWriter::tabs();
+    let mut d = String::new();
+    emit_doc(&mut d, &field.doc, "", Some(&method));
+    w.raw(d);
+    w.block(
+        format!("func (s *{go_struct}) {method}() {ret} {{"),
+        "}",
+        |w| match &field.ty {
+            TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::F64 => {
+                let conv = go_scalar_conv(&format!("{getter}(s.ptr)"), &field.ty);
+                w.line(format!("return {conv}"));
             }
             TypeRef::Bool => {
-                out.push_str(&format!("\tcVal := {getter}(s.ptr)\n"));
-                out.push_str("\tif cVal == nil {\n\t\treturn nil\n\t}\n");
-                out.push_str("\tv := cToBool(*cVal)\n");
-                out.push_str("\treturn &v\n");
+                w.line(format!("return cToBool({getter}(s.ptr))"));
+            }
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                w.line(format!("return C.GoString({getter}(s.ptr))"));
+            }
+            TypeRef::Enum(_) => {
+                w.line(format!("return {ret}({getter}(s.ptr))"));
+            }
+            TypeRef::TypedHandle(n) => {
+                let inner = local_type_name(n).to_upper_camel_case();
+                w.line(format!("return &{inner}{{ptr: {getter}(s.ptr)}}"));
+            }
+            TypeRef::Struct(n) => {
+                let inner = local_type_name(n).to_upper_camel_case();
+                w.line(format!("return &{inner}{{ptr: {getter}(s.ptr)}}"));
+            }
+            TypeRef::Optional(inner) => match inner.as_ref() {
+                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                    w.line(format!("cStr := {getter}(s.ptr)"));
+                    w.block("if cStr == nil {", "}", |w| {
+                        w.line("return nil");
+                    });
+                    w.line("v := C.GoString(cStr)");
+                    w.line("return &v");
+                }
+                TypeRef::TypedHandle(n) => {
+                    let inner_go = local_type_name(n).to_upper_camel_case();
+                    w.line(format!("cPtr := {getter}(s.ptr)"));
+                    w.block("if cPtr == nil {", "}", |w| {
+                        w.line("return nil");
+                    });
+                    w.line(format!("return &{inner_go}{{ptr: cPtr}}"));
+                }
+                TypeRef::Struct(n) => {
+                    let inner_go = local_type_name(n).to_upper_camel_case();
+                    w.line(format!("cPtr := {getter}(s.ptr)"));
+                    w.block("if cPtr == nil {", "}", |w| {
+                        w.line("return nil");
+                    });
+                    w.line(format!("return &{inner_go}{{ptr: cPtr}}"));
+                }
+                TypeRef::Bool => {
+                    w.line(format!("cVal := {getter}(s.ptr)"));
+                    w.block("if cVal == nil {", "}", |w| {
+                        w.line("return nil");
+                    });
+                    w.line("v := cToBool(*cVal)");
+                    w.line("return &v");
+                }
+                _ => {
+                    let inner_go = go_type(inner);
+                    w.line(format!("cVal := {getter}(s.ptr)"));
+                    w.block("if cVal == nil {", "}", |w| {
+                        w.line("return nil");
+                    });
+                    w.line(format!("v := {inner_go}(*cVal)"));
+                    w.line("return &v");
+                }
+            },
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
+                w.line("var cOutLen C.size_t");
+                w.line(format!("result := {getter}(s.ptr, &cOutLen)"));
+                w.block("if result == nil {", "}", |w| {
+                    w.line("return nil");
+                });
+                w.line("return C.GoBytes(unsafe.Pointer(result), C.int(cOutLen))");
+            }
+            TypeRef::List(inner) => {
+                w.line("var cOutLen C.size_t");
+                w.line(format!("result := {getter}(s.ptr, &cOutLen)"));
+                w.line("count := int(cOutLen)");
+                let mut body = String::new();
+                decode_list(
+                    &mut body, "goResult", inner, "result", "count", prefix, module,
+                );
+                w.raw(body);
+                w.line("return goResult");
+            }
+            TypeRef::Map(k, v) => {
+                let kt = go_cmap_ptr_type(k, prefix, module);
+                let vt = go_cmap_ptr_type(v, prefix, module);
+                w.line(format!("var cMapKeys {kt}"));
+                w.line(format!("var cMapVals {vt}"));
+                w.line("var cOutLen C.size_t");
+                w.line(format!("{getter}(s.ptr, &cMapKeys, &cMapVals, &cOutLen)"));
+                w.line("count := int(cOutLen)");
+                let mut body = String::new();
+                decode_map(
+                    &mut body, "goResult", k, v, "cMapKeys", "cMapVals", "count", prefix, module,
+                );
+                w.raw(body);
+                w.line("return goResult");
             }
             _ => {
-                let inner_go = go_type(inner);
-                out.push_str(&format!("\tcVal := {getter}(s.ptr)\n"));
-                out.push_str("\tif cVal == nil {\n\t\treturn nil\n\t}\n");
-                out.push_str(&format!("\tv := {inner_go}(*cVal)\n"));
-                out.push_str("\treturn &v\n");
+                w.line(format!("return {ret}({getter}(s.ptr))"));
             }
         },
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            out.push_str("\tvar cOutLen C.size_t\n");
-            out.push_str(&format!("\tresult := {getter}(s.ptr, &cOutLen)\n"));
-            out.push_str("\tif result == nil {\n\t\treturn nil\n\t}\n");
-            out.push_str("\treturn C.GoBytes(unsafe.Pointer(result), C.int(cOutLen))\n");
-        }
-        TypeRef::List(inner) => {
-            out.push_str("\tvar cOutLen C.size_t\n");
-            out.push_str(&format!("\tresult := {getter}(s.ptr, &cOutLen)\n"));
-            out.push_str("\tcount := int(cOutLen)\n");
-            decode_list(out, "goResult", inner, "result", "count", prefix, module);
-            out.push_str("\treturn goResult\n");
-        }
-        TypeRef::Map(k, v) => {
-            let kt = go_cmap_ptr_type(k, prefix, module);
-            let vt = go_cmap_ptr_type(v, prefix, module);
-            out.push_str(&format!("\tvar cMapKeys {kt}\n"));
-            out.push_str(&format!("\tvar cMapVals {vt}\n"));
-            out.push_str("\tvar cOutLen C.size_t\n");
-            out.push_str(&format!(
-                "\t{getter}(s.ptr, &cMapKeys, &cMapVals, &cOutLen)\n"
-            ));
-            out.push_str("\tcount := int(cOutLen)\n");
-            decode_map(
-                out, "goResult", k, v, "cMapKeys", "cMapVals", "count", prefix, module,
-            );
-            out.push_str("\treturn goResult\n");
-        }
-        _ => {
-            out.push_str(&format!("\treturn {ret}({getter}(s.ptr))\n"));
-        }
-    }
-
-    out.push_str("}\n\n");
+    );
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 // ── Functions ──
@@ -1565,15 +1696,13 @@ fn render_function(out: &mut String, prefix: &str, module: &str, f: &FnBinding) 
         None => "error".into(),
     };
 
-    emit_fn_doc(out, &f.doc, &f.params, "", &go_name);
+    let mut w = CodeWriter::tabs();
+    let mut doc = String::new();
+    emit_fn_doc(&mut doc, &f.doc, &f.params, "", &go_name);
+    w.raw(doc);
     if let Some(msg) = &f.deprecated {
-        out.push_str(&format!("// Deprecated: {msg}\n"));
+        w.line(format!("// Deprecated: {msg}"));
     }
-
-    out.push_str(&format!(
-        "func {go_name}({}) {ret_sig} {{\n",
-        go_params.join(", ")
-    ));
 
     let mut pre = String::new();
     let mut c_args: Vec<String> = Vec::new();
@@ -1592,8 +1721,16 @@ fn render_function(out: &mut String, prefix: &str, module: &str, f: &FnBinding) 
     // An iterator-returning function launches an opaque iterator (no out_len),
     // then this wrapper drains it via the `next`/`destroy` symbols into a slice.
     if let CallShape::Iterator(ib) = &f.shape {
-        emit_iterator_body(out, &mut pre, &mut c_args, ib, prefix, module);
-        out.push_str("}\n\n");
+        let mut body = String::new();
+        emit_iterator_body(&mut body, &mut pre, &mut c_args, ib, prefix, module);
+        w.line(format!(
+            "func {go_name}({}) {ret_sig} {{",
+            go_params.join(", ")
+        ));
+        w.raw(body);
+        w.line("}");
+        w.blank();
+        out.push_str(&w.finish());
         return;
     }
 
@@ -1604,34 +1741,42 @@ fn render_function(out: &mut String, prefix: &str, module: &str, f: &FnBinding) 
     pre.push_str("\tvar cErr C.weaveffi_error\n");
     c_args.push("&cErr".into());
 
-    out.push_str(&pre);
-
     let args = c_args.join(", ");
     let c_returns_void = matches!(&f.ret, Some(TypeRef::Map(_, _)));
 
-    if f.ret.is_some() && !c_returns_void {
-        out.push_str(&format!("\tresult := C.{c_sym}({args})\n"));
-    } else {
-        out.push_str(&format!("\tC.{c_sym}({args})\n"));
-    }
+    w.block(
+        format!("func {go_name}({}) {ret_sig} {{", go_params.join(", ")),
+        "}",
+        |w| {
+            w.raw(pre.as_str());
 
-    out.push_str("\tif cErr.code != 0 {\n");
-    out.push_str("\t\tgoErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(cErr.message), int(cErr.code))\n");
-    out.push_str("\t\tC.weaveffi_error_clear(&cErr)\n");
-    if let Some(ref ret) = f.ret {
-        out.push_str(&format!("\t\treturn {}, goErr\n", go_zero(ret)));
-    } else {
-        out.push_str("\t\treturn goErr\n");
-    }
-    out.push_str("\t}\n");
+            if f.ret.is_some() && !c_returns_void {
+                w.line(format!("result := C.{c_sym}({args})"));
+            } else {
+                w.line(format!("C.{c_sym}({args})"));
+            }
 
-    if let Some(ref ret) = f.ret {
-        emit_return(out, ret, prefix, module);
-    } else {
-        out.push_str("\treturn nil\n");
-    }
+            w.block("if cErr.code != 0 {", "}", |w| {
+                w.line("goErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(cErr.message), int(cErr.code))");
+                w.line("C.weaveffi_error_clear(&cErr)");
+                if let Some(ref ret) = f.ret {
+                    w.line(format!("return {}, goErr", go_zero(ret)));
+                } else {
+                    w.line("return goErr");
+                }
+            });
 
-    out.push_str("}\n\n");
+            if let Some(ref ret) = f.ret {
+                let mut tail = String::new();
+                emit_return(&mut tail, ret, prefix, module);
+                w.raw(tail);
+            } else {
+                w.line("return nil");
+            }
+        },
+    );
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// Go type of the `out_item` local whose address is passed to an iterator's
@@ -1649,25 +1794,25 @@ fn iter_out_item_type(inner: &TypeRef, prefix: &str, module: &str) -> String {
 /// Append one freshly-pulled iterator element (`item`) to the result slice,
 /// converting to the Go type and releasing any callee-allocated string.
 fn emit_iter_elem_append(out: &mut String, dst: &str, inner: &TypeRef, item: &str) {
+    let mut w = CodeWriter::tabs().with_depth(2);
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!("\t\t{dst} = append({dst}, C.GoString({item}))\n"));
-            out.push_str(&format!("\t\tC.weaveffi_free_string({item})\n"));
+            w.line(format!("{dst} = append({dst}, C.GoString({item}))"));
+            w.line(format!("C.weaveffi_free_string({item})"));
         }
         TypeRef::TypedHandle(n) | TypeRef::Struct(n) => {
             let gs = local_type_name(n).to_upper_camel_case();
-            out.push_str(&format!(
-                "\t\t{dst} = append({dst}, &{gs}{{ptr: {item}}})\n"
-            ));
+            w.line(format!("{dst} = append({dst}, &{gs}{{ptr: {item}}})"));
         }
         TypeRef::Bool => {
-            out.push_str(&format!("\t\t{dst} = append({dst}, cToBool({item}))\n"));
+            w.line(format!("{dst} = append({dst}, cToBool({item}))"));
         }
         _ => {
             let conv = go_scalar_conv(item, inner);
-            out.push_str(&format!("\t\t{dst} = append({dst}, {conv})\n"));
+            w.line(format!("{dst} = append({dst}, {conv})"));
         }
     }
+    out.push_str(&w.finish());
 }
 
 /// Emit the launch + drain + destroy body of an iterator-returning function.
@@ -1683,39 +1828,45 @@ fn emit_iterator_body(
 ) {
     pre.push_str("\tvar cErr C.weaveffi_error\n");
     c_args.push("&cErr".into());
-    out.push_str(pre);
 
     let elem = &ib.elem;
     let item_ty = iter_out_item_type(elem, prefix, module);
-    out.push_str(&format!(
-        "\tit := C.{}({})\n",
+
+    let mut w = CodeWriter::tabs().with_depth(1);
+    w.raw(pre.as_str());
+    w.line(format!(
+        "it := C.{}({})",
         ib.launch.symbol,
         c_args.join(", ")
     ));
-    out.push_str("\tif cErr.code != 0 {\n");
-    out.push_str("\t\tgoErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(cErr.message), int(cErr.code))\n");
-    out.push_str("\t\tC.weaveffi_error_clear(&cErr)\n");
-    out.push_str("\t\treturn nil, goErr\n");
-    out.push_str("\t}\n");
-    out.push_str(&format!("\tdefer C.{}(it)\n", ib.destroy_symbol));
-    out.push_str(&format!("\tgoResult := []{}{{}}\n", go_type(elem)));
-    out.push_str("\tfor {\n");
-    out.push_str(&format!("\t\tvar outItem {item_ty}\n"));
-    out.push_str("\t\tvar iterErr C.weaveffi_error\n");
-    out.push_str(&format!(
-        "\t\tif C.{}(it, &outItem, &iterErr) == 0 {{\n",
-        ib.next.symbol
-    ));
-    out.push_str("\t\t\tbreak\n");
-    out.push_str("\t\t}\n");
-    out.push_str("\t\tif iterErr.code != 0 {\n");
-    out.push_str("\t\t\tgoErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(iterErr.message), int(iterErr.code))\n");
-    out.push_str("\t\t\tC.weaveffi_error_clear(&iterErr)\n");
-    out.push_str("\t\t\treturn nil, goErr\n");
-    out.push_str("\t\t}\n");
-    emit_iter_elem_append(out, "goResult", elem, "outItem");
-    out.push_str("\t}\n");
-    out.push_str("\treturn goResult, nil\n");
+    w.block("if cErr.code != 0 {", "}", |w| {
+        w.line("goErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(cErr.message), int(cErr.code))");
+        w.line("C.weaveffi_error_clear(&cErr)");
+        w.line("return nil, goErr");
+    });
+    w.line(format!("defer C.{}(it)", ib.destroy_symbol));
+    w.line(format!("goResult := []{}{{}}", go_type(elem)));
+    w.block("for {", "}", |w| {
+        w.line(format!("var outItem {item_ty}"));
+        w.line("var iterErr C.weaveffi_error");
+        w.block(
+            format!("if C.{}(it, &outItem, &iterErr) == 0 {{", ib.next.symbol),
+            "}",
+            |w| {
+                w.line("break");
+            },
+        );
+        w.block("if iterErr.code != 0 {", "}", |w| {
+            w.line("goErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(iterErr.message), int(iterErr.code))");
+            w.line("C.weaveffi_error_clear(&iterErr)");
+            w.line("return nil, goErr");
+        });
+        let mut app = String::new();
+        emit_iter_elem_append(&mut app, "goResult", elem, "outItem");
+        w.raw(app);
+    });
+    w.line("return goResult, nil");
+    out.push_str(&w.finish());
 }
 
 // ── Parameter conversion ──
@@ -1728,6 +1879,7 @@ fn emit_param(
     prefix: &str,
     module: &str,
 ) {
+    let mut w = CodeWriter::tabs().with_depth(1);
     match ty {
         TypeRef::I8
         | TypeRef::I16
@@ -1751,31 +1903,32 @@ fn emit_param(
 
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             let cv = format!("c{}", name.to_upper_camel_case());
-            pre.push_str(&format!("\t{cv} := C.CString({name})\n"));
-            pre.push_str(&format!("\tdefer C.free(unsafe.Pointer({cv}))\n"));
+            w.line(format!("{cv} := C.CString({name})"));
+            w.line(format!("defer C.free(unsafe.Pointer({cv}))"));
             args.push(cv);
         }
 
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             let pv = format!("c{}Ptr", name.to_upper_camel_case());
             let lv = format!("c{}Len", name.to_upper_camel_case());
-            pre.push_str(&format!("\tvar {pv} *C.uint8_t\n"));
-            pre.push_str(&format!("\t{lv} := C.size_t(len({name}))\n"));
-            pre.push_str(&format!("\tif len({name}) > 0 {{\n"));
-            pre.push_str(&format!(
-                "\t\t{pv} = (*C.uint8_t)(unsafe.Pointer(&{name}[0]))\n"
-            ));
-            pre.push_str("\t}\n");
+            w.line(format!("var {pv} *C.uint8_t"));
+            w.line(format!("{lv} := C.size_t(len({name}))"));
+            w.block(format!("if len({name}) > 0 {{"), "}", |w| {
+                w.line(format!("{pv} = (*C.uint8_t)(unsafe.Pointer(&{name}[0]))"));
+            });
             args.push(pv);
             args.push(lv);
         }
 
-        TypeRef::Optional(inner) => emit_optional_param(pre, args, name, inner, prefix, module),
-        TypeRef::List(inner) => emit_list_param(pre, args, name, inner, prefix, module),
-        TypeRef::Map(k, v) => emit_map_param(pre, args, name, k, v, prefix, module),
+        TypeRef::Optional(inner) => {
+            return emit_optional_param(pre, args, name, inner, prefix, module)
+        }
+        TypeRef::List(inner) => return emit_list_param(pre, args, name, inner, prefix, module),
+        TypeRef::Map(k, v) => return emit_map_param(pre, args, name, k, v, prefix, module),
 
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
     }
+    pre.push_str(&w.finish());
 }
 
 fn emit_optional_param(
@@ -1788,37 +1941,39 @@ fn emit_optional_param(
 ) {
     let cv = format!("c{}", name.to_upper_camel_case());
 
+    let mut w = CodeWriter::tabs().with_depth(1);
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            pre.push_str(&format!("\tvar {cv} *C.char\n"));
-            pre.push_str(&format!("\tif {name} != nil {{\n"));
-            pre.push_str(&format!("\t\t{cv} = C.CString(*{name})\n"));
-            pre.push_str(&format!("\t\tdefer C.free(unsafe.Pointer({cv}))\n"));
-            pre.push_str("\t}\n");
+            w.line(format!("var {cv} *C.char"));
+            w.block(format!("if {name} != nil {{"), "}", |w| {
+                w.line(format!("{cv} = C.CString(*{name})"));
+                w.line(format!("defer C.free(unsafe.Pointer({cv}))"));
+            });
             args.push(cv);
         }
         TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
             let ct = c_opaque_type(inner, prefix, module);
-            pre.push_str(&format!("\tvar {cv} *C.{ct}\n"));
-            pre.push_str(&format!("\tif {name} != nil {{\n"));
-            pre.push_str(&format!("\t\t{cv} = {name}.ptr\n"));
-            pre.push_str("\t}\n");
+            w.line(format!("var {cv} *C.{ct}"));
+            w.block(format!("if {name} != nil {{"), "}", |w| {
+                w.line(format!("{cv} = {name}.ptr"));
+            });
             args.push(cv);
         }
         _ => {
             if let Some(ct) = c_scalar_type(inner, prefix, module) {
-                pre.push_str(&format!("\tvar {cv} *{ct}\n"));
-                pre.push_str(&format!("\tif {name} != nil {{\n"));
+                w.line(format!("var {cv} *{ct}"));
                 let conv = c_scalar_conv(&format!("*{name}"), inner, prefix, module);
-                pre.push_str(&format!("\t\ttmp := {conv}\n"));
-                pre.push_str(&format!("\t\t{cv} = &tmp\n"));
-                pre.push_str("\t}\n");
+                w.block(format!("if {name} != nil {{"), "}", |w| {
+                    w.line(format!("tmp := {conv}"));
+                    w.line(format!("{cv} = &tmp"));
+                });
                 args.push(cv);
             } else {
                 args.push(name.to_string());
             }
         }
     }
+    pre.push_str(&w.finish());
 }
 
 fn emit_list_param(
@@ -1833,57 +1988,57 @@ fn emit_list_param(
     let pv = format!("c{cn}Ptr");
     let lv = format!("c{cn}Len");
 
-    pre.push_str(&format!("\t{lv} := C.size_t(len({name}))\n"));
+    let mut w = CodeWriter::tabs().with_depth(1);
+    w.line(format!("{lv} := C.size_t(len({name}))"));
 
     if let Some(ct) = c_scalar_type(inner, prefix, module) {
         if matches!(inner, TypeRef::Bool) {
             let arr = format!("c{cn}Arr");
-            pre.push_str(&format!("\t{arr} := make([]C._Bool, len({name}))\n"));
-            pre.push_str(&format!("\tfor i, b := range {name} {{\n"));
-            pre.push_str(&format!("\t\t{arr}[i] = boolToC(b)\n"));
-            pre.push_str("\t}\n");
-            pre.push_str(&format!("\tvar {pv} *C._Bool\n"));
-            pre.push_str(&format!("\tif len({arr}) > 0 {{\n"));
-            pre.push_str(&format!("\t\t{pv} = &{arr}[0]\n"));
-            pre.push_str("\t}\n");
+            w.line(format!("{arr} := make([]C._Bool, len({name}))"));
+            w.block(format!("for i, b := range {name} {{"), "}", |w| {
+                w.line(format!("{arr}[i] = boolToC(b)"));
+            });
+            w.line(format!("var {pv} *C._Bool"));
+            w.block(format!("if len({arr}) > 0 {{"), "}", |w| {
+                w.line(format!("{pv} = &{arr}[0]"));
+            });
         } else {
-            pre.push_str(&format!("\tvar {pv} *{ct}\n"));
-            pre.push_str(&format!("\tif len({name}) > 0 {{\n"));
-            pre.push_str(&format!("\t\t{pv} = (*{ct})(unsafe.Pointer(&{name}[0]))\n"));
-            pre.push_str("\t}\n");
+            w.line(format!("var {pv} *{ct}"));
+            w.block(format!("if len({name}) > 0 {{"), "}", |w| {
+                w.line(format!("{pv} = (*{ct})(unsafe.Pointer(&{name}[0]))"));
+            });
         }
     } else if matches!(inner, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
         let arr = format!("c{cn}Arr");
-        pre.push_str(&format!("\t{arr} := make([]*C.char, len({name}))\n"));
-        pre.push_str(&format!("\tfor i, s := range {name} {{\n"));
-        pre.push_str(&format!("\t\t{arr}[i] = C.CString(s)\n"));
-        pre.push_str("\t}\n");
-        pre.push_str("\tdefer func() {\n");
-        pre.push_str(&format!("\t\tfor _, p := range {arr} {{\n"));
-        pre.push_str("\t\t\tC.free(unsafe.Pointer(p))\n");
-        pre.push_str("\t\t}\n");
-        pre.push_str("\t}()\n");
-        pre.push_str(&format!("\tvar {pv} **C.char\n"));
-        pre.push_str(&format!("\tif len({arr}) > 0 {{\n"));
-        pre.push_str(&format!(
-            "\t\t{pv} = (**C.char)(unsafe.Pointer(&{arr}[0]))\n"
-        ));
-        pre.push_str("\t}\n");
+        w.line(format!("{arr} := make([]*C.char, len({name}))"));
+        w.block(format!("for i, s := range {name} {{"), "}", |w| {
+            w.line(format!("{arr}[i] = C.CString(s)"));
+        });
+        w.block("defer func() {", "}()", |w| {
+            w.block(format!("for _, p := range {arr} {{"), "}", |w| {
+                w.line("C.free(unsafe.Pointer(p))");
+            });
+        });
+        w.line(format!("var {pv} **C.char"));
+        w.block(format!("if len({arr}) > 0 {{"), "}", |w| {
+            w.line(format!("{pv} = (**C.char)(unsafe.Pointer(&{arr}[0]))"));
+        });
     } else if let TypeRef::Struct(n) | TypeRef::TypedHandle(n) = inner {
         let ct = format!("C.{}", c_abi_struct_name(n, module, prefix));
         let arr = format!("c{cn}Arr");
-        pre.push_str(&format!("\t{arr} := make([]*{ct}, len({name}))\n"));
-        pre.push_str(&format!("\tfor i, item := range {name} {{\n"));
-        pre.push_str(&format!("\t\t{arr}[i] = item.ptr\n"));
-        pre.push_str("\t}\n");
-        pre.push_str(&format!("\tvar {pv} **{ct}\n"));
-        pre.push_str(&format!("\tif len({arr}) > 0 {{\n"));
-        pre.push_str(&format!("\t\t{pv} = (**{ct})(unsafe.Pointer(&{arr}[0]))\n"));
-        pre.push_str("\t}\n");
+        w.line(format!("{arr} := make([]*{ct}, len({name}))"));
+        w.block(format!("for i, item := range {name} {{"), "}", |w| {
+            w.line(format!("{arr}[i] = item.ptr"));
+        });
+        w.line(format!("var {pv} **{ct}"));
+        w.block(format!("if len({arr}) > 0 {{"), "}", |w| {
+            w.line(format!("{pv} = (**{ct})(unsafe.Pointer(&{arr}[0]))"));
+        });
     } else {
-        pre.push_str(&format!("\tvar {pv} unsafe.Pointer\n"));
+        w.line(format!("var {pv} unsafe.Pointer"));
     }
 
+    pre.push_str(&w.finish());
     args.push(pv);
     args.push(lv);
 }
@@ -1902,13 +2057,15 @@ fn emit_map_param(
     let go_k = go_type(k);
     let go_v = go_type(v);
 
-    pre.push_str(&format!("\t{lv} := C.size_t(len({name}))\n"));
-    pre.push_str(&format!("\tkeys{cn} := make([]{go_k}, 0, len({name}))\n"));
-    pre.push_str(&format!("\tvals{cn} := make([]{go_v}, 0, len({name}))\n"));
-    pre.push_str(&format!("\tfor mk, mv := range {name} {{\n"));
-    pre.push_str(&format!("\t\tkeys{cn} = append(keys{cn}, mk)\n"));
-    pre.push_str(&format!("\t\tvals{cn} = append(vals{cn}, mv)\n"));
-    pre.push_str("\t}\n");
+    let mut w = CodeWriter::tabs().with_depth(1);
+    w.line(format!("{lv} := C.size_t(len({name}))"));
+    w.line(format!("keys{cn} := make([]{go_k}, 0, len({name}))"));
+    w.line(format!("vals{cn} := make([]{go_v}, 0, len({name}))"));
+    w.block(format!("for mk, mv := range {name} {{"), "}", |w| {
+        w.line(format!("keys{cn} = append(keys{cn}, mk)"));
+        w.line(format!("vals{cn} = append(vals{cn}, mv)"));
+    });
+    pre.push_str(&w.finish());
 
     let kp = format!("c{cn}KeysPtr");
     emit_map_array(pre, &kp, &format!("keys{cn}"), k, prefix, module);
@@ -1929,33 +2086,33 @@ fn emit_map_array(
     prefix: &str,
     module: &str,
 ) {
+    let mut w = CodeWriter::tabs().with_depth(1);
     if let Some(ct) = c_scalar_type(ty, prefix, module) {
-        pre.push_str(&format!("\tvar {ptr_var} *{ct}\n"));
-        pre.push_str(&format!("\tif len({slice_name}) > 0 {{\n"));
-        pre.push_str(&format!(
-            "\t\t{ptr_var} = (*{ct})(unsafe.Pointer(&{slice_name}[0]))\n"
-        ));
-        pre.push_str("\t}\n");
+        w.line(format!("var {ptr_var} *{ct}"));
+        w.block(format!("if len({slice_name}) > 0 {{"), "}", |w| {
+            w.line(format!(
+                "{ptr_var} = (*{ct})(unsafe.Pointer(&{slice_name}[0]))"
+            ));
+        });
     } else if matches!(ty, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
         let arr = format!("{ptr_var}Arr");
-        pre.push_str(&format!("\t{arr} := make([]*C.char, len({slice_name}))\n"));
-        pre.push_str(&format!("\tfor i, s := range {slice_name} {{\n"));
-        pre.push_str(&format!("\t\t{arr}[i] = C.CString(s)\n"));
-        pre.push_str("\t}\n");
-        pre.push_str("\tdefer func() {\n");
-        pre.push_str(&format!("\t\tfor _, p := range {arr} {{\n"));
-        pre.push_str("\t\t\tC.free(unsafe.Pointer(p))\n");
-        pre.push_str("\t\t}\n");
-        pre.push_str("\t}()\n");
-        pre.push_str(&format!("\tvar {ptr_var} **C.char\n"));
-        pre.push_str(&format!("\tif len({arr}) > 0 {{\n"));
-        pre.push_str(&format!(
-            "\t\t{ptr_var} = (**C.char)(unsafe.Pointer(&{arr}[0]))\n"
-        ));
-        pre.push_str("\t}\n");
+        w.line(format!("{arr} := make([]*C.char, len({slice_name}))"));
+        w.block(format!("for i, s := range {slice_name} {{"), "}", |w| {
+            w.line(format!("{arr}[i] = C.CString(s)"));
+        });
+        w.block("defer func() {", "}()", |w| {
+            w.block(format!("for _, p := range {arr} {{"), "}", |w| {
+                w.line("C.free(unsafe.Pointer(p))");
+            });
+        });
+        w.line(format!("var {ptr_var} **C.char"));
+        w.block(format!("if len({arr}) > 0 {{"), "}", |w| {
+            w.line(format!("{ptr_var} = (**C.char)(unsafe.Pointer(&{arr}[0]))"));
+        });
     } else {
-        pre.push_str(&format!("\tvar {ptr_var} unsafe.Pointer\n"));
+        w.line(format!("var {ptr_var} unsafe.Pointer"));
     }
+    pre.push_str(&w.finish());
 }
 
 // ── Return out-params ──
@@ -1967,29 +2124,34 @@ fn emit_return_out_params(
     prefix: &str,
     module: &str,
 ) {
+    let mut w = CodeWriter::tabs().with_depth(1);
     match ty {
         TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            pre.push_str("\tvar cOutLen C.size_t\n");
+            w.line("var cOutLen C.size_t");
             args.push("&cOutLen".into());
         }
         TypeRef::Map(k, v) => {
             let kt = go_cmap_ptr_type(k, prefix, module);
             let vt = go_cmap_ptr_type(v, prefix, module);
-            pre.push_str(&format!("\tvar cMapKeys {kt}\n"));
-            pre.push_str(&format!("\tvar cMapVals {vt}\n"));
-            pre.push_str("\tvar cOutLen C.size_t\n");
+            w.line(format!("var cMapKeys {kt}"));
+            w.line(format!("var cMapVals {vt}"));
+            w.line("var cOutLen C.size_t");
             args.push("&cMapKeys".into());
             args.push("&cMapVals".into());
             args.push("&cOutLen".into());
         }
-        TypeRef::Optional(inner) => emit_return_out_params(pre, args, inner, prefix, module),
+        TypeRef::Optional(inner) => {
+            return emit_return_out_params(pre, args, inner, prefix, module)
+        }
         _ => {}
     }
+    pre.push_str(&w.finish());
 }
 
 // ── Return conversion ──
 
 fn emit_return(out: &mut String, ty: &TypeRef, prefix: &str, module: &str) {
+    let mut w = CodeWriter::tabs().with_depth(1);
     match ty {
         TypeRef::I8
         | TypeRef::I16
@@ -2003,79 +2165,98 @@ fn emit_return(out: &mut String, ty: &TypeRef, prefix: &str, module: &str) {
         | TypeRef::F32
         | TypeRef::F64 => {
             let conv = go_scalar_conv("result", ty);
-            out.push_str(&format!("\treturn {conv}, nil\n"));
+            w.line(format!("return {conv}, nil"));
         }
-        TypeRef::Bool => out.push_str("\treturn cToBool(result), nil\n"),
+        TypeRef::Bool => {
+            w.line("return cToBool(result), nil");
+        }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str("\tgoResult := C.GoString(result)\n");
-            out.push_str("\tC.weaveffi_free_string(result)\n");
-            out.push_str("\treturn goResult, nil\n");
+            w.line("goResult := C.GoString(result)");
+            w.line("C.weaveffi_free_string(result)");
+            w.line("return goResult, nil");
         }
         TypeRef::Enum(_) => {
             let conv = go_scalar_conv("result", ty);
-            out.push_str(&format!("\treturn {conv}, nil\n"));
+            w.line(format!("return {conv}, nil"));
         }
         TypeRef::TypedHandle(n) => {
             let g = local_type_name(n).to_upper_camel_case();
-            out.push_str(&format!("\treturn &{g}{{ptr: result}}, nil\n"));
+            w.line(format!("return &{g}{{ptr: result}}, nil"));
         }
         TypeRef::Struct(n) => {
             let g = local_type_name(n).to_upper_camel_case();
-            out.push_str(&format!("\treturn &{g}{{ptr: result}}, nil\n"));
+            w.line(format!("return &{g}{{ptr: result}}, nil"));
         }
-        TypeRef::Optional(inner) => emit_optional_return(out, inner, module),
-        TypeRef::List(inner) => emit_list_return(out, inner, prefix, module),
+        TypeRef::Optional(inner) => return emit_optional_return(out, inner, module),
+        TypeRef::List(inner) => return emit_list_return(out, inner, prefix, module),
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            out.push_str("\tif result == nil {\n\t\treturn nil, nil\n\t}\n");
-            out.push_str("\tgoResult := C.GoBytes(unsafe.Pointer(result), C.int(cOutLen))\n");
-            out.push_str("\tC.weaveffi_free_bytes(result, cOutLen)\n");
-            out.push_str("\treturn goResult, nil\n");
+            w.block("if result == nil {", "}", |w| {
+                w.line("return nil, nil");
+            });
+            w.line("goResult := C.GoBytes(unsafe.Pointer(result), C.int(cOutLen))");
+            w.line("C.weaveffi_free_bytes(result, cOutLen)");
+            w.line("return goResult, nil");
         }
-        TypeRef::Map(k, v) => emit_map_return(out, k, v, prefix, module),
-        TypeRef::Iterator(inner) => emit_list_return(out, inner, prefix, module),
+        TypeRef::Map(k, v) => return emit_map_return(out, k, v, prefix, module),
+        TypeRef::Iterator(inner) => return emit_list_return(out, inner, prefix, module),
     }
+    out.push_str(&w.finish());
 }
 
 fn emit_optional_return(out: &mut String, inner: &TypeRef, _module: &str) {
-    out.push_str("\tif result == nil {\n\t\treturn nil, nil\n\t}\n");
+    let mut w = CodeWriter::tabs().with_depth(1);
+    w.block("if result == nil {", "}", |w| {
+        w.line("return nil, nil");
+    });
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str("\tv := C.GoString(result)\n");
-            out.push_str("\tC.weaveffi_free_string(result)\n");
-            out.push_str("\treturn &v, nil\n");
+            w.line("v := C.GoString(result)");
+            w.line("C.weaveffi_free_string(result)");
+            w.line("return &v, nil");
         }
         TypeRef::TypedHandle(n) => {
             let g = local_type_name(n).to_upper_camel_case();
-            out.push_str(&format!("\treturn &{g}{{ptr: result}}, nil\n"));
+            w.line(format!("return &{g}{{ptr: result}}, nil"));
         }
         TypeRef::Struct(n) => {
             let g = local_type_name(n).to_upper_camel_case();
-            out.push_str(&format!("\treturn &{g}{{ptr: result}}, nil\n"));
+            w.line(format!("return &{g}{{ptr: result}}, nil"));
         }
         TypeRef::Bool => {
-            out.push_str("\tv := cToBool(*result)\n");
-            out.push_str("\treturn &v, nil\n");
+            w.line("v := cToBool(*result)");
+            w.line("return &v, nil");
         }
         _ => {
             let gt = go_type(inner);
-            out.push_str(&format!("\tv := {gt}(*result)\n"));
-            out.push_str("\treturn &v, nil\n");
+            w.line(format!("v := {gt}(*result)"));
+            w.line("return &v, nil");
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn emit_list_return(out: &mut String, inner: &TypeRef, prefix: &str, module: &str) {
-    out.push_str("\tcount := int(cOutLen)\n");
-    decode_list(out, "goResult", inner, "result", "count", prefix, module);
-    out.push_str("\treturn goResult, nil\n");
+    let mut w = CodeWriter::tabs().with_depth(1);
+    w.line("count := int(cOutLen)");
+    let mut body = String::new();
+    decode_list(
+        &mut body, "goResult", inner, "result", "count", prefix, module,
+    );
+    w.raw(body);
+    w.line("return goResult, nil");
+    out.push_str(&w.finish());
 }
 
 fn emit_map_return(out: &mut String, k: &TypeRef, v: &TypeRef, prefix: &str, module: &str) {
-    out.push_str("\tcount := int(cOutLen)\n");
+    let mut w = CodeWriter::tabs().with_depth(1);
+    w.line("count := int(cOutLen)");
+    let mut body = String::new();
     decode_map(
-        out, "goResult", k, v, "cMapKeys", "cMapVals", "count", prefix, module,
+        &mut body, "goResult", k, v, "cMapKeys", "cMapVals", "count", prefix, module,
     );
-    out.push_str("\treturn goResult, nil\n");
+    w.raw(body);
+    w.line("return goResult, nil");
+    out.push_str(&w.finish());
 }
 
 /// Go type of the local variable whose address is passed for an
@@ -2112,31 +2293,45 @@ fn decode_list(
     module: &str,
 ) {
     let gi = go_type(inner);
-    out.push_str(&format!("\t{dst} := make([]{gi}, {count})\n"));
-    out.push_str(&format!("\tif {count} > 0 && {src} != nil {{\n"));
-    if let Some(ct) = c_scalar_type(inner, prefix, module) {
-        out.push_str(&format!(
-            "\t\tfor i, v := range unsafe.Slice((*{ct})(unsafe.Pointer({src})), {count}) {{\n"
-        ));
-        let conv = go_scalar_conv("v", inner);
-        out.push_str(&format!("\t\t\t{dst}[i] = {conv}\n"));
-        out.push_str("\t\t}\n");
-    } else if matches!(inner, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
-        out.push_str(&format!(
-            "\t\tfor i, v := range unsafe.Slice((**C.char)(unsafe.Pointer({src})), {count}) {{\n"
-        ));
-        out.push_str(&format!("\t\t\t{dst}[i] = C.GoString(v)\n"));
-        out.push_str("\t\t}\n");
-    } else if let TypeRef::TypedHandle(n) | TypeRef::Struct(n) = inner {
-        let ct = format!("C.{}", c_abi_struct_name(n, module, prefix));
-        let gs = local_type_name(n).to_upper_camel_case();
-        out.push_str(&format!(
-            "\t\tfor i, v := range unsafe.Slice((**{ct})(unsafe.Pointer({src})), {count}) {{\n"
-        ));
-        out.push_str(&format!("\t\t\t{dst}[i] = &{gs}{{ptr: v}}\n"));
-        out.push_str("\t\t}\n");
-    }
-    out.push_str("\t}\n");
+    let mut w = CodeWriter::tabs().with_depth(1);
+    w.line(format!("{dst} := make([]{gi}, {count})"));
+    w.block(format!("if {count} > 0 && {src} != nil {{"), "}", |w| {
+        if let Some(ct) = c_scalar_type(inner, prefix, module) {
+            w.block(
+                format!(
+                    "for i, v := range unsafe.Slice((*{ct})(unsafe.Pointer({src})), {count}) {{"
+                ),
+                "}",
+                |w| {
+                    let conv = go_scalar_conv("v", inner);
+                    w.line(format!("{dst}[i] = {conv}"));
+                },
+            );
+        } else if matches!(inner, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
+            w.block(
+                format!(
+                    "for i, v := range unsafe.Slice((**C.char)(unsafe.Pointer({src})), {count}) {{"
+                ),
+                "}",
+                |w| {
+                    w.line(format!("{dst}[i] = C.GoString(v)"));
+                },
+            );
+        } else if let TypeRef::TypedHandle(n) | TypeRef::Struct(n) = inner {
+            let ct = format!("C.{}", c_abi_struct_name(n, module, prefix));
+            let gs = local_type_name(n).to_upper_camel_case();
+            w.block(
+                format!(
+                    "for i, v := range unsafe.Slice((**{ct})(unsafe.Pointer({src})), {count}) {{"
+                ),
+                "}",
+                |w| {
+                    w.line(format!("{dst}[i] = &{gs}{{ptr: v}}"));
+                },
+            );
+        }
+    });
+    out.push_str(&w.finish());
 }
 
 /// Emit Go that materializes parallel C key/value arrays (`keys`/`vals`, already
@@ -2155,18 +2350,22 @@ fn decode_map(
 ) {
     let gk = go_type(k);
     let gv = go_type(v);
-    out.push_str(&format!("\t{dst} := make(map[{gk}]{gv}, {count})\n"));
-    out.push_str(&format!(
-        "\tif {count} > 0 && {keys} != nil && {vals} != nil {{\n"
-    ));
-    out.push_str(&format!("\t\tkeySlice := unsafe.Slice({keys}, {count})\n"));
-    out.push_str(&format!("\t\tvalSlice := unsafe.Slice({vals}, {count})\n"));
-    out.push_str(&format!("\t\tfor i := 0; i < {count}; i++ {{\n"));
-    let kr = map_elem_read("keySlice[i]", k);
-    let vr = map_elem_read("valSlice[i]", v);
-    out.push_str(&format!("\t\t\t{dst}[{kr}] = {vr}\n"));
-    out.push_str("\t\t}\n");
-    out.push_str("\t}\n");
+    let mut w = CodeWriter::tabs().with_depth(1);
+    w.line(format!("{dst} := make(map[{gk}]{gv}, {count})"));
+    w.block(
+        format!("if {count} > 0 && {keys} != nil && {vals} != nil {{"),
+        "}",
+        |w| {
+            w.line(format!("keySlice := unsafe.Slice({keys}, {count})"));
+            w.line(format!("valSlice := unsafe.Slice({vals}, {count})"));
+            w.block(format!("for i := 0; i < {count}; i++ {{"), "}", |w| {
+                let kr = map_elem_read("keySlice[i]", k);
+                let vr = map_elem_read("valSlice[i]", v);
+                w.line(format!("{dst}[{kr}] = {vr}"));
+            });
+        },
+    );
+    out.push_str(&w.finish());
 }
 
 #[cfg(test)]

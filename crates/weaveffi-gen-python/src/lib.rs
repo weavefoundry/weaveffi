@@ -18,6 +18,7 @@ use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, is_c_pointer_type, pascal_case, DocCommentStyle,
 };
+use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::model::{
     BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
     ListenerBinding, ModuleBinding, ParamBinding, RichVariantBinding, StructBinding,
@@ -1015,19 +1016,25 @@ fn render_enum(out: &mut String, e: &EnumBinding) {
         render_rich_enum(out, e);
         return;
     }
-    out.push_str(&format!("\n\nclass {}(IntEnum):\n", e.name));
-    emit_docstring(out, &e.doc, "    ");
+    let mut w = CodeWriter::four_space();
+    w.blank().blank();
+    w.line(format!("class {}(IntEnum):", e.name));
+    w.indent();
+    let mut doc = String::new();
+    emit_docstring(&mut doc, &e.doc, "    ");
+    w.raw(doc);
     for v in &e.variants {
         if let Some(d) = &v.doc {
             let trimmed = d.trim();
             if !trimmed.is_empty() {
                 for line in trimmed.lines() {
-                    out.push_str(&format!("    # {}\n", line));
+                    w.line(format!("# {}", line));
                 }
             }
         }
-        out.push_str(&format!("    {} = {}\n", v.name, v.value));
+        w.line(format!("{} = {}", v.name, v.value));
     }
+    out.push_str(&w.finish());
 }
 
 /// Render a rich (algebraic) enum as an opaque-object wrapper class, mirroring
@@ -1298,18 +1305,22 @@ fn py_field_default(ty: &TypeRef) -> (String, String) {
 fn render_callback_type(out: &mut String, c: &CallbackBinding) {
     let mut parts: Vec<String> = vec!["None".into()];
     parts.extend(c.abi_params.iter().map(|p| py_ctype(&p.ty)));
-    out.push_str("\n\n");
-    emit_doc(out, &c.doc, "");
-    out.push_str(&format!(
-        "# Callback type {}: {}\n",
+    let mut w = CodeWriter::four_space();
+    w.blank().blank();
+    let mut doc = String::new();
+    emit_doc(&mut doc, &c.doc, "");
+    w.raw(doc);
+    w.line(format!(
+        "# Callback type {}: {}",
         c.name,
         py_callable_hint(&c.params)
     ));
-    out.push_str(&format!(
-        "_CFUNC_{} = ctypes.CFUNCTYPE({})\n",
+    w.line(format!(
+        "_CFUNC_{} = ctypes.CFUNCTYPE({})",
         c.c_fn_type,
         parts.join(", ")
     ));
+    out.push_str(&w.finish());
 }
 
 /// `Callable[[<param hints>], None]` for a callback's idiomatic signature.
@@ -1403,11 +1414,15 @@ fn render_listener(
     let cfunc = format!("_CFUNC_{}", cb.c_fn_type);
     let ind = "    ";
 
+    let mut w = CodeWriter::four_space();
+
     // register_{listener}(callback) -> int
-    out.push_str(&format!(
-        "\n\ndef {register_name}(callback: {}) -> int:\n",
+    w.blank().blank();
+    w.line(format!(
+        "def {register_name}(callback: {}) -> int:",
         py_callable_hint(&cb.params)
     ));
+    w.indent();
     let reg_doc = match &l.doc {
         Some(d) => format!(
             "{}\n\nReturns a subscription id for {unregister_name}().",
@@ -1418,7 +1433,9 @@ fn render_listener(
             cb.name
         ),
     };
-    emit_docstring(out, &Some(reg_doc), ind);
+    let mut doc = String::new();
+    emit_docstring(&mut doc, &Some(reg_doc), ind);
+    w.raw(doc);
 
     let tramp_params: Vec<String> = cb
         .params
@@ -1431,35 +1448,38 @@ fn render_listener(
         .iter()
         .map(|p| py_cb_param_expr(&p.name, &p.ty))
         .collect();
-    out.push_str(&format!(
-        "{ind}def _trampoline({}):\n",
-        tramp_params.join(", ")
-    ));
-    out.push_str(&format!("{ind}    callback({})\n", call_args.join(", ")));
-    out.push_str(&format!("{ind}_cfunc = {cfunc}(_trampoline)\n"));
-    out.push_str(&format!("{ind}_fn = _lib.{}\n", l.register_symbol));
-    out.push_str(&format!("{ind}_fn.argtypes = [{cfunc}, ctypes.c_void_p]\n"));
-    out.push_str(&format!("{ind}_fn.restype = ctypes.c_uint64\n"));
-    out.push_str(&format!("{ind}_listener_id = int(_fn(_cfunc, None))\n"));
-    out.push_str(&format!("{ind}_listener_refs[_listener_id] = _cfunc\n"));
-    out.push_str(&format!("{ind}return _listener_id\n"));
+    w.line(format!("def _trampoline({}):", tramp_params.join(", ")));
+    w.scope(|w| {
+        w.line(format!("callback({})", call_args.join(", ")));
+    });
+    w.line(format!("_cfunc = {cfunc}(_trampoline)"));
+    w.line(format!("_fn = _lib.{}", l.register_symbol));
+    w.line(format!("_fn.argtypes = [{cfunc}, ctypes.c_void_p]"));
+    w.line("_fn.restype = ctypes.c_uint64");
+    w.line("_listener_id = int(_fn(_cfunc, None))");
+    w.line("_listener_refs[_listener_id] = _cfunc");
+    w.line("return _listener_id");
+    w.dedent();
 
     // unregister_{listener}(listener_id) -> None
-    out.push_str(&format!(
-        "\n\ndef {unregister_name}(listener_id: int) -> None:\n"
-    ));
+    w.blank().blank();
+    w.line(format!("def {unregister_name}(listener_id: int) -> None:"));
+    w.indent();
+    let mut unreg_doc = String::new();
     emit_docstring(
-        out,
+        &mut unreg_doc,
         &Some(format!(
             "Unregister a listener previously registered with {register_name}()."
         )),
         ind,
     );
-    out.push_str(&format!("{ind}_fn = _lib.{}\n", l.unregister_symbol));
-    out.push_str(&format!("{ind}_fn.argtypes = [ctypes.c_uint64]\n"));
-    out.push_str(&format!("{ind}_fn.restype = None\n"));
-    out.push_str(&format!("{ind}_fn(ctypes.c_uint64(listener_id))\n"));
-    out.push_str(&format!("{ind}_listener_refs.pop(listener_id, None)\n"));
+    w.raw(unreg_doc);
+    w.line(format!("_fn = _lib.{}", l.unregister_symbol));
+    w.line("_fn.argtypes = [ctypes.c_uint64]");
+    w.line("_fn.restype = None");
+    w.line("_fn(ctypes.c_uint64(listener_id))");
+    w.line("_listener_refs.pop(listener_id, None)");
+    out.push_str(&w.finish());
 }
 
 fn render_getter(out: &mut String, field: &FieldBinding) {
@@ -1467,39 +1487,41 @@ fn render_getter(out: &mut String, field: &FieldBinding) {
     let py_ty = py_type_hint(&field.ty);
     let ind = "        ";
 
-    out.push_str(&format!(
-        "\n\n    @property\n    def {}(self) -> {}:\n",
-        field.name, py_ty
-    ));
-    emit_docstring(out, &field.doc, ind);
-    out.push_str(&format!("{ind}_fn = _lib.{getter}\n"));
+    let mut w = CodeWriter::four_space();
+    w.blank().blank().indent();
+    w.line("@property");
+    w.line(format!("def {}(self) -> {}:", field.name, py_ty));
+    w.indent();
+    let mut doc = String::new();
+    emit_docstring(&mut doc, &field.doc, ind);
+    w.raw(doc);
+    w.line(format!("_fn = _lib.{getter}"));
 
     let (restype, out_argtypes) = py_return_info(&field.ty);
     let mut argtypes = vec!["ctypes.c_void_p".to_string()];
     argtypes.extend(out_argtypes.iter().cloned());
 
-    out.push_str(&format!("{ind}_fn.argtypes = [{}]\n", argtypes.join(", ")));
-    out.push_str(&format!("{ind}_fn.restype = {restype}\n"));
+    w.line(format!("_fn.argtypes = [{}]", argtypes.join(", ")));
+    w.line(format!("_fn.restype = {restype}"));
 
     if out_argtypes.is_empty() {
-        out.push_str(&format!("{ind}_result = _fn(self._ptr)\n"));
+        w.line("_result = _fn(self._ptr)");
     } else if let Some((k, v)) = get_map_kv(&field.ty) {
-        out.push_str(&format!(
-            "{ind}_out_keys = ctypes.POINTER({})()\n",
+        w.line(format!(
+            "_out_keys = ctypes.POINTER({})()",
             py_ctypes_scalar(k)
         ));
-        out.push_str(&format!(
-            "{ind}_out_values = ctypes.POINTER({})()\n",
+        w.line(format!(
+            "_out_values = ctypes.POINTER({})()",
             py_ctypes_scalar(v)
         ));
-        out.push_str(&format!("{ind}_out_len = ctypes.c_size_t(0)\n"));
-        out.push_str(&format!("{ind}_fn(self._ptr, ctypes.byref(_out_keys), ctypes.byref(_out_values), ctypes.byref(_out_len))\n"));
+        w.line("_out_len = ctypes.c_size_t(0)");
+        w.line("_fn(self._ptr, ctypes.byref(_out_keys), ctypes.byref(_out_values), ctypes.byref(_out_len))");
     } else {
-        out.push_str(&format!("{ind}_out_len = ctypes.c_size_t(0)\n"));
-        out.push_str(&format!(
-            "{ind}_result = _fn(self._ptr, ctypes.byref(_out_len))\n"
-        ));
+        w.line("_out_len = ctypes.c_size_t(0)");
+        w.line("_result = _fn(self._ptr, ctypes.byref(_out_len))");
     }
+    out.push_str(&w.finish());
 
     render_return_value(out, &field.ty, ind);
 }
@@ -1527,28 +1549,39 @@ fn render_function(out: &mut String, module_name: &str, f: &FnBinding, strip_mod
         render_iterator_class(out, &it.iter_tag, &f.name, inner);
     }
 
-    out.push_str(&format!(
-        "\n\ndef {}({}) -> {}:\n",
+    let ind = "    ";
+
+    let mut w = CodeWriter::four_space();
+    w.blank().blank();
+    w.line(format!(
+        "def {}({}) -> {}:",
         def_name,
         params_sig.join(", "),
         ret_hint
     ));
+    w.indent();
 
-    let ind = "    ";
-
-    emit_fn_docstring(out, &f.doc, &f.params, ind);
+    let mut fdoc = String::new();
+    emit_fn_docstring(&mut fdoc, &f.doc, &f.params, ind);
+    w.raw(fdoc);
 
     if let Some(msg) = &f.deprecated {
-        out.push_str(&format!(
-            "{ind}import warnings\n{ind}warnings.warn(\"{}\", DeprecationWarning, stacklevel=2)\n",
+        w.line("import warnings");
+        w.line(format!(
+            "warnings.warn(\"{}\", DeprecationWarning, stacklevel=2)",
             msg.replace('"', "\\\"")
         ));
     }
 
     if f.is_async {
-        render_async_ffi_call_body(out, f);
+        // The async FFI call body is rendered at the function-body indent and
+        // spliced in verbatim.
+        let mut body = String::new();
+        render_async_ffi_call_body(&mut body, f);
+        w.raw(body);
+        out.push_str(&w.finish());
     } else {
-        out.push_str(&format!("{ind}_fn = _lib.{}\n", f.c_base));
+        w.line(format!("_fn = _lib.{}", f.c_base));
 
         let mut argtypes: Vec<String> = Vec::new();
         for p in &f.params {
@@ -1566,33 +1599,32 @@ fn render_function(out: &mut String, module_name: &str, f: &FnBinding, strip_mod
         }
         argtypes.push("ctypes.POINTER(_WeaveFFIErrorStruct)".into());
 
-        out.push_str(&format!("{ind}_fn.argtypes = [{}]\n", argtypes.join(", ")));
-        out.push_str(&format!("{ind}_fn.restype = {restype}\n"));
+        w.line(format!("_fn.argtypes = [{}]", argtypes.join(", ")));
+        w.line(format!("_fn.restype = {restype}"));
 
         for p in &f.params {
             for line in py_param_conversion(&p.name, &p.ty, ind) {
-                out.push_str(&line);
-                out.push('\n');
+                w.raw(&line).raw("\n");
             }
         }
 
-        out.push_str(&format!("{ind}_err = _WeaveFFIErrorStruct()\n"));
+        w.line("_err = _WeaveFFIErrorStruct()");
 
         let is_map_ret = f.ret.as_ref().and_then(get_map_kv).is_some();
         let has_out_len = !out_ret_argtypes.is_empty() && !is_map_ret;
 
         if let Some((k, v)) = f.ret.as_ref().and_then(get_map_kv) {
-            out.push_str(&format!(
-                "{ind}_out_keys = ctypes.POINTER({})()\n",
+            w.line(format!(
+                "_out_keys = ctypes.POINTER({})()",
                 py_ctypes_scalar(k)
             ));
-            out.push_str(&format!(
-                "{ind}_out_values = ctypes.POINTER({})()\n",
+            w.line(format!(
+                "_out_values = ctypes.POINTER({})()",
                 py_ctypes_scalar(v)
             ));
-            out.push_str(&format!("{ind}_out_len = ctypes.c_size_t(0)\n"));
+            w.line("_out_len = ctypes.c_size_t(0)");
         } else if has_out_len {
-            out.push_str(&format!("{ind}_out_len = ctypes.c_size_t(0)\n"));
+            w.line("_out_len = ctypes.c_size_t(0)");
         }
 
         let mut call_args: Vec<String> = Vec::new();
@@ -1610,12 +1642,13 @@ fn render_function(out: &mut String, module_name: &str, f: &FnBinding, strip_mod
 
         let call_expr = format!("_fn({})", call_args.join(", "));
         if f.ret.is_some() && !is_map_ret {
-            out.push_str(&format!("{ind}_result = {call_expr}\n"));
+            w.line(format!("_result = {call_expr}"));
         } else {
-            out.push_str(&format!("{ind}{call_expr}\n"));
+            w.line(call_expr);
         }
 
-        out.push_str(&format!("{ind}_check_error(_err)\n"));
+        w.line("_check_error(_err)");
+        out.push_str(&w.finish());
 
         if let Some(ret_ty) = &f.ret {
             if let (TypeRef::Iterator(inner), CallShape::Iterator(it)) = (ret_ty, &f.shape) {
@@ -1628,12 +1661,17 @@ fn render_function(out: &mut String, module_name: &str, f: &FnBinding, strip_mod
 
     if f.is_async {
         let params_joined = params_sig.join(", ");
-        out.push_str(&format!(
-            "\n\nasync def {}({}) -> {}:\n",
+        let mut w = CodeWriter::four_space();
+        w.blank().blank();
+        w.line(format!(
+            "async def {}({}) -> {}:",
             func_name, params_joined, ret_hint
         ));
-        emit_fn_docstring(out, &f.doc, &f.params, ind);
-        out.push_str("    _loop = asyncio.get_event_loop()\n");
+        w.indent();
+        let mut adoc = String::new();
+        emit_fn_docstring(&mut adoc, &f.doc, &f.params, ind);
+        w.raw(adoc);
+        w.line("_loop = asyncio.get_event_loop()");
         let arg_names: Vec<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
         let executor_args = if arg_names.is_empty() {
             def_name
@@ -1641,14 +1679,15 @@ fn render_function(out: &mut String, module_name: &str, f: &FnBinding, strip_mod
             format!("{def_name}, {}", arg_names.join(", "))
         };
         if f.ret.is_some() {
-            out.push_str(&format!(
-                "    return await _loop.run_in_executor(None, {executor_args})\n"
+            w.line(format!(
+                "return await _loop.run_in_executor(None, {executor_args})"
             ));
         } else {
-            out.push_str(&format!(
-                "    await _loop.run_in_executor(None, {executor_args})\n"
+            w.line(format!(
+                "await _loop.run_in_executor(None, {executor_args})"
             ));
         }
+        out.push_str(&w.finish());
     }
 }
 
@@ -1825,6 +1864,7 @@ fn py_read_element(expr: &str, ty: &TypeRef) -> String {
 }
 
 fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
+    let mut w = CodeWriter::four_space().with_depth(ind.len() / 4);
     match ty {
         TypeRef::I8
         | TypeRef::I16
@@ -1837,93 +1877,111 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
         | TypeRef::F32
         | TypeRef::F64
         | TypeRef::Handle => {
-            out.push_str(&format!("{ind}return _result\n"));
+            w.line("return _result");
         }
         TypeRef::Bool => {
-            out.push_str(&format!("{ind}return bool(_result)\n"));
+            w.line("return bool(_result)");
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!("{ind}return _bytes_to_string(_result) or \"\"\n"));
+            w.line("return _bytes_to_string(_result) or \"\"");
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            out.push_str(&format!("{ind}if not _result:\n"));
-            out.push_str(&format!("{ind}    return b\"\"\n"));
-            out.push_str(&format!("{ind}return bytes(_result[:_out_len.value])\n"));
+            w.line("if not _result:");
+            w.scope(|w| {
+                w.line("return b\"\"");
+            });
+            w.line("return bytes(_result[:_out_len.value])");
         }
         TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
             let name = local_type_name(name);
-            out.push_str(&format!("{ind}if _result is None:\n"));
-            out.push_str(&format!(
-                "{ind}    raise WeaveFFIError(-1, \"null pointer\")\n"
-            ));
-            out.push_str(&format!("{ind}return {name}(_result)\n"));
+            w.line("if _result is None:");
+            w.scope(|w| {
+                w.line("raise WeaveFFIError(-1, \"null pointer\")");
+            });
+            w.line(format!("return {name}(_result)"));
         }
         TypeRef::Enum(name) => {
             let name = local_type_name(name);
-            out.push_str(&format!("{ind}return {name}(_result)\n"));
+            w.line(format!("return {name}(_result)"));
         }
-        TypeRef::Optional(inner) => render_optional_return(out, inner, ind),
-        TypeRef::List(inner) => render_list_return(out, inner, ind),
-        TypeRef::Map(k, v) => render_map_return(out, k, v, ind),
+        // Compound returns delegate to their own helpers, which append directly.
+        TypeRef::Optional(inner) => return render_optional_return(out, inner, ind),
+        TypeRef::List(inner) => return render_list_return(out, inner, ind),
+        TypeRef::Map(k, v) => return render_map_return(out, k, v, ind),
         TypeRef::Iterator(_) => unreachable!("iterator return handled in render_function"),
     }
+    out.push_str(&w.finish());
 }
 
 fn render_optional_return(out: &mut String, inner: &TypeRef, ind: &str) {
+    let mut w = CodeWriter::four_space().with_depth(ind.len() / 4);
+    // Every branch but the first guards a `None` early-return, so factor the
+    // shared `if not _result: return None` shape out of each arm.
+    let guard_none = |w: &mut CodeWriter, none_value: &str| {
+        w.line("if not _result:");
+        w.scope(|w| {
+            w.line(format!("return {none_value}"));
+        });
+    };
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!("{ind}return _bytes_to_string(_result)\n"));
+            w.line("return _bytes_to_string(_result)");
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            out.push_str(&format!("{ind}if not _result:\n"));
-            out.push_str(&format!("{ind}    return None\n"));
-            out.push_str(&format!("{ind}return bytes(_result[:_out_len.value])\n"));
+            guard_none(&mut w, "None");
+            w.line("return bytes(_result[:_out_len.value])");
         }
         TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
             let name = local_type_name(name);
-            out.push_str(&format!("{ind}if _result is None:\n"));
-            out.push_str(&format!("{ind}    return None\n"));
-            out.push_str(&format!("{ind}return {name}(_result)\n"));
+            w.line("if _result is None:");
+            w.scope(|w| {
+                w.line("return None");
+            });
+            w.line(format!("return {name}(_result)"));
         }
         TypeRef::Enum(name) => {
             let name = local_type_name(name);
-            out.push_str(&format!("{ind}if not _result:\n"));
-            out.push_str(&format!("{ind}    return None\n"));
-            out.push_str(&format!("{ind}return {name}(_result[0])\n"));
+            guard_none(&mut w, "None");
+            w.line(format!("return {name}(_result[0])"));
         }
         TypeRef::Bool => {
-            out.push_str(&format!("{ind}if not _result:\n"));
-            out.push_str(&format!("{ind}    return None\n"));
-            out.push_str(&format!("{ind}return bool(_result[0])\n"));
+            guard_none(&mut w, "None");
+            w.line("return bool(_result[0])");
         }
         _ if !is_c_pointer_type(inner) => {
-            out.push_str(&format!("{ind}if not _result:\n"));
-            out.push_str(&format!("{ind}    return None\n"));
-            out.push_str(&format!("{ind}return _result[0]\n"));
+            guard_none(&mut w, "None");
+            w.line("return _result[0]");
         }
         _ => {
-            out.push_str(&format!("{ind}return _result\n"));
+            w.line("return _result");
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn render_list_return(out: &mut String, inner: &TypeRef, ind: &str) {
-    out.push_str(&format!("{ind}if not _result:\n"));
-    out.push_str(&format!("{ind}    return []\n"));
+    let mut w = CodeWriter::four_space().with_depth(ind.len() / 4);
+    w.line("if not _result:");
+    w.scope(|w| {
+        w.line("return []");
+    });
     let elem = py_read_element("_result[_i]", inner);
-    out.push_str(&format!(
-        "{ind}return [{elem} for _i in range(_out_len.value)]\n"
-    ));
+    w.line(format!("return [{elem} for _i in range(_out_len.value)]"));
+    out.push_str(&w.finish());
 }
 
 fn render_map_return(out: &mut String, k: &TypeRef, v: &TypeRef, ind: &str) {
-    out.push_str(&format!("{ind}if not _out_keys or not _out_values:\n"));
-    out.push_str(&format!("{ind}    return {{}}\n"));
+    let mut w = CodeWriter::four_space().with_depth(ind.len() / 4);
+    w.line("if not _out_keys or not _out_values:");
+    w.scope(|w| {
+        w.line("return {}");
+    });
     let key_read = py_read_element("_out_keys[_i]", k);
     let val_read = py_read_element("_out_values[_i]", v);
-    out.push_str(&format!(
-        "{ind}return {{{key_read}: {val_read} for _i in range(_out_len.value)}}\n"
+    w.line(format!(
+        "return {{{key_read}: {val_read} for _i in range(_out_len.value)}}"
     ));
+    out.push_str(&w.finish());
 }
 
 // ── Iterator helpers ──

@@ -20,6 +20,7 @@ use weaveffi_core::capabilities::{self, TargetCapabilities};
 use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, walk_modules, walk_modules_with_path, DocCommentStyle,
 };
+use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::model::{
     BindingModel, CallShape, EnumBinding, FieldBinding, FnBinding, IteratorBinding,
     ListenerBinding, ModuleBinding, RichEnumBinding, RichVariantBinding, StructBinding,
@@ -649,20 +650,15 @@ fn emit_stage_input(
     args: &mut Vec<String>,
     cleanup: &mut Vec<String>,
 ) {
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            let _ = writeln!(
-                out,
-                "{indent}const [{tmp}_p, {tmp}_s] = _cstr(wasm, {value});"
-            );
+            w.line(format!("const [{tmp}_p, {tmp}_s] = _cstr(wasm, {value});"));
             args.push(format!("{tmp}_p"));
             cleanup.push(format!("wasm.weaveffi_dealloc({tmp}_p, {tmp}_s);"));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            let _ = writeln!(
-                out,
-                "{indent}const [{tmp}_p, {tmp}_l] = _bytes(wasm, {value});"
-            );
+            w.line(format!("const [{tmp}_p, {tmp}_l] = _bytes(wasm, {value});"));
             args.push(format!("{tmp}_p"));
             args.push(format!("{tmp}_l"));
             cleanup.push(format!("wasm.weaveffi_dealloc({tmp}_p, {tmp}_l);"));
@@ -690,62 +686,65 @@ fn emit_stage_input(
                 args.push(format!("({value} ? {value}._handle : 0)"));
             }
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                let _ = writeln!(out, "{indent}let {tmp}_p = 0, {tmp}_s = 0;");
-                let _ = writeln!(
-                    out,
-                    "{indent}if ({value} !== null && {value} !== undefined) {{ [{tmp}_p, {tmp}_s] = _cstr(wasm, {value}); }}"
-                );
+                w.line(format!("let {tmp}_p = 0, {tmp}_s = 0;"));
+                w.line(format!(
+                    "if ({value} !== null && {value} !== undefined) {{ [{tmp}_p, {tmp}_s] = _cstr(wasm, {value}); }}"
+                ));
                 args.push(format!("{tmp}_p"));
                 cleanup.push(format!(
                     "if ({tmp}_p !== 0) wasm.weaveffi_dealloc({tmp}_p, {tmp}_s);"
                 ));
             }
             scalar => {
-                let w = scalar_width(scalar);
-                let _ = writeln!(out, "{indent}let {tmp}_p = 0;");
-                let _ = writeln!(
-                    out,
-                    "{indent}if ({value} !== null && {value} !== undefined) {{"
+                let width = scalar_width(scalar);
+                w.line(format!("let {tmp}_p = 0;"));
+                w.block(
+                    format!("if ({value} !== null && {value} !== undefined) {{"),
+                    "}",
+                    |w| {
+                        w.line(format!("{tmp}_p = wasm.weaveffi_alloc({width});"));
+                        w.line(format!(
+                            "const {tmp}_dv = new DataView(wasm.memory.buffer);"
+                        ));
+                        let ind = w.indent_str();
+                        let mut sc = String::new();
+                        emit_write_scalar(
+                            &mut sc,
+                            &ind,
+                            scalar,
+                            &format!("{tmp}_dv"),
+                            &format!("{tmp}_p"),
+                            value,
+                        );
+                        w.raw(sc);
+                    },
                 );
-                let _ = writeln!(out, "{indent}  {tmp}_p = wasm.weaveffi_alloc({w});");
-                let _ = writeln!(
-                    out,
-                    "{indent}  const {tmp}_dv = new DataView(wasm.memory.buffer);"
-                );
-                emit_write_scalar(
-                    out,
-                    &format!("{indent}  "),
-                    scalar,
-                    &format!("{tmp}_dv"),
-                    &format!("{tmp}_p"),
-                    value,
-                );
-                let _ = writeln!(out, "{indent}}}");
                 args.push(format!("{tmp}_p"));
                 cleanup.push(format!(
-                    "if ({tmp}_p !== 0) wasm.weaveffi_dealloc({tmp}_p, {w});"
+                    "if ({tmp}_p !== 0) wasm.weaveffi_dealloc({tmp}_p, {width});"
                 ));
             }
         },
         TypeRef::List(inner) => {
-            emit_stage_list(out, indent, inner, value, tmp, args, cleanup);
+            let mut staged = String::new();
+            emit_stage_list(&mut staged, indent, inner, value, tmp, args, cleanup);
+            w.raw(staged);
         }
         TypeRef::Map(k, v) => {
             let kt = format!("{tmp}_k");
             let vt = format!("{tmp}_v");
-            let _ = writeln!(out, "{indent}const {tmp}_m = {value} || {{}};");
-            let _ = writeln!(
-                out,
-                "{indent}const {tmp}_ks = ({tmp}_m instanceof Map) ? [...{tmp}_m.keys()] : Object.keys({tmp}_m);"
-            );
-            let _ = writeln!(
-                out,
-                "{indent}const {tmp}_vs = ({tmp}_m instanceof Map) ? [...{tmp}_m.values()] : Object.values({tmp}_m);"
-            );
+            w.line(format!("const {tmp}_m = {value} || {{}};"));
+            w.line(format!(
+                "const {tmp}_ks = ({tmp}_m instanceof Map) ? [...{tmp}_m.keys()] : Object.keys({tmp}_m);"
+            ));
+            w.line(format!(
+                "const {tmp}_vs = ({tmp}_m instanceof Map) ? [...{tmp}_m.values()] : Object.values({tmp}_m);"
+            ));
             let mut kargs = Vec::new();
             let mut vargs = Vec::new();
+            let mut staged = String::new();
             emit_stage_list(
-                out,
+                &mut staged,
                 indent,
                 k,
                 &format!("{tmp}_ks"),
@@ -754,7 +753,7 @@ fn emit_stage_input(
                 cleanup,
             );
             emit_stage_list(
-                out,
+                &mut staged,
                 indent,
                 v,
                 &format!("{tmp}_vs"),
@@ -762,6 +761,7 @@ fn emit_stage_input(
                 &mut vargs,
                 cleanup,
             );
+            w.raw(staged);
             // Each list staged `(base, len)`; the map ABI is `(keys, values, len)`.
             args.push(kargs[0].clone());
             args.push(vargs[0].clone());
@@ -769,6 +769,7 @@ fn emit_stage_input(
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as an input"),
     }
+    out.push_str(&w.finish());
 }
 
 /// Stage a JS array `value` of element type `inner` as a packed C array,
@@ -783,53 +784,49 @@ fn emit_stage_list(
     cleanup: &mut Vec<String>,
 ) {
     let stride = wasm_stride(inner);
-    let _ = writeln!(out, "{indent}const {tmp}_arr = {value} || [];");
-    let _ = writeln!(out, "{indent}const {tmp}_n = {tmp}_arr.length;");
-    let _ = writeln!(
-        out,
-        "{indent}const {tmp}_base = wasm.weaveffi_alloc({tmp}_n ? {tmp}_n * {stride} : 1);"
-    );
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
+    w.line(format!("const {tmp}_arr = {value} || [];"));
+    w.line(format!("const {tmp}_n = {tmp}_arr.length;"));
+    w.line(format!(
+        "const {tmp}_base = wasm.weaveffi_alloc({tmp}_n ? {tmp}_n * {stride} : 1);"
+    ));
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            let _ = writeln!(out, "{indent}const {tmp}_ep = [];");
-            let _ = writeln!(out, "{indent}for (let i = 0; i < {tmp}_n; i++) {tmp}_ep.push(_cstr(wasm, {tmp}_arr[i]));");
-            let _ = writeln!(out, "{indent}{{");
-            let _ = writeln!(
-                out,
-                "{indent}  const dv = new DataView(wasm.memory.buffer);"
-            );
-            let _ = writeln!(out, "{indent}  for (let i = 0; i < {tmp}_n; i++) dv.setUint32({tmp}_base + i * 4, {tmp}_ep[i][0], true);");
-            let _ = writeln!(out, "{indent}}}");
+            w.line(format!("const {tmp}_ep = [];"));
+            w.line(format!(
+                "for (let i = 0; i < {tmp}_n; i++) {tmp}_ep.push(_cstr(wasm, {tmp}_arr[i]));"
+            ));
+            w.block("{", "}", |w| {
+                w.line("const dv = new DataView(wasm.memory.buffer);");
+                w.line(format!("for (let i = 0; i < {tmp}_n; i++) dv.setUint32({tmp}_base + i * 4, {tmp}_ep[i][0], true);"));
+            });
             cleanup.push(format!(
                 "for (const [ep, es] of {tmp}_ep) wasm.weaveffi_dealloc(ep, es);"
             ));
         }
         TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
-            let _ = writeln!(out, "{indent}{{");
-            let _ = writeln!(
-                out,
-                "{indent}  const dv = new DataView(wasm.memory.buffer);"
-            );
-            let _ = writeln!(out, "{indent}  for (let i = 0; i < {tmp}_n; i++) dv.setInt32({tmp}_base + i * 4, {tmp}_arr[i]._handle, true);");
-            let _ = writeln!(out, "{indent}}}");
+            w.block("{", "}", |w| {
+                w.line("const dv = new DataView(wasm.memory.buffer);");
+                w.line(format!("for (let i = 0; i < {tmp}_n; i++) dv.setInt32({tmp}_base + i * 4, {tmp}_arr[i]._handle, true);"));
+            });
         }
         scalar => {
-            let _ = writeln!(out, "{indent}{{");
-            let _ = writeln!(
-                out,
-                "{indent}  const dv = new DataView(wasm.memory.buffer);"
-            );
-            let _ = writeln!(out, "{indent}  for (let i = 0; i < {tmp}_n; i++) {{");
-            emit_write_scalar(
-                out,
-                &format!("{indent}    "),
-                scalar,
-                "dv",
-                &format!("{tmp}_base + i * {stride}"),
-                &format!("{tmp}_arr[i]"),
-            );
-            let _ = writeln!(out, "{indent}  }}");
-            let _ = writeln!(out, "{indent}}}");
+            w.block("{", "}", |w| {
+                w.line("const dv = new DataView(wasm.memory.buffer);");
+                w.block(format!("for (let i = 0; i < {tmp}_n; i++) {{"), "}", |w| {
+                    let ind = w.indent_str();
+                    let mut sc = String::new();
+                    emit_write_scalar(
+                        &mut sc,
+                        &ind,
+                        scalar,
+                        "dv",
+                        &format!("{tmp}_base + i * {stride}"),
+                        &format!("{tmp}_arr[i]"),
+                    );
+                    w.raw(sc);
+                });
+            });
         }
     }
     cleanup.push(format!(
@@ -837,6 +834,7 @@ fn emit_stage_list(
     ));
     args.push(format!("{tmp}_base"));
     args.push(format!("{tmp}_n"));
+    out.push_str(&w.finish());
 }
 
 /// Emit `const {target} = ...;` building a JS array of `inner` elements from the
@@ -849,42 +847,35 @@ fn emit_read_list_into(
     len: &str,
     target: &str,
 ) {
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            let _ = writeln!(
-                out,
-                "{indent}const {target} = _takeStrArray(wasm, {base}, {len});"
-            );
+            w.line(format!(
+                "const {target} = _takeStrArray(wasm, {base}, {len});"
+            ));
         }
         TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
             let cls = local_type_name(name);
-            let _ = writeln!(out, "{indent}const {target} = [];");
-            let _ = writeln!(out, "{indent}{{");
-            let _ = writeln!(
-                out,
-                "{indent}  const dv = new DataView(wasm.memory.buffer);"
-            );
-            let _ = writeln!(
-                out,
-                "{indent}  for (let i = 0; i < {len}; i++) {target}.push(new {cls}(wasm, dv.getInt32({base} + i * 4, true)));"
-            );
-            let _ = writeln!(out, "{indent}}}");
+            w.line(format!("const {target} = [];"));
+            w.block("{", "}", |w| {
+                w.line("const dv = new DataView(wasm.memory.buffer);");
+                w.line(format!(
+                    "for (let i = 0; i < {len}; i++) {target}.push(new {cls}(wasm, dv.getInt32({base} + i * 4, true)));"
+                ));
+            });
         }
         scalar => {
-            let _ = writeln!(out, "{indent}const {target} = [];");
-            let _ = writeln!(out, "{indent}{{");
-            let _ = writeln!(
-                out,
-                "{indent}  const dv = new DataView(wasm.memory.buffer);"
-            );
+            w.line(format!("const {target} = [];"));
             let elem = wasm_read_scalar_elem(scalar, "dv", base, "i");
-            let _ = writeln!(
-                out,
-                "{indent}  for (let i = 0; i < {len}; i++) {target}.push({elem});"
-            );
-            let _ = writeln!(out, "{indent}}}");
+            w.block("{", "}", |w| {
+                w.line("const dv = new DataView(wasm.memory.buffer);");
+                w.line(format!(
+                    "for (let i = 0; i < {len}; i++) {target}.push({elem});"
+                ));
+            });
         }
     }
+    out.push_str(&w.finish());
 }
 
 /// Emit `const {target} = ...;` building a JS object (`Record`) from the
@@ -902,11 +893,12 @@ fn emit_read_map_into(
 ) {
     emit_read_list_into(out, indent, k, ka, len, &format!("{target}_k"));
     emit_read_list_into(out, indent, v, va, len, &format!("{target}_v"));
-    let _ = writeln!(out, "{indent}const {target} = {{}};");
-    let _ = writeln!(
-        out,
-        "{indent}for (let i = 0; i < {len}; i++) {target}[{target}_k[i]] = {target}_v[i];"
-    );
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
+    w.line(format!("const {target} = {{}};"));
+    w.line(format!(
+        "for (let i = 0; i < {len}; i++) {target}[{target}_k[i]] = {target}_v[i];"
+    ));
+    out.push_str(&w.finish());
 }
 
 /// Emit the body that invokes `symbol` with the already-staged `in_args`, runs
@@ -932,38 +924,40 @@ fn emit_return_decode(
     );
     let needs_map = matches!(unwrapped, Some(TypeRef::Map(_, _)));
 
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     let mut call_args = in_args.to_vec();
     if needs_len {
-        let _ = writeln!(out, "{indent}const _lp = wasm.weaveffi_alloc(4);");
+        w.line("const _lp = wasm.weaveffi_alloc(4);");
         call_args.push("_lp".to_string());
     } else if needs_map {
-        let _ = writeln!(out, "{indent}const _kp = wasm.weaveffi_alloc(4);");
-        let _ = writeln!(out, "{indent}const _vp = wasm.weaveffi_alloc(4);");
-        let _ = writeln!(out, "{indent}const _lp = wasm.weaveffi_alloc(4);");
+        w.line("const _kp = wasm.weaveffi_alloc(4);");
+        w.line("const _vp = wasm.weaveffi_alloc(4);");
+        w.line("const _lp = wasm.weaveffi_alloc(4);");
         call_args.push("_kp".to_string());
         call_args.push("_vp".to_string());
         call_args.push("_lp".to_string());
     }
     if with_err {
-        let _ = writeln!(out, "{indent}const _err = _allocErr(wasm);");
+        w.line("const _err = _allocErr(wasm);");
         call_args.push("_err".to_string());
     }
 
     let call = format!("wasm.{symbol}({})", call_args.join(", "));
     let captures_r = !needs_map && ret.is_some();
     if captures_r {
-        let _ = writeln!(out, "{indent}const _r = {call};");
+        w.line(format!("const _r = {call};"));
     } else {
-        let _ = writeln!(out, "{indent}{call};");
+        w.line(format!("{call};"));
     }
 
     for stmt in cleanup {
-        let _ = writeln!(out, "{indent}{stmt}");
+        w.line(stmt);
     }
     if with_err {
-        let _ = writeln!(out, "{indent}_checkErr(wasm, _err);");
-        let _ = writeln!(out, "{indent}_freeErr(wasm, _err);");
+        w.line("_checkErr(wasm, _err);");
+        w.line("_freeErr(wasm, _err);");
     }
+    out.push_str(&w.finish());
 
     emit_decode_value(out, indent, ret, "_r");
 }
@@ -974,9 +968,10 @@ fn emit_decode_value(out: &mut String, indent: &str, ret: Option<&TypeRef>, r: &
     let Some(ret) = ret else {
         return;
     };
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     match ret {
         TypeRef::Bool => {
-            let _ = writeln!(out, "{indent}return {r} !== 0;");
+            w.line(format!("return {r} !== 0;"));
         }
         TypeRef::I8
         | TypeRef::I16
@@ -990,64 +985,68 @@ fn emit_decode_value(out: &mut String, indent: &str, ret: Option<&TypeRef>, r: &
         | TypeRef::F64
         | TypeRef::Handle
         | TypeRef::Enum(_) => {
-            let _ = writeln!(out, "{indent}return {r};");
+            w.line(format!("return {r};"));
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            let _ = writeln!(out, "{indent}return _takeCStr(wasm, {r});");
+            w.line(format!("return _takeCStr(wasm, {r});"));
         }
         TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
             let cls = local_type_name(name);
-            let _ = writeln!(out, "{indent}return new {cls}(wasm, {r});");
+            w.line(format!("return new {cls}(wasm, {r});"));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            let _ = writeln!(out, "{indent}const _dv = new DataView(wasm.memory.buffer);");
-            let _ = writeln!(out, "{indent}const _len = _dv.getUint32(_lp, true);");
-            let _ = writeln!(out, "{indent}wasm.weaveffi_dealloc(_lp, 4);");
-            let _ = writeln!(out, "{indent}return _takeBytes(wasm, {r}, _len);");
+            w.line("const _dv = new DataView(wasm.memory.buffer);");
+            w.line("const _len = _dv.getUint32(_lp, true);");
+            w.line("wasm.weaveffi_dealloc(_lp, 4);");
+            w.line(format!("return _takeBytes(wasm, {r}, _len);"));
         }
         TypeRef::List(inner) => {
-            let _ = writeln!(out, "{indent}const _dv = new DataView(wasm.memory.buffer);");
-            let _ = writeln!(out, "{indent}const _len = _dv.getUint32(_lp, true);");
-            let _ = writeln!(out, "{indent}wasm.weaveffi_dealloc(_lp, 4);");
-            emit_read_list_into(out, indent, inner, r, "_len", "_out");
-            let _ = writeln!(out, "{indent}return _out;");
+            w.line("const _dv = new DataView(wasm.memory.buffer);");
+            w.line("const _len = _dv.getUint32(_lp, true);");
+            w.line("wasm.weaveffi_dealloc(_lp, 4);");
+            let mut tmp = String::new();
+            emit_read_list_into(&mut tmp, indent, inner, r, "_len", "_out");
+            w.raw(tmp);
+            w.line("return _out;");
         }
         TypeRef::Map(k, v) => {
-            let _ = writeln!(out, "{indent}const _dv = new DataView(wasm.memory.buffer);");
-            let _ = writeln!(out, "{indent}const _ka = _dv.getUint32(_kp, true);");
-            let _ = writeln!(out, "{indent}const _va = _dv.getUint32(_vp, true);");
-            let _ = writeln!(out, "{indent}const _len = _dv.getUint32(_lp, true);");
-            let _ = writeln!(out, "{indent}wasm.weaveffi_dealloc(_kp, 4);");
-            let _ = writeln!(out, "{indent}wasm.weaveffi_dealloc(_vp, 4);");
-            let _ = writeln!(out, "{indent}wasm.weaveffi_dealloc(_lp, 4);");
-            emit_read_map_into(out, indent, k, v, "_ka", "_va", "_len", "_out");
-            let _ = writeln!(out, "{indent}return _out;");
+            w.line("const _dv = new DataView(wasm.memory.buffer);");
+            w.line("const _ka = _dv.getUint32(_kp, true);");
+            w.line("const _va = _dv.getUint32(_vp, true);");
+            w.line("const _len = _dv.getUint32(_lp, true);");
+            w.line("wasm.weaveffi_dealloc(_kp, 4);");
+            w.line("wasm.weaveffi_dealloc(_vp, 4);");
+            w.line("wasm.weaveffi_dealloc(_lp, 4);");
+            let mut tmp = String::new();
+            emit_read_map_into(&mut tmp, indent, k, v, "_ka", "_va", "_len", "_out");
+            w.raw(tmp);
+            w.line("return _out;");
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
                 let cls = local_type_name(name);
-                let _ = writeln!(
-                    out,
-                    "{indent}return {r} === 0 ? null : new {cls}(wasm, {r});"
-                );
+                w.line(format!("return {r} === 0 ? null : new {cls}(wasm, {r});"));
             }
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                let _ = writeln!(out, "{indent}return _takeCStr(wasm, {r});");
+                w.line(format!("return _takeCStr(wasm, {r});"));
             }
             TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) | TypeRef::Map(_, _) => {
                 // Aggregate optionals: a null base decodes to empty by the readers.
-                emit_decode_value(out, indent, Some(inner), r);
+                let mut tmp = String::new();
+                emit_decode_value(&mut tmp, indent, Some(inner), r);
+                w.raw(tmp);
             }
             scalar => {
                 let getter = wasm_read_scalar_elem(scalar, "_dv", r, "0")
                     .replace(&format!("{r} + 0 * {}", wasm_stride(scalar)), r);
-                let _ = writeln!(out, "{indent}if ({r} === 0) return null;");
-                let _ = writeln!(out, "{indent}const _dv = new DataView(wasm.memory.buffer);");
-                let _ = writeln!(out, "{indent}return {getter};");
+                w.line(format!("if ({r} === 0) return null;"));
+                w.line("const _dv = new DataView(wasm.memory.buffer);");
+                w.line(format!("return {getter};"));
             }
         },
         TypeRef::Iterator(_) => unreachable!("iterator returns handled separately"),
     }
+    out.push_str(&w.finish());
 }
 
 fn ts_type_for(ty: &TypeRef) -> String {
@@ -1108,17 +1107,14 @@ fn emit_fn_doc(
     if trimmed_doc.is_none() && !has_param_docs && extra_tags.is_empty() {
         return;
     }
-    out.push_str(indent);
-    out.push_str("/**\n");
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
+    w.line("/**");
     if let Some(d) = trimmed_doc {
         for line in d.lines() {
-            out.push_str(indent);
             if line.is_empty() {
-                out.push_str(" *\n");
+                w.line(" *");
             } else {
-                out.push_str(" * ");
-                out.push_str(line);
-                out.push('\n');
+                w.line(format!(" * {line}"));
             }
         }
     }
@@ -1130,29 +1126,22 @@ fn emit_fn_doc(
             }
             let mut lines = pdoc.lines();
             if let Some(first) = lines.next() {
-                out.push_str(indent);
-                out.push_str(&format!(" * @param {} {}\n", p.name, first));
+                w.line(format!(" * @param {} {}", p.name, first));
             }
             for line in lines {
-                out.push_str(indent);
                 if line.is_empty() {
-                    out.push_str(" *\n");
+                    w.line(" *");
                 } else {
-                    out.push_str(" *   ");
-                    out.push_str(line);
-                    out.push('\n');
+                    w.line(format!(" *   {line}"));
                 }
             }
         }
     }
     for tag in extra_tags {
-        out.push_str(indent);
-        out.push_str(" * ");
-        out.push_str(tag);
-        out.push('\n');
+        w.line(format!(" * {tag}"));
     }
-    out.push_str(indent);
-    out.push_str(" */\n");
+    w.line(" */");
+    out.push_str(&w.finish());
 }
 
 fn render_wasm_dts(api: &Api, module_name: &str, input_basename: &str, filename: &str) -> String {
@@ -1217,33 +1206,36 @@ fn render_wasm_dts(api: &Api, module_name: &str, input_basename: &str, filename:
 /// camelCase namespaced field getters, and `free()`. Mirrors the runtime JS
 /// class emitted by [`emit_rich_enum_class`].
 fn emit_dts_rich_enum_class(out: &mut String, e: &EnumDef) {
-    emit_doc(out, &e.doc, "");
     let name = &e.name;
-    let _ = writeln!(out, "export declare class {name} {{");
-    let _ = writeln!(out, "  get tag(): number;");
-    let _ = writeln!(out, "  static readonly Tag: Readonly<{{");
-    for v in &e.variants {
-        let _ = writeln!(out, "    {}: {};", v.name, v.value);
-    }
-    let _ = writeln!(out, "  }}>;");
-    for v in &e.variants {
-        emit_doc(out, &v.doc, "  ");
-        let factory = v.name.to_lower_camel_case();
-        let params: Vec<String> = v
-            .fields
-            .iter()
-            .map(|f| format!("{}: {}", f.name, ts_type_for(&f.ty)))
-            .collect();
-        let _ = writeln!(out, "  static {factory}({}): {name};", params.join(", "));
-    }
-    for v in &e.variants {
-        for f in &v.fields {
-            let js_name = format!("{}_{}", v.name, f.name).to_lower_camel_case();
-            let _ = writeln!(out, "  get {js_name}(): {};", ts_type_for(&f.ty));
+    let mut w = CodeWriter::two_space();
+    w.doc(&e.doc, DocCommentStyle::Javadoc);
+    w.block(format!("export declare class {name} {{"), "}", |w| {
+        w.line("get tag(): number;");
+        w.block("static readonly Tag: Readonly<{", "}>;", |w| {
+            for v in &e.variants {
+                w.line(format!("{}: {};", v.name, v.value));
+            }
+        });
+        for v in &e.variants {
+            w.doc(&v.doc, DocCommentStyle::Javadoc);
+            let factory = v.name.to_lower_camel_case();
+            let params: Vec<String> = v
+                .fields
+                .iter()
+                .map(|f| format!("{}: {}", f.name, ts_type_for(&f.ty)))
+                .collect();
+            w.line(format!("static {factory}({}): {name};", params.join(", ")));
         }
-    }
-    let _ = writeln!(out, "  free(): void;");
-    let _ = writeln!(out, "}}\n");
+        for v in &e.variants {
+            for f in &v.fields {
+                let js_name = format!("{}_{}", v.name, f.name).to_lower_camel_case();
+                w.line(format!("get {js_name}(): {};", ts_type_for(&f.ty)));
+            }
+        }
+        w.line("free(): void;");
+    });
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 fn render_dts_module_interface(out: &mut String, m: &Module, module_path: &str, indent: &str) {
@@ -1254,40 +1246,41 @@ fn render_dts_module_interface(out: &mut String, m: &Module, module_path: &str, 
     if !has_content {
         return;
     }
-    out.push_str(&format!("{indent}{}: {{\n", m.name));
-    let inner = format!("{indent}  ");
-    for func in &m.functions {
-        let params: Vec<String> = func
-            .params
-            .iter()
-            .map(|p| format!("{}: {}", p.name, ts_type_for(&p.ty)))
-            .collect();
-        let base_ret = match &func.returns {
-            Some(ty) => ts_type_for(ty),
-            None => "void".into(),
-        };
-        let ret = if func.r#async {
-            format!("Promise<{base_ret}>")
-        } else {
-            base_ret
-        };
-        let mut tags = vec!["@throws {Error} if the native call fails".to_string()];
-        if let Some(msg) = &func.deprecated {
-            tags.insert(0, format!("@deprecated {msg}"));
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
+    w.block(format!("{}: {{", m.name), "};", |w| {
+        let inner = w.indent_str();
+        for func in &m.functions {
+            let params: Vec<String> = func
+                .params
+                .iter()
+                .map(|p| format!("{}: {}", p.name, ts_type_for(&p.ty)))
+                .collect();
+            let base_ret = match &func.returns {
+                Some(ty) => ts_type_for(ty),
+                None => "void".into(),
+            };
+            let ret = if func.r#async {
+                format!("Promise<{base_ret}>")
+            } else {
+                base_ret
+            };
+            let mut tags = vec!["@throws {Error} if the native call fails".to_string()];
+            if let Some(msg) = &func.deprecated {
+                tags.insert(0, format!("@deprecated {msg}"));
+            }
+            let mut doc = String::new();
+            emit_fn_doc(&mut doc, &func.doc, &func.params, &inner, &tags);
+            w.raw(doc);
+            w.line(format!("{}({}): {};", func.name, params.join(", "), ret));
         }
-        emit_fn_doc(out, &func.doc, &func.params, &inner, &tags);
-        out.push_str(&format!(
-            "{inner}{}({}): {};\n",
-            func.name,
-            params.join(", "),
-            ret
-        ));
-    }
-    for sub in &m.modules {
-        let sub_path = format!("{module_path}_{}", sub.name);
-        render_dts_module_interface(out, sub, &sub_path, &inner);
-    }
-    out.push_str(&format!("{indent}}};\n"));
+        for sub in &m.modules {
+            let sub_path = format!("{module_path}_{}", sub.name);
+            let mut tmp = String::new();
+            render_dts_module_interface(&mut tmp, sub, &sub_path, &inner);
+            w.raw(tmp);
+        }
+    });
+    out.push_str(&w.finish());
 }
 
 fn render_wasm_js_stub(
@@ -1606,32 +1599,46 @@ fn render_js_module_object(
     if !module_tree_has_content(m, module_path, by_path) {
         return;
     }
-    let _ = writeln!(out, "{indent}{}: {{", m.name);
-    let inner = format!("{indent}  ");
     let mb = by_path[module_path];
-    for f in &mb.functions {
-        match &f.shape {
-            CallShape::Iterator(ib) => emit_js_iterator_function_wrapper(out, f, ib, &inner),
-            _ if f.is_async => emit_js_async_function_wrapper(out, f, &inner),
-            _ => emit_js_function_wrapper(out, f, &inner),
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
+    w.block(format!("{}: {{", m.name), "},", |w| {
+        let inner = w.indent_str();
+        for f in &mb.functions {
+            let mut tmp = String::new();
+            match &f.shape {
+                CallShape::Iterator(ib) => {
+                    emit_js_iterator_function_wrapper(&mut tmp, f, ib, &inner)
+                }
+                _ if f.is_async => emit_js_async_function_wrapper(&mut tmp, f, &inner),
+                _ => emit_js_function_wrapper(&mut tmp, f, &inner),
+            }
+            w.raw(tmp);
         }
-    }
-    for l in &mb.listeners {
-        emit_js_listener_stub(out, l, &inner);
-    }
-    for s in &mb.structs {
-        emit_js_struct_factory(out, s, &inner);
-    }
-    for e in &mb.enums {
-        if e.is_rich() {
-            emit_js_rich_enum_factory(out, e, &inner);
+        for l in &mb.listeners {
+            let mut tmp = String::new();
+            emit_js_listener_stub(&mut tmp, l, &inner);
+            w.raw(tmp);
         }
-    }
-    for sub in &m.modules {
-        let sub_path = format!("{module_path}_{}", sub.name);
-        render_js_module_object(out, sub, &sub_path, by_path, &inner);
-    }
-    let _ = writeln!(out, "{indent}}},");
+        for s in &mb.structs {
+            let mut tmp = String::new();
+            emit_js_struct_factory(&mut tmp, s, &inner);
+            w.raw(tmp);
+        }
+        for e in &mb.enums {
+            if e.is_rich() {
+                let mut tmp = String::new();
+                emit_js_rich_enum_factory(&mut tmp, e, &inner);
+                w.raw(tmp);
+            }
+        }
+        for sub in &m.modules {
+            let sub_path = format!("{module_path}_{}", sub.name);
+            let mut tmp = String::new();
+            render_js_module_object(&mut tmp, sub, &sub_path, by_path, &inner);
+            w.raw(tmp);
+        }
+    });
+    out.push_str(&w.finish());
 }
 
 /// Listeners are unsupported on wasm (see `WasmGenerator::capabilities`);
@@ -1640,32 +1647,34 @@ fn render_js_module_object(
 /// call time, so the gap is impossible to miss from JS even though the
 /// `.d.ts` deliberately omits the pair (a compile-time error for TS users).
 fn emit_js_listener_stub(out: &mut String, l: &ListenerBinding, indent: &str) {
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     for op in ["register", "unregister"] {
-        let _ = writeln!(out, "{indent}{op}_{}() {{", l.name);
-        let _ = writeln!(
-            out,
-            "{indent}  throw new Error(\"weaveffi: listener '{}' is not supported by the wasm \
-             target (single-threaded wasm has no producer thread to deliver events); use a \
-             native target for listeners\");",
-            l.name
-        );
-        let _ = writeln!(out, "{indent}}},");
+        w.block(format!("{op}_{}() {{", l.name), "},", |w| {
+            w.line(format!(
+                "throw new Error(\"weaveffi: listener '{}' is not supported by the wasm \
+                 target (single-threaded wasm has no producer thread to deliver events); use a \
+                 native target for listeners\");",
+                l.name
+            ));
+        });
     }
+    out.push_str(&w.finish());
 }
 
 /// Expose a struct's `create(...)` and (when present) `builder()` on the module
 /// object, bound to the loaded `wasm` instance.
 fn emit_js_struct_factory(out: &mut String, s: &StructBinding, indent: &str) {
-    let _ = writeln!(out, "{indent}{}: {{", s.name);
-    let _ = writeln!(
-        out,
-        "{indent}  create: (...args) => {}.create(wasm, ...args),",
-        s.name
-    );
-    if s.builder.is_some() {
-        let _ = writeln!(out, "{indent}  builder: () => new {}Builder(wasm),", s.name);
-    }
-    let _ = writeln!(out, "{indent}}},");
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
+    w.block(format!("{}: {{", s.name), "},", |w| {
+        w.line(format!(
+            "create: (...args) => {}.create(wasm, ...args),",
+            s.name
+        ));
+        if s.builder.is_some() {
+            w.line(format!("builder: () => new {}Builder(wasm),", s.name));
+        }
+    });
+    out.push_str(&w.finish());
 }
 
 /// Expose a rich (algebraic) enum on the module object: one per-variant factory
@@ -1676,16 +1685,17 @@ fn emit_js_rich_enum_factory(out: &mut String, e: &EnumBinding, indent: &str) {
         return;
     };
     let name = &e.name;
-    let _ = writeln!(out, "{indent}{name}: {{");
-    for v in &rich.variants {
-        let factory = v.name.to_lower_camel_case();
-        let _ = writeln!(
-            out,
-            "{indent}  {factory}: (...args) => {name}.{factory}(wasm, ...args),"
-        );
-    }
-    let _ = writeln!(out, "{indent}  Tag: {name}.Tag,");
-    let _ = writeln!(out, "{indent}}},");
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
+    w.block(format!("{name}: {{"), "},", |w| {
+        for v in &rich.variants {
+            let factory = v.name.to_lower_camel_case();
+            w.line(format!(
+                "{factory}: (...args) => {name}.{factory}(wasm, ...args),"
+            ));
+        }
+        w.line(format!("Tag: {name}.Tag,"));
+    });
+    out.push_str(&w.finish());
 }
 
 /// Emit a synchronous function as a method `name(params) { ... }` at `indent`,
@@ -1693,17 +1703,19 @@ fn emit_js_rich_enum_factory(out: &mut String, e: &EnumBinding, indent: &str) {
 fn emit_js_function_wrapper(out: &mut String, f: &FnBinding, indent: &str) {
     let body = format!("{indent}  ");
     let js_params: Vec<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
 
     if let Some(msg) = &f.deprecated {
-        let _ = writeln!(out, "{indent}/** @deprecated {msg} */");
+        w.line(format!("/** @deprecated {msg} */"));
     }
-    let _ = writeln!(out, "{indent}{}({}) {{", f.name, js_params.join(", "));
+    w.line(format!("{}({}) {{", f.name, js_params.join(", ")));
 
+    let mut inner = String::new();
     let mut args = Vec::new();
     let mut cleanup = Vec::new();
     for (i, p) in f.params.iter().enumerate() {
         emit_stage_input(
-            out,
+            &mut inner,
             &body,
             &p.ty,
             &p.name,
@@ -1712,8 +1724,18 @@ fn emit_js_function_wrapper(out: &mut String, f: &FnBinding, indent: &str) {
             &mut cleanup,
         );
     }
-    emit_return_decode(out, &body, f.ret.as_ref(), &f.c_base, &args, &cleanup, true);
-    let _ = writeln!(out, "{indent}}},");
+    emit_return_decode(
+        &mut inner,
+        &body,
+        f.ret.as_ref(),
+        &f.c_base,
+        &args,
+        &cleanup,
+        true,
+    );
+    w.raw(inner);
+    w.line("},");
+    out.push_str(&w.finish());
 }
 
 /// Emit an iterator-returning function as a method that drains the iterator
@@ -1726,17 +1748,19 @@ fn emit_js_iterator_function_wrapper(
 ) {
     let body = format!("{indent}  ");
     let js_params: Vec<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
 
     if let Some(msg) = &f.deprecated {
-        let _ = writeln!(out, "{indent}/** @deprecated {msg} */");
+        w.line(format!("/** @deprecated {msg} */"));
     }
-    let _ = writeln!(out, "{indent}{}({}) {{", f.name, js_params.join(", "));
+    w.line(format!("{}({}) {{", f.name, js_params.join(", ")));
 
     let mut args = Vec::new();
     let mut cleanup = Vec::new();
+    let mut staged = String::new();
     for (i, p) in f.params.iter().enumerate() {
         emit_stage_input(
-            out,
+            &mut staged,
             &body,
             &p.ty,
             &p.name,
@@ -1745,61 +1769,59 @@ fn emit_js_iterator_function_wrapper(
             &mut cleanup,
         );
     }
-    let _ = writeln!(out, "{body}const _err = _allocErr(wasm);");
     if f.cancellable {
         args.push("0".to_string());
     }
     args.push("_err".to_string());
-    let _ = writeln!(
-        out,
-        "{body}const _it = wasm.{}({});",
-        f.c_base,
-        args.join(", ")
-    );
-    for stmt in &cleanup {
-        let _ = writeln!(out, "{body}{stmt}");
-    }
-    let _ = writeln!(out, "{body}_checkErr(wasm, _err);");
-    let _ = writeln!(out, "{body}_freeErr(wasm, _err);");
-
     let stride = wasm_stride(&ib.elem);
-    let _ = writeln!(out, "{body}const _out = [];");
-    let _ = writeln!(out, "{body}const _ip = wasm.weaveffi_alloc({stride});");
-    let _ = writeln!(out, "{body}const _ierr = _allocErr(wasm);");
-    let _ = writeln!(
-        out,
-        "{body}while (wasm.{}(_it, _ip, _ierr) !== 0) {{",
-        ib.next.symbol
-    );
-    let _ = writeln!(out, "{body}  _checkErr(wasm, _ierr);");
-    let _ = writeln!(out, "{body}  const _dv = new DataView(wasm.memory.buffer);");
-    match &ib.elem {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            let _ = writeln!(
-                out,
-                "{body}  _out.push(_takeCStr(wasm, _dv.getUint32(_ip, true)));"
-            );
+    w.scope(|w| {
+        w.raw(&staged);
+        w.line("const _err = _allocErr(wasm);");
+        w.line(format!(
+            "const _it = wasm.{}({});",
+            f.c_base,
+            args.join(", ")
+        ));
+        for stmt in &cleanup {
+            w.line(stmt);
         }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
-            let cls = local_type_name(name);
-            let _ = writeln!(
-                out,
-                "{body}  _out.push(new {cls}(wasm, _dv.getInt32(_ip, true)));"
-            );
-        }
-        scalar => {
-            let elem = wasm_read_scalar_elem(scalar, "_dv", "_ip", "0")
-                .replace(&format!("_ip + 0 * {stride}"), "_ip");
-            let _ = writeln!(out, "{body}  _out.push({elem});");
-        }
-    }
-    let _ = writeln!(out, "{body}}}");
-    let _ = writeln!(out, "{body}_checkErr(wasm, _ierr);");
-    let _ = writeln!(out, "{body}_freeErr(wasm, _ierr);");
-    let _ = writeln!(out, "{body}wasm.weaveffi_dealloc(_ip, {stride});");
-    let _ = writeln!(out, "{body}wasm.{}(_it);", ib.destroy_symbol);
-    let _ = writeln!(out, "{body}return _out;");
-    let _ = writeln!(out, "{indent}}},");
+        w.line("_checkErr(wasm, _err);");
+        w.line("_freeErr(wasm, _err);");
+        w.line("const _out = [];");
+        w.line(format!("const _ip = wasm.weaveffi_alloc({stride});"));
+        w.line("const _ierr = _allocErr(wasm);");
+        w.block(
+            format!("while (wasm.{}(_it, _ip, _ierr) !== 0) {{", ib.next.symbol),
+            "}",
+            |w| {
+                w.line("_checkErr(wasm, _ierr);");
+                w.line("const _dv = new DataView(wasm.memory.buffer);");
+                match &ib.elem {
+                    TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                        w.line("_out.push(_takeCStr(wasm, _dv.getUint32(_ip, true)));");
+                    }
+                    TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+                        let cls = local_type_name(name);
+                        w.line(format!(
+                            "_out.push(new {cls}(wasm, _dv.getInt32(_ip, true)));"
+                        ));
+                    }
+                    scalar => {
+                        let elem = wasm_read_scalar_elem(scalar, "_dv", "_ip", "0")
+                            .replace(&format!("_ip + 0 * {stride}"), "_ip");
+                        w.line(format!("_out.push({elem});"));
+                    }
+                }
+            },
+        );
+        w.line("_checkErr(wasm, _ierr);");
+        w.line("_freeErr(wasm, _ierr);");
+        w.line(format!("wasm.weaveffi_dealloc(_ip, {stride});"));
+        w.line(format!("wasm.{}(_it);", ib.destroy_symbol));
+        w.line("return _out;");
+    });
+    w.line("},");
+    out.push_str(&w.finish());
 }
 
 /// The wasm callback param-type list for an async function with the given
@@ -1867,17 +1889,16 @@ fn async_cb_wasm_params(returns: Option<&TypeRef>) -> Vec<&'static str> {
 /// result (where `results[0]` is already idiomatic). Assumes the callback was
 /// registered with [`async_cb_wasm_params`] widths.
 fn emit_async_unwrap(out: &mut String, indent: &str, ret: Option<&TypeRef>) {
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     let Some(ret) = ret else {
-        let _ = writeln!(
-            out,
-            "{indent}_asyncContexts.set(ctxId, {{ resolve, reject }});"
-        );
+        w.line("_asyncContexts.set(ctxId, { resolve, reject });");
+        out.push_str(&w.finish());
         return;
     };
-    let open = format!("{indent}_asyncContexts.set(ctxId, {{ resolve, reject, unwrap: ");
+    let open = "_asyncContexts.set(ctxId, { resolve, reject, unwrap: ";
     match ret {
         TypeRef::Bool => {
-            let _ = writeln!(out, "{open}(w, r) => r !== 0 }});");
+            w.line(format!("{open}(w, r) => r !== 0 }});"));
         }
         TypeRef::I8
         | TypeRef::I16
@@ -1891,78 +1912,81 @@ fn emit_async_unwrap(out: &mut String, indent: &str, ret: Option<&TypeRef>) {
         | TypeRef::F64
         | TypeRef::Handle
         | TypeRef::Enum(_) => {
-            let _ = writeln!(
-                out,
-                "{indent}_asyncContexts.set(ctxId, {{ resolve, reject }});"
-            );
+            w.line("_asyncContexts.set(ctxId, { resolve, reject });");
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            let _ = writeln!(out, "{open}(w, p) => _takeCStr(w, p) }});");
+            w.line(format!("{open}(w, p) => _takeCStr(w, p) }});"));
         }
         TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
             let cls = local_type_name(name);
-            let _ = writeln!(out, "{open}(w, h) => new {cls}(w, h) }});");
+            w.line(format!("{open}(w, h) => new {cls}(w, h) }});"));
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
                 let cls = local_type_name(name);
-                let _ = writeln!(out, "{open}(w, h) => h === 0 ? null : new {cls}(w, h) }});");
+                w.line(format!(
+                    "{open}(w, h) => h === 0 ? null : new {cls}(w, h) }});"
+                ));
             }
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                let _ = writeln!(out, "{open}(w, p) => _takeCStr(w, p) }});");
+                w.line(format!("{open}(w, p) => _takeCStr(w, p) }});"));
             }
             _ => {
-                let _ = writeln!(
-                    out,
-                    "{indent}_asyncContexts.set(ctxId, {{ resolve, reject }});"
-                );
+                w.line("_asyncContexts.set(ctxId, { resolve, reject });");
             }
         },
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            let _ = writeln!(out, "{open}(w, ptr, len) => _takeBytes(w, ptr, len) }});");
+            w.line(format!(
+                "{open}(w, ptr, len) => _takeBytes(w, ptr, len) }});"
+            ));
         }
         TypeRef::List(inner) => {
-            let _ = writeln!(out, "{open}(w, base, len) => {{");
-            let _ = writeln!(out, "{indent}  const wasm = w;");
-            emit_read_list_into(out, &format!("{indent}  "), inner, "base", "len", "_out");
-            let _ = writeln!(out, "{indent}  return _out;");
-            let _ = writeln!(out, "{indent}}} }});");
+            w.block(format!("{open}(w, base, len) => {{"), "} });", |w| {
+                w.line("const wasm = w;");
+                let ind = w.indent_str();
+                let mut tmp = String::new();
+                emit_read_list_into(&mut tmp, &ind, inner, "base", "len", "_out");
+                w.raw(tmp);
+                w.line("return _out;");
+            });
         }
         TypeRef::Map(k, v) => {
-            let _ = writeln!(out, "{open}(w, ka, va, len) => {{");
-            let _ = writeln!(out, "{indent}  const wasm = w;");
-            emit_read_map_into(out, &format!("{indent}  "), k, v, "ka", "va", "len", "_out");
-            let _ = writeln!(out, "{indent}  return _out;");
-            let _ = writeln!(out, "{indent}}} }});");
+            w.block(format!("{open}(w, ka, va, len) => {{"), "} });", |w| {
+                w.line("const wasm = w;");
+                let ind = w.indent_str();
+                let mut tmp = String::new();
+                emit_read_map_into(&mut tmp, &ind, k, v, "ka", "va", "len", "_out");
+                w.raw(tmp);
+                w.line("return _out;");
+            });
         }
         TypeRef::Iterator(_) => {
-            let _ = writeln!(
-                out,
-                "{indent}_asyncContexts.set(ctxId, {{ resolve, reject }});"
-            );
+            w.line("_asyncContexts.set(ctxId, { resolve, reject });");
         }
     }
+    out.push_str(&w.finish());
 }
 
 /// Emit an async function as a method returning a `Promise` at `indent`.
 fn emit_js_async_function_wrapper(out: &mut String, f: &FnBinding, indent: &str) {
-    let body = format!("{indent}  ");
     let body2 = format!("{indent}    ");
     let js_params: Vec<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
 
     if let Some(msg) = &f.deprecated {
-        let _ = writeln!(out, "{indent}/** @deprecated {msg} */");
+        w.line(format!("/** @deprecated {msg} */"));
     }
-    let _ = writeln!(out, "{indent}{}({}) {{", f.name, js_params.join(", "));
-    let _ = writeln!(out, "{body}return new Promise((resolve, reject) => {{");
-    let _ = writeln!(out, "{body2}const ctxId = _nextCtxId++;");
-    emit_async_unwrap(out, &body2, f.ret.as_ref());
 
+    // Pre-render the inner-most (depth + 2) fragments that delegate to helpers,
+    // so the nested blocks below can splice them at the right depth.
+    let mut unwrap = String::new();
+    emit_async_unwrap(&mut unwrap, &body2, f.ret.as_ref());
+    let mut staged = String::new();
     let mut args = Vec::new();
     let mut cleanup = Vec::new();
     for (i, p) in f.params.iter().enumerate() {
         emit_stage_input(
-            out,
+            &mut staged,
             &body2,
             &p.ty,
             &p.name,
@@ -1971,7 +1995,6 @@ fn emit_js_async_function_wrapper(out: &mut String, f: &FnBinding, indent: &str)
             &mut cleanup,
         );
     }
-
     let cb_params = async_cb_wasm_params(f.ret.as_ref());
     let sig_key = cb_params.join("_");
     if f.cancellable {
@@ -1979,29 +2002,46 @@ fn emit_js_async_function_wrapper(out: &mut String, f: &FnBinding, indent: &str)
     }
     args.push(format!("_cbPtr_{sig_key}"));
     args.push("ctxId".to_string());
-    let _ = writeln!(out, "{body2}wasm.{}_async({});", f.c_base, args.join(", "));
-    for stmt in &cleanup {
-        let _ = writeln!(out, "{body2}{stmt}");
-    }
-    let _ = writeln!(out, "{body}}});");
-    let _ = writeln!(out, "{indent}}},");
+
+    w.block(
+        format!("{}({}) {{", f.name, js_params.join(", ")),
+        "},",
+        |w| {
+            w.block("return new Promise((resolve, reject) => {", "});", |w| {
+                w.line("const ctxId = _nextCtxId++;");
+                w.raw(&unwrap);
+                w.raw(&staged);
+                w.line(format!("wasm.{}_async({});", f.c_base, args.join(", ")));
+                for stmt in &cleanup {
+                    w.line(stmt);
+                }
+            });
+        },
+    );
+    out.push_str(&w.finish());
 }
 
 /// Emit the module-level `class` for a struct: constructor, field getters, and
 /// a static `create(...)` factory.
 fn emit_struct_class(out: &mut String, s: &StructBinding) {
     let cls = &s.name;
-    let _ = writeln!(out, "class {cls} {{");
-    let _ = writeln!(out, "  constructor(wasm, handle) {{");
-    let _ = writeln!(out, "    this._wasm = wasm;");
-    let _ = writeln!(out, "    this._handle = handle;");
-    let _ = writeln!(out, "  }}");
-    for field in &s.fields {
-        emit_struct_getter(out, field);
-    }
-    emit_struct_create(out, s);
-    let _ = writeln!(out, "}}");
-    out.push('\n');
+    let mut w = CodeWriter::two_space();
+    w.block(format!("class {cls} {{"), "}", |w| {
+        w.block("constructor(wasm, handle) {", "}", |w| {
+            w.line("this._wasm = wasm;");
+            w.line("this._handle = handle;");
+        });
+        for field in &s.fields {
+            let mut tmp = String::new();
+            emit_struct_getter(&mut tmp, field);
+            w.raw(tmp);
+        }
+        let mut tmp = String::new();
+        emit_struct_create(&mut tmp, s);
+        w.raw(tmp);
+    });
+    w.blank();
+    out.push_str(&w.finish());
     if s.builder.is_some() {
         emit_builder_class(out, s);
     }
@@ -2020,62 +2060,67 @@ fn emit_rich_enum_class(out: &mut String, e: &EnumBinding) {
         return;
     };
     let cls = &e.name;
-    let _ = writeln!(out, "class {cls} {{");
-    let _ = writeln!(out, "  constructor(wasm, handle) {{");
-    let _ = writeln!(out, "    this._wasm = wasm;");
-    let _ = writeln!(out, "    this._handle = handle;");
-    let _ = writeln!(out, "  }}");
+    let mut w = CodeWriter::two_space();
+    w.block(format!("class {cls} {{"), "}", |w| {
+        w.block("constructor(wasm, handle) {", "}", |w| {
+            w.line("this._wasm = wasm;");
+            w.line("this._handle = handle;");
+        });
 
-    // Active variant discriminant (an i32, comparable to the `Tag` members).
-    let _ = writeln!(out, "  get tag() {{");
-    let _ = writeln!(out, "    const wasm = this._wasm;");
-    emit_return_decode(
-        out,
-        "    ",
-        Some(&TypeRef::I32),
-        &rich.tag_symbol,
-        &["this._handle".to_string()],
-        &[],
-        false,
-    );
-    let _ = writeln!(out, "  }}");
+        // Active variant discriminant (an i32, comparable to the `Tag` members).
+        w.block("get tag() {", "}", |w| {
+            w.line("const wasm = this._wasm;");
+            let ind = w.indent_str();
+            let mut tmp = String::new();
+            emit_return_decode(
+                &mut tmp,
+                &ind,
+                Some(&TypeRef::I32),
+                &rich.tag_symbol,
+                &["this._handle".to_string()],
+                &[],
+                false,
+            );
+            w.raw(tmp);
+        });
 
-    // One static factory per variant (`Shape.circle(2.5)`).
-    for v in &rich.variants {
-        emit_rich_enum_factory(out, &e.name, v);
-    }
-
-    // Per-variant field getters, namespaced in camelCase to avoid collisions.
-    // Reuse the struct getter renderer by projecting the camelCase name onto the
-    // field's precomputed getter symbol (identical marshalling).
-    for v in &rich.variants {
-        for f in &v.fields {
-            let mut namespaced = f.clone();
-            namespaced.name = format!("{}_{}", v.name, f.name).to_lower_camel_case();
-            emit_struct_getter(out, &namespaced);
+        // One static factory per variant (`Shape.circle(2.5)`).
+        for v in &rich.variants {
+            let mut tmp = String::new();
+            emit_rich_enum_factory(&mut tmp, &e.name, v);
+            w.raw(tmp);
         }
-    }
 
-    // Explicit cleanup: release the producer-owned handle exactly once.
-    let _ = writeln!(out, "  free() {{");
-    let _ = writeln!(out, "    if (this._handle !== 0) {{");
-    let _ = writeln!(
-        out,
-        "      this._wasm.{}(this._handle);",
-        rich.destroy_symbol
-    );
-    let _ = writeln!(out, "      this._handle = 0;");
-    let _ = writeln!(out, "    }}");
-    let _ = writeln!(out, "  }}");
-    let _ = writeln!(out, "}}");
+        // Per-variant field getters, namespaced in camelCase to avoid collisions.
+        // Reuse the struct getter renderer by projecting the camelCase name onto the
+        // field's precomputed getter symbol (identical marshalling).
+        for v in &rich.variants {
+            for f in &v.fields {
+                let mut namespaced = f.clone();
+                namespaced.name = format!("{}_{}", v.name, f.name).to_lower_camel_case();
+                let mut tmp = String::new();
+                emit_struct_getter(&mut tmp, &namespaced);
+                w.raw(tmp);
+            }
+        }
+
+        // Explicit cleanup: release the producer-owned handle exactly once.
+        w.block("free() {", "}", |w| {
+            w.block("if (this._handle !== 0) {", "}", |w| {
+                w.line(format!("this._wasm.{}(this._handle);", rich.destroy_symbol));
+                w.line("this._handle = 0;");
+            });
+        });
+    });
 
     // Frozen discriminant map (`Shape.Tag.Circle === 1`).
-    let _ = writeln!(out, "{cls}.Tag = Object.freeze({{");
-    for v in &e.variants {
-        let _ = writeln!(out, "  {}: {},", v.name, v.value);
-    }
-    let _ = writeln!(out, "}});");
-    out.push('\n');
+    w.block(format!("{cls}.Tag = Object.freeze({{"), "});", |w| {
+        for v in &e.variants {
+            w.line(format!("{}: {},", v.name, v.value));
+        }
+    });
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// Emit `static <variant>(wasm, <fields...>)` for one rich-enum variant: stage
@@ -2090,78 +2135,97 @@ fn emit_rich_enum_factory(out: &mut String, enum_name: &str, v: &RichVariantBind
     } else {
         format!("wasm, {}", params.join(", "))
     };
-    let _ = writeln!(out, "  static {factory}({sig}) {{");
-    let mut args = Vec::new();
-    let mut cleanup = Vec::new();
-    for (i, f) in v.fields.iter().enumerate() {
-        emit_stage_input(
-            out,
-            "    ",
-            &f.ty,
-            &f.name,
-            &format!("a{i}"),
-            &mut args,
-            &mut cleanup,
+    let mut w = CodeWriter::two_space().with_depth(1);
+    w.block(format!("static {factory}({sig}) {{"), "}", |w| {
+        let ind = w.indent_str();
+        let mut inner = String::new();
+        let mut args = Vec::new();
+        let mut cleanup = Vec::new();
+        for (i, f) in v.fields.iter().enumerate() {
+            emit_stage_input(
+                &mut inner,
+                &ind,
+                &f.ty,
+                &f.name,
+                &format!("a{i}"),
+                &mut args,
+                &mut cleanup,
+            );
+        }
+        let ret = TypeRef::Struct(enum_name.to_string());
+        emit_return_decode(
+            &mut inner,
+            &ind,
+            Some(&ret),
+            &v.create.symbol,
+            &args,
+            &cleanup,
+            true,
         );
-    }
-    let ret = TypeRef::Struct(enum_name.to_string());
-    emit_return_decode(
-        out,
-        "    ",
-        Some(&ret),
-        &v.create.symbol,
-        &args,
-        &cleanup,
-        true,
-    );
-    let _ = writeln!(out, "  }}");
+        w.raw(inner);
+    });
+    out.push_str(&w.finish());
 }
 
 /// Emit one `get field() { ... }` accessor that decodes the C getter's return.
 fn emit_struct_getter(out: &mut String, field: &FieldBinding) {
-    let _ = writeln!(out, "  get {}() {{", field.name);
-    let _ = writeln!(out, "    const wasm = this._wasm;");
-    emit_return_decode(
-        out,
-        "    ",
-        Some(&field.ty),
-        &field.getter_symbol,
-        &["this._handle".to_string()],
-        &[],
-        false,
-    );
-    let _ = writeln!(out, "  }}");
+    let mut w = CodeWriter::two_space().with_depth(1);
+    w.block(format!("get {}() {{", field.name), "}", |w| {
+        w.line("const wasm = this._wasm;");
+        let ind = w.indent_str();
+        let mut tmp = String::new();
+        emit_return_decode(
+            &mut tmp,
+            &ind,
+            Some(&field.ty),
+            &field.getter_symbol,
+            &["this._handle".to_string()],
+            &[],
+            false,
+        );
+        w.raw(tmp);
+    });
+    out.push_str(&w.finish());
 }
 
 /// Emit `static create(wasm, <fields...>)` that stages every field and returns a
 /// wrapped instance.
 fn emit_struct_create(out: &mut String, s: &StructBinding) {
     let params: Vec<String> = s.fields.iter().map(|f| f.name.clone()).collect();
-    let _ = writeln!(out, "  static create(wasm, {}) {{", params.join(", "));
-    let mut args = Vec::new();
-    let mut cleanup = Vec::new();
-    for (i, f) in s.fields.iter().enumerate() {
-        emit_stage_input(
-            out,
-            "    ",
-            &f.ty,
-            &f.name,
-            &format!("a{i}"),
-            &mut args,
-            &mut cleanup,
-        );
-    }
-    let ret = TypeRef::Struct(s.name.clone());
-    emit_return_decode(
-        out,
-        "    ",
-        Some(&ret),
-        &s.create.symbol,
-        &args,
-        &cleanup,
-        true,
+    let mut w = CodeWriter::two_space().with_depth(1);
+    w.block(
+        format!("static create(wasm, {}) {{", params.join(", ")),
+        "}",
+        |w| {
+            let ind = w.indent_str();
+            let mut inner = String::new();
+            let mut args = Vec::new();
+            let mut cleanup = Vec::new();
+            for (i, f) in s.fields.iter().enumerate() {
+                emit_stage_input(
+                    &mut inner,
+                    &ind,
+                    &f.ty,
+                    &f.name,
+                    &format!("a{i}"),
+                    &mut args,
+                    &mut cleanup,
+                );
+            }
+            let ret = TypeRef::Struct(s.name.clone());
+            emit_return_decode(
+                &mut inner,
+                &ind,
+                Some(&ret),
+                &s.create.symbol,
+                &args,
+                &cleanup,
+                true,
+            );
+            w.raw(inner);
+        },
     );
-    let _ = writeln!(out, "  }}");
+    out.push_str(&w.finish());
 }
 
 /// Emit the fluent `class XBuilder` for a struct that opted into a builder.
@@ -2170,47 +2234,55 @@ fn emit_builder_class(out: &mut String, s: &StructBinding) {
         return;
     };
     let cls = &s.name;
-    let _ = writeln!(out, "class {cls}Builder {{");
-    let _ = writeln!(out, "  constructor(wasm) {{");
-    let _ = writeln!(out, "    this._wasm = wasm;");
-    let _ = writeln!(out, "    this._b = wasm.{}();", b.new_symbol);
-    let _ = writeln!(out, "  }}");
-    for (field, (_fname, setter)) in s.fields.iter().zip(&b.setters) {
-        let _ = writeln!(out, "  {}(value) {{", field.name);
-        let _ = writeln!(out, "    const wasm = this._wasm;");
-        let mut args = vec!["this._b".to_string()];
-        let mut cleanup = Vec::new();
-        emit_stage_input(
-            out,
-            "    ",
-            &field.ty,
-            "value",
-            "a0",
-            &mut args,
-            &mut cleanup,
-        );
-        let _ = writeln!(out, "    wasm.{}({});", setter, args.join(", "));
-        for stmt in &cleanup {
-            let _ = writeln!(out, "    {stmt}");
+    let mut w = CodeWriter::two_space();
+    w.block(format!("class {cls}Builder {{"), "}", |w| {
+        w.block("constructor(wasm) {", "}", |w| {
+            w.line("this._wasm = wasm;");
+            w.line(format!("this._b = wasm.{}();", b.new_symbol));
+        });
+        for (field, (_fname, setter)) in s.fields.iter().zip(&b.setters) {
+            w.block(format!("{}(value) {{", field.name), "}", |w| {
+                w.line("const wasm = this._wasm;");
+                let ind = w.indent_str();
+                let mut args = vec!["this._b".to_string()];
+                let mut cleanup = Vec::new();
+                let mut staged = String::new();
+                emit_stage_input(
+                    &mut staged,
+                    &ind,
+                    &field.ty,
+                    "value",
+                    "a0",
+                    &mut args,
+                    &mut cleanup,
+                );
+                w.raw(staged);
+                w.line(format!("wasm.{}({});", setter, args.join(", ")));
+                for stmt in &cleanup {
+                    w.line(stmt);
+                }
+                w.line("return this;");
+            });
         }
-        let _ = writeln!(out, "    return this;");
-        let _ = writeln!(out, "  }}");
-    }
-    let _ = writeln!(out, "  build() {{");
-    let _ = writeln!(out, "    const wasm = this._wasm;");
-    let ret = TypeRef::Struct(cls.clone());
-    emit_return_decode(
-        out,
-        "    ",
-        Some(&ret),
-        &b.build_symbol,
-        &["this._b".to_string()],
-        &[],
-        true,
-    );
-    let _ = writeln!(out, "  }}");
-    let _ = writeln!(out, "}}");
-    out.push('\n');
+        w.block("build() {", "}", |w| {
+            w.line("const wasm = this._wasm;");
+            let ind = w.indent_str();
+            let ret = TypeRef::Struct(cls.clone());
+            let mut tmp = String::new();
+            emit_return_decode(
+                &mut tmp,
+                &ind,
+                Some(&ret),
+                &b.build_symbol,
+                &["this._b".to_string()],
+                &[],
+                true,
+            );
+            w.raw(tmp);
+        });
+    });
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 #[cfg(test)]

@@ -19,6 +19,7 @@ use weaveffi_core::abi;
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, walk_modules, DocCommentStyle};
+use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::model::{
     BindingModel, CallShape, EnumBinding, FieldBinding, FnBinding, ListenerBinding, ModuleBinding,
     ParamBinding, RichVariantBinding, StructBinding,
@@ -485,7 +486,6 @@ fn has_buffer_params(params: &[ParamBinding]) -> bool {
 }
 
 fn render_swift_enum(out: &mut String, e: &EnumBinding) {
-    emit_doc(out, &e.doc, "");
     // Match how Swift imports the generated C enum: a C enum with only
     // non-negative discriminants is imported with a `UInt32` raw value,
     // otherwise `Int32`. Mirroring the raw type here keeps every `.rawValue`
@@ -496,16 +496,22 @@ fn render_swift_enum(out: &mut String, e: &EnumBinding) {
     } else {
         "UInt32"
     };
-    out.push_str(&format!("public enum {}: {} {{\n", e.name, raw));
-    for v in &e.variants {
-        emit_doc(out, &v.doc, "    ");
-        out.push_str(&format!(
-            "    case {} = {}\n",
-            v.name.to_lower_camel_case(),
-            v.value
-        ));
-    }
-    out.push_str("}\n\n");
+    let mut w = CodeWriter::four_space();
+    w.doc(&e.doc, DocCommentStyle::TripleSlash);
+    w.line(format!("public enum {}: {} {{", e.name, raw));
+    w.scope(|w| {
+        for v in &e.variants {
+            w.doc(&v.doc, DocCommentStyle::TripleSlash);
+            w.line(format!(
+                "case {} = {}",
+                v.name.to_lower_camel_case(),
+                v.value
+            ));
+        }
+    });
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// Render a rich (algebraic) enum as an opaque-object wrapper class, mirroring
@@ -529,40 +535,54 @@ fn render_swift_rich_enum(
     };
     let class_name = &e.name;
 
-    emit_doc(out, &e.doc, "");
-    out.push_str(&format!("public class {} {{\n", class_name));
-    out.push_str("    let ptr: OpaquePointer\n\n");
-    out.push_str("    init(ptr: OpaquePointer) {\n");
-    out.push_str("        self.ptr = ptr\n");
-    out.push_str("    }\n\n");
-    out.push_str(&format!(
-        "    deinit {{\n        {}(ptr)\n    }}\n\n",
-        rich.destroy_symbol
-    ));
+    let mut w = CodeWriter::four_space();
+    w.doc(&e.doc, DocCommentStyle::TripleSlash);
+    w.line(format!("public class {} {{", class_name));
+    w.indent();
+    w.line("let ptr: OpaquePointer");
+    w.blank();
+    w.line("init(ptr: OpaquePointer) {");
+    w.scope(|w| {
+        w.line("self.ptr = ptr");
+    });
+    w.line("}");
+    w.blank();
+    w.line("deinit {");
+    w.scope(|w| {
+        w.line(format!("{}(ptr)", rich.destroy_symbol));
+    });
+    w.line("}");
+    w.blank();
 
     // The C tag getter returns `int32_t`, so the nested discriminant enum is
     // always `Int32`-backed (regardless of the variant value signs).
-    out.push_str("    public enum Tag: Int32 {\n");
-    for v in &e.variants {
-        emit_doc(out, &v.doc, "        ");
-        out.push_str(&format!(
-            "        case {} = {}\n",
-            v.name.to_lower_camel_case(),
-            v.value
-        ));
-    }
-    out.push_str("    }\n\n");
+    w.line("public enum Tag: Int32 {");
+    w.scope(|w| {
+        for v in &e.variants {
+            w.doc(&v.doc, DocCommentStyle::TripleSlash);
+            w.line(format!(
+                "case {} = {}",
+                v.name.to_lower_camel_case(),
+                v.value
+            ));
+        }
+    });
+    w.line("}");
+    w.blank();
 
-    out.push_str("    /// The active variant's discriminant.\n");
-    out.push_str("    public var tag: Tag {\n");
-    out.push_str(&format!(
-        "        return Tag(rawValue: {}(ptr))!\n",
-        rich.tag_symbol
-    ));
-    out.push_str("    }\n\n");
+    w.line("/// The active variant's discriminant.");
+    w.line("public var tag: Tag {");
+    w.scope(|w| {
+        w.line(format!("return Tag(rawValue: {}(ptr))!", rich.tag_symbol));
+    });
+    w.line("}");
+    w.blank();
+    w.dedent();
 
     for v in &rich.variants {
-        render_swift_rich_variant_factory(out, c_prefix, module_path, class_name, v, ctx);
+        let mut tmp = String::new();
+        render_swift_rich_variant_factory(&mut tmp, c_prefix, module_path, class_name, v, ctx);
+        w.raw(tmp);
     }
 
     // Getters are namespaced per variant (`circleRadius`) and reuse the struct
@@ -576,11 +596,15 @@ fn render_swift_rich_enum(
                 v.name.to_lower_camel_case(),
                 f.name.to_upper_camel_case()
             );
-            render_swift_getter(out, &named, ctx);
+            let mut tmp = String::new();
+            render_swift_getter(&mut tmp, &named, ctx);
+            w.raw(tmp);
         }
     }
 
-    out.push_str("}\n\n");
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// One throwing static factory for a rich-enum variant (`static func
@@ -599,33 +623,48 @@ fn render_swift_rich_variant_factory(
     let params = struct_fields_as_params(&v.fields);
     let create_sym = &v.create.symbol;
 
-    emit_doc(out, &v.doc, "    ");
-    let _ = write!(
-        out,
-        "    public static func {}(",
-        v.name.to_lower_camel_case()
-    );
-    write_swift_params_sig(out, &params, ctx);
-    let _ = writeln!(out, ") throws -> {} {{", class_name);
-    out.push_str("        var err = weaveffi_error(code: 0, message: nil)\n");
+    let mut w = CodeWriter::four_space().with_depth(1);
+    w.doc(&v.doc, DocCommentStyle::TripleSlash);
+    let mut sig = String::new();
+    write_swift_params_sig(&mut sig, &params, ctx);
+    w.line(format!(
+        "public static func {}({}) throws -> {} {{",
+        v.name.to_lower_camel_case(),
+        sig,
+        class_name
+    ));
+    w.indent();
+    w.line("var err = weaveffi_error(code: 0, message: nil)");
 
     if !has_buffer_params(&params) {
         let call_args = build_c_call_args(&params, c_prefix, module_path);
         if call_args.is_empty() {
-            let _ = writeln!(out, "        let ptr = {}(&err)", create_sym);
+            w.line(format!("let ptr = {}(&err)", create_sym));
         } else {
-            let _ = writeln!(out, "        let ptr = {}({}, &err)", create_sym, call_args);
+            w.line(format!("let ptr = {}({}, &err)", create_sym, call_args));
         }
-        out.push_str("        try check(&err)\n");
-        out.push_str(
-            "        guard let ptr = ptr else { throw WeaveFFIError.error(code: -1, message: \"null pointer\") }\n",
+        w.line("try check(&err)");
+        w.line(
+            "guard let ptr = ptr else { throw WeaveFFIError.error(code: -1, message: \"null pointer\") }",
         );
-        let _ = writeln!(out, "        return {}(ptr: ptr)", class_name);
+        w.line(format!("return {}(ptr: ptr)", class_name));
     } else {
-        render_buffered_struct_create(out, c_prefix, module_path, create_sym, &params, class_name);
+        let mut tmp = String::new();
+        render_buffered_struct_create(
+            &mut tmp,
+            c_prefix,
+            module_path,
+            create_sym,
+            &params,
+            class_name,
+        );
+        w.raw(tmp);
     }
 
-    out.push_str("    }\n\n");
+    w.dedent();
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 fn render_swift_wrapper(
@@ -881,22 +920,34 @@ fn render_swift_module_body(
 fn render_swift_struct(out: &mut String, s: &StructBinding, ctx: SwiftCtx) {
     let prefix = &s.c_tag;
 
-    emit_doc(out, &s.doc, "");
-    out.push_str(&format!("public class {} {{\n", s.name));
-    out.push_str("    let ptr: OpaquePointer\n\n");
-    out.push_str("    init(ptr: OpaquePointer) {\n");
-    out.push_str("        self.ptr = ptr\n");
-    out.push_str("    }\n\n");
-    out.push_str(&format!(
-        "    deinit {{\n        {}_destroy(ptr)\n    }}\n",
-        prefix
-    ));
+    let mut w = CodeWriter::four_space();
+    w.doc(&s.doc, DocCommentStyle::TripleSlash);
+    w.line(format!("public class {} {{", s.name));
+    w.indent();
+    w.line("let ptr: OpaquePointer");
+    w.blank();
+    w.line("init(ptr: OpaquePointer) {");
+    w.scope(|w| {
+        w.line("self.ptr = ptr");
+    });
+    w.line("}");
+    w.blank();
+    w.line("deinit {");
+    w.scope(|w| {
+        w.line(format!("{}_destroy(ptr)", prefix));
+    });
+    w.line("}");
+    w.dedent();
 
     for field in &s.fields {
-        render_swift_getter(out, field, ctx);
+        let mut tmp = String::new();
+        render_swift_getter(&mut tmp, field, ctx);
+        w.raw(tmp);
     }
 
-    out.push_str("}\n\n");
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 fn struct_fields_as_params(fields: &[FieldBinding]) -> Vec<ParamBinding> {
@@ -917,149 +968,168 @@ fn render_swift_builder(out: &mut String, c_prefix: &str, module_name: &str, s: 
     let class_name = local_type_name(&s.name);
     let builder_name = format!("{class_name}Builder");
 
-    emit_doc(out, &s.doc, "");
-    out.push_str(&format!("public class {} {{\n", builder_name));
+    let mut w = CodeWriter::four_space();
+    w.doc(&s.doc, DocCommentStyle::TripleSlash);
+    w.line(format!("public class {} {{", builder_name));
+    w.indent();
     for field in &s.fields {
         let swift_ty = swift_type_for(&field.ty);
-        out.push_str(&format!("    private var _{}: {}?\n", field.name, swift_ty));
+        w.line(format!("private var _{}: {}?", field.name, swift_ty));
     }
-    out.push_str("\n    public init() {}\n\n");
+    w.blank();
+    w.line("public init() {}");
+    w.blank();
 
     for field in &s.fields {
         let pascal = field.name.to_upper_camel_case();
         let swift_ty = swift_type_for(&field.ty);
-        emit_doc(out, &field.doc, "    ");
-        out.push_str("    @discardableResult\n");
-        out.push_str(&format!(
-            "    public func with{}(_ value: {}) -> Self {{\n        self._{} = value\n        return self\n    }}\n\n",
-            pascal, swift_ty, field.name
+        w.doc(&field.doc, DocCommentStyle::TripleSlash);
+        w.line("@discardableResult");
+        w.line(format!(
+            "public func with{}(_ value: {}) -> Self {{",
+            pascal, swift_ty
         ));
+        w.scope(|w| {
+            w.line(format!("self._{} = value", field.name));
+            w.line("return self");
+        });
+        w.line("}");
+        w.blank();
     }
 
     let params = struct_fields_as_params(&s.fields);
-    out.push_str(&format!(
-        "    public func build() throws -> {} {{\n",
-        class_name
-    ));
+    w.line(format!("public func build() throws -> {} {{", class_name));
+    w.indent();
     for field in &s.fields {
-        out.push_str(&format!(
-            "        guard let {} = _{} else {{ fatalError(\"missing field: {}\") }}\n",
+        w.line(format!(
+            "guard let {} = _{} else {{ fatalError(\"missing field: {}\") }}",
             field.name, field.name, field.name
         ));
     }
-    out.push_str("        var err = weaveffi_error(code: 0, message: nil)\n");
+    w.line("var err = weaveffi_error(code: 0, message: nil)");
 
     if !has_buffer_params(&params) {
         let create_sym = format!("{}_create", prefix);
         let call_args = build_c_call_args(&params, c_prefix, module_name);
         if call_args.is_empty() {
-            out.push_str(&format!("        let ptr = {}(&err)\n", create_sym));
+            w.line(format!("let ptr = {}(&err)", create_sym));
         } else {
-            out.push_str(&format!(
-                "        let ptr = {}({}, &err)\n",
-                create_sym, call_args
-            ));
+            w.line(format!("let ptr = {}({}, &err)", create_sym, call_args));
         }
-        out.push_str("        try check(&err)\n");
-        out.push_str(
-            "        guard let ptr = ptr else { throw WeaveFFIError.error(code: -1, message: \"null pointer\") }\n",
+        w.line("try check(&err)");
+        w.line(
+            "guard let ptr = ptr else { throw WeaveFFIError.error(code: -1, message: \"null pointer\") }",
         );
-        out.push_str(&format!("        return {}(ptr: ptr)\n", class_name));
+        w.line(format!("return {}(ptr: ptr)", class_name));
     } else {
         let create_sym = format!("{}_create", prefix);
-        render_buffered_struct_create(out, c_prefix, module_name, &create_sym, &params, class_name);
+        let mut tmp = String::new();
+        render_buffered_struct_create(
+            &mut tmp,
+            c_prefix,
+            module_name,
+            &create_sym,
+            &params,
+            class_name,
+        );
+        w.raw(tmp);
     }
 
-    out.push_str("    }\n}\n\n");
+    w.dedent();
+    w.line("}");
+    w.dedent();
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 fn render_swift_getter(out: &mut String, field: &FieldBinding, ctx: SwiftCtx) {
     let getter = &field.getter_symbol;
     let swift_ty = swift_type_for(&field.ty);
 
-    out.push('\n');
-    emit_doc(out, &field.doc, "    ");
-    out.push_str(&format!("    public var {}: {} {{\n", field.name, swift_ty));
+    let mut w = CodeWriter::four_space().with_depth(1);
+    w.blank();
+    w.doc(&field.doc, DocCommentStyle::TripleSlash);
+    w.line(format!("public var {}: {} {{", field.name, swift_ty));
+    w.indent();
 
     match &field.ty {
         TypeRef::StringUtf8 => {
-            out.push_str(&format!("        let raw = {}(ptr)\n", getter));
-            out.push_str("        guard let raw = raw else { return \"\" }\n");
-            out.push_str("        defer { weaveffi_free_string(raw) }\n");
-            out.push_str("        return String(cString: raw)\n");
+            w.line(format!("let raw = {}(ptr)", getter));
+            w.line("guard let raw = raw else { return \"\" }");
+            w.line("defer { weaveffi_free_string(raw) }");
+            w.line("return String(cString: raw)");
         }
         TypeRef::Bytes => {
-            out.push_str("        var outLen: Int = 0\n");
-            out.push_str(&format!("        let raw = {}(ptr, &outLen)\n", getter));
-            out.push_str("        guard let raw = raw else { return Data() }\n");
-            out.push_str("        defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: raw), outLen) }\n");
-            out.push_str("        return Data(bytes: raw, count: outLen)\n");
+            w.line("var outLen: Int = 0");
+            w.line(format!("let raw = {}(ptr, &outLen)", getter));
+            w.line("guard let raw = raw else { return Data() }");
+            w.line("defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: raw), outLen) }");
+            w.line("return Data(bytes: raw, count: outLen)");
         }
         TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
             let name = local_type_name(name);
-            out.push_str(&format!("        return {}(ptr: {}(ptr)!)\n", name, getter));
+            w.line(format!("return {}(ptr: {}(ptr)!)", name, getter));
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 => {
-                out.push_str(&format!("        let p = {}(ptr)\n", getter));
-                out.push_str("        guard let p = p else { return nil }\n");
-                out.push_str("        defer { weaveffi_free_string(p) }\n");
-                out.push_str("        return String(cString: p)\n");
+                w.line(format!("let p = {}(ptr)", getter));
+                w.line("guard let p = p else { return nil }");
+                w.line("defer { weaveffi_free_string(p) }");
+                w.line("return String(cString: p)");
             }
             TypeRef::Bytes => {
-                out.push_str("        var outLen: Int = 0\n");
-                out.push_str(&format!("        let p = {}(ptr, &outLen)\n", getter));
-                out.push_str("        guard let p = p else { return nil }\n");
-                out.push_str("        defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: p), outLen) }\n");
-                out.push_str("        return Data(bytes: p, count: outLen)\n");
+                w.line("var outLen: Int = 0");
+                w.line(format!("let p = {}(ptr, &outLen)", getter));
+                w.line("guard let p = p else { return nil }");
+                w.line("defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: p), outLen) }");
+                w.line("return Data(bytes: p, count: outLen)");
             }
             TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
                 let name = local_type_name(name);
-                out.push_str(&format!("        let p = {}(ptr)\n", getter));
-                out.push_str(&format!("        return p.map {{ {}(ptr: $0) }}\n", name));
+                w.line(format!("let p = {}(ptr)", getter));
+                w.line(format!("return p.map {{ {}(ptr: $0) }}", name));
             }
             TypeRef::Enum(name) => {
                 let name = local_type_name(name);
-                out.push_str(&format!("        let p = {}(ptr)\n", getter));
-                out.push_str(&format!(
-                    "        return p.map {{ {}(rawValue: $0.pointee.rawValue)! }}\n",
+                w.line(format!("let p = {}(ptr)", getter));
+                w.line(format!(
+                    "return p.map {{ {}(rawValue: $0.pointee.rawValue)! }}",
                     name
                 ));
             }
             _ if is_c_value_type(inner) => {
-                out.push_str(&format!("        let p = {}(ptr)\n", getter));
-                out.push_str("        return p?.pointee\n");
+                w.line(format!("let p = {}(ptr)", getter));
+                w.line("return p?.pointee");
             }
             _ => {
-                out.push_str(&format!("        return {}(ptr)\n", getter));
+                w.line(format!("return {}(ptr)", getter));
             }
         },
         TypeRef::List(inner) => {
-            out.push_str("        var outLen: Int = 0\n");
-            out.push_str(&format!("        let rv = {}(ptr, &outLen)\n", getter));
-            out.push_str("        guard let rv = rv else { return [] }\n");
+            w.line("var outLen: Int = 0");
+            w.line(format!("let rv = {}(ptr, &outLen)", getter));
+            w.line("guard let rv = rv else { return [] }");
             match inner.as_ref() {
                 TypeRef::Enum(name) => {
                     let name = local_type_name(name);
-                    out.push_str(&format!(
-                        "        return (0..<outLen).map {{ {}(rawValue: rv[$0].rawValue)! }}\n",
+                    w.line(format!(
+                        "return (0..<outLen).map {{ {}(rawValue: rv[$0].rawValue)! }}",
                         name
                     ));
                 }
                 TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
                     let name = local_type_name(name);
-                    out.push_str(&format!(
-                        "        return (0..<outLen).map {{ {}(ptr: rv[$0]!) }}\n",
+                    w.line(format!(
+                        "return (0..<outLen).map {{ {}(ptr: rv[$0]!) }}",
                         name
                     ));
                 }
                 TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                    out.push_str("        return (0..<outLen).map { String(cString: rv[$0]!) }\n");
+                    w.line("return (0..<outLen).map { String(cString: rv[$0]!) }");
                 }
                 _ => {
-                    out.push_str(
-                        "        return Array(UnsafeBufferPointer(start: rv, count: outLen))\n",
-                    );
+                    w.line("return Array(UnsafeBufferPointer(start: rv, count: outLen))");
                 }
             }
         }
@@ -1068,49 +1138,47 @@ fn render_swift_getter(out: &mut String, field: &FieldBinding, ctx: SwiftCtx) {
             let val_elem = swift_c_ptr_element(v);
             let key_swift = swift_type_for(k);
             let val_swift = swift_type_for(v);
-            out.push_str(&format!(
-                "        var outKeysPtr: UnsafeMutablePointer<{}>? = nil\n",
+            w.line(format!(
+                "var outKeysPtr: UnsafeMutablePointer<{}>? = nil",
                 key_elem
             ));
-            out.push_str(&format!(
-                "        var outValuesPtr: UnsafeMutablePointer<{}>? = nil\n",
+            w.line(format!(
+                "var outValuesPtr: UnsafeMutablePointer<{}>? = nil",
                 val_elem
             ));
-            out.push_str("        var outLen: Int = 0\n");
-            out.push_str(&format!(
-                "        {}(ptr, &outKeysPtr, &outValuesPtr, &outLen)\n",
+            w.line("var outLen: Int = 0");
+            w.line(format!(
+                "{}(ptr, &outKeysPtr, &outValuesPtr, &outLen)",
                 getter
             ));
-            out.push_str(
-                "        guard let outKeys = outKeysPtr, let outValues = outValuesPtr else { return [:] }\n",
+            w.line(
+                "guard let outKeys = outKeysPtr, let outValues = outValuesPtr else { return [:] }",
             );
-            out.push_str(&format!(
-                "        var result: [{}: {}] = [:]\n",
-                key_swift, val_swift
-            ));
-            out.push_str("        for i in 0..<outLen {\n");
-            let key_expr = map_element_read(k, "outKeys[i]", ctx);
-            let val_expr = map_element_read(v, "outValues[i]", ctx);
-            out.push_str(&format!(
-                "            result[{}] = {}\n",
-                key_expr, val_expr
-            ));
-            out.push_str("        }\n");
-            out.push_str("        return result\n");
+            w.line(format!("var result: [{}: {}] = [:]", key_swift, val_swift));
+            w.line("for i in 0..<outLen {");
+            w.scope(|w| {
+                let key_expr = map_element_read(k, "outKeys[i]", ctx);
+                let val_expr = map_element_read(v, "outValues[i]", ctx);
+                w.line(format!("result[{}] = {}", key_expr, val_expr));
+            });
+            w.line("}");
+            w.line("return result");
         }
         TypeRef::Enum(name) => {
             let name = local_type_name(name);
-            out.push_str(&format!(
-                "        return {}(rawValue: {}(ptr).rawValue)!\n",
+            w.line(format!(
+                "return {}(rawValue: {}(ptr).rawValue)!",
                 name, getter
             ));
         }
         _ => {
-            out.push_str(&format!("        return {}(ptr)\n", getter));
+            w.line(format!("return {}(ptr)", getter));
         }
     }
 
-    out.push_str("    }\n");
+    w.dedent();
+    w.line("}");
+    out.push_str(&w.finish());
 }
 
 fn render_swift_function(
@@ -1121,13 +1189,17 @@ fn render_swift_function(
     strip_module_prefix: bool,
     ctx: SwiftCtx,
 ) {
-    emit_fn_doc(out, &f.doc, &f.params, "    ");
+    let mut w = CodeWriter::four_space().with_depth(1);
+    {
+        let mut tmp = String::new();
+        emit_fn_doc(&mut tmp, &f.doc, &f.params, "    ");
+        w.raw(tmp);
+    }
     if let Some(msg) = &f.deprecated {
-        let _ = writeln!(
-            out,
-            "    @available(*, deprecated, message: \"{}\")",
+        w.line(format!(
+            "@available(*, deprecated, message: \"{}\")",
             msg.replace('"', "\\\"")
-        );
+        ));
     }
     let func_name = wrapper_name(module_name, &f.name, strip_module_prefix);
     let ret_swift = f
@@ -1135,10 +1207,14 @@ fn render_swift_function(
         .as_ref()
         .map(|t| swift_type_ctx(t, ctx))
         .unwrap_or_else(|| "Void".to_string());
-    let _ = write!(out, "    public static func {}(", func_name);
-    write_swift_params_sig(out, &f.params, ctx);
-    let _ = writeln!(out, ") throws -> {} {{", ret_swift);
-    out.push_str("        var err = weaveffi_error(code: 0, message: nil)\n");
+    let mut sig = String::new();
+    write_swift_params_sig(&mut sig, &f.params, ctx);
+    w.line(format!(
+        "public static func {}({}) throws -> {} {{",
+        func_name, sig, ret_swift
+    ));
+    w.indent();
+    w.line("var err = weaveffi_error(code: 0, message: nil)");
 
     let c_sym = &f.c_base;
     let call_args = build_c_call_args(&f.params, c_prefix, module_name);
@@ -1148,13 +1224,17 @@ fn render_swift_function(
         format!("{}({}, &err)", c_sym, call_args)
     };
 
+    let mut body = String::new();
     if !has_buffer_params(&f.params) {
-        render_direct_call(out, f, &call_with_err, ctx);
+        render_direct_call(&mut body, f, &call_with_err, ctx);
     } else {
-        render_buffered_call(out, c_prefix, f, &f.params, module_name, ctx);
+        render_buffered_call(&mut body, c_prefix, f, &f.params, module_name, ctx);
     }
+    w.raw(body);
 
-    out.push_str("    }\n");
+    w.dedent();
+    w.line("}");
+    out.push_str(&w.finish());
 }
 
 /// Write `_ name: SwiftType, _ name: SwiftType, ...` directly into `out`,
@@ -1324,54 +1404,61 @@ fn render_swift_listener(
         .map(|p| swift_cb_arg_expr(p, ctx))
         .collect();
 
-    emit_fn_doc(out, &l.doc, &[], "    ");
-    let _ = writeln!(
-        out,
-        "    /// - Returns: A subscription id for ``{unregister_fn}(_:)``."
-    );
-    let _ = writeln!(
-        out,
-        "    public static func {register_fn}(_ callback: @escaping {closure_type}) -> UInt64 {{"
-    );
-    out.push_str("        let box = WvCallbackBox(callback)\n");
-    out.push_str("        let ctx = Unmanaged.passRetained(box).toOpaque()\n");
-    let _ = writeln!(
-        out,
-        "        let id = {}({{ {} in",
+    let mut w = CodeWriter::four_space().with_depth(1);
+    {
+        let mut tmp = String::new();
+        emit_fn_doc(&mut tmp, &l.doc, &[], "    ");
+        w.raw(tmp);
+    }
+    w.line(format!(
+        "/// - Returns: A subscription id for ``{unregister_fn}(_:)``."
+    ));
+    w.line(format!(
+        "public static func {register_fn}(_ callback: @escaping {closure_type}) -> UInt64 {{"
+    ));
+    w.indent();
+    w.line("let box = WvCallbackBox(callback)");
+    w.line("let ctx = Unmanaged.passRetained(box).toOpaque()");
+    w.line(format!(
+        "let id = {}({{ {} in",
         l.register_symbol,
         slot_names.join(", ")
-    );
-    let _ = writeln!(
-        out,
-        "            let cb = Unmanaged<WvCallbackBox<{closure_type}>>.fromOpaque(context!).takeUnretainedValue().value"
-    );
-    let _ = writeln!(out, "            cb({})", args.join(", "));
-    out.push_str("        }, ctx)\n");
-    out.push_str("        wvListenerLock.lock()\n");
-    out.push_str("        wvListenerContexts[id] = ctx\n");
-    out.push_str("        wvListenerLock.unlock()\n");
-    out.push_str("        return id\n");
-    out.push_str("    }\n");
+    ));
+    w.scope(|w| {
+        w.line(format!(
+            "let cb = Unmanaged<WvCallbackBox<{closure_type}>>.fromOpaque(context!).takeUnretainedValue().value"
+        ));
+        w.line(format!("cb({})", args.join(", ")));
+    });
+    w.line("}, ctx)");
+    w.line("wvListenerLock.lock()");
+    w.line("wvListenerContexts[id] = ctx");
+    w.line("wvListenerLock.unlock()");
+    w.line("return id");
+    w.dedent();
+    w.line("}");
 
-    let _ = writeln!(
-        out,
-        "    /// Unregisters a listener previously registered with ``{register_fn}(_:)``."
-    );
-    let _ = writeln!(
-        out,
-        "    public static func {unregister_fn}(_ id: UInt64) {{"
-    );
-    let _ = writeln!(out, "        {}(id)", l.unregister_symbol);
-    out.push_str("        wvListenerLock.lock()\n");
-    out.push_str("        let ctx = wvListenerContexts.removeValue(forKey: id)\n");
-    out.push_str("        wvListenerLock.unlock()\n");
-    out.push_str("        if let ctx = ctx {\n");
-    let _ = writeln!(
-        out,
-        "            Unmanaged<WvCallbackBox<{closure_type}>>.fromOpaque(ctx).release()"
-    );
-    out.push_str("        }\n");
-    out.push_str("    }\n");
+    w.line(format!(
+        "/// Unregisters a listener previously registered with ``{register_fn}(_:)``."
+    ));
+    w.line(format!(
+        "public static func {unregister_fn}(_ id: UInt64) {{"
+    ));
+    w.indent();
+    w.line(format!("{}(id)", l.unregister_symbol));
+    w.line("wvListenerLock.lock()");
+    w.line("let ctx = wvListenerContexts.removeValue(forKey: id)");
+    w.line("wvListenerLock.unlock()");
+    w.line("if let ctx = ctx {");
+    w.scope(|w| {
+        w.line(format!(
+            "Unmanaged<WvCallbackBox<{closure_type}>>.fromOpaque(ctx).release()"
+        ));
+    });
+    w.line("}");
+    w.dedent();
+    w.line("}");
+    out.push_str(&w.finish());
 }
 
 fn render_swift_async_function(
@@ -1927,130 +2014,141 @@ fn build_c_call_args(params: &[ParamBinding], c_prefix: &str, module_name: &str)
 }
 
 fn render_direct_call(out: &mut String, f: &FnBinding, call_with_err: &str, ctx: SwiftCtx) {
+    let mut w = CodeWriter::four_space().with_depth(2);
     match &f.ret {
         None => {
-            out.push_str(&format!("        {}\n", call_with_err));
-            out.push_str("        try check(&err)\n");
+            w.line(call_with_err);
+            w.line("try check(&err)");
         }
         Some(TypeRef::StringUtf8) => {
-            out.push_str(&format!("        let rv = {}\n", call_with_err));
-            out.push_str("        try check(&err)\n");
-            out.push_str("        guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: \"null string\") }\n");
-            out.push_str("        defer { weaveffi_free_string(rv) }\n");
-            out.push_str("        return String(cString: rv)\n");
+            w.line(format!("let rv = {}", call_with_err));
+            w.line("try check(&err)");
+            w.line("guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: \"null string\") }");
+            w.line("defer { weaveffi_free_string(rv) }");
+            w.line("return String(cString: rv)");
         }
         Some(TypeRef::Bytes) => {
-            out.push_str("        var outLen: Int = 0\n");
-            out.push_str(&format!(
-                "        let rv = {}\n",
+            w.line("var outLen: Int = 0");
+            w.line(format!(
+                "let rv = {}",
                 call_with_err.replace("&err)", "&outLen, &err)")
             ));
-            out.push_str("        try check(&err)\n");
-            out.push_str("        guard let rv = rv else { return Data() }\n");
-            out.push_str("        defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen) }\n");
-            out.push_str("        return Data(bytes: rv, count: outLen)\n");
+            w.line("try check(&err)");
+            w.line("guard let rv = rv else { return Data() }");
+            w.line("defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen) }");
+            w.line("return Data(bytes: rv, count: outLen)");
         }
         Some(TypeRef::Struct(name)) | Some(TypeRef::TypedHandle(name)) => {
             let name = ctx.ty_name(local_type_name(name));
-            out.push_str(&format!("        let rv = {}\n", call_with_err));
-            out.push_str("        try check(&err)\n");
-            out.push_str("        guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: \"null pointer\") }\n");
-            out.push_str(&format!("        return {}(ptr: rv)\n", name));
+            w.line(format!("let rv = {}", call_with_err));
+            w.line("try check(&err)");
+            w.line("guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: \"null pointer\") }");
+            w.line(format!("return {}(ptr: rv)", name));
         }
         Some(TypeRef::Enum(name)) => {
             let name = ctx.ty_name(local_type_name(name));
-            out.push_str(&format!("        let rv = {}\n", call_with_err));
-            out.push_str("        try check(&err)\n");
-            out.push_str(&format!(
-                "        return {}(rawValue: rv.rawValue)!\n",
-                name
-            ));
+            w.line(format!("let rv = {}", call_with_err));
+            w.line("try check(&err)");
+            w.line(format!("return {}(rawValue: rv.rawValue)!", name));
         }
         Some(TypeRef::Optional(inner)) => {
-            render_optional_return(out, call_with_err, inner, ctx);
+            let mut tmp = String::new();
+            render_optional_return(&mut tmp, call_with_err, inner, ctx);
+            w.raw(tmp);
         }
         Some(TypeRef::List(inner)) => {
-            render_list_return(out, call_with_err, inner, ctx);
+            let mut tmp = String::new();
+            render_list_return(&mut tmp, call_with_err, inner, ctx);
+            w.raw(tmp);
         }
         Some(TypeRef::Map(k, v)) => {
-            render_map_return(out, call_with_err, k, v, ctx);
+            let mut tmp = String::new();
+            render_map_return(&mut tmp, call_with_err, k, v, ctx);
+            w.raw(tmp);
         }
         Some(TypeRef::Iterator(_)) => {
-            render_iterator_return(out, f, call_with_err, "        ", ctx);
+            let mut tmp = String::new();
+            render_iterator_return(&mut tmp, f, call_with_err, "        ", ctx);
+            w.raw(tmp);
         }
         Some(_) => {
-            out.push_str(&format!("        let rv = {}\n", call_with_err));
-            out.push_str("        try check(&err)\n");
-            out.push_str("        return rv\n");
+            w.line(format!("let rv = {}", call_with_err));
+            w.line("try check(&err)");
+            w.line("return rv");
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn render_optional_return(out: &mut String, call_with_err: &str, inner: &TypeRef, ctx: SwiftCtx) {
+    let mut w = CodeWriter::four_space().with_depth(2);
     match inner {
         TypeRef::StringUtf8 => {
-            out.push_str(&format!("        let rv = {}\n", call_with_err));
-            out.push_str("        try check(&err)\n");
-            out.push_str("        guard let rv = rv else { return nil }\n");
-            out.push_str("        defer { weaveffi_free_string(rv) }\n");
-            out.push_str("        return String(cString: rv)\n");
+            w.line(format!("let rv = {}", call_with_err));
+            w.line("try check(&err)");
+            w.line("guard let rv = rv else { return nil }");
+            w.line("defer { weaveffi_free_string(rv) }");
+            w.line("return String(cString: rv)");
         }
         TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
             let name = ctx.ty_name(local_type_name(name));
-            out.push_str(&format!("        let rv = {}\n", call_with_err));
-            out.push_str("        try check(&err)\n");
-            out.push_str(&format!("        return rv.map {{ {}(ptr: $0) }}\n", name));
+            w.line(format!("let rv = {}", call_with_err));
+            w.line("try check(&err)");
+            w.line(format!("return rv.map {{ {}(ptr: $0) }}", name));
         }
         TypeRef::Enum(name) => {
             let name = ctx.ty_name(local_type_name(name));
-            out.push_str(&format!("        let rv = {}\n", call_with_err));
-            out.push_str("        try check(&err)\n");
-            out.push_str(&format!(
-                "        return rv.map {{ {}(rawValue: $0.pointee.rawValue)! }}\n",
+            w.line(format!("let rv = {}", call_with_err));
+            w.line("try check(&err)");
+            w.line(format!(
+                "return rv.map {{ {}(rawValue: $0.pointee.rawValue)! }}",
                 name
             ));
         }
         _ if is_c_value_type(inner) => {
-            out.push_str(&format!("        let rv = {}\n", call_with_err));
-            out.push_str("        try check(&err)\n");
-            out.push_str("        return rv?.pointee\n");
+            w.line(format!("let rv = {}", call_with_err));
+            w.line("try check(&err)");
+            w.line("return rv?.pointee");
         }
         _ => {
-            out.push_str(&format!("        let rv = {}\n", call_with_err));
-            out.push_str("        try check(&err)\n");
-            out.push_str("        return rv\n");
+            w.line(format!("let rv = {}", call_with_err));
+            w.line("try check(&err)");
+            w.line("return rv");
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn render_list_return(out: &mut String, call_with_err: &str, inner: &TypeRef, ctx: SwiftCtx) {
-    out.push_str("        var outLen: Int = 0\n");
+    let mut w = CodeWriter::four_space().with_depth(2);
+    w.line("var outLen: Int = 0");
     let modified_call = call_with_err.replace("&err)", "&outLen, &err)");
-    out.push_str(&format!("        let rv = {}\n", modified_call));
-    out.push_str("        try check(&err)\n");
-    out.push_str("        guard let rv = rv else { return [] }\n");
+    w.line(format!("let rv = {}", modified_call));
+    w.line("try check(&err)");
+    w.line("guard let rv = rv else { return [] }");
     match inner {
         TypeRef::Enum(name) => {
             let name = ctx.ty_name(local_type_name(name));
-            out.push_str(&format!(
-                "        return (0..<outLen).map {{ {}(rawValue: rv[$0].rawValue)! }}\n",
+            w.line(format!(
+                "return (0..<outLen).map {{ {}(rawValue: rv[$0].rawValue)! }}",
                 name
             ));
         }
         TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
             let name = ctx.ty_name(local_type_name(name));
-            out.push_str(&format!(
-                "        return (0..<outLen).map {{ {}(ptr: rv[$0]!) }}\n",
+            w.line(format!(
+                "return (0..<outLen).map {{ {}(ptr: rv[$0]!) }}",
                 name
             ));
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str("        return (0..<outLen).map { String(cString: rv[$0]!) }\n");
+            w.line("return (0..<outLen).map { String(cString: rv[$0]!) }");
         }
         _ => {
-            out.push_str("        return Array(UnsafeBufferPointer(start: rv, count: outLen))\n");
+            w.line("return Array(UnsafeBufferPointer(start: rv, count: outLen))");
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn render_optional_return_inner(
@@ -2060,49 +2158,42 @@ fn render_optional_return_inner(
     indent: &str,
     ctx: SwiftCtx,
 ) {
+    let mut w = CodeWriter::four_space().with_depth(indent.len() / 4 + 1);
     match inner {
         TypeRef::StringUtf8 => {
-            out.push_str(&format!("{}    let rv = {}\n", indent, call));
-            out.push_str(&format!("{}    try check(&err)\n", indent));
-            out.push_str(&format!(
-                "{}    guard let rv = rv else {{ return nil }}\n",
-                indent
-            ));
-            out.push_str(&format!(
-                "{}    defer {{ weaveffi_free_string(rv) }}\n",
-                indent
-            ));
-            out.push_str(&format!("{}    return String(cString: rv)\n", indent));
+            w.line(format!("let rv = {}", call));
+            w.line("try check(&err)");
+            w.line("guard let rv = rv else { return nil }");
+            w.line("defer { weaveffi_free_string(rv) }");
+            w.line("return String(cString: rv)");
         }
         TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
             let name = ctx.ty_name(local_type_name(name));
-            out.push_str(&format!("{}    let rv = {}\n", indent, call));
-            out.push_str(&format!("{}    try check(&err)\n", indent));
-            out.push_str(&format!(
-                "{}    return rv.map {{ {}(ptr: $0) }}\n",
-                indent, name
-            ));
+            w.line(format!("let rv = {}", call));
+            w.line("try check(&err)");
+            w.line(format!("return rv.map {{ {}(ptr: $0) }}", name));
         }
         TypeRef::Enum(name) => {
             let name = ctx.ty_name(local_type_name(name));
-            out.push_str(&format!("{}    let rv = {}\n", indent, call));
-            out.push_str(&format!("{}    try check(&err)\n", indent));
-            out.push_str(&format!(
-                "{}    return rv.map {{ {}(rawValue: $0.pointee.rawValue)! }}\n",
-                indent, name
+            w.line(format!("let rv = {}", call));
+            w.line("try check(&err)");
+            w.line(format!(
+                "return rv.map {{ {}(rawValue: $0.pointee.rawValue)! }}",
+                name
             ));
         }
         _ if is_c_value_type(inner) => {
-            out.push_str(&format!("{}    let rv = {}\n", indent, call));
-            out.push_str(&format!("{}    try check(&err)\n", indent));
-            out.push_str(&format!("{}    return rv?.pointee\n", indent));
+            w.line(format!("let rv = {}", call));
+            w.line("try check(&err)");
+            w.line("return rv?.pointee");
         }
         _ => {
-            out.push_str(&format!("{}    let rv = {}\n", indent, call));
-            out.push_str(&format!("{}    try check(&err)\n", indent));
-            out.push_str(&format!("{}    return rv\n", indent));
+            w.line(format!("let rv = {}", call));
+            w.line("try check(&err)");
+            w.line("return rv");
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn render_list_return_inner(
@@ -2112,40 +2203,33 @@ fn render_list_return_inner(
     indent: &str,
     ctx: SwiftCtx,
 ) {
-    out.push_str(&format!("{}    let rv = {}\n", indent, call));
-    out.push_str(&format!("{}    try check(&err)\n", indent));
-    out.push_str(&format!(
-        "{}    guard let rv = rv else {{ return [] }}\n",
-        indent
-    ));
+    let mut w = CodeWriter::four_space().with_depth(indent.len() / 4 + 1);
+    w.line(format!("let rv = {}", call));
+    w.line("try check(&err)");
+    w.line("guard let rv = rv else { return [] }");
     match inner {
         TypeRef::Enum(name) => {
             let name = ctx.ty_name(local_type_name(name));
-            out.push_str(&format!(
-                "{}    return (0..<outLen).map {{ {}(rawValue: rv[$0].rawValue)! }}\n",
-                indent, name
+            w.line(format!(
+                "return (0..<outLen).map {{ {}(rawValue: rv[$0].rawValue)! }}",
+                name
             ));
         }
         TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
             let name = ctx.ty_name(local_type_name(name));
-            out.push_str(&format!(
-                "{}    return (0..<outLen).map {{ {}(ptr: rv[$0]!) }}\n",
-                indent, name
+            w.line(format!(
+                "return (0..<outLen).map {{ {}(ptr: rv[$0]!) }}",
+                name
             ));
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!(
-                "{}    return (0..<outLen).map {{ String(cString: rv[$0]!) }}\n",
-                indent
-            ));
+            w.line("return (0..<outLen).map { String(cString: rv[$0]!) }");
         }
         _ => {
-            out.push_str(&format!(
-                "{}    return Array(UnsafeBufferPointer(start: rv, count: outLen))\n",
-                indent
-            ));
+            w.line("return Array(UnsafeBufferPointer(start: rv, count: outLen))");
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn swift_c_ptr_element(ty: &TypeRef) -> String {
@@ -2201,35 +2285,31 @@ fn render_map_return(
     let key_swift = swift_type_ctx(k, ctx);
     let val_swift = swift_type_ctx(v, ctx);
 
-    out.push_str(&format!(
-        "        var outKeysPtr: UnsafeMutablePointer<{}>? = nil\n",
+    let mut w = CodeWriter::four_space().with_depth(2);
+    w.line(format!(
+        "var outKeysPtr: UnsafeMutablePointer<{}>? = nil",
         key_elem
     ));
-    out.push_str(&format!(
-        "        var outValuesPtr: UnsafeMutablePointer<{}>? = nil\n",
+    w.line(format!(
+        "var outValuesPtr: UnsafeMutablePointer<{}>? = nil",
         val_elem
     ));
-    out.push_str("        var outLen: Int = 0\n");
+    w.line("var outLen: Int = 0");
     let modified_call =
         call_with_err.replace("&err)", "&outKeysPtr, &outValuesPtr, &outLen, &err)");
-    out.push_str(&format!("        {}\n", modified_call));
-    out.push_str("        try check(&err)\n");
-    out.push_str(
-        "        guard let outKeys = outKeysPtr, let outValues = outValuesPtr else { return [:] }\n",
-    );
-    out.push_str(&format!(
-        "        var result: [{}: {}] = [:]\n",
-        key_swift, val_swift
-    ));
-    out.push_str("        for i in 0..<outLen {\n");
-    let key_expr = map_element_read(k, "outKeys[i]", ctx);
-    let val_expr = map_element_read(v, "outValues[i]", ctx);
-    out.push_str(&format!(
-        "            result[{}] = {}\n",
-        key_expr, val_expr
-    ));
-    out.push_str("        }\n");
-    out.push_str("        return result\n");
+    w.line(modified_call);
+    w.line("try check(&err)");
+    w.line("guard let outKeys = outKeysPtr, let outValues = outValuesPtr else { return [:] }");
+    w.line(format!("var result: [{}: {}] = [:]", key_swift, val_swift));
+    w.line("for i in 0..<outLen {");
+    w.scope(|w| {
+        let key_expr = map_element_read(k, "outKeys[i]", ctx);
+        let val_expr = map_element_read(v, "outValues[i]", ctx);
+        w.line(format!("result[{}] = {}", key_expr, val_expr));
+    });
+    w.line("}");
+    w.line("return result");
+    out.push_str(&w.finish());
 }
 
 fn render_map_return_inner(
@@ -2243,25 +2323,20 @@ fn render_map_return_inner(
     let key_swift = swift_type_ctx(k, ctx);
     let val_swift = swift_type_ctx(v, ctx);
 
-    out.push_str(&format!("{}    {}\n", indent, call));
-    out.push_str(&format!("{}    try check(&err)\n", indent));
-    out.push_str(&format!(
-        "{}    guard let outKeys = outKeysPtr, let outValues = outValuesPtr else {{ return [:] }}\n",
-        indent
-    ));
-    out.push_str(&format!(
-        "{}    var result: [{}: {}] = [:]\n",
-        indent, key_swift, val_swift
-    ));
-    out.push_str(&format!("{}    for i in 0..<outLen {{\n", indent));
-    let key_expr = map_element_read(k, "outKeys[i]", ctx);
-    let val_expr = map_element_read(v, "outValues[i]", ctx);
-    out.push_str(&format!(
-        "{}        result[{}] = {}\n",
-        indent, key_expr, val_expr
-    ));
-    out.push_str(&format!("{}    }}\n", indent));
-    out.push_str(&format!("{}    return result\n", indent));
+    let mut w = CodeWriter::four_space().with_depth(indent.len() / 4 + 1);
+    w.line(call);
+    w.line("try check(&err)");
+    w.line("guard let outKeys = outKeysPtr, let outValues = outValuesPtr else { return [:] }");
+    w.line(format!("var result: [{}: {}] = [:]", key_swift, val_swift));
+    w.line("for i in 0..<outLen {");
+    w.scope(|w| {
+        let key_expr = map_element_read(k, "outKeys[i]", ctx);
+        let val_expr = map_element_read(v, "outValues[i]", ctx);
+        w.line(format!("result[{}] = {}", key_expr, val_expr));
+    });
+    w.line("}");
+    w.line("return result");
+    out.push_str(&w.finish());
 }
 
 /// Swift literal initializing the by-value `out_item` slot used while pulling
@@ -2319,18 +2394,20 @@ fn render_iter_pull(
             None,
         ),
     };
-    out.push_str(&format!("{indent}var iterItem: {c_var} = {default}\n"));
-    out.push_str(&format!(
-        "{indent}var iterErr = weaveffi_error(code: 0, message: nil)\n"
+    let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
+    w.line(format!("var iterItem: {c_var} = {default}"));
+    w.line("var iterErr = weaveffi_error(code: 0, message: nil)");
+    w.line(format!(
+        "while {next_fn}({iter_ptr}, &iterItem, &iterErr) != 0 {{"
     ));
-    out.push_str(&format!(
-        "{indent}while {next_fn}({iter_ptr}, &iterItem, &iterErr) != 0 {{\n"
-    ));
-    out.push_str(&format!("{indent}    items.append({convert})\n"));
+    w.indent();
+    w.line(format!("items.append({convert})"));
     if let Some(free) = free {
-        out.push_str(&format!("{indent}    {free}\n"));
+        w.line(free);
     }
-    out.push_str(&format!("{indent}}}\n"));
+    w.dedent();
+    w.line("}");
+    out.push_str(&w.finish());
 }
 
 fn render_iterator_return(
@@ -2362,16 +2439,20 @@ fn render_iterator_return(
         })
         .unwrap_or_default();
 
-    out.push_str(&format!("{indent}let iter = {call_with_err}\n"));
-    out.push_str(&format!("{indent}try check(&err)\n"));
-    out.push_str(&format!(
-        "{indent}guard let iter = iter else {{ return [] }}\n"
-    ));
-    out.push_str(&format!("{indent}var items: [{inner_swift}] = []\n"));
-    render_iter_pull(out, indent, next_fn, "iter", inner, &elem_c_type, ctx);
-    out.push_str(&format!("{indent}{destroy_fn}(iter)\n"));
-    out.push_str(&format!("{indent}try check(&iterErr)\n"));
-    out.push_str(&format!("{indent}return items\n"));
+    let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
+    w.line(format!("let iter = {call_with_err}"));
+    w.line("try check(&err)");
+    w.line("guard let iter = iter else { return [] }");
+    w.line(format!("var items: [{inner_swift}] = []"));
+    {
+        let mut tmp = String::new();
+        render_iter_pull(&mut tmp, indent, next_fn, "iter", inner, &elem_c_type, ctx);
+        w.raw(tmp);
+    }
+    w.line(format!("{destroy_fn}(iter)"));
+    w.line("try check(&iterErr)");
+    w.line("return items");
+    out.push_str(&w.finish());
 }
 
 fn is_string_elem(ty: &TypeRef) -> bool {

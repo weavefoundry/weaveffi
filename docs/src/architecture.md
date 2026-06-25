@@ -82,7 +82,7 @@ weaveffi-fuzz ──► weaveffi-ir, weaveffi-core (workspace-private; unpublish
 | `weaveffi`           | The producer facade a Rust cdylib depends on: re-exports the `weaveffi-macros` attributes, `export_runtime!`, and `weaveffi-abi` as `weaveffi::abi`. |
 | `weaveffi-core`      | The `Generator` trait, the `LanguageBackend` framework + driver, the `Orchestrator`, the `abi` C-ABI lowering model, the `BindingModel`, validation rules, generator config resolution, and the per-generator hash cache. |
 | `weaveffi-gen-*`     | Eleven generator crates. Each implements `LanguageBackend` (bridged to `Generator` by `impl_generator_via_backend!`) and produces target-specific output (header, wrapper, package metadata).                    |
-| `weaveffi-cli`       | The `weaveffi` binary. Parses the IDL, applies validation, instantiates every generator (via the `cli_targets!` registry), and dispatches the `Orchestrator`. Self-contained subcommands live in their own modules (`doctor.rs`, `extract.rs`, `scaffold.rs`). |
+| `weaveffi-cli`       | The `weaveffi` binary. Parses the IDL, applies validation, instantiates every generator (via the `cli_targets!` registry in `config.rs`), and dispatches the `Orchestrator`. Subcommands live under `commands/` (`generate`, `validate`, `diff`, `format`, `package`, `new`, `watch`); `doctor.rs`, `extract.rs`, and `scaffold.rs` sit beside `main.rs`; `config.rs` holds the target registry and config resolution; `report.rs` formats CLI output. |
 | `weaveffi-fuzz`      | `cargo-fuzz` harnesses for the parsers, the validator, and `parse_type_ref`. Workspace-private (not published to crates.io).                     |
 
 Crates that contain `unsafe` code opt in explicitly: `weaveffi-abi`,
@@ -97,12 +97,15 @@ a macro-based producer needs no crate-level opt-in. The workspace-wide
 ### CLI internals
 
 `weaveffi-cli` is split so that `main.rs` holds only argument parsing and
-command dispatch; each self-contained subcommand group lives in its own
+command dispatch; each subcommand and shared concern lives in its own
 module:
 
 | Module        | Responsibility                                                        |
 | ------------- | --------------------------------------------------------------------- |
-| `main.rs`     | `clap` definitions, the `cli_targets!` registry, and dispatch.        |
+| `main.rs`     | `clap` definitions and top-level dispatch into `commands/`.           |
+| `config.rs`   | The `cli_targets!` registry macro, the generated `CliConfig`, and config resolution (`--config` TOML + inline `generators:`). |
+| `report.rs`   | Human-readable formatting of generate/diff results and summaries.     |
+| `commands/`   | One module per subcommand: `generate`, `validate`, `diff`, `format`, `package`, `new`, `watch` (re-exported through `commands/mod.rs`). |
 | `doctor.rs`   | `weaveffi doctor`: probes host toolchains per target.                  |
 | `extract.rs`  | `weaveffi extract`: a thin wrapper over `weaveffi-bridge` that serializes the derived IDL. |
 | `scaffold.rs` | the Rust producer stubs emitted by `weaveffi generate --scaffold` (for non-macro producers). |
@@ -112,7 +115,7 @@ module:
 The 11 language targets used to be spelled out a dozen times (config
 struct fields, the `--target` parser, inline-generator merging, and the
 `Orchestrator` wiring). They now live in **one** declarative macro,
-`cli_targets!`, invoked once near the top of `main.rs`:
+`cli_targets!`, defined and invoked in `config.rs`:
 
 ```rust
 cli_targets! {
@@ -350,19 +353,64 @@ multi-pass (their FFI declarations, wrapper classes, and secondary
 surfaces such as the JNI C shim are emitted in their own passes inside
 `files`).
 
-Generators emit code by direct string construction; there is no
-template-engine layer (an early Tera prototype intended for user
-template overrides was removed in 0.4.0 because nothing read from it).
-Shared rendering infrastructure lives in `weaveffi_core`:
+Generators emit code into a `String`; there is no template-engine layer
+(an early Tera prototype intended for user template overrides was removed
+in 0.4.0 because nothing read from it). Indentation and block nesting are
+managed by the `CodeWriter` toolkit (see below) rather than by hand-rolled
+`\n`/space bookkeeping. Shared rendering infrastructure lives in
+`weaveffi_core`:
 
 - `backend`: the `LanguageBackend` trait, the `run`/`output_files`
   driver, the `OutputFile` type, and the `impl_generator_via_backend!`
   bridge macro.
 - `model::BindingModel`: the normalized, fully-lowered view every
   backend renders from (precomputed C symbol names and ABI signatures).
+- `codegen::writer::CodeWriter`: the structured code-emission toolkit
+  (see [The `CodeWriter` emission toolkit](#the-codewriter-emission-toolkit)).
 - `codegen::common`: module-tree traversal (`walk_modules`,
   `walk_modules_with_path`), the `is_c_pointer_type` ABI classifier,
   doc-comment emission (`emit_doc`), and `pascal_case` naming.
+
+### The `CodeWriter` emission toolkit
+
+`weaveffi_core::codegen::CodeWriter` is a small, deterministic,
+language-agnostic builder that owns indentation and block scoping, so a
+generator describes the *shape* of its output instead of threading
+`\n` and indent strings through every `push_str`. It is the preferred
+way to render any indented, line-oriented body.
+
+```rust,ignore
+let mut w = CodeWriter::four_space(); // or two_space() / tabs()
+w.line("class Greeter:");
+w.scope(|w| {                          // one deeper indent level
+    w.line("def greet(self, name):");
+    w.scope(|w| {
+        w.line("return f\"Hello, {name}\"");
+    });
+});
+let src = w.finish();                  // owns the assembled String
+```
+
+Design points that keep output stable and migrations safe:
+
+- **One indent authority.** `line` writes `indent + text + "\n"`;
+  `scope`/`block` push and pop a level around a closure; `indent`/
+  `dedent` adjust it manually. Blank lines (`blank`) never carry trailing
+  whitespace, preserving the determinism contract.
+- **`with_depth(n)`** seeds the starting indent so a writer can render a
+  fragment that will be spliced into an already-indented context.
+- **`raw`** appends pre-formatted text verbatim (no re-indentation),
+  which is how existing helpers (e.g. `emit_doc`) and large literal
+  blocks compose into a writer without a rewrite. This makes adoption
+  incremental: a backend can move one function at a time onto
+  `CodeWriter` while the snapshot suite proves the output is unchanged
+  byte-for-byte.
+
+The Python backend (`weaveffi-gen-python`) is the reference adopter: its
+return marshalling, getters, enums, callbacks, listeners, and the central
+function renderer are built with `CodeWriter`. Remaining generators are
+being migrated onto it incrementally, each move guarded by the snapshot
+corpus.
 
 The signatures above use `Result<T>` from `anyhow` and IR types from
 `weaveffi_ir`; consult those crates for the precise import set.
@@ -505,7 +553,7 @@ A condensed checklist (the long version lives in
    `BindingModel` and `weaveffi_core::codegen::common` instead of
    re-deriving traversal or ABI classification.
 3. Wire the generator into the `cli_targets!` registry macro in
-   `crates/weaveffi-cli/src/main.rs`: add one line
+   `crates/weaveffi-cli/src/config.rs`: add one line
    (`"<name>" => <field>: <Config> via <Generator>`, plus `strip` if the
    generator honors `strip_module_prefix`). That single entry is the
    source of truth: it expands to the `CliConfig` field, the

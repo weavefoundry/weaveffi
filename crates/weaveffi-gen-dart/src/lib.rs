@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
+use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::model::{
     BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
     IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding, RichVariantBinding,
@@ -426,18 +427,22 @@ fn emit_input(out: &mut String, name: &str, ty: &TypeRef, frees: &mut Vec<String
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             let p = format!("{name}Ptr");
-            out.push_str(&format!("  final {p} = {name}.toNativeUtf8();\n"));
+            let mut w = CodeWriter::two_space().with_depth(1);
+            w.line(format!("final {p} = {name}.toNativeUtf8();"));
+            out.push_str(&w.finish());
             frees.push(format!("calloc.free({p});"));
             vec![p]
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             let p = format!("{name}Ptr");
-            out.push_str(&format!(
-                "  final {p} = {name}.isEmpty ? nullptr : calloc<Uint8>({name}.length);\n"
+            let mut w = CodeWriter::two_space().with_depth(1);
+            w.line(format!(
+                "final {p} = {name}.isEmpty ? nullptr : calloc<Uint8>({name}.length);"
             ));
-            out.push_str(&format!(
-                "  for (var i = 0; i < {name}.length; i++) {{ {p}[i] = {name}[i]; }}\n"
+            w.line(format!(
+                "for (var i = 0; i < {name}.length; i++) {{ {p}[i] = {name}[i]; }}"
             ));
+            out.push_str(&w.finish());
             frees.push(format!("if ({p} != nullptr) calloc.free({p});"));
             vec![p, format!("{name}.length")]
         }
@@ -456,9 +461,11 @@ fn emit_optional_input(
     let p = format!("{name}Ptr");
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!(
-                "  final {p} = {name} == null ? nullptr : {name}.toNativeUtf8();\n"
+            let mut w = CodeWriter::two_space().with_depth(1);
+            w.line(format!(
+                "final {p} = {name} == null ? nullptr : {name}.toNativeUtf8();"
             ));
+            out.push_str(&w.finish());
             frees.push(format!("if ({p} != nullptr) calloc.free({p});"));
             vec![p]
         }
@@ -472,11 +479,15 @@ fn emit_optional_input(
                 TypeRef::Enum(_) => format!("{name}.value"),
                 _ => name.to_string(),
             };
-            out.push_str(&format!("  Pointer<{native}> {p} = nullptr;\n"));
-            out.push_str(&format!("  if ({name} != null) {{\n"));
-            out.push_str(&format!("    {p} = calloc<{native}>();\n"));
-            out.push_str(&format!("    {p}.value = {val};\n"));
-            out.push_str("  }\n");
+            let mut w = CodeWriter::two_space().with_depth(1);
+            w.line(format!("Pointer<{native}> {p} = nullptr;"));
+            w.line(format!("if ({name} != null) {{"));
+            w.scope(|w| {
+                w.line(format!("{p} = calloc<{native}>();"));
+                w.line(format!("{p}.value = {val};"));
+            });
+            w.line("}");
+            out.push_str(&w.finish());
             frees.push(format!("if ({p} != nullptr) calloc.free({p});"));
             vec![p]
         }
@@ -496,15 +507,19 @@ fn emit_list_input(
         .and_then(|s| s.strip_suffix('>'))
         .unwrap_or("Pointer<Void>")
         .to_string();
-    out.push_str(&format!(
-        "  final {p} = {name}.isEmpty ? nullptr : calloc<{inner_ffi}>({name}.length);\n"
+    let mut w = CodeWriter::two_space().with_depth(1);
+    w.line(format!(
+        "final {p} = {name}.isEmpty ? nullptr : calloc<{inner_ffi}>({name}.length);"
     ));
-    out.push_str(&format!("  for (var i = 0; i < {name}.length; i++) {{\n"));
-    out.push_str(&format!(
-        "    {p}[i] = {};\n",
-        elem_to_native(&format!("{name}[i]"), inner)
-    ));
-    out.push_str("  }\n");
+    w.line(format!("for (var i = 0; i < {name}.length; i++) {{"));
+    w.scope(|w| {
+        w.line(format!(
+            "{p}[i] = {};",
+            elem_to_native(&format!("{name}[i]"), inner)
+        ));
+    });
+    w.line("}");
+    out.push_str(&w.finish());
     if matches!(inner, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
         frees.push(format!(
             "if ({p} != nullptr) {{ for (var i = 0; i < {name}.length; i++) {{ calloc.free({p}[i]); }} calloc.free({p}); }}"
@@ -536,27 +551,27 @@ fn emit_map_input(
         .and_then(|s| s.strip_suffix('>'))
         .unwrap_or("Pointer<Void>")
         .to_string();
-    out.push_str(&format!(
-        "  final {name}Entries = {name}.entries.toList();\n"
+    let mut w = CodeWriter::two_space().with_depth(1);
+    w.line(format!("final {name}Entries = {name}.entries.toList();"));
+    w.line(format!(
+        "final {kp} = {name}.isEmpty ? nullptr : calloc<{ki}>({name}.length);"
     ));
-    out.push_str(&format!(
-        "  final {kp} = {name}.isEmpty ? nullptr : calloc<{ki}>({name}.length);\n"
+    w.line(format!(
+        "final {vp} = {name}.isEmpty ? nullptr : calloc<{vi}>({name}.length);"
     ));
-    out.push_str(&format!(
-        "  final {vp} = {name}.isEmpty ? nullptr : calloc<{vi}>({name}.length);\n"
-    ));
-    out.push_str(&format!(
-        "  for (var i = 0; i < {name}Entries.length; i++) {{\n"
-    ));
-    out.push_str(&format!(
-        "    {kp}[i] = {};\n",
-        elem_to_native(&format!("{name}Entries[i].key"), k)
-    ));
-    out.push_str(&format!(
-        "    {vp}[i] = {};\n",
-        elem_to_native(&format!("{name}Entries[i].value"), v)
-    ));
-    out.push_str("  }\n");
+    w.line(format!("for (var i = 0; i < {name}Entries.length; i++) {{"));
+    w.scope(|w| {
+        w.line(format!(
+            "{kp}[i] = {};",
+            elem_to_native(&format!("{name}Entries[i].key"), k)
+        ));
+        w.line(format!(
+            "{vp}[i] = {};",
+            elem_to_native(&format!("{name}Entries[i].value"), v)
+        ));
+    });
+    w.line("}");
+    out.push_str(&w.finish());
     let free_arr = |which: &str, ty: &TypeRef| -> String {
         if matches!(ty, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
             format!("if ({which} != nullptr) {{ for (var i = 0; i < {name}.length; i++) {{ calloc.free({which}[i]); }} calloc.free({which}); }}")
@@ -667,9 +682,10 @@ fn emit_return_alloc(
     frees: &mut Vec<String>,
     indent: &str,
 ) -> Vec<String> {
-    match ty {
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
+    let args = match ty {
         TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) => {
-            out.push_str(&format!("{indent}final outLen = calloc<Size>();\n"));
+            w.line("final outLen = calloc<Size>();");
             frees.push("calloc.free(outLen);".into());
             vec!["outLen".into()]
         }
@@ -685,16 +701,18 @@ fn emit_return_alloc(
                 .strip_prefix("Pointer<")
                 .and_then(|s| s.strip_suffix('>'))
                 .unwrap();
-            out.push_str(&format!("{indent}final outKeys = calloc<{ki}>();\n"));
-            out.push_str(&format!("{indent}final outValues = calloc<{vi}>();\n"));
-            out.push_str(&format!("{indent}final outLen = calloc<Size>();\n"));
+            w.line(format!("final outKeys = calloc<{ki}>();"));
+            w.line(format!("final outValues = calloc<{vi}>();"));
+            w.line("final outLen = calloc<Size>();");
             frees.push("calloc.free(outKeys);".into());
             frees.push("calloc.free(outValues);".into());
             frees.push("calloc.free(outLen);".into());
             vec!["outKeys".into(), "outValues".into(), "outLen".into()]
         }
         _ => vec![],
-    }
+    };
+    out.push_str(&w.finish());
+    args
 }
 
 /// Emit the post-call decode of a (possibly complex) return into the wrapper's
@@ -703,29 +721,31 @@ fn emit_return_decode(out: &mut String, ty: &TypeRef, indent: &str) {
     match ty {
         TypeRef::List(inner) => emit_list_conversion(out, inner, indent),
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            out.push_str(&format!("{indent}final n = outLen.value;\n"));
-            out.push_str(&format!(
-                "{indent}if (result == nullptr || n == 0) return <int>[];\n"
-            ));
-            out.push_str(&format!(
-                "{indent}return List<int>.generate(n, (i) => result[i]);\n"
-            ));
+            let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
+            w.line("final n = outLen.value;");
+            w.line("if (result == nullptr || n == 0) return <int>[];");
+            w.line("return List<int>.generate(n, (i) => result[i]);");
+            out.push_str(&w.finish());
         }
         TypeRef::Map(k, v) => {
             let kt = dart_type(k);
             let vt = dart_type(v);
-            out.push_str(&format!("{indent}final n = outLen.value;\n"));
-            out.push_str(&format!("{indent}final m = <{kt}, {vt}>{{}};\n"));
-            out.push_str(&format!("{indent}final keys = outKeys.value;\n"));
-            out.push_str(&format!("{indent}final vals = outValues.value;\n"));
-            out.push_str(&format!("{indent}for (var i = 0; i < n; i++) {{\n"));
-            out.push_str(&format!(
-                "{indent}  m[{}] = {};\n",
-                map_elem_read("keys", "i", k),
-                map_elem_read("vals", "i", v)
-            ));
-            out.push_str(&format!("{indent}}}\n"));
-            out.push_str(&format!("{indent}return m;\n"));
+            let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
+            w.line("final n = outLen.value;");
+            w.line(format!("final m = <{kt}, {vt}>{{}};"));
+            w.line("final keys = outKeys.value;");
+            w.line("final vals = outValues.value;");
+            w.line("for (var i = 0; i < n; i++) {");
+            w.scope(|w| {
+                w.line(format!(
+                    "m[{}] = {};",
+                    map_elem_read("keys", "i", k),
+                    map_elem_read("vals", "i", v)
+                ));
+            });
+            w.line("}");
+            w.line("return m;");
+            out.push_str(&w.finish());
         }
         _ => emit_result_conversion(out, ty, indent),
     }
@@ -951,21 +971,30 @@ fn render_enum(out: &mut String, e: &EnumBinding) {
         return;
     }
     let name = e.name.to_upper_camel_case();
-    out.push('\n');
-    emit_doc(out, &e.doc, "");
-    out.push_str(&format!("enum {name} {{\n"));
-    for v in &e.variants {
-        let vname = v.name.to_lower_camel_case();
-        emit_doc(out, &v.doc, "  ");
-        out.push_str(&format!("  {vname}({}),\n", v.value));
+    let mut w = CodeWriter::two_space();
+    w.blank();
+    {
+        let mut d = String::new();
+        emit_doc(&mut d, &e.doc, "");
+        w.raw(d);
     }
-    out.push_str("  ;\n");
-    out.push_str(&format!("  const {name}(this.value);\n"));
-    out.push_str("  final int value;\n\n");
-    out.push_str(&format!(
-        "  static {name} fromValue(int value) =>\n      {name}.values.firstWhere((e) => e.value == value);\n"
-    ));
-    out.push_str("}\n");
+    w.block(format!("enum {name} {{"), "}", |w| {
+        for v in &e.variants {
+            let vname = v.name.to_lower_camel_case();
+            let mut vd = String::new();
+            emit_doc(&mut vd, &v.doc, "  ");
+            w.raw(vd);
+            w.line(format!("{vname}({}),", v.value));
+        }
+        w.line(";");
+        w.line(format!("const {name}(this.value);"));
+        w.line("final int value;");
+        w.blank();
+        w.line(format!(
+            "static {name} fromValue(int value) =>\n      {name}.values.firstWhere((e) => e.value == value);"
+        ));
+    });
+    out.push_str(&w.finish());
 }
 
 fn render_struct(out: &mut String, s: &StructBinding) {
@@ -986,24 +1015,27 @@ fn render_struct(out: &mut String, s: &StructBinding) {
         emit_field_getter_typedef(out, field);
     }
 
-    out.push('\n');
-    emit_doc(out, &s.doc, "");
-    out.push_str(&format!("class {class_name} {{\n"));
-    out.push_str("  final Pointer<Void> _handle;\n");
-    out.push_str(&format!("  {class_name}._(this._handle);\n\n"));
-
-    out.push_str("  void dispose() {\n");
-    out.push_str(&format!(
-        "    _{}(_handle);\n",
-        destroy_sym.to_lower_camel_case()
-    ));
-    out.push_str("  }\n");
-
-    for field in &s.fields {
-        emit_field_getter_method(out, field);
+    let mut w = CodeWriter::two_space();
+    w.blank();
+    {
+        let mut d = String::new();
+        emit_doc(&mut d, &s.doc, "");
+        w.raw(d);
     }
-
-    out.push_str("}\n");
+    w.block(format!("class {class_name} {{"), "}", |w| {
+        w.line("final Pointer<Void> _handle;");
+        w.line(format!("{class_name}._(this._handle);"));
+        w.blank();
+        w.block("void dispose() {", "}", |w| {
+            w.line(format!("_{}(_handle);", destroy_sym.to_lower_camel_case()));
+        });
+        for field in &s.fields {
+            let mut m = String::new();
+            emit_field_getter_method(&mut m, field);
+            w.raw(m);
+        }
+    });
+    out.push_str(&w.finish());
 }
 
 /// Emit the dart:ffi typedef + `lookupFunction` for one opaque-object field
@@ -1041,41 +1073,61 @@ fn emit_field_getter_method(out: &mut String, field: &FieldBinding) {
     let dart_ret = dart_type(&field.ty);
     let fname = field.name.to_lower_camel_case();
 
-    out.push('\n');
-    emit_doc(out, &field.doc, "  ");
-    out.push_str(&format!("  {dart_ret} get {fname} {{\n"));
+    let mut w = CodeWriter::two_space().with_depth(1);
+    w.blank();
+    {
+        let mut d = String::new();
+        emit_doc(&mut d, &field.doc, "  ");
+        w.raw(d);
+    }
+    w.line(format!("{dart_ret} get {fname} {{"));
     if return_has_out_params(&field.ty) {
         let mut frees: Vec<String> = Vec::new();
         let mut args = vec!["_handle".to_string()];
-        args.extend(emit_return_alloc(out, &field.ty, &mut frees, "    "));
-        out.push_str("    try {\n");
-        if matches!(&field.ty, TypeRef::Map(_, _)) {
-            out.push_str(&format!(
-                "      _{}({});\n",
-                getter_sym.to_lower_camel_case(),
-                args.join(", ")
-            ));
-        } else {
-            out.push_str(&format!(
-                "      final result = _{}({});\n",
-                getter_sym.to_lower_camel_case(),
-                args.join(", ")
-            ));
-        }
-        emit_return_decode(out, &field.ty, "      ");
-        out.push_str("    } finally {\n");
-        for fr in &frees {
-            out.push_str(&format!("      {fr}\n"));
-        }
-        out.push_str("    }\n");
+        let mut alloc = String::new();
+        args.extend(emit_return_alloc(&mut alloc, &field.ty, &mut frees, "    "));
+        let mut dec = String::new();
+        emit_return_decode(&mut dec, &field.ty, "      ");
+        w.raw(alloc);
+        w.scope(|w| {
+            w.line("try {");
+            w.scope(|w| {
+                if matches!(&field.ty, TypeRef::Map(_, _)) {
+                    w.line(format!(
+                        "_{}({});",
+                        getter_sym.to_lower_camel_case(),
+                        args.join(", ")
+                    ));
+                } else {
+                    w.line(format!(
+                        "final result = _{}({});",
+                        getter_sym.to_lower_camel_case(),
+                        args.join(", ")
+                    ));
+                }
+                w.raw(&dec);
+            });
+            w.line("} finally {");
+            w.scope(|w| {
+                for fr in &frees {
+                    w.line(fr);
+                }
+            });
+            w.line("}");
+        });
     } else {
-        out.push_str(&format!(
-            "    final result = _{}(_handle);\n",
-            getter_sym.to_lower_camel_case()
-        ));
-        emit_result_conversion(out, &field.ty, "    ");
+        let mut conv = String::new();
+        emit_result_conversion(&mut conv, &field.ty, "    ");
+        w.scope(|w| {
+            w.line(format!(
+                "final result = _{}(_handle);",
+                getter_sym.to_lower_camel_case()
+            ));
+            w.raw(conv);
+        });
     }
-    out.push_str("  }\n");
+    w.line("}");
+    out.push_str(&w.finish());
 }
 
 fn render_dart_builder(out: &mut String, s: &StructBinding) {
@@ -1104,74 +1156,99 @@ fn render_dart_builder(out: &mut String, s: &StructBinding) {
         "Pointer<Void>",
     );
 
-    out.push('\n');
-    emit_doc(out, &s.doc, "");
-    out.push_str(&format!("class {builder_name} {{\n"));
-    for field in &s.fields {
-        let dt = dart_nullable_type_for_builder_field(&field.ty);
-        let priv_name = field.name.to_lower_camel_case();
-        out.push_str(&format!("  {dt} _{priv_name};\n"));
-    }
-
-    for field in &s.fields {
-        let pascal = field.name.to_upper_camel_case();
-        let dt = dart_type(&field.ty);
-        let priv_name = field.name.to_lower_camel_case();
-        out.push('\n');
-        emit_doc(out, &field.doc, "  ");
-        out.push_str(&format!(
-            "  {builder_name} with{pascal}({dt} value) {{\n    _{priv_name} = value;\n    return this;\n  }}\n"
-        ));
-    }
-
-    out.push_str(&format!("\n  {class_name} build() {{\n"));
-    // Required fields must be set; optional fields default to null.
-    for field in &s.fields {
-        if !matches!(&field.ty, TypeRef::Optional(_)) {
-            let priv_name = field.name.to_lower_camel_case();
-            out.push_str(&format!(
-                "    if (_{priv_name} == null) {{\n      throw StateError('missing field: {}');\n    }}\n",
-                field.name
-            ));
-        }
-    }
-    for field in &s.fields {
-        let priv_name = field.name.to_lower_camel_case();
-        if matches!(&field.ty, TypeRef::Optional(_)) {
-            out.push_str(&format!("    final {priv_name} = _{priv_name};\n"));
-        } else {
-            out.push_str(&format!("    final {priv_name} = _{priv_name}!;\n"));
-        }
-    }
     let mut frees: Vec<String> = Vec::new();
     let mut call_args: Vec<String> = Vec::new();
+    let mut staging = String::new();
     for field in &s.fields {
         let args = emit_input(
-            out,
+            &mut staging,
             &field.name.to_lower_camel_case(),
             &field.ty,
             &mut frees,
         );
         call_args.extend(args);
     }
-    out.push_str("    final err = calloc<_WeaveFFIError>();\n");
     frees.push("calloc.free(err);".into());
     call_args.push("err".into());
-    out.push_str("    try {\n");
-    out.push_str(&format!(
-        "      final result = _{}({});\n",
-        create_sym.to_lower_camel_case(),
-        call_args.join(", ")
-    ));
-    out.push_str("      _checkError(err);\n");
-    out.push_str(&format!("      return {class_name}._(result);\n"));
-    out.push_str("    } finally {\n");
-    for fr in &frees {
-        out.push_str(&format!("      {fr}\n"));
+
+    let mut w = CodeWriter::two_space();
+    w.blank();
+    {
+        let mut d = String::new();
+        emit_doc(&mut d, &s.doc, "");
+        w.raw(d);
     }
-    out.push_str("    }\n");
-    out.push_str("  }\n");
-    out.push_str("}\n");
+    w.block(format!("class {builder_name} {{"), "}", |w| {
+        for field in &s.fields {
+            let dt = dart_nullable_type_for_builder_field(&field.ty);
+            let priv_name = field.name.to_lower_camel_case();
+            w.line(format!("{dt} _{priv_name};"));
+        }
+
+        for field in &s.fields {
+            let pascal = field.name.to_upper_camel_case();
+            let dt = dart_type(&field.ty);
+            let priv_name = field.name.to_lower_camel_case();
+            w.blank();
+            {
+                let mut fd = String::new();
+                emit_doc(&mut fd, &field.doc, "  ");
+                w.raw(fd);
+            }
+            w.block(
+                format!("{builder_name} with{pascal}({dt} value) {{"),
+                "}",
+                |w| {
+                    w.line(format!("_{priv_name} = value;"));
+                    w.line("return this;");
+                },
+            );
+        }
+
+        w.blank();
+        w.block(format!("{class_name} build() {{"), "}", |w| {
+            // Required fields must be set; optional fields default to null.
+            for field in &s.fields {
+                if !matches!(&field.ty, TypeRef::Optional(_)) {
+                    let priv_name = field.name.to_lower_camel_case();
+                    w.block(format!("if (_{priv_name} == null) {{"), "}", |w| {
+                        w.line(format!(
+                            "throw StateError('missing field: {}');",
+                            field.name
+                        ));
+                    });
+                }
+            }
+            for field in &s.fields {
+                let priv_name = field.name.to_lower_camel_case();
+                if matches!(&field.ty, TypeRef::Optional(_)) {
+                    w.line(format!("final {priv_name} = _{priv_name};"));
+                } else {
+                    w.line(format!("final {priv_name} = _{priv_name}!;"));
+                }
+            }
+            w.raw(&staging);
+            w.line("final err = calloc<_WeaveFFIError>();");
+            w.line("try {");
+            w.scope(|w| {
+                w.line(format!(
+                    "final result = _{}({});",
+                    create_sym.to_lower_camel_case(),
+                    call_args.join(", ")
+                ));
+                w.line("_checkError(err);");
+                w.line(format!("return {class_name}._(result);"));
+            });
+            w.line("} finally {");
+            w.scope(|w| {
+                for fr in &frees {
+                    w.line(fr);
+                }
+            });
+            w.line("}");
+        });
+    });
+    out.push_str(&w.finish());
 }
 
 /// Render a rich (algebraic) enum as an opaque-object wrapper, mirroring the
@@ -1223,60 +1300,78 @@ fn render_rich_enum(out: &mut String, e: &EnumBinding) {
         }
     }
 
-    out.push('\n');
-    emit_doc(out, &e.doc, "");
-    out.push_str(&format!("class {class_name} {{\n"));
-    out.push_str("  final Pointer<Void> _handle;\n");
-    out.push_str(&format!("  {class_name}._(this._handle);\n\n"));
-
-    out.push_str("  void dispose() {\n");
-    out.push_str(&format!(
-        "    _{}(_handle);\n",
-        rich.destroy_symbol.to_lower_camel_case()
-    ));
-    out.push_str("  }\n");
-
-    // The active variant's discriminant, read back as the typed tag enum.
-    out.push('\n');
-    out.push_str(&format!(
-        "  {tag_name} get tag =>\n      {tag_name}.fromValue(_{}(_handle));\n",
-        rich.tag_symbol.to_lower_camel_case()
-    ));
-
-    // One factory constructor per variant (`Shape.circle(2.5)`).
-    for v in &rich.variants {
-        emit_rich_variant_factory(out, &class_name, v);
+    let mut w = CodeWriter::two_space();
+    w.blank();
+    {
+        let mut d = String::new();
+        emit_doc(&mut d, &e.doc, "");
+        w.raw(d);
     }
+    w.block(format!("class {class_name} {{"), "}", |w| {
+        w.line("final Pointer<Void> _handle;");
+        w.line(format!("{class_name}._(this._handle);"));
+        w.blank();
+        w.block("void dispose() {", "}", |w| {
+            w.line(format!(
+                "_{}(_handle);",
+                rich.destroy_symbol.to_lower_camel_case()
+            ));
+        });
 
-    // Per-variant field getters, namespaced by variant (`circleRadius`).
-    for v in &rich.variants {
-        for field in namespaced_variant_fields(v) {
-            emit_field_getter_method(out, &field);
+        // The active variant's discriminant, read back as the typed tag enum.
+        w.blank();
+        w.line(format!(
+            "{tag_name} get tag =>\n      {tag_name}.fromValue(_{}(_handle));",
+            rich.tag_symbol.to_lower_camel_case()
+        ));
+
+        // One factory constructor per variant (`Shape.circle(2.5)`).
+        for v in &rich.variants {
+            let mut m = String::new();
+            emit_rich_variant_factory(&mut m, &class_name, v);
+            w.raw(m);
         }
-    }
 
-    out.push_str("}\n");
+        // Per-variant field getters, namespaced by variant (`circleRadius`).
+        for v in &rich.variants {
+            for field in namespaced_variant_fields(v) {
+                let mut m = String::new();
+                emit_field_getter_method(&mut m, &field);
+                w.raw(m);
+            }
+        }
+    });
+    out.push_str(&w.finish());
 }
 
 /// The typed discriminant of a rich enum, emitted as a top-level Dart `enum`
 /// (Dart cannot nest an `enum` in a class). Mirrors [`render_enum`]'s enhanced
 /// enum so `tag` reads back as e.g. `ShapeTag.circle`.
 fn render_rich_enum_tag(out: &mut String, e: &EnumBinding, tag_name: &str) {
-    out.push('\n');
-    emit_doc(out, &e.doc, "");
-    out.push_str(&format!("enum {tag_name} {{\n"));
-    for v in &e.variants {
-        let vname = v.name.to_lower_camel_case();
-        emit_doc(out, &v.doc, "  ");
-        out.push_str(&format!("  {vname}({}),\n", v.value));
+    let mut w = CodeWriter::two_space();
+    w.blank();
+    {
+        let mut d = String::new();
+        emit_doc(&mut d, &e.doc, "");
+        w.raw(d);
     }
-    out.push_str("  ;\n");
-    out.push_str(&format!("  const {tag_name}(this.value);\n"));
-    out.push_str("  final int value;\n\n");
-    out.push_str(&format!(
-        "  static {tag_name} fromValue(int value) =>\n      {tag_name}.values.firstWhere((e) => e.value == value);\n"
-    ));
-    out.push_str("}\n");
+    w.block(format!("enum {tag_name} {{"), "}", |w| {
+        for v in &e.variants {
+            let vname = v.name.to_lower_camel_case();
+            let mut vd = String::new();
+            emit_doc(&mut vd, &v.doc, "  ");
+            w.raw(vd);
+            w.line(format!("{vname}({}),", v.value));
+        }
+        w.line(";");
+        w.line(format!("const {tag_name}(this.value);"));
+        w.line("final int value;");
+        w.blank();
+        w.line(format!(
+            "static {tag_name} fromValue(int value) =>\n      {tag_name}.values.firstWhere((e) => e.value == value);"
+        ));
+    });
+    out.push_str(&w.finish());
 }
 
 /// Project a variant's fields into [`FieldBinding`]s whose Dart member name is
@@ -1336,36 +1431,55 @@ fn emit_rich_variant_factory(out: &mut String, class_name: &str, v: &RichVariant
         .map(|f| format!("{} {}", dart_type(&f.ty), f.name.to_lower_camel_case()))
         .collect();
 
-    out.push('\n');
-    emit_doc(out, &v.doc, "  ");
-    out.push_str(&format!(
-        "  factory {class_name}.{factory}({}) {{\n",
-        params.join(", ")
-    ));
-
     let mut frees: Vec<String> = Vec::new();
     let mut call_args: Vec<String> = Vec::new();
+    let mut staging = String::new();
     for f in &v.fields {
-        let args = emit_input(out, &f.name.to_lower_camel_case(), &f.ty, &mut frees);
+        let args = emit_input(
+            &mut staging,
+            &f.name.to_lower_camel_case(),
+            &f.ty,
+            &mut frees,
+        );
         call_args.extend(args);
     }
-    out.push_str("    final err = calloc<_WeaveFFIError>();\n");
     frees.push("calloc.free(err);".into());
     call_args.push("err".into());
-    out.push_str("    try {\n");
-    out.push_str(&format!(
-        "      final result = _{}({});\n",
-        create_sym.to_lower_camel_case(),
-        call_args.join(", ")
-    ));
-    out.push_str("      _checkError(err);\n");
-    out.push_str(&format!("      return {class_name}._(result);\n"));
-    out.push_str("    } finally {\n");
-    for fr in &frees {
-        out.push_str(&format!("      {fr}\n"));
+
+    let mut w = CodeWriter::two_space().with_depth(1);
+    w.blank();
+    {
+        let mut d = String::new();
+        emit_doc(&mut d, &v.doc, "  ");
+        w.raw(d);
     }
-    out.push_str("    }\n");
-    out.push_str("  }\n");
+    w.line(format!(
+        "factory {class_name}.{factory}({}) {{",
+        params.join(", ")
+    ));
+    w.raw(staging);
+    w.scope(|w| {
+        w.line("final err = calloc<_WeaveFFIError>();");
+        w.line("try {");
+        w.scope(|w| {
+            w.line(format!(
+                "final result = _{}({});",
+                create_sym.to_lower_camel_case(),
+                call_args.join(", ")
+            ));
+            w.line("_checkError(err);");
+            w.line(format!("return {class_name}._(result);"));
+        });
+        w.line("} finally {");
+        w.scope(|w| {
+            for fr in &frees {
+                w.line(fr);
+            }
+        });
+        w.line("}");
+    });
+    w.line("}");
+    out.push_str(&w.finish());
 }
 
 fn render_function(out: &mut String, f: &FnBinding) {
@@ -1425,18 +1539,28 @@ fn render_function(out: &mut String, f: &FnBinding) {
         emit_iter_lookups(out, ib);
     }
 
-    out.push('\n');
-    emit_doc(out, &f.doc, "");
+    let mut w = CodeWriter::two_space();
+    w.blank();
+    {
+        let mut d = String::new();
+        emit_doc(&mut d, &f.doc, "");
+        w.raw(d);
+    }
     if let Some(msg) = &f.deprecated {
         let escaped = msg.replace('\'', "\\'");
-        out.push_str(&format!("@Deprecated('{escaped}')\n"));
+        w.line(format!("@Deprecated('{escaped}')"));
     }
-    out.push_str(&format!(
-        "{pub_ret} {wrapper_name}({}) {{\n",
+    w.line(format!(
+        "{pub_ret} {wrapper_name}({}) {{",
         wrapper_params.join(", ")
     ));
-    emit_function_body(out, f, c_sym);
-    out.push_str("}\n");
+    {
+        let mut body = String::new();
+        emit_function_body(&mut body, f, c_sym);
+        w.raw(body);
+    }
+    w.line("}");
+    out.push_str(&w.finish());
 }
 
 /// The native FFI typedef for a module-level callback declaration, shared by
@@ -1565,41 +1689,53 @@ fn render_listener(out: &mut String, m: &ModuleBinding, l: &ListenerBinding) {
     tramp_decls.push("Pointer<Void> context".into());
     let call_args: Vec<String> = cb.params.iter().map(cb_arg_expr).collect();
 
-    out.push('\n');
-    emit_doc(out, &l.doc, "");
-    out.push_str(&format!(
-        "/// Registers a {} listener. Returns a subscription id for {unregister_name}().\n",
+    let mut w = CodeWriter::two_space();
+    w.blank();
+    {
+        let mut d = String::new();
+        emit_doc(&mut d, &l.doc, "");
+        w.raw(d);
+    }
+    w.line(format!(
+        "/// Registers a {} listener. Returns a subscription id for {unregister_name}().",
         cb.name
     ));
-    out.push_str(&format!(
-        "int {register_name}(void Function({}) callback) {{\n",
-        user_fn_params.join(", ")
-    ));
-    out.push_str(&format!(
-        "  final callable = NativeCallable<{cb_typedef}>.isolateLocal(({}) {{\n",
-        tramp_decls.join(", ")
-    ));
-    out.push_str(&format!("    callback({});\n", call_args.join(", ")));
-    out.push_str("  });\n");
-    out.push_str(&format!(
-        "  final id = _{}(callable.nativeFunction, nullptr);\n",
-        l.register_symbol.to_lower_camel_case()
-    ));
-    out.push_str("  _listenerCallables[id] = callable;\n");
-    out.push_str("  return id;\n");
-    out.push_str("}\n");
+    w.block(
+        format!(
+            "int {register_name}(void Function({}) callback) {{",
+            user_fn_params.join(", ")
+        ),
+        "}",
+        |w| {
+            w.line(format!(
+                "final callable = NativeCallable<{cb_typedef}>.isolateLocal(({}) {{",
+                tramp_decls.join(", ")
+            ));
+            w.scope(|w| {
+                w.line(format!("callback({});", call_args.join(", ")));
+            });
+            w.line("});");
+            w.line(format!(
+                "final id = _{}(callable.nativeFunction, nullptr);",
+                l.register_symbol.to_lower_camel_case()
+            ));
+            w.line("_listenerCallables[id] = callable;");
+            w.line("return id;");
+        },
+    );
 
-    out.push('\n');
-    out.push_str(&format!(
-        "/// Unregisters a listener previously registered with {register_name}().\n"
+    w.blank();
+    w.line(format!(
+        "/// Unregisters a listener previously registered with {register_name}()."
     ));
-    out.push_str(&format!("void {unregister_name}(int id) {{\n"));
-    out.push_str(&format!(
-        "  _{}(id);\n",
-        l.unregister_symbol.to_lower_camel_case()
-    ));
-    out.push_str("  _listenerCallables.remove(id)?.close();\n");
-    out.push_str("}\n");
+    w.block(format!("void {unregister_name}(int id) {{"), "}", |w| {
+        w.line(format!(
+            "_{}(id);",
+            l.unregister_symbol.to_lower_camel_case()
+        ));
+        w.line("_listenerCallables.remove(id)?.close();");
+    });
+    out.push_str(&w.finish());
 }
 
 /// Returns the (native, dart) FFI types of the trailing callback parameters
@@ -1690,35 +1826,24 @@ fn render_async_function(
         "void",
     );
 
-    out.push('\n');
-    emit_doc(out, &f.doc, "");
-    if let Some(msg) = &f.deprecated {
-        let escaped = msg.replace('\'', "\\'");
-        out.push_str(&format!("@Deprecated('{escaped}')\n"));
-    }
-    out.push_str(&format!(
-        "Future<{pub_ret}> {wrapper_name}({}) {{\n",
-        wrapper_params.join(", ")
-    ));
-
     let completer_type = if f.ret.is_some() {
         pub_ret.to_string()
     } else {
         "void".to_string()
     };
-    out.push_str(&format!(
-        "  final completer = Completer<{completer_type}>();\n"
-    ));
 
-    let mut native_strings = Vec::new();
-    for p in &f.params {
-        if matches!(p.ty, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
+    // String inputs are pinned across the async call and freed on completion;
+    // capture `(pointer name, source name)` up front so the writer emits the
+    // staging in order and the cleanup can reference the pointers.
+    let native_strings: Vec<(String, String)> = f
+        .params
+        .iter()
+        .filter(|p| matches!(p.ty, TypeRef::StringUtf8 | TypeRef::BorrowedStr))
+        .map(|p| {
             let pname = p.name.to_lower_camel_case();
-            let ptr = format!("{pname}Ptr");
-            out.push_str(&format!("  final {ptr} = {pname}.toNativeUtf8();\n"));
-            native_strings.push(ptr);
-        }
-    }
+            (format!("{pname}Ptr"), pname)
+        })
+        .collect();
 
     let cb_dart_params: Vec<String> = std::iter::once("Pointer<Void>".to_string())
         .chain(std::iter::once("Pointer<_WeaveFFIError>".to_string()))
@@ -1740,27 +1865,6 @@ fn render_async_function(
         .map(|(t, n)| format!("{t} {n}"))
         .collect();
 
-    out.push_str(&format!("  late NativeCallable<{cb_typedef}> callable;\n"));
-    out.push_str(&format!(
-        "  callable = NativeCallable<{cb_typedef}>.listener(({}) {{\n",
-        cb_param_decls.join(", ")
-    ));
-    out.push_str("    try {\n");
-    out.push_str("      if (err.address != 0 && err.ref.code != 0) {\n");
-    out.push_str("        final code = err.ref.code;\n");
-    out.push_str("        final msg = err.ref.message.toDartString();\n");
-    out.push_str("        _weaveffiErrorClear(err);\n");
-    out.push_str("        completer.completeError(WeaveFFIException(code, msg));\n");
-    out.push_str("        return;\n");
-    out.push_str("      }\n");
-    emit_async_complete(out, f.ret.as_ref(), "      ");
-    out.push_str("    } catch (e) {\n");
-    out.push_str("      completer.completeError(e);\n");
-    out.push_str("    } finally {\n");
-    out.push_str("      callable.close();\n");
-    out.push_str("    }\n");
-    out.push_str("  });\n");
-
     let mut call_args: Vec<String> = Vec::new();
     for p in &f.params {
         let pname = p.name.to_lower_camel_case();
@@ -1779,88 +1883,160 @@ fn render_async_function(
     call_args.push("nullptr".into());
 
     let var = async_sym.to_lower_camel_case();
-    out.push_str("  try {\n");
-    out.push_str(&format!("    _{var}({});\n", call_args.join(", ")));
-    out.push_str("  } catch (e) {\n");
-    out.push_str("    callable.close();\n");
-    for ns in &native_strings {
-        out.push_str(&format!("    calloc.free({ns});\n"));
+
+    let mut ac = String::new();
+    emit_async_complete(&mut ac, f.ret.as_ref(), "      ");
+
+    let mut w = CodeWriter::two_space();
+    w.blank();
+    {
+        let mut d = String::new();
+        emit_doc(&mut d, &f.doc, "");
+        w.raw(d);
     }
-    out.push_str("    rethrow;\n");
-    out.push_str("  }\n");
-    if native_strings.is_empty() {
-        out.push_str("  return completer.future;\n");
-    } else {
-        out.push_str("  return completer.future.whenComplete(() {\n");
-        for ns in &native_strings {
-            out.push_str(&format!("    calloc.free({ns});\n"));
-        }
-        out.push_str("  });\n");
+    if let Some(msg) = &f.deprecated {
+        let escaped = msg.replace('\'', "\\'");
+        w.line(format!("@Deprecated('{escaped}')"));
     }
-    out.push_str("}\n");
+    w.block(
+        format!(
+            "Future<{pub_ret}> {wrapper_name}({}) {{",
+            wrapper_params.join(", ")
+        ),
+        "}",
+        |w| {
+            w.line(format!("final completer = Completer<{completer_type}>();"));
+            for (ptr, pname) in &native_strings {
+                w.line(format!("final {ptr} = {pname}.toNativeUtf8();"));
+            }
+            w.line(format!("late NativeCallable<{cb_typedef}> callable;"));
+            w.line(format!(
+                "callable = NativeCallable<{cb_typedef}>.listener(({}) {{",
+                cb_param_decls.join(", ")
+            ));
+            w.scope(|w| {
+                w.line("try {");
+                w.scope(|w| {
+                    w.line("if (err.address != 0 && err.ref.code != 0) {");
+                    w.scope(|w| {
+                        w.line("final code = err.ref.code;");
+                        w.line("final msg = err.ref.message.toDartString();");
+                        w.line("_weaveffiErrorClear(err);");
+                        w.line("completer.completeError(WeaveFFIException(code, msg));");
+                        w.line("return;");
+                    });
+                    w.line("}");
+                    w.raw(&ac);
+                });
+                w.line("} catch (e) {");
+                w.scope(|w| {
+                    w.line("completer.completeError(e);");
+                });
+                w.line("} finally {");
+                w.scope(|w| {
+                    w.line("callable.close();");
+                });
+                w.line("}");
+            });
+            w.line("});");
+            w.line("try {");
+            w.scope(|w| {
+                w.line(format!("_{var}({});", call_args.join(", ")));
+            });
+            w.line("} catch (e) {");
+            w.scope(|w| {
+                w.line("callable.close();");
+                for (ptr, _) in &native_strings {
+                    w.line(format!("calloc.free({ptr});"));
+                }
+                w.line("rethrow;");
+            });
+            w.line("}");
+            if native_strings.is_empty() {
+                w.line("return completer.future;");
+            } else {
+                w.line("return completer.future.whenComplete(() {");
+                w.scope(|w| {
+                    for (ptr, _) in &native_strings {
+                        w.line(format!("calloc.free({ptr});"));
+                    }
+                });
+                w.line("});");
+            }
+        },
+    );
+    out.push_str(&w.finish());
 }
 
 fn emit_async_complete(out: &mut String, ty: Option<&TypeRef>, indent: &str) {
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     match ty {
         None => {
-            out.push_str(&format!("{indent}completer.complete();\n"));
+            w.line("completer.complete();");
         }
         Some(TypeRef::Bool) => {
-            out.push_str(&format!("{indent}completer.complete(result != 0);\n"));
+            w.line("completer.complete(result != 0);");
         }
         Some(TypeRef::Enum(name)) => {
             let n = local_type_name(name).to_upper_camel_case();
-            out.push_str(&format!(
-                "{indent}completer.complete({n}.fromValue(result));\n"
-            ));
+            w.line(format!("completer.complete({n}.fromValue(result));"));
         }
         Some(TypeRef::Struct(name)) => {
             let n = local_type_name(name).to_upper_camel_case();
-            out.push_str(&format!("{indent}completer.complete({n}._(result));\n"));
+            w.line(format!("completer.complete({n}._(result));"));
         }
         Some(TypeRef::TypedHandle(name)) => {
             let n = local_type_name(name).to_upper_camel_case();
-            out.push_str(&format!("{indent}completer.complete({n}._(result));\n"));
+            w.line(format!("completer.complete({n}._(result));"));
         }
         Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
-            out.push_str(&format!(
-                "{indent}completer.complete(result.toDartString());\n"
-            ));
+            w.line("completer.complete(result.toDartString());");
         }
         Some(TypeRef::Optional(inner)) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                out.push_str(&format!("{indent}if (result == nullptr) {{\n"));
-                out.push_str(&format!("{indent}  completer.complete(null);\n"));
-                out.push_str(&format!("{indent}}} else {{\n"));
-                out.push_str(&format!(
-                    "{indent}  completer.complete(result.toDartString());\n"
-                ));
-                out.push_str(&format!("{indent}}}\n"));
+                w.line("if (result == nullptr) {");
+                w.scope(|w| {
+                    w.line("completer.complete(null);");
+                });
+                w.line("} else {");
+                w.scope(|w| {
+                    w.line("completer.complete(result.toDartString());");
+                });
+                w.line("}");
             }
             TypeRef::Struct(name) => {
                 let n = local_type_name(name).to_upper_camel_case();
-                out.push_str(&format!("{indent}if (result == nullptr) {{\n"));
-                out.push_str(&format!("{indent}  completer.complete(null);\n"));
-                out.push_str(&format!("{indent}}} else {{\n"));
-                out.push_str(&format!("{indent}  completer.complete({n}._(result));\n"));
-                out.push_str(&format!("{indent}}}\n"));
+                w.line("if (result == nullptr) {");
+                w.scope(|w| {
+                    w.line("completer.complete(null);");
+                });
+                w.line("} else {");
+                w.scope(|w| {
+                    w.line(format!("completer.complete({n}._(result));"));
+                });
+                w.line("}");
             }
             TypeRef::TypedHandle(name) => {
                 let n = local_type_name(name).to_upper_camel_case();
-                out.push_str(&format!("{indent}if (result == nullptr) {{\n"));
-                out.push_str(&format!("{indent}  completer.complete(null);\n"));
-                out.push_str(&format!("{indent}}} else {{\n"));
-                out.push_str(&format!("{indent}  completer.complete({n}._(result));\n"));
-                out.push_str(&format!("{indent}}}\n"));
+                w.line("if (result == nullptr) {");
+                w.scope(|w| {
+                    w.line("completer.complete(null);");
+                });
+                w.line("} else {");
+                w.scope(|w| {
+                    w.line(format!("completer.complete({n}._(result));"));
+                });
+                w.line("}");
             }
             _ => {
-                out.push_str(&format!("{indent}completer.complete(result);\n"));
+                w.line("completer.complete(result);");
             }
         },
         Some(_) => {
-            out.push_str(&format!("{indent}completer.complete(result);\n"));
+            w.line("completer.complete(result);");
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn emit_function_body(out: &mut String, f: &FnBinding, c_sym: &str) {
@@ -1871,36 +2047,52 @@ fn emit_function_body(out: &mut String, f: &FnBinding, c_sym: &str) {
 
     let mut frees: Vec<String> = Vec::new();
     let mut call_args: Vec<String> = Vec::new();
+    let mut staging = String::new();
     for p in &f.params {
-        let args = emit_input(out, &p.name.to_lower_camel_case(), &p.ty, &mut frees);
+        let args = emit_input(
+            &mut staging,
+            &p.name.to_lower_camel_case(),
+            &p.ty,
+            &mut frees,
+        );
         call_args.extend(args);
     }
     if let Some(ret) = &f.ret {
-        call_args.extend(emit_return_alloc(out, ret, &mut frees, "  "));
+        call_args.extend(emit_return_alloc(&mut staging, ret, &mut frees, "  "));
     }
-    out.push_str("  final err = calloc<_WeaveFFIError>();\n");
     frees.push("calloc.free(err);".into());
     call_args.push("err".into());
 
-    out.push_str("  try {\n");
     let var = c_sym.to_lower_camel_case();
     let args = call_args.join(", ");
     // A map return is a `void` symbol whose results land in the out-params.
     let void_call = f.ret.is_none() || matches!(&f.ret, Some(TypeRef::Map(_, _)));
-    if void_call {
-        out.push_str(&format!("    _{var}({args});\n"));
-    } else {
-        out.push_str(&format!("    final result = _{var}({args});\n"));
-    }
-    out.push_str("    _checkError(err);\n");
+    let mut dec = String::new();
     if let Some(ret) = &f.ret {
-        emit_return_decode(out, ret, "    ");
+        emit_return_decode(&mut dec, ret, "    ");
     }
-    out.push_str("  } finally {\n");
-    for fr in &frees {
-        out.push_str(&format!("    {fr}\n"));
-    }
-    out.push_str("  }\n");
+
+    let mut w = CodeWriter::two_space().with_depth(1);
+    w.raw(staging);
+    w.line("final err = calloc<_WeaveFFIError>();");
+    w.line("try {");
+    w.scope(|w| {
+        if void_call {
+            w.line(format!("_{var}({args});"));
+        } else {
+            w.line(format!("final result = _{var}({args});"));
+        }
+        w.line("_checkError(err);");
+        w.raw(&dec);
+    });
+    w.line("} finally {");
+    w.scope(|w| {
+        for fr in &frees {
+            w.line(fr);
+        }
+    });
+    w.line("}");
+    out.push_str(&w.finish());
 }
 
 /// Bind the element `next`/`destroy` symbols of an iterator-returning function.
@@ -1928,172 +2120,168 @@ fn emit_iter_lookups(out: &mut String, ib: &IteratorBinding) {
 fn emit_iterator_body(out: &mut String, f: &FnBinding, c_sym: &str, ib: &IteratorBinding) {
     let mut frees: Vec<String> = Vec::new();
     let mut call_args: Vec<String> = Vec::new();
+    let mut staging = String::new();
     for p in &f.params {
-        let args = emit_input(out, &p.name.to_lower_camel_case(), &p.ty, &mut frees);
+        let args = emit_input(
+            &mut staging,
+            &p.name.to_lower_camel_case(),
+            &p.ty,
+            &mut frees,
+        );
         call_args.extend(args);
     }
-    out.push_str("  final err = calloc<_WeaveFFIError>();\n");
     frees.push("calloc.free(err);".into());
     call_args.push("err".into());
 
-    out.push_str("  try {\n");
     let var = c_sym.to_lower_camel_case();
-    out.push_str(&format!(
-        "    final iter = _{var}({});\n",
-        call_args.join(", ")
-    ));
-    out.push_str("    _checkError(err);\n");
     let elem = &ib.elem;
     let dt = dart_type(elem);
-    out.push_str(&format!("    final items = <{dt}>[];\n"));
-    out.push_str(&format!(
-        "    final outItem = calloc<{}>();\n",
-        iter_item_pointee(elem)
-    ));
-    out.push_str(&format!(
-        "    while (_{}(iter, outItem, err) != 0) {{\n",
-        ib.next.symbol.to_lower_camel_case()
-    ));
-    out.push_str("      _checkError(err);\n");
-    out.push_str(&format!(
-        "      items.add({});\n",
-        read_value("outItem.value", elem)
-    ));
-    out.push_str("    }\n");
-    out.push_str("    _checkError(err);\n");
-    out.push_str("    calloc.free(outItem);\n");
-    out.push_str(&format!(
-        "    _{}(iter);\n",
-        ib.destroy_symbol.to_lower_camel_case()
-    ));
-    out.push_str("    return items;\n");
-    out.push_str("  } finally {\n");
-    for fr in &frees {
-        out.push_str(&format!("    {fr}\n"));
-    }
-    out.push_str("  }\n");
+
+    let mut w = CodeWriter::two_space().with_depth(1);
+    w.raw(staging);
+    w.line("final err = calloc<_WeaveFFIError>();");
+    w.line("try {");
+    w.scope(|w| {
+        w.line(format!("final iter = _{var}({});", call_args.join(", ")));
+        w.line("_checkError(err);");
+        w.line(format!("final items = <{dt}>[];"));
+        w.line(format!(
+            "final outItem = calloc<{}>();",
+            iter_item_pointee(elem)
+        ));
+        w.line(format!(
+            "while (_{}(iter, outItem, err) != 0) {{",
+            ib.next.symbol.to_lower_camel_case()
+        ));
+        w.scope(|w| {
+            w.line("_checkError(err);");
+            w.line(format!("items.add({});", read_value("outItem.value", elem)));
+        });
+        w.line("}");
+        w.line("_checkError(err);");
+        w.line("calloc.free(outItem);");
+        w.line(format!(
+            "_{}(iter);",
+            ib.destroy_symbol.to_lower_camel_case()
+        ));
+        w.line("return items;");
+    });
+    w.line("} finally {");
+    w.scope(|w| {
+        for fr in &frees {
+            w.line(fr);
+        }
+    });
+    w.line("}");
+    out.push_str(&w.finish());
 }
 
 /// Materialises a `T**` + `out_len` C return into a Dart `List<T>`. The array
 /// buffer is owned by the callee per the WeaveFFI ABI; element ownership (e.g.
 /// struct handles) transfers to the caller, who disposes each element.
 fn emit_list_conversion(out: &mut String, inner: &TypeRef, indent: &str) {
-    out.push_str(&format!("{indent}final n = outLen.value;\n"));
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
+    w.line("final n = outLen.value;");
     let dt = dart_type(inner);
-    out.push_str(&format!(
-        "{indent}if (result == nullptr || n == 0) return <{dt}>[];\n"
-    ));
+    w.line(format!("if (result == nullptr || n == 0) return <{dt}>[];"));
     match inner {
         TypeRef::Struct(name) => {
             let n = local_type_name(name).to_upper_camel_case();
-            out.push_str(&format!(
-                "{indent}final arr = result.cast<Pointer<Void>>();\n"
-            ));
-            out.push_str(&format!(
-                "{indent}return List<{n}>.generate(n, (i) => {n}._(arr[i]));\n"
+            w.line("final arr = result.cast<Pointer<Void>>();");
+            w.line(format!(
+                "return List<{n}>.generate(n, (i) => {n}._(arr[i]));"
             ));
         }
         TypeRef::TypedHandle(name) => {
             let n = local_type_name(name).to_upper_camel_case();
-            out.push_str(&format!(
-                "{indent}final arr = result.cast<Pointer<Void>>();\n"
-            ));
-            out.push_str(&format!(
-                "{indent}return List<{n}>.generate(n, (i) => {n}._(arr[i]));\n"
+            w.line("final arr = result.cast<Pointer<Void>>();");
+            w.line(format!(
+                "return List<{n}>.generate(n, (i) => {n}._(arr[i]));"
             ));
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!(
-                "{indent}final arr = result.cast<Pointer<Utf8>>();\n"
-            ));
-            out.push_str(&format!(
-                "{indent}return List<String>.generate(n, (i) => arr[i].toDartString());\n"
-            ));
+            w.line("final arr = result.cast<Pointer<Utf8>>();");
+            w.line("return List<String>.generate(n, (i) => arr[i].toDartString());");
         }
         TypeRef::I64 | TypeRef::Handle => {
-            out.push_str(&format!("{indent}final arr = result.cast<Int64>();\n"));
-            out.push_str(&format!(
-                "{indent}return List<int>.generate(n, (i) => arr[i]);\n"
-            ));
+            w.line("final arr = result.cast<Int64>();");
+            w.line("return List<int>.generate(n, (i) => arr[i]);");
         }
         TypeRef::F64 => {
-            out.push_str(&format!("{indent}final arr = result.cast<Double>();\n"));
-            out.push_str(&format!(
-                "{indent}return List<double>.generate(n, (i) => arr[i]);\n"
-            ));
+            w.line("final arr = result.cast<Double>();");
+            w.line("return List<double>.generate(n, (i) => arr[i]);");
         }
         TypeRef::Bool => {
-            out.push_str(&format!("{indent}final arr = result.cast<Int32>();\n"));
-            out.push_str(&format!(
-                "{indent}return List<bool>.generate(n, (i) => arr[i] != 0);\n"
-            ));
+            w.line("final arr = result.cast<Int32>();");
+            w.line("return List<bool>.generate(n, (i) => arr[i] != 0);");
         }
         TypeRef::Enum(name) => {
             let n = local_type_name(name).to_upper_camel_case();
-            out.push_str(&format!("{indent}final arr = result.cast<Int32>();\n"));
-            out.push_str(&format!(
-                "{indent}return List<{n}>.generate(n, (i) => {n}.fromValue(arr[i]));\n"
+            w.line("final arr = result.cast<Int32>();");
+            w.line(format!(
+                "return List<{n}>.generate(n, (i) => {n}.fromValue(arr[i]));"
             ));
         }
         _ => {
             // I32/U32 and any other word-sized element.
-            out.push_str(&format!("{indent}final arr = result.cast<Int32>();\n"));
-            out.push_str(&format!(
-                "{indent}return List<int>.generate(n, (i) => arr[i]);\n"
-            ));
+            w.line("final arr = result.cast<Int32>();");
+            w.line("return List<int>.generate(n, (i) => arr[i]);");
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn emit_result_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!("{indent}return result.toDartString();\n"));
+            w.line("return result.toDartString();");
         }
         TypeRef::Bool => {
-            out.push_str(&format!("{indent}return result != 0;\n"));
+            w.line("return result != 0;");
         }
         TypeRef::Enum(name) => {
             let n = local_type_name(name).to_upper_camel_case();
-            out.push_str(&format!("{indent}return {n}.fromValue(result);\n"));
+            w.line(format!("return {n}.fromValue(result);"));
         }
         TypeRef::Struct(name) => {
             let n = local_type_name(name).to_upper_camel_case();
-            out.push_str(&format!("{indent}return {n}._(result);\n"));
+            w.line(format!("return {n}._(result);"));
         }
         TypeRef::TypedHandle(name) => {
             let n = local_type_name(name).to_upper_camel_case();
-            out.push_str(&format!("{indent}return {n}._(result);\n"));
+            w.line(format!("return {n}._(result);"));
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                out.push_str(&format!("{indent}if (result == nullptr) return null;\n"));
-                out.push_str(&format!("{indent}return result.toDartString();\n"));
+                w.line("if (result == nullptr) return null;");
+                w.line("return result.toDartString();");
             }
             TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
                 let n = local_type_name(name).to_upper_camel_case();
-                out.push_str(&format!("{indent}if (result == nullptr) return null;\n"));
-                out.push_str(&format!("{indent}return {n}._(result);\n"));
+                w.line("if (result == nullptr) return null;");
+                w.line(format!("return {n}._(result);"));
             }
             // Optional scalars/bools/enums lower to a nullable pointer-to-scalar.
             TypeRef::Bool => {
-                out.push_str(&format!("{indent}if (result == nullptr) return null;\n"));
-                out.push_str(&format!("{indent}return result.value != 0;\n"));
+                w.line("if (result == nullptr) return null;");
+                w.line("return result.value != 0;");
             }
             TypeRef::Enum(name) => {
                 let n = local_type_name(name).to_upper_camel_case();
-                out.push_str(&format!("{indent}if (result == nullptr) return null;\n"));
-                out.push_str(&format!("{indent}return {n}.fromValue(result.value);\n"));
+                w.line("if (result == nullptr) return null;");
+                w.line(format!("return {n}.fromValue(result.value);"));
             }
             _ => {
-                out.push_str(&format!("{indent}if (result == nullptr) return null;\n"));
-                out.push_str(&format!("{indent}return result.value;\n"));
+                w.line("if (result == nullptr) return null;");
+                w.line("return result.value;");
             }
         },
         _ => {
-            out.push_str(&format!("{indent}return result;\n"));
+            w.line("return result;");
         }
     }
+    out.push_str(&w.finish());
 }
 
 #[cfg(test)]

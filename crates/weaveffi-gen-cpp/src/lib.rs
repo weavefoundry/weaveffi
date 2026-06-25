@@ -19,9 +19,9 @@ use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::cabi;
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{
-    emit_doc as common_emit_doc, is_c_pointer_type, walk_modules, walk_modules_with_path,
-    DocCommentStyle,
+    is_c_pointer_type, walk_modules, walk_modules_with_path, DocCommentStyle,
 };
+use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors;
 use weaveffi_core::model::BindingModel;
 use weaveffi_core::package::{PackageContext, PackagedFile};
@@ -433,12 +433,6 @@ fn render_cpp_header(
     out
 }
 
-/// Emits a `/** ... */` doc comment at `indent`. Single-line docs collapse to
-/// `/** text */`; multi-line docs expand to a block with ` * ` prefixed lines.
-fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
-    common_emit_doc(out, doc, indent, DocCommentStyle::Javadoc);
-}
-
 // ── C ABI type helpers (mirrors the C generator logic) ──
 
 /// Renders ABI parameter slots to C declarations (`<type> <name>`), the form
@@ -521,44 +515,58 @@ fn cpp_param_decl(ty: &TypeRef, name: &str) -> String {
 // ── Namespace: error classes ──
 
 fn render_cpp_error_classes(out: &mut String, error_codes: &[&ErrorCode]) {
-    out.push_str("class WeaveFFIError : public std::runtime_error {\n");
-    out.push_str("    int32_t code_;\n\n");
-    out.push_str("public:\n");
-    out.push_str("    WeaveFFIError(int32_t code, const std::string& msg) : std::runtime_error(msg), code_(code) {}\n");
-    out.push_str("    int32_t code() const { return code_; }\n");
-    out.push_str("};\n\n");
+    let mut w = CodeWriter::four_space();
+    w.line("class WeaveFFIError : public std::runtime_error {");
+    w.scope(|w| {
+        w.line("int32_t code_;");
+        w.blank();
+    });
+    w.line("public:");
+    w.scope(|w| {
+        w.line("WeaveFFIError(int32_t code, const std::string& msg) : std::runtime_error(msg), code_(code) {}");
+        w.line("int32_t code() const { return code_; }");
+    });
+    w.line("};");
+    w.blank();
 
     for ec in error_codes {
         let class = cpp_error_class(&ec.name);
-        emit_doc(out, &ec.doc, "");
-        out.push_str(&format!("class {class} : public WeaveFFIError {{\n"));
-        out.push_str("public:\n");
-        out.push_str(&format!(
-            "    {class}(const std::string& msg) : WeaveFFIError({}, msg) {{}}\n",
-            ec.code
-        ));
-        out.push_str("};\n\n");
+        w.doc(&ec.doc, DocCommentStyle::Javadoc);
+        w.line(format!("class {class} : public WeaveFFIError {{"));
+        w.line("public:");
+        w.scope(|w| {
+            w.line(format!(
+                "{class}(const std::string& msg) : WeaveFFIError({}, msg) {{}}",
+                ec.code
+            ));
+        });
+        w.line("};");
+        w.blank();
     }
+    out.push_str(&w.finish());
 }
 
 // ── Namespace: enums ──
 
 fn render_cpp_enums(out: &mut String, module: &Module) {
+    let mut w = CodeWriter::four_space();
     for e in &module.enums {
         // Rich (algebraic) enums are opaque-object wrappers, emitted as classes
         // alongside structs; only plain C-style enums map to `enum class`.
         if e.is_rich() {
             continue;
         }
-        emit_doc(out, &e.doc, "");
-        out.push_str(&format!("enum class {} : int32_t {{\n", e.name));
-        for (i, v) in e.variants.iter().enumerate() {
-            emit_doc(out, &v.doc, "    ");
-            let comma = if i + 1 < e.variants.len() { "," } else { "" };
-            out.push_str(&format!("    {} = {}{}\n", v.name, v.value, comma));
-        }
-        out.push_str("};\n\n");
+        w.doc(&e.doc, DocCommentStyle::Javadoc);
+        w.block(format!("enum class {} : int32_t {{", e.name), "};", |w| {
+            for (i, v) in e.variants.iter().enumerate() {
+                w.doc(&v.doc, DocCommentStyle::Javadoc);
+                let comma = if i + 1 < e.variants.len() { "," } else { "" };
+                w.line(format!("{} = {}{}", v.name, v.value, comma));
+            }
+        });
+        w.blank();
     }
+    out.push_str(&w.finish());
 }
 
 // ── Namespace: RAII classes ──
@@ -567,55 +575,72 @@ fn render_cpp_class(out: &mut String, s: &StructDef, abi_module: &str, prefix: &
     let tag = format!("{prefix}_{}_{}", abi_module, s.name);
     let name = &s.name;
 
-    emit_doc(out, &s.doc, "");
-    out.push_str(&format!("class {name} {{\n"));
-    out.push_str("    void* handle_;\n\n");
-    out.push_str("public:\n");
-    out.push_str(&format!(
-        "    explicit {name}(void* h) : handle_(h) {{}}\n\n"
-    ));
+    let mut w = CodeWriter::four_space();
+    w.doc(&s.doc, DocCommentStyle::Javadoc);
+    w.line(format!("class {name} {{"));
+    w.scope(|w| {
+        w.line("void* handle_;");
+        w.blank();
+    });
+    w.line("public:");
+    w.scope(|w| {
+        w.line(format!("explicit {name}(void* h) : handle_(h) {{}}"));
+        w.blank();
 
-    // Destructor
-    out.push_str(&format!("    ~{name}() {{\n"));
-    out.push_str(&format!(
-        "        if (handle_) {tag}_destroy(static_cast<{tag}*>(handle_));\n"
-    ));
-    out.push_str("    }\n\n");
+        // Destructor
+        w.line(format!("~{name}() {{"));
+        w.scope(|w| {
+            w.line(format!(
+                "if (handle_) {tag}_destroy(static_cast<{tag}*>(handle_));"
+            ));
+        });
+        w.line("}");
+        w.blank();
 
-    // Deleted copy
-    out.push_str(&format!("    {name}(const {name}&) = delete;\n"));
-    out.push_str(&format!(
-        "    {name}& operator=(const {name}&) = delete;\n\n"
-    ));
+        // Deleted copy
+        w.line(format!("{name}(const {name}&) = delete;"));
+        w.line(format!("{name}& operator=(const {name}&) = delete;"));
+        w.blank();
 
-    // Move constructor
-    out.push_str(&format!(
-        "    {name}({name}&& other) noexcept : handle_(other.handle_) {{\n"
-    ));
-    out.push_str("        other.handle_ = nullptr;\n");
-    out.push_str("    }\n\n");
+        // Move constructor
+        w.line(format!(
+            "{name}({name}&& other) noexcept : handle_(other.handle_) {{"
+        ));
+        w.scope(|w| {
+            w.line("other.handle_ = nullptr;");
+        });
+        w.line("}");
+        w.blank();
 
-    // Move assignment
-    out.push_str(&format!(
-        "    {name}& operator=({name}&& other) noexcept {{\n"
-    ));
-    out.push_str("        if (this != &other) {\n");
-    out.push_str(&format!(
-        "            if (handle_) {tag}_destroy(static_cast<{tag}*>(handle_));\n"
-    ));
-    out.push_str("            handle_ = other.handle_;\n");
-    out.push_str("            other.handle_ = nullptr;\n");
-    out.push_str("        }\n");
-    out.push_str("        return *this;\n");
-    out.push_str("    }\n\n");
+        // Move assignment
+        w.line(format!("{name}& operator=({name}&& other) noexcept {{"));
+        w.scope(|w| {
+            w.line("if (this != &other) {");
+            w.scope(|w| {
+                w.line(format!(
+                    "if (handle_) {tag}_destroy(static_cast<{tag}*>(handle_));"
+                ));
+                w.line("handle_ = other.handle_;");
+                w.line("other.handle_ = nullptr;");
+            });
+            w.line("}");
+            w.line("return *this;");
+        });
+        w.line("}");
+        w.blank();
 
-    out.push_str("    void* handle() const { return handle_; }\n\n");
+        w.line("void* handle() const { return handle_; }");
+        w.blank();
 
-    for field in &s.fields {
-        render_cpp_getter(out, name, abi_module, field, prefix);
-    }
-
-    out.push_str("};\n\n");
+        let mut getters = String::new();
+        for field in &s.fields {
+            render_cpp_getter(&mut getters, name, abi_module, field, prefix);
+        }
+        w.raw(getters);
+    });
+    w.line("};");
+    w.blank();
+    out.push_str(&w.finish());
 
     if s.builder {
         render_cpp_builder(out, s, abi_module, prefix);
@@ -631,111 +656,138 @@ fn render_cpp_rich_enum_class(out: &mut String, e: &EnumDef, abi_module: &str, p
     let tag = format!("{prefix}_{}_{}", abi_module, e.name);
     let name = &e.name;
 
-    emit_doc(out, &e.doc, "");
-    out.push_str(&format!("class {name} {{\n"));
-    out.push_str("    void* handle_;\n\n");
-    out.push_str("public:\n");
-    out.push_str(&format!(
-        "    explicit {name}(void* h) : handle_(h) {{}}\n\n"
-    ));
+    let mut w = CodeWriter::four_space();
+    w.doc(&e.doc, DocCommentStyle::Javadoc);
+    w.line(format!("class {name} {{"));
+    w.scope(|w| {
+        w.line("void* handle_;");
+        w.blank();
+    });
+    w.line("public:");
+    w.scope(|w| {
+        w.line(format!("explicit {name}(void* h) : handle_(h) {{}}"));
+        w.blank();
 
-    // Destructor / move-only ownership (identical contract to a struct wrapper).
-    out.push_str(&format!("    ~{name}() {{\n"));
-    out.push_str(&format!(
-        "        if (handle_) {tag}_destroy(static_cast<{tag}*>(handle_));\n"
-    ));
-    out.push_str("    }\n\n");
-    out.push_str(&format!("    {name}(const {name}&) = delete;\n"));
-    out.push_str(&format!(
-        "    {name}& operator=(const {name}&) = delete;\n\n"
-    ));
-    out.push_str(&format!(
-        "    {name}({name}&& other) noexcept : handle_(other.handle_) {{\n"
-    ));
-    out.push_str("        other.handle_ = nullptr;\n");
-    out.push_str("    }\n\n");
-    out.push_str(&format!(
-        "    {name}& operator=({name}&& other) noexcept {{\n"
-    ));
-    out.push_str("        if (this != &other) {\n");
-    out.push_str(&format!(
-        "            if (handle_) {tag}_destroy(static_cast<{tag}*>(handle_));\n"
-    ));
-    out.push_str("            handle_ = other.handle_;\n");
-    out.push_str("            other.handle_ = nullptr;\n");
-    out.push_str("        }\n");
-    out.push_str("        return *this;\n");
-    out.push_str("    }\n\n");
-    out.push_str("    void* handle() const { return handle_; }\n\n");
-
-    // Nested tag enum + reader.
-    out.push_str("    enum class Tag : int32_t {\n");
-    for (i, v) in e.variants.iter().enumerate() {
-        let comma = if i + 1 < e.variants.len() { "," } else { "" };
-        out.push_str(&format!("        {} = {}{}\n", v.name, v.value, comma));
-    }
-    out.push_str("    };\n\n");
-    out.push_str("    Tag tag() const {\n");
-    out.push_str(&format!(
-        "        return static_cast<Tag>({tag}_tag(static_cast<const {tag}*>(handle_)));\n"
-    ));
-    out.push_str("    }\n\n");
-
-    // One static factory per variant.
-    for v in &e.variants {
-        let decls: Vec<String> = v
-            .fields
-            .iter()
-            .map(|f| cpp_param_decl(&f.ty, &f.name))
-            .collect();
-        emit_doc(out, &v.doc, "    ");
-        out.push_str(&format!(
-            "    static {name} {}({}) {{\n",
-            v.name,
-            decls.join(", ")
+        // Destructor / move-only ownership (identical contract to a struct wrapper).
+        w.line(format!("~{name}() {{"));
+        w.scope(|w| {
+            w.line(format!(
+                "if (handle_) {tag}_destroy(static_cast<{tag}*>(handle_));"
+            ));
+        });
+        w.line("}");
+        w.blank();
+        w.line(format!("{name}(const {name}&) = delete;"));
+        w.line(format!("{name}& operator=(const {name}&) = delete;"));
+        w.blank();
+        w.line(format!(
+            "{name}({name}&& other) noexcept : handle_(other.handle_) {{"
         ));
-        let mut setup = Vec::new();
-        let mut c_args = Vec::new();
-        for f in &v.fields {
-            let (s, a) = param_to_c_args(&f.ty, &f.name, abi_module, prefix);
-            setup.extend(s);
-            c_args.extend(a);
-        }
-        c_args.push("&err".into());
-        for line in &setup {
-            out.push_str(&format!("        {line}\n"));
-        }
-        out.push_str(&format!("        {prefix}_error err{{}};\n"));
-        out.push_str(&format!(
-            "        auto* result = {tag}_{}_new({});\n",
-            v.name,
-            c_args.join(", ")
-        ));
-        out.push_str("        if (err.code != 0) {\n");
-        out.push_str(
-            "            std::string msg(err.message ? err.message : \"unknown error\");\n",
-        );
-        out.push_str("            int32_t code = err.code;\n");
-        out.push_str(&format!("            {prefix}_error_clear(&err);\n"));
-        out.push_str("            throw WeaveFFIError(code, msg);\n");
-        out.push_str("        }\n");
-        out.push_str(&format!("        return {name}(result);\n"));
-        out.push_str("    }\n\n");
-    }
+        w.scope(|w| {
+            w.line("other.handle_ = nullptr;");
+        });
+        w.line("}");
+        w.blank();
+        w.line(format!("{name}& operator=({name}&& other) noexcept {{"));
+        w.scope(|w| {
+            w.line("if (this != &other) {");
+            w.scope(|w| {
+                w.line(format!(
+                    "if (handle_) {tag}_destroy(static_cast<{tag}*>(handle_));"
+                ));
+                w.line("handle_ = other.handle_;");
+                w.line("other.handle_ = nullptr;");
+            });
+            w.line("}");
+            w.line("return *this;");
+        });
+        w.line("}");
+        w.blank();
+        w.line("void* handle() const { return handle_; }");
+        w.blank();
 
-    // Per-variant field accessors, namespaced by variant to avoid collisions.
-    for v in &e.variants {
-        let cast = format!("static_cast<const {tag}*>(handle_)");
-        for f in &v.fields {
-            let getter = format!("{tag}_{}_get_{}", v.name, f.name);
-            let method = format!("{}_{}", v.name.to_snake_case(), f.name);
-            emit_cpp_getter_method(
-                out, &method, &getter, &cast, &f.ty, &f.doc, abi_module, prefix,
-            );
-        }
-    }
+        // Nested tag enum + reader.
+        w.block("enum class Tag : int32_t {", "};", |w| {
+            for (i, v) in e.variants.iter().enumerate() {
+                let comma = if i + 1 < e.variants.len() { "," } else { "" };
+                w.line(format!("{} = {}{}", v.name, v.value, comma));
+            }
+        });
+        w.blank();
+        w.line("Tag tag() const {");
+        w.scope(|w| {
+            w.line(format!(
+                "return static_cast<Tag>({tag}_tag(static_cast<const {tag}*>(handle_)));"
+            ));
+        });
+        w.line("}");
+        w.blank();
 
-    out.push_str("};\n\n");
+        // One static factory per variant.
+        for v in &e.variants {
+            let decls: Vec<String> = v
+                .fields
+                .iter()
+                .map(|f| cpp_param_decl(&f.ty, &f.name))
+                .collect();
+            w.doc(&v.doc, DocCommentStyle::Javadoc);
+            w.line(format!("static {name} {}({}) {{", v.name, decls.join(", ")));
+            let mut setup = Vec::new();
+            let mut c_args = Vec::new();
+            for f in &v.fields {
+                let (s, a) = param_to_c_args(&f.ty, &f.name, abi_module, prefix);
+                setup.extend(s);
+                c_args.extend(a);
+            }
+            c_args.push("&err".into());
+            w.scope(|w| {
+                for line in &setup {
+                    w.line(line);
+                }
+                w.line(format!("{prefix}_error err{{}};"));
+                w.line(format!(
+                    "auto* result = {tag}_{}_new({});",
+                    v.name,
+                    c_args.join(", ")
+                ));
+                w.line("if (err.code != 0) {");
+                w.scope(|w| {
+                    w.line("std::string msg(err.message ? err.message : \"unknown error\");");
+                    w.line("int32_t code = err.code;");
+                    w.line(format!("{prefix}_error_clear(&err);"));
+                    w.line("throw WeaveFFIError(code, msg);");
+                });
+                w.line("}");
+                w.line(format!("return {name}(result);"));
+            });
+            w.line("}");
+            w.blank();
+        }
+
+        // Per-variant field accessors, namespaced by variant to avoid collisions.
+        let mut accessors = String::new();
+        for v in &e.variants {
+            let cast = format!("static_cast<const {tag}*>(handle_)");
+            for f in &v.fields {
+                let getter = format!("{tag}_{}_get_{}", v.name, f.name);
+                let method = format!("{}_{}", v.name.to_snake_case(), f.name);
+                emit_cpp_getter_method(
+                    &mut accessors,
+                    &method,
+                    &getter,
+                    &cast,
+                    &f.ty,
+                    &f.doc,
+                    abi_module,
+                    prefix,
+                );
+            }
+        }
+        w.raw(accessors);
+    });
+    w.line("};");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// Collect the local class names of any wrapper types (`struct`/`handle<T>`)
@@ -843,72 +895,96 @@ fn render_cpp_builder(out: &mut String, s: &StructDef, abi_module: &str, prefix:
     let builder_ty = format!("{tag}Builder");
     let name = &s.name;
 
-    emit_doc(out, &s.doc, "");
-    out.push_str(&format!("class {name}Builder {{\n"));
-    out.push_str("    void* handle_;\n\n");
-    out.push_str("public:\n");
-    out.push_str(&format!(
-        "    {name}Builder() : handle_(reinterpret_cast<void*>({tag}_Builder_new())) {{}}\n\n"
-    ));
-    out.push_str(&format!("    ~{name}Builder() {{\n"));
-    out.push_str(&format!(
-        "        if (handle_) {tag}_Builder_destroy(static_cast<{builder_ty}*>(handle_));\n"
-    ));
-    out.push_str("    }\n\n");
-
-    out.push_str(&format!(
-        "    {name}Builder(const {name}Builder&) = delete;\n"
-    ));
-    out.push_str(&format!(
-        "    {name}Builder& operator=(const {name}Builder&) = delete;\n\n"
-    ));
-    out.push_str(&format!(
-        "    {name}Builder({name}Builder&& other) noexcept : handle_(other.handle_) {{\n"
-    ));
-    out.push_str("        other.handle_ = nullptr;\n");
-    out.push_str("    }\n\n");
-    out.push_str(&format!(
-        "    {name}Builder& operator=({name}Builder&& other) noexcept {{\n"
-    ));
-    out.push_str("        if (this != &other) {\n");
-    out.push_str(&format!(
-        "            if (handle_) {tag}_Builder_destroy(static_cast<{builder_ty}*>(handle_));\n"
-    ));
-    out.push_str("            handle_ = other.handle_;\n");
-    out.push_str("            other.handle_ = nullptr;\n");
-    out.push_str("        }\n");
-    out.push_str("        return *this;\n");
-    out.push_str("    }\n\n");
-
-    for field in &s.fields {
-        let pascal = field.name.to_upper_camel_case();
-        let decl = cpp_param_decl(&field.ty, "value");
-        emit_doc(out, &field.doc, "    ");
-        out.push_str(&format!("    {name}Builder& with{pascal}({decl}) {{\n"));
-        let (setup, args) = param_to_c_args(&field.ty, "value", abi_module, prefix);
-        for line in &setup {
-            out.push_str(&format!("        {line}\n"));
-        }
-        let args_str = args.join(", ");
-        out.push_str(&format!(
-            "        {tag}_Builder_set_{}(static_cast<{builder_ty}*>(handle_), {args_str});\n",
-            field.name
+    let mut w = CodeWriter::four_space();
+    w.doc(&s.doc, DocCommentStyle::Javadoc);
+    w.line(format!("class {name}Builder {{"));
+    w.scope(|w| {
+        w.line("void* handle_;");
+        w.blank();
+    });
+    w.line("public:");
+    w.scope(|w| {
+        w.line(format!(
+            "{name}Builder() : handle_(reinterpret_cast<void*>({tag}_Builder_new())) {{}}"
         ));
-        out.push_str("        return *this;\n");
-        out.push_str("    }\n\n");
-    }
+        w.blank();
+        w.line(format!("~{name}Builder() {{"));
+        w.scope(|w| {
+            w.line(format!(
+                "if (handle_) {tag}_Builder_destroy(static_cast<{builder_ty}*>(handle_));"
+            ));
+        });
+        w.line("}");
+        w.blank();
 
-    out.push_str(&format!("    {name} build() {{\n"));
-    out.push_str(&format!("        {prefix}_error err{{}};\n"));
-    out.push_str(&format!(
-        "        auto* ptr = {tag}_Builder_build(static_cast<{builder_ty}*>(handle_), &err);\n"
-    ));
-    out.push_str(
-        "        if (err.code != 0) throw std::runtime_error(err.message ? err.message : \"build failed\");\n",
-    );
-    out.push_str(&format!("        return {name}(ptr);\n"));
-    out.push_str("    }\n");
-    out.push_str("};\n\n");
+        w.line(format!("{name}Builder(const {name}Builder&) = delete;"));
+        w.line(format!(
+            "{name}Builder& operator=(const {name}Builder&) = delete;"
+        ));
+        w.blank();
+        w.line(format!(
+            "{name}Builder({name}Builder&& other) noexcept : handle_(other.handle_) {{"
+        ));
+        w.scope(|w| {
+            w.line("other.handle_ = nullptr;");
+        });
+        w.line("}");
+        w.blank();
+        w.line(format!(
+            "{name}Builder& operator=({name}Builder&& other) noexcept {{"
+        ));
+        w.scope(|w| {
+            w.line("if (this != &other) {");
+            w.scope(|w| {
+                w.line(format!(
+                    "if (handle_) {tag}_Builder_destroy(static_cast<{builder_ty}*>(handle_));"
+                ));
+                w.line("handle_ = other.handle_;");
+                w.line("other.handle_ = nullptr;");
+            });
+            w.line("}");
+            w.line("return *this;");
+        });
+        w.line("}");
+        w.blank();
+
+        for field in &s.fields {
+            let pascal = field.name.to_upper_camel_case();
+            let decl = cpp_param_decl(&field.ty, "value");
+            w.doc(&field.doc, DocCommentStyle::Javadoc);
+            w.line(format!("{name}Builder& with{pascal}({decl}) {{"));
+            let (setup, args) = param_to_c_args(&field.ty, "value", abi_module, prefix);
+            w.scope(|w| {
+                for line in &setup {
+                    w.line(line);
+                }
+                let args_str = args.join(", ");
+                w.line(format!(
+                    "{tag}_Builder_set_{}(static_cast<{builder_ty}*>(handle_), {args_str});",
+                    field.name
+                ));
+                w.line("return *this;");
+            });
+            w.line("}");
+            w.blank();
+        }
+
+        w.line(format!("{name} build() {{"));
+        w.scope(|w| {
+            w.line(format!("{prefix}_error err{{}};"));
+            w.line(format!(
+                "auto* ptr = {tag}_Builder_build(static_cast<{builder_ty}*>(handle_), &err);"
+            ));
+            w.line(
+                "if (err.code != 0) throw std::runtime_error(err.message ? err.message : \"build failed\");",
+            );
+            w.line(format!("return {name}(ptr);"));
+        });
+        w.line("}");
+    });
+    w.line("};");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 fn render_cpp_getter(
@@ -950,10 +1026,10 @@ fn emit_cpp_getter_method(
 ) {
     let ret_type = cpp_type(ty);
 
-    emit_doc(out, doc, "    ");
-    out.push_str(&format!("    {ret_type} {method_name}() const {{\n"));
-
-    match ty {
+    let mut w = CodeWriter::four_space().with_depth(1);
+    w.doc(doc, DocCommentStyle::Javadoc);
+    w.line(format!("{ret_type} {method_name}() const {{"));
+    w.scope(|w| match ty {
         TypeRef::I8
         | TypeRef::I16
         | TypeRef::I32
@@ -965,51 +1041,56 @@ fn emit_cpp_getter_method(
         | TypeRef::F32
         | TypeRef::F64
         | TypeRef::Bool => {
-            out.push_str(&format!("        return {getter}({cast});\n"));
+            w.line(format!("return {getter}({cast});"));
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!("        const char* raw = {getter}({cast});\n"));
-            out.push_str("        std::string ret(raw);\n");
-            out.push_str(&format!("        {prefix}_free_string(raw);\n"));
-            out.push_str("        return ret;\n");
+            w.line(format!("const char* raw = {getter}({cast});"));
+            w.line("std::string ret(raw);");
+            w.line(format!("{prefix}_free_string(raw);"));
+            w.line("return ret;");
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            out.push_str("        size_t len = 0;\n");
-            out.push_str(&format!("        auto* raw = {getter}({cast}, &len);\n"));
-            out.push_str("        return std::vector<uint8_t>(raw, raw + len);\n");
+            w.line("size_t len = 0;");
+            w.line(format!("auto* raw = {getter}({cast}, &len);"));
+            w.line("return std::vector<uint8_t>(raw, raw + len);");
         }
         TypeRef::Handle => {
-            out.push_str(&format!(
-                "        return reinterpret_cast<void*>(static_cast<uintptr_t>({getter}({cast})));\n"
+            w.line(format!(
+                "return reinterpret_cast<void*>(static_cast<uintptr_t>({getter}({cast})));"
             ));
         }
         TypeRef::TypedHandle(n) => {
             let ln = local_type_name(n);
-            out.push_str(&format!("        return {ln}({getter}({cast}));\n"));
+            w.line(format!("return {ln}({getter}({cast}));"));
         }
         TypeRef::Struct(n) => {
             let ln = local_type_name(n);
-            out.push_str(&format!("        return {ln}({getter}({cast}));\n"));
+            w.line(format!("return {ln}({getter}({cast}));"));
         }
         TypeRef::Enum(n) => {
             let n = local_type_name(n);
-            out.push_str(&format!(
-                "        return static_cast<{n}>({getter}({cast}));\n"
-            ));
+            w.line(format!("return static_cast<{n}>({getter}({cast}));"));
         }
         TypeRef::Optional(inner) => {
-            render_getter_optional(out, inner, getter, cast, prefix);
+            let mut tmp = String::new();
+            render_getter_optional(&mut tmp, inner, getter, cast, prefix);
+            w.raw(tmp);
         }
         TypeRef::List(inner) => {
-            render_getter_list(out, inner, getter, cast);
+            let mut tmp = String::new();
+            render_getter_list(&mut tmp, inner, getter, cast);
+            w.raw(tmp);
         }
         TypeRef::Map(k, v) => {
-            render_getter_map(out, k, v, getter, cast, module, prefix);
+            let mut tmp = String::new();
+            render_getter_map(&mut tmp, k, v, getter, cast, module, prefix);
+            w.raw(tmp);
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as enum/struct field"),
-    }
-
-    out.push_str("    }\n\n");
+    });
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 fn render_getter_optional(
@@ -1019,70 +1100,74 @@ fn render_getter_optional(
     cast: &str,
     prefix: &str,
 ) {
-    out.push_str(&format!("        auto* raw = {getter}({cast});\n"));
-    out.push_str("        if (!raw) return std::nullopt;\n");
+    let mut w = CodeWriter::four_space().with_depth(2);
+    w.line(format!("auto* raw = {getter}({cast});"));
+    w.line("if (!raw) return std::nullopt;");
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str("        std::string ret(raw);\n");
-            out.push_str(&format!("        {prefix}_free_string(raw);\n"));
-            out.push_str("        return ret;\n");
+            w.line("std::string ret(raw);");
+            w.line(format!("{prefix}_free_string(raw);"));
+            w.line("return ret;");
         }
         TypeRef::TypedHandle(n) => {
             let ln = local_type_name(n);
-            out.push_str(&format!("        return {ln}(raw);\n"));
+            w.line(format!("return {ln}(raw);"));
         }
         TypeRef::Struct(n) => {
             let ln = local_type_name(n);
-            out.push_str(&format!("        return {ln}(raw);\n"));
+            w.line(format!("return {ln}(raw);"));
         }
         TypeRef::Enum(n) => {
             let n = local_type_name(n);
-            out.push_str(&format!("        return static_cast<{n}>(*raw);\n"));
+            w.line(format!("return static_cast<{n}>(*raw);"));
         }
         _ if !is_c_pointer_type(inner) => {
-            out.push_str("        return *raw;\n");
+            w.line("return *raw;");
         }
         _ => {
-            out.push_str(&format!("        return {}(raw);\n", cpp_type(inner)));
+            w.line(format!("return {}(raw);", cpp_type(inner)));
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn render_getter_list(out: &mut String, inner: &TypeRef, getter: &str, cast: &str) {
-    out.push_str("        size_t len = 0;\n");
-    out.push_str(&format!("        auto* raw = {getter}({cast}, &len);\n"));
+    let mut w = CodeWriter::four_space().with_depth(2);
+    w.line("size_t len = 0;");
+    w.line(format!("auto* raw = {getter}({cast}, &len);"));
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str("        std::vector<std::string> ret;\n");
-            out.push_str("        ret.reserve(len);\n");
-            out.push_str("        for (size_t i = 0; i < len; ++i) ret.emplace_back(raw[i]);\n");
-            out.push_str("        return ret;\n");
+            w.line("std::vector<std::string> ret;");
+            w.line("ret.reserve(len);");
+            w.line("for (size_t i = 0; i < len; ++i) ret.emplace_back(raw[i]);");
+            w.line("return ret;");
         }
         TypeRef::Struct(n) => {
             let ln = local_type_name(n);
-            out.push_str(&format!("        std::vector<{ln}> ret;\n"));
-            out.push_str("        ret.reserve(len);\n");
-            out.push_str(&format!(
-                "        for (size_t i = 0; i < len; ++i) ret.emplace_back({ln}(raw[i]));\n"
+            w.line(format!("std::vector<{ln}> ret;"));
+            w.line("ret.reserve(len);");
+            w.line(format!(
+                "for (size_t i = 0; i < len; ++i) ret.emplace_back({ln}(raw[i]));"
             ));
-            out.push_str("        return ret;\n");
+            w.line("return ret;");
         }
         TypeRef::Enum(n) => {
             let n = local_type_name(n);
-            out.push_str(&format!("        std::vector<{n}> ret;\n"));
-            out.push_str("        ret.reserve(len);\n");
-            out.push_str(&format!(
-                "        for (size_t i = 0; i < len; ++i) ret.emplace_back(static_cast<{n}>(raw[i]));\n"
+            w.line(format!("std::vector<{n}> ret;"));
+            w.line("ret.reserve(len);");
+            w.line(format!(
+                "for (size_t i = 0; i < len; ++i) ret.emplace_back(static_cast<{n}>(raw[i]));"
             ));
-            out.push_str("        return ret;\n");
+            w.line("return ret;");
         }
         _ => {
-            out.push_str(&format!(
-                "        return std::vector<{}>(raw, raw + len);\n",
+            w.line(format!(
+                "return std::vector<{}>(raw, raw + len);",
                 cpp_type(inner)
             ));
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn render_getter_map(
@@ -1096,19 +1181,15 @@ fn render_getter_map(
 ) {
     let kc = c_element_type(k, module, prefix);
     let vc = c_element_type(v, module, prefix);
-    out.push_str(&format!("        {kc}* out_keys = nullptr;\n"));
-    out.push_str(&format!("        {vc}* out_values = nullptr;\n"));
-    out.push_str("        size_t len = 0;\n");
-    out.push_str(&format!(
-        "        {getter}({cast}, &out_keys, &out_values, &len);\n"
-    ));
+    let mut w = CodeWriter::four_space().with_depth(2);
+    w.line(format!("{kc}* out_keys = nullptr;"));
+    w.line(format!("{vc}* out_values = nullptr;"));
+    w.line("size_t len = 0;");
+    w.line(format!("{getter}({cast}, &out_keys, &out_values, &len);"));
 
     let cpp_k = cpp_type(k);
     let cpp_v = cpp_type(v);
-    out.push_str(&format!(
-        "        std::unordered_map<{cpp_k}, {cpp_v}> ret;\n"
-    ));
-    out.push_str("        for (size_t i = 0; i < len; ++i) {\n");
+    w.line(format!("std::unordered_map<{cpp_k}, {cpp_v}> ret;"));
     let ke = match k {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "std::string(out_keys[i])".into(),
         TypeRef::Enum(n) => format!("static_cast<{}>(out_keys[i])", local_type_name(n)),
@@ -1120,9 +1201,13 @@ fn render_getter_map(
         TypeRef::Struct(n) => format!("{}(out_values[i])", local_type_name(n)),
         _ => "out_values[i]".into(),
     };
-    out.push_str(&format!("            ret[{ke}] = {ve};\n"));
-    out.push_str("        }\n");
-    out.push_str("        return ret;\n");
+    w.line("for (size_t i = 0; i < len; ++i) {");
+    w.scope(|w| {
+        w.line(format!("ret[{ke}] = {ve};"));
+    });
+    w.line("}");
+    w.line("return ret;");
+    out.push_str(&w.finish());
 }
 
 // ── Namespace: free function wrappers ──
@@ -1310,40 +1395,50 @@ fn render_cpp_listener(
     let register_sym = format!("{prefix}_{abi_module}_register_{}", l.name);
     let unregister_sym = format!("{prefix}_{abi_module}_unregister_{}", l.name);
 
-    emit_doc(out, &l.doc, "");
-    out.push_str(&format!(
-        "/** @return A subscription id for {unregister_name}(). */\n"
+    let mut w = CodeWriter::four_space();
+    w.doc(&l.doc, DocCommentStyle::Javadoc);
+    w.line(format!(
+        "/** @return A subscription id for {unregister_name}(). */"
     ));
-    out.push_str(&format!(
-        "inline uint64_t {register_name}({std_fn} callback) {{\n"
+    w.line(format!(
+        "inline uint64_t {register_name}({std_fn} callback) {{"
     ));
-    out.push_str(&format!(
-        "    auto fn = std::make_shared<{std_fn}>(std::move(callback));\n"
-    ));
-    out.push_str(&format!("    uint64_t id = {register_sym}(\n"));
-    out.push_str(&format!("        []({lambda_params}) {{\n"));
-    out.push_str(&format!(
-        "            auto& cb = *static_cast<{std_fn}*>(context);\n"
-    ));
-    for s in &stmts {
-        out.push_str(&format!("            {s}\n"));
-    }
-    out.push_str(&format!("            cb({});\n", args.join(", ")));
-    out.push_str("        },\n");
-    out.push_str("        fn.get());\n");
-    out.push_str("    std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());\n");
-    out.push_str("    detail::wv_listener_registry()[id] = fn;\n");
-    out.push_str("    return id;\n");
-    out.push_str("}\n\n");
+    w.scope(|w| {
+        w.line(format!(
+            "auto fn = std::make_shared<{std_fn}>(std::move(callback));"
+        ));
+        w.line(format!("uint64_t id = {register_sym}("));
+        w.scope(|w| {
+            w.line(format!("[]({lambda_params}) {{"));
+            w.scope(|w| {
+                w.line(format!("auto& cb = *static_cast<{std_fn}*>(context);"));
+                for s in &stmts {
+                    w.line(s);
+                }
+                w.line(format!("cb({});", args.join(", ")));
+            });
+            w.line("},");
+            w.line("fn.get());");
+        });
+        w.line("std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());");
+        w.line("detail::wv_listener_registry()[id] = fn;");
+        w.line("return id;");
+    });
+    w.line("}");
+    w.blank();
 
-    out.push_str(&format!(
-        "/** Unregisters a listener previously registered with {register_name}(). */\n"
+    w.line(format!(
+        "/** Unregisters a listener previously registered with {register_name}(). */"
     ));
-    out.push_str(&format!("inline void {unregister_name}(uint64_t id) {{\n"));
-    out.push_str(&format!("    {unregister_sym}(id);\n"));
-    out.push_str("    std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());\n");
-    out.push_str("    detail::wv_listener_registry().erase(id);\n");
-    out.push_str("}\n\n");
+    w.line(format!("inline void {unregister_name}(uint64_t id) {{"));
+    w.scope(|w| {
+        w.line(format!("{unregister_sym}(id);"));
+        w.line("std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());");
+        w.line("detail::wv_listener_registry().erase(id);");
+    });
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// Converts a C++ param into setup lines and C argument expressions.
@@ -1542,14 +1637,15 @@ fn render_cpp_function(
         .collect();
     let fn_name = format!("{}_{}", abi_module, func.name);
 
-    emit_doc(out, &func.doc, "");
+    let mut w = CodeWriter::four_space();
+    w.doc(&func.doc, DocCommentStyle::Javadoc);
     if let Some(msg) = &func.deprecated {
         let escaped = msg.replace('"', "\\\"");
-        out.push_str(&format!("[[deprecated(\"{escaped}\")]]\n"));
+        w.line(format!("[[deprecated(\"{escaped}\")]]"));
     }
 
-    out.push_str(&format!(
-        "inline {cpp_ret} {fn_name}({}) {{\n",
+    w.line(format!(
+        "inline {cpp_ret} {fn_name}({}) {{",
         cpp_params.join(", ")
     ));
 
@@ -1588,71 +1684,76 @@ fn render_cpp_function(
 
     c_args.push("&err".into());
 
-    for line in &setup {
-        out.push_str(&format!("    {line}\n"));
-    }
-    out.push_str(&format!("    {prefix}_error err{{}};\n"));
-
     let c_fn = format!("{prefix}_{}_{}", abi_module, func.name);
     let args_str = c_args.join(", ");
-    if is_void_c {
-        out.push_str(&format!("    {c_fn}({args_str});\n"));
-    } else {
-        out.push_str(&format!("    auto result = {c_fn}({args_str});\n"));
-    }
-
-    out.push_str("    if (err.code != 0) {\n");
-    out.push_str("        std::string msg(err.message ? err.message : \"unknown error\");\n");
-    out.push_str("        int32_t code = err.code;\n");
-    out.push_str(&format!("        {prefix}_error_clear(&err);\n"));
-    if error_codes.is_empty() {
-        out.push_str("        throw WeaveFFIError(code, msg);\n");
-    } else {
-        out.push_str("        switch (code) {\n");
-        for ec in error_codes {
-            out.push_str(&format!(
-                "        case {}: throw {}(msg);\n",
-                ec.code,
-                cpp_error_class(&ec.name)
-            ));
+    w.scope(|w| {
+        for line in &setup {
+            w.line(line);
         }
-        out.push_str("        default: throw WeaveFFIError(code, msg);\n");
-        out.push_str("        }\n");
-    }
-    out.push_str("    }\n");
+        w.line(format!("{prefix}_error err{{}};"));
 
-    if let Some(ret) = &func.returns {
-        render_cpp_return(out, ret, prefix);
-    }
+        if is_void_c {
+            w.line(format!("{c_fn}({args_str});"));
+        } else {
+            w.line(format!("auto result = {c_fn}({args_str});"));
+        }
 
-    out.push_str("}\n\n");
+        w.line("if (err.code != 0) {");
+        w.scope(|w| {
+            w.line("std::string msg(err.message ? err.message : \"unknown error\");");
+            w.line("int32_t code = err.code;");
+            w.line(format!("{prefix}_error_clear(&err);"));
+            if error_codes.is_empty() {
+                w.line("throw WeaveFFIError(code, msg);");
+            } else {
+                w.line("switch (code) {");
+                for ec in error_codes {
+                    w.line(format!(
+                        "case {}: throw {}(msg);",
+                        ec.code,
+                        cpp_error_class(&ec.name)
+                    ));
+                }
+                w.line("default: throw WeaveFFIError(code, msg);");
+                w.line("}");
+            }
+        });
+        w.line("}");
+
+        if let Some(ret) = &func.returns {
+            let mut tmp = String::new();
+            render_cpp_return(&mut tmp, ret, prefix);
+            w.raw(tmp);
+        }
+    });
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// Emit the body of an `if (err.code != 0) { ... }` throw block at `indent`
 /// (the indent of the statements *inside* the braces). Translates the C error
 /// struct into the matching C++ exception, clearing the error first.
 fn emit_error_throw_body(out: &mut String, error_codes: &[&ErrorCode], prefix: &str, indent: &str) {
-    out.push_str(&format!(
-        "{indent}std::string msg(err.message ? err.message : \"unknown error\");\n"
-    ));
-    out.push_str(&format!("{indent}int32_t code = err.code;\n"));
-    out.push_str(&format!("{indent}{prefix}_error_clear(&err);\n"));
+    let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
+    w.line("std::string msg(err.message ? err.message : \"unknown error\");");
+    w.line("int32_t code = err.code;");
+    w.line(format!("{prefix}_error_clear(&err);"));
     if error_codes.is_empty() {
-        out.push_str(&format!("{indent}throw WeaveFFIError(code, msg);\n"));
+        w.line("throw WeaveFFIError(code, msg);");
     } else {
-        out.push_str(&format!("{indent}switch (code) {{\n"));
+        w.line("switch (code) {");
         for ec in error_codes {
-            out.push_str(&format!(
-                "{indent}case {}: throw {}(msg);\n",
+            w.line(format!(
+                "case {}: throw {}(msg);",
                 ec.code,
                 cpp_error_class(&ec.name)
             ));
         }
-        out.push_str(&format!(
-            "{indent}default: throw WeaveFFIError(code, msg);\n"
-        ));
-        out.push_str(&format!("{indent}}}\n"));
+        w.line("default: throw WeaveFFIError(code, msg);");
+        w.line("}");
     }
+    out.push_str(&w.finish());
 }
 
 /// Render an iterator-returning function. The C ABI yields an opaque iterator
@@ -1674,13 +1775,14 @@ fn render_cpp_iterator_function(
         .collect();
     let fn_name = format!("{}_{}", abi_module, func.name);
 
-    emit_doc(out, &func.doc, "");
+    let mut w = CodeWriter::four_space();
+    w.doc(&func.doc, DocCommentStyle::Javadoc);
     if let Some(msg) = &func.deprecated {
         let escaped = msg.replace('"', "\\\"");
-        out.push_str(&format!("[[deprecated(\"{escaped}\")]]\n"));
+        w.line(format!("[[deprecated(\"{escaped}\")]]"));
     }
-    out.push_str(&format!(
-        "inline std::vector<{elem_cpp}> {fn_name}({}) {{\n",
+    w.line(format!(
+        "inline std::vector<{elem_cpp}> {fn_name}({}) {{",
         cpp_params.join(", ")
     ));
 
@@ -1691,10 +1793,6 @@ fn render_cpp_iterator_function(
         setup.extend(s);
         c_args.extend(a);
     }
-    for line in &setup {
-        out.push_str(&format!("    {line}\n"));
-    }
-    out.push_str(&format!("    {prefix}_error err{{}};\n"));
 
     let launcher = format!("{prefix}_{}_{}", abi_module, func.name);
     let iter_tag = format!(
@@ -1706,68 +1804,84 @@ fn render_cpp_iterator_function(
     let destroy_fn = format!("{iter_tag}_destroy");
 
     c_args.push("&err".into());
-    out.push_str(&format!(
-        "    {iter_tag}* iter = {launcher}({});\n",
-        c_args.join(", ")
-    ));
-    out.push_str("    if (err.code != 0) {\n");
-    emit_error_throw_body(out, error_codes, prefix, "        ");
-    out.push_str("    }\n");
 
     let item_ret = abi::lower_return(inner, abi_module);
     let item_ty = item_ret.ret.render_c(prefix);
-    out.push_str(&format!("    std::vector<{elem_cpp}> ret;\n"));
-    out.push_str("    while (true) {\n");
-    out.push_str(&format!("        {item_ty} item{{}};\n"));
-    let mut next_args = vec!["iter".to_string(), "&item".to_string()];
-    if !item_ret.out_params.is_empty() {
-        out.push_str("        size_t item_len = 0;\n");
-        next_args.push("&item_len".to_string());
-    }
-    next_args.push("&err".to_string());
-    out.push_str(&format!(
-        "        int32_t has_item = {next_fn}({});\n",
-        next_args.join(", ")
-    ));
-    out.push_str("        if (err.code != 0) {\n");
-    out.push_str(&format!("            {destroy_fn}(iter);\n"));
-    emit_error_throw_body(out, error_codes, prefix, "            ");
-    out.push_str("        }\n");
-    out.push_str("        if (has_item == 0) break;\n");
-    match inner {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str("        ret.emplace_back(item);\n");
-            out.push_str(&format!("        {prefix}_free_string(item);\n"));
+    w.scope(|w| {
+        for line in &setup {
+            w.line(line);
         }
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            out.push_str("        ret.emplace_back(item, item + item_len);\n");
-            out.push_str(&format!(
-                "        {prefix}_free_bytes(const_cast<uint8_t*>(item), item_len);\n"
+        w.line(format!("{prefix}_error err{{}};"));
+
+        w.line(format!(
+            "{iter_tag}* iter = {launcher}({});",
+            c_args.join(", ")
+        ));
+        w.line("if (err.code != 0) {");
+        w.scope(|w| {
+            let mut tmp = String::new();
+            emit_error_throw_body(&mut tmp, error_codes, prefix, "        ");
+            w.raw(tmp);
+        });
+        w.line("}");
+
+        w.line(format!("std::vector<{elem_cpp}> ret;"));
+        w.line("while (true) {");
+        w.scope(|w| {
+            w.line(format!("{item_ty} item{{}};"));
+            let mut next_args = vec!["iter".to_string(), "&item".to_string()];
+            if !item_ret.out_params.is_empty() {
+                w.line("size_t item_len = 0;");
+                next_args.push("&item_len".to_string());
+            }
+            next_args.push("&err".to_string());
+            w.line(format!(
+                "int32_t has_item = {next_fn}({});",
+                next_args.join(", ")
             ));
-        }
-        TypeRef::Struct(n) => {
-            out.push_str(&format!(
-                "        ret.emplace_back({}(item));\n",
-                local_type_name(n)
-            ));
-        }
-        TypeRef::Enum(n) => {
-            let n = local_type_name(n);
-            out.push_str(&format!(
-                "        ret.emplace_back(static_cast<{n}>(item));\n"
-            ));
-        }
-        _ => {
-            out.push_str("        ret.emplace_back(item);\n");
-        }
-    }
-    out.push_str("    }\n");
-    out.push_str(&format!("    {destroy_fn}(iter);\n"));
-    out.push_str("    return ret;\n");
-    out.push_str("}\n\n");
+            w.line("if (err.code != 0) {");
+            w.scope(|w| {
+                w.line(format!("{destroy_fn}(iter);"));
+                let mut tmp = String::new();
+                emit_error_throw_body(&mut tmp, error_codes, prefix, "            ");
+                w.raw(tmp);
+            });
+            w.line("}");
+            w.line("if (has_item == 0) break;");
+            match inner {
+                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                    w.line("ret.emplace_back(item);");
+                    w.line(format!("{prefix}_free_string(item);"));
+                }
+                TypeRef::Bytes | TypeRef::BorrowedBytes => {
+                    w.line("ret.emplace_back(item, item + item_len);");
+                    w.line(format!(
+                        "{prefix}_free_bytes(const_cast<uint8_t*>(item), item_len);"
+                    ));
+                }
+                TypeRef::Struct(n) => {
+                    w.line(format!("ret.emplace_back({}(item));", local_type_name(n)));
+                }
+                TypeRef::Enum(n) => {
+                    let n = local_type_name(n);
+                    w.line(format!("ret.emplace_back(static_cast<{n}>(item));"));
+                }
+                _ => {
+                    w.line("ret.emplace_back(item);");
+                }
+            }
+        });
+        w.line("}");
+        w.line(format!("{destroy_fn}(iter);"));
+        w.line("return ret;");
+    });
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 fn render_cpp_return(out: &mut String, ty: &TypeRef, prefix: &str) {
+    let mut w = CodeWriter::four_space().with_depth(1);
     match ty {
         TypeRef::I8
         | TypeRef::I16
@@ -1780,93 +1894,91 @@ fn render_cpp_return(out: &mut String, ty: &TypeRef, prefix: &str) {
         | TypeRef::F32
         | TypeRef::F64
         | TypeRef::Bool => {
-            out.push_str("    return result;\n");
+            w.line("return result;");
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str("    std::string ret(result);\n");
-            out.push_str(&format!("    {prefix}_free_string(result);\n"));
-            out.push_str("    return ret;\n");
+            w.line("std::string ret(result);");
+            w.line(format!("{prefix}_free_string(result);"));
+            w.line("return ret;");
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            out.push_str("    std::vector<uint8_t> ret(result, result + out_len);\n");
-            out.push_str(&format!(
-                "    {prefix}_free_bytes(const_cast<uint8_t*>(result), out_len);\n"
+            w.line("std::vector<uint8_t> ret(result, result + out_len);");
+            w.line(format!(
+                "{prefix}_free_bytes(const_cast<uint8_t*>(result), out_len);"
             ));
-            out.push_str("    return ret;\n");
+            w.line("return ret;");
         }
         TypeRef::Handle => {
-            out.push_str("    return reinterpret_cast<void*>(static_cast<uintptr_t>(result));\n");
+            w.line("return reinterpret_cast<void*>(static_cast<uintptr_t>(result));");
         }
         TypeRef::TypedHandle(n) => {
             let ln = local_type_name(n);
-            out.push_str(&format!("    return {ln}(result);\n"));
+            w.line(format!("return {ln}(result);"));
         }
         TypeRef::Struct(n) => {
             let ln = local_type_name(n);
-            out.push_str(&format!("    return {ln}(result);\n"));
+            w.line(format!("return {ln}(result);"));
         }
         TypeRef::Enum(n) => {
             let n = local_type_name(n);
-            out.push_str(&format!("    return static_cast<{n}>(result);\n"));
+            w.line(format!("return static_cast<{n}>(result);"));
         }
         TypeRef::Optional(inner) => {
-            out.push_str("    if (!result) return std::nullopt;\n");
+            w.line("if (!result) return std::nullopt;");
             match inner.as_ref() {
                 TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                    out.push_str("    std::string ret(result);\n");
-                    out.push_str(&format!("    {prefix}_free_string(result);\n"));
-                    out.push_str("    return ret;\n");
+                    w.line("std::string ret(result);");
+                    w.line(format!("{prefix}_free_string(result);"));
+                    w.line("return ret;");
                 }
                 TypeRef::TypedHandle(n) => {
                     let ln = local_type_name(n);
-                    out.push_str(&format!("    return {ln}(result);\n"));
+                    w.line(format!("return {ln}(result);"));
                 }
                 TypeRef::Struct(n) => {
                     let ln = local_type_name(n);
-                    out.push_str(&format!("    return {ln}(result);\n"));
+                    w.line(format!("return {ln}(result);"));
                 }
                 TypeRef::Enum(n) => {
                     let n = local_type_name(n);
-                    out.push_str(&format!("    return static_cast<{n}>(*result);\n"));
+                    w.line(format!("return static_cast<{n}>(*result);"));
                 }
                 _ if !is_c_pointer_type(inner) => {
-                    out.push_str("    return *result;\n");
+                    w.line("return *result;");
                 }
                 _ => {
-                    out.push_str(&format!("    return {}(result);\n", cpp_type(inner)));
+                    w.line(format!("return {}(result);", cpp_type(inner)));
                 }
             }
         }
         TypeRef::List(inner) | TypeRef::Iterator(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                out.push_str("    std::vector<std::string> ret;\n");
-                out.push_str("    ret.reserve(out_len);\n");
-                out.push_str(
-                    "    for (size_t i = 0; i < out_len; ++i) ret.emplace_back(result[i]);\n",
-                );
-                out.push_str("    return ret;\n");
+                w.line("std::vector<std::string> ret;");
+                w.line("ret.reserve(out_len);");
+                w.line("for (size_t i = 0; i < out_len; ++i) ret.emplace_back(result[i]);");
+                w.line("return ret;");
             }
             TypeRef::Struct(n) => {
                 let ln = local_type_name(n);
-                out.push_str(&format!("    std::vector<{ln}> ret;\n"));
-                out.push_str("    ret.reserve(out_len);\n");
-                out.push_str(&format!(
-                    "    for (size_t i = 0; i < out_len; ++i) ret.emplace_back({ln}(result[i]));\n"
+                w.line(format!("std::vector<{ln}> ret;"));
+                w.line("ret.reserve(out_len);");
+                w.line(format!(
+                    "for (size_t i = 0; i < out_len; ++i) ret.emplace_back({ln}(result[i]));"
                 ));
-                out.push_str("    return ret;\n");
+                w.line("return ret;");
             }
             TypeRef::Enum(n) => {
                 let n = local_type_name(n);
-                out.push_str(&format!("    std::vector<{n}> ret;\n"));
-                out.push_str("    ret.reserve(out_len);\n");
-                out.push_str(&format!(
-                    "    for (size_t i = 0; i < out_len; ++i) ret.emplace_back(static_cast<{n}>(result[i]));\n"
+                w.line(format!("std::vector<{n}> ret;"));
+                w.line("ret.reserve(out_len);");
+                w.line(format!(
+                    "for (size_t i = 0; i < out_len; ++i) ret.emplace_back(static_cast<{n}>(result[i]));"
                 ));
-                out.push_str("    return ret;\n");
+                w.line("return ret;");
             }
             _ => {
-                out.push_str(&format!(
-                    "    return std::vector<{}>(result, result + out_len);\n",
+                w.line(format!(
+                    "return std::vector<{}>(result, result + out_len);",
                     cpp_type(inner)
                 ));
             }
@@ -1874,8 +1986,7 @@ fn render_cpp_return(out: &mut String, ty: &TypeRef, prefix: &str) {
         TypeRef::Map(k, v) => {
             let ck = cpp_type(k);
             let cv = cpp_type(v);
-            out.push_str(&format!("    std::unordered_map<{ck}, {cv}> ret;\n"));
-            out.push_str("    for (size_t i = 0; i < out_len; ++i) {\n");
+            w.line(format!("std::unordered_map<{ck}, {cv}> ret;"));
             let ke = match k.as_ref() {
                 TypeRef::StringUtf8 | TypeRef::BorrowedStr => "std::string(out_keys[i])".into(),
                 TypeRef::Enum(n) => format!("static_cast<{}>(out_keys[i])", local_type_name(n)),
@@ -1887,11 +1998,15 @@ fn render_cpp_return(out: &mut String, ty: &TypeRef, prefix: &str) {
                 TypeRef::Struct(n) => format!("{}(out_values[i])", local_type_name(n)),
                 _ => "out_values[i]".into(),
             };
-            out.push_str(&format!("        ret[{ke}] = {ve};\n"));
-            out.push_str("    }\n");
-            out.push_str("    return ret;\n");
+            w.line("for (size_t i = 0; i < out_len; ++i) {");
+            w.scope(|w| {
+                w.line(format!("ret[{ke}] = {ve};"));
+            });
+            w.line("}");
+            w.line("return ret;");
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn render_cpp_async_function(out: &mut String, func: &Function, abi_module: &str, prefix: &str) {
@@ -1906,14 +2021,15 @@ fn render_cpp_async_function(out: &mut String, func: &Function, abi_module: &str
     }
     let fn_name = format!("{}_{}", abi_module, func.name);
 
-    emit_doc(out, &func.doc, "");
+    let mut w = CodeWriter::four_space();
+    w.doc(&func.doc, DocCommentStyle::Javadoc);
     if let Some(msg) = &func.deprecated {
         let escaped = msg.replace('"', "\\\"");
-        out.push_str(&format!("[[deprecated(\"{escaped}\")]]\n"));
+        w.line(format!("[[deprecated(\"{escaped}\")]]"));
     }
 
-    out.push_str(&format!(
-        "inline std::future<{cpp_ret}> {fn_name}({}) {{\n",
+    w.line(format!(
+        "inline std::future<{cpp_ret}> {fn_name}({}) {{",
         cpp_params.join(", ")
     ));
 
@@ -1928,55 +2044,63 @@ fn render_cpp_async_function(out: &mut String, func: &Function, abi_module: &str
         c_args.push("cancel_token".to_string());
     }
 
-    out.push_str(&format!(
-        "    auto* promise_ptr = new std::promise<{cpp_ret}>();\n"
-    ));
-    out.push_str("    auto future = promise_ptr->get_future();\n");
-
-    for line in &setup {
-        out.push_str(&format!("    {line}\n"));
-    }
-
     let mut cb_params = vec!["void* context".to_string(), format!("{prefix}_error* err")];
     if let Some(ret) = &func.returns {
         cb_params.extend(c_callback_result_params(ret, abi_module, prefix));
     }
 
     let c_fn = format!("{prefix}_{}_{}_async", abi_module, func.name);
-    if c_args.is_empty() {
-        out.push_str(&format!("    {c_fn}([]({}) {{\n", cb_params.join(", ")));
-    } else {
-        out.push_str(&format!(
-            "    {c_fn}({}, []({}) {{\n",
-            c_args.join(", "),
-            cb_params.join(", ")
+    w.scope(|w| {
+        w.line(format!(
+            "auto* promise_ptr = new std::promise<{cpp_ret}>();"
         ));
-    }
+        w.line("auto future = promise_ptr->get_future();");
 
-    out.push_str(&format!(
-        "        auto* p = static_cast<std::promise<{cpp_ret}>*>(context);\n"
-    ));
-    out.push_str("        if (err && err->code != 0) {\n");
-    out.push_str("            std::string msg(err->message ? err->message : \"unknown error\");\n");
-    out.push_str(
-        "            p->set_exception(std::make_exception_ptr(WeaveFFIError(err->code, msg)));\n",
-    );
-    out.push_str("        } else {\n");
+        for line in &setup {
+            w.line(line);
+        }
 
-    if let Some(ret) = &func.returns {
-        render_async_set_value(out, ret, prefix);
-    } else {
-        out.push_str("            p->set_value();\n");
-    }
-
-    out.push_str("        }\n");
-    out.push_str("        delete p;\n");
-    out.push_str("    }, static_cast<void*>(promise_ptr));\n");
-    out.push_str("    return future;\n");
-    out.push_str("}\n\n");
+        if c_args.is_empty() {
+            w.line(format!("{c_fn}([]({}) {{", cb_params.join(", ")));
+        } else {
+            w.line(format!(
+                "{c_fn}({}, []({}) {{",
+                c_args.join(", "),
+                cb_params.join(", ")
+            ));
+        }
+        w.scope(|w| {
+            w.line(format!(
+                "auto* p = static_cast<std::promise<{cpp_ret}>*>(context);"
+            ));
+            w.line("if (err && err->code != 0) {");
+            w.scope(|w| {
+                w.line("std::string msg(err->message ? err->message : \"unknown error\");");
+                w.line("p->set_exception(std::make_exception_ptr(WeaveFFIError(err->code, msg)));");
+            });
+            w.line("} else {");
+            if let Some(ret) = &func.returns {
+                let mut tmp = String::new();
+                render_async_set_value(&mut tmp, ret, prefix);
+                w.raw(tmp);
+            } else {
+                w.scope(|w| {
+                    w.line("p->set_value();");
+                });
+            }
+            w.line("}");
+            w.line("delete p;");
+        });
+        w.line("}, static_cast<void*>(promise_ptr));");
+        w.line("return future;");
+    });
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 fn render_async_set_value(out: &mut String, ty: &TypeRef, prefix: &str) {
+    let mut w = CodeWriter::four_space().with_depth(3);
     match ty {
         TypeRef::I8
         | TypeRef::I16
@@ -1989,103 +2113,92 @@ fn render_async_set_value(out: &mut String, ty: &TypeRef, prefix: &str) {
         | TypeRef::F32
         | TypeRef::F64
         | TypeRef::Bool => {
-            out.push_str("            p->set_value(result);\n");
+            w.line("p->set_value(result);");
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str("            std::string ret(result);\n");
-            out.push_str(&format!("            {prefix}_free_string(result);\n"));
-            out.push_str("            p->set_value(std::move(ret));\n");
+            w.line("std::string ret(result);");
+            w.line(format!("{prefix}_free_string(result);"));
+            w.line("p->set_value(std::move(ret));");
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            out.push_str(
-                "            p->set_value(std::vector<uint8_t>(result, result + result_len));\n",
-            );
+            w.line("p->set_value(std::vector<uint8_t>(result, result + result_len));");
         }
         TypeRef::Handle => {
-            out.push_str(
-                "            p->set_value(reinterpret_cast<void*>(static_cast<uintptr_t>(result)));\n",
-            );
+            w.line("p->set_value(reinterpret_cast<void*>(static_cast<uintptr_t>(result)));");
         }
         TypeRef::TypedHandle(n) => {
             let ln = local_type_name(n);
-            out.push_str(&format!("            p->set_value({ln}(result));\n"));
+            w.line(format!("p->set_value({ln}(result));"));
         }
         TypeRef::Struct(n) => {
             let ln = local_type_name(n);
-            out.push_str(&format!("            p->set_value({ln}(result));\n"));
+            w.line(format!("p->set_value({ln}(result));"));
         }
         TypeRef::Enum(n) => {
             let n = local_type_name(n);
-            out.push_str(&format!(
-                "            p->set_value(static_cast<{n}>(result));\n"
-            ));
+            w.line(format!("p->set_value(static_cast<{n}>(result));"));
         }
         TypeRef::Optional(inner) => {
-            out.push_str("            if (!result) {\n");
-            out.push_str("                p->set_value(std::nullopt);\n");
-            out.push_str("            } else {\n");
-            match inner.as_ref() {
+            w.line("if (!result) {");
+            w.scope(|w| {
+                w.line("p->set_value(std::nullopt);");
+            });
+            w.line("} else {");
+            w.scope(|w| match inner.as_ref() {
                 TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                    out.push_str("                std::string ret(result);\n");
-                    out.push_str(&format!("                {prefix}_free_string(result);\n"));
-                    out.push_str("                p->set_value(std::move(ret));\n");
+                    w.line("std::string ret(result);");
+                    w.line(format!("{prefix}_free_string(result);"));
+                    w.line("p->set_value(std::move(ret));");
                 }
                 TypeRef::TypedHandle(n) => {
                     let ln = local_type_name(n);
-                    out.push_str(&format!("                p->set_value({ln}(result));\n"));
+                    w.line(format!("p->set_value({ln}(result));"));
                 }
                 TypeRef::Struct(n) => {
                     let ln = local_type_name(n);
-                    out.push_str(&format!("                p->set_value({ln}(result));\n"));
+                    w.line(format!("p->set_value({ln}(result));"));
                 }
                 TypeRef::Enum(n) => {
                     let n = local_type_name(n);
-                    out.push_str(&format!(
-                        "                p->set_value(static_cast<{n}>(*result));\n"
-                    ));
+                    w.line(format!("p->set_value(static_cast<{n}>(*result));"));
                 }
                 _ if !is_c_pointer_type(inner) => {
-                    out.push_str("                p->set_value(*result);\n");
+                    w.line("p->set_value(*result);");
                 }
                 _ => {
-                    out.push_str(&format!(
-                        "                p->set_value({}(result));\n",
-                        cpp_type(inner)
-                    ));
+                    w.line(format!("p->set_value({}(result));", cpp_type(inner)));
                 }
-            }
-            out.push_str("            }\n");
+            });
+            w.line("}");
         }
         TypeRef::List(inner) | TypeRef::Iterator(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                out.push_str("            std::vector<std::string> ret;\n");
-                out.push_str("            ret.reserve(result_len);\n");
-                out.push_str(
-                    "            for (size_t i = 0; i < result_len; ++i) ret.emplace_back(result[i]);\n",
-                );
-                out.push_str("            p->set_value(std::move(ret));\n");
+                w.line("std::vector<std::string> ret;");
+                w.line("ret.reserve(result_len);");
+                w.line("for (size_t i = 0; i < result_len; ++i) ret.emplace_back(result[i]);");
+                w.line("p->set_value(std::move(ret));");
             }
             TypeRef::Struct(n) => {
                 let ln = local_type_name(n);
-                out.push_str(&format!("            std::vector<{ln}> ret;\n"));
-                out.push_str("            ret.reserve(result_len);\n");
-                out.push_str(&format!(
-                    "            for (size_t i = 0; i < result_len; ++i) ret.emplace_back({ln}(result[i]));\n"
+                w.line(format!("std::vector<{ln}> ret;"));
+                w.line("ret.reserve(result_len);");
+                w.line(format!(
+                    "for (size_t i = 0; i < result_len; ++i) ret.emplace_back({ln}(result[i]));"
                 ));
-                out.push_str("            p->set_value(std::move(ret));\n");
+                w.line("p->set_value(std::move(ret));");
             }
             TypeRef::Enum(n) => {
                 let n = local_type_name(n);
-                out.push_str(&format!("            std::vector<{n}> ret;\n"));
-                out.push_str("            ret.reserve(result_len);\n");
-                out.push_str(&format!(
-                    "            for (size_t i = 0; i < result_len; ++i) ret.emplace_back(static_cast<{n}>(result[i]));\n"
+                w.line(format!("std::vector<{n}> ret;"));
+                w.line("ret.reserve(result_len);");
+                w.line(format!(
+                    "for (size_t i = 0; i < result_len; ++i) ret.emplace_back(static_cast<{n}>(result[i]));"
                 ));
-                out.push_str("            p->set_value(std::move(ret));\n");
+                w.line("p->set_value(std::move(ret));");
             }
             _ => {
-                out.push_str(&format!(
-                    "            p->set_value(std::vector<{}>(result, result + result_len));\n",
+                w.line(format!(
+                    "p->set_value(std::vector<{}>(result, result + result_len));",
                     cpp_type(inner)
                 ));
             }
@@ -2093,10 +2206,7 @@ fn render_async_set_value(out: &mut String, ty: &TypeRef, prefix: &str) {
         TypeRef::Map(k, v) => {
             let ck = cpp_type(k);
             let cv = cpp_type(v);
-            out.push_str(&format!(
-                "            std::unordered_map<{ck}, {cv}> ret;\n"
-            ));
-            out.push_str("            for (size_t i = 0; i < result_len; ++i) {\n");
+            w.line(format!("std::unordered_map<{ck}, {cv}> ret;"));
             let ke = match k.as_ref() {
                 TypeRef::StringUtf8 | TypeRef::BorrowedStr => "std::string(result_keys[i])".into(),
                 TypeRef::Enum(n) => format!("static_cast<{}>(result_keys[i])", local_type_name(n)),
@@ -2112,11 +2222,15 @@ fn render_async_set_value(out: &mut String, ty: &TypeRef, prefix: &str) {
                 TypeRef::Struct(n) => format!("{}(result_values[i])", local_type_name(n)),
                 _ => "result_values[i]".into(),
             };
-            out.push_str(&format!("                ret[{ke}] = {ve};\n"));
-            out.push_str("            }\n");
-            out.push_str("            p->set_value(std::move(ret));\n");
+            w.line("for (size_t i = 0; i < result_len; ++i) {");
+            w.scope(|w| {
+                w.line(format!("ret[{ke}] = {ve};"));
+            });
+            w.line("}");
+            w.line("p->set_value(std::move(ret));");
         }
     }
+    out.push_str(&w.finish());
 }
 
 #[cfg(test)]

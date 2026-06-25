@@ -91,13 +91,21 @@ fn generated_output_has_no_stub_markers() {
         root.join("samples/kvstore/kvstore.yml"),
     ];
 
-    // Case-insensitive marker list. "not supported" is deliberately absent:
-    // explicit unsupported-feature stubs (e.g. wasm listeners behind
-    // allow_unsupported) are the *correct* loud behavior.
+    // Case-insensitive marker list. Bare "not supported" is deliberately
+    // absent: an explicit, permanently declared unsupported-feature surface
+    // (e.g. wasm listeners behind `allow_unsupported`, which throw "is not
+    // supported by the wasm target") is the *correct* loud behavior. The
+    // "yet" in "not yet supported" is what distinguishes capability drift: a
+    // target that declares a feature `true` (so the gate lets generation
+    // through) but then emits a runtime-throwing TODO stub for it. That is
+    // exactly the Android `iter<T>` regression the capability gate exists to
+    // prevent, so it must stay a hard build failure.
     let banned = [
         "unimplemented",
         "notimplemented",
         "not implemented",
+        "not yet supported",
+        "not yet implemented",
         "requires ffi backing",
     ];
 

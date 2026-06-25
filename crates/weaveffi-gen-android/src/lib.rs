@@ -18,6 +18,7 @@ use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, pascal_case, walk_modules, DocCommentStyle,
 };
+use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors;
 use weaveffi_core::model::{
     BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
@@ -193,6 +194,25 @@ fn emit_fn_doc(out: &mut String, doc: &Option<String>, params: &[ParamBinding], 
     }
     out.push_str(indent);
     out.push_str(" */\n");
+}
+
+/// Emit [`emit_doc`] at the writer's current depth by rendering into a scratch
+/// buffer and splicing it verbatim, so a [`CodeWriter`]-based renderer can
+/// interleave KDoc comments without re-implementing their formatting.
+fn writer_doc(w: &mut CodeWriter, doc: &Option<String>) {
+    let mut tmp = String::new();
+    emit_doc(&mut tmp, doc, &w.indent_str());
+    w.raw(tmp);
+}
+
+/// Run a sub-renderer that writes already-indented text into a scratch buffer,
+/// then splice it verbatim into `w`. The interleaved emitters (`write_*`) carry
+/// their own absolute indentation, so a [`CodeWriter`]-based caller folds them
+/// in with [`CodeWriter::raw`] without disturbing its own depth.
+fn splice(w: &mut CodeWriter, render: impl FnOnce(&mut String)) {
+    let mut tmp = String::new();
+    render(&mut tmp);
+    w.raw(tmp);
 }
 
 fn build_gradle(namespace: &str, input_basename: &str) -> String {
@@ -751,12 +771,12 @@ fn render_kotlin_async_fun(out: &mut String, f: &FnBinding, func_name: &str) {
     }
     native_param_chain.push("callback: Any".to_string());
     let native_params = native_param_chain;
-    let _ = writeln!(
-        out,
-        "        @JvmStatic private external fun {}Async({})",
+    let mut w = CodeWriter::four_space().with_depth(2);
+    w.line(format!(
+        "@JvmStatic private external fun {}Async({})",
         func_name,
         native_params.join(", ")
-    );
+    ));
 
     let params_sig: Vec<String> = f
         .params
@@ -794,7 +814,7 @@ fn render_kotlin_async_fun(out: &mut String, f: &FnBinding, func_name: &str) {
     call_arg_chain.push("WeaveContinuation(cont)".to_string());
     let call_args = call_arg_chain;
     if let Some(msg) = &f.deprecated {
-        let _ = writeln!(out, "        @Deprecated(\"{}\")", msg.replace('"', "\\\""));
+        w.line(format!("@Deprecated(\"{}\")", msg.replace('"', "\\\"")));
     }
 
     // Map the resumed (lowered) value back to the public type.
@@ -814,44 +834,38 @@ fn render_kotlin_async_fun(out: &mut String, f: &FnBinding, func_name: &str) {
 
     match wrap_expr {
         Some(wrap) => {
-            let _ = writeln!(
-                out,
-                "        @JvmStatic suspend fun {}({}): {} {{",
+            w.line(format!(
+                "@JvmStatic suspend fun {}({}): {} {{",
                 func_name,
                 params_sig.join(", "),
                 public_ret
-            );
-            let _ = writeln!(
-                out,
-                "            val raw: {jni_ret} = suspendCancellableCoroutine {{ cont ->"
-            );
-            let _ = writeln!(
-                out,
-                "                {}Async({})",
-                func_name,
-                call_args.join(", ")
-            );
-            let _ = writeln!(out, "            }}");
-            let _ = writeln!(out, "            return {wrap}");
-            let _ = writeln!(out, "        }}");
+            ));
+            w.scope(|w| {
+                w.line(format!(
+                    "val raw: {jni_ret} = suspendCancellableCoroutine {{ cont ->"
+                ));
+                w.scope(|w| {
+                    w.line(format!("{}Async({})", func_name, call_args.join(", ")));
+                });
+                w.line("}");
+                w.line(format!("return {wrap}"));
+            });
+            w.line("}");
         }
         None => {
-            let _ = writeln!(
-                out,
-                "        @JvmStatic suspend fun {}({}): {} = suspendCancellableCoroutine {{ cont ->",
+            w.line(format!(
+                "@JvmStatic suspend fun {}({}): {} = suspendCancellableCoroutine {{ cont ->",
                 func_name,
                 params_sig.join(", "),
                 public_ret
-            );
-            let _ = writeln!(
-                out,
-                "            {}Async({})",
-                func_name,
-                call_args.join(", ")
-            );
-            let _ = writeln!(out, "        }}");
+            ));
+            w.scope(|w| {
+                w.line(format!("{}Async({})", func_name, call_args.join(", ")));
+            });
+            w.line("}");
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn render_kotlin_enum(out: &mut String, e: &EnumBinding) {
@@ -862,23 +876,28 @@ fn render_kotlin_enum(out: &mut String, e: &EnumBinding) {
         render_kotlin_rich_enum(out, e);
         return;
     }
-    let _ = writeln!(out);
-    emit_doc(out, &e.doc, "");
-    let _ = writeln!(out, "enum class {}(val value: Int) {{", e.name);
-    for (i, v) in e.variants.iter().enumerate() {
-        emit_doc(out, &v.doc, "    ");
-        let comma = if i < e.variants.len() - 1 { "," } else { ";" };
-        let _ = writeln!(out, "    {}({}){}", v.name, v.value, comma);
-    }
-    let _ = writeln!(out);
-    let _ = writeln!(out, "    companion object {{");
-    let _ = writeln!(
-        out,
-        "        fun fromValue(value: Int): {} = entries.first {{ it.value == value }}",
-        e.name
-    );
-    let _ = writeln!(out, "    }}");
-    let _ = writeln!(out, "}}");
+    let mut w = CodeWriter::four_space();
+    w.blank();
+    writer_doc(&mut w, &e.doc);
+    w.line(format!("enum class {}(val value: Int) {{", e.name));
+    w.scope(|w| {
+        for (i, v) in e.variants.iter().enumerate() {
+            writer_doc(w, &v.doc);
+            let comma = if i < e.variants.len() - 1 { "," } else { ";" };
+            w.line(format!("{}({}){}", v.name, v.value, comma));
+        }
+        w.blank();
+        w.line("companion object {");
+        w.scope(|w| {
+            w.line(format!(
+                "fun fromValue(value: Int): {} = entries.first {{ it.value == value }}",
+                e.name
+            ));
+        });
+        w.line("}");
+    });
+    w.line("}");
+    out.push_str(&w.finish());
 }
 
 /// Render a rich (algebraic) enum as an owned opaque-object wrapper class,
@@ -897,158 +916,155 @@ fn render_kotlin_rich_enum(out: &mut String, e: &EnumBinding) {
     };
     let name = &e.name;
 
-    let _ = writeln!(out);
-    emit_doc(out, &e.doc, "");
-    let _ = writeln!(
-        out,
-        // `handle` is `internal` (not `private`) so the `WeaveFFI` companion
-        // wrappers in this module can unwrap `shape.handle` and re-wrap a
-        // returned pointer as `Shape(ptr)`; it stays hidden from consumers.
+    let mut w = CodeWriter::four_space();
+    w.blank();
+    writer_doc(&mut w, &e.doc);
+    // `handle` is `internal` (not `private`) so the `WeaveFFI` companion
+    // wrappers in this module can unwrap `shape.handle` and re-wrap a
+    // returned pointer as `Shape(ptr)`; it stays hidden from consumers.
+    w.line(format!(
         "class {} internal constructor(internal var handle: Long) : java.io.Closeable {{",
         name
-    );
-    let _ = writeln!(out, "    companion object {{");
-    let _ = writeln!(out, "        init {{ System.loadLibrary(\"weaveffi\") }}");
-    let _ = writeln!(out);
+    ));
+    w.scope(|w| {
+        w.line("companion object {");
+        w.scope(|w| {
+            w.line("init { System.loadLibrary(\"weaveffi\") }");
+            w.blank();
 
-    // tag reader + destructor natives (shared across all variants).
-    let _ = writeln!(
-        out,
-        "        @JvmStatic external fun nativeTag(handle: Long): Int"
-    );
-    let _ = writeln!(
-        out,
-        "        @JvmStatic external fun nativeDestroy(handle: Long)"
-    );
+            // tag reader + destructor natives (shared across all variants).
+            w.line("@JvmStatic external fun nativeTag(handle: Long): Int");
+            w.line("@JvmStatic external fun nativeDestroy(handle: Long)");
 
-    // One constructor native per variant; a unit variant takes no value slots.
-    for v in &rich.variants {
-        let create_params: Vec<String> = v
-            .fields
-            .iter()
-            .map(|f| format!("{}: {}", f.name, kotlin_type(&f.ty)))
-            .collect();
-        let _ = writeln!(
-            out,
-            "        @JvmStatic external fun nativeNew{}({}): Long",
-            pascal_case(&v.name),
-            create_params.join(", ")
-        );
-    }
+            // One constructor native per variant; a unit variant takes no value slots.
+            for v in &rich.variants {
+                let create_params: Vec<String> = v
+                    .fields
+                    .iter()
+                    .map(|f| format!("{}: {}", f.name, kotlin_type(&f.ty)))
+                    .collect();
+                w.line(format!(
+                    "@JvmStatic external fun nativeNew{}({}): Long",
+                    pascal_case(&v.name),
+                    create_params.join(", ")
+                ));
+            }
 
-    // One getter native per variant field, namespaced by variant to avoid
-    // collisions when two variants share a field name.
-    for v in &rich.variants {
-        for f in &v.fields {
-            let _ = writeln!(
-                out,
-                "        @JvmStatic external fun nativeGet{}{}(handle: Long): {}",
-                pascal_case(&v.name),
-                pascal_case(&f.name),
-                kotlin_type(&f.ty)
-            );
-        }
-    }
-
-    let _ = writeln!(out);
-    // Idiomatic per-variant factories (`Shape.circle(2.5)`). Like the struct
-    // `create` factory, these forward the raw native slots directly and wrap the
-    // returned pointer into the owning class.
-    for v in &rich.variants {
-        let factory = lower_camel(&v.name);
-        let create_params: Vec<String> = v
-            .fields
-            .iter()
-            .map(|f| format!("{}: {}", f.name, kotlin_type(&f.ty)))
-            .collect();
-        let param_names: Vec<&str> = v.fields.iter().map(|f| f.name.as_str()).collect();
-        emit_doc(out, &v.doc, "        ");
-        let _ = writeln!(
-            out,
-            "        fun {}({}): {} = {}(nativeNew{}({}))",
-            factory,
-            create_params.join(", "),
-            name,
-            name,
-            pascal_case(&v.name),
-            param_names.join(", ")
-        );
-    }
-    let _ = writeln!(out, "    }}");
-    let _ = writeln!(out);
-
-    // Nested discriminant enum (`Shape.Tag.Circle == 1`) + active-tag reader.
-    let _ = writeln!(out, "    enum class Tag(val value: Int) {{");
-    for (i, v) in e.variants.iter().enumerate() {
-        emit_doc(out, &v.doc, "        ");
-        let comma = if i < e.variants.len() - 1 { "," } else { ";" };
-        let _ = writeln!(out, "        {}({}){}", v.name, v.value, comma);
-    }
-    let _ = writeln!(out);
-    let _ = writeln!(out, "        companion object {{");
-    let _ = writeln!(
-        out,
-        "            fun fromValue(value: Int): Tag = entries.first {{ it.value == value }}"
-    );
-    let _ = writeln!(out, "        }}");
-    let _ = writeln!(out, "    }}");
-    let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "    val tag: Tag get() = Tag.fromValue(nativeTag(handle))"
-    );
-    let _ = writeln!(out);
-
-    // Per-variant field getters. The native returns the raw slot; struct/enum
-    // payloads round-trip through their wrapper exactly like a struct field.
-    for v in &rich.variants {
-        let variant_camel = lower_camel(&v.name);
-        for f in &v.fields {
-            let prop = format!("{}{}", variant_camel, pascal_case(&f.name));
-            let native = format!("nativeGet{}{}", pascal_case(&v.name), pascal_case(&f.name));
-            let kt_type = kotlin_getter_type(&f.ty);
-            emit_doc(out, &f.doc, "    ");
-            match &f.ty {
-                TypeRef::Struct(sname) => {
-                    let local = local_type_name(sname);
-                    let _ = writeln!(
-                        out,
-                        "    val {}: {} get() = {}({}(handle))",
-                        prop, kt_type, local, native
-                    );
+            // One getter native per variant field, namespaced by variant to avoid
+            // collisions when two variants share a field name.
+            for v in &rich.variants {
+                for f in &v.fields {
+                    w.line(format!(
+                        "@JvmStatic external fun nativeGet{}{}(handle: Long): {}",
+                        pascal_case(&v.name),
+                        pascal_case(&f.name),
+                        kotlin_type(&f.ty)
+                    ));
                 }
-                // The native getter returns the raw `Int` value, so an enum
-                // payload round-trips through the generated `fromValue` factory.
-                TypeRef::Enum(_) => {
-                    let _ = writeln!(
-                        out,
-                        "    val {}: {} get() = {}.fromValue({}(handle))",
-                        prop, kt_type, kt_type, native
-                    );
-                }
-                _ => {
-                    let _ = writeln!(
-                        out,
-                        "    val {}: {} get() = {}(handle)",
-                        prop, kt_type, native
-                    );
+            }
+
+            w.blank();
+            // Idiomatic per-variant factories (`Shape.circle(2.5)`). Like the struct
+            // `create` factory, these forward the raw native slots directly and wrap the
+            // returned pointer into the owning class.
+            for v in &rich.variants {
+                let factory = lower_camel(&v.name);
+                let create_params: Vec<String> = v
+                    .fields
+                    .iter()
+                    .map(|f| format!("{}: {}", f.name, kotlin_type(&f.ty)))
+                    .collect();
+                let param_names: Vec<&str> = v.fields.iter().map(|f| f.name.as_str()).collect();
+                writer_doc(w, &v.doc);
+                w.line(format!(
+                    "fun {}({}): {} = {}(nativeNew{}({}))",
+                    factory,
+                    create_params.join(", "),
+                    name,
+                    name,
+                    pascal_case(&v.name),
+                    param_names.join(", ")
+                ));
+            }
+        });
+        w.line("}");
+        w.blank();
+
+        // Nested discriminant enum (`Shape.Tag.Circle == 1`) + active-tag reader.
+        w.line("enum class Tag(val value: Int) {");
+        w.scope(|w| {
+            for (i, v) in e.variants.iter().enumerate() {
+                writer_doc(w, &v.doc);
+                let comma = if i < e.variants.len() - 1 { "," } else { ";" };
+                w.line(format!("{}({}){}", v.name, v.value, comma));
+            }
+            w.blank();
+            w.line("companion object {");
+            w.scope(|w| {
+                w.line("fun fromValue(value: Int): Tag = entries.first { it.value == value }");
+            });
+            w.line("}");
+        });
+        w.line("}");
+        w.blank();
+        w.line("val tag: Tag get() = Tag.fromValue(nativeTag(handle))");
+        w.blank();
+
+        // Per-variant field getters. The native returns the raw slot; struct/enum
+        // payloads round-trip through their wrapper exactly like a struct field.
+        for v in &rich.variants {
+            let variant_camel = lower_camel(&v.name);
+            for f in &v.fields {
+                let prop = format!("{}{}", variant_camel, pascal_case(&f.name));
+                let native = format!("nativeGet{}{}", pascal_case(&v.name), pascal_case(&f.name));
+                let kt_type = kotlin_getter_type(&f.ty);
+                writer_doc(w, &f.doc);
+                match &f.ty {
+                    TypeRef::Struct(sname) => {
+                        let local = local_type_name(sname);
+                        w.line(format!(
+                            "val {}: {} get() = {}({}(handle))",
+                            prop, kt_type, local, native
+                        ));
+                    }
+                    // The native getter returns the raw `Int` value, so an enum
+                    // payload round-trips through the generated `fromValue` factory.
+                    TypeRef::Enum(_) => {
+                        w.line(format!(
+                            "val {}: {} get() = {}.fromValue({}(handle))",
+                            prop, kt_type, kt_type, native
+                        ));
+                    }
+                    _ => {
+                        w.line(format!(
+                            "val {}: {} get() = {}(handle)",
+                            prop, kt_type, native
+                        ));
+                    }
                 }
             }
         }
-    }
-    let _ = writeln!(out);
+        w.blank();
 
-    let _ = writeln!(out, "    override fun close() {{");
-    let _ = writeln!(out, "        if (handle != 0L) {{");
-    let _ = writeln!(out, "            nativeDestroy(handle)");
-    let _ = writeln!(out, "            handle = 0L");
-    let _ = writeln!(out, "        }}");
-    let _ = writeln!(out, "    }}");
-    let _ = writeln!(out);
-    let _ = writeln!(out, "    protected fun finalize() {{");
-    let _ = writeln!(out, "        close()");
-    let _ = writeln!(out, "    }}");
-    let _ = writeln!(out, "}}");
+        w.line("override fun close() {");
+        w.scope(|w| {
+            w.line("if (handle != 0L) {");
+            w.scope(|w| {
+                w.line("nativeDestroy(handle)");
+                w.line("handle = 0L");
+            });
+            w.line("}");
+        });
+        w.line("}");
+        w.blank();
+        w.line("protected fun finalize() {");
+        w.scope(|w| {
+            w.line("close()");
+        });
+        w.line("}");
+    });
+    w.line("}");
+    out.push_str(&w.finish());
 }
 
 fn render_kotlin_error_types(out: &mut String, api: &Api) {
@@ -1057,29 +1073,28 @@ fn render_kotlin_error_types(out: &mut String, api: &Api) {
         .flat_map(|e| &e.codes)
         .collect();
 
-    let _ = writeln!(out);
+    let mut w = CodeWriter::four_space();
+    w.blank();
     if error_codes.is_empty() {
-        let _ = writeln!(
-            out,
-            "open class WeaveFFIException(val code: Int, message: String) : Exception(message)"
-        );
+        w.line("open class WeaveFFIException(val code: Int, message: String) : Exception(message)");
     } else {
-        let _ = writeln!(
-            out,
-            "sealed class WeaveFFIException(val code: Int, message: String) : Exception(message) {{"
+        w.line(
+            "sealed class WeaveFFIException(val code: Int, message: String) : Exception(message) {",
         );
-        for ec in &error_codes {
-            emit_doc(out, &ec.doc, "    ");
-            let _ = writeln!(
-                out,
-                "    class {}(message: String = \"{}\") : WeaveFFIException({}, message)",
-                errors::pascal(&ec.name),
-                ec.message,
-                ec.code
-            );
-        }
-        let _ = writeln!(out, "}}");
+        w.scope(|w| {
+            for ec in &error_codes {
+                writer_doc(w, &ec.doc);
+                w.line(format!(
+                    "class {}(message: String = \"{}\") : WeaveFFIException({}, message)",
+                    errors::pascal(&ec.name),
+                    ec.message,
+                    ec.code
+                ));
+            }
+        });
+        w.line("}");
     }
+    out.push_str(&w.finish());
 }
 
 fn render_jni_c(
@@ -1287,26 +1302,25 @@ fn async_cb_result_params(ret: Option<&TypeRef>) -> String {
 }
 
 fn write_jni_box_result(out: &mut String, ret: Option<&TypeRef>) {
+    let mut w = CodeWriter::four_space().with_depth(2);
     match ret {
         None => {
-            out.push_str("        jobject boxed = NULL;\n");
+            w.line("jobject boxed = NULL;");
         }
         Some(TypeRef::I8 | TypeRef::U8) => {
-            out.push_str("        jclass boxCls = (*env)->FindClass(env, \"java/lang/Byte\");\n");
-            out.push_str("        jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(B)Ljava/lang/Byte;\");\n");
-            out.push_str("        jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jbyte)result);\n");
+            w.line("jclass boxCls = (*env)->FindClass(env, \"java/lang/Byte\");");
+            w.line("jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(B)Ljava/lang/Byte;\");");
+            w.line("jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jbyte)result);");
         }
         Some(TypeRef::I16 | TypeRef::U16) => {
-            out.push_str("        jclass boxCls = (*env)->FindClass(env, \"java/lang/Short\");\n");
-            out.push_str("        jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(S)Ljava/lang/Short;\");\n");
-            out.push_str("        jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jshort)result);\n");
+            w.line("jclass boxCls = (*env)->FindClass(env, \"java/lang/Short\");");
+            w.line("jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(S)Ljava/lang/Short;\");");
+            w.line("jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jshort)result);");
         }
         Some(TypeRef::I32 | TypeRef::Enum(_)) => {
-            out.push_str(
-                "        jclass boxCls = (*env)->FindClass(env, \"java/lang/Integer\");\n",
-            );
-            out.push_str("        jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(I)Ljava/lang/Integer;\");\n");
-            out.push_str("        jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jint)result);\n");
+            w.line("jclass boxCls = (*env)->FindClass(env, \"java/lang/Integer\");");
+            w.line("jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(I)Ljava/lang/Integer;\");");
+            w.line("jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jint)result);");
         }
         Some(
             TypeRef::U32
@@ -1316,37 +1330,38 @@ fn write_jni_box_result(out: &mut String, ret: Option<&TypeRef>) {
             | TypeRef::TypedHandle(_)
             | TypeRef::Struct(_),
         ) => {
-            out.push_str("        jclass boxCls = (*env)->FindClass(env, \"java/lang/Long\");\n");
-            out.push_str("        jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(J)Ljava/lang/Long;\");\n");
-            out.push_str("        jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jlong)result);\n");
+            w.line("jclass boxCls = (*env)->FindClass(env, \"java/lang/Long\");");
+            w.line("jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(J)Ljava/lang/Long;\");");
+            w.line("jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jlong)result);");
         }
         Some(TypeRef::F64) => {
-            out.push_str("        jclass boxCls = (*env)->FindClass(env, \"java/lang/Double\");\n");
-            out.push_str("        jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(D)Ljava/lang/Double;\");\n");
-            out.push_str("        jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jdouble)result);\n");
+            w.line("jclass boxCls = (*env)->FindClass(env, \"java/lang/Double\");");
+            w.line("jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(D)Ljava/lang/Double;\");");
+            w.line("jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jdouble)result);");
         }
         Some(TypeRef::F32) => {
-            out.push_str("        jclass boxCls = (*env)->FindClass(env, \"java/lang/Float\");\n");
-            out.push_str("        jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(F)Ljava/lang/Float;\");\n");
-            out.push_str("        jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jfloat)result);\n");
+            w.line("jclass boxCls = (*env)->FindClass(env, \"java/lang/Float\");");
+            w.line("jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(F)Ljava/lang/Float;\");");
+            w.line("jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jfloat)result);");
         }
         Some(TypeRef::Bool) => {
-            out.push_str(
-                "        jclass boxCls = (*env)->FindClass(env, \"java/lang/Boolean\");\n",
-            );
-            out.push_str("        jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(Z)Ljava/lang/Boolean;\");\n");
-            out.push_str("        jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, result ? JNI_TRUE : JNI_FALSE);\n");
+            w.line("jclass boxCls = (*env)->FindClass(env, \"java/lang/Boolean\");");
+            w.line("jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(Z)Ljava/lang/Boolean;\");");
+            w.line("jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, result ? JNI_TRUE : JNI_FALSE);");
         }
         Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
-            out.push_str("        jobject boxed = (*env)->NewStringUTF(env, result);\n");
+            w.line("jobject boxed = (*env)->NewStringUTF(env, result);");
         }
         _ => {
-            out.push_str("        jobject boxed = (jobject)(intptr_t)result;\n");
+            w.line("jobject boxed = (jobject)(intptr_t)result;");
         }
     }
-    out.push_str("        jclass cls = (*env)->GetObjectClass(env, ctx->callback);\n");
-    out.push_str("        jmethodID mid = (*env)->GetMethodID(env, cls, \"onSuccess\", \"(Ljava/lang/Object;)V\");\n");
-    out.push_str("        (*env)->CallVoidMethod(env, ctx->callback, mid, boxed);\n");
+    w.line("jclass cls = (*env)->GetObjectClass(env, ctx->callback);");
+    w.line(
+        "jmethodID mid = (*env)->GetMethodID(env, cls, \"onSuccess\", \"(Ljava/lang/Object;)V\");",
+    );
+    w.line("(*env)->CallVoidMethod(env, ctx->callback, mid, boxed);");
+    out.push_str(&w.finish());
 }
 
 fn render_jni_async_function(
@@ -1361,41 +1376,49 @@ fn render_jni_async_function(
     let cb_name = format!("{c_sym}_jni_cb");
     let cb_result_params = async_cb_result_params(f.ret.as_ref());
 
-    let _ = writeln!(
-        out,
+    let mut w = CodeWriter::four_space();
+    w.line(format!(
         "static void {cb_name}(void* context, weaveffi_error* err{cb_result_params}) {{"
-    );
-    out.push_str("    weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)context;\n");
-    // The producer invokes this from its own worker thread, which usually is
-    // not a JVM thread: attach if needed and detach before the thread exits.
-    // A thread that dies while still attached leaves the JVM with a zombie
-    // attachment record, hanging process shutdown (DestroyJavaVM never sees
-    // the thread terminate cleanly).
-    out.push_str("    JNIEnv* env = NULL;\n");
-    out.push_str("    int attached = 0;\n");
-    out.push_str(
-        "    if ((*ctx->jvm)->GetEnv(ctx->jvm, (void**)&env, JNI_VERSION_1_6) != JNI_OK) {\n",
-    );
-    out.push_str(
-        "        if ((*ctx->jvm)->AttachCurrentThread(ctx->jvm, (void**)&env, NULL) != JNI_OK) { free(ctx); return; }\n",
-    );
-    out.push_str("        attached = 1;\n");
-    out.push_str("    }\n");
-    out.push_str("    if (err != NULL && err->code != 0) {\n");
-    out.push_str("        const char* msg = err->message ? err->message : \"WeaveFFI error\";\n");
-    out.push_str("        jstring jmsg = (*env)->NewStringUTF(env, msg);\n");
-    out.push_str("        jclass cls = (*env)->GetObjectClass(env, ctx->callback);\n");
-    out.push_str("        jmethodID mid = (*env)->GetMethodID(env, cls, \"onError\", \"(Ljava/lang/String;)V\");\n");
-    out.push_str("        (*env)->CallVoidMethod(env, ctx->callback, mid, jmsg);\n");
-    out.push_str("    } else {\n");
-    write_jni_box_result(out, f.ret.as_ref());
-    out.push_str("    }\n");
-    out.push_str("    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);\n");
-    out.push_str("    (*env)->DeleteGlobalRef(env, ctx->callback);\n");
-    out.push_str("    JavaVM* jvm = ctx->jvm;\n");
-    out.push_str("    free(ctx);\n");
-    out.push_str("    if (attached) (*jvm)->DetachCurrentThread(jvm);\n");
-    out.push_str("}\n\n");
+    ));
+    w.scope(|w| {
+        w.line("weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)context;");
+        // The producer invokes this from its own worker thread, which usually is
+        // not a JVM thread: attach if needed and detach before the thread exits.
+        // A thread that dies while still attached leaves the JVM with a zombie
+        // attachment record, hanging process shutdown (DestroyJavaVM never sees
+        // the thread terminate cleanly).
+        w.line("JNIEnv* env = NULL;");
+        w.line("int attached = 0;");
+        w.block(
+            "if ((*ctx->jvm)->GetEnv(ctx->jvm, (void**)&env, JNI_VERSION_1_6) != JNI_OK) {",
+            "}",
+            |w| {
+                w.line("if ((*ctx->jvm)->AttachCurrentThread(ctx->jvm, (void**)&env, NULL) != JNI_OK) { free(ctx); return; }");
+                w.line("attached = 1;");
+            },
+        );
+        w.line("if (err != NULL && err->code != 0) {");
+        w.scope(|w| {
+            w.line("const char* msg = err->message ? err->message : \"WeaveFFI error\";");
+            w.line("jstring jmsg = (*env)->NewStringUTF(env, msg);");
+            w.line("jclass cls = (*env)->GetObjectClass(env, ctx->callback);");
+            w.line("jmethodID mid = (*env)->GetMethodID(env, cls, \"onError\", \"(Ljava/lang/String;)V\");");
+            w.line("(*env)->CallVoidMethod(env, ctx->callback, mid, jmsg);");
+        });
+        w.line("} else {");
+        w.scope(|w| {
+            splice(w, |o| write_jni_box_result(o, f.ret.as_ref()));
+        });
+        w.line("}");
+        w.line("if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);");
+        w.line("(*env)->DeleteGlobalRef(env, ctx->callback);");
+        w.line("JavaVM* jvm = ctx->jvm;");
+        w.line("free(ctx);");
+        w.line("if (attached) (*jvm)->DetachCurrentThread(jvm);");
+    });
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
 
     let mut jparams: Vec<String> = vec!["JNIEnv* env".into(), "jclass clazz".into()];
     for p in &f.params {
@@ -1407,53 +1430,61 @@ fn render_jni_async_function(
     jparams.push("jobject callback".to_string());
 
     let jni_name = format!("{func_name}Async");
-    let _ = writeln!(
-        out,
+    let mut w = CodeWriter::four_space();
+    w.line(format!(
         "JNIEXPORT void JNICALL Java_{}_WeaveFFI_{}({}) {{",
         jni_prefix,
         jni_mangle(&jni_name),
         jparams.join(", ")
-    );
+    ));
+    w.scope(|w| {
+        w.line("weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)malloc(sizeof(weaveffi_jni_async_ctx));");
+        w.line("(*env)->GetJavaVM(env, &ctx->jvm);");
+        w.line("ctx->callback = (*env)->NewGlobalRef(env, callback);");
 
-    out.push_str("    weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)malloc(sizeof(weaveffi_jni_async_ctx));\n");
-    out.push_str("    (*env)->GetJavaVM(env, &ctx->jvm);\n");
-    out.push_str("    ctx->callback = (*env)->NewGlobalRef(env, callback);\n");
+        for p in &f.params {
+            splice(w, |o| write_param_acquire(o, &p.name, &p.ty));
+        }
 
-    for p in &f.params {
-        write_param_acquire(out, &p.name, &p.ty);
-    }
+        let mut call_args: Vec<String> = Vec::new();
+        for p in &f.params {
+            build_c_call_args(&mut call_args, &p.name, &p.ty, module_name, c_prefix);
+        }
+        if f.cancellable {
+            call_args.push("(weaveffi_cancel_token*)(intptr_t)cancelToken".to_string());
+        }
+        call_args.push(cb_name.clone());
+        call_args.push("ctx".to_string());
 
-    let mut call_args: Vec<String> = Vec::new();
-    for p in &f.params {
-        build_c_call_args(&mut call_args, &p.name, &p.ty, module_name, c_prefix);
-    }
-    if f.cancellable {
-        call_args.push("(weaveffi_cancel_token*)(intptr_t)cancelToken".to_string());
-    }
-    call_args.push(cb_name);
-    call_args.push("ctx".to_string());
+        w.line(format!("{c_sym}_async({});", call_args.join(", ")));
 
-    let _ = writeln!(out, "    {c_sym}_async({});", call_args.join(", "));
-
-    release_jni_resources(out, &f.params);
-
-    out.push_str("}\n\n");
+        splice(w, |o| release_jni_resources(o, &f.params));
+    });
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// The shared listener context + registry. Producers may fire events on any
 /// thread, so registry mutation (register/unregister, both on JVM threads)
 /// is mutex-guarded; trampolines only read their own context.
 fn render_jni_listener_support(out: &mut String) {
-    out.push_str("typedef struct weaveffi_jni_listener_ctx {\n");
-    out.push_str("    JavaVM* jvm;\n");
-    out.push_str("    jobject callback;\n");
-    out.push_str("    uint64_t id;\n");
-    out.push_str("    struct weaveffi_jni_listener_ctx* next;\n");
-    out.push_str("} weaveffi_jni_listener_ctx;\n\n");
-    out.push_str("static weaveffi_jni_listener_ctx* weaveffi_jni_listeners = NULL;\n");
-    out.push_str(
-        "static pthread_mutex_t weaveffi_jni_listener_lock = PTHREAD_MUTEX_INITIALIZER;\n\n",
+    let mut w = CodeWriter::four_space();
+    w.block(
+        "typedef struct weaveffi_jni_listener_ctx {",
+        "} weaveffi_jni_listener_ctx;",
+        |w| {
+            w.line("JavaVM* jvm;");
+            w.line("jobject callback;");
+            w.line("uint64_t id;");
+            w.line("struct weaveffi_jni_listener_ctx* next;");
+        },
     );
+    w.blank();
+    w.line("static weaveffi_jni_listener_ctx* weaveffi_jni_listeners = NULL;");
+    w.line("static pthread_mutex_t weaveffi_jni_listener_lock = PTHREAD_MUTEX_INITIALIZER;");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// Box one C ABI callback argument into a JVM local reference named `var`.
@@ -1465,6 +1496,7 @@ fn write_jni_cb_box_arg(out: &mut String, p: &ParamBinding, var: &str) {
     let box_leaf = |out: &mut String, ty: &TypeRef, var: &str, src: &str| {
         write_boxed_scalar(out, ty, var, src, "    ");
     };
+    let mut w = CodeWriter::four_space().with_depth(1);
     match &p.ty {
         TypeRef::I8
         | TypeRef::I16
@@ -1479,188 +1511,178 @@ fn write_jni_cb_box_arg(out: &mut String, p: &ParamBinding, var: &str) {
         | TypeRef::Bool
         | TypeRef::Enum(_)
         | TypeRef::Handle => {
-            box_leaf(out, &p.ty, var, &n0);
+            splice(&mut w, |o| box_leaf(o, &p.ty, var, &n0));
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            let _ = writeln!(
-                out,
-                "    jobject {var} = {n0} ? (jobject)(*env)->NewStringUTF(env, {n0}) : (jobject)(*env)->NewStringUTF(env, \"\");"
-            );
+            w.line(format!(
+                "jobject {var} = {n0} ? (jobject)(*env)->NewStringUTF(env, {n0}) : (jobject)(*env)->NewStringUTF(env, \"\");"
+            ));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             let n1 = &slots[1].name;
-            let _ = writeln!(
-                out,
-                "    jbyteArray {var} = (*env)->NewByteArray(env, (jsize){n1});"
-            );
-            let _ = writeln!(
-                out,
-                "    if ({var} && {n0}) {{ (*env)->SetByteArrayRegion(env, {var}, 0, (jsize){n1}, (const jbyte*){n0}); }}"
-            );
+            w.line(format!(
+                "jbyteArray {var} = (*env)->NewByteArray(env, (jsize){n1});"
+            ));
+            w.line(format!(
+                "if ({var} && {n0}) {{ (*env)->SetByteArrayRegion(env, {var}, 0, (jsize){n1}, (const jbyte*){n0}); }}"
+            ));
         }
         TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
-            box_leaf(out, &TypeRef::Handle, var, &format!("(intptr_t){n0}"));
+            splice(&mut w, |o| {
+                box_leaf(o, &TypeRef::Handle, var, &format!("(intptr_t){n0}"))
+            });
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                let _ = writeln!(
-                    out,
-                    "    jobject {var} = {n0} ? (jobject)(*env)->NewStringUTF(env, {n0}) : NULL;"
-                );
+                w.line(format!(
+                    "jobject {var} = {n0} ? (jobject)(*env)->NewStringUTF(env, {n0}) : NULL;"
+                ));
             }
             TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 let n1 = &slots[1].name;
-                let _ = writeln!(out, "    jobject {var} = NULL;");
-                let _ = writeln!(out, "    if ({n0}) {{");
-                let _ = writeln!(
-                    out,
-                    "        jbyteArray {var}_arr = (*env)->NewByteArray(env, (jsize){n1});"
-                );
-                let _ = writeln!(
-                    out,
-                    "        if ({var}_arr) {{ (*env)->SetByteArrayRegion(env, {var}_arr, 0, (jsize){n1}, (const jbyte*){n0}); }}"
-                );
-                let _ = writeln!(out, "        {var} = (jobject){var}_arr;");
-                let _ = writeln!(out, "    }}");
+                w.line(format!("jobject {var} = NULL;"));
+                w.block(format!("if ({n0}) {{"), "}", |w| {
+                    w.line(format!(
+                        "jbyteArray {var}_arr = (*env)->NewByteArray(env, (jsize){n1});"
+                    ));
+                    w.line(format!(
+                        "if ({var}_arr) {{ (*env)->SetByteArrayRegion(env, {var}_arr, 0, (jsize){n1}, (const jbyte*){n0}); }}"
+                    ));
+                    w.line(format!("{var} = (jobject){var}_arr;"));
+                });
             }
             TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
-                let _ = writeln!(out, "    jobject {var} = NULL;");
-                let _ = writeln!(out, "    if ({n0}) {{");
-                write_boxed_scalar(
-                    out,
-                    &TypeRef::Handle,
-                    &format!("{var}_box"),
-                    &format!("(intptr_t){n0}"),
-                    "        ",
-                );
-                let _ = writeln!(out, "        {var} = {var}_box;");
-                let _ = writeln!(out, "    }}");
+                w.line(format!("jobject {var} = NULL;"));
+                w.block(format!("if ({n0}) {{"), "}", |w| {
+                    splice(w, |o| {
+                        write_boxed_scalar(
+                            o,
+                            &TypeRef::Handle,
+                            &format!("{var}_box"),
+                            &format!("(intptr_t){n0}"),
+                            "        ",
+                        )
+                    });
+                    w.line(format!("{var} = {var}_box;"));
+                });
             }
             other => {
-                let _ = writeln!(out, "    jobject {var} = NULL;");
-                let _ = writeln!(out, "    if ({n0}) {{");
-                write_boxed_scalar(
-                    out,
-                    other,
-                    &format!("{var}_box"),
-                    &format!("(*{n0})"),
-                    "        ",
-                );
-                let _ = writeln!(out, "        {var} = {var}_box;");
-                let _ = writeln!(out, "    }}");
+                w.line(format!("jobject {var} = NULL;"));
+                w.block(format!("if ({n0}) {{"), "}", |w| {
+                    splice(w, |o| {
+                        write_boxed_scalar(
+                            o,
+                            other,
+                            &format!("{var}_box"),
+                            &format!("(*{n0})"),
+                            "        ",
+                        )
+                    });
+                    w.line(format!("{var} = {var}_box;"));
+                });
             }
         },
         TypeRef::List(inner) => {
             let n1 = &slots[1].name;
             match inner.as_ref() {
                 TypeRef::I8 | TypeRef::U8 => {
-                    let _ = writeln!(
-                        out,
-                        "    jbyteArray {var} = (*env)->NewByteArray(env, (jsize){n1});"
-                    );
-                    let _ = writeln!(
-                        out,
-                        "    if ({var} && {n0}) {{ (*env)->SetByteArrayRegion(env, {var}, 0, (jsize){n1}, (const jbyte*){n0}); }}"
-                    );
+                    w.line(format!(
+                        "jbyteArray {var} = (*env)->NewByteArray(env, (jsize){n1});"
+                    ));
+                    w.line(format!(
+                        "if ({var} && {n0}) {{ (*env)->SetByteArrayRegion(env, {var}, 0, (jsize){n1}, (const jbyte*){n0}); }}"
+                    ));
                 }
                 TypeRef::I16 | TypeRef::U16 => {
-                    let _ = writeln!(
-                        out,
-                        "    jshortArray {var} = (*env)->NewShortArray(env, (jsize){n1});"
-                    );
-                    let _ = writeln!(
-                        out,
-                        "    if ({var} && {n0}) {{ (*env)->SetShortArrayRegion(env, {var}, 0, (jsize){n1}, (const jshort*){n0}); }}"
-                    );
+                    w.line(format!(
+                        "jshortArray {var} = (*env)->NewShortArray(env, (jsize){n1});"
+                    ));
+                    w.line(format!(
+                        "if ({var} && {n0}) {{ (*env)->SetShortArrayRegion(env, {var}, 0, (jsize){n1}, (const jshort*){n0}); }}"
+                    ));
                 }
                 TypeRef::I32 | TypeRef::Enum(_) => {
-                    let _ = writeln!(
-                        out,
-                        "    jintArray {var} = (*env)->NewIntArray(env, (jsize){n1});"
-                    );
-                    let _ = writeln!(
-                        out,
-                        "    if ({var} && {n0}) {{ (*env)->SetIntArrayRegion(env, {var}, 0, (jsize){n1}, (const jint*){n0}); }}"
-                    );
+                    w.line(format!(
+                        "jintArray {var} = (*env)->NewIntArray(env, (jsize){n1});"
+                    ));
+                    w.line(format!(
+                        "if ({var} && {n0}) {{ (*env)->SetIntArrayRegion(env, {var}, 0, (jsize){n1}, (const jint*){n0}); }}"
+                    ));
                 }
                 TypeRef::U32 | TypeRef::I64 | TypeRef::U64 => {
-                    let _ = writeln!(
-                        out,
-                        "    jlongArray {var} = (*env)->NewLongArray(env, (jsize){n1});"
+                    w.line(format!(
+                        "jlongArray {var} = (*env)->NewLongArray(env, (jsize){n1});"
+                    ));
+                    w.block(
+                        format!(
+                            "for (size_t {var}_i = 0; {var} && {n0} && {var}_i < {n1}; {var}_i++) {{"
+                        ),
+                        "}",
+                        |w| {
+                            w.line(format!("jlong {var}_tmp = (jlong){n0}[{var}_i];"));
+                            w.line(format!(
+                                "(*env)->SetLongArrayRegion(env, {var}, (jsize){var}_i, 1, &{var}_tmp);"
+                            ));
+                        },
                     );
-                    let _ = writeln!(
-                        out,
-                        "    for (size_t {var}_i = 0; {var} && {n0} && {var}_i < {n1}; {var}_i++) {{"
-                    );
-                    let _ = writeln!(out, "        jlong {var}_tmp = (jlong){n0}[{var}_i];");
-                    let _ = writeln!(
-                        out,
-                        "        (*env)->SetLongArrayRegion(env, {var}, (jsize){var}_i, 1, &{var}_tmp);"
-                    );
-                    let _ = writeln!(out, "    }}");
                 }
                 TypeRef::F64 => {
-                    let _ = writeln!(
-                        out,
-                        "    jdoubleArray {var} = (*env)->NewDoubleArray(env, (jsize){n1});"
-                    );
-                    let _ = writeln!(
-                        out,
-                        "    if ({var} && {n0}) {{ (*env)->SetDoubleArrayRegion(env, {var}, 0, (jsize){n1}, (const jdouble*){n0}); }}"
-                    );
+                    w.line(format!(
+                        "jdoubleArray {var} = (*env)->NewDoubleArray(env, (jsize){n1});"
+                    ));
+                    w.line(format!(
+                        "if ({var} && {n0}) {{ (*env)->SetDoubleArrayRegion(env, {var}, 0, (jsize){n1}, (const jdouble*){n0}); }}"
+                    ));
                 }
                 TypeRef::F32 => {
-                    let _ = writeln!(
-                        out,
-                        "    jfloatArray {var} = (*env)->NewFloatArray(env, (jsize){n1});"
-                    );
-                    let _ = writeln!(
-                        out,
-                        "    if ({var} && {n0}) {{ (*env)->SetFloatArrayRegion(env, {var}, 0, (jsize){n1}, (const jfloat*){n0}); }}"
-                    );
+                    w.line(format!(
+                        "jfloatArray {var} = (*env)->NewFloatArray(env, (jsize){n1});"
+                    ));
+                    w.line(format!(
+                        "if ({var} && {n0}) {{ (*env)->SetFloatArrayRegion(env, {var}, 0, (jsize){n1}, (const jfloat*){n0}); }}"
+                    ));
                 }
                 TypeRef::Bool => {
-                    let _ = writeln!(
-                        out,
-                        "    jbooleanArray {var} = (*env)->NewBooleanArray(env, (jsize){n1});"
+                    w.line(format!(
+                        "jbooleanArray {var} = (*env)->NewBooleanArray(env, (jsize){n1});"
+                    ));
+                    w.block(
+                        format!(
+                            "for (size_t {var}_i = 0; {var} && {n0} && {var}_i < {n1}; {var}_i++) {{"
+                        ),
+                        "}",
+                        |w| {
+                            w.line(format!(
+                                "jboolean {var}_tmp = {n0}[{var}_i] ? JNI_TRUE : JNI_FALSE;"
+                            ));
+                            w.line(format!(
+                                "(*env)->SetBooleanArrayRegion(env, {var}, (jsize){var}_i, 1, &{var}_tmp);"
+                            ));
+                        },
                     );
-                    let _ = writeln!(
-                        out,
-                        "    for (size_t {var}_i = 0; {var} && {n0} && {var}_i < {n1}; {var}_i++) {{"
-                    );
-                    let _ = writeln!(
-                        out,
-                        "        jboolean {var}_tmp = {n0}[{var}_i] ? JNI_TRUE : JNI_FALSE;"
-                    );
-                    let _ = writeln!(
-                        out,
-                        "        (*env)->SetBooleanArrayRegion(env, {var}, (jsize){var}_i, 1, &{var}_tmp);"
-                    );
-                    let _ = writeln!(out, "    }}");
                 }
                 _ => {
-                    let _ = writeln!(
-                        out,
-                        "    jclass {var}_scls = (*env)->FindClass(env, \"java/lang/String\");"
+                    w.line(format!(
+                        "jclass {var}_scls = (*env)->FindClass(env, \"java/lang/String\");"
+                    ));
+                    w.line(format!(
+                        "jobjectArray {var} = (*env)->NewObjectArray(env, (jsize){n1}, {var}_scls, NULL);"
+                    ));
+                    w.block(
+                        format!(
+                            "for (size_t {var}_i = 0; {var} && {n0} && {var}_i < {n1}; {var}_i++) {{"
+                        ),
+                        "}",
+                        |w| {
+                            w.line(format!(
+                                "jstring {var}_s = {n0}[{var}_i] ? (*env)->NewStringUTF(env, {n0}[{var}_i]) : (*env)->NewStringUTF(env, \"\");"
+                            ));
+                            w.line(format!(
+                                "(*env)->SetObjectArrayElement(env, {var}, (jsize){var}_i, {var}_s);"
+                            ));
+                            w.line(format!("(*env)->DeleteLocalRef(env, {var}_s);"));
+                        },
                     );
-                    let _ = writeln!(
-                        out,
-                        "    jobjectArray {var} = (*env)->NewObjectArray(env, (jsize){n1}, {var}_scls, NULL);"
-                    );
-                    let _ = writeln!(
-                        out,
-                        "    for (size_t {var}_i = 0; {var} && {n0} && {var}_i < {n1}; {var}_i++) {{"
-                    );
-                    let _ = writeln!(
-                        out,
-                        "        jstring {var}_s = {n0}[{var}_i] ? (*env)->NewStringUTF(env, {n0}[{var}_i]) : (*env)->NewStringUTF(env, \"\");"
-                    );
-                    let _ = writeln!(
-                        out,
-                        "        (*env)->SetObjectArrayElement(env, {var}, (jsize){var}_i, {var}_s);"
-                    );
-                    let _ = writeln!(out, "        (*env)->DeleteLocalRef(env, {var}_s);");
-                    let _ = writeln!(out, "    }}");
                 }
             }
         }
@@ -1668,35 +1690,33 @@ fn write_jni_cb_box_arg(out: &mut String, p: &ParamBinding, var: &str) {
             let keys = n0;
             let vals = slots[1].name.clone();
             let len = slots[2].name.clone();
-            let _ = writeln!(
-                out,
-                "    jclass {var}_hm = (*env)->FindClass(env, \"java/util/HashMap\");"
-            );
-            let _ = writeln!(
-                out,
-                "    jobject {var} = (*env)->NewObject(env, {var}_hm, (*env)->GetMethodID(env, {var}_hm, \"<init>\", \"()V\"));"
-            );
-            let _ = writeln!(
-                out,
-                "    jmethodID {var}_put = (*env)->GetMethodID(env, {var}_hm, \"put\", \"(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;\");"
-            );
+            w.line(format!(
+                "jclass {var}_hm = (*env)->FindClass(env, \"java/util/HashMap\");"
+            ));
+            w.line(format!(
+                "jobject {var} = (*env)->NewObject(env, {var}_hm, (*env)->GetMethodID(env, {var}_hm, \"<init>\", \"()V\"));"
+            ));
+            w.line(format!(
+                "jmethodID {var}_put = (*env)->GetMethodID(env, {var}_hm, \"put\", \"(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;\");"
+            ));
             // write_map_box_elem indexes with the literal loop variable `i`.
-            let _ = writeln!(
-                out,
-                "    for (size_t i = 0; {keys} && {vals} && i < {len}; i++) {{"
+            w.block(
+                format!("for (size_t i = 0; {keys} && {vals} && i < {len}; i++) {{"),
+                "}",
+                |w| {
+                    splice(w, |o| write_map_box_elem(o, k, &format!("{var}_k"), &keys));
+                    splice(w, |o| write_map_box_elem(o, v, &format!("{var}_v"), &vals));
+                    w.line(format!(
+                        "(*env)->CallObjectMethod(env, {var}, {var}_put, {var}_k, {var}_v);"
+                    ));
+                    w.line(format!("(*env)->DeleteLocalRef(env, {var}_k);"));
+                    w.line(format!("(*env)->DeleteLocalRef(env, {var}_v);"));
+                },
             );
-            write_map_box_elem(out, k, &format!("{var}_k"), &keys);
-            write_map_box_elem(out, v, &format!("{var}_v"), &vals);
-            let _ = writeln!(
-                out,
-                "        (*env)->CallObjectMethod(env, {var}, {var}_put, {var}_k, {var}_v);"
-            );
-            let _ = writeln!(out, "        (*env)->DeleteLocalRef(env, {var}_k);");
-            let _ = writeln!(out, "        (*env)->DeleteLocalRef(env, {var}_v);");
-            let _ = writeln!(out, "    }}");
         }
         TypeRef::Iterator(_) => unreachable!("validation rejects iterator callback params"),
     }
+    out.push_str(&w.finish());
 }
 
 /// The producer-thread trampoline for one callback type: attach to the JVM if
@@ -1710,57 +1730,59 @@ fn render_jni_cb_tramp(out: &mut String, cb: &CallbackBinding, c_prefix: &str) {
         .map(|slot| format!("{} {}", slot.ty.render_c(c_prefix), slot.name))
         .collect();
     decls.push("void* context".into());
-    let _ = writeln!(
-        out,
+    let mut w = CodeWriter::four_space();
+    w.line(format!(
         "static void {}_jni_tramp({}) {{",
         cb.c_fn_type,
         decls.join(", ")
-    );
-    out.push_str("    weaveffi_jni_listener_ctx* ctx = (weaveffi_jni_listener_ctx*)context;\n");
-    out.push_str("    JNIEnv* env = NULL;\n");
-    out.push_str("    int attached = 0;\n");
-    out.push_str(
-        "    if ((*ctx->jvm)->GetEnv(ctx->jvm, (void**)&env, JNI_VERSION_1_6) != JNI_OK) {\n",
-    );
-    out.push_str(
-        "        if ((*ctx->jvm)->AttachCurrentThread(ctx->jvm, (void**)&env, NULL) != JNI_OK) return;\n",
-    );
-    out.push_str("        attached = 1;\n");
-    out.push_str("    }\n");
-    // A local frame bounds every reference created while boxing, so event
-    // bursts on a long-lived JVM thread cannot exhaust the local-ref table.
-    out.push_str("    if ((*env)->PushLocalFrame(env, 32) != 0) {\n");
-    out.push_str("        if (attached) (*ctx->jvm)->DetachCurrentThread(ctx->jvm);\n");
-    out.push_str("        return;\n");
-    out.push_str("    }\n");
-    let mut arg_vars: Vec<String> = Vec::new();
-    for (i, p) in cb.params.iter().enumerate() {
-        let var = format!("_a{i}");
-        write_jni_cb_box_arg(out, p, &var);
-        arg_vars.push(var);
-    }
-    out.push_str("    jclass fn_cls = (*env)->GetObjectClass(env, ctx->callback);\n");
-    let sig = format!(
-        "({})Ljava/lang/Object;",
-        "Ljava/lang/Object;".repeat(cb.params.len())
-    );
-    let _ = writeln!(
-        out,
-        "    jmethodID invoke = (*env)->GetMethodID(env, fn_cls, \"invoke\", \"{sig}\");"
-    );
-    let call_args = if arg_vars.is_empty() {
-        String::new()
-    } else {
-        format!(", {}", arg_vars.join(", "))
-    };
-    let _ = writeln!(
-        out,
-        "    (*env)->CallObjectMethod(env, ctx->callback, invoke{call_args});"
-    );
-    out.push_str("    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);\n");
-    out.push_str("    (*env)->PopLocalFrame(env, NULL);\n");
-    out.push_str("    if (attached) (*ctx->jvm)->DetachCurrentThread(ctx->jvm);\n");
-    out.push_str("}\n\n");
+    ));
+    w.scope(|w| {
+        w.line("weaveffi_jni_listener_ctx* ctx = (weaveffi_jni_listener_ctx*)context;");
+        w.line("JNIEnv* env = NULL;");
+        w.line("int attached = 0;");
+        w.block(
+            "if ((*ctx->jvm)->GetEnv(ctx->jvm, (void**)&env, JNI_VERSION_1_6) != JNI_OK) {",
+            "}",
+            |w| {
+                w.line("if ((*ctx->jvm)->AttachCurrentThread(ctx->jvm, (void**)&env, NULL) != JNI_OK) return;");
+                w.line("attached = 1;");
+            },
+        );
+        // A local frame bounds every reference created while boxing, so event
+        // bursts on a long-lived JVM thread cannot exhaust the local-ref table.
+        w.block("if ((*env)->PushLocalFrame(env, 32) != 0) {", "}", |w| {
+            w.line("if (attached) (*ctx->jvm)->DetachCurrentThread(ctx->jvm);");
+            w.line("return;");
+        });
+        let mut arg_vars: Vec<String> = Vec::new();
+        for (i, p) in cb.params.iter().enumerate() {
+            let var = format!("_a{i}");
+            splice(w, |o| write_jni_cb_box_arg(o, p, &var));
+            arg_vars.push(var);
+        }
+        w.line("jclass fn_cls = (*env)->GetObjectClass(env, ctx->callback);");
+        let sig = format!(
+            "({})Ljava/lang/Object;",
+            "Ljava/lang/Object;".repeat(cb.params.len())
+        );
+        w.line(format!(
+            "jmethodID invoke = (*env)->GetMethodID(env, fn_cls, \"invoke\", \"{sig}\");"
+        ));
+        let call_args = if arg_vars.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", arg_vars.join(", "))
+        };
+        w.line(format!(
+            "(*env)->CallObjectMethod(env, ctx->callback, invoke{call_args});"
+        ));
+        w.line("if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);");
+        w.line("(*env)->PopLocalFrame(env, NULL);");
+        w.line("if (attached) (*ctx->jvm)->DetachCurrentThread(ctx->jvm);");
+    });
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// The JNI register/unregister exports for one listener. Register pins the
@@ -1785,175 +1807,174 @@ fn render_jni_listener_fns(
         strip_module_prefix,
     );
 
-    let _ = writeln!(
-        out,
-        "JNIEXPORT jlong JNICALL Java_{}_WeaveFFI_{}(JNIEnv* env, jclass clazz, jobject callback) {{",
-        jni_prefix,
-        jni_mangle(&register_kt)
-    );
-    out.push_str("    weaveffi_jni_listener_ctx* ctx = (weaveffi_jni_listener_ctx*)calloc(1, sizeof(weaveffi_jni_listener_ctx));\n");
-    out.push_str("    (*env)->GetJavaVM(env, &ctx->jvm);\n");
-    out.push_str("    ctx->callback = (*env)->NewGlobalRef(env, callback);\n");
-    let _ = writeln!(
-        out,
-        "    uint64_t id = {}({}_jni_tramp, ctx);",
-        l.register_symbol, cb.c_fn_type
-    );
-    out.push_str("    ctx->id = id;\n");
-    out.push_str("    pthread_mutex_lock(&weaveffi_jni_listener_lock);\n");
-    out.push_str("    ctx->next = weaveffi_jni_listeners;\n");
-    out.push_str("    weaveffi_jni_listeners = ctx;\n");
-    out.push_str("    pthread_mutex_unlock(&weaveffi_jni_listener_lock);\n");
-    out.push_str("    return (jlong)id;\n");
-    out.push_str("}\n\n");
+    {
+        let mut w = CodeWriter::four_space();
+        w.line(format!(
+            "JNIEXPORT jlong JNICALL Java_{}_WeaveFFI_{}(JNIEnv* env, jclass clazz, jobject callback) {{",
+            jni_prefix,
+            jni_mangle(&register_kt)
+        ));
+        w.scope(|w| {
+            w.line("weaveffi_jni_listener_ctx* ctx = (weaveffi_jni_listener_ctx*)calloc(1, sizeof(weaveffi_jni_listener_ctx));");
+            w.line("(*env)->GetJavaVM(env, &ctx->jvm);");
+            w.line("ctx->callback = (*env)->NewGlobalRef(env, callback);");
+            w.line(format!(
+                "uint64_t id = {}({}_jni_tramp, ctx);",
+                l.register_symbol, cb.c_fn_type
+            ));
+            w.line("ctx->id = id;");
+            w.line("pthread_mutex_lock(&weaveffi_jni_listener_lock);");
+            w.line("ctx->next = weaveffi_jni_listeners;");
+            w.line("weaveffi_jni_listeners = ctx;");
+            w.line("pthread_mutex_unlock(&weaveffi_jni_listener_lock);");
+            w.line("return (jlong)id;");
+        });
+        w.line("}");
+        w.blank();
+        out.push_str(&w.finish());
+    }
 
-    let _ = writeln!(
-        out,
-        "JNIEXPORT void JNICALL Java_{}_WeaveFFI_{}(JNIEnv* env, jclass clazz, jlong id) {{",
-        jni_prefix,
-        jni_mangle(&unregister_kt)
-    );
-    // Stop producer-side delivery before unpinning so no trampoline can fire
-    // against a deleted global ref.
-    let _ = writeln!(out, "    {}((uint64_t)id);", l.unregister_symbol);
-    out.push_str("    pthread_mutex_lock(&weaveffi_jni_listener_lock);\n");
-    out.push_str("    weaveffi_jni_listener_ctx** link = &weaveffi_jni_listeners;\n");
-    out.push_str("    while (*link != NULL) {\n");
-    out.push_str("        if ((*link)->id == (uint64_t)id) {\n");
-    out.push_str("            weaveffi_jni_listener_ctx* found = *link;\n");
-    out.push_str("            *link = found->next;\n");
-    out.push_str("            (*env)->DeleteGlobalRef(env, found->callback);\n");
-    out.push_str("            free(found);\n");
-    out.push_str("            break;\n");
-    out.push_str("        }\n");
-    out.push_str("        link = &(*link)->next;\n");
-    out.push_str("    }\n");
-    out.push_str("    pthread_mutex_unlock(&weaveffi_jni_listener_lock);\n");
-    out.push_str("}\n\n");
+    {
+        let mut w = CodeWriter::four_space();
+        w.line(format!(
+            "JNIEXPORT void JNICALL Java_{}_WeaveFFI_{}(JNIEnv* env, jclass clazz, jlong id) {{",
+            jni_prefix,
+            jni_mangle(&unregister_kt)
+        ));
+        w.scope(|w| {
+            // Stop producer-side delivery before unpinning so no trampoline can fire
+            // against a deleted global ref.
+            w.line(format!("{}((uint64_t)id);", l.unregister_symbol));
+            w.line("pthread_mutex_lock(&weaveffi_jni_listener_lock);");
+            w.line("weaveffi_jni_listener_ctx** link = &weaveffi_jni_listeners;");
+            w.block("while (*link != NULL) {", "}", |w| {
+                w.block("if ((*link)->id == (uint64_t)id) {", "}", |w| {
+                    w.line("weaveffi_jni_listener_ctx* found = *link;");
+                    w.line("*link = found->next;");
+                    w.line("(*env)->DeleteGlobalRef(env, found->callback);");
+                    w.line("free(found);");
+                    w.line("break;");
+                });
+                w.line("link = &(*link)->next;");
+            });
+            w.line("pthread_mutex_unlock(&weaveffi_jni_listener_lock);");
+        });
+        w.line("}");
+        w.blank();
+        out.push_str(&w.finish());
+    }
 }
 
 fn write_param_acquire(out: &mut String, name: &str, ty: &TypeRef) {
+    let mut w = CodeWriter::four_space().with_depth(1);
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            let _ = writeln!(
-                out,
-                "    const char* {n}_chars = (*env)->GetStringUTFChars(env, {n}, NULL);",
+            w.line(format!(
+                "const char* {n}_chars = (*env)->GetStringUTFChars(env, {n}, NULL);",
                 n = name
-            );
+            ));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            let _ = writeln!(out, "    jboolean {n}_is_copy = 0;", n = name);
-            let _ = writeln!(
-                out,
-                "    jbyte* {n}_elems = (*env)->GetByteArrayElements(env, {n}, &{n}_is_copy);",
+            w.line(format!("jboolean {n}_is_copy = 0;", n = name));
+            w.line(format!(
+                "jbyte* {n}_elems = (*env)->GetByteArrayElements(env, {n}, &{n}_is_copy);",
                 n = name
-            );
-            let _ = writeln!(
-                out,
-                "    jsize {n}_len = (*env)->GetArrayLength(env, {n});",
+            ));
+            w.line(format!(
+                "jsize {n}_len = (*env)->GetArrayLength(env, {n});",
                 n = name
-            );
+            ));
         }
-        TypeRef::Optional(inner) => write_optional_acquire(out, name, inner),
-        TypeRef::List(inner) => write_list_acquire(out, name, inner),
-        TypeRef::Map(k, v) => write_map_acquire(out, name, k, v),
+        TypeRef::Optional(inner) => splice(&mut w, |o| write_optional_acquire(o, name, inner)),
+        TypeRef::List(inner) => splice(&mut w, |o| write_list_acquire(o, name, inner)),
+        TypeRef::Map(k, v) => splice(&mut w, |o| write_map_acquire(o, name, k, v)),
         _ => {}
     }
+    out.push_str(&w.finish());
 }
 
 fn write_optional_acquire(out: &mut String, name: &str, inner: &TypeRef) {
+    let mut w = CodeWriter::four_space().with_depth(1);
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            let _ = writeln!(out, "    const char* {n}_chars = NULL;", n = name);
-            let _ = writeln!(out, "    if ({n} != NULL) {{", n = name);
-            let _ = writeln!(
-                out,
-                "        {n}_chars = (*env)->GetStringUTFChars(env, {n}, NULL);",
-                n = name
-            );
-            let _ = writeln!(out, "    }}");
+            w.line(format!("const char* {n}_chars = NULL;", n = name));
+            w.block(format!("if ({n} != NULL) {{", n = name), "}", |w| {
+                w.line(format!(
+                    "{n}_chars = (*env)->GetStringUTFChars(env, {n}, NULL);",
+                    n = name
+                ));
+            });
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            let _ = writeln!(out, "    jbyte* {n}_elems = NULL;", n = name);
-            let _ = writeln!(out, "    jsize {n}_len = 0;", n = name);
-            let _ = writeln!(out, "    if ({n} != NULL) {{", n = name);
-            let _ = writeln!(
-                out,
-                "        {n}_elems = (*env)->GetByteArrayElements(env, {n}, NULL);",
-                n = name
-            );
-            let _ = writeln!(
-                out,
-                "        {n}_len = (*env)->GetArrayLength(env, {n});",
-                n = name
-            );
-            let _ = writeln!(out, "    }}");
+            w.line(format!("jbyte* {n}_elems = NULL;", n = name));
+            w.line(format!("jsize {n}_len = 0;", n = name));
+            w.block(format!("if ({n} != NULL) {{", n = name), "}", |w| {
+                w.line(format!(
+                    "{n}_elems = (*env)->GetByteArrayElements(env, {n}, NULL);",
+                    n = name
+                ));
+                w.line(format!(
+                    "{n}_len = (*env)->GetArrayLength(env, {n});",
+                    n = name
+                ));
+            });
         }
         TypeRef::I8 | TypeRef::U8 => {
-            let _ = writeln!(out, "    int8_t {n}_val = 0;", n = name);
-            let _ = writeln!(out, "    const int8_t* {n}_ptr = NULL;", n = name);
-            let _ = writeln!(out, "    if ({n} != NULL) {{", n = name);
-            let _ = writeln!(
-                out,
-                "        jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Byte\");",
-                n = name
-            );
-            let _ = writeln!(
-                out,
-                "        jmethodID {n}_mid = (*env)->GetMethodID(env, {n}_cls, \"byteValue\", \"()B\");",
-                n = name
-            );
-            let _ = writeln!(
-                out,
-                "        {n}_val = (int8_t)(*env)->CallByteMethod(env, {n}, {n}_mid);",
-                n = name
-            );
-            let _ = writeln!(out, "        {n}_ptr = &{n}_val;", n = name);
-            let _ = writeln!(out, "    }}");
+            w.line(format!("int8_t {n}_val = 0;", n = name));
+            w.line(format!("const int8_t* {n}_ptr = NULL;", n = name));
+            w.block(format!("if ({n} != NULL) {{", n = name), "}", |w| {
+                w.line(format!(
+                    "jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Byte\");",
+                    n = name
+                ));
+                w.line(format!(
+                    "jmethodID {n}_mid = (*env)->GetMethodID(env, {n}_cls, \"byteValue\", \"()B\");",
+                    n = name
+                ));
+                w.line(format!(
+                    "{n}_val = (int8_t)(*env)->CallByteMethod(env, {n}, {n}_mid);",
+                    n = name
+                ));
+                w.line(format!("{n}_ptr = &{n}_val;", n = name));
+            });
         }
         TypeRef::I16 | TypeRef::U16 => {
-            let _ = writeln!(out, "    int16_t {n}_val = 0;", n = name);
-            let _ = writeln!(out, "    const int16_t* {n}_ptr = NULL;", n = name);
-            let _ = writeln!(out, "    if ({n} != NULL) {{", n = name);
-            let _ = writeln!(
-                out,
-                "        jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Short\");",
-                n = name
-            );
-            let _ = writeln!(
-                out,
-                "        jmethodID {n}_mid = (*env)->GetMethodID(env, {n}_cls, \"shortValue\", \"()S\");",
-                n = name
-            );
-            let _ = writeln!(
-                out,
-                "        {n}_val = (int16_t)(*env)->CallShortMethod(env, {n}, {n}_mid);",
-                n = name
-            );
-            let _ = writeln!(out, "        {n}_ptr = &{n}_val;", n = name);
-            let _ = writeln!(out, "    }}");
+            w.line(format!("int16_t {n}_val = 0;", n = name));
+            w.line(format!("const int16_t* {n}_ptr = NULL;", n = name));
+            w.block(format!("if ({n} != NULL) {{", n = name), "}", |w| {
+                w.line(format!(
+                    "jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Short\");",
+                    n = name
+                ));
+                w.line(format!(
+                    "jmethodID {n}_mid = (*env)->GetMethodID(env, {n}_cls, \"shortValue\", \"()S\");",
+                    n = name
+                ));
+                w.line(format!(
+                    "{n}_val = (int16_t)(*env)->CallShortMethod(env, {n}, {n}_mid);",
+                    n = name
+                ));
+                w.line(format!("{n}_ptr = &{n}_val;", n = name));
+            });
         }
         TypeRef::I32 | TypeRef::Enum(_) => {
-            let _ = writeln!(out, "    int32_t {n}_val = 0;", n = name);
-            let _ = writeln!(out, "    const int32_t* {n}_ptr = NULL;", n = name);
-            let _ = writeln!(out, "    if ({n} != NULL) {{", n = name);
-            let _ = writeln!(
-                out,
-                "        jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Integer\");",
-                n = name
-            );
-            let _ = writeln!(
-                out,
-                "        jmethodID {n}_mid = (*env)->GetMethodID(env, {n}_cls, \"intValue\", \"()I\");",
-                n = name
-            );
-            let _ = writeln!(
-                out,
-                "        {n}_val = (int32_t)(*env)->CallIntMethod(env, {n}, {n}_mid);",
-                n = name
-            );
-            let _ = writeln!(out, "        {n}_ptr = &{n}_val;", n = name);
-            let _ = writeln!(out, "    }}");
+            w.line(format!("int32_t {n}_val = 0;", n = name));
+            w.line(format!("const int32_t* {n}_ptr = NULL;", n = name));
+            w.block(format!("if ({n} != NULL) {{", n = name), "}", |w| {
+                w.line(format!(
+                    "jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Integer\");",
+                    n = name
+                ));
+                w.line(format!(
+                    "jmethodID {n}_mid = (*env)->GetMethodID(env, {n}_cls, \"intValue\", \"()I\");",
+                    n = name
+                ));
+                w.line(format!(
+                    "{n}_val = (int32_t)(*env)->CallIntMethod(env, {n}, {n}_mid);",
+                    n = name
+                ));
+                w.line(format!("{n}_ptr = &{n}_val;", n = name));
+            });
         }
         TypeRef::U32
         | TypeRef::I64
@@ -1961,134 +1982,118 @@ fn write_optional_acquire(out: &mut String, name: &str, inner: &TypeRef) {
         | TypeRef::TypedHandle(_)
         | TypeRef::Handle
         | TypeRef::Struct(_) => {
-            let _ = writeln!(out, "    int64_t {n}_val = 0;", n = name);
-            let _ = writeln!(out, "    const int64_t* {n}_ptr = NULL;", n = name);
-            let _ = writeln!(out, "    if ({n} != NULL) {{", n = name);
-            let _ = writeln!(
-                out,
-                "        jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Long\");",
-                n = name
-            );
-            let _ = writeln!(
-                out,
-                "        jmethodID {n}_mid = (*env)->GetMethodID(env, {n}_cls, \"longValue\", \"()J\");",
-                n = name
-            );
-            let _ = writeln!(
-                out,
-                "        {n}_val = (int64_t)(*env)->CallLongMethod(env, {n}, {n}_mid);",
-                n = name
-            );
-            let _ = writeln!(out, "        {n}_ptr = &{n}_val;", n = name);
-            let _ = writeln!(out, "    }}");
+            w.line(format!("int64_t {n}_val = 0;", n = name));
+            w.line(format!("const int64_t* {n}_ptr = NULL;", n = name));
+            w.block(format!("if ({n} != NULL) {{", n = name), "}", |w| {
+                w.line(format!(
+                    "jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Long\");",
+                    n = name
+                ));
+                w.line(format!(
+                    "jmethodID {n}_mid = (*env)->GetMethodID(env, {n}_cls, \"longValue\", \"()J\");",
+                    n = name
+                ));
+                w.line(format!(
+                    "{n}_val = (int64_t)(*env)->CallLongMethod(env, {n}, {n}_mid);",
+                    n = name
+                ));
+                w.line(format!("{n}_ptr = &{n}_val;", n = name));
+            });
         }
         TypeRef::F64 => {
-            let _ = writeln!(out, "    double {n}_val = 0.0;", n = name);
-            let _ = writeln!(out, "    const double* {n}_ptr = NULL;", n = name);
-            let _ = writeln!(out, "    if ({n} != NULL) {{", n = name);
-            let _ = writeln!(
-                out,
-                "        jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Double\");",
-                n = name
-            );
-            let _ = writeln!(
-                out,
-                "        jmethodID {n}_mid = (*env)->GetMethodID(env, {n}_cls, \"doubleValue\", \"()D\");",
-                n = name
-            );
-            let _ = writeln!(
-                out,
-                "        {n}_val = (*env)->CallDoubleMethod(env, {n}, {n}_mid);",
-                n = name
-            );
-            let _ = writeln!(out, "        {n}_ptr = &{n}_val;", n = name);
-            let _ = writeln!(out, "    }}");
+            w.line(format!("double {n}_val = 0.0;", n = name));
+            w.line(format!("const double* {n}_ptr = NULL;", n = name));
+            w.block(format!("if ({n} != NULL) {{", n = name), "}", |w| {
+                w.line(format!(
+                    "jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Double\");",
+                    n = name
+                ));
+                w.line(format!(
+                    "jmethodID {n}_mid = (*env)->GetMethodID(env, {n}_cls, \"doubleValue\", \"()D\");",
+                    n = name
+                ));
+                w.line(format!(
+                    "{n}_val = (*env)->CallDoubleMethod(env, {n}, {n}_mid);",
+                    n = name
+                ));
+                w.line(format!("{n}_ptr = &{n}_val;", n = name));
+            });
         }
         TypeRef::F32 => {
-            let _ = writeln!(out, "    float {n}_val = 0.0f;", n = name);
-            let _ = writeln!(out, "    const float* {n}_ptr = NULL;", n = name);
-            let _ = writeln!(out, "    if ({n} != NULL) {{", n = name);
-            let _ = writeln!(
-                out,
-                "        jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Float\");",
-                n = name
-            );
-            let _ = writeln!(
-                out,
-                "        jmethodID {n}_mid = (*env)->GetMethodID(env, {n}_cls, \"floatValue\", \"()F\");",
-                n = name
-            );
-            let _ = writeln!(
-                out,
-                "        {n}_val = (*env)->CallFloatMethod(env, {n}, {n}_mid);",
-                n = name
-            );
-            let _ = writeln!(out, "        {n}_ptr = &{n}_val;", n = name);
-            let _ = writeln!(out, "    }}");
+            w.line(format!("float {n}_val = 0.0f;", n = name));
+            w.line(format!("const float* {n}_ptr = NULL;", n = name));
+            w.block(format!("if ({n} != NULL) {{", n = name), "}", |w| {
+                w.line(format!(
+                    "jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Float\");",
+                    n = name
+                ));
+                w.line(format!(
+                    "jmethodID {n}_mid = (*env)->GetMethodID(env, {n}_cls, \"floatValue\", \"()F\");",
+                    n = name
+                ));
+                w.line(format!(
+                    "{n}_val = (*env)->CallFloatMethod(env, {n}, {n}_mid);",
+                    n = name
+                ));
+                w.line(format!("{n}_ptr = &{n}_val;", n = name));
+            });
         }
         TypeRef::Bool => {
-            let _ = writeln!(out, "    bool {n}_val = false;", n = name);
-            let _ = writeln!(out, "    const bool* {n}_ptr = NULL;", n = name);
-            let _ = writeln!(out, "    if ({n} != NULL) {{", n = name);
-            let _ = writeln!(
-                out,
-                "        jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Boolean\");",
-                n = name
-            );
-            let _ = writeln!(
-                out,
-                "        jmethodID {n}_mid = (*env)->GetMethodID(env, {n}_cls, \"booleanValue\", \"()Z\");",
-                n = name
-            );
-            let _ = writeln!(
-                out,
-                "        {n}_val = (bool)(*env)->CallBooleanMethod(env, {n}, {n}_mid);",
-                n = name
-            );
-            let _ = writeln!(out, "        {n}_ptr = &{n}_val;", n = name);
-            let _ = writeln!(out, "    }}");
+            w.line(format!("bool {n}_val = false;", n = name));
+            w.line(format!("const bool* {n}_ptr = NULL;", n = name));
+            w.block(format!("if ({n} != NULL) {{", n = name), "}", |w| {
+                w.line(format!(
+                    "jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Boolean\");",
+                    n = name
+                ));
+                w.line(format!(
+                    "jmethodID {n}_mid = (*env)->GetMethodID(env, {n}_cls, \"booleanValue\", \"()Z\");",
+                    n = name
+                ));
+                w.line(format!(
+                    "{n}_val = (bool)(*env)->CallBooleanMethod(env, {n}, {n}_mid);",
+                    n = name
+                ));
+                w.line(format!("{n}_ptr = &{n}_val;", n = name));
+            });
         }
         TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) => {}
     }
+    out.push_str(&w.finish());
 }
 
 fn write_list_acquire(out: &mut String, name: &str, inner: &TypeRef) {
+    let mut w = CodeWriter::four_space().with_depth(1);
     match inner {
         TypeRef::I8 | TypeRef::U8 => {
-            let _ = writeln!(
-                out,
-                "    jbyte* {n}_elems = (*env)->GetByteArrayElements(env, {n}, NULL);",
+            w.line(format!(
+                "jbyte* {n}_elems = (*env)->GetByteArrayElements(env, {n}, NULL);",
                 n = name
-            );
-            let _ = writeln!(
-                out,
-                "    jsize {n}_len = (*env)->GetArrayLength(env, {n});",
+            ));
+            w.line(format!(
+                "jsize {n}_len = (*env)->GetArrayLength(env, {n});",
                 n = name
-            );
+            ));
         }
         TypeRef::I16 | TypeRef::U16 => {
-            let _ = writeln!(
-                out,
-                "    jshort* {n}_elems = (*env)->GetShortArrayElements(env, {n}, NULL);",
+            w.line(format!(
+                "jshort* {n}_elems = (*env)->GetShortArrayElements(env, {n}, NULL);",
                 n = name
-            );
-            let _ = writeln!(
-                out,
-                "    jsize {n}_len = (*env)->GetArrayLength(env, {n});",
+            ));
+            w.line(format!(
+                "jsize {n}_len = (*env)->GetArrayLength(env, {n});",
                 n = name
-            );
+            ));
         }
         TypeRef::I32 | TypeRef::Enum(_) => {
-            let _ = writeln!(
-                out,
-                "    jint* {n}_elems = (*env)->GetIntArrayElements(env, {n}, NULL);",
+            w.line(format!(
+                "jint* {n}_elems = (*env)->GetIntArrayElements(env, {n}, NULL);",
                 n = name
-            );
-            let _ = writeln!(
-                out,
-                "    jsize {n}_len = (*env)->GetArrayLength(env, {n});",
+            ));
+            w.line(format!(
+                "jsize {n}_len = (*env)->GetArrayLength(env, {n});",
                 n = name
-            );
+            ));
         }
         TypeRef::U32
         | TypeRef::I64
@@ -2096,52 +2101,44 @@ fn write_list_acquire(out: &mut String, name: &str, inner: &TypeRef) {
         | TypeRef::TypedHandle(_)
         | TypeRef::Handle
         | TypeRef::Struct(_) => {
-            let _ = writeln!(
-                out,
-                "    jlong* {n}_elems = (*env)->GetLongArrayElements(env, {n}, NULL);",
+            w.line(format!(
+                "jlong* {n}_elems = (*env)->GetLongArrayElements(env, {n}, NULL);",
                 n = name
-            );
-            let _ = writeln!(
-                out,
-                "    jsize {n}_len = (*env)->GetArrayLength(env, {n});",
+            ));
+            w.line(format!(
+                "jsize {n}_len = (*env)->GetArrayLength(env, {n});",
                 n = name
-            );
+            ));
         }
         TypeRef::F32 => {
-            let _ = writeln!(
-                out,
-                "    jfloat* {n}_elems = (*env)->GetFloatArrayElements(env, {n}, NULL);",
+            w.line(format!(
+                "jfloat* {n}_elems = (*env)->GetFloatArrayElements(env, {n}, NULL);",
                 n = name
-            );
-            let _ = writeln!(
-                out,
-                "    jsize {n}_len = (*env)->GetArrayLength(env, {n});",
+            ));
+            w.line(format!(
+                "jsize {n}_len = (*env)->GetArrayLength(env, {n});",
                 n = name
-            );
+            ));
         }
         TypeRef::F64 => {
-            let _ = writeln!(
-                out,
-                "    jdouble* {n}_elems = (*env)->GetDoubleArrayElements(env, {n}, NULL);",
+            w.line(format!(
+                "jdouble* {n}_elems = (*env)->GetDoubleArrayElements(env, {n}, NULL);",
                 n = name
-            );
-            let _ = writeln!(
-                out,
-                "    jsize {n}_len = (*env)->GetArrayLength(env, {n});",
+            ));
+            w.line(format!(
+                "jsize {n}_len = (*env)->GetArrayLength(env, {n});",
                 n = name
-            );
+            ));
         }
         TypeRef::Bool => {
-            let _ = writeln!(
-                out,
-                "    jboolean* {n}_elems = (*env)->GetBooleanArrayElements(env, {n}, NULL);",
+            w.line(format!(
+                "jboolean* {n}_elems = (*env)->GetBooleanArrayElements(env, {n}, NULL);",
                 n = name
-            );
-            let _ = writeln!(
-                out,
-                "    jsize {n}_len = (*env)->GetArrayLength(env, {n});",
+            ));
+            w.line(format!(
+                "jsize {n}_len = (*env)->GetArrayLength(env, {n});",
                 n = name
-            );
+            ));
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             // Java passes List<String> as String[] (jobjectArray). The C ABI
@@ -2149,42 +2146,38 @@ fn write_list_acquire(out: &mut String, name: &str, inner: &TypeRef) {
             // parallel arrays: `_elems` holds the UTF-8 char pointers, and
             // `_jstrs` keeps the original jstrings around so we can call
             // ReleaseStringUTFChars for each one in the release path.
-            let _ = writeln!(
-                out,
-                "    jsize {n}_len = (*env)->GetArrayLength(env, {n});",
+            w.line(format!(
+                "jsize {n}_len = (*env)->GetArrayLength(env, {n});",
                 n = name
-            );
-            let _ = writeln!(
-                out,
-                "    const char** {n}_elems = (const char**)malloc((size_t){n}_len * sizeof(const char*));",
+            ));
+            w.line(format!(
+                "const char** {n}_elems = (const char**)malloc((size_t){n}_len * sizeof(const char*));",
                 n = name
-            );
-            let _ = writeln!(
-                out,
-                "    jstring* {n}_jstrs = (jstring*)malloc((size_t){n}_len * sizeof(jstring));",
+            ));
+            w.line(format!(
+                "jstring* {n}_jstrs = (jstring*)malloc((size_t){n}_len * sizeof(jstring));",
                 n = name
+            ));
+            w.block(
+                format!("for (jsize {n}_i = 0; {n}_i < {n}_len; {n}_i++) {{", n = name),
+                "}",
+                |w| {
+                    w.line(format!(
+                        "{n}_jstrs[{n}_i] = (jstring)(*env)->GetObjectArrayElement(env, {n}, {n}_i);",
+                        n = name
+                    ));
+                    w.line(format!(
+                        "{n}_elems[{n}_i] = (*env)->GetStringUTFChars(env, {n}_jstrs[{n}_i], NULL);",
+                        n = name
+                    ));
+                },
             );
-            let _ = writeln!(
-                out,
-                "    for (jsize {n}_i = 0; {n}_i < {n}_len; {n}_i++) {{",
-                n = name
-            );
-            let _ = writeln!(
-                out,
-                "        {n}_jstrs[{n}_i] = (jstring)(*env)->GetObjectArrayElement(env, {n}, {n}_i);",
-                n = name
-            );
-            let _ = writeln!(
-                out,
-                "        {n}_elems[{n}_i] = (*env)->GetStringUTFChars(env, {n}_jstrs[{n}_i], NULL);",
-                n = name
-            );
-            let _ = writeln!(out, "    }}");
         }
         other => {
             unreachable!("validation rejects list params with composite element type {other:?}")
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn map_elem_c_type(ty: &TypeRef) -> &'static str {
@@ -2226,186 +2219,171 @@ fn map_elem_c_call_cast(ty: &TypeRef) -> &'static str {
 fn write_map_acquire(out: &mut String, name: &str, key: &TypeRef, val: &TypeRef) {
     let key_c = map_elem_c_type(key);
     let val_c = map_elem_c_type(val);
-    let _ = writeln!(
-        out,
-        "    jclass {n}_mc = (*env)->FindClass(env, \"java/util/Map\");",
+    let mut w = CodeWriter::four_space().with_depth(1);
+    w.line(format!(
+        "jclass {n}_mc = (*env)->FindClass(env, \"java/util/Map\");",
         n = name
-    );
-    let _ = writeln!(
-        out,
-        "    jsize {n}_len = (jsize)(*env)->CallIntMethod(env, {n}, (*env)->GetMethodID(env, {n}_mc, \"size\", \"()I\"));",
+    ));
+    w.line(format!(
+        "jsize {n}_len = (jsize)(*env)->CallIntMethod(env, {n}, (*env)->GetMethodID(env, {n}_mc, \"size\", \"()I\"));",
         n = name
-    );
-    let _ = writeln!(
-        out,
-        "    jobject {n}_ks = (*env)->CallObjectMethod(env, {n}, (*env)->GetMethodID(env, {n}_mc, \"keySet\", \"()Ljava/util/Set;\"));",
+    ));
+    w.line(format!(
+        "jobject {n}_ks = (*env)->CallObjectMethod(env, {n}, (*env)->GetMethodID(env, {n}_mc, \"keySet\", \"()Ljava/util/Set;\"));",
         n = name
-    );
-    let _ = writeln!(
-        out,
-        "    jclass {n}_sc = (*env)->FindClass(env, \"java/util/Set\");",
+    ));
+    w.line(format!(
+        "jclass {n}_sc = (*env)->FindClass(env, \"java/util/Set\");",
         n = name
-    );
-    let _ = writeln!(
-        out,
-        "    jobjectArray {n}_ka = (jobjectArray)(*env)->CallObjectMethod(env, {n}_ks, (*env)->GetMethodID(env, {n}_sc, \"toArray\", \"()[Ljava/lang/Object;\"));",
+    ));
+    w.line(format!(
+        "jobjectArray {n}_ka = (jobjectArray)(*env)->CallObjectMethod(env, {n}_ks, (*env)->GetMethodID(env, {n}_sc, \"toArray\", \"()[Ljava/lang/Object;\"));",
         n = name
-    );
-    let _ = writeln!(
-        out,
-        "    jmethodID {n}_gm = (*env)->GetMethodID(env, {n}_mc, \"get\", \"(Ljava/lang/Object;)Ljava/lang/Object;\");",
+    ));
+    w.line(format!(
+        "jmethodID {n}_gm = (*env)->GetMethodID(env, {n}_mc, \"get\", \"(Ljava/lang/Object;)Ljava/lang/Object;\");",
         n = name
-    );
-    let _ = writeln!(
-        out,
-        "    {kc}* {n}_c_keys = ({kc}*)malloc((size_t){n}_len * sizeof({kc}));",
+    ));
+    w.line(format!(
+        "{kc}* {n}_c_keys = ({kc}*)malloc((size_t){n}_len * sizeof({kc}));",
         kc = key_c,
         n = name
-    );
-    let _ = writeln!(
-        out,
-        "    {vc}* {n}_c_vals = ({vc}*)malloc((size_t){n}_len * sizeof({vc}));",
+    ));
+    w.line(format!(
+        "{vc}* {n}_c_vals = ({vc}*)malloc((size_t){n}_len * sizeof({vc}));",
         vc = val_c,
         n = name
-    );
+    ));
     if matches!(key, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
-        let _ = writeln!(
-            out,
-            "    jstring* {n}_jk = (jstring*)malloc((size_t){n}_len * sizeof(jstring));",
+        w.line(format!(
+            "jstring* {n}_jk = (jstring*)malloc((size_t){n}_len * sizeof(jstring));",
             n = name
-        );
+        ));
     }
     if matches!(val, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
-        let _ = writeln!(
-            out,
-            "    jstring* {n}_jv = (jstring*)malloc((size_t){n}_len * sizeof(jstring));",
+        w.line(format!(
+            "jstring* {n}_jv = (jstring*)malloc((size_t){n}_len * sizeof(jstring));",
             n = name
-        );
+        ));
     }
-    write_map_unbox_setup(out, name, "k", key);
-    write_map_unbox_setup(out, name, "v", val);
-    let _ = writeln!(
-        out,
-        "    for (jsize {n}_i = 0; {n}_i < {n}_len; {n}_i++) {{",
-        n = name
+    splice(&mut w, |o| write_map_unbox_setup(o, name, "k", key));
+    splice(&mut w, |o| write_map_unbox_setup(o, name, "v", val));
+    w.block(
+        format!(
+            "for (jsize {n}_i = 0; {n}_i < {n}_len; {n}_i++) {{",
+            n = name
+        ),
+        "}",
+        |w| {
+            w.line(format!(
+                "jobject {n}_ko = (*env)->GetObjectArrayElement(env, {n}_ka, {n}_i);",
+                n = name
+            ));
+            splice(w, |o| {
+                write_map_elem_extract(o, name, "k", "c_keys", key, &format!("{name}_ko"))
+            });
+            w.line(format!(
+                "jobject {n}_vo = (*env)->CallObjectMethod(env, {n}, {n}_gm, {n}_ko);",
+                n = name
+            ));
+            splice(w, |o| {
+                write_map_elem_extract(o, name, "v", "c_vals", val, &format!("{name}_vo"))
+            });
+        },
     );
-    let _ = writeln!(
-        out,
-        "        jobject {n}_ko = (*env)->GetObjectArrayElement(env, {n}_ka, {n}_i);",
-        n = name
-    );
-    write_map_elem_extract(out, name, "k", "c_keys", key, &format!("{name}_ko"));
-    let _ = writeln!(
-        out,
-        "        jobject {n}_vo = (*env)->CallObjectMethod(env, {n}, {n}_gm, {n}_ko);",
-        n = name
-    );
-    write_map_elem_extract(out, name, "v", "c_vals", val, &format!("{name}_vo"));
-    let _ = writeln!(out, "    }}");
+    out.push_str(&w.finish());
 }
 
 fn write_map_unbox_setup(out: &mut String, name: &str, suffix: &str, ty: &TypeRef) {
+    let mut w = CodeWriter::four_space().with_depth(1);
     match ty {
         TypeRef::I8 | TypeRef::U8 => {
-            let _ = writeln!(
-                out,
-                "    jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Byte\");",
+            w.line(format!(
+                "jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Byte\");",
                 n = name,
                 s = suffix
-            );
-            let _ = writeln!(
-                out,
-                "    jmethodID {n}_{s}m = (*env)->GetMethodID(env, {n}_{s}c, \"byteValue\", \"()B\");",
+            ));
+            w.line(format!(
+                "jmethodID {n}_{s}m = (*env)->GetMethodID(env, {n}_{s}c, \"byteValue\", \"()B\");",
                 n = name,
                 s = suffix
-            );
+            ));
         }
         TypeRef::I16 | TypeRef::U16 => {
-            let _ = writeln!(
-                out,
-                "    jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Short\");",
+            w.line(format!(
+                "jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Short\");",
                 n = name,
                 s = suffix
-            );
-            let _ = writeln!(
-                out,
-                "    jmethodID {n}_{s}m = (*env)->GetMethodID(env, {n}_{s}c, \"shortValue\", \"()S\");",
+            ));
+            w.line(format!(
+                "jmethodID {n}_{s}m = (*env)->GetMethodID(env, {n}_{s}c, \"shortValue\", \"()S\");",
                 n = name,
                 s = suffix
-            );
+            ));
         }
         TypeRef::I32 | TypeRef::Enum(_) => {
-            let _ = writeln!(
-                out,
-                "    jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Integer\");",
+            w.line(format!(
+                "jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Integer\");",
                 n = name,
                 s = suffix
-            );
-            let _ = writeln!(
-                out,
-                "    jmethodID {n}_{s}m = (*env)->GetMethodID(env, {n}_{s}c, \"intValue\", \"()I\");",
+            ));
+            w.line(format!(
+                "jmethodID {n}_{s}m = (*env)->GetMethodID(env, {n}_{s}c, \"intValue\", \"()I\");",
                 n = name,
                 s = suffix
-            );
+            ));
         }
         TypeRef::U32 | TypeRef::I64 | TypeRef::U64 | TypeRef::TypedHandle(_) | TypeRef::Handle => {
-            let _ = writeln!(
-                out,
-                "    jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Long\");",
+            w.line(format!(
+                "jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Long\");",
                 n = name,
                 s = suffix
-            );
-            let _ = writeln!(
-                out,
-                "    jmethodID {n}_{s}m = (*env)->GetMethodID(env, {n}_{s}c, \"longValue\", \"()J\");",
+            ));
+            w.line(format!(
+                "jmethodID {n}_{s}m = (*env)->GetMethodID(env, {n}_{s}c, \"longValue\", \"()J\");",
                 n = name,
                 s = suffix
-            );
+            ));
         }
         TypeRef::F32 => {
-            let _ = writeln!(
-                out,
-                "    jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Float\");",
+            w.line(format!(
+                "jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Float\");",
                 n = name,
                 s = suffix
-            );
-            let _ = writeln!(
-                out,
-                "    jmethodID {n}_{s}m = (*env)->GetMethodID(env, {n}_{s}c, \"floatValue\", \"()F\");",
+            ));
+            w.line(format!(
+                "jmethodID {n}_{s}m = (*env)->GetMethodID(env, {n}_{s}c, \"floatValue\", \"()F\");",
                 n = name,
                 s = suffix
-            );
+            ));
         }
         TypeRef::F64 => {
-            let _ = writeln!(
-                out,
-                "    jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Double\");",
+            w.line(format!(
+                "jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Double\");",
                 n = name,
                 s = suffix
-            );
-            let _ = writeln!(
-                out,
-                "    jmethodID {n}_{s}m = (*env)->GetMethodID(env, {n}_{s}c, \"doubleValue\", \"()D\");",
+            ));
+            w.line(format!(
+                "jmethodID {n}_{s}m = (*env)->GetMethodID(env, {n}_{s}c, \"doubleValue\", \"()D\");",
                 n = name,
                 s = suffix
-            );
+            ));
         }
         TypeRef::Bool => {
-            let _ = writeln!(
-                out,
-                "    jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Boolean\");",
+            w.line(format!(
+                "jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Boolean\");",
                 n = name,
                 s = suffix
-            );
-            let _ = writeln!(
-                out,
-                "    jmethodID {n}_{s}m = (*env)->GetMethodID(env, {n}_{s}c, \"booleanValue\", \"()Z\");",
+            ));
+            w.line(format!(
+                "jmethodID {n}_{s}m = (*env)->GetMethodID(env, {n}_{s}c, \"booleanValue\", \"()Z\");",
                 n = name,
                 s = suffix
-            );
+            ));
         }
         _ => {}
     }
+    out.push_str(&w.finish());
 }
 
 fn write_map_elem_extract(
@@ -2416,135 +2394,124 @@ fn write_map_elem_extract(
     ty: &TypeRef,
     obj_var: &str,
 ) {
+    let mut w = CodeWriter::four_space().with_depth(2);
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            let _ = writeln!(
-                out,
-                "        {n}_j{s}[{n}_i] = (jstring){obj};",
+            w.line(format!(
+                "{n}_j{s}[{n}_i] = (jstring){obj};",
                 n = name,
                 s = suffix,
                 obj = obj_var
-            );
-            let _ = writeln!(
-                out,
-                "        {n}_{a}[{n}_i] = (*env)->GetStringUTFChars(env, (jstring){obj}, NULL);",
+            ));
+            w.line(format!(
+                "{n}_{a}[{n}_i] = (*env)->GetStringUTFChars(env, (jstring){obj}, NULL);",
                 n = name,
                 a = arr,
                 obj = obj_var
-            );
+            ));
         }
         TypeRef::I8 => {
-            let _ = writeln!(
-                out,
-                "        {n}_{a}[{n}_i] = (int8_t)(*env)->CallByteMethod(env, {obj}, {n}_{s}m);",
+            w.line(format!(
+                "{n}_{a}[{n}_i] = (int8_t)(*env)->CallByteMethod(env, {obj}, {n}_{s}m);",
                 n = name,
                 a = arr,
                 obj = obj_var,
                 s = suffix
-            );
+            ));
         }
         TypeRef::U8 => {
-            let _ = writeln!(
-                out,
-                "        {n}_{a}[{n}_i] = (uint8_t)(*env)->CallByteMethod(env, {obj}, {n}_{s}m);",
+            w.line(format!(
+                "{n}_{a}[{n}_i] = (uint8_t)(*env)->CallByteMethod(env, {obj}, {n}_{s}m);",
                 n = name,
                 a = arr,
                 obj = obj_var,
                 s = suffix
-            );
+            ));
         }
         TypeRef::I16 => {
-            let _ = writeln!(
-                out,
-                "        {n}_{a}[{n}_i] = (int16_t)(*env)->CallShortMethod(env, {obj}, {n}_{s}m);",
+            w.line(format!(
+                "{n}_{a}[{n}_i] = (int16_t)(*env)->CallShortMethod(env, {obj}, {n}_{s}m);",
                 n = name,
                 a = arr,
                 obj = obj_var,
                 s = suffix
-            );
+            ));
         }
         TypeRef::U16 => {
-            let _ = writeln!(
-                out,
-                "        {n}_{a}[{n}_i] = (uint16_t)(*env)->CallShortMethod(env, {obj}, {n}_{s}m);",
+            w.line(format!(
+                "{n}_{a}[{n}_i] = (uint16_t)(*env)->CallShortMethod(env, {obj}, {n}_{s}m);",
                 n = name,
                 a = arr,
                 obj = obj_var,
                 s = suffix
-            );
+            ));
         }
         TypeRef::I32 | TypeRef::Enum(_) => {
-            let _ = writeln!(
-                out,
-                "        {n}_{a}[{n}_i] = (int32_t)(*env)->CallIntMethod(env, {obj}, {n}_{s}m);",
+            w.line(format!(
+                "{n}_{a}[{n}_i] = (int32_t)(*env)->CallIntMethod(env, {obj}, {n}_{s}m);",
                 n = name,
                 a = arr,
                 obj = obj_var,
                 s = suffix
-            );
+            ));
         }
         TypeRef::U32 => {
-            let _ = writeln!(
-                out,
-                "        {n}_{a}[{n}_i] = (uint32_t)(*env)->CallLongMethod(env, {obj}, {n}_{s}m);",
+            w.line(format!(
+                "{n}_{a}[{n}_i] = (uint32_t)(*env)->CallLongMethod(env, {obj}, {n}_{s}m);",
                 n = name,
                 a = arr,
                 obj = obj_var,
                 s = suffix
-            );
+            ));
         }
         TypeRef::I64 | TypeRef::TypedHandle(_) | TypeRef::Handle => {
-            let _ = writeln!(
-                out,
-                "        {n}_{a}[{n}_i] = (int64_t)(*env)->CallLongMethod(env, {obj}, {n}_{s}m);",
+            w.line(format!(
+                "{n}_{a}[{n}_i] = (int64_t)(*env)->CallLongMethod(env, {obj}, {n}_{s}m);",
                 n = name,
                 a = arr,
                 obj = obj_var,
                 s = suffix
-            );
+            ));
         }
         TypeRef::U64 => {
-            let _ = writeln!(
-                out,
-                "        {n}_{a}[{n}_i] = (uint64_t)(*env)->CallLongMethod(env, {obj}, {n}_{s}m);",
+            w.line(format!(
+                "{n}_{a}[{n}_i] = (uint64_t)(*env)->CallLongMethod(env, {obj}, {n}_{s}m);",
                 n = name,
                 a = arr,
                 obj = obj_var,
                 s = suffix
-            );
+            ));
         }
         TypeRef::F64 => {
-            let _ = writeln!(
-                out,
-                "        {n}_{a}[{n}_i] = (*env)->CallDoubleMethod(env, {obj}, {n}_{s}m);",
+            w.line(format!(
+                "{n}_{a}[{n}_i] = (*env)->CallDoubleMethod(env, {obj}, {n}_{s}m);",
                 n = name,
                 a = arr,
                 obj = obj_var,
                 s = suffix
-            );
+            ));
         }
         TypeRef::F32 => {
-            let _ = writeln!(
-                out,
-                "        {n}_{a}[{n}_i] = (*env)->CallFloatMethod(env, {obj}, {n}_{s}m);",
+            w.line(format!(
+                "{n}_{a}[{n}_i] = (*env)->CallFloatMethod(env, {obj}, {n}_{s}m);",
                 n = name,
                 a = arr,
                 obj = obj_var,
                 s = suffix
-            );
+            ));
         }
         TypeRef::Bool => {
-            let _ = writeln!(
-                out,
-                "        {n}_{a}[{n}_i] = (*env)->CallBooleanMethod(env, {obj}, {n}_{s}m);",
+            w.line(format!(
+                "{n}_{a}[{n}_i] = (*env)->CallBooleanMethod(env, {obj}, {n}_{s}m);",
                 n = name,
                 a = arr,
                 obj = obj_var,
                 s = suffix
-            );
+            ));
         }
         _ => {}
     }
+    out.push_str(&w.finish());
 }
 
 fn build_c_call_args(
@@ -2686,46 +2653,40 @@ fn write_return_handling(
     let args_str = call_args.join(", ");
     let call_with_err = join_call_args(&args_str, "&err");
     let call_with_out_len_err = join_call_args(&args_str, "&out_len, &err");
+    let mut w = CodeWriter::four_space().with_depth(1);
     match ret_type {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            let _ = writeln!(jni_c, "    const char* rv = {}({});", c_sym, call_with_err);
-            write_error_check(jni_c, returns);
-            let _ = writeln!(jni_c, "    jstring out = rv ? (*env)->NewStringUTF(env, rv) : (*env)->NewStringUTF(env, \"\");");
-            let _ = writeln!(jni_c, "    weaveffi_free_string(rv);");
-            release_jni_resources(jni_c, params);
-            let _ = writeln!(jni_c, "    return out;");
+            w.line(format!("const char* rv = {}({});", c_sym, call_with_err));
+            splice(&mut w, |o| write_error_check(o, returns));
+            w.line("jstring out = rv ? (*env)->NewStringUTF(env, rv) : (*env)->NewStringUTF(env, \"\");");
+            w.line("weaveffi_free_string(rv);");
+            splice(&mut w, |o| release_jni_resources(o, params));
+            w.line("return out;");
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            let _ = writeln!(
-                jni_c,
-                "    const uint8_t* rv = {}({});",
+            w.line(format!(
+                "const uint8_t* rv = {}({});",
                 c_sym, call_with_out_len_err
-            );
-            write_error_check(jni_c, returns);
-            let _ = writeln!(
-                jni_c,
-                "    jbyteArray out = (*env)->NewByteArray(env, (jsize)out_len);"
-            );
-            let _ = writeln!(jni_c, "    if (out && rv) {{ (*env)->SetByteArrayRegion(env, out, 0, (jsize)out_len, (const jbyte*)rv); }}");
-            let _ = writeln!(
-                jni_c,
-                "    weaveffi_free_bytes((uint8_t*)rv, (size_t)out_len);"
-            );
-            release_jni_resources(jni_c, params);
-            let _ = writeln!(jni_c, "    return out;");
+            ));
+            splice(&mut w, |o| write_error_check(o, returns));
+            w.line("jbyteArray out = (*env)->NewByteArray(env, (jsize)out_len);");
+            w.line("if (out && rv) { (*env)->SetByteArrayRegion(env, out, 0, (jsize)out_len, (const jbyte*)rv); }");
+            w.line("weaveffi_free_bytes((uint8_t*)rv, (size_t)out_len);");
+            splice(&mut w, |o| release_jni_resources(o, params));
+            w.line("return out;");
         }
         TypeRef::Bool => {
-            let _ = writeln!(jni_c, "    bool rv = {}({});", c_sym, call_with_err);
-            write_error_check(jni_c, returns);
-            release_jni_resources(jni_c, params);
-            let _ = writeln!(jni_c, "    return rv ? JNI_TRUE : JNI_FALSE;");
+            w.line(format!("bool rv = {}({});", c_sym, call_with_err));
+            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| release_jni_resources(o, params));
+            w.line("return rv ? JNI_TRUE : JNI_FALSE;");
         }
         TypeRef::Struct(name) => {
             let c_ty = weaveffi_core::utils::c_abi_struct_name(name, module, c_prefix);
-            let _ = writeln!(jni_c, "    {}* rv = {}({});", c_ty, c_sym, call_with_err);
-            write_error_check(jni_c, returns);
-            release_jni_resources(jni_c, params);
-            let _ = writeln!(jni_c, "    return (jlong)(intptr_t)rv;");
+            w.line(format!("{}* rv = {}({});", c_ty, c_sym, call_with_err));
+            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| release_jni_resources(o, params));
+            w.line("return (jlong)(intptr_t)rv;");
         }
         // A typed handle lowers to the owner-qualified C struct pointer, so the
         // return variable must be that pointer (not the generic integer handle)
@@ -2733,47 +2694,45 @@ fn write_return_handling(
         // untyped `Handle` case stays in the scalar fallthrough below.
         TypeRef::TypedHandle(name) => {
             let c_ty = weaveffi_core::utils::c_abi_struct_name(name, module, c_prefix);
-            let _ = writeln!(jni_c, "    {}* rv = {}({});", c_ty, c_sym, call_with_err);
-            write_error_check(jni_c, returns);
-            release_jni_resources(jni_c, params);
-            let _ = writeln!(jni_c, "    return (jlong)(intptr_t)rv;");
+            w.line(format!("{}* rv = {}({});", c_ty, c_sym, call_with_err));
+            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| release_jni_resources(o, params));
+            w.line("return (jlong)(intptr_t)rv;");
         }
         TypeRef::Optional(inner) => {
-            write_optional_return(jni_c, inner, c_sym, &args_str, returns, params, module);
+            splice(&mut w, |o| {
+                write_optional_return(o, inner, c_sym, &args_str, returns, params, module)
+            });
         }
         TypeRef::List(inner) => {
-            write_list_return(jni_c, inner, c_sym, &args_str, returns, params);
+            splice(&mut w, |o| {
+                write_list_return(o, inner, c_sym, &args_str, returns, params)
+            });
         }
         TypeRef::Iterator(_) => {
-            // Iterator returns expose an opaque `<Name>Iterator*` handle from
-            // the C ABI (not a buffer + length), so they need a different
-            // wrapping strategy than List<T>. Marshalling that into a Kotlin
-            // Iterator (or a materialized array) is not yet implemented.
-            // Emit a stub that throws at runtime so the rest of the binding
-            // still compiles and the unsupported call surface is obvious.
-            release_jni_resources(jni_c, params);
-            let _ = writeln!(
-                jni_c,
-                "    jclass _ufe = (*env)->FindClass(env, \"java/lang/UnsupportedOperationException\");"
+            // Iterator returns are intercepted in `render_jni_c` (the
+            // `CallShape::Iterator` arm drains the C iterator into a Kotlin
+            // `Iterator` via `write_iterator_return`), so the `TypeRef`-only
+            // dispatcher is never reached with one.
+            unreachable!(
+                "iterator returns are handled in render_jni_c before write_return_handling"
             );
-            let _ = writeln!(
-                jni_c,
-                "    if (_ufe) {{ (*env)->ThrowNew(env, _ufe, \"Iterator<T> returns are not yet supported by the WeaveFFI Android generator\"); }}"
-            );
-            let _ = writeln!(jni_c, "    return NULL;");
         }
         TypeRef::Map(k, v) => {
-            write_map_return(jni_c, k, v, c_sym, &args_str, returns, params);
+            splice(&mut w, |o| {
+                write_map_return(o, k, v, c_sym, &args_str, returns, params)
+            });
         }
         ret_type => {
             let c_ty = c_type_for_return(ret_type);
             let jcast = jni_cast_for(ret_type);
-            let _ = writeln!(jni_c, "    {} rv = {}({});", c_ty, c_sym, call_with_err);
-            write_error_check(jni_c, returns);
-            release_jni_resources(jni_c, params);
-            let _ = writeln!(jni_c, "    return {} rv;", jcast);
+            w.line(format!("{} rv = {}({});", c_ty, c_sym, call_with_err));
+            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| release_jni_resources(o, params));
+            w.line(format!("return {} rv;", jcast));
         }
     }
+    jni_c.push_str(&w.finish());
 }
 
 /// The C declaration type of an iterator's `out_item` pointee for the element
@@ -2794,96 +2753,79 @@ fn iter_item_c_type(elem: &TypeRef, module: &str, c_prefix: &str) -> String {
 /// Box one iterator/collection scalar `src` into a JVM reference `var`. Unlike
 /// [`write_map_box_elem`] the source is a plain lvalue (not `arr[i]`).
 fn write_boxed_scalar(out: &mut String, ty: &TypeRef, var: &str, src: &str, indent: &str) {
+    let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            let _ = writeln!(
-                out,
-                "{i}jstring {v} = {s} ? (*env)->NewStringUTF(env, {s}) : (*env)->NewStringUTF(env, \"\");",
-                i = indent, v = var, s = src
-            );
+            w.line(format!(
+                "jstring {v} = {s} ? (*env)->NewStringUTF(env, {s}) : (*env)->NewStringUTF(env, \"\");",
+                v = var, s = src
+            ));
         }
         TypeRef::I8 | TypeRef::U8 => {
-            let _ = writeln!(
-                out,
-                "{i}jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Byte\");",
-                i = indent,
+            w.line(format!(
+                "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Byte\");",
                 v = var
-            );
-            let _ = writeln!(out, "{i}jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(B)Ljava/lang/Byte;\"), (jbyte){s});", i = indent, v = var, s = src);
+            ));
+            w.line(format!("jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(B)Ljava/lang/Byte;\"), (jbyte){s});", v = var, s = src));
         }
         TypeRef::I16 | TypeRef::U16 => {
-            let _ = writeln!(
-                out,
-                "{i}jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Short\");",
-                i = indent,
+            w.line(format!(
+                "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Short\");",
                 v = var
-            );
-            let _ = writeln!(out, "{i}jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(S)Ljava/lang/Short;\"), (jshort){s});", i = indent, v = var, s = src);
+            ));
+            w.line(format!("jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(S)Ljava/lang/Short;\"), (jshort){s});", v = var, s = src));
         }
         TypeRef::I32 | TypeRef::Enum(_) => {
-            let _ = writeln!(
-                out,
-                "{i}jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Integer\");",
-                i = indent,
+            w.line(format!(
+                "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Integer\");",
                 v = var
-            );
-            let _ = writeln!(out, "{i}jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(I)Ljava/lang/Integer;\"), (jint){s});", i = indent, v = var, s = src);
+            ));
+            w.line(format!("jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(I)Ljava/lang/Integer;\"), (jint){s});", v = var, s = src));
         }
         TypeRef::U32 | TypeRef::I64 | TypeRef::U64 => {
-            let _ = writeln!(
-                out,
-                "{i}jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Long\");",
-                i = indent,
+            w.line(format!(
+                "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Long\");",
                 v = var
-            );
-            let _ = writeln!(out, "{i}jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(J)Ljava/lang/Long;\"), (jlong){s});", i = indent, v = var, s = src);
+            ));
+            w.line(format!("jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(J)Ljava/lang/Long;\"), (jlong){s});", v = var, s = src));
         }
         TypeRef::TypedHandle(_) | TypeRef::Handle | TypeRef::Struct(_) => {
-            let _ = writeln!(
-                out,
-                "{i}jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Long\");",
-                i = indent,
+            w.line(format!(
+                "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Long\");",
                 v = var
-            );
-            let _ = writeln!(out, "{i}jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(J)Ljava/lang/Long;\"), (jlong)(intptr_t){s});", i = indent, v = var, s = src);
+            ));
+            w.line(format!("jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(J)Ljava/lang/Long;\"), (jlong)(intptr_t){s});", v = var, s = src));
         }
         TypeRef::F32 => {
-            let _ = writeln!(
-                out,
-                "{i}jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Float\");",
-                i = indent,
+            w.line(format!(
+                "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Float\");",
                 v = var
-            );
-            let _ = writeln!(out, "{i}jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(F)Ljava/lang/Float;\"), (jfloat){s});", i = indent, v = var, s = src);
+            ));
+            w.line(format!("jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(F)Ljava/lang/Float;\"), (jfloat){s});", v = var, s = src));
         }
         TypeRef::F64 => {
-            let _ = writeln!(
-                out,
-                "{i}jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Double\");",
-                i = indent,
+            w.line(format!(
+                "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Double\");",
                 v = var
-            );
-            let _ = writeln!(out, "{i}jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(D)Ljava/lang/Double;\"), (jdouble){s});", i = indent, v = var, s = src);
+            ));
+            w.line(format!("jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(D)Ljava/lang/Double;\"), (jdouble){s});", v = var, s = src));
         }
         TypeRef::Bool => {
-            let _ = writeln!(
-                out,
-                "{i}jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Boolean\");",
-                i = indent,
+            w.line(format!(
+                "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Boolean\");",
                 v = var
-            );
-            let _ = writeln!(out, "{i}jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(Z)Ljava/lang/Boolean;\"), {s} ? JNI_TRUE : JNI_FALSE);", i = indent, v = var, s = src);
+            ));
+            w.line(format!("jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(Z)Ljava/lang/Boolean;\"), {s} ? JNI_TRUE : JNI_FALSE);", v = var, s = src));
         }
         _ => {
-            let _ = writeln!(
-                out,
-                "{i}jobject {v} = (jobject)(intptr_t){s};",
-                i = indent,
+            w.line(format!(
+                "jobject {v} = (jobject)(intptr_t){s};",
                 v = var,
                 s = src
-            );
+            ));
         }
     }
+    out.push_str(&w.finish());
 }
 
 /// Drain an `iter<T>` into a `java.util.ArrayList<T>` and return its `Iterator`.
@@ -2902,47 +2844,47 @@ fn write_iterator_return(
     let iter_ret = TypeRef::Iterator(Box::new(it.elem.clone()));
     let is_string = matches!(it.elem, TypeRef::StringUtf8 | TypeRef::BorrowedStr);
 
-    let _ = writeln!(
-        out,
-        "    {tag}* _iter = {sym}({call});",
+    let mut w = CodeWriter::four_space().with_depth(1);
+    w.line(format!(
+        "{tag}* _iter = {sym}({call});",
         tag = it.iter_tag,
         sym = it.launch.symbol,
         call = launch_call
-    );
-    write_error_check(out, Some(&iter_ret));
-    release_jni_resources(out, params);
+    ));
+    splice(&mut w, |o| write_error_check(o, Some(&iter_ret)));
+    splice(&mut w, |o| release_jni_resources(o, params));
 
-    let _ = writeln!(
-        out,
-        "    jclass _al_cls = (*env)->FindClass(env, \"java/util/ArrayList\");"
-    );
-    let _ = writeln!(out, "    jobject _list = (*env)->NewObject(env, _al_cls, (*env)->GetMethodID(env, _al_cls, \"<init>\", \"()V\"));");
-    let _ = writeln!(out, "    jmethodID _al_add = (*env)->GetMethodID(env, _al_cls, \"add\", \"(Ljava/lang/Object;)Z\");");
+    w.line("jclass _al_cls = (*env)->FindClass(env, \"java/util/ArrayList\");");
+    w.line("jobject _list = (*env)->NewObject(env, _al_cls, (*env)->GetMethodID(env, _al_cls, \"<init>\", \"()V\"));");
+    w.line("jmethodID _al_add = (*env)->GetMethodID(env, _al_cls, \"add\", \"(Ljava/lang/Object;)Z\");");
 
     let item_c = iter_item_c_type(&it.elem, module, c_prefix);
-    let _ = writeln!(out, "    {ty} _item = ({ty})0;", ty = item_c);
-    let _ = writeln!(out, "    weaveffi_error _iter_err = {{0, NULL}};");
-    let _ = writeln!(
-        out,
-        "    while ({next}(_iter, &_item, &_iter_err) != 0) {{",
-        next = it.next.symbol
+    w.line(format!("{ty} _item = ({ty})0;", ty = item_c));
+    w.line("weaveffi_error _iter_err = {0, NULL};");
+    w.block(
+        format!(
+            "while ({next}(_iter, &_item, &_iter_err) != 0) {{",
+            next = it.next.symbol
+        ),
+        "}",
+        |w| {
+            splice(w, |o| {
+                write_boxed_scalar(o, &it.elem, "_jitem", "_item", "        ")
+            });
+            w.line("(*env)->CallBooleanMethod(env, _list, _al_add, _jitem);");
+            w.line("(*env)->DeleteLocalRef(env, _jitem);");
+            if is_string {
+                w.line("weaveffi_free_string(_item);");
+            }
+        },
     );
-    write_boxed_scalar(out, &it.elem, "_jitem", "_item", "        ");
-    let _ = writeln!(
-        out,
-        "        (*env)->CallBooleanMethod(env, _list, _al_add, _jitem);"
-    );
-    let _ = writeln!(out, "        (*env)->DeleteLocalRef(env, _jitem);");
-    if is_string {
-        let _ = writeln!(out, "        weaveffi_free_string(_item);");
-    }
-    let _ = writeln!(out, "    }}");
-    let _ = writeln!(out, "    {}(_iter);", it.destroy_symbol);
-    let _ = writeln!(out, "    if (_iter_err.code != 0) {{");
-    let _ = writeln!(out, "        throw_weaveffi_error(env, &_iter_err);");
-    let _ = writeln!(out, "        return NULL;");
-    let _ = writeln!(out, "    }}");
-    let _ = writeln!(out, "    return (*env)->CallObjectMethod(env, _list, (*env)->GetMethodID(env, _al_cls, \"iterator\", \"()Ljava/util/Iterator;\"));");
+    w.line(format!("{}(_iter);", it.destroy_symbol));
+    w.block("if (_iter_err.code != 0) {", "}", |w| {
+        w.line("throw_weaveffi_error(env, &_iter_err);");
+        w.line("return NULL;");
+    });
+    w.line("return (*env)->CallObjectMethod(env, _list, (*env)->GetMethodID(env, _al_cls, \"iterator\", \"()Ljava/util/Iterator;\"));");
+    out.push_str(&w.finish());
 }
 
 fn write_optional_return(
@@ -2955,182 +2897,111 @@ fn write_optional_return(
     _module: &str,
 ) {
     let call = join_call_args(args_str, "&err");
+    let mut w = CodeWriter::four_space().with_depth(1);
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            let _ = writeln!(out, "    const char* rv = {}({});", c_sym, call);
-            write_error_check(out, returns);
-            release_jni_resources(out, params);
-            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
-            let _ = writeln!(out, "    jstring result = (*env)->NewStringUTF(env, rv);");
-            let _ = writeln!(out, "    weaveffi_free_string(rv);");
-            let _ = writeln!(out, "    return result;");
+            w.line(format!("const char* rv = {}({});", c_sym, call));
+            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| release_jni_resources(o, params));
+            w.line("if (rv == NULL) { return NULL; }");
+            w.line("jstring result = (*env)->NewStringUTF(env, rv);");
+            w.line("weaveffi_free_string(rv);");
+            w.line("return result;");
         }
         TypeRef::I8 | TypeRef::U8 => {
-            let _ = writeln!(
-                out,
-                "    const int8_t* rv = (const int8_t*){}({});",
+            w.line(format!(
+                "const int8_t* rv = (const int8_t*){}({});",
                 c_sym, call
-            );
-            write_error_check(out, returns);
-            release_jni_resources(out, params);
-            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
-            let _ = writeln!(
-                out,
-                "    jclass cls = (*env)->FindClass(env, \"java/lang/Byte\");"
-            );
-            let _ = writeln!(
-                out,
-                "    jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(B)Ljava/lang/Byte;\");"
-            );
-            let _ = writeln!(
-                out,
-                "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jbyte)*rv);"
-            );
+            ));
+            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| release_jni_resources(o, params));
+            w.line("if (rv == NULL) { return NULL; }");
+            w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Byte\");");
+            w.line("jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(B)Ljava/lang/Byte;\");");
+            w.line("return (*env)->CallStaticObjectMethod(env, cls, mid, (jbyte)*rv);");
         }
         TypeRef::I16 | TypeRef::U16 => {
-            let _ = writeln!(
-                out,
-                "    const int16_t* rv = (const int16_t*){}({});",
+            w.line(format!(
+                "const int16_t* rv = (const int16_t*){}({});",
                 c_sym, call
-            );
-            write_error_check(out, returns);
-            release_jni_resources(out, params);
-            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
-            let _ = writeln!(
-                out,
-                "    jclass cls = (*env)->FindClass(env, \"java/lang/Short\");"
-            );
-            let _ = writeln!(
-                out,
-                "    jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(S)Ljava/lang/Short;\");"
-            );
-            let _ = writeln!(
-                out,
-                "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jshort)*rv);"
-            );
+            ));
+            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| release_jni_resources(o, params));
+            w.line("if (rv == NULL) { return NULL; }");
+            w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Short\");");
+            w.line("jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(S)Ljava/lang/Short;\");");
+            w.line("return (*env)->CallStaticObjectMethod(env, cls, mid, (jshort)*rv);");
         }
         TypeRef::I32 | TypeRef::Enum(_) => {
-            let _ = writeln!(out, "    const int32_t* rv = {}({});", c_sym, call);
-            write_error_check(out, returns);
-            release_jni_resources(out, params);
-            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
-            let _ = writeln!(
-                out,
-                "    jclass cls = (*env)->FindClass(env, \"java/lang/Integer\");"
-            );
-            let _ = writeln!(
-                out,
-                "    jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(I)Ljava/lang/Integer;\");"
-            );
-            let _ = writeln!(
-                out,
-                "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jint)*rv);"
-            );
+            w.line(format!("const int32_t* rv = {}({});", c_sym, call));
+            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| release_jni_resources(o, params));
+            w.line("if (rv == NULL) { return NULL; }");
+            w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Integer\");");
+            w.line("jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(I)Ljava/lang/Integer;\");");
+            w.line("return (*env)->CallStaticObjectMethod(env, cls, mid, (jint)*rv);");
         }
         // An optional struct/handle return is a *nullable handle pointer*: box
         // the pointer value itself (do not dereference it as an integer).
         TypeRef::TypedHandle(_) | TypeRef::Handle | TypeRef::Struct(_) => {
-            let _ = writeln!(out, "    const void* rv = {}({});", c_sym, call);
-            write_error_check(out, returns);
-            release_jni_resources(out, params);
-            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
-            let _ = writeln!(
-                out,
-                "    jclass cls = (*env)->FindClass(env, \"java/lang/Long\");"
-            );
-            let _ = writeln!(
-                out,
-                "    jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(J)Ljava/lang/Long;\");"
-            );
-            let _ = writeln!(
-                out,
-                "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jlong)(intptr_t)rv);"
-            );
+            w.line(format!("const void* rv = {}({});", c_sym, call));
+            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| release_jni_resources(o, params));
+            w.line("if (rv == NULL) { return NULL; }");
+            w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Long\");");
+            w.line("jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(J)Ljava/lang/Long;\");");
+            w.line("return (*env)->CallStaticObjectMethod(env, cls, mid, (jlong)(intptr_t)rv);");
         }
         // Optional scalar return: a nullable pointer to the value; dereference.
         TypeRef::U32 | TypeRef::I64 | TypeRef::U64 => {
-            let _ = writeln!(
-                out,
-                "    const int64_t* rv = (const int64_t*){}({});",
+            w.line(format!(
+                "const int64_t* rv = (const int64_t*){}({});",
                 c_sym, call
-            );
-            write_error_check(out, returns);
-            release_jni_resources(out, params);
-            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
-            let _ = writeln!(
-                out,
-                "    jclass cls = (*env)->FindClass(env, \"java/lang/Long\");"
-            );
-            let _ = writeln!(
-                out,
-                "    jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(J)Ljava/lang/Long;\");"
-            );
-            let _ = writeln!(
-                out,
-                "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jlong)*rv);"
-            );
+            ));
+            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| release_jni_resources(o, params));
+            w.line("if (rv == NULL) { return NULL; }");
+            w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Long\");");
+            w.line("jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(J)Ljava/lang/Long;\");");
+            w.line("return (*env)->CallStaticObjectMethod(env, cls, mid, (jlong)*rv);");
         }
         TypeRef::F32 => {
-            let _ = writeln!(out, "    const float* rv = {}({});", c_sym, call);
-            write_error_check(out, returns);
-            release_jni_resources(out, params);
-            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
-            let _ = writeln!(
-                out,
-                "    jclass cls = (*env)->FindClass(env, \"java/lang/Float\");"
-            );
-            let _ = writeln!(
-                out,
-                "    jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(F)Ljava/lang/Float;\");"
-            );
-            let _ = writeln!(
-                out,
-                "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jfloat)*rv);"
-            );
+            w.line(format!("const float* rv = {}({});", c_sym, call));
+            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| release_jni_resources(o, params));
+            w.line("if (rv == NULL) { return NULL; }");
+            w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Float\");");
+            w.line("jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(F)Ljava/lang/Float;\");");
+            w.line("return (*env)->CallStaticObjectMethod(env, cls, mid, (jfloat)*rv);");
         }
         TypeRef::F64 => {
-            let _ = writeln!(out, "    const double* rv = {}({});", c_sym, call);
-            write_error_check(out, returns);
-            release_jni_resources(out, params);
-            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
-            let _ = writeln!(
-                out,
-                "    jclass cls = (*env)->FindClass(env, \"java/lang/Double\");"
-            );
-            let _ = writeln!(
-                out,
-                "    jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(D)Ljava/lang/Double;\");"
-            );
-            let _ = writeln!(
-                out,
-                "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jdouble)*rv);"
-            );
+            w.line(format!("const double* rv = {}({});", c_sym, call));
+            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| release_jni_resources(o, params));
+            w.line("if (rv == NULL) { return NULL; }");
+            w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Double\");");
+            w.line("jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(D)Ljava/lang/Double;\");");
+            w.line("return (*env)->CallStaticObjectMethod(env, cls, mid, (jdouble)*rv);");
         }
         TypeRef::Bool => {
-            let _ = writeln!(out, "    const bool* rv = {}({});", c_sym, call);
-            write_error_check(out, returns);
-            release_jni_resources(out, params);
-            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
-            let _ = writeln!(
-                out,
-                "    jclass cls = (*env)->FindClass(env, \"java/lang/Boolean\");"
-            );
-            let _ = writeln!(
-                out,
-                "    jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(Z)Ljava/lang/Boolean;\");"
-            );
-            let _ = writeln!(
-                out,
-                "    return (*env)->CallStaticObjectMethod(env, cls, mid, *rv ? JNI_TRUE : JNI_FALSE);"
+            w.line(format!("const bool* rv = {}({});", c_sym, call));
+            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| release_jni_resources(o, params));
+            w.line("if (rv == NULL) { return NULL; }");
+            w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Boolean\");");
+            w.line("jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(Z)Ljava/lang/Boolean;\");");
+            w.line(
+                "return (*env)->CallStaticObjectMethod(env, cls, mid, *rv ? JNI_TRUE : JNI_FALSE);",
             );
         }
         _ => {
-            let _ = writeln!(out, "    void* rv = {}({});", c_sym, call);
-            write_error_check(out, returns);
-            release_jni_resources(out, params);
-            let _ = writeln!(out, "    return (jobject)rv;");
+            w.line(format!("void* rv = {}({});", c_sym, call));
+            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| release_jni_resources(o, params));
+            w.line("return (jobject)rv;");
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn write_list_return(
@@ -3142,47 +3013,37 @@ fn write_list_return(
     params: &[ParamBinding],
 ) {
     let call = join_call_args(args_str, "&out_len, &err");
+    let mut w = CodeWriter::four_space().with_depth(1);
     match inner {
         TypeRef::I8 | TypeRef::U8 => {
-            let _ = writeln!(
-                out,
-                "    const int8_t* rv = (const int8_t*){}({});",
+            w.line(format!(
+                "const int8_t* rv = (const int8_t*){}({});",
                 c_sym, call
-            );
-            write_error_check(out, returns);
-            release_jni_resources(out, params);
-            let _ = writeln!(
-                out,
-                "    jbyteArray result = (*env)->NewByteArray(env, (jsize)out_len);"
-            );
-            let _ = writeln!(out, "    if (result && rv) {{ (*env)->SetByteArrayRegion(env, result, 0, (jsize)out_len, (const jbyte*)rv); }}");
-            let _ = writeln!(out, "    return result;");
+            ));
+            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| release_jni_resources(o, params));
+            w.line("jbyteArray result = (*env)->NewByteArray(env, (jsize)out_len);");
+            w.line("if (result && rv) { (*env)->SetByteArrayRegion(env, result, 0, (jsize)out_len, (const jbyte*)rv); }");
+            w.line("return result;");
         }
         TypeRef::I16 | TypeRef::U16 => {
-            let _ = writeln!(
-                out,
-                "    const int16_t* rv = (const int16_t*){}({});",
+            w.line(format!(
+                "const int16_t* rv = (const int16_t*){}({});",
                 c_sym, call
-            );
-            write_error_check(out, returns);
-            release_jni_resources(out, params);
-            let _ = writeln!(
-                out,
-                "    jshortArray result = (*env)->NewShortArray(env, (jsize)out_len);"
-            );
-            let _ = writeln!(out, "    if (result && rv) {{ (*env)->SetShortArrayRegion(env, result, 0, (jsize)out_len, (const jshort*)rv); }}");
-            let _ = writeln!(out, "    return result;");
+            ));
+            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| release_jni_resources(o, params));
+            w.line("jshortArray result = (*env)->NewShortArray(env, (jsize)out_len);");
+            w.line("if (result && rv) { (*env)->SetShortArrayRegion(env, result, 0, (jsize)out_len, (const jshort*)rv); }");
+            w.line("return result;");
         }
         TypeRef::I32 | TypeRef::Enum(_) => {
-            let _ = writeln!(out, "    const int32_t* rv = {}({});", c_sym, call);
-            write_error_check(out, returns);
-            release_jni_resources(out, params);
-            let _ = writeln!(
-                out,
-                "    jintArray result = (*env)->NewIntArray(env, (jsize)out_len);"
-            );
-            let _ = writeln!(out, "    if (result && rv) {{ (*env)->SetIntArrayRegion(env, result, 0, (jsize)out_len, (const jint*)rv); }}");
-            let _ = writeln!(out, "    return result;");
+            w.line(format!("const int32_t* rv = {}({});", c_sym, call));
+            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| release_jni_resources(o, params));
+            w.line("jintArray result = (*env)->NewIntArray(env, (jsize)out_len);");
+            w.line("if (result && rv) { (*env)->SetIntArrayRegion(env, result, 0, (jsize)out_len, (const jint*)rv); }");
+            w.line("return result;");
         }
         // NULL entries in a pointer array express "none", so optional
         // structs/handles ride the same long-array lowering (0L = null).
@@ -3193,89 +3054,65 @@ fn write_list_return(
         | TypeRef::Handle
         | TypeRef::Struct(_)
         | TypeRef::Optional(_) => {
-            let _ = writeln!(
-                out,
-                "    const int64_t* rv = (const int64_t*){}({});",
+            w.line(format!(
+                "const int64_t* rv = (const int64_t*){}({});",
                 c_sym, call
-            );
-            write_error_check(out, returns);
-            release_jni_resources(out, params);
-            let _ = writeln!(
-                out,
-                "    jlongArray result = (*env)->NewLongArray(env, (jsize)out_len);"
-            );
-            let _ = writeln!(out, "    if (result && rv) {{ (*env)->SetLongArrayRegion(env, result, 0, (jsize)out_len, (const jlong*)rv); }}");
-            let _ = writeln!(out, "    return result;");
+            ));
+            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| release_jni_resources(o, params));
+            w.line("jlongArray result = (*env)->NewLongArray(env, (jsize)out_len);");
+            w.line("if (result && rv) { (*env)->SetLongArrayRegion(env, result, 0, (jsize)out_len, (const jlong*)rv); }");
+            w.line("return result;");
         }
         TypeRef::F32 => {
-            let _ = writeln!(out, "    const float* rv = {}({});", c_sym, call);
-            write_error_check(out, returns);
-            release_jni_resources(out, params);
-            let _ = writeln!(
-                out,
-                "    jfloatArray result = (*env)->NewFloatArray(env, (jsize)out_len);"
-            );
-            let _ = writeln!(out, "    if (result && rv) {{ (*env)->SetFloatArrayRegion(env, result, 0, (jsize)out_len, (const jfloat*)rv); }}");
-            let _ = writeln!(out, "    return result;");
+            w.line(format!("const float* rv = {}({});", c_sym, call));
+            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| release_jni_resources(o, params));
+            w.line("jfloatArray result = (*env)->NewFloatArray(env, (jsize)out_len);");
+            w.line("if (result && rv) { (*env)->SetFloatArrayRegion(env, result, 0, (jsize)out_len, (const jfloat*)rv); }");
+            w.line("return result;");
         }
         TypeRef::F64 => {
-            let _ = writeln!(out, "    const double* rv = {}({});", c_sym, call);
-            write_error_check(out, returns);
-            release_jni_resources(out, params);
-            let _ = writeln!(
-                out,
-                "    jdoubleArray result = (*env)->NewDoubleArray(env, (jsize)out_len);"
-            );
-            let _ = writeln!(out, "    if (result && rv) {{ (*env)->SetDoubleArrayRegion(env, result, 0, (jsize)out_len, (const jdouble*)rv); }}");
-            let _ = writeln!(out, "    return result;");
+            w.line(format!("const double* rv = {}({});", c_sym, call));
+            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| release_jni_resources(o, params));
+            w.line("jdoubleArray result = (*env)->NewDoubleArray(env, (jsize)out_len);");
+            w.line("if (result && rv) { (*env)->SetDoubleArrayRegion(env, result, 0, (jsize)out_len, (const jdouble*)rv); }");
+            w.line("return result;");
         }
         TypeRef::Bool => {
-            let _ = writeln!(out, "    const bool* rv = {}({});", c_sym, call);
-            write_error_check(out, returns);
-            release_jni_resources(out, params);
-            let _ = writeln!(
-                out,
-                "    jbooleanArray result = (*env)->NewBooleanArray(env, (jsize)out_len);"
-            );
-            let _ = writeln!(out, "    if (result && rv) {{ (*env)->SetBooleanArrayRegion(env, result, 0, (jsize)out_len, (const jboolean*)rv); }}");
-            let _ = writeln!(out, "    return result;");
+            w.line(format!("const bool* rv = {}({});", c_sym, call));
+            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| release_jni_resources(o, params));
+            w.line("jbooleanArray result = (*env)->NewBooleanArray(env, (jsize)out_len);");
+            w.line("if (result && rv) { (*env)->SetBooleanArrayRegion(env, result, 0, (jsize)out_len, (const jboolean*)rv); }");
+            w.line("return result;");
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            let _ = writeln!(
-                out,
-                "    const char* const* rv = (const char* const*){}({});",
+            w.line(format!(
+                "const char* const* rv = (const char* const*){}({});",
                 c_sym, call
+            ));
+            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| release_jni_resources(o, params));
+            w.line("jclass _str_cls = (*env)->FindClass(env, \"java/lang/String\");");
+            w.line("jobjectArray result = (*env)->NewObjectArray(env, (jsize)out_len, _str_cls, NULL);");
+            w.block(
+                "for (jsize _li = 0; rv != NULL && _li < (jsize)out_len; _li++) {",
+                "}",
+                |w| {
+                    w.line("jstring _ls = rv[_li] ? (*env)->NewStringUTF(env, rv[_li]) : (*env)->NewStringUTF(env, \"\");");
+                    w.line("(*env)->SetObjectArrayElement(env, result, _li, _ls);");
+                    w.line("(*env)->DeleteLocalRef(env, _ls);");
+                },
             );
-            write_error_check(out, returns);
-            release_jni_resources(out, params);
-            let _ = writeln!(
-                out,
-                "    jclass _str_cls = (*env)->FindClass(env, \"java/lang/String\");"
-            );
-            let _ = writeln!(
-                out,
-                "    jobjectArray result = (*env)->NewObjectArray(env, (jsize)out_len, _str_cls, NULL);"
-            );
-            let _ = writeln!(
-                out,
-                "    for (jsize _li = 0; rv != NULL && _li < (jsize)out_len; _li++) {{"
-            );
-            let _ = writeln!(
-                out,
-                "        jstring _ls = rv[_li] ? (*env)->NewStringUTF(env, rv[_li]) : (*env)->NewStringUTF(env, \"\");"
-            );
-            let _ = writeln!(
-                out,
-                "        (*env)->SetObjectArrayElement(env, result, _li, _ls);"
-            );
-            let _ = writeln!(out, "        (*env)->DeleteLocalRef(env, _ls);");
-            let _ = writeln!(out, "    }}");
-            let _ = writeln!(out, "    return result;");
+            w.line("return result;");
         }
         other => {
             unreachable!("validation rejects list returns with composite element type {other:?}")
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn write_map_return(
@@ -3289,216 +3126,199 @@ fn write_map_return(
 ) {
     let key_c = map_elem_c_type(key);
     let val_c = map_elem_c_type(val);
-    let _ = writeln!(out, "    size_t out_map_len = 0;");
-    let _ = writeln!(out, "    {kc}* out_keys = NULL;", kc = key_c);
-    let _ = writeln!(out, "    {vc}* out_vals = NULL;", vc = val_c);
-    let _ = writeln!(
-        out,
-        "    {}({});",
+    let mut w = CodeWriter::four_space().with_depth(1);
+    w.line("size_t out_map_len = 0;");
+    w.line(format!("{kc}* out_keys = NULL;", kc = key_c));
+    w.line(format!("{vc}* out_vals = NULL;", vc = val_c));
+    w.line(format!(
+        "{}({});",
         c_sym,
         join_call_args(args_str, "out_keys, out_vals, &out_map_len, &err")
-    );
-    write_error_check(out, returns);
-    release_jni_resources(out, params);
-    let _ = writeln!(
-        out,
-        "    jclass hm_cls = (*env)->FindClass(env, \"java/util/HashMap\");"
-    );
-    let _ = writeln!(out, "    jobject result = (*env)->NewObject(env, hm_cls, (*env)->GetMethodID(env, hm_cls, \"<init>\", \"(I)V\"), (jint)out_map_len);");
-    let _ = writeln!(out, "    jmethodID hm_put = (*env)->GetMethodID(env, hm_cls, \"put\", \"(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;\");");
-    let _ = writeln!(out, "    for (size_t i = 0; i < out_map_len; i++) {{");
-    write_map_box_elem(out, key, "jkey", "out_keys");
-    write_map_box_elem(out, val, "jval", "out_vals");
-    let _ = writeln!(
-        out,
-        "        (*env)->CallObjectMethod(env, result, hm_put, jkey, jval);"
-    );
-    let _ = writeln!(out, "    }}");
-    let _ = writeln!(out, "    return result;");
+    ));
+    splice(&mut w, |o| write_error_check(o, returns));
+    splice(&mut w, |o| release_jni_resources(o, params));
+    w.line("jclass hm_cls = (*env)->FindClass(env, \"java/util/HashMap\");");
+    w.line("jobject result = (*env)->NewObject(env, hm_cls, (*env)->GetMethodID(env, hm_cls, \"<init>\", \"(I)V\"), (jint)out_map_len);");
+    w.line("jmethodID hm_put = (*env)->GetMethodID(env, hm_cls, \"put\", \"(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;\");");
+    w.block("for (size_t i = 0; i < out_map_len; i++) {", "}", |w| {
+        splice(w, |o| write_map_box_elem(o, key, "jkey", "out_keys"));
+        splice(w, |o| write_map_box_elem(o, val, "jval", "out_vals"));
+        w.line("(*env)->CallObjectMethod(env, result, hm_put, jkey, jval);");
+    });
+    w.line("return result;");
+    out.push_str(&w.finish());
 }
 
 fn write_map_box_elem(out: &mut String, ty: &TypeRef, var: &str, arr: &str) {
+    let mut w = CodeWriter::four_space().with_depth(2);
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            let _ = writeln!(
-                out,
-                "        jstring {v} = (*env)->NewStringUTF(env, {a}[i]);",
+            w.line(format!(
+                "jstring {v} = (*env)->NewStringUTF(env, {a}[i]);",
                 v = var,
                 a = arr
-            );
+            ));
         }
         TypeRef::I8 | TypeRef::U8 => {
-            let _ = writeln!(
-                out,
-                "        jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Byte\");",
+            w.line(format!(
+                "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Byte\");",
                 v = var
-            );
-            let _ = writeln!(
-                out,
-                "        jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(B)Ljava/lang/Byte;\"), (jbyte){a}[i]);",
+            ));
+            w.line(format!(
+                "jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(B)Ljava/lang/Byte;\"), (jbyte){a}[i]);",
                 v = var,
                 a = arr
-            );
+            ));
         }
         TypeRef::I16 | TypeRef::U16 => {
-            let _ = writeln!(
-                out,
-                "        jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Short\");",
+            w.line(format!(
+                "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Short\");",
                 v = var
-            );
-            let _ = writeln!(
-                out,
-                "        jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(S)Ljava/lang/Short;\"), (jshort){a}[i]);",
+            ));
+            w.line(format!(
+                "jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(S)Ljava/lang/Short;\"), (jshort){a}[i]);",
                 v = var,
                 a = arr
-            );
+            ));
         }
         TypeRef::I32 | TypeRef::Enum(_) => {
-            let _ = writeln!(
-                out,
-                "        jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Integer\");",
+            w.line(format!(
+                "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Integer\");",
                 v = var
-            );
-            let _ = writeln!(
-                out,
-                "        jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(I)Ljava/lang/Integer;\"), (jint){a}[i]);",
+            ));
+            w.line(format!(
+                "jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(I)Ljava/lang/Integer;\"), (jint){a}[i]);",
                 v = var,
                 a = arr
-            );
+            ));
         }
         TypeRef::U32 | TypeRef::I64 | TypeRef::U64 | TypeRef::TypedHandle(_) | TypeRef::Handle => {
-            let _ = writeln!(
-                out,
-                "        jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Long\");",
+            w.line(format!(
+                "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Long\");",
                 v = var
-            );
-            let _ = writeln!(
-                out,
-                "        jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(J)Ljava/lang/Long;\"), (jlong){a}[i]);",
+            ));
+            w.line(format!(
+                "jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(J)Ljava/lang/Long;\"), (jlong){a}[i]);",
                 v = var,
                 a = arr
-            );
+            ));
         }
         TypeRef::F32 => {
-            let _ = writeln!(
-                out,
-                "        jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Float\");",
+            w.line(format!(
+                "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Float\");",
                 v = var
-            );
-            let _ = writeln!(
-                out,
-                "        jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(F)Ljava/lang/Float;\"), (jfloat){a}[i]);",
+            ));
+            w.line(format!(
+                "jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(F)Ljava/lang/Float;\"), (jfloat){a}[i]);",
                 v = var,
                 a = arr
-            );
+            ));
         }
         TypeRef::F64 => {
-            let _ = writeln!(
-                out,
-                "        jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Double\");",
+            w.line(format!(
+                "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Double\");",
                 v = var
-            );
-            let _ = writeln!(
-                out,
-                "        jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(D)Ljava/lang/Double;\"), (jdouble){a}[i]);",
+            ));
+            w.line(format!(
+                "jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(D)Ljava/lang/Double;\"), (jdouble){a}[i]);",
                 v = var,
                 a = arr
-            );
+            ));
         }
         TypeRef::Bool => {
-            let _ = writeln!(
-                out,
-                "        jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Boolean\");",
+            w.line(format!(
+                "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Boolean\");",
                 v = var
-            );
-            let _ = writeln!(
-                out,
-                "        jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(Z)Ljava/lang/Boolean;\"), {a}[i]);",
+            ));
+            w.line(format!(
+                "jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(Z)Ljava/lang/Boolean;\"), {a}[i]);",
                 v = var,
                 a = arr
-            );
+            ));
         }
         _ => {
-            let _ = writeln!(
-                out,
-                "        jobject {v} = (jobject){a}[i];",
-                v = var,
-                a = arr
-            );
+            w.line(format!("jobject {v} = (jobject){a}[i];", v = var, a = arr));
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn write_error_check(out: &mut String, ret_type: Option<&TypeRef>) {
-    let _ = writeln!(out, "    if (err.code != 0) {{");
-    let _ = writeln!(out, "        throw_weaveffi_error(env, &err);");
-    let _ = writeln!(out, "        {}", jni_default_return(ret_type));
-    let _ = writeln!(out, "    }}");
+    let mut w = CodeWriter::four_space().with_depth(1);
+    w.block("if (err.code != 0) {", "}", |w| {
+        w.line("throw_weaveffi_error(env, &err);");
+        // The default-return statement may be empty (void functions), in which
+        // case the original emitted an indented blank line ("        \n"), so
+        // splice the indent verbatim rather than via `line` (which would drop
+        // the indentation for an empty argument).
+        w.raw(format!(
+            "{}{}\n",
+            w.indent_str(),
+            jni_default_return(ret_type)
+        ));
+    });
+    out.push_str(&w.finish());
 }
 
 fn release_jni_resources(out: &mut String, params: &[ParamBinding]) {
+    let mut w = CodeWriter::four_space().with_depth(1);
     for p in params {
         match &p.ty {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                let _ = writeln!(
-                    out,
-                    "    (*env)->ReleaseStringUTFChars(env, {n}, {n}_chars);",
+                w.line(format!(
+                    "(*env)->ReleaseStringUTFChars(env, {n}, {n}_chars);",
                     n = p.name
-                );
+                ));
             }
             TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                let _ = writeln!(
-                    out,
-                    "    (*env)->ReleaseByteArrayElements(env, {n}, {n}_elems, 0);",
+                w.line(format!(
+                    "(*env)->ReleaseByteArrayElements(env, {n}, {n}_elems, 0);",
                     n = p.name
-                );
+                ));
             }
             TypeRef::Optional(inner) => match inner.as_ref() {
                 TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                    let _ = writeln!(
-                        out,
-                        "    if ({n} != NULL) {{ (*env)->ReleaseStringUTFChars(env, {n}, {n}_chars); }}",
+                    w.line(format!(
+                        "if ({n} != NULL) {{ (*env)->ReleaseStringUTFChars(env, {n}, {n}_chars); }}",
                         n = p.name
-                    );
+                    ));
                 }
                 TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                    let _ = writeln!(
-                        out,
-                        "    if ({n} != NULL && {n}_elems != NULL) {{ (*env)->ReleaseByteArrayElements(env, {n}, {n}_elems, 0); }}",
+                    w.line(format!(
+                        "if ({n} != NULL && {n}_elems != NULL) {{ (*env)->ReleaseByteArrayElements(env, {n}, {n}_elems, 0); }}",
                         n = p.name
-                    );
+                    ));
                 }
                 _ => {}
             },
-            TypeRef::List(inner) => write_list_release(out, &p.name, inner),
-            TypeRef::Map(k, v) => write_map_release(out, &p.name, k, v),
+            TypeRef::List(inner) => splice(&mut w, |o| write_list_release(o, &p.name, inner)),
+            TypeRef::Map(k, v) => splice(&mut w, |o| write_map_release(o, &p.name, k, v)),
             _ => {}
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn write_list_release(out: &mut String, name: &str, inner: &TypeRef) {
+    let mut w = CodeWriter::four_space().with_depth(1);
     match inner {
         TypeRef::I8 | TypeRef::U8 => {
-            let _ = writeln!(
-                out,
-                "    (*env)->ReleaseByteArrayElements(env, {n}, {n}_elems, 0);",
+            w.line(format!(
+                "(*env)->ReleaseByteArrayElements(env, {n}, {n}_elems, 0);",
                 n = name
-            );
+            ));
         }
         TypeRef::I16 | TypeRef::U16 => {
-            let _ = writeln!(
-                out,
-                "    (*env)->ReleaseShortArrayElements(env, {n}, {n}_elems, 0);",
+            w.line(format!(
+                "(*env)->ReleaseShortArrayElements(env, {n}, {n}_elems, 0);",
                 n = name
-            );
+            ));
         }
         TypeRef::I32 | TypeRef::Enum(_) => {
-            let _ = writeln!(
-                out,
-                "    (*env)->ReleaseIntArrayElements(env, {n}, {n}_elems, 0);",
+            w.line(format!(
+                "(*env)->ReleaseIntArrayElements(env, {n}, {n}_elems, 0);",
                 n = name
-            );
+            ));
         }
         TypeRef::U32
         | TypeRef::I64
@@ -3506,85 +3326,90 @@ fn write_list_release(out: &mut String, name: &str, inner: &TypeRef) {
         | TypeRef::TypedHandle(_)
         | TypeRef::Handle
         | TypeRef::Struct(_) => {
-            let _ = writeln!(
-                out,
-                "    (*env)->ReleaseLongArrayElements(env, {n}, {n}_elems, 0);",
+            w.line(format!(
+                "(*env)->ReleaseLongArrayElements(env, {n}, {n}_elems, 0);",
                 n = name
-            );
+            ));
         }
         TypeRef::F32 => {
-            let _ = writeln!(
-                out,
-                "    (*env)->ReleaseFloatArrayElements(env, {n}, {n}_elems, 0);",
+            w.line(format!(
+                "(*env)->ReleaseFloatArrayElements(env, {n}, {n}_elems, 0);",
                 n = name
-            );
+            ));
         }
         TypeRef::F64 => {
-            let _ = writeln!(
-                out,
-                "    (*env)->ReleaseDoubleArrayElements(env, {n}, {n}_elems, 0);",
+            w.line(format!(
+                "(*env)->ReleaseDoubleArrayElements(env, {n}, {n}_elems, 0);",
                 n = name
-            );
+            ));
         }
         TypeRef::Bool => {
-            let _ = writeln!(
-                out,
-                "    (*env)->ReleaseBooleanArrayElements(env, {n}, {n}_elems, 0);",
+            w.line(format!(
+                "(*env)->ReleaseBooleanArrayElements(env, {n}, {n}_elems, 0);",
                 n = name
-            );
+            ));
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            let _ = writeln!(
-                out,
-                "    for (jsize {n}_ri = 0; {n}_ri < {n}_len; {n}_ri++) {{",
-                n = name
+            w.block(
+                format!(
+                    "for (jsize {n}_ri = 0; {n}_ri < {n}_len; {n}_ri++) {{",
+                    n = name
+                ),
+                "}",
+                |w| {
+                    w.line(format!(
+                        "(*env)->ReleaseStringUTFChars(env, {n}_jstrs[{n}_ri], {n}_elems[{n}_ri]);",
+                        n = name
+                    ));
+                },
             );
-            let _ = writeln!(
-                out,
-                "        (*env)->ReleaseStringUTFChars(env, {n}_jstrs[{n}_ri], {n}_elems[{n}_ri]);",
-                n = name
-            );
-            let _ = writeln!(out, "    }}");
-            let _ = writeln!(out, "    free((void*){n}_elems);", n = name);
-            let _ = writeln!(out, "    free({n}_jstrs);", n = name);
+            w.line(format!("free((void*){n}_elems);", n = name));
+            w.line(format!("free({n}_jstrs);", n = name));
         }
         other => {
             unreachable!("validation rejects list params with composite element type {other:?}")
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn write_map_release(out: &mut String, name: &str, key: &TypeRef, val: &TypeRef) {
+    let mut w = CodeWriter::four_space().with_depth(1);
     if matches!(key, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
-        let _ = writeln!(
-            out,
-            "    for (jsize {n}_ri = 0; {n}_ri < {n}_len; {n}_ri++) {{",
-            n = name
+        w.block(
+            format!(
+                "for (jsize {n}_ri = 0; {n}_ri < {n}_len; {n}_ri++) {{",
+                n = name
+            ),
+            "}",
+            |w| {
+                w.line(format!(
+                    "(*env)->ReleaseStringUTFChars(env, {n}_jk[{n}_ri], {n}_c_keys[{n}_ri]);",
+                    n = name
+                ));
+            },
         );
-        let _ = writeln!(
-            out,
-            "        (*env)->ReleaseStringUTFChars(env, {n}_jk[{n}_ri], {n}_c_keys[{n}_ri]);",
-            n = name
-        );
-        let _ = writeln!(out, "    }}");
-        let _ = writeln!(out, "    free({n}_jk);", n = name);
+        w.line(format!("free({n}_jk);", n = name));
     }
     if matches!(val, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
-        let _ = writeln!(
-            out,
-            "    for (jsize {n}_ri = 0; {n}_ri < {n}_len; {n}_ri++) {{",
-            n = name
+        w.block(
+            format!(
+                "for (jsize {n}_ri = 0; {n}_ri < {n}_len; {n}_ri++) {{",
+                n = name
+            ),
+            "}",
+            |w| {
+                w.line(format!(
+                    "(*env)->ReleaseStringUTFChars(env, {n}_jv[{n}_ri], {n}_c_vals[{n}_ri]);",
+                    n = name
+                ));
+            },
         );
-        let _ = writeln!(
-            out,
-            "        (*env)->ReleaseStringUTFChars(env, {n}_jv[{n}_ri], {n}_c_vals[{n}_ri]);",
-            n = name
-        );
-        let _ = writeln!(out, "    }}");
-        let _ = writeln!(out, "    free({n}_jv);", n = name);
+        w.line(format!("free({n}_jv);", n = name));
     }
-    let _ = writeln!(out, "    free((void*){n}_c_keys);", n = name);
-    let _ = writeln!(out, "    free((void*){n}_c_vals);", n = name);
+    w.line(format!("free((void*){n}_c_keys);", n = name));
+    w.line(format!("free((void*){n}_c_vals);", n = name));
+    out.push_str(&w.finish());
 }
 
 fn kotlin_getter_type(t: &TypeRef) -> String {
@@ -3596,159 +3421,169 @@ fn kotlin_getter_type(t: &TypeRef) -> String {
 }
 
 fn render_kotlin_struct(out: &mut String, s: &StructBinding) {
-    let _ = writeln!(out);
-    emit_doc(out, &s.doc, "");
-    let _ = writeln!(
-        out,
-        // `handle` is `internal` (not `private`) so the `WeaveFFI` companion
-        // wrappers and builders in this module can unwrap `store.handle`; it
-        // stays hidden from external consumers.
-        "class {} internal constructor(internal var handle: Long) : java.io.Closeable {{",
-        s.name
-    );
-    let _ = writeln!(out, "    companion object {{");
-    let _ = writeln!(out, "        init {{ System.loadLibrary(\"weaveffi\") }}");
-    let _ = writeln!(out);
-
     let create_params: Vec<String> = s
         .fields
         .iter()
         .map(|f| format!("{}: {}", f.name, kotlin_type(&f.ty)))
         .collect();
-    let _ = writeln!(
-        out,
-        "        @JvmStatic external fun nativeCreate({}): Long",
-        create_params.join(", ")
-    );
-    let _ = writeln!(
-        out,
-        "        @JvmStatic external fun nativeDestroy(handle: Long)"
-    );
-    for f in &s.fields {
-        let pascal = pascal_case(&f.name);
-        let _ = writeln!(
-            out,
-            "        @JvmStatic external fun nativeGet{}(handle: Long): {}",
-            pascal,
-            kotlin_type(&f.ty)
-        );
-    }
-
     let param_names: Vec<&str> = s.fields.iter().map(|f| f.name.as_str()).collect();
-    let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "        fun create({}): {} = {}(nativeCreate({}))",
-        create_params.join(", "),
-        s.name,
-        s.name,
-        param_names.join(", ")
-    );
-    let _ = writeln!(out, "    }}");
-    let _ = writeln!(out);
 
-    for f in &s.fields {
-        let pascal = pascal_case(&f.name);
-        let kt_type = kotlin_getter_type(&f.ty);
-        emit_doc(out, &f.doc, "    ");
-        match &f.ty {
-            TypeRef::Struct(name) => {
-                let local = local_type_name(name);
-                let _ = writeln!(
-                    out,
-                    "    val {}: {} get() = {}(nativeGet{}(handle))",
-                    f.name, kt_type, local, pascal
-                );
+    let mut w = CodeWriter::four_space();
+    w.blank();
+    writer_doc(&mut w, &s.doc);
+    // `handle` is `internal` (not `private`) so the `WeaveFFI` companion
+    // wrappers and builders in this module can unwrap `store.handle`; it
+    // stays hidden from external consumers.
+    w.line(format!(
+        "class {} internal constructor(internal var handle: Long) : java.io.Closeable {{",
+        s.name
+    ));
+    w.scope(|w| {
+        w.line("companion object {");
+        w.scope(|w| {
+            w.line("init { System.loadLibrary(\"weaveffi\") }");
+            w.blank();
+            w.line(format!(
+                "@JvmStatic external fun nativeCreate({}): Long",
+                create_params.join(", ")
+            ));
+            w.line("@JvmStatic external fun nativeDestroy(handle: Long)");
+            for f in &s.fields {
+                let pascal = pascal_case(&f.name);
+                w.line(format!(
+                    "@JvmStatic external fun nativeGet{}(handle: Long): {}",
+                    pascal,
+                    kotlin_type(&f.ty)
+                ));
             }
-            // The native getter returns the raw `Int` value, so an enum field
-            // must round-trip through the generated `fromValue` factory to yield
-            // the typed enum (the declared `kt_type` is the bare local class).
-            TypeRef::Enum(_) => {
-                let _ = writeln!(
-                    out,
-                    "    val {}: {} get() = {}.fromValue(nativeGet{}(handle))",
-                    f.name, kt_type, kt_type, pascal
-                );
-            }
-            _ => {
-                let _ = writeln!(
-                    out,
-                    "    val {}: {} get() = nativeGet{}(handle)",
-                    f.name, kt_type, pascal
-                );
+            w.blank();
+            w.line(format!(
+                "fun create({}): {} = {}(nativeCreate({}))",
+                create_params.join(", "),
+                s.name,
+                s.name,
+                param_names.join(", ")
+            ));
+        });
+        w.line("}");
+        w.blank();
+
+        for f in &s.fields {
+            let pascal = pascal_case(&f.name);
+            let kt_type = kotlin_getter_type(&f.ty);
+            writer_doc(w, &f.doc);
+            match &f.ty {
+                TypeRef::Struct(name) => {
+                    let local = local_type_name(name);
+                    w.line(format!(
+                        "val {}: {} get() = {}(nativeGet{}(handle))",
+                        f.name, kt_type, local, pascal
+                    ));
+                }
+                // The native getter returns the raw `Int` value, so an enum field
+                // must round-trip through the generated `fromValue` factory to yield
+                // the typed enum (the declared `kt_type` is the bare local class).
+                TypeRef::Enum(_) => {
+                    w.line(format!(
+                        "val {}: {} get() = {}.fromValue(nativeGet{}(handle))",
+                        f.name, kt_type, kt_type, pascal
+                    ));
+                }
+                _ => {
+                    w.line(format!(
+                        "val {}: {} get() = nativeGet{}(handle)",
+                        f.name, kt_type, pascal
+                    ));
+                }
             }
         }
-    }
-    let _ = writeln!(out);
+        w.blank();
 
-    let _ = writeln!(out, "    override fun close() {{");
-    let _ = writeln!(out, "        if (handle != 0L) {{");
-    let _ = writeln!(out, "            nativeDestroy(handle)");
-    let _ = writeln!(out, "            handle = 0L");
-    let _ = writeln!(out, "        }}");
-    let _ = writeln!(out, "    }}");
-    let _ = writeln!(out);
-    let _ = writeln!(out, "    protected fun finalize() {{");
-    let _ = writeln!(out, "        close()");
-    let _ = writeln!(out, "    }}");
-    let _ = writeln!(out, "}}");
+        w.line("override fun close() {");
+        w.scope(|w| {
+            w.line("if (handle != 0L) {");
+            w.scope(|w| {
+                w.line("nativeDestroy(handle)");
+                w.line("handle = 0L");
+            });
+            w.line("}");
+        });
+        w.line("}");
+        w.blank();
+        w.line("protected fun finalize() {");
+        w.scope(|w| {
+            w.line("close()");
+        });
+        w.line("}");
+    });
+    w.line("}");
+    out.push_str(&w.finish());
 }
 
 fn render_kotlin_builder(out: &mut String, s: &StructBinding) {
     if s.builder.is_none() {
         return;
     }
-    let _ = writeln!(out);
-    emit_doc(out, &s.doc, "");
-    let _ = writeln!(out, "class {}Builder {{", s.name);
-    for f in &s.fields {
-        // Optional fields are already nullable; using a single nullable slot lets
-        // "unset" and "explicitly null" both mean "absent" (a legal value), and
-        // avoids a `T??` double-optional that `build()` could never satisfy.
-        let decl_ty = if matches!(&f.ty, TypeRef::Optional(_)) {
-            kotlin_getter_type(&f.ty)
-        } else {
-            format!("{}?", kotlin_getter_type(&f.ty))
-        };
-        let _ = writeln!(out, "    private var {}: {} = null", f.name, decl_ty);
-    }
-    for f in &s.fields {
-        let pascal = pascal_case(&f.name);
-        let kt_getter = kotlin_getter_type(&f.ty);
-        emit_doc(out, &f.doc, "    ");
-        let _ = writeln!(
-            out,
-            "    fun with{}({}: {}): {}Builder {{",
-            pascal, f.name, kt_getter, s.name
-        );
-        let _ = writeln!(out, "        this.{} = {}", f.name, f.name);
-        let _ = writeln!(out, "        return this");
-        let _ = writeln!(out, "    }}");
-    }
-    let _ = writeln!(out, "    fun build(): {} {{", s.name);
-    if s.fields.is_empty() {
-        let _ = writeln!(out, "        return {}.create()", s.name);
-    } else {
-        let _ = writeln!(out, "        return {}.create(", s.name);
-        let n = s.fields.len();
-        for (i, f) in s.fields.iter().enumerate() {
-            // Optional fields pass through as-is (null = absent); required fields
-            // are asserted present.
-            let arg = if matches!(&f.ty, TypeRef::Optional(_)) {
-                f.name.clone()
+    let mut w = CodeWriter::four_space();
+    w.blank();
+    writer_doc(&mut w, &s.doc);
+    w.line(format!("class {}Builder {{", s.name));
+    w.scope(|w| {
+        for f in &s.fields {
+            // Optional fields are already nullable; using a single nullable slot lets
+            // "unset" and "explicitly null" both mean "absent" (a legal value), and
+            // avoids a `T??` double-optional that `build()` could never satisfy.
+            let decl_ty = if matches!(&f.ty, TypeRef::Optional(_)) {
+                kotlin_getter_type(&f.ty)
             } else {
-                format!(
-                    "{} ?: throw IllegalStateException(\"missing field: {}\")",
-                    f.name, f.name
-                )
+                format!("{}?", kotlin_getter_type(&f.ty))
             };
-            let suffix = if i + 1 < n { "," } else { "" };
-            let _ = writeln!(out, "            {}{}", arg, suffix);
+            w.line(format!("private var {}: {} = null", f.name, decl_ty));
         }
-        let _ = writeln!(out, "        )");
-    }
-    let _ = writeln!(out, "    }}");
-    let _ = writeln!(out, "}}");
+        for f in &s.fields {
+            let pascal = pascal_case(&f.name);
+            let kt_getter = kotlin_getter_type(&f.ty);
+            writer_doc(w, &f.doc);
+            w.line(format!(
+                "fun with{}({}: {}): {}Builder {{",
+                pascal, f.name, kt_getter, s.name
+            ));
+            w.scope(|w| {
+                w.line(format!("this.{} = {}", f.name, f.name));
+                w.line("return this");
+            });
+            w.line("}");
+        }
+        w.line(format!("fun build(): {} {{", s.name));
+        w.scope(|w| {
+            if s.fields.is_empty() {
+                w.line(format!("return {}.create()", s.name));
+            } else {
+                w.line(format!("return {}.create(", s.name));
+                let n = s.fields.len();
+                w.scope(|w| {
+                    for (i, f) in s.fields.iter().enumerate() {
+                        // Optional fields pass through as-is (null = absent); required fields
+                        // are asserted present.
+                        let arg = if matches!(&f.ty, TypeRef::Optional(_)) {
+                            f.name.clone()
+                        } else {
+                            format!(
+                                "{} ?: throw IllegalStateException(\"missing field: {}\")",
+                                f.name, f.name
+                            )
+                        };
+                        let suffix = if i + 1 < n { "," } else { "" };
+                        w.line(format!("{}{}", arg, suffix));
+                    }
+                });
+                w.line(")");
+            }
+        });
+        w.line("}");
+    });
+    w.line("}");
+    out.push_str(&w.finish());
 }
 
 fn render_jni_struct(
@@ -3779,18 +3614,21 @@ fn render_jni_struct(
 
     // nativeDestroy
     {
-        let _ = writeln!(
-            out,
+        let mut w = CodeWriter::four_space();
+        w.line(format!(
             "JNIEXPORT void JNICALL Java_{}_{}_nativeDestroy(JNIEnv* env, jclass clazz, jlong handle) {{",
             jni_prefix,
             s.name
-        );
-        let _ = writeln!(
-            out,
-            "    {}(({}*)(intptr_t)handle);",
-            s.destroy_symbol, prefix
-        );
-        let _ = writeln!(out, "}}\n");
+        ));
+        w.scope(|w| {
+            w.line(format!(
+                "{}(({}*)(intptr_t)handle);",
+                s.destroy_symbol, prefix
+            ));
+        });
+        w.line("}");
+        w.blank();
+        out.push_str(&w.finish());
     }
 
     // nativeGet{Field} for each field: shared opaque-object getter emitter
@@ -3831,41 +3669,44 @@ fn render_jni_object_constructor(
     for f in fields {
         jparams.push(format!("{} {}", jni_param_type(&f.ty), f.name));
     }
-    let _ = writeln!(
-        out,
+    let mut w = CodeWriter::four_space();
+    w.line(format!(
         "JNIEXPORT jlong JNICALL Java_{}_{}_{}({}) {{",
         jni_prefix,
         class_name,
         method,
         jparams.join(", ")
-    );
-    let _ = writeln!(out, "    weaveffi_error err = {{0, NULL}};");
+    ));
+    w.scope(|w| {
+        w.line("weaveffi_error err = {0, NULL};");
 
-    for f in fields {
-        write_param_acquire(out, &f.name, &f.ty);
-    }
+        for f in fields {
+            splice(w, |o| write_param_acquire(o, &f.name, &f.ty));
+        }
 
-    let mut call_args: Vec<String> = Vec::new();
-    for f in fields {
-        build_c_call_args(&mut call_args, &f.name, &f.ty, module_name, c_prefix);
-    }
+        let mut call_args: Vec<String> = Vec::new();
+        for f in fields {
+            build_c_call_args(&mut call_args, &f.name, &f.ty, module_name, c_prefix);
+        }
 
-    let args_str = call_args.join(", ");
-    let _ = writeln!(
-        out,
-        "    {}* rv = {}({});",
-        c_tag,
-        create_symbol,
-        join_call_args(&args_str, "&err")
-    );
-    write_error_check(out, Some(&TypeRef::Handle));
+        let args_str = call_args.join(", ");
+        w.line(format!(
+            "{}* rv = {}({});",
+            c_tag,
+            create_symbol,
+            join_call_args(&args_str, "&err")
+        ));
+        splice(w, |o| write_error_check(o, Some(&TypeRef::Handle)));
 
-    for f in fields {
-        release_jni_resources_single(out, &f.name, &f.ty);
-    }
+        for f in fields {
+            splice(w, |o| release_jni_resources_single(o, &f.name, &f.ty));
+        }
 
-    let _ = writeln!(out, "    return (jlong)(intptr_t)rv;");
-    let _ = writeln!(out, "}}\n");
+        w.line("return (jlong)(intptr_t)rv;");
+    });
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// Emit one JNI opaque-object field getter
@@ -3885,20 +3726,24 @@ fn render_jni_object_getter(
     c_prefix: &str,
 ) {
     let jret = jni_ret_type(Some(&field.ty));
-    let _ = writeln!(
-        out,
+    let mut w = CodeWriter::four_space();
+    w.line(format!(
         "JNIEXPORT {} JNICALL Java_{}_{}_nativeGet{}(JNIEnv* env, jclass clazz, jlong handle) {{",
         jret, jni_prefix, class_name, suffix
-    );
-    render_jni_getter_body(
-        out,
-        &field.ty,
-        &field.getter_symbol,
-        c_tag,
-        module_name,
-        c_prefix,
-    );
-    let _ = writeln!(out, "}}\n");
+    ));
+    splice(&mut w, |o| {
+        render_jni_getter_body(
+            o,
+            &field.ty,
+            &field.getter_symbol,
+            c_tag,
+            module_name,
+            c_prefix,
+        )
+    });
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// Emit the body of an opaque-object field getter: cast the `jlong` handle to
@@ -3913,80 +3758,75 @@ fn render_jni_getter_body(
     module_name: &str,
     c_prefix: &str,
 ) {
+    let mut w = CodeWriter::four_space().with_depth(1);
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            let _ = writeln!(
-                out,
-                "    const char* rv = {}((const {}*)(intptr_t)handle);",
+            w.line(format!(
+                "const char* rv = {}((const {}*)(intptr_t)handle);",
                 getter_c, prefix
+            ));
+            w.line(
+                "jstring jout = rv ? (*env)->NewStringUTF(env, rv) : (*env)->NewStringUTF(env, \"\");",
             );
-            let _ = writeln!(
-                out,
-                "    jstring jout = rv ? (*env)->NewStringUTF(env, rv) : (*env)->NewStringUTF(env, \"\");"
-            );
-            let _ = writeln!(out, "    weaveffi_free_string(rv);");
-            let _ = writeln!(out, "    return jout;");
+            w.line("weaveffi_free_string(rv);");
+            w.line("return jout;");
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            let _ = writeln!(out, "    size_t out_len = 0;");
-            let _ = writeln!(
-                out,
-                "    const uint8_t* rv = {}((const {}*)(intptr_t)handle, &out_len);",
+            w.line("size_t out_len = 0;");
+            w.line(format!(
+                "const uint8_t* rv = {}((const {}*)(intptr_t)handle, &out_len);",
                 getter_c, prefix
+            ));
+            w.line("jbyteArray jout = (*env)->NewByteArray(env, (jsize)out_len);");
+            w.line(
+                "if (jout && rv) { (*env)->SetByteArrayRegion(env, jout, 0, (jsize)out_len, (const jbyte*)rv); }",
             );
-            let _ = writeln!(
-                out,
-                "    jbyteArray jout = (*env)->NewByteArray(env, (jsize)out_len);"
-            );
-            let _ = writeln!(
-                out,
-                "    if (jout && rv) {{ (*env)->SetByteArrayRegion(env, jout, 0, (jsize)out_len, (const jbyte*)rv); }}"
-            );
-            let _ = writeln!(
-                out,
-                "    weaveffi_free_bytes((uint8_t*)rv, (size_t)out_len);"
-            );
-            let _ = writeln!(out, "    return jout;");
+            w.line("weaveffi_free_bytes((uint8_t*)rv, (size_t)out_len);");
+            w.line("return jout;");
         }
         TypeRef::Bool => {
-            let _ = writeln!(
-                out,
-                "    bool rv = {}((const {}*)(intptr_t)handle);",
+            w.line(format!(
+                "bool rv = {}((const {}*)(intptr_t)handle);",
                 getter_c, prefix
-            );
-            let _ = writeln!(out, "    return rv ? JNI_TRUE : JNI_FALSE;");
+            ));
+            w.line("return rv ? JNI_TRUE : JNI_FALSE;");
         }
         TypeRef::Struct(name) => {
             let c_struct = weaveffi_core::utils::c_abi_struct_name(name, module_name, c_prefix);
-            let _ = writeln!(
-                out,
-                "    const {c_struct}* rv = {getter_c}((const {prefix}*)(intptr_t)handle);",
+            w.line(format!(
+                "const {c_struct}* rv = {getter_c}((const {prefix}*)(intptr_t)handle);",
                 c_struct = c_struct,
                 getter_c = getter_c,
                 prefix = prefix
-            );
-            let _ = writeln!(out, "    return (jlong)(intptr_t)rv;");
+            ));
+            w.line("return (jlong)(intptr_t)rv;");
         }
         TypeRef::Optional(inner) => {
-            write_struct_optional_getter(out, inner, getter_c, prefix);
+            splice(&mut w, |o| {
+                write_struct_optional_getter(o, inner, getter_c, prefix)
+            });
         }
         TypeRef::List(inner) => {
-            write_struct_list_getter(out, inner, getter_c, prefix);
+            splice(&mut w, |o| {
+                write_struct_list_getter(o, inner, getter_c, prefix)
+            });
         }
         TypeRef::Map(k, v) => {
-            write_struct_map_getter(out, k, v, getter_c, prefix);
+            splice(&mut w, |o| {
+                write_struct_map_getter(o, k, v, getter_c, prefix)
+            });
         }
         other => {
             let c_ty = c_type_for_return(other);
             let jcast = jni_cast_for(other);
-            let _ = writeln!(
-                out,
-                "    {} rv = {}((const {}*)(intptr_t)handle);",
+            w.line(format!(
+                "{} rv = {}((const {}*)(intptr_t)handle);",
                 c_ty, getter_c, prefix
-            );
-            let _ = writeln!(out, "    return {}rv;", jcast);
+            ));
+            w.line(format!("return {}rv;", jcast));
         }
     }
+    out.push_str(&w.finish());
 }
 
 /// Render a rich (algebraic) enum's JNI bridge, mirroring [`render_jni_struct`]:
@@ -4025,30 +3865,40 @@ fn render_jni_rich_enum(
     }
 
     // Active-variant discriminant reader.
-    let _ = writeln!(
-        out,
-        "JNIEXPORT jint JNICALL Java_{}_{}_nativeTag(JNIEnv* env, jclass clazz, jlong handle) {{",
-        jni_prefix, class_name
-    );
-    let _ = writeln!(
-        out,
-        "    return (jint){}((const {}*)(intptr_t)handle);",
-        rich.tag_symbol, c_tag
-    );
-    let _ = writeln!(out, "}}\n");
+    {
+        let mut w = CodeWriter::four_space();
+        w.line(format!(
+            "JNIEXPORT jint JNICALL Java_{}_{}_nativeTag(JNIEnv* env, jclass clazz, jlong handle) {{",
+            jni_prefix, class_name
+        ));
+        w.scope(|w| {
+            w.line(format!(
+                "return (jint){}((const {}*)(intptr_t)handle);",
+                rich.tag_symbol, c_tag
+            ));
+        });
+        w.line("}");
+        w.blank();
+        out.push_str(&w.finish());
+    }
 
     // Destructor (identical contract to a struct's `nativeDestroy`).
-    let _ = writeln!(
-        out,
-        "JNIEXPORT void JNICALL Java_{}_{}_nativeDestroy(JNIEnv* env, jclass clazz, jlong handle) {{",
-        jni_prefix, class_name
-    );
-    let _ = writeln!(
-        out,
-        "    {}(({}*)(intptr_t)handle);",
-        rich.destroy_symbol, c_tag
-    );
-    let _ = writeln!(out, "}}\n");
+    {
+        let mut w = CodeWriter::four_space();
+        w.line(format!(
+            "JNIEXPORT void JNICALL Java_{}_{}_nativeDestroy(JNIEnv* env, jclass clazz, jlong handle) {{",
+            jni_prefix, class_name
+        ));
+        w.scope(|w| {
+            w.line(format!(
+                "{}(({}*)(intptr_t)handle);",
+                rich.destroy_symbol, c_tag
+            ));
+        });
+        w.line("}");
+        w.blank();
+        out.push_str(&w.finish());
+    }
 
     // Per-variant field getters, namespaced by variant.
     for v in &rich.variants {
@@ -4069,250 +3919,160 @@ fn render_jni_rich_enum(
 }
 
 fn write_struct_optional_getter(out: &mut String, inner: &TypeRef, getter_c: &str, prefix: &str) {
+    let mut w = CodeWriter::four_space().with_depth(1);
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            let _ = writeln!(
-                out,
-                "    const char* rv = {}((const {}*)(intptr_t)handle);",
+            w.line(format!(
+                "const char* rv = {}((const {}*)(intptr_t)handle);",
                 getter_c, prefix
-            );
-            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
-            let _ = writeln!(out, "    jstring jout = (*env)->NewStringUTF(env, rv);");
-            let _ = writeln!(out, "    weaveffi_free_string(rv);");
-            let _ = writeln!(out, "    return jout;");
+            ));
+            w.line("if (rv == NULL) { return NULL; }");
+            w.line("jstring jout = (*env)->NewStringUTF(env, rv);");
+            w.line("weaveffi_free_string(rv);");
+            w.line("return jout;");
         }
         TypeRef::I8 | TypeRef::U8 => {
-            let _ = writeln!(
-                out,
-                "    const int8_t* rv = (const int8_t*){}((const {}*)(intptr_t)handle);",
+            w.line(format!(
+                "const int8_t* rv = (const int8_t*){}((const {}*)(intptr_t)handle);",
                 getter_c, prefix
-            );
-            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
-            let _ = writeln!(
-                out,
-                "    jclass cls = (*env)->FindClass(env, \"java/lang/Byte\");"
-            );
-            let _ = writeln!(
-                out,
-                "    jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(B)Ljava/lang/Byte;\");"
-            );
-            let _ = writeln!(
-                out,
-                "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jbyte)*rv);"
-            );
+            ));
+            w.line("if (rv == NULL) { return NULL; }");
+            w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Byte\");");
+            w.line("jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(B)Ljava/lang/Byte;\");");
+            w.line("return (*env)->CallStaticObjectMethod(env, cls, mid, (jbyte)*rv);");
         }
         TypeRef::I16 | TypeRef::U16 => {
-            let _ = writeln!(
-                out,
-                "    const int16_t* rv = (const int16_t*){}((const {}*)(intptr_t)handle);",
+            w.line(format!(
+                "const int16_t* rv = (const int16_t*){}((const {}*)(intptr_t)handle);",
                 getter_c, prefix
-            );
-            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
-            let _ = writeln!(
-                out,
-                "    jclass cls = (*env)->FindClass(env, \"java/lang/Short\");"
-            );
-            let _ = writeln!(
-                out,
-                "    jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(S)Ljava/lang/Short;\");"
-            );
-            let _ = writeln!(
-                out,
-                "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jshort)*rv);"
-            );
+            ));
+            w.line("if (rv == NULL) { return NULL; }");
+            w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Short\");");
+            w.line("jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(S)Ljava/lang/Short;\");");
+            w.line("return (*env)->CallStaticObjectMethod(env, cls, mid, (jshort)*rv);");
         }
         TypeRef::I32 | TypeRef::Enum(_) => {
-            let _ = writeln!(
-                out,
-                "    const int32_t* rv = {}((const {}*)(intptr_t)handle);",
+            w.line(format!(
+                "const int32_t* rv = {}((const {}*)(intptr_t)handle);",
                 getter_c, prefix
-            );
-            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
-            let _ = writeln!(
-                out,
-                "    jclass cls = (*env)->FindClass(env, \"java/lang/Integer\");"
-            );
-            let _ = writeln!(
-                out,
-                "    jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(I)Ljava/lang/Integer;\");"
-            );
-            let _ = writeln!(
-                out,
-                "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jint)*rv);"
-            );
+            ));
+            w.line("if (rv == NULL) { return NULL; }");
+            w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Integer\");");
+            w.line("jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(I)Ljava/lang/Integer;\");");
+            w.line("return (*env)->CallStaticObjectMethod(env, cls, mid, (jint)*rv);");
         }
         TypeRef::U32 | TypeRef::I64 | TypeRef::U64 => {
-            let _ = writeln!(
-                out,
-                "    const int64_t* rv = (const int64_t*){}((const {}*)(intptr_t)handle);",
+            w.line(format!(
+                "const int64_t* rv = (const int64_t*){}((const {}*)(intptr_t)handle);",
                 getter_c, prefix
-            );
-            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
-            let _ = writeln!(
-                out,
-                "    jclass cls = (*env)->FindClass(env, \"java/lang/Long\");"
-            );
-            let _ = writeln!(
-                out,
-                "    jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(J)Ljava/lang/Long;\");"
-            );
-            let _ = writeln!(
-                out,
-                "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jlong)*rv);"
-            );
+            ));
+            w.line("if (rv == NULL) { return NULL; }");
+            w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Long\");");
+            w.line("jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(J)Ljava/lang/Long;\");");
+            w.line("return (*env)->CallStaticObjectMethod(env, cls, mid, (jlong)*rv);");
         }
         TypeRef::F32 => {
-            let _ = writeln!(
-                out,
-                "    const float* rv = (const float*){}((const {}*)(intptr_t)handle);",
+            w.line(format!(
+                "const float* rv = (const float*){}((const {}*)(intptr_t)handle);",
                 getter_c, prefix
-            );
-            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
-            let _ = writeln!(
-                out,
-                "    jclass cls = (*env)->FindClass(env, \"java/lang/Float\");"
-            );
-            let _ = writeln!(
-                out,
-                "    jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(F)Ljava/lang/Float;\");"
-            );
-            let _ = writeln!(
-                out,
-                "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jfloat)*rv);"
-            );
+            ));
+            w.line("if (rv == NULL) { return NULL; }");
+            w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Float\");");
+            w.line("jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(F)Ljava/lang/Float;\");");
+            w.line("return (*env)->CallStaticObjectMethod(env, cls, mid, (jfloat)*rv);");
         }
         TypeRef::F64 => {
-            let _ = writeln!(
-                out,
-                "    const double* rv = (const double*){}((const {}*)(intptr_t)handle);",
+            w.line(format!(
+                "const double* rv = (const double*){}((const {}*)(intptr_t)handle);",
                 getter_c, prefix
-            );
-            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
-            let _ = writeln!(
-                out,
-                "    jclass cls = (*env)->FindClass(env, \"java/lang/Double\");"
-            );
-            let _ = writeln!(
-                out,
-                "    jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(D)Ljava/lang/Double;\");"
-            );
-            let _ = writeln!(
-                out,
-                "    return (*env)->CallStaticObjectMethod(env, cls, mid, (jdouble)*rv);"
-            );
+            ));
+            w.line("if (rv == NULL) { return NULL; }");
+            w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Double\");");
+            w.line("jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(D)Ljava/lang/Double;\");");
+            w.line("return (*env)->CallStaticObjectMethod(env, cls, mid, (jdouble)*rv);");
         }
         TypeRef::Bool => {
-            let _ = writeln!(
-                out,
-                "    const bool* rv = (const bool*){}((const {}*)(intptr_t)handle);",
+            w.line(format!(
+                "const bool* rv = (const bool*){}((const {}*)(intptr_t)handle);",
                 getter_c, prefix
-            );
-            let _ = writeln!(out, "    if (rv == NULL) {{ return NULL; }}");
-            let _ = writeln!(
-                out,
-                "    jclass cls = (*env)->FindClass(env, \"java/lang/Boolean\");"
-            );
-            let _ = writeln!(
-                out,
-                "    jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(Z)Ljava/lang/Boolean;\");"
-            );
-            let _ = writeln!(
-                out,
-                "    return (*env)->CallStaticObjectMethod(env, cls, mid, *rv ? JNI_TRUE : JNI_FALSE);"
+            ));
+            w.line("if (rv == NULL) { return NULL; }");
+            w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Boolean\");");
+            w.line("jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(Z)Ljava/lang/Boolean;\");");
+            w.line(
+                "return (*env)->CallStaticObjectMethod(env, cls, mid, *rv ? JNI_TRUE : JNI_FALSE);",
             );
         }
         TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Handle => {
-            let _ = writeln!(
-                out,
-                "    const void* rv = {}((const {}*)(intptr_t)handle);",
+            w.line(format!(
+                "const void* rv = {}((const {}*)(intptr_t)handle);",
                 getter_c, prefix
-            );
-            let _ = writeln!(out, "    if (!rv) {{ return 0; }}");
-            let _ = writeln!(out, "    return (jlong)(intptr_t)rv;");
+            ));
+            w.line("if (!rv) { return 0; }");
+            w.line("return (jlong)(intptr_t)rv;");
         }
         _ => {
-            let _ = writeln!(
-                out,
-                "    const void* rv = {}((const {}*)(intptr_t)handle);",
+            w.line(format!(
+                "const void* rv = {}((const {}*)(intptr_t)handle);",
                 getter_c, prefix
-            );
-            let _ = writeln!(out, "    if (!rv) {{ return 0; }}");
-            let _ = writeln!(out, "    return (jlong)(intptr_t)rv;");
+            ));
+            w.line("if (!rv) { return 0; }");
+            w.line("return (jlong)(intptr_t)rv;");
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn write_struct_list_getter(out: &mut String, inner: &TypeRef, getter_c: &str, prefix: &str) {
+    let mut w = CodeWriter::four_space().with_depth(1);
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            let _ = writeln!(out, "    size_t out_len = 0;");
-            let _ = writeln!(
-                out,
-                "    const char** rv = (const char**){}((const {}*)(intptr_t)handle, &out_len);",
+            w.line("size_t out_len = 0;");
+            w.line(format!(
+                "const char** rv = (const char**){}((const {}*)(intptr_t)handle, &out_len);",
                 getter_c, prefix
-            );
-            let _ = writeln!(
-                out,
-                "    jclass scls = (*env)->FindClass(env, \"java/lang/String\");"
-            );
-            let _ = writeln!(
-                out,
-                "    jobjectArray jout = (*env)->NewObjectArray(env, (jsize)out_len, scls, NULL);"
-            );
-            let _ = writeln!(out, "    if (jout && rv) {{");
-            let _ = writeln!(out, "        for (size_t i = 0; i < out_len; i++) {{");
-            let _ = writeln!(out, "            jstring s = rv[i] ? (*env)->NewStringUTF(env, rv[i]) : (*env)->NewStringUTF(env, \"\");");
-            let _ = writeln!(
-                out,
-                "            (*env)->SetObjectArrayElement(env, jout, (jsize)i, s);"
-            );
-            let _ = writeln!(out, "            (*env)->DeleteLocalRef(env, s);");
-            let _ = writeln!(out, "            weaveffi_free_string(rv[i]);");
-            let _ = writeln!(out, "        }}");
-            let _ = writeln!(out, "    }}");
-            let _ = writeln!(out, "    return jout;");
+            ));
+            w.line("jclass scls = (*env)->FindClass(env, \"java/lang/String\");");
+            w.line("jobjectArray jout = (*env)->NewObjectArray(env, (jsize)out_len, scls, NULL);");
+            w.block("if (jout && rv) {", "}", |w| {
+                w.block("for (size_t i = 0; i < out_len; i++) {", "}", |w| {
+                    w.line("jstring s = rv[i] ? (*env)->NewStringUTF(env, rv[i]) : (*env)->NewStringUTF(env, \"\");");
+                    w.line("(*env)->SetObjectArrayElement(env, jout, (jsize)i, s);");
+                    w.line("(*env)->DeleteLocalRef(env, s);");
+                    w.line("weaveffi_free_string(rv[i]);");
+                });
+            });
+            w.line("return jout;");
         }
         TypeRef::I8 | TypeRef::U8 => {
-            let _ = writeln!(out, "    size_t out_len = 0;");
-            let _ = writeln!(
-                out,
-                "    const int8_t* rv = (const int8_t*){}((const {}*)(intptr_t)handle, &out_len);",
+            w.line("size_t out_len = 0;");
+            w.line(format!(
+                "const int8_t* rv = (const int8_t*){}((const {}*)(intptr_t)handle, &out_len);",
                 getter_c, prefix
-            );
-            let _ = writeln!(
-                out,
-                "    jbyteArray jout = (*env)->NewByteArray(env, (jsize)out_len);"
-            );
-            let _ = writeln!(out, "    if (jout && rv) {{ (*env)->SetByteArrayRegion(env, jout, 0, (jsize)out_len, (const jbyte*)rv); }}");
-            let _ = writeln!(out, "    return jout;");
+            ));
+            w.line("jbyteArray jout = (*env)->NewByteArray(env, (jsize)out_len);");
+            w.line("if (jout && rv) { (*env)->SetByteArrayRegion(env, jout, 0, (jsize)out_len, (const jbyte*)rv); }");
+            w.line("return jout;");
         }
         TypeRef::I16 | TypeRef::U16 => {
-            let _ = writeln!(out, "    size_t out_len = 0;");
-            let _ = writeln!(
-                out,
-                "    const int16_t* rv = (const int16_t*){}((const {}*)(intptr_t)handle, &out_len);",
+            w.line("size_t out_len = 0;");
+            w.line(format!(
+                "const int16_t* rv = (const int16_t*){}((const {}*)(intptr_t)handle, &out_len);",
                 getter_c, prefix
-            );
-            let _ = writeln!(
-                out,
-                "    jshortArray jout = (*env)->NewShortArray(env, (jsize)out_len);"
-            );
-            let _ = writeln!(out, "    if (jout && rv) {{ (*env)->SetShortArrayRegion(env, jout, 0, (jsize)out_len, (const jshort*)rv); }}");
-            let _ = writeln!(out, "    return jout;");
+            ));
+            w.line("jshortArray jout = (*env)->NewShortArray(env, (jsize)out_len);");
+            w.line("if (jout && rv) { (*env)->SetShortArrayRegion(env, jout, 0, (jsize)out_len, (const jshort*)rv); }");
+            w.line("return jout;");
         }
         TypeRef::I32 | TypeRef::Enum(_) => {
-            let _ = writeln!(out, "    size_t out_len = 0;");
-            let _ = writeln!(
-                out,
-                "    const int32_t* rv = {}((const {}*)(intptr_t)handle, &out_len);",
+            w.line("size_t out_len = 0;");
+            w.line(format!(
+                "const int32_t* rv = {}((const {}*)(intptr_t)handle, &out_len);",
                 getter_c, prefix
-            );
-            let _ = writeln!(
-                out,
-                "    jintArray jout = (*env)->NewIntArray(env, (jsize)out_len);"
-            );
-            let _ = writeln!(out, "    if (jout && rv) {{ (*env)->SetIntArrayRegion(env, jout, 0, (jsize)out_len, (const jint*)rv); }}");
-            let _ = writeln!(out, "    return jout;");
+            ));
+            w.line("jintArray jout = (*env)->NewIntArray(env, (jsize)out_len);");
+            w.line("if (jout && rv) { (*env)->SetIntArrayRegion(env, jout, 0, (jsize)out_len, (const jint*)rv); }");
+            w.line("return jout;");
         }
         TypeRef::U32
         | TypeRef::I64
@@ -4320,83 +4080,61 @@ fn write_struct_list_getter(out: &mut String, inner: &TypeRef, getter_c: &str, p
         | TypeRef::TypedHandle(_)
         | TypeRef::Handle
         | TypeRef::Struct(_) => {
-            let _ = writeln!(out, "    size_t out_len = 0;");
-            let _ = writeln!(
-                out,
-                "    const int64_t* rv = (const int64_t*){}((const {}*)(intptr_t)handle, &out_len);",
+            w.line("size_t out_len = 0;");
+            w.line(format!(
+                "const int64_t* rv = (const int64_t*){}((const {}*)(intptr_t)handle, &out_len);",
                 getter_c, prefix
-            );
-            let _ = writeln!(
-                out,
-                "    jlongArray jout = (*env)->NewLongArray(env, (jsize)out_len);"
-            );
-            let _ = writeln!(out, "    if (jout && rv) {{ (*env)->SetLongArrayRegion(env, jout, 0, (jsize)out_len, (const jlong*)rv); }}");
-            let _ = writeln!(out, "    return jout;");
+            ));
+            w.line("jlongArray jout = (*env)->NewLongArray(env, (jsize)out_len);");
+            w.line("if (jout && rv) { (*env)->SetLongArrayRegion(env, jout, 0, (jsize)out_len, (const jlong*)rv); }");
+            w.line("return jout;");
         }
         TypeRef::F32 => {
-            let _ = writeln!(out, "    size_t out_len = 0;");
-            let _ = writeln!(
-                out,
-                "    const float* rv = (const float*){}((const {}*)(intptr_t)handle, &out_len);",
+            w.line("size_t out_len = 0;");
+            w.line(format!(
+                "const float* rv = (const float*){}((const {}*)(intptr_t)handle, &out_len);",
                 getter_c, prefix
-            );
-            let _ = writeln!(
-                out,
-                "    jfloatArray jout = (*env)->NewFloatArray(env, (jsize)out_len);"
-            );
-            let _ = writeln!(out, "    if (jout && rv) {{ (*env)->SetFloatArrayRegion(env, jout, 0, (jsize)out_len, (const jfloat*)rv); }}");
-            let _ = writeln!(out, "    return jout;");
+            ));
+            w.line("jfloatArray jout = (*env)->NewFloatArray(env, (jsize)out_len);");
+            w.line("if (jout && rv) { (*env)->SetFloatArrayRegion(env, jout, 0, (jsize)out_len, (const jfloat*)rv); }");
+            w.line("return jout;");
         }
         TypeRef::F64 => {
-            let _ = writeln!(out, "    size_t out_len = 0;");
-            let _ = writeln!(
-                out,
-                "    const double* rv = (const double*){}((const {}*)(intptr_t)handle, &out_len);",
+            w.line("size_t out_len = 0;");
+            w.line(format!(
+                "const double* rv = (const double*){}((const {}*)(intptr_t)handle, &out_len);",
                 getter_c, prefix
-            );
-            let _ = writeln!(
-                out,
-                "    jdoubleArray jout = (*env)->NewDoubleArray(env, (jsize)out_len);"
-            );
-            let _ = writeln!(out, "    if (jout && rv) {{ (*env)->SetDoubleArrayRegion(env, jout, 0, (jsize)out_len, (const jdouble*)rv); }}");
-            let _ = writeln!(out, "    return jout;");
+            ));
+            w.line("jdoubleArray jout = (*env)->NewDoubleArray(env, (jsize)out_len);");
+            w.line("if (jout && rv) { (*env)->SetDoubleArrayRegion(env, jout, 0, (jsize)out_len, (const jdouble*)rv); }");
+            w.line("return jout;");
         }
         TypeRef::Bool => {
-            let _ = writeln!(out, "    size_t out_len = 0;");
-            let _ = writeln!(
-                out,
-                "    const int32_t* rv = (const int32_t*){}((const {}*)(intptr_t)handle, &out_len);",
+            w.line("size_t out_len = 0;");
+            w.line(format!(
+                "const int32_t* rv = (const int32_t*){}((const {}*)(intptr_t)handle, &out_len);",
                 getter_c, prefix
-            );
-            let _ = writeln!(
-                out,
-                "    jbooleanArray jout = (*env)->NewBooleanArray(env, (jsize)out_len);"
-            );
-            let _ = writeln!(out, "    if (jout && rv) {{");
-            let _ = writeln!(out, "        for (jsize i = 0; i < (jsize)out_len; i++) {{");
-            let _ = writeln!(
-                out,
-                "            jboolean val = rv[i] ? JNI_TRUE : JNI_FALSE;"
-            );
-            let _ = writeln!(
-                out,
-                "            (*env)->SetBooleanArrayRegion(env, jout, i, 1, &val);"
-            );
-            let _ = writeln!(out, "        }}");
-            let _ = writeln!(out, "    }}");
-            let _ = writeln!(out, "    return jout;");
+            ));
+            w.line("jbooleanArray jout = (*env)->NewBooleanArray(env, (jsize)out_len);");
+            w.block("if (jout && rv) {", "}", |w| {
+                w.block("for (jsize i = 0; i < (jsize)out_len; i++) {", "}", |w| {
+                    w.line("jboolean val = rv[i] ? JNI_TRUE : JNI_FALSE;");
+                    w.line("(*env)->SetBooleanArrayRegion(env, jout, i, 1, &val);");
+                });
+            });
+            w.line("return jout;");
         }
         _ => {
-            let _ = writeln!(out, "    size_t out_len = 0;");
-            let _ = writeln!(
-                out,
-                "    const void* rv = {}((const {}*)(intptr_t)handle, &out_len);",
+            w.line("size_t out_len = 0;");
+            w.line(format!(
+                "const void* rv = {}((const {}*)(intptr_t)handle, &out_len);",
                 getter_c, prefix
-            );
-            let _ = writeln!(out, "    (void)rv; (void)out_len;");
-            let _ = writeln!(out, "    return NULL;");
+            ));
+            w.line("(void)rv; (void)out_len;");
+            w.line("return NULL;");
         }
     }
+    out.push_str(&w.finish());
 }
 
 /// Materialize a struct map getter into a `java.util.HashMap`. The C surface is
@@ -4413,77 +4151,70 @@ fn write_struct_map_getter(
     let val_c = map_elem_c_type(val);
     let key_is_string = matches!(key, TypeRef::StringUtf8 | TypeRef::BorrowedStr);
     let val_is_string = matches!(val, TypeRef::StringUtf8 | TypeRef::BorrowedStr);
-    let _ = writeln!(out, "    {kc}* out_keys = NULL;", kc = key_c);
-    let _ = writeln!(out, "    {vc}* out_vals = NULL;", vc = val_c);
-    let _ = writeln!(out, "    size_t out_len = 0;");
-    let _ = writeln!(
-        out,
-        "    {getter}((const {prefix}*)(intptr_t)handle, &out_keys, &out_vals, &out_len);",
+    let mut w = CodeWriter::four_space().with_depth(1);
+    w.line(format!("{kc}* out_keys = NULL;", kc = key_c));
+    w.line(format!("{vc}* out_vals = NULL;", vc = val_c));
+    w.line("size_t out_len = 0;");
+    w.line(format!(
+        "{getter}((const {prefix}*)(intptr_t)handle, &out_keys, &out_vals, &out_len);",
         getter = getter_c,
         prefix = prefix
-    );
-    let _ = writeln!(
-        out,
-        "    jclass hm_cls = (*env)->FindClass(env, \"java/util/HashMap\");"
-    );
-    let _ = writeln!(out, "    jobject result = (*env)->NewObject(env, hm_cls, (*env)->GetMethodID(env, hm_cls, \"<init>\", \"(I)V\"), (jint)out_len);");
-    let _ = writeln!(out, "    jmethodID hm_put = (*env)->GetMethodID(env, hm_cls, \"put\", \"(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;\");");
-    let _ = writeln!(out, "    for (size_t i = 0; i < out_len; i++) {{");
-    write_map_box_elem(out, key, "jkey", "out_keys");
-    write_map_box_elem(out, val, "jval", "out_vals");
-    let _ = writeln!(
-        out,
-        "        (*env)->CallObjectMethod(env, result, hm_put, jkey, jval);"
-    );
-    let _ = writeln!(out, "        (*env)->DeleteLocalRef(env, jkey);");
-    let _ = writeln!(out, "        (*env)->DeleteLocalRef(env, jval);");
-    if key_is_string {
-        let _ = writeln!(out, "        weaveffi_free_string(out_keys[i]);");
-    }
-    if val_is_string {
-        let _ = writeln!(out, "        weaveffi_free_string(out_vals[i]);");
-    }
-    let _ = writeln!(out, "    }}");
-    let _ = writeln!(out, "    return result;");
+    ));
+    w.line("jclass hm_cls = (*env)->FindClass(env, \"java/util/HashMap\");");
+    w.line("jobject result = (*env)->NewObject(env, hm_cls, (*env)->GetMethodID(env, hm_cls, \"<init>\", \"(I)V\"), (jint)out_len);");
+    w.line("jmethodID hm_put = (*env)->GetMethodID(env, hm_cls, \"put\", \"(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;\");");
+    w.block("for (size_t i = 0; i < out_len; i++) {", "}", |w| {
+        splice(w, |o| write_map_box_elem(o, key, "jkey", "out_keys"));
+        splice(w, |o| write_map_box_elem(o, val, "jval", "out_vals"));
+        w.line("(*env)->CallObjectMethod(env, result, hm_put, jkey, jval);");
+        w.line("(*env)->DeleteLocalRef(env, jkey);");
+        w.line("(*env)->DeleteLocalRef(env, jval);");
+        if key_is_string {
+            w.line("weaveffi_free_string(out_keys[i]);");
+        }
+        if val_is_string {
+            w.line("weaveffi_free_string(out_vals[i]);");
+        }
+    });
+    w.line("return result;");
+    out.push_str(&w.finish());
 }
 
 fn release_jni_resources_single(out: &mut String, name: &str, ty: &TypeRef) {
+    let mut w = CodeWriter::four_space().with_depth(1);
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            let _ = writeln!(
-                out,
-                "    (*env)->ReleaseStringUTFChars(env, {n}, {n}_chars);",
+            w.line(format!(
+                "(*env)->ReleaseStringUTFChars(env, {n}, {n}_chars);",
                 n = name
-            );
+            ));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            let _ = writeln!(
-                out,
-                "    (*env)->ReleaseByteArrayElements(env, {n}, {n}_elems, 0);",
+            w.line(format!(
+                "(*env)->ReleaseByteArrayElements(env, {n}, {n}_elems, 0);",
                 n = name
-            );
+            ));
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                let _ = writeln!(
-                    out,
-                    "    if ({n} != NULL) {{ (*env)->ReleaseStringUTFChars(env, {n}, {n}_chars); }}",
+                w.line(format!(
+                    "if ({n} != NULL) {{ (*env)->ReleaseStringUTFChars(env, {n}, {n}_chars); }}",
                     n = name
-                );
+                ));
             }
             TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                let _ = writeln!(
-                    out,
-                    "    if ({n} != NULL && {n}_elems != NULL) {{ (*env)->ReleaseByteArrayElements(env, {n}, {n}_elems, 0); }}",
+                w.line(format!(
+                    "if ({n} != NULL && {n}_elems != NULL) {{ (*env)->ReleaseByteArrayElements(env, {n}, {n}_elems, 0); }}",
                     n = name
-                );
+                ));
             }
             _ => {}
         },
-        TypeRef::List(inner) => write_list_release(out, name, inner),
-        TypeRef::Map(k, v) => write_map_release(out, name, k, v),
+        TypeRef::List(inner) => splice(&mut w, |o| write_list_release(o, name, inner)),
+        TypeRef::Map(k, v) => splice(&mut w, |o| write_map_release(o, name, k, v)),
         _ => {}
     }
+    out.push_str(&w.finish());
 }
 
 #[cfg(test)]

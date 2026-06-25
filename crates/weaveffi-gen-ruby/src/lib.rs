@@ -18,6 +18,7 @@ use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, is_c_pointer_type, DocCommentStyle,
 };
+use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::model::{
     AsyncBinding, BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
     IteratorBinding, ListenerBinding, ModuleBinding, RichVariantBinding, StructBinding,
@@ -635,30 +636,35 @@ module {module_name}
 }
 
 fn render_enum(out: &mut String, e: &EnumBinding) {
-    out.push('\n');
-    emit_doc(out, &e.doc, "  ");
-    out.push_str(&format!("  module {}\n", e.name));
-    for v in &e.variants {
-        emit_doc(out, &v.doc, "    ");
-        out.push_str(&format!(
-            "    {} = {}\n",
-            v.name.to_shouty_snake_case(),
-            v.value
-        ));
-    }
-    out.push_str("  end\n");
+    let mut w = CodeWriter::two_space().with_depth(1);
+    w.blank();
+    let mut d = String::new();
+    emit_doc(&mut d, &e.doc, "  ");
+    w.raw(d);
+    w.line(format!("module {}", e.name));
+    w.scope(|w| {
+        for v in &e.variants {
+            let mut vd = String::new();
+            emit_doc(&mut vd, &v.doc, "    ");
+            w.raw(vd);
+            w.line(format!("{} = {}", v.name.to_shouty_snake_case(), v.value));
+        }
+    });
+    w.line("end");
+    out.push_str(&w.finish());
 }
 
 fn render_struct_ffi(out: &mut String, s: &StructBinding) {
-    out.push('\n');
-    out.push_str(&format!(
-        "  attach_function :{}, [:pointer], :void\n",
+    let mut w = CodeWriter::two_space().with_depth(1);
+    w.blank();
+    w.line(format!(
+        "attach_function :{}, [:pointer], :void",
         s.destroy_symbol
     ));
     // The builder's `build` calls the C `create`; only attach it when needed.
     if s.builder.is_some() {
-        out.push_str(&format!(
-            "  attach_function :{}, [{}], :pointer\n",
+        w.line(format!(
+            "attach_function :{}, [{}], :pointer",
             s.create.symbol,
             rb_abi_types(&s.create.params, false).join(", ")
         ));
@@ -672,12 +678,15 @@ fn render_struct_ffi(out: &mut String, s: &StructBinding) {
                 .map(|s| s.to_string()),
         );
         let restype = rb_return_ffi_type(&field.ty);
-        emit_doc(out, &field.doc, "  ");
-        out.push_str(&format!(
-            "  attach_function :{getter}, [{}], {restype}\n",
+        let mut d = String::new();
+        emit_doc(&mut d, &field.doc, "  ");
+        w.raw(d);
+        w.line(format!(
+            "attach_function :{getter}, [{}], {restype}",
             argtypes.join(", ")
         ));
     }
+    out.push_str(&w.finish());
 }
 
 /// Declare the FFI bindings for a rich (algebraic) enum: the tag getter, the
@@ -690,20 +699,21 @@ fn render_rich_enum_ffi(out: &mut String, e: &EnumBinding) {
         .rich
         .as_ref()
         .expect("render_rich_enum_ffi requires a rich enum");
-    out.push('\n');
-    out.push_str(&format!(
-        "  attach_function :{}, [:pointer], :int32\n",
+    let mut w = CodeWriter::two_space().with_depth(1);
+    w.blank();
+    w.line(format!(
+        "attach_function :{}, [:pointer], :int32",
         rich.tag_symbol
     ));
-    out.push_str(&format!(
-        "  attach_function :{}, [:pointer], :void\n",
+    w.line(format!(
+        "attach_function :{}, [:pointer], :void",
         rich.destroy_symbol
     ));
     for v in &rich.variants {
         // Constructor: the variant's field value slots, then out_err, returning
         // the opaque object pointer (a unit variant takes only out_err).
-        out.push_str(&format!(
-            "  attach_function :{}, [{}], :pointer\n",
+        w.line(format!(
+            "attach_function :{}, [{}], :pointer",
             v.create.symbol,
             rb_abi_types(&v.create.params, false).join(", ")
         ));
@@ -716,13 +726,16 @@ fn render_rich_enum_ffi(out: &mut String, e: &EnumBinding) {
                     .map(|s| s.to_string()),
             );
             let restype = rb_return_ffi_type(&field.ty);
-            emit_doc(out, &field.doc, "  ");
-            out.push_str(&format!(
-                "  attach_function :{getter}, [{}], {restype}\n",
+            let mut d = String::new();
+            emit_doc(&mut d, &field.doc, "  ");
+            w.raw(d);
+            w.line(format!(
+                "attach_function :{getter}, [{}], {restype}",
                 argtypes.join(", ")
             ));
         }
     }
+    out.push_str(&w.finish());
 }
 
 /// Map lowered ABI slots onto Ruby FFI type tokens. `string_as_pointer`
@@ -739,31 +752,40 @@ fn rb_abi_types(params: &[AbiParam], string_as_pointer: bool) -> Vec<String> {
 /// Listener `attach_function`s reference the type by this symbol. Borrowed
 /// string params use `:string` so the ffi gem hands the block a Ruby String.
 fn render_callback_decl(out: &mut String, c: &CallbackBinding) {
-    emit_doc(out, &c.doc, "  ");
-    out.push_str(&format!(
-        "  callback :{}, [{}], :void\n",
+    let mut w = CodeWriter::two_space().with_depth(1);
+    let mut d = String::new();
+    emit_doc(&mut d, &c.doc, "  ");
+    w.raw(d);
+    w.line(format!(
+        "callback :{}, [{}], :void",
         c.c_fn_type,
         rb_abi_types(&c.abi_params, false).join(", ")
     ));
+    out.push_str(&w.finish());
 }
 
 fn render_listener_ffi(out: &mut String, l: &ListenerBinding) {
-    out.push_str(&format!(
-        "  attach_function :{}, [:{}, :pointer], :uint64\n",
+    let mut w = CodeWriter::two_space().with_depth(1);
+    w.line(format!(
+        "attach_function :{}, [:{}, :pointer], :uint64",
         l.register_symbol, l.callback_c_fn_type
     ));
-    out.push_str(&format!(
-        "  attach_function :{}, [:uint64], :void\n",
+    w.line(format!(
+        "attach_function :{}, [:uint64], :void",
         l.unregister_symbol
     ));
+    out.push_str(&w.finish());
 }
 
 fn render_attach_function(out: &mut String, f: &FnBinding) {
-    emit_doc(out, &f.doc, "  ");
+    let mut w = CodeWriter::two_space().with_depth(1);
+    let mut d = String::new();
+    emit_doc(&mut d, &f.doc, "  ");
+    w.raw(d);
     match &f.shape {
         CallShape::Sync(abi) => {
-            out.push_str(&format!(
-                "  attach_function :{}, [{}], {}\n",
+            w.line(format!(
+                "attach_function :{}, [{}], {}",
                 abi.symbol,
                 rb_abi_types(&abi.params, false).join(", "),
                 rb_ffi_type(&abi.ret, true)
@@ -773,8 +795,8 @@ fn render_attach_function(out: &mut String, f: &FnBinding) {
             // Completion callback: result strings/bytes stay `:pointer`
             // (the wrapper owns and frees them); the launcher takes the
             // declared callback type plus the opaque context.
-            out.push_str(&format!(
-                "  callback :{}, [{}], :void\n",
+            w.line(format!(
+                "callback :{}, [{}], :void",
                 a.callback_type,
                 rb_abi_types(&a.callback_params, true).join(", ")
             ));
@@ -789,108 +811,135 @@ fn render_attach_function(out: &mut String, f: &FnBinding) {
                     ty => rb_ffi_type(ty, false).to_string(),
                 })
                 .collect();
-            out.push_str(&format!(
-                "  attach_function :{}, [{}], :void\n",
+            w.line(format!(
+                "attach_function :{}, [{}], :void",
                 a.launch.symbol,
                 argtypes.join(", ")
             ));
         }
         CallShape::Iterator(it) => {
-            out.push_str(&format!(
-                "  attach_function :{}, [{}], :pointer\n",
+            w.line(format!(
+                "attach_function :{}, [{}], :pointer",
                 it.launch.symbol,
                 rb_abi_types(&it.launch.params, false).join(", ")
             ));
-            out.push_str(&format!(
-                "  attach_function :{}, [{}], :int32\n",
+            w.line(format!(
+                "attach_function :{}, [{}], :int32",
                 it.next.symbol,
                 // Every `next` slot is a pointer (iter, out_item, out lens, err).
                 rb_abi_types(&it.next.params, true).join(", ")
             ));
-            out.push_str(&format!(
-                "  attach_function :{}, [:pointer], :void\n",
+            w.line(format!(
+                "attach_function :{}, [:pointer], :void",
                 it.destroy_symbol
             ));
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn render_struct_class(out: &mut String, s: &StructBinding, rb_module_name: &str) {
-    out.push_str(&format!("\n  class {}Ptr < FFI::AutoPointer\n", s.name));
-    out.push_str(&format!(
-        "    def self.release(ptr)\n      {rb_module_name}.{}(ptr)\n    end\n",
-        s.destroy_symbol
-    ));
-    out.push_str("  end\n\n");
-
-    emit_doc(out, &s.doc, "  ");
-    out.push_str(&format!("  class {}\n", s.name));
-    out.push_str("    attr_reader :handle\n\n");
-    out.push_str(&format!(
-        "    def initialize(handle)\n      @handle = {}Ptr.new(handle)\n    end\n\n",
-        s.name
-    ));
-    out.push_str("    def self.create(handle)\n      new(handle)\n    end\n\n");
-    out.push_str(
-        "    def destroy\n      return if @handle.nil?\n      @handle.free\n      @handle = nil\n    end\n",
+    let mut w = CodeWriter::two_space().with_depth(1);
+    w.blank();
+    w.block(
+        format!("class {}Ptr < FFI::AutoPointer", s.name),
+        "end",
+        |w| {
+            w.block("def self.release(ptr)", "end", |w| {
+                w.line(format!("{rb_module_name}.{}(ptr)", s.destroy_symbol));
+            });
+        },
     );
+    w.blank();
 
-    for field in &s.fields {
-        render_getter(out, &field.name, field, rb_module_name);
-    }
+    let mut d = String::new();
+    emit_doc(&mut d, &s.doc, "  ");
+    w.raw(d);
+    w.line(format!("class {}", s.name));
+    w.scope(|w| {
+        w.line("attr_reader :handle");
+        w.blank();
+        w.block("def initialize(handle)", "end", |w| {
+            w.line(format!("@handle = {}Ptr.new(handle)", s.name));
+        });
+        w.blank();
+        w.block("def self.create(handle)", "end", |w| {
+            w.line("new(handle)");
+        });
+        w.blank();
+        w.block("def destroy", "end", |w| {
+            w.line("return if @handle.nil?");
+            w.line("@handle.free");
+            w.line("@handle = nil");
+        });
 
-    out.push_str("  end\n");
+        for field in &s.fields {
+            let mut g = String::new();
+            render_getter(&mut g, &field.name, field, rb_module_name);
+            w.raw(g);
+        }
+    });
+    w.line("end");
+    out.push_str(&w.finish());
 }
 
 fn render_ruby_builder_class(out: &mut String, s: &StructBinding, rb_module_name: &str) {
     let builder = format!("{}Builder", s.name);
     let ind = "      ";
-    out.push('\n');
-    emit_doc(out, &s.doc, "  ");
-    out.push_str(&format!("  class {builder}\n"));
-    out.push_str("    def initialize\n");
-    // Zero-value defaults (the same contract as the other backends): scalars
-    // start at 0/false/""/"".b, collections empty, optionals absent. Unset
-    // fields therefore lower to valid C arguments instead of raising.
-    for field in &s.fields {
-        out.push_str(&format!(
-            "      @{} = {}\n",
-            field.name,
-            rb_field_default(&field.ty)
-        ));
-    }
-    out.push_str("    end\n\n");
+    let mut w = CodeWriter::two_space().with_depth(1);
+    w.blank();
+    let mut d = String::new();
+    emit_doc(&mut d, &s.doc, "  ");
+    w.raw(d);
+    w.line(format!("class {builder}"));
+    w.scope(|w| {
+        w.block("def initialize", "end", |w| {
+            // Zero-value defaults (the same contract as the other backends): scalars
+            // start at 0/false/""/"".b, collections empty, optionals absent. Unset
+            // fields therefore lower to valid C arguments instead of raising.
+            for field in &s.fields {
+                w.line(format!("@{} = {}", field.name, rb_field_default(&field.ty)));
+            }
+        });
+        w.blank();
 
-    for field in &s.fields {
-        emit_doc(out, &field.doc, "    ");
-        out.push_str(&format!(
-            "    def with_{}(value)\n      @{} = value\n      self\n    end\n\n",
-            field.name, field.name
-        ));
-    }
+        for field in &s.fields {
+            let mut fd = String::new();
+            emit_doc(&mut fd, &field.doc, "    ");
+            w.raw(fd);
+            w.block(format!("def with_{}(value)", field.name), "end", |w| {
+                w.line(format!("@{} = value", field.name));
+                w.line("self");
+            });
+            w.blank();
+        }
 
-    // Build: marshal every field into the struct's C `create` call with the
-    // same lowering used for function parameters, then wrap the handle.
-    out.push_str("    def build\n");
-    out.push_str(&format!("{ind}err = {rb_module_name}::ErrorStruct.new\n"));
-    for field in &s.fields {
-        out.push_str(&format!("{ind}{} = @{}\n", field.name, field.name));
-        render_param_conversion(out, &field.name, &field.ty, ind);
-    }
-    let mut call_args: Vec<String> = Vec::new();
-    for field in &s.fields {
-        call_args.extend(rb_call_args(&field.name, &field.ty));
-    }
-    call_args.push("err".into());
-    out.push_str(&format!(
-        "{ind}result = {rb_module_name}.{}({})\n",
-        s.create.symbol,
-        call_args.join(", ")
-    ));
-    out.push_str(&format!("{ind}{rb_module_name}.check_error!(err)\n"));
-    out.push_str(&format!("{ind}{}.new(result)\n", s.name));
-    out.push_str("    end\n");
-    out.push_str("  end\n");
+        // Build: marshal every field into the struct's C `create` call with the
+        // same lowering used for function parameters, then wrap the handle.
+        w.block("def build", "end", |w| {
+            w.line(format!("err = {rb_module_name}::ErrorStruct.new"));
+            for field in &s.fields {
+                w.line(format!("{} = @{}", field.name, field.name));
+                let mut pc = String::new();
+                render_param_conversion(&mut pc, &field.name, &field.ty, ind);
+                w.raw(pc);
+            }
+            let mut call_args: Vec<String> = Vec::new();
+            for field in &s.fields {
+                call_args.extend(rb_call_args(&field.name, &field.ty));
+            }
+            call_args.push("err".into());
+            w.line(format!(
+                "result = {rb_module_name}.{}({})",
+                s.create.symbol,
+                call_args.join(", ")
+            ));
+            w.line(format!("{rb_module_name}.check_error!(err)"));
+            w.line(format!("{}.new(result)", s.name));
+        });
+    });
+    w.line("end");
+    out.push_str(&w.finish());
 }
 
 /// The zero-value default for one Ruby builder slot.
@@ -922,41 +971,43 @@ fn render_getter(out: &mut String, method: &str, field: &FieldBinding, rb_module
     let getter = &field.getter_symbol;
     let ind = "      ";
 
-    out.push('\n');
-    emit_doc(out, &field.doc, "    ");
-    out.push_str(&format!("    def {}\n", method));
+    let mut w = CodeWriter::two_space().with_depth(2);
+    w.blank();
+    let mut d = String::new();
+    emit_doc(&mut d, &field.doc, "    ");
+    w.raw(d);
+    w.block(format!("def {}", method), "end", |w| {
+        let out_params = rb_return_out_params(&field.ty);
+        let is_map = get_map_kv(&field.ty).is_some();
 
-    let out_params = rb_return_out_params(&field.ty);
-    let is_map = get_map_kv(&field.ty).is_some();
-
-    if is_map {
-        out.push_str(&format!(
-            "{ind}out_keys = FFI::MemoryPointer.new(:pointer)\n"
-        ));
-        out.push_str(&format!(
-            "{ind}out_values = FFI::MemoryPointer.new(:pointer)\n"
-        ));
-        out.push_str(&format!("{ind}out_len = FFI::MemoryPointer.new(:size_t)\n"));
-        out.push_str(&format!(
-            "{ind}{rb_module_name}.{getter}(@handle, out_keys, out_values, out_len)\n"
-        ));
-        let (k, v) = get_map_kv(&field.ty).unwrap();
-        let is_optional = matches!(&field.ty, TypeRef::Optional(_));
-        render_map_return_code(out, k, v, ind, is_optional);
-    } else if !out_params.is_empty() {
-        out.push_str(&format!("{ind}out_len = FFI::MemoryPointer.new(:size_t)\n"));
-        out.push_str(&format!(
-            "{ind}result = {rb_module_name}.{getter}(@handle, out_len)\n"
-        ));
-        render_return_code(out, &field.ty, ind, Some(rb_module_name));
-    } else {
-        out.push_str(&format!(
-            "{ind}result = {rb_module_name}.{getter}(@handle)\n"
-        ));
-        render_return_code(out, &field.ty, ind, Some(rb_module_name));
-    }
-
-    out.push_str("    end\n");
+        if is_map {
+            w.line("out_keys = FFI::MemoryPointer.new(:pointer)");
+            w.line("out_values = FFI::MemoryPointer.new(:pointer)");
+            w.line("out_len = FFI::MemoryPointer.new(:size_t)");
+            w.line(format!(
+                "{rb_module_name}.{getter}(@handle, out_keys, out_values, out_len)"
+            ));
+            let (k, v) = get_map_kv(&field.ty).unwrap();
+            let is_optional = matches!(&field.ty, TypeRef::Optional(_));
+            let mut tmp = String::new();
+            render_map_return_code(&mut tmp, k, v, ind, is_optional);
+            w.raw(tmp);
+        } else if !out_params.is_empty() {
+            w.line("out_len = FFI::MemoryPointer.new(:size_t)");
+            w.line(format!(
+                "result = {rb_module_name}.{getter}(@handle, out_len)"
+            ));
+            let mut tmp = String::new();
+            render_return_code(&mut tmp, &field.ty, ind, Some(rb_module_name));
+            w.raw(tmp);
+        } else {
+            w.line(format!("result = {rb_module_name}.{getter}(@handle)"));
+            let mut tmp = String::new();
+            render_return_code(&mut tmp, &field.ty, ind, Some(rb_module_name));
+            w.raw(tmp);
+        }
+    });
+    out.push_str(&w.finish());
 }
 
 /// Render a rich (algebraic) enum as an opaque-object wrapper class, mirroring
@@ -972,57 +1023,75 @@ fn render_rich_enum_class(out: &mut String, e: &EnumBinding, rb_module_name: &st
         .as_ref()
         .expect("render_rich_enum_class requires a rich enum");
 
+    let mut w = CodeWriter::two_space().with_depth(1);
     // AutoPointer releases the handle through the enum's C destructor on GC,
     // the same ownership contract a struct wrapper uses.
-    out.push_str(&format!("\n  class {}Ptr < FFI::AutoPointer\n", e.name));
-    out.push_str(&format!(
-        "    def self.release(ptr)\n      {rb_module_name}.{}(ptr)\n    end\n",
-        rich.destroy_symbol
-    ));
-    out.push_str("  end\n\n");
-
-    emit_doc(out, &e.doc, "  ");
-    out.push_str(&format!("  class {}\n", e.name));
-    out.push_str("    attr_reader :handle\n\n");
-    out.push_str(&format!(
-        "    def initialize(handle)\n      @handle = {}Ptr.new(handle)\n    end\n\n",
-        e.name
-    ));
-    out.push_str("    def self.create(handle)\n      new(handle)\n    end\n\n");
-    out.push_str(
-        "    def destroy\n      return if @handle.nil?\n      @handle.free\n      @handle = nil\n    end\n\n",
+    w.blank();
+    w.block(
+        format!("class {}Ptr < FFI::AutoPointer", e.name),
+        "end",
+        |w| {
+            w.block("def self.release(ptr)", "end", |w| {
+                w.line(format!("{rb_module_name}.{}(ptr)", rich.destroy_symbol));
+            });
+        },
     );
+    w.blank();
 
-    // Tag constants (one per variant) plus the active-variant reader.
-    for v in &e.variants {
-        emit_doc(out, &v.doc, "    ");
-        out.push_str(&format!(
-            "    {} = {}\n",
-            v.name.to_shouty_snake_case(),
-            v.value
-        ));
-    }
-    out.push('\n');
-    out.push_str(&format!(
-        "    def tag\n      {rb_module_name}.{}(@handle)\n    end\n",
-        rich.tag_symbol
-    ));
+    let mut d = String::new();
+    emit_doc(&mut d, &e.doc, "  ");
+    w.raw(d);
+    w.line(format!("class {}", e.name));
+    w.scope(|w| {
+        w.line("attr_reader :handle");
+        w.blank();
+        w.block("def initialize(handle)", "end", |w| {
+            w.line(format!("@handle = {}Ptr.new(handle)", e.name));
+        });
+        w.blank();
+        w.block("def self.create(handle)", "end", |w| {
+            w.line("new(handle)");
+        });
+        w.blank();
+        w.block("def destroy", "end", |w| {
+            w.line("return if @handle.nil?");
+            w.line("@handle.free");
+            w.line("@handle = nil");
+        });
+        w.blank();
 
-    // One factory class method per variant.
-    for v in &rich.variants {
-        render_rich_variant_factory(out, v, rb_module_name);
-    }
-
-    // Per-variant field accessors, namespaced by variant (`circle_radius`) to
-    // avoid collisions, reusing the struct getter marshalling verbatim.
-    for v in &rich.variants {
-        for field in &v.fields {
-            let method = format!("{}_{}", v.name.to_snake_case(), field.name);
-            render_getter(out, &method, field, rb_module_name);
+        // Tag constants (one per variant) plus the active-variant reader.
+        for v in &e.variants {
+            let mut vd = String::new();
+            emit_doc(&mut vd, &v.doc, "    ");
+            w.raw(vd);
+            w.line(format!("{} = {}", v.name.to_shouty_snake_case(), v.value));
         }
-    }
+        w.blank();
+        w.block("def tag", "end", |w| {
+            w.line(format!("{rb_module_name}.{}(@handle)", rich.tag_symbol));
+        });
 
-    out.push_str("  end\n");
+        // One factory class method per variant.
+        for v in &rich.variants {
+            let mut f = String::new();
+            render_rich_variant_factory(&mut f, v, rb_module_name);
+            w.raw(f);
+        }
+
+        // Per-variant field accessors, namespaced by variant (`circle_radius`) to
+        // avoid collisions, reusing the struct getter marshalling verbatim.
+        for v in &rich.variants {
+            for field in &v.fields {
+                let method = format!("{}_{}", v.name.to_snake_case(), field.name);
+                let mut g = String::new();
+                render_getter(&mut g, &method, field, rb_module_name);
+                w.raw(g);
+            }
+        }
+    });
+    w.line("end");
+    out.push_str(&w.finish());
 }
 
 /// Render one variant factory as a class method (`Shape.circle(radius)`). Marshals
@@ -1034,30 +1103,37 @@ fn render_rich_variant_factory(out: &mut String, v: &RichVariantBinding, rb_modu
     let factory = v.name.to_snake_case();
     let params: Vec<String> = v.fields.iter().map(|f| f.name.to_snake_case()).collect();
 
-    out.push('\n');
-    emit_doc(out, &v.doc, "    ");
-    if params.is_empty() {
-        out.push_str(&format!("    def self.{factory}\n"));
+    let mut w = CodeWriter::two_space().with_depth(2);
+    w.blank();
+    let mut d = String::new();
+    emit_doc(&mut d, &v.doc, "    ");
+    w.raw(d);
+    let open = if params.is_empty() {
+        format!("def self.{factory}")
     } else {
-        out.push_str(&format!("    def self.{factory}({})\n", params.join(", ")));
-    }
-    out.push_str(&format!("{ind}err = {rb_module_name}::ErrorStruct.new\n"));
-    for f in &v.fields {
-        render_param_conversion(out, &f.name.to_snake_case(), &f.ty, ind);
-    }
-    let mut call_args: Vec<String> = Vec::new();
-    for f in &v.fields {
-        call_args.extend(rb_call_args(&f.name.to_snake_case(), &f.ty));
-    }
-    call_args.push("err".into());
-    out.push_str(&format!(
-        "{ind}result = {rb_module_name}.{}({})\n",
-        v.create.symbol,
-        call_args.join(", ")
-    ));
-    out.push_str(&format!("{ind}{rb_module_name}.check_error!(err)\n"));
-    out.push_str(&format!("{ind}new(result)\n"));
-    out.push_str("    end\n");
+        format!("def self.{factory}({})", params.join(", "))
+    };
+    w.block(open, "end", |w| {
+        w.line(format!("err = {rb_module_name}::ErrorStruct.new"));
+        for f in &v.fields {
+            let mut pc = String::new();
+            render_param_conversion(&mut pc, &f.name.to_snake_case(), &f.ty, ind);
+            w.raw(pc);
+        }
+        let mut call_args: Vec<String> = Vec::new();
+        for f in &v.fields {
+            call_args.extend(rb_call_args(&f.name.to_snake_case(), &f.ty));
+        }
+        call_args.push("err".into());
+        w.line(format!(
+            "result = {rb_module_name}.{}({})",
+            v.create.symbol,
+            call_args.join(", ")
+        ));
+        w.line(format!("{rb_module_name}.check_error!(err)"));
+        w.line("new(result)");
+    });
+    out.push_str(&w.finish());
 }
 
 fn render_function_wrapper(out: &mut String, f: &FnBinding) {
@@ -1077,15 +1153,17 @@ fn render_listener_wrapper(out: &mut String, module: &ModuleBinding, l: &Listene
     };
     let register_name = format!("register_{}", l.name.to_snake_case());
     let unregister_name = format!("unregister_{}", l.name.to_snake_case());
-    let ind = "    ";
 
-    out.push('\n');
-    emit_doc(out, &l.doc, "  ");
-    out.push_str(&format!(
-        "  # Registers a {} listener block. Returns a subscription id for\n  # {unregister_name}.\n",
+    let mut w = CodeWriter::two_space().with_depth(1);
+    w.blank();
+    let mut d = String::new();
+    emit_doc(&mut d, &l.doc, "  ");
+    w.raw(d);
+    w.line(format!(
+        "# Registers a {} listener block. Returns a subscription id for",
         cb.name
     ));
-    out.push_str(&format!("  def self.{register_name}(&block)\n"));
+    w.line(format!("# {unregister_name}."));
 
     // Trampoline formals: one per ABI slot, plus the ignored context.
     let tramp_formals: Vec<String> = cb
@@ -1100,30 +1178,40 @@ fn render_listener_wrapper(out: &mut String, module: &ModuleBinding, l: &Listene
         .iter()
         .map(|p| rb_cb_arg_expr(&p.name.to_snake_case(), &p.ty))
         .collect();
-    out.push_str(&format!(
-        "{ind}trampoline = FFI::Function.new(:void, [{}]) do |{}|\n",
-        tramp_types.join(", "),
-        tramp_formals.join(", ")
-    ));
-    out.push_str(&format!("{ind}  block.call({})\n", call_args.join(", ")));
-    out.push_str(&format!("{ind}end\n"));
-    out.push_str(&format!(
-        "{ind}listener_id = {}(trampoline, FFI::Pointer::NULL)\n",
-        l.register_symbol
-    ));
-    out.push_str(&format!("{ind}@listener_refs[listener_id] = trampoline\n"));
-    out.push_str(&format!("{ind}listener_id\n"));
-    out.push_str("  end\n");
+    w.block(format!("def self.{register_name}(&block)"), "end", |w| {
+        w.block(
+            format!(
+                "trampoline = FFI::Function.new(:void, [{}]) do |{}|",
+                tramp_types.join(", "),
+                tramp_formals.join(", ")
+            ),
+            "end",
+            |w| {
+                w.line(format!("block.call({})", call_args.join(", ")));
+            },
+        );
+        w.line(format!(
+            "listener_id = {}(trampoline, FFI::Pointer::NULL)",
+            l.register_symbol
+        ));
+        w.line("@listener_refs[listener_id] = trampoline");
+        w.line("listener_id");
+    });
 
-    out.push('\n');
-    out.push_str(&format!(
-        "  # Unregisters a listener previously registered with {register_name}.\n"
+    w.blank();
+    w.line(format!(
+        "# Unregisters a listener previously registered with {register_name}."
     ));
-    out.push_str(&format!("  def self.{unregister_name}(listener_id)\n"));
-    out.push_str(&format!("{ind}{}(listener_id)\n", l.unregister_symbol));
-    out.push_str(&format!("{ind}@listener_refs.delete(listener_id)\n"));
-    out.push_str(&format!("{ind}nil\n"));
-    out.push_str("  end\n");
+    w.block(
+        format!("def self.{unregister_name}(listener_id)"),
+        "end",
+        |w| {
+            w.line(format!("{}(listener_id)", l.unregister_symbol));
+            w.line("@listener_refs.delete(listener_id)");
+            w.line("nil");
+        },
+    );
+    out.push_str(&w.finish());
 }
 
 /// The Ruby expression converting one callback parameter's trampoline
@@ -1209,8 +1297,11 @@ fn render_sync_function_wrapper(out: &mut String, f: &FnBinding) {
     let ind = "    ";
 
     let params: Vec<String> = f.params.iter().map(|p| p.name.to_snake_case()).collect();
-    out.push('\n');
-    emit_doc(out, &f.doc, "  ");
+    let mut w = CodeWriter::two_space().with_depth(1);
+    w.blank();
+    let mut d = String::new();
+    emit_doc(&mut d, &f.doc, "  ");
+    w.raw(d);
     for p in &f.params {
         if let Some(pdoc) = &p.doc {
             let trimmed = pdoc.trim();
@@ -1219,88 +1310,89 @@ fn render_sync_function_wrapper(out: &mut String, f: &FnBinding) {
             }
             let mut lines = trimmed.lines();
             if let Some(first) = lines.next() {
-                out.push_str(&format!(
-                    "  # @param {} [Object] {}\n",
+                w.line(format!(
+                    "# @param {} [Object] {}",
                     p.name.to_snake_case(),
                     first
                 ));
             }
             for line in lines {
                 if line.is_empty() {
-                    out.push_str("  #\n");
+                    w.line("#");
                 } else {
-                    out.push_str(&format!("  #   {}\n", line));
+                    w.line(format!("#   {}", line));
                 }
             }
         }
     }
-    out.push_str(&format!(
-        "  def self.{}({})\n",
-        func_name,
-        params.join(", ")
-    ));
+    w.block(
+        format!("def self.{}({})", func_name, params.join(", ")),
+        "end",
+        |w| {
+            if let Some(msg) = &f.deprecated {
+                let escaped = msg.replace('"', "\\\"");
+                w.line(format!("warn \"[DEPRECATED] {escaped}\""));
+            }
 
-    if let Some(msg) = &f.deprecated {
-        let escaped = msg.replace('"', "\\\"");
-        out.push_str(&format!("{ind}warn \"[DEPRECATED] {escaped}\"\n"));
-    }
+            w.line("err = ErrorStruct.new");
 
-    out.push_str(&format!("{ind}err = ErrorStruct.new\n"));
+            for p in &f.params {
+                let mut pc = String::new();
+                render_param_conversion(&mut pc, &p.name.to_snake_case(), &p.ty, ind);
+                w.raw(pc);
+            }
 
-    for p in &f.params {
-        render_param_conversion(out, &p.name.to_snake_case(), &p.ty, ind);
-    }
+            let is_map_ret = f.ret.as_ref().and_then(get_map_kv).is_some();
+            let has_out_len = f
+                .ret
+                .as_ref()
+                .is_some_and(|ty| !rb_return_out_params(ty).is_empty())
+                && !is_map_ret;
 
-    let is_map_ret = f.ret.as_ref().and_then(get_map_kv).is_some();
-    let has_out_len = f
-        .ret
-        .as_ref()
-        .is_some_and(|ty| !rb_return_out_params(ty).is_empty())
-        && !is_map_ret;
+            if is_map_ret {
+                w.line("out_keys = FFI::MemoryPointer.new(:pointer)");
+                w.line("out_values = FFI::MemoryPointer.new(:pointer)");
+                w.line("out_len = FFI::MemoryPointer.new(:size_t)");
+            } else if has_out_len {
+                w.line("out_len = FFI::MemoryPointer.new(:size_t)");
+            }
 
-    if is_map_ret {
-        out.push_str(&format!(
-            "{ind}out_keys = FFI::MemoryPointer.new(:pointer)\n"
-        ));
-        out.push_str(&format!(
-            "{ind}out_values = FFI::MemoryPointer.new(:pointer)\n"
-        ));
-        out.push_str(&format!("{ind}out_len = FFI::MemoryPointer.new(:size_t)\n"));
-    } else if has_out_len {
-        out.push_str(&format!("{ind}out_len = FFI::MemoryPointer.new(:size_t)\n"));
-    }
+            let mut call_args: Vec<String> = Vec::new();
+            for p in &f.params {
+                call_args.extend(rb_call_args(&p.name.to_snake_case(), &p.ty));
+            }
+            if is_map_ret {
+                call_args.extend(["out_keys".into(), "out_values".into(), "out_len".into()]);
+            } else if has_out_len {
+                call_args.push("out_len".into());
+            }
+            call_args.push("err".into());
 
-    let mut call_args: Vec<String> = Vec::new();
-    for p in &f.params {
-        call_args.extend(rb_call_args(&p.name.to_snake_case(), &p.ty));
-    }
-    if is_map_ret {
-        call_args.extend(["out_keys".into(), "out_values".into(), "out_len".into()]);
-    } else if has_out_len {
-        call_args.push("out_len".into());
-    }
-    call_args.push("err".into());
+            let call = format!("{c_sym}({})", call_args.join(", "));
+            if f.ret.is_some() && !is_map_ret {
+                w.line(format!("result = {call}"));
+            } else {
+                w.line(call);
+            }
 
-    let call = format!("{c_sym}({})", call_args.join(", "));
-    if f.ret.is_some() && !is_map_ret {
-        out.push_str(&format!("{ind}result = {call}\n"));
-    } else {
-        out.push_str(&format!("{ind}{call}\n"));
-    }
+            w.line("check_error!(err)");
 
-    out.push_str(&format!("{ind}check_error!(err)\n"));
-
-    if let Some(ret_ty) = &f.ret {
-        if is_map_ret {
-            let (k, v) = get_map_kv(ret_ty).unwrap();
-            let is_optional = matches!(ret_ty, TypeRef::Optional(_));
-            render_map_return_code(out, k, v, ind, is_optional);
-        } else {
-            render_return_code(out, ret_ty, ind, None);
-        }
-    }
-
-    out.push_str("  end\n");
+            if let Some(ret_ty) = &f.ret {
+                if is_map_ret {
+                    let (k, v) = get_map_kv(ret_ty).unwrap();
+                    let is_optional = matches!(ret_ty, TypeRef::Optional(_));
+                    let mut tmp = String::new();
+                    render_map_return_code(&mut tmp, k, v, ind, is_optional);
+                    w.raw(tmp);
+                } else {
+                    let mut tmp = String::new();
+                    render_return_code(&mut tmp, ret_ty, ind, None);
+                    w.raw(tmp);
+                }
+            }
+        },
+    );
+    out.push_str(&w.finish());
 }
 
 /// Async wrapper: launches the `_async` C symbol with an `FFI::Function`
@@ -1313,82 +1405,92 @@ fn render_async_function_wrapper(out: &mut String, f: &FnBinding, a: &AsyncBindi
     let ind = "    ";
     let params: Vec<String> = f.params.iter().map(|p| p.name.to_snake_case()).collect();
 
-    out.push('\n');
-    emit_doc(out, &f.doc, "  ");
-    out.push_str(&format!(
-        "  # Blocks until the async producer completes{}.\n",
+    let mut w = CodeWriter::two_space().with_depth(1);
+    w.blank();
+    let mut d = String::new();
+    emit_doc(&mut d, &f.doc, "  ");
+    w.raw(d);
+    w.line(format!(
+        "# Blocks until the async producer completes{}.",
         if f.cancellable {
             " (cancellation token not exposed; pass-through is NULL)"
         } else {
             ""
         }
     ));
-    out.push_str(&format!(
-        "  def self.{}({})\n",
-        func_name,
-        params.join(", ")
-    ));
-    if let Some(msg) = &f.deprecated {
-        let escaped = msg.replace('"', "\\\"");
-        out.push_str(&format!("{ind}warn \"[DEPRECATED] {escaped}\"\n"));
-    }
+    w.block(
+        format!("def self.{}({})", func_name, params.join(", ")),
+        "end",
+        |w| {
+            if let Some(msg) = &f.deprecated {
+                let escaped = msg.replace('"', "\\\"");
+                w.line(format!("warn \"[DEPRECATED] {escaped}\""));
+            }
 
-    out.push_str(&format!("{ind}queue = Queue.new\n"));
+            w.line("queue = Queue.new");
 
-    // Completion trampoline: (context, err, <result slots>).
-    let cb_types = rb_abi_types(&a.callback_params, true);
-    let mut cb_formals: Vec<String> = vec!["_context".into(), "err_ptr".into()];
-    cb_formals.extend(a.callback_params.iter().skip(2).map(|p| p.name.clone()));
-    out.push_str(&format!(
-        "{ind}callback = FFI::Function.new(:void, [{}]) do |{}|\n",
-        cb_types.join(", "),
-        cb_formals.join(", ")
-    ));
-    // Producers pass err = NULL on success, so guard before dereferencing.
-    out.push_str(&format!(
-        "{ind}  err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)\n"
-    ));
-    out.push_str(&format!("{ind}  if err && err[:code] != 0\n"));
-    out.push_str(&format!("{ind}    code = err[:code]\n"));
-    out.push_str(&format!(
-        "{ind}    msg = err[:message].null? ? '' : err[:message].read_string\n"
-    ));
-    out.push_str(&format!("{ind}    weaveffi_error_clear(err_ptr)\n"));
-    out.push_str(&format!("{ind}    queue << Error.new(code, msg)\n"));
-    out.push_str(&format!("{ind}  else\n"));
-    render_async_result_push(out, &f.ret, &format!("{ind}    "));
-    out.push_str(&format!("{ind}  end\n"));
-    out.push_str(&format!("{ind}end\n"));
+            // Completion trampoline: (context, err, <result slots>).
+            let cb_types = rb_abi_types(&a.callback_params, true);
+            let mut cb_formals: Vec<String> = vec!["_context".into(), "err_ptr".into()];
+            cb_formals.extend(a.callback_params.iter().skip(2).map(|p| p.name.clone()));
+            w.block(
+                format!(
+                    "callback = FFI::Function.new(:void, [{}]) do |{}|",
+                    cb_types.join(", "),
+                    cb_formals.join(", ")
+                ),
+                "end",
+                |w| {
+                    // Producers pass err = NULL on success, so guard before dereferencing.
+                    w.line("err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)");
+                    w.line("if err && err[:code] != 0");
+                    w.scope(|w| {
+                        w.line("code = err[:code]");
+                        w.line("msg = err[:message].null? ? '' : err[:message].read_string");
+                        w.line("weaveffi_error_clear(err_ptr)");
+                        w.line("queue << Error.new(code, msg)");
+                    });
+                    w.line("else");
+                    w.scope(|w| {
+                        let mut tmp = String::new();
+                        render_async_result_push(&mut tmp, &f.ret, &format!("{ind}    "));
+                        w.raw(tmp);
+                    });
+                    w.line("end");
+                },
+            );
 
-    for p in &f.params {
-        render_param_conversion(out, &p.name.to_snake_case(), &p.ty, ind);
-    }
-    let mut call_args: Vec<String> = Vec::new();
-    for p in &f.params {
-        call_args.extend(rb_call_args(&p.name.to_snake_case(), &p.ty));
-    }
-    if f.cancellable {
-        call_args.push("FFI::Pointer::NULL".into());
-    }
-    call_args.push("callback".into());
-    call_args.push("FFI::Pointer::NULL".into());
-    out.push_str(&format!(
-        "{ind}{}({})\n",
-        a.launch.symbol,
-        call_args.join(", ")
-    ));
-    out.push_str(&format!("{ind}value = queue.pop\n"));
-    out.push_str(&format!("{ind}raise value if value.is_a?(Error)\n"));
-    out.push_str(&format!("{ind}value\n"));
-    out.push_str("  end\n");
+            for p in &f.params {
+                let mut pc = String::new();
+                render_param_conversion(&mut pc, &p.name.to_snake_case(), &p.ty, ind);
+                w.raw(pc);
+            }
+            let mut call_args: Vec<String> = Vec::new();
+            for p in &f.params {
+                call_args.extend(rb_call_args(&p.name.to_snake_case(), &p.ty));
+            }
+            if f.cancellable {
+                call_args.push("FFI::Pointer::NULL".into());
+            }
+            call_args.push("callback".into());
+            call_args.push("FFI::Pointer::NULL".into());
+            w.line(format!("{}({})", a.launch.symbol, call_args.join(", ")));
+            w.line("value = queue.pop");
+            w.line("raise value if value.is_a?(Error)");
+            w.line("value");
+        },
+    );
+    out.push_str(&w.finish());
 }
 
 /// Push the converted async result onto the queue. Result slots are named by
 /// [`abi::callback_result_params`]: `result` (+ `result_len`, or
 /// `result_keys`/`result_values`/`result_len` for maps).
 fn render_async_result_push(out: &mut String, ret: &Option<TypeRef>, ind: &str) {
+    let mut w = CodeWriter::two_space().with_depth(ind.len() / 2);
     let Some(ty) = ret else {
-        out.push_str(&format!("{ind}queue << nil\n"));
+        w.line("queue << nil");
+        out.push_str(&w.finish());
         return;
     };
     match ty {
@@ -1403,39 +1505,51 @@ fn render_async_result_push(out: &mut String, ret: &Option<TypeRef>, ind: &str) 
         | TypeRef::F32
         | TypeRef::F64
         | TypeRef::Handle => {
-            out.push_str(&format!("{ind}queue << result\n"));
+            w.line("queue << result");
         }
         TypeRef::Bool => {
-            out.push_str(&format!("{ind}queue << (result != 0)\n"));
+            w.line("queue << (result != 0)");
         }
         TypeRef::Enum(_) => {
-            out.push_str(&format!("{ind}queue << result\n"));
+            w.line("queue << result");
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!("{ind}if result.null?\n"));
-            out.push_str(&format!("{ind}  queue << ''\n"));
-            out.push_str(&format!("{ind}else\n"));
-            out.push_str(&format!("{ind}  s = result.read_string\n"));
-            out.push_str(&format!("{ind}  weaveffi_free_string(result)\n"));
-            out.push_str(&format!("{ind}  queue << s\n"));
-            out.push_str(&format!("{ind}end\n"));
+            w.line("if result.null?");
+            w.scope(|w| {
+                w.line("queue << ''");
+            });
+            w.line("else");
+            w.scope(|w| {
+                w.line("s = result.read_string");
+                w.line("weaveffi_free_string(result)");
+                w.line("queue << s");
+            });
+            w.line("end");
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            out.push_str(&format!("{ind}if result.null?\n"));
-            out.push_str(&format!("{ind}  queue << ''.b\n"));
-            out.push_str(&format!("{ind}else\n"));
-            out.push_str(&format!("{ind}  data = result.read_string(result_len)\n"));
-            out.push_str(&format!("{ind}  weaveffi_free_bytes(result, result_len)\n"));
-            out.push_str(&format!("{ind}  queue << data\n"));
-            out.push_str(&format!("{ind}end\n"));
+            w.line("if result.null?");
+            w.scope(|w| {
+                w.line("queue << ''.b");
+            });
+            w.line("else");
+            w.scope(|w| {
+                w.line("data = result.read_string(result_len)");
+                w.line("weaveffi_free_bytes(result, result_len)");
+                w.line("queue << data");
+            });
+            w.line("end");
         }
         TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
             let local = local_type_name(name);
-            out.push_str(&format!("{ind}if result.null?\n"));
-            out.push_str(&format!("{ind}  queue << Error.new(-1, 'null pointer')\n"));
-            out.push_str(&format!("{ind}else\n"));
-            out.push_str(&format!("{ind}  queue << {local}.new(result)\n"));
-            out.push_str(&format!("{ind}end\n"));
+            w.line("if result.null?");
+            w.scope(|w| {
+                w.line("queue << Error.new(-1, 'null pointer')");
+            });
+            w.line("else");
+            w.scope(|w| {
+                w.line(format!("queue << {local}.new(result)"));
+            });
+            w.line("end");
         }
         TypeRef::List(elem) => {
             let reader = rb_array_reader(elem);
@@ -1449,8 +1563,8 @@ fn render_async_result_push(out: &mut String, ret: &Option<TypeRef>, ind: &str) 
                 }
                 _ => String::new(),
             };
-            out.push_str(&format!(
-                "{ind}queue << (result.null? ? [] : result.{reader}(result_len){map_suffix})\n"
+            w.line(format!(
+                "queue << (result.null? ? [] : result.{reader}(result_len){map_suffix})"
             ));
         }
         TypeRef::Map(k, v) => {
@@ -1458,45 +1572,48 @@ fn render_async_result_push(out: &mut String, ret: &Option<TypeRef>, ind: &str) 
             let v_reader = rb_array_reader(v);
             let k_expr = rb_element_expr("k", k);
             let v_expr = rb_element_expr("v", v);
-            out.push_str(&format!(
-                "{ind}queue << (result_keys.null? ? {{}} : result_keys.{k_reader}(result_len)\
+            w.line(format!(
+                "queue << (result_keys.null? ? {{}} : result_keys.{k_reader}(result_len)\
                  .zip(result_values.{v_reader}(result_len))\
-                 .each_with_object({{}}) {{ |(k, v), h| h[{k_expr}] = {v_expr} }})\n"
+                 .each_with_object({{}}) {{ |(k, v), h| h[{k_expr}] = {v_expr} }})"
             ));
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                out.push_str(&format!("{ind}if result.null?\n"));
-                out.push_str(&format!("{ind}  queue << nil\n"));
-                out.push_str(&format!("{ind}else\n"));
-                out.push_str(&format!("{ind}  s = result.read_string\n"));
-                out.push_str(&format!("{ind}  weaveffi_free_string(result)\n"));
-                out.push_str(&format!("{ind}  queue << s\n"));
-                out.push_str(&format!("{ind}end\n"));
+                w.line("if result.null?");
+                w.scope(|w| {
+                    w.line("queue << nil");
+                });
+                w.line("else");
+                w.scope(|w| {
+                    w.line("s = result.read_string");
+                    w.line("weaveffi_free_string(result)");
+                    w.line("queue << s");
+                });
+                w.line("end");
             }
             TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
                 let local = local_type_name(name);
-                out.push_str(&format!(
-                    "{ind}queue << (result.null? ? nil : {local}.new(result))\n"
+                w.line(format!(
+                    "queue << (result.null? ? nil : {local}.new(result))"
                 ));
             }
             TypeRef::Bool => {
-                out.push_str(&format!(
-                    "{ind}queue << (result.null? ? nil : (result.read_int32 != 0))\n"
-                ));
+                w.line("queue << (result.null? ? nil : (result.read_int32 != 0))");
             }
             _ if !is_c_pointer_type(inner) => {
                 let read = rb_read_method(inner);
-                out.push_str(&format!(
-                    "{ind}queue << (result.null? ? nil : result.{read})\n"
-                ));
+                w.line(format!("queue << (result.null? ? nil : result.{read})"));
             }
             _ => {
-                render_async_result_push(out, &Some((**inner).clone()), ind);
+                let mut tmp = String::new();
+                render_async_result_push(&mut tmp, &Some((**inner).clone()), ind);
+                w.raw(tmp);
             }
         },
         TypeRef::Iterator(_) => unreachable!("async iterator returns are rejected upstream"),
     }
+    out.push_str(&w.finish());
 }
 
 /// Iterator wrapper: launch, drain `next` into an Array, destroy. Errors
@@ -1506,121 +1623,134 @@ fn render_iterator_function_wrapper(out: &mut String, f: &FnBinding, it: &Iterat
     let ind = "    ";
     let params: Vec<String> = f.params.iter().map(|p| p.name.to_snake_case()).collect();
 
-    out.push('\n');
-    emit_doc(out, &f.doc, "  ");
-    out.push_str(&format!(
-        "  def self.{}({})\n",
-        func_name,
-        params.join(", ")
-    ));
-    if let Some(msg) = &f.deprecated {
-        let escaped = msg.replace('"', "\\\"");
-        out.push_str(&format!("{ind}warn \"[DEPRECATED] {escaped}\"\n"));
-    }
-    out.push_str(&format!("{ind}err = ErrorStruct.new\n"));
-    for p in &f.params {
-        render_param_conversion(out, &p.name.to_snake_case(), &p.ty, ind);
-    }
-    let mut call_args: Vec<String> = Vec::new();
-    for p in &f.params {
-        call_args.extend(rb_call_args(&p.name.to_snake_case(), &p.ty));
-    }
-    call_args.push("err".into());
-    out.push_str(&format!(
-        "{ind}iter = {}({})\n",
-        it.launch.symbol,
-        call_args.join(", ")
-    ));
-    out.push_str(&format!("{ind}check_error!(err)\n"));
-    out.push_str(&format!("{ind}items = []\n"));
-    out.push_str(&format!("{ind}return items if iter.null?\n"));
-    out.push_str(&format!("{ind}loop do\n"));
-
-    // `next` params: (iter, out_item, <extra elem out slots>, out_err).
-    let elem = &it.elem;
-    let needs_len = matches!(elem, TypeRef::Bytes | TypeRef::BorrowedBytes);
-    let item_mem = rb_mem_type(elem);
-    out.push_str(&format!(
-        "{ind}  out_item = FFI::MemoryPointer.new({item_mem})\n"
-    ));
-    if needs_len {
-        out.push_str(&format!(
-            "{ind}  out_item_len = FFI::MemoryPointer.new(:size_t)\n"
-        ));
-    }
-    out.push_str(&format!("{ind}  item_err = ErrorStruct.new\n"));
-    let next_args = if needs_len {
-        "iter, out_item, out_item_len, item_err"
-    } else {
-        "iter, out_item, item_err"
-    };
-    out.push_str(&format!(
-        "{ind}  has_item = {}({next_args})\n",
-        it.next.symbol
-    ));
-    out.push_str(&format!("{ind}  if item_err[:code] != 0\n"));
-    out.push_str(&format!("{ind}    {}(iter)\n", it.destroy_symbol));
-    out.push_str(&format!("{ind}    check_error!(item_err)\n"));
-    out.push_str(&format!("{ind}  end\n"));
-    out.push_str(&format!("{ind}  break if has_item.zero?\n"));
-    render_iterator_item_push(out, elem, &format!("{ind}  "));
-    out.push_str(&format!("{ind}end\n"));
-    out.push_str(&format!("{ind}{}(iter)\n", it.destroy_symbol));
-    out.push_str(&format!("{ind}items\n"));
-    out.push_str("  end\n");
+    let mut w = CodeWriter::two_space().with_depth(1);
+    w.blank();
+    let mut d = String::new();
+    emit_doc(&mut d, &f.doc, "  ");
+    w.raw(d);
+    w.block(
+        format!("def self.{}({})", func_name, params.join(", ")),
+        "end",
+        |w| {
+            if let Some(msg) = &f.deprecated {
+                let escaped = msg.replace('"', "\\\"");
+                w.line(format!("warn \"[DEPRECATED] {escaped}\""));
+            }
+            w.line("err = ErrorStruct.new");
+            for p in &f.params {
+                let mut pc = String::new();
+                render_param_conversion(&mut pc, &p.name.to_snake_case(), &p.ty, ind);
+                w.raw(pc);
+            }
+            let mut call_args: Vec<String> = Vec::new();
+            for p in &f.params {
+                call_args.extend(rb_call_args(&p.name.to_snake_case(), &p.ty));
+            }
+            call_args.push("err".into());
+            w.line(format!(
+                "iter = {}({})",
+                it.launch.symbol,
+                call_args.join(", ")
+            ));
+            w.line("check_error!(err)");
+            w.line("items = []");
+            w.line("return items if iter.null?");
+            w.block("loop do", "end", |w| {
+                // `next` params: (iter, out_item, <extra elem out slots>, out_err).
+                let elem = &it.elem;
+                let needs_len = matches!(elem, TypeRef::Bytes | TypeRef::BorrowedBytes);
+                let item_mem = rb_mem_type(elem);
+                w.line(format!("out_item = FFI::MemoryPointer.new({item_mem})"));
+                if needs_len {
+                    w.line("out_item_len = FFI::MemoryPointer.new(:size_t)");
+                }
+                w.line("item_err = ErrorStruct.new");
+                let next_args = if needs_len {
+                    "iter, out_item, out_item_len, item_err"
+                } else {
+                    "iter, out_item, item_err"
+                };
+                w.line(format!("has_item = {}({next_args})", it.next.symbol));
+                w.line("if item_err[:code] != 0");
+                w.scope(|w| {
+                    w.line(format!("{}(iter)", it.destroy_symbol));
+                    w.line("check_error!(item_err)");
+                });
+                w.line("end");
+                w.line("break if has_item.zero?");
+                let mut tmp = String::new();
+                render_iterator_item_push(&mut tmp, elem, &format!("{ind}  "));
+                w.raw(tmp);
+            });
+            w.line(format!("{}(iter)", it.destroy_symbol));
+            w.line("items");
+        },
+    );
+    out.push_str(&w.finish());
 }
 
 /// Convert the value written into `out_item` and append it to `items`.
 fn render_iterator_item_push(out: &mut String, elem: &TypeRef, ind: &str) {
+    let mut w = CodeWriter::two_space().with_depth(ind.len() / 2);
     match elem {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!("{ind}item_ptr = out_item.read_pointer\n"));
-            out.push_str(&format!("{ind}if item_ptr.null?\n"));
-            out.push_str(&format!("{ind}  items << ''\n"));
-            out.push_str(&format!("{ind}else\n"));
-            out.push_str(&format!("{ind}  items << item_ptr.read_string\n"));
-            out.push_str(&format!("{ind}  weaveffi_free_string(item_ptr)\n"));
-            out.push_str(&format!("{ind}end\n"));
+            w.line("item_ptr = out_item.read_pointer");
+            w.line("if item_ptr.null?");
+            w.scope(|w| {
+                w.line("items << ''");
+            });
+            w.line("else");
+            w.scope(|w| {
+                w.line("items << item_ptr.read_string");
+                w.line("weaveffi_free_string(item_ptr)");
+            });
+            w.line("end");
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            out.push_str(&format!("{ind}item_ptr = out_item.read_pointer\n"));
-            out.push_str(&format!("{ind}item_len = out_item_len.read(:size_t)\n"));
-            out.push_str(&format!("{ind}if item_ptr.null?\n"));
-            out.push_str(&format!("{ind}  items << ''.b\n"));
-            out.push_str(&format!("{ind}else\n"));
-            out.push_str(&format!("{ind}  items << item_ptr.read_string(item_len)\n"));
-            out.push_str(&format!("{ind}  weaveffi_free_bytes(item_ptr, item_len)\n"));
-            out.push_str(&format!("{ind}end\n"));
+            w.line("item_ptr = out_item.read_pointer");
+            w.line("item_len = out_item_len.read(:size_t)");
+            w.line("if item_ptr.null?");
+            w.scope(|w| {
+                w.line("items << ''.b");
+            });
+            w.line("else");
+            w.scope(|w| {
+                w.line("items << item_ptr.read_string(item_len)");
+                w.line("weaveffi_free_bytes(item_ptr, item_len)");
+            });
+            w.line("end");
         }
         TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
             let local = local_type_name(name);
-            out.push_str(&format!("{ind}item_ptr = out_item.read_pointer\n"));
-            out.push_str(&format!(
-                "{ind}items << {local}.new(item_ptr) unless item_ptr.null?\n"
+            w.line("item_ptr = out_item.read_pointer");
+            w.line(format!(
+                "items << {local}.new(item_ptr) unless item_ptr.null?"
             ));
         }
         TypeRef::Bool => {
-            out.push_str(&format!("{ind}items << (out_item.read_int32 != 0)\n"));
+            w.line("items << (out_item.read_int32 != 0)");
         }
         _ => {
             let read = rb_read_method(elem);
-            out.push_str(&format!("{ind}items << out_item.{read}\n"));
+            w.line(format!("items << out_item.{read}"));
         }
     }
+    out.push_str(&w.finish());
 }
 
 // ── Parameter conversion ──
 
 fn render_param_conversion(out: &mut String, name: &str, ty: &TypeRef, ind: &str) {
+    let mut w = CodeWriter::two_space().with_depth(ind.len() / 2);
     match ty {
         TypeRef::Bool => {
-            out.push_str(&format!("{ind}{name}_c = {name} ? 1 : 0\n"));
+            w.line(format!("{name}_c = {name} ? 1 : 0"));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            out.push_str(&format!(
-                "{ind}{name}_buf = FFI::MemoryPointer.new(:uint8, {name}.bytesize)\n"
+            w.line(format!(
+                "{name}_buf = FFI::MemoryPointer.new(:uint8, {name}.bytesize)"
             ));
-            out.push_str(&format!("{ind}{name}_buf.put_bytes(0, {name})\n"));
+            w.line(format!("{name}_buf.put_bytes(0, {name})"));
         }
         TypeRef::Optional(inner) if !is_c_pointer_type(inner) => {
             let mem = rb_mem_type(inner);
@@ -1629,52 +1759,73 @@ fn render_param_conversion(out: &mut String, name: &str, ty: &TypeRef, ind: &str
                 TypeRef::Bool => format!("{name} ? 1 : 0"),
                 _ => name.to_string(),
             };
-            out.push_str(&format!(
-                "{ind}{name}_c = {name}.nil? ? FFI::Pointer::NULL : \
-                 begin; p = FFI::MemoryPointer.new({mem}); p.{write}({val}); p; end\n"
+            w.line(format!(
+                "{name}_c = {name}.nil? ? FFI::Pointer::NULL : \
+                 begin; p = FFI::MemoryPointer.new({mem}); p.{write}({val}); p; end"
             ));
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                out.push_str(&format!("{ind}if {name}.nil?\n"));
-                out.push_str(&format!("{ind}  {name}_buf = FFI::Pointer::NULL\n"));
-                out.push_str(&format!("{ind}  {name}_len = 0\n"));
-                out.push_str(&format!("{ind}else\n"));
-                out.push_str(&format!(
-                    "{ind}  {name}_buf = FFI::MemoryPointer.new(:uint8, {name}.bytesize)\n"
-                ));
-                out.push_str(&format!("{ind}  {name}_buf.put_bytes(0, {name})\n"));
-                out.push_str(&format!("{ind}  {name}_len = {name}.bytesize\n"));
-                out.push_str(&format!("{ind}end\n"));
+                w.line(format!("if {name}.nil?"));
+                w.scope(|w| {
+                    w.line(format!("{name}_buf = FFI::Pointer::NULL"));
+                    w.line(format!("{name}_len = 0"));
+                });
+                w.line("else");
+                w.scope(|w| {
+                    w.line(format!(
+                        "{name}_buf = FFI::MemoryPointer.new(:uint8, {name}.bytesize)"
+                    ));
+                    w.line(format!("{name}_buf.put_bytes(0, {name})"));
+                    w.line(format!("{name}_len = {name}.bytesize"));
+                });
+                w.line("end");
             }
             TypeRef::List(elem) => {
-                out.push_str(&format!("{ind}if {name}.nil?\n"));
-                out.push_str(&format!("{ind}  {name}_buf = FFI::Pointer::NULL\n"));
-                out.push_str(&format!("{ind}  {name}_len = 0\n"));
-                out.push_str(&format!("{ind}else\n"));
-                render_list_buf(out, name, elem, &format!("{ind}  "));
-                out.push_str(&format!("{ind}  {name}_len = {name}.length\n"));
-                out.push_str(&format!("{ind}end\n"));
+                w.line(format!("if {name}.nil?"));
+                w.scope(|w| {
+                    w.line(format!("{name}_buf = FFI::Pointer::NULL"));
+                    w.line(format!("{name}_len = 0"));
+                });
+                w.line("else");
+                w.scope(|w| {
+                    let mut tmp = String::new();
+                    render_list_buf(&mut tmp, name, elem, &format!("{ind}  "));
+                    w.raw(tmp);
+                    w.line(format!("{name}_len = {name}.length"));
+                });
+                w.line("end");
             }
             TypeRef::Map(k, v) => {
-                out.push_str(&format!("{ind}if {name}.nil?\n"));
-                out.push_str(&format!("{ind}  {name}_keys_buf = FFI::Pointer::NULL\n"));
-                out.push_str(&format!("{ind}  {name}_vals_buf = FFI::Pointer::NULL\n"));
-                out.push_str(&format!("{ind}  {name}_len = 0\n"));
-                out.push_str(&format!("{ind}else\n"));
-                render_map_buf(out, name, k, v, &format!("{ind}  "));
-                out.push_str(&format!("{ind}end\n"));
+                w.line(format!("if {name}.nil?"));
+                w.scope(|w| {
+                    w.line(format!("{name}_keys_buf = FFI::Pointer::NULL"));
+                    w.line(format!("{name}_vals_buf = FFI::Pointer::NULL"));
+                    w.line(format!("{name}_len = 0"));
+                });
+                w.line("else");
+                w.scope(|w| {
+                    let mut tmp = String::new();
+                    render_map_buf(&mut tmp, name, k, v, &format!("{ind}  "));
+                    w.raw(tmp);
+                });
+                w.line("end");
             }
             _ => {}
         },
         TypeRef::List(elem) => {
-            render_list_buf(out, name, elem, ind);
+            let mut tmp = String::new();
+            render_list_buf(&mut tmp, name, elem, ind);
+            w.raw(tmp);
         }
         TypeRef::Map(k, v) => {
-            render_map_buf(out, name, k, v, ind);
+            let mut tmp = String::new();
+            render_map_buf(&mut tmp, name, k, v, ind);
+            w.raw(tmp);
         }
         _ => {}
     }
+    out.push_str(&w.finish());
 }
 
 /// Writes one element list into `{buf_name}_buf`. String/handle elements are
@@ -1688,51 +1839,57 @@ fn render_element_array_write(
     elem: &TypeRef,
     ind: &str,
 ) {
+    let mut w = CodeWriter::two_space().with_depth(ind.len() / 2);
     match elem {
         TypeRef::Bool => {
-            out.push_str(&format!(
-                "{ind}{buf_name}_buf.write_array_of_int32({list_expr}.map {{ |v| v ? 1 : 0 }})\n"
+            w.line(format!(
+                "{buf_name}_buf.write_array_of_int32({list_expr}.map {{ |v| v ? 1 : 0 }})"
             ));
         }
         TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
-            out.push_str(&format!(
-                "{ind}{buf_name}_buf.write_array_of_pointer({list_expr}.map(&:handle))\n"
+            w.line(format!(
+                "{buf_name}_buf.write_array_of_pointer({list_expr}.map(&:handle))"
             ));
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!(
-                "{ind}{buf_name}_ptrs = {list_expr}.map {{ |s| FFI::MemoryPointer.from_string(s) }}\n"
+            w.line(format!(
+                "{buf_name}_ptrs = {list_expr}.map {{ |s| FFI::MemoryPointer.from_string(s) }}"
             ));
-            out.push_str(&format!(
-                "{ind}{buf_name}_buf.write_array_of_pointer({buf_name}_ptrs)\n"
+            w.line(format!(
+                "{buf_name}_buf.write_array_of_pointer({buf_name}_ptrs)"
             ));
         }
         _ => {
             let write = rb_array_writer(elem);
-            out.push_str(&format!("{ind}{buf_name}_buf.{write}({list_expr})\n"));
+            w.line(format!("{buf_name}_buf.{write}({list_expr})"));
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn render_list_buf(out: &mut String, name: &str, elem: &TypeRef, ind: &str) {
     let mem = rb_mem_type(elem);
-    out.push_str(&format!(
-        "{ind}{name}_buf = FFI::MemoryPointer.new({mem}, {name}.length)\n"
+    let mut w = CodeWriter::two_space().with_depth(ind.len() / 2);
+    w.line(format!(
+        "{name}_buf = FFI::MemoryPointer.new({mem}, {name}.length)"
     ));
+    out.push_str(&w.finish());
     render_element_array_write(out, name, name, elem, ind);
 }
 
 fn render_map_buf(out: &mut String, name: &str, k: &TypeRef, v: &TypeRef, ind: &str) {
     let k_mem = rb_mem_type(k);
     let v_mem = rb_mem_type(v);
-    out.push_str(&format!("{ind}{name}_k = {name}.keys\n"));
-    out.push_str(&format!("{ind}{name}_v = {name}.values\n"));
-    out.push_str(&format!(
-        "{ind}{name}_keys_buf = FFI::MemoryPointer.new({k_mem}, {name}_k.length)\n"
+    let mut w = CodeWriter::two_space().with_depth(ind.len() / 2);
+    w.line(format!("{name}_k = {name}.keys"));
+    w.line(format!("{name}_v = {name}.values"));
+    w.line(format!(
+        "{name}_keys_buf = FFI::MemoryPointer.new({k_mem}, {name}_k.length)"
     ));
-    out.push_str(&format!(
-        "{ind}{name}_vals_buf = FFI::MemoryPointer.new({v_mem}, {name}_v.length)\n"
+    w.line(format!(
+        "{name}_vals_buf = FFI::MemoryPointer.new({v_mem}, {name}_v.length)"
     ));
+    out.push_str(&w.finish());
     render_element_array_write(out, &format!("{name}_keys"), &format!("{name}_k"), k, ind);
     render_element_array_write(out, &format!("{name}_vals"), &format!("{name}_v"), v, ind);
 }
@@ -1741,6 +1898,7 @@ fn render_map_buf(out: &mut String, name: &str, k: &TypeRef, v: &TypeRef, ind: &
 
 fn render_return_code(out: &mut String, ty: &TypeRef, ind: &str, qualifier: Option<&str>) {
     let m = qualifier.map(|q| format!("{q}.")).unwrap_or_default();
+    let mut w = CodeWriter::two_space().with_depth(ind.len() / 2);
     match ty {
         TypeRef::I8
         | TypeRef::I16
@@ -1754,48 +1912,51 @@ fn render_return_code(out: &mut String, ty: &TypeRef, ind: &str, qualifier: Opti
         | TypeRef::F64
         | TypeRef::Handle
         | TypeRef::Enum(_) => {
-            out.push_str(&format!("{ind}result\n"));
+            w.line("result");
         }
         TypeRef::Bool => {
-            out.push_str(&format!("{ind}result != 0\n"));
+            w.line("result != 0");
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!("{ind}return '' if result.null?\n"));
-            out.push_str(&format!("{ind}str = result.read_string\n"));
-            out.push_str(&format!("{ind}{m}weaveffi_free_string(result)\n"));
-            out.push_str(&format!("{ind}str\n"));
+            w.line("return '' if result.null?");
+            w.line("str = result.read_string");
+            w.line(format!("{m}weaveffi_free_string(result)"));
+            w.line("str");
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            out.push_str(&format!("{ind}return ''.b if result.null?\n"));
-            out.push_str(&format!("{ind}len = out_len.read(:size_t)\n"));
-            out.push_str(&format!("{ind}data = result.read_string(len)\n"));
-            out.push_str(&format!("{ind}{m}weaveffi_free_bytes(result, len)\n"));
-            out.push_str(&format!("{ind}data\n"));
+            w.line("return ''.b if result.null?");
+            w.line("len = out_len.read(:size_t)");
+            w.line("data = result.read_string(len)");
+            w.line(format!("{m}weaveffi_free_bytes(result, len)"));
+            w.line("data");
         }
         TypeRef::TypedHandle(name) => {
-            out.push_str(&format!(
-                "{ind}raise Error.new(-1, 'null pointer') if result.null?\n"
-            ));
-            out.push_str(&format!("{ind}{name}.new(result)\n"));
+            w.line("raise Error.new(-1, 'null pointer') if result.null?");
+            w.line(format!("{name}.new(result)"));
         }
         TypeRef::Struct(name) => {
-            out.push_str(&format!(
-                "{ind}raise Error.new(-1, 'null pointer') if result.null?\n"
-            ));
-            out.push_str(&format!("{ind}{}.new(result)\n", local_type_name(name)));
+            w.line("raise Error.new(-1, 'null pointer') if result.null?");
+            w.line(format!("{}.new(result)", local_type_name(name)));
         }
-        TypeRef::Optional(inner) => render_optional_return_code(out, inner, ind, qualifier),
+        TypeRef::Optional(inner) => {
+            let mut tmp = String::new();
+            render_optional_return_code(&mut tmp, inner, ind, qualifier);
+            w.raw(tmp);
+        }
         TypeRef::List(inner) => {
-            out.push_str(&format!("{ind}return [] if result.null?\n"));
-            render_list_return_body(out, inner, ind);
+            w.line("return [] if result.null?");
+            let mut tmp = String::new();
+            render_list_return_body(&mut tmp, inner, ind);
+            w.raw(tmp);
         }
         TypeRef::Iterator(_) => {
             unreachable!("iterator returns render via render_iterator_function_wrapper")
         }
         TypeRef::Map(_, _) => {
-            out.push_str(&format!("{ind}result\n"));
+            w.line("result");
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn render_optional_return_code(
@@ -1805,95 +1966,101 @@ fn render_optional_return_code(
     qualifier: Option<&str>,
 ) {
     let m = qualifier.map(|q| format!("{q}.")).unwrap_or_default();
+    let mut w = CodeWriter::two_space().with_depth(ind.len() / 2);
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!("{ind}return nil if result.null?\n"));
-            out.push_str(&format!("{ind}str = result.read_string\n"));
-            out.push_str(&format!("{ind}{m}weaveffi_free_string(result)\n"));
-            out.push_str(&format!("{ind}str\n"));
+            w.line("return nil if result.null?");
+            w.line("str = result.read_string");
+            w.line(format!("{m}weaveffi_free_string(result)"));
+            w.line("str");
         }
         TypeRef::TypedHandle(name) => {
-            out.push_str(&format!("{ind}return nil if result.null?\n"));
-            out.push_str(&format!("{ind}{name}.new(result)\n"));
+            w.line("return nil if result.null?");
+            w.line(format!("{name}.new(result)"));
         }
         TypeRef::Struct(name) => {
-            out.push_str(&format!("{ind}return nil if result.null?\n"));
-            out.push_str(&format!("{ind}{}.new(result)\n", local_type_name(name)));
+            w.line("return nil if result.null?");
+            w.line(format!("{}.new(result)", local_type_name(name)));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            out.push_str(&format!("{ind}return nil if result.null?\n"));
-            out.push_str(&format!("{ind}len = out_len.read(:size_t)\n"));
-            out.push_str(&format!("{ind}data = result.read_string(len)\n"));
-            out.push_str(&format!("{ind}{m}weaveffi_free_bytes(result, len)\n"));
-            out.push_str(&format!("{ind}data\n"));
+            w.line("return nil if result.null?");
+            w.line("len = out_len.read(:size_t)");
+            w.line("data = result.read_string(len)");
+            w.line(format!("{m}weaveffi_free_bytes(result, len)"));
+            w.line("data");
         }
         TypeRef::Bool => {
-            out.push_str(&format!("{ind}return nil if result.null?\n"));
-            out.push_str(&format!("{ind}result.read_int32 != 0\n"));
+            w.line("return nil if result.null?");
+            w.line("result.read_int32 != 0");
         }
         TypeRef::List(elem) => {
-            out.push_str(&format!("{ind}return nil if result.null?\n"));
-            render_list_return_body(out, elem, ind);
+            w.line("return nil if result.null?");
+            let mut tmp = String::new();
+            render_list_return_body(&mut tmp, elem, ind);
+            w.raw(tmp);
         }
         TypeRef::Map(k, v) => {
-            render_map_return_code(out, k, v, ind, true);
+            let mut tmp = String::new();
+            render_map_return_code(&mut tmp, k, v, ind, true);
+            w.raw(tmp);
         }
         _ if !is_c_pointer_type(inner) => {
             let read = rb_read_method(inner);
-            out.push_str(&format!("{ind}return nil if result.null?\n"));
-            out.push_str(&format!("{ind}result.{read}\n"));
+            w.line("return nil if result.null?");
+            w.line(format!("result.{read}"));
         }
         _ => {
-            out.push_str(&format!("{ind}result\n"));
+            w.line("result");
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn render_list_return_body(out: &mut String, inner: &TypeRef, ind: &str) {
-    out.push_str(&format!("{ind}len = out_len.read(:size_t)\n"));
+    let mut w = CodeWriter::two_space().with_depth(ind.len() / 2);
+    w.line("len = out_len.read(:size_t)");
     let reader = rb_array_reader(inner);
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!(
-                "{ind}result.{reader}(len).map {{ |p| p.null? ? '' : p.read_string }}\n"
+            w.line(format!(
+                "result.{reader}(len).map {{ |p| p.null? ? '' : p.read_string }}"
             ));
         }
         TypeRef::TypedHandle(name) => {
-            out.push_str(&format!(
-                "{ind}result.{reader}(len).map {{ |p| {name}.new(p) }}\n"
-            ));
+            w.line(format!("result.{reader}(len).map {{ |p| {name}.new(p) }}"));
         }
         TypeRef::Struct(name) => {
             let local = local_type_name(name);
-            out.push_str(&format!(
-                "{ind}result.{reader}(len).map {{ |p| {local}.new(p) }}\n"
-            ));
+            w.line(format!("result.{reader}(len).map {{ |p| {local}.new(p) }}"));
         }
         TypeRef::Bool => {
-            out.push_str(&format!("{ind}result.{reader}(len).map {{ |v| v != 0 }}\n"));
+            w.line(format!("result.{reader}(len).map {{ |v| v != 0 }}"));
         }
         _ => {
-            out.push_str(&format!("{ind}result.{reader}(len)\n"));
+            w.line(format!("result.{reader}(len)"));
         }
     }
+    out.push_str(&w.finish());
 }
 
 fn render_map_return_code(out: &mut String, k: &TypeRef, v: &TypeRef, ind: &str, optional: bool) {
     let null_val = if optional { "nil" } else { "{}" };
-    out.push_str(&format!("{ind}len = out_len.read(:size_t)\n"));
-    out.push_str(&format!("{ind}keys_ptr = out_keys.read_pointer\n"));
-    out.push_str(&format!("{ind}vals_ptr = out_values.read_pointer\n"));
-    out.push_str(&format!(
-        "{ind}return {null_val} if keys_ptr.null? || vals_ptr.null?\n"
+    let mut w = CodeWriter::two_space().with_depth(ind.len() / 2);
+    w.line("len = out_len.read(:size_t)");
+    w.line("keys_ptr = out_keys.read_pointer");
+    w.line("vals_ptr = out_values.read_pointer");
+    w.line(format!(
+        "return {null_val} if keys_ptr.null? || vals_ptr.null?"
     ));
     let k_reader = rb_array_reader(k);
     let v_reader = rb_array_reader(v);
     let k_expr = rb_element_expr("k", k);
     let v_expr = rb_element_expr("v", v);
-    out.push_str(&format!(
-        "{ind}keys_ptr.{k_reader}(len).zip(vals_ptr.{v_reader}(len))\
-         .each_with_object({{}}) {{ |(k, v), h| h[{k_expr}] = {v_expr} }}\n"
+    w.line(format!(
+        "keys_ptr.{k_reader}(len).zip(vals_ptr.{v_reader}(len))\
+         .each_with_object({{}}) {{ |(k, v), h| h[{k_expr}] = {v_expr} }}"
     ));
+    out.push_str(&w.finish());
 }
 
 fn render_gemspec(package: &ResolvedPackage, gem_file: &str, input_basename: &str) -> String {

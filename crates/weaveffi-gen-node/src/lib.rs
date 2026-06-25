@@ -18,6 +18,7 @@ use weaveffi_core::abi;
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
+use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::model::{
     BindingModel, CallbackBinding, EnumBinding, FnBinding, ListenerBinding, ParamBinding,
     StructBinding,
@@ -771,14 +772,22 @@ fn render_rich_enum_napi_fns(
 /// registry is only mutated from the JS thread (register/unregister are plain
 /// N-API calls), so a simple singly-linked list suffices.
 fn render_listener_support_c(out: &mut String, prefix: &str) {
-    out.push_str(&format!("typedef struct {prefix}_napi_listener_ctx {{\n"));
-    out.push_str("    napi_threadsafe_function tsfn;\n");
-    out.push_str("    uint64_t id;\n");
-    out.push_str(&format!("    struct {prefix}_napi_listener_ctx* next;\n"));
-    out.push_str(&format!("}} {prefix}_napi_listener_ctx;\n\n"));
-    out.push_str(&format!(
-        "static {prefix}_napi_listener_ctx* {prefix}_napi_listeners = NULL;\n\n"
+    let mut w = CodeWriter::four_space();
+    w.block(
+        format!("typedef struct {prefix}_napi_listener_ctx {{"),
+        format!("}} {prefix}_napi_listener_ctx;"),
+        |w| {
+            w.line("napi_threadsafe_function tsfn;");
+            w.line("uint64_t id;");
+            w.line(format!("struct {prefix}_napi_listener_ctx* next;"));
+        },
+    );
+    w.blank();
+    w.line(format!(
+        "static {prefix}_napi_listener_ctx* {prefix}_napi_listeners = NULL;"
     ));
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 fn cb_payload_name(cb: &CallbackBinding) -> String {
@@ -799,72 +808,81 @@ fn cb_slot_decls(cb: &CallbackBinding, prefix: &str) -> Vec<String> {
 /// trampoline, freed in the call-js marshaller); struct/handle pointers are
 /// shallow-copied and surface as numeric handles.
 fn render_cb_payload_struct(out: &mut String, cb: &CallbackBinding, prefix: &str) {
-    out.push_str("typedef struct {\n");
-    for p in &cb.params {
-        let slots = abi::lower_param(&p.name, &p.ty, "", false);
-        let n0 = &slots[0].name;
-        match &p.ty {
-            TypeRef::I8
-            | TypeRef::I16
-            | TypeRef::I32
-            | TypeRef::I64
-            | TypeRef::U8
-            | TypeRef::U16
-            | TypeRef::U32
-            | TypeRef::U64
-            | TypeRef::F32
-            | TypeRef::F64
-            | TypeRef::Bool
-            | TypeRef::Handle
-            | TypeRef::Enum(_) => {
-                out.push_str(&format!("    {} {n0};\n", slots[0].ty.render_c(prefix)));
-            }
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                out.push_str(&format!("    char* {n0};\n"));
-            }
-            TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                out.push_str(&format!("    uint8_t* {n0};\n"));
-                out.push_str(&format!("    size_t {};\n", slots[1].name));
-            }
-            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
-                out.push_str(&format!("    void* {n0};\n"));
-            }
-            TypeRef::Optional(inner) => match inner.as_ref() {
-                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                    out.push_str(&format!("    char* {n0};\n"));
+    let mut w = CodeWriter::four_space();
+    w.block(
+        "typedef struct {",
+        format!("}} {};", cb_payload_name(cb)),
+        |w| {
+            for p in &cb.params {
+                let slots = abi::lower_param(&p.name, &p.ty, "", false);
+                let n0 = &slots[0].name;
+                match &p.ty {
+                    TypeRef::I8
+                    | TypeRef::I16
+                    | TypeRef::I32
+                    | TypeRef::I64
+                    | TypeRef::U8
+                    | TypeRef::U16
+                    | TypeRef::U32
+                    | TypeRef::U64
+                    | TypeRef::F32
+                    | TypeRef::F64
+                    | TypeRef::Bool
+                    | TypeRef::Handle
+                    | TypeRef::Enum(_) => {
+                        w.line(format!("{} {n0};", slots[0].ty.render_c(prefix)));
+                    }
+                    TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                        w.line(format!("char* {n0};"));
+                    }
+                    TypeRef::Bytes | TypeRef::BorrowedBytes => {
+                        w.line(format!("uint8_t* {n0};"));
+                        w.line(format!("size_t {};", slots[1].name));
+                    }
+                    TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+                        w.line(format!("void* {n0};"));
+                    }
+                    TypeRef::Optional(inner) => match inner.as_ref() {
+                        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                            w.line(format!("char* {n0};"));
+                        }
+                        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+                            w.line(format!("int {n0}_has;"));
+                            w.line(format!("uint8_t* {n0};"));
+                            w.line(format!("size_t {};", slots[1].name));
+                        }
+                        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+                            w.line(format!("void* {n0};"));
+                        }
+                        other => {
+                            w.line(format!("int {n0}_has;"));
+                            w.line(format!(
+                                "{} {n0};",
+                                abi::element_ctype(other, "").render_c(prefix)
+                            ));
+                        }
+                    },
+                    TypeRef::List(inner) => {
+                        let elem = elem_payload_ctype(inner, prefix);
+                        w.line(format!("{elem}* {n0};"));
+                        w.line(format!("size_t {};", slots[1].name));
+                    }
+                    TypeRef::Map(k, v) => {
+                        let kt = elem_payload_ctype(k, prefix);
+                        let vt = elem_payload_ctype(v, prefix);
+                        w.line(format!("{kt}* {n0};"));
+                        w.line(format!("{vt}* {};", slots[1].name));
+                        w.line(format!("size_t {};", slots[2].name));
+                    }
+                    TypeRef::Iterator(_) => {
+                        unreachable!("validated: iterator not a callback param")
+                    }
                 }
-                TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                    out.push_str(&format!("    int {n0}_has;\n"));
-                    out.push_str(&format!("    uint8_t* {n0};\n"));
-                    out.push_str(&format!("    size_t {};\n", slots[1].name));
-                }
-                TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
-                    out.push_str(&format!("    void* {n0};\n"));
-                }
-                other => {
-                    out.push_str(&format!("    int {n0}_has;\n"));
-                    out.push_str(&format!(
-                        "    {} {n0};\n",
-                        abi::element_ctype(other, "").render_c(prefix)
-                    ));
-                }
-            },
-            TypeRef::List(inner) => {
-                let elem = elem_payload_ctype(inner, prefix);
-                out.push_str(&format!("    {elem}* {n0};\n"));
-                out.push_str(&format!("    size_t {};\n", slots[1].name));
             }
-            TypeRef::Map(k, v) => {
-                let kt = elem_payload_ctype(k, prefix);
-                let vt = elem_payload_ctype(v, prefix);
-                out.push_str(&format!("    {kt}* {n0};\n"));
-                out.push_str(&format!("    {vt}* {};\n", slots[1].name));
-                out.push_str(&format!("    size_t {};\n", slots[2].name));
-            }
-            TypeRef::Iterator(_) => unreachable!("validated: iterator not a callback param"),
-        }
-    }
-    out.push_str(&format!("}} {};\n\n", cb_payload_name(cb)));
+        },
+    );
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 /// The payload element type for list/map callback parameters. Strings own
@@ -3081,59 +3099,74 @@ fn render_rich_enum_dts(out: &mut String, e: &EnumBinding) {
         return;
     };
     let name = &e.name;
-    emit_doc(out, &e.doc, "");
-    out.push_str(&format!("export class {name} {{\n"));
-    for v in &rich.variants {
-        let factory = v.name.to_lower_camel_case();
-        let params: Vec<String> = v
-            .fields
-            .iter()
-            .map(|f| format!("{}: {}", f.name, ts_type_for(&f.ty)))
-            .collect();
-        emit_doc(out, &v.doc, "  ");
-        out.push_str(&format!(
-            "  static {factory}({}): {name};\n",
-            params.join(", ")
-        ));
+    let mut w = CodeWriter::two_space();
+    {
+        let mut d = String::new();
+        emit_doc(&mut d, &e.doc, "");
+        w.raw(d);
     }
-    out.push_str("  /** The active variant's discriminant. */\n");
-    out.push_str("  tag(): number;\n");
-    for v in &rich.variants {
-        for f in &v.fields {
-            let getter = format!(
-                "{}{}",
-                v.name.to_lower_camel_case(),
-                f.name.to_upper_camel_case()
-            );
-            emit_doc(out, &f.doc, "  ");
-            out.push_str(&format!("  get {getter}(): {};\n", ts_type_for(&f.ty)));
+    w.block(format!("export class {name} {{"), "}", |w| {
+        for v in &rich.variants {
+            let factory = v.name.to_lower_camel_case();
+            let params: Vec<String> = v
+                .fields
+                .iter()
+                .map(|f| format!("{}: {}", f.name, ts_type_for(&f.ty)))
+                .collect();
+            let mut d = String::new();
+            emit_doc(&mut d, &v.doc, "  ");
+            w.raw(d);
+            w.line(format!("static {factory}({}): {name};", params.join(", ")));
         }
-    }
-    out.push_str("  /** Free the underlying native object. */\n");
-    out.push_str("  destroy(): void;\n");
-    out.push_str("}\n");
+        w.line("/** The active variant's discriminant. */");
+        w.line("tag(): number;");
+        for v in &rich.variants {
+            for f in &v.fields {
+                let getter = format!(
+                    "{}{}",
+                    v.name.to_lower_camel_case(),
+                    f.name.to_upper_camel_case()
+                );
+                let mut d = String::new();
+                emit_doc(&mut d, &f.doc, "  ");
+                w.raw(d);
+                w.line(format!("get {getter}(): {};", ts_type_for(&f.ty)));
+            }
+        }
+        w.line("/** Free the underlying native object. */");
+        w.line("destroy(): void;");
+    });
     // The discriminant map, e.g. `Shape.Tag.Circle === 1`.
-    out.push_str(&format!("export namespace {name} {{\n"));
-    out.push_str("  const Tag: Readonly<{\n");
-    for v in &e.variants {
-        out.push_str(&format!("    {}: {},\n", v.name, v.value));
-    }
-    out.push_str("  }>;\n");
-    out.push_str("}\n");
+    w.block(format!("export namespace {name} {{"), "}", |w| {
+        w.block("const Tag: Readonly<{", "}>;", |w| {
+            for v in &e.variants {
+                w.line(format!("{}: {},", v.name, v.value));
+            }
+        });
+    });
+    out.push_str(&w.finish());
 }
 
 fn render_struct_builder_dts(out: &mut String, s: &StructBinding) {
     let name = &s.name;
-    emit_doc(out, &s.doc, "");
-    out.push_str(&format!("export interface {}Builder {{\n", s.name));
-    for field in &s.fields {
-        let method = format!("with{}", field.name.to_upper_camel_case());
-        let ts = ts_type_for(&field.ty);
-        emit_doc(out, &field.doc, "  ");
-        out.push_str(&format!("  {method}(value: {ts}): {name}Builder;\n"));
+    let mut w = CodeWriter::two_space();
+    {
+        let mut d = String::new();
+        emit_doc(&mut d, &s.doc, "");
+        w.raw(d);
     }
-    out.push_str(&format!("  build(): {name};\n"));
-    out.push_str("}\n");
+    w.block(format!("export interface {}Builder {{", s.name), "}", |w| {
+        for field in &s.fields {
+            let method = format!("with{}", field.name.to_upper_camel_case());
+            let ts = ts_type_for(&field.ty);
+            let mut d = String::new();
+            emit_doc(&mut d, &field.doc, "  ");
+            w.raw(d);
+            w.line(format!("{method}(value: {ts}): {name}Builder;"));
+        }
+        w.line(format!("build(): {name};"));
+    });
+    out.push_str(&w.finish());
 }
 
 /// The set of *local* names of every rich (algebraic) enum in the model. Used
@@ -3274,60 +3307,64 @@ fn render_rich_enum_class_js(out: &mut String, e: &EnumBinding, module: &str, st
     let name = &e.name;
     let destroy_js = wrapper_name(module, &rich_destroy_base(name), strip);
 
-    out.push_str(&format!("class {name} {{\n"));
-    out.push_str("  constructor(handle) {\n");
-    out.push_str("    this._handle = handle;\n");
-    out.push_str(&format!(
-        "    {name}._cleanup.register(this, handle, this);\n"
-    ));
-    out.push_str("  }\n");
+    let mut w = CodeWriter::two_space();
+    w.block(format!("class {name} {{"), "}", |w| {
+        w.block("constructor(handle) {", "}", |w| {
+            w.line("this._handle = handle;");
+            w.line(format!("{name}._cleanup.register(this, handle, this);"));
+        });
 
-    // Per-variant factories (`Shape.circle(radius)`).
-    for v in &rich.variants {
-        let factory = v.name.to_lower_camel_case();
-        let ctor_js = wrapper_name(module, &rich_ctor_base(name, &v.name), strip);
-        let params: Vec<String> = v.fields.iter().map(|f| f.name.clone()).collect();
-        let joined = params.join(", ");
-        out.push_str(&format!(
-            "  static {factory}({joined}) {{\n    return new {name}(addon.{ctor_js}({joined}));\n  }}\n"
-        ));
-    }
-
-    // Discriminant reader.
-    let tag_js = wrapper_name(module, &rich_tag_base(name), strip);
-    out.push_str(&format!(
-        "  tag() {{\n    return addon.{tag_js}(this._handle);\n  }}\n"
-    ));
-
-    // Namespaced per-variant field getters (`circleRadius`).
-    for v in &rich.variants {
-        for f in &v.fields {
-            let getter = format!(
-                "{}{}",
-                v.name.to_lower_camel_case(),
-                f.name.to_upper_camel_case()
-            );
-            let getter_js = wrapper_name(module, &rich_getter_base(name, &v.name, &f.name), strip);
-            out.push_str(&format!(
-                "  get {getter}() {{\n    return addon.{getter_js}(this._handle);\n  }}\n"
-            ));
+        // Per-variant factories (`Shape.circle(radius)`).
+        for v in &rich.variants {
+            let factory = v.name.to_lower_camel_case();
+            let ctor_js = wrapper_name(module, &rich_ctor_base(name, &v.name), strip);
+            let params: Vec<String> = v.fields.iter().map(|f| f.name.clone()).collect();
+            let joined = params.join(", ");
+            w.block(format!("static {factory}({joined}) {{"), "}", |w| {
+                w.line(format!("return new {name}(addon.{ctor_js}({joined}));"));
+            });
         }
-    }
 
-    // Explicit cleanup; guarded so a double `destroy()` (or destroy-then-GC) is
-    // a no-op rather than a double free.
-    out.push_str("  destroy() {\n");
-    out.push_str("    if (this._handle) {\n");
-    out.push_str(&format!("      {name}._cleanup.unregister(this);\n"));
-    out.push_str(&format!("      addon.{destroy_js}(this._handle);\n"));
-    out.push_str("      this._handle = 0;\n");
-    out.push_str("    }\n");
-    out.push_str("  }\n");
-    out.push_str("}\n");
+        // Discriminant reader.
+        let tag_js = wrapper_name(module, &rich_tag_base(name), strip);
+        w.block("tag() {", "}", |w| {
+            w.line(format!("return addon.{tag_js}(this._handle);"));
+        });
 
-    out.push_str(&format!(
-        "{name}._cleanup = new FinalizationRegistry((handle) => {{\n  if (handle) {{ addon.{destroy_js}(handle); }}\n}});\n"
-    ));
+        // Namespaced per-variant field getters (`circleRadius`).
+        for v in &rich.variants {
+            for f in &v.fields {
+                let getter = format!(
+                    "{}{}",
+                    v.name.to_lower_camel_case(),
+                    f.name.to_upper_camel_case()
+                );
+                let getter_js =
+                    wrapper_name(module, &rich_getter_base(name, &v.name, &f.name), strip);
+                w.block(format!("get {getter}() {{"), "}", |w| {
+                    w.line(format!("return addon.{getter_js}(this._handle);"));
+                });
+            }
+        }
+
+        // Explicit cleanup; guarded so a double `destroy()` (or destroy-then-GC) is
+        // a no-op rather than a double free.
+        w.block("destroy() {", "}", |w| {
+            w.block("if (this._handle) {", "}", |w| {
+                w.line(format!("{name}._cleanup.unregister(this);"));
+                w.line(format!("addon.{destroy_js}(this._handle);"));
+                w.line("this._handle = 0;");
+            });
+        });
+    });
+
+    w.block(
+        format!("{name}._cleanup = new FinalizationRegistry((handle) => {{"),
+        "});",
+        |w| {
+            w.line(format!("if (handle) {{ addon.{destroy_js}(handle); }}"));
+        },
+    );
 
     // Frozen discriminant map (`Shape.Tag.Circle === 1`).
     let consts: Vec<String> = e
@@ -3335,11 +3372,13 @@ fn render_rich_enum_class_js(out: &mut String, e: &EnumBinding, module: &str, st
         .iter()
         .map(|v| format!("{}: {}", v.name, v.value))
         .collect();
-    out.push_str(&format!(
-        "{name}.Tag = Object.freeze({{ {} }});\n",
+    w.line(format!(
+        "{name}.Tag = Object.freeze({{ {} }});",
         consts.join(", ")
     ));
-    out.push_str(&format!("wv.{name} = {name};\n\n"));
+    w.line(format!("wv.{name} = {name};"));
+    w.blank();
+    out.push_str(&w.finish());
 }
 
 fn render_node_dts(
