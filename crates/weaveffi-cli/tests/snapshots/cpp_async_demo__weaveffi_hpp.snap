@@ -16,38 +16,62 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <stdexcept>
 #include <future>
 
+#ifndef WEAVEFFI_API
+#  if defined(_WIN32) || defined(__CYGWIN__)
+#    ifdef WEAVEFFI_BUILD
+#      define WEAVEFFI_API __declspec(dllexport)
+#    else
+#      define WEAVEFFI_API __declspec(dllimport)
+#    endif
+#  elif defined(__GNUC__) && (__GNUC__ >= 4)
+#    define WEAVEFFI_API __attribute__((visibility("default")))
+#  else
+#    define WEAVEFFI_API
+#  endif
+#endif
+
+#ifndef WEAVEFFI_DEPRECATED
+#  if defined(_MSC_VER)
+#    define WEAVEFFI_DEPRECATED(msg) __declspec(deprecated(msg))
+#  elif defined(__GNUC__) || defined(__clang__)
+#    define WEAVEFFI_DEPRECATED(msg) __attribute__((deprecated(msg)))
+#  else
+#    define WEAVEFFI_DEPRECATED(msg)
+#  endif
+#endif
+
 extern "C" {
 
 typedef uint64_t weaveffi_handle_t;
 
 typedef struct weaveffi_error { int32_t code; const char* message; } weaveffi_error;
 
-void weaveffi_error_clear(weaveffi_error* err);
-void weaveffi_free_string(const char* ptr);
-void weaveffi_free_bytes(uint8_t* ptr, size_t len);
+WEAVEFFI_API void weaveffi_error_clear(weaveffi_error* err);
+WEAVEFFI_API void weaveffi_free_string(const char* ptr);
+WEAVEFFI_API void weaveffi_free_bytes(uint8_t* ptr, size_t len);
 
 typedef struct weaveffi_cancel_token weaveffi_cancel_token;
-weaveffi_cancel_token* weaveffi_cancel_token_create(void);
-void weaveffi_cancel_token_cancel(weaveffi_cancel_token* token);
-bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token* token);
-void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
+WEAVEFFI_API weaveffi_cancel_token* weaveffi_cancel_token_create(void);
+WEAVEFFI_API void weaveffi_cancel_token_cancel(weaveffi_cancel_token* token);
+WEAVEFFI_API bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token* token);
+WEAVEFFI_API void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
 
 typedef struct weaveffi_tasks_TaskResult weaveffi_tasks_TaskResult;
 typedef void (*weaveffi_tasks_run_task_callback)(void* context, weaveffi_error* err, weaveffi_tasks_TaskResult* result);
 typedef void (*weaveffi_tasks_run_batch_callback)(void* context, weaveffi_error* err, weaveffi_tasks_TaskResult** result, size_t result_len);
 typedef void (*weaveffi_tasks_run_n_tasks_callback)(void* context, weaveffi_error* err, int32_t result);
 
-weaveffi_tasks_TaskResult* weaveffi_tasks_TaskResult_create(int64_t id, const char* value, bool success, weaveffi_error* out_err);
-void weaveffi_tasks_TaskResult_destroy(weaveffi_tasks_TaskResult* ptr);
-int64_t weaveffi_tasks_TaskResult_get_id(const weaveffi_tasks_TaskResult* ptr);
-const char* weaveffi_tasks_TaskResult_get_value(const weaveffi_tasks_TaskResult* ptr);
-bool weaveffi_tasks_TaskResult_get_success(const weaveffi_tasks_TaskResult* ptr);
+WEAVEFFI_API weaveffi_tasks_TaskResult* weaveffi_tasks_TaskResult_create(int64_t id, const char* value, bool success, weaveffi_error* out_err);
+WEAVEFFI_API void weaveffi_tasks_TaskResult_destroy(weaveffi_tasks_TaskResult* ptr);
+WEAVEFFI_API int64_t weaveffi_tasks_TaskResult_get_id(const weaveffi_tasks_TaskResult* ptr);
+WEAVEFFI_API const char* weaveffi_tasks_TaskResult_get_value(const weaveffi_tasks_TaskResult* ptr);
+WEAVEFFI_API bool weaveffi_tasks_TaskResult_get_success(const weaveffi_tasks_TaskResult* ptr);
 
-void weaveffi_tasks_run_task_async(const char* name, weaveffi_tasks_run_task_callback callback, void* context);
-void weaveffi_tasks_run_batch_async(const char* const* names, size_t names_len, weaveffi_tasks_run_batch_callback callback, void* context);
-bool weaveffi_tasks_cancel_task(int64_t id, weaveffi_error* out_err);
-void weaveffi_tasks_run_n_tasks_async(int32_t n, weaveffi_tasks_run_n_tasks_callback callback, void* context);
-int64_t weaveffi_tasks_active_callbacks(weaveffi_error* out_err);
+WEAVEFFI_API void weaveffi_tasks_run_task_async(const char* name, weaveffi_tasks_run_task_callback callback, void* context);
+WEAVEFFI_API void weaveffi_tasks_run_batch_async(const char* const* names, size_t names_len, weaveffi_tasks_run_batch_callback callback, void* context);
+WEAVEFFI_API bool weaveffi_tasks_cancel_task(int64_t id, weaveffi_error* out_err);
+WEAVEFFI_API void weaveffi_tasks_run_n_tasks_async(int32_t n, weaveffi_tasks_run_n_tasks_callback callback, void* context);
+WEAVEFFI_API int64_t weaveffi_tasks_active_callbacks(weaveffi_error* out_err);
 
 } // extern "C"
 

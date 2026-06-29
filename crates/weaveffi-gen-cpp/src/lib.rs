@@ -358,6 +358,7 @@ fn render_cpp_header(
     }
     out.push('\n');
 
+    cabi::render_visibility_macros(&mut out, c_prefix);
     out.push_str(&render_abi_prefix_aliases(c_prefix));
     out.push_str("extern \"C\" {\n\n");
     render_extern_c(&mut out, api, c_prefix);
@@ -2643,6 +2644,29 @@ mod tests {
         assert!(
             h.contains("void weaveffi_free_bytes(uint8_t* ptr, size_t len);"),
             "missing free_bytes"
+        );
+    }
+
+    #[test]
+    fn visibility_macro_defined_and_applied() {
+        let h = render_cpp_header(
+            &minimal_api(),
+            "weaveffi",
+            "weaveffi",
+            "weaveffi.yml",
+            "weaveffi.hpp",
+        );
+        // Defined once behind a guard so a translation unit that includes both
+        // weaveffi.h and weaveffi.hpp does not redefine it.
+        assert!(h.contains("#ifndef WEAVEFFI_API"), "missing macro guard");
+        assert!(
+            h.contains("#    define WEAVEFFI_API __attribute__((visibility(\"default\")))"),
+            "missing GCC/Clang visibility branch"
+        );
+        // The inlined extern \"C\" declarations carry the export tag.
+        assert!(
+            h.contains("WEAVEFFI_API void weaveffi_free_string(const char* ptr);"),
+            "runtime helper not tagged for export"
         );
     }
 

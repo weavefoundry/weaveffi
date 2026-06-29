@@ -98,8 +98,11 @@ fn audit_c_string_ownership() {
     let const_char_fns: Vec<&str> = h
         .lines()
         .filter(|l| {
-            let t = l.trim();
-            t.starts_with("const char*") && t.contains('(') && t.ends_with(';')
+            // Every exported prototype is tagged with the `WEAVEFFI_API`
+            // visibility macro, with the `const char*` return type right after.
+            l.trim().strip_prefix("WEAVEFFI_API ").is_some_and(|t| {
+                t.starts_with("const char*") && t.contains('(') && t.ends_with(';')
+            })
         })
         .collect();
     assert!(
