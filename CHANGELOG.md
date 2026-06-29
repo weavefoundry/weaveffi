@@ -1,3 +1,9 @@
+## [0.13.1](https://github.com/weavefoundry/weaveffi/compare/v0.13.0...v0.13.1) (2026-06-29)
+
+### Bug Fixes
+
+* export generated C/C++ ABI symbols under hidden visibility ([#25](https://github.com/weavefoundry/weaveffi/issues/25)) ([fdc5711](https://github.com/weavefoundry/weaveffi/commit/fdc571164721b64d881903401596492cc093f4c2)), closes [#23](https://github.com/weavefoundry/weaveffi/issues/23)
+
 ## [0.13.0](https://github.com/weavefoundry/weaveffi/compare/v0.12.0...v0.13.0) (2026-06-24)
 
 ### ⚠ BREAKING CHANGES
