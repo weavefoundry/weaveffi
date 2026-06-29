@@ -135,6 +135,31 @@ cpp_shapes() {
         && "$OUT/cpp_shapes"
 }
 
+# Producer lane: unlike every other lane (which *consumes* a prebuilt cdylib),
+# this compiles a C backend that *implements* the generated header into a shared
+# library under hidden default visibility (-fvisibility=hidden, the release norm
+# and the MSVC default). The generated header tags every prototype with the
+# WEAVEFFI_API visibility macro, so the implemented symbols stay exported; before
+# that macro existed they were hidden and unusable. Regression oracle for
+# https://github.com/weavefoundry/weaveffi/issues/23. Asserts both a user
+# function and a runtime helper are exported (defined + external) via `nm`.
+c_producer_exports() {
+    local incdir="$GENROOT/calculator/c"
+    local lib="$OUT/libcalc_producer.$EXT"
+    clang -shared -fPIC -fvisibility=hidden \
+        -I "$incdir" "$ROOT/conformance/c/producer.c" -o "$lib" \
+        || { echo "producer compile failed" >&2; return 1; }
+    local syms
+    syms=$(nm -g --defined-only "$lib" 2>/dev/null) || syms=$(nm -gU "$lib" 2>/dev/null)
+    for sym in weaveffi_calculator_add weaveffi_free_bytes; do
+        if ! printf '%s\n' "$syms" | grep -Eq "(^| )_?${sym}\$"; then
+            echo "symbol '$sym' not exported under hidden visibility from $lib" >&2
+            printf '%s\n' "$syms" | head -40 >&2
+            return 1
+        fi
+    done
+}
+
 # Resolve the platform-specific cdylib path for a sample crate.
 sample_lib() {
     case "$(uname)" in
@@ -447,6 +472,8 @@ build_producer kvstore
 generate kvstore samples/kvstore/kvstore.yml
 build_producer shapes
 generate shapes samples/shapes/shapes.yml
+# Header-only: the producer-export lane implements this in C, no Rust cdylib.
+generate calculator samples/calculator/calculator.yml
 
 # ---------------------------------------------------------------------------
 # Run matrix: every language runs the events lane (callbacks/listeners +
@@ -460,6 +487,7 @@ check cpp-events cpp_events
 check cpp-kvstore cpp_kvstore
 check c-shapes c_shapes
 check cpp-shapes cpp_shapes
+check c-producer-exports c_producer_exports
 check python-shapes python_shapes
 check ruby-shapes ruby_shapes
 check go-shapes go_shapes

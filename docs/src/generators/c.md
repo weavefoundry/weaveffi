@@ -133,6 +133,11 @@ void weaveffi_free_string(const char* ptr);
 void weaveffi_free_bytes(uint8_t* ptr, size_t len);
 ```
 
+In the real output each prototype is prefixed with a `WEAVEFFI_API` visibility
+macro (and deprecated functions with `WEAVEFFI_DEPRECATED`), omitted here for
+brevity. See [Symbol visibility](#symbol-visibility) for what it does and when
+you need it.
+
 Structs become forward-declared opaque typedefs reached via
 create/destroy/getter functions:
 
@@ -184,6 +189,55 @@ if (err.code != 0) {
     return 1;
 }
 ```
+
+## Symbol visibility
+
+Every function prototype is tagged with a `WEAVEFFI_API` macro that the header
+defines near the top:
+
+```c
+#ifndef WEAVEFFI_API
+#  if defined(_WIN32) || defined(__CYGWIN__)
+#    ifdef WEAVEFFI_BUILD
+#      define WEAVEFFI_API __declspec(dllexport)
+#    else
+#      define WEAVEFFI_API __declspec(dllimport)
+#    endif
+#  elif defined(__GNUC__) && (__GNUC__ >= 4)
+#    define WEAVEFFI_API __attribute__((visibility("default")))
+#  else
+#    define WEAVEFFI_API
+#  endif
+#endif
+```
+
+This covers the two ways the header is used:
+
+- **Consuming** a prebuilt library (the common case) needs nothing extra. On
+  Windows the prototypes resolve to `__declspec(dllimport)`; everywhere else the
+  macro is harmless.
+- **Implementing** the header (a C, C++, or Zig backend that supplies the
+  symbols instead of calling them) relies on the macro to stay exportable. Under
+  hidden default visibility (`-fvisibility=hidden`, the release-build norm and
+  the MSVC default) an untagged definition is local and ships no usable symbol.
+  On GCC and Clang the macro applies `visibility("default")`, so your
+  definitions export with no extra flags.
+
+When you implement the header on Windows, compile your library with
+`WEAVEFFI_BUILD` defined so the macro switches to `__declspec(dllexport)`:
+
+```sh
+cc -DWEAVEFFI_BUILD -shared mylib.c -o mylib.dll
+```
+
+Deprecated functions carry a companion `WEAVEFFI_DEPRECATED("...")` macro that
+expands to `__declspec(deprecated(...))` on MSVC and
+`__attribute__((deprecated(...)))` on GCC and Clang.
+
+When the IDL sets `c_prefix`, both macros follow it: a `c_prefix` of `acme`
+yields `ACME_API`, `ACME_BUILD`, and `ACME_DEPRECATED`, so two
+WeaveFFI-generated libraries can coexist in one translation unit without
+colliding.
 
 ## Rich (algebraic) enums
 

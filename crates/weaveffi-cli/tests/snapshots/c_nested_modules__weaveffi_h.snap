@@ -12,6 +12,30 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <stddef.h>
 #include <stdbool.h>
 
+#ifndef WEAVEFFI_API
+#  if defined(_WIN32) || defined(__CYGWIN__)
+#    ifdef WEAVEFFI_BUILD
+#      define WEAVEFFI_API __declspec(dllexport)
+#    else
+#      define WEAVEFFI_API __declspec(dllimport)
+#    endif
+#  elif defined(__GNUC__) && (__GNUC__ >= 4)
+#    define WEAVEFFI_API __attribute__((visibility("default")))
+#  else
+#    define WEAVEFFI_API
+#  endif
+#endif
+
+#ifndef WEAVEFFI_DEPRECATED
+#  if defined(_MSC_VER)
+#    define WEAVEFFI_DEPRECATED(msg) __declspec(deprecated(msg))
+#  elif defined(__GNUC__) || defined(__clang__)
+#    define WEAVEFFI_DEPRECATED(msg) __attribute__((deprecated(msg)))
+#  else
+#    define WEAVEFFI_DEPRECATED(msg)
+#  endif
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -20,15 +44,15 @@ typedef uint64_t weaveffi_handle_t;
 
 typedef struct weaveffi_error { int32_t code; const char* message; } weaveffi_error;
 
-void weaveffi_error_clear(weaveffi_error* err);
-void weaveffi_free_string(const char* ptr);
-void weaveffi_free_bytes(uint8_t* ptr, size_t len);
+WEAVEFFI_API void weaveffi_error_clear(weaveffi_error* err);
+WEAVEFFI_API void weaveffi_free_string(const char* ptr);
+WEAVEFFI_API void weaveffi_free_bytes(uint8_t* ptr, size_t len);
 
 typedef struct weaveffi_cancel_token weaveffi_cancel_token;
-weaveffi_cancel_token* weaveffi_cancel_token_create(void);
-void weaveffi_cancel_token_cancel(weaveffi_cancel_token* token);
-bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token* token);
-void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
+WEAVEFFI_API weaveffi_cancel_token* weaveffi_cancel_token_create(void);
+WEAVEFFI_API void weaveffi_cancel_token_cancel(weaveffi_cancel_token* token);
+WEAVEFFI_API bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token* token);
+WEAVEFFI_API void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
 
 /*
  * Map convention: Maps are passed as parallel arrays of keys and values.
@@ -47,38 +71,38 @@ typedef struct weaveffi_graphics_shapes_geometry_Detail weaveffi_graphics_shapes
 
 // Module: graphics
 /** Top-level struct that references a struct defined one level deeper. */
-weaveffi_graphics_Canvas* weaveffi_graphics_Canvas_create(int32_t width, const weaveffi_graphics_shapes_Shape* root, weaveffi_error* out_err);
-void weaveffi_graphics_Canvas_destroy(weaveffi_graphics_Canvas* ptr);
-int32_t weaveffi_graphics_Canvas_get_width(const weaveffi_graphics_Canvas* ptr);
+WEAVEFFI_API weaveffi_graphics_Canvas* weaveffi_graphics_Canvas_create(int32_t width, const weaveffi_graphics_shapes_Shape* root, weaveffi_error* out_err);
+WEAVEFFI_API void weaveffi_graphics_Canvas_destroy(weaveffi_graphics_Canvas* ptr);
+WEAVEFFI_API int32_t weaveffi_graphics_Canvas_get_width(const weaveffi_graphics_Canvas* ptr);
 /** Reference down into a nested module */
-weaveffi_graphics_shapes_Shape* weaveffi_graphics_Canvas_get_root(const weaveffi_graphics_Canvas* ptr);
+WEAVEFFI_API weaveffi_graphics_shapes_Shape* weaveffi_graphics_Canvas_get_root(const weaveffi_graphics_Canvas* ptr);
 
 /** Construct a Canvas. */
-weaveffi_graphics_Canvas* weaveffi_graphics_new_canvas(int32_t width, weaveffi_error* out_err);
+WEAVEFFI_API weaveffi_graphics_Canvas* weaveffi_graphics_new_canvas(int32_t width, weaveffi_error* out_err);
 
 // Module: graphics_shapes
 /** A struct one level deep that references both an ancestor enum and a deeper struct. */
-weaveffi_graphics_shapes_Shape* weaveffi_graphics_shapes_Shape_create(int32_t sides, weaveffi_graphics_Unit unit, const weaveffi_graphics_shapes_geometry_Detail* detail, weaveffi_error* out_err);
-void weaveffi_graphics_shapes_Shape_destroy(weaveffi_graphics_shapes_Shape* ptr);
-int32_t weaveffi_graphics_shapes_Shape_get_sides(const weaveffi_graphics_shapes_Shape* ptr);
+WEAVEFFI_API weaveffi_graphics_shapes_Shape* weaveffi_graphics_shapes_Shape_create(int32_t sides, weaveffi_graphics_Unit unit, const weaveffi_graphics_shapes_geometry_Detail* detail, weaveffi_error* out_err);
+WEAVEFFI_API void weaveffi_graphics_shapes_Shape_destroy(weaveffi_graphics_shapes_Shape* ptr);
+WEAVEFFI_API int32_t weaveffi_graphics_shapes_Shape_get_sides(const weaveffi_graphics_shapes_Shape* ptr);
 /** Reference up to the parent module's enum */
-weaveffi_graphics_Unit weaveffi_graphics_shapes_Shape_get_unit(const weaveffi_graphics_shapes_Shape* ptr);
+WEAVEFFI_API weaveffi_graphics_Unit weaveffi_graphics_shapes_Shape_get_unit(const weaveffi_graphics_shapes_Shape* ptr);
 /** Reference down into a deeper module */
-weaveffi_graphics_shapes_geometry_Detail* weaveffi_graphics_shapes_Shape_get_detail(const weaveffi_graphics_shapes_Shape* ptr);
+WEAVEFFI_API weaveffi_graphics_shapes_geometry_Detail* weaveffi_graphics_shapes_Shape_get_detail(const weaveffi_graphics_shapes_Shape* ptr);
 
 /** Construct a Shape. */
-weaveffi_graphics_shapes_Shape* weaveffi_graphics_shapes_make_shape(int32_t sides, weaveffi_error* out_err);
+WEAVEFFI_API weaveffi_graphics_shapes_Shape* weaveffi_graphics_shapes_make_shape(int32_t sides, weaveffi_error* out_err);
 /** Nested function returning a struct owned by an ancestor module. */
-weaveffi_graphics_Canvas* weaveffi_graphics_shapes_describe(weaveffi_error* out_err);
+WEAVEFFI_API weaveffi_graphics_Canvas* weaveffi_graphics_shapes_describe(weaveffi_error* out_err);
 
 // Module: graphics_shapes_geometry
 /** A struct two levels deep. */
-weaveffi_graphics_shapes_geometry_Detail* weaveffi_graphics_shapes_geometry_Detail_create(double area, weaveffi_error* out_err);
-void weaveffi_graphics_shapes_geometry_Detail_destroy(weaveffi_graphics_shapes_geometry_Detail* ptr);
-double weaveffi_graphics_shapes_geometry_Detail_get_area(const weaveffi_graphics_shapes_geometry_Detail* ptr);
+WEAVEFFI_API weaveffi_graphics_shapes_geometry_Detail* weaveffi_graphics_shapes_geometry_Detail_create(double area, weaveffi_error* out_err);
+WEAVEFFI_API void weaveffi_graphics_shapes_geometry_Detail_destroy(weaveffi_graphics_shapes_geometry_Detail* ptr);
+WEAVEFFI_API double weaveffi_graphics_shapes_geometry_Detail_get_area(const weaveffi_graphics_shapes_geometry_Detail* ptr);
 
 /** Deeper function taking an ancestor-module struct. */
-weaveffi_graphics_shapes_geometry_Detail* weaveffi_graphics_shapes_geometry_compute(const weaveffi_graphics_shapes_Shape* shape, weaveffi_error* out_err);
+WEAVEFFI_API weaveffi_graphics_shapes_geometry_Detail* weaveffi_graphics_shapes_geometry_compute(const weaveffi_graphics_shapes_Shape* shape, weaveffi_error* out_err);
 
 
 #ifdef __cplusplus

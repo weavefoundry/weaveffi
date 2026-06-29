@@ -12,6 +12,30 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <stddef.h>
 #include <stdbool.h>
 
+#ifndef WEAVEFFI_API
+#  if defined(_WIN32) || defined(__CYGWIN__)
+#    ifdef WEAVEFFI_BUILD
+#      define WEAVEFFI_API __declspec(dllexport)
+#    else
+#      define WEAVEFFI_API __declspec(dllimport)
+#    endif
+#  elif defined(__GNUC__) && (__GNUC__ >= 4)
+#    define WEAVEFFI_API __attribute__((visibility("default")))
+#  else
+#    define WEAVEFFI_API
+#  endif
+#endif
+
+#ifndef WEAVEFFI_DEPRECATED
+#  if defined(_MSC_VER)
+#    define WEAVEFFI_DEPRECATED(msg) __declspec(deprecated(msg))
+#  elif defined(__GNUC__) || defined(__clang__)
+#    define WEAVEFFI_DEPRECATED(msg) __attribute__((deprecated(msg)))
+#  else
+#    define WEAVEFFI_DEPRECATED(msg)
+#  endif
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -20,15 +44,15 @@ typedef uint64_t weaveffi_handle_t;
 
 typedef struct weaveffi_error { int32_t code; const char* message; } weaveffi_error;
 
-void weaveffi_error_clear(weaveffi_error* err);
-void weaveffi_free_string(const char* ptr);
-void weaveffi_free_bytes(uint8_t* ptr, size_t len);
+WEAVEFFI_API void weaveffi_error_clear(weaveffi_error* err);
+WEAVEFFI_API void weaveffi_free_string(const char* ptr);
+WEAVEFFI_API void weaveffi_free_bytes(uint8_t* ptr, size_t len);
 
 typedef struct weaveffi_cancel_token weaveffi_cancel_token;
-weaveffi_cancel_token* weaveffi_cancel_token_create(void);
-void weaveffi_cancel_token_cancel(weaveffi_cancel_token* token);
-bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token* token);
-void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
+WEAVEFFI_API weaveffi_cancel_token* weaveffi_cancel_token_create(void);
+WEAVEFFI_API void weaveffi_cancel_token_cancel(weaveffi_cancel_token* token);
+WEAVEFFI_API bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token* token);
+WEAVEFFI_API void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
 
 /*
  * Map convention: Maps are passed as parallel arrays of keys and values.
@@ -64,44 +88,44 @@ typedef void (*weaveffi_docs_publish_async_callback)(void* context, weaveffi_err
  *
  * Documents are persisted to disk and exposed via the public API.
  */
-weaveffi_docs_Document* weaveffi_docs_Document_create(int64_t id, const char* title, weaveffi_docs_Status status, const char* const* tags, size_t tags_len, weaveffi_error* out_err);
-void weaveffi_docs_Document_destroy(weaveffi_docs_Document* ptr);
+WEAVEFFI_API weaveffi_docs_Document* weaveffi_docs_Document_create(int64_t id, const char* title, weaveffi_docs_Status status, const char* const* tags, size_t tags_len, weaveffi_error* out_err);
+WEAVEFFI_API void weaveffi_docs_Document_destroy(weaveffi_docs_Document* ptr);
 /** Stable opaque identifier */
-int64_t weaveffi_docs_Document_get_id(const weaveffi_docs_Document* ptr);
+WEAVEFFI_API int64_t weaveffi_docs_Document_get_id(const weaveffi_docs_Document* ptr);
 /** Human-readable title shown in lists */
-const char* weaveffi_docs_Document_get_title(const weaveffi_docs_Document* ptr);
+WEAVEFFI_API const char* weaveffi_docs_Document_get_title(const weaveffi_docs_Document* ptr);
 /** Current lifecycle status */
-weaveffi_docs_Status weaveffi_docs_Document_get_status(const weaveffi_docs_Document* ptr);
+WEAVEFFI_API weaveffi_docs_Status weaveffi_docs_Document_get_status(const weaveffi_docs_Document* ptr);
 /** Free-form tags for grouping */
-const char** weaveffi_docs_Document_get_tags(const weaveffi_docs_Document* ptr, size_t* out_len);
+WEAVEFFI_API const char** weaveffi_docs_Document_get_tags(const weaveffi_docs_Document* ptr, size_t* out_len);
 
-weaveffi_docs_DocumentBuilder* weaveffi_docs_Document_Builder_new(void);
+WEAVEFFI_API weaveffi_docs_DocumentBuilder* weaveffi_docs_Document_Builder_new(void);
 /** Stable opaque identifier */
-void weaveffi_docs_Document_Builder_set_id(weaveffi_docs_DocumentBuilder* builder, int64_t id);
+WEAVEFFI_API void weaveffi_docs_Document_Builder_set_id(weaveffi_docs_DocumentBuilder* builder, int64_t id);
 /** Human-readable title shown in lists */
-void weaveffi_docs_Document_Builder_set_title(weaveffi_docs_DocumentBuilder* builder, const char* title);
+WEAVEFFI_API void weaveffi_docs_Document_Builder_set_title(weaveffi_docs_DocumentBuilder* builder, const char* title);
 /** Current lifecycle status */
-void weaveffi_docs_Document_Builder_set_status(weaveffi_docs_DocumentBuilder* builder, weaveffi_docs_Status status);
+WEAVEFFI_API void weaveffi_docs_Document_Builder_set_status(weaveffi_docs_DocumentBuilder* builder, weaveffi_docs_Status status);
 /** Free-form tags for grouping */
-void weaveffi_docs_Document_Builder_set_tags(weaveffi_docs_DocumentBuilder* builder, const char* const* tags, size_t tags_len);
-weaveffi_docs_Document* weaveffi_docs_Document_Builder_build(weaveffi_docs_DocumentBuilder* builder, weaveffi_error* out_err);
-void weaveffi_docs_Document_Builder_destroy(weaveffi_docs_DocumentBuilder* builder);
+WEAVEFFI_API void weaveffi_docs_Document_Builder_set_tags(weaveffi_docs_DocumentBuilder* builder, const char* const* tags, size_t tags_len);
+WEAVEFFI_API weaveffi_docs_Document* weaveffi_docs_Document_Builder_build(weaveffi_docs_DocumentBuilder* builder, weaveffi_error* out_err);
+WEAVEFFI_API void weaveffi_docs_Document_Builder_destroy(weaveffi_docs_DocumentBuilder* builder);
 
 /** Subscribe to document-saved notifications */
-uint64_t weaveffi_docs_register_saved_listener(weaveffi_docs_OnSaved_fn callback, void* context);
+WEAVEFFI_API uint64_t weaveffi_docs_register_saved_listener(weaveffi_docs_OnSaved_fn callback, void* context);
 /** Subscribe to document-saved notifications */
-void weaveffi_docs_unregister_saved_listener(uint64_t id);
+WEAVEFFI_API void weaveffi_docs_unregister_saved_listener(uint64_t id);
 /**
  * Create a brand new document.
  *
  * The document starts in `Draft` status; callers must publish
  * it explicitly to make it visible.
  */
-weaveffi_docs_Document* weaveffi_docs_create_document(const char* title, const char* const* tags, size_t tags_len, weaveffi_error* out_err);
+WEAVEFFI_API weaveffi_docs_Document* weaveffi_docs_create_document(const char* title, const char* const* tags, size_t tags_len, weaveffi_error* out_err);
 /** Look up a document by identifier */
-weaveffi_docs_Document* weaveffi_docs_get_document(int64_t id, weaveffi_error* out_err);
+WEAVEFFI_API weaveffi_docs_Document* weaveffi_docs_get_document(int64_t id, weaveffi_error* out_err);
 /** Publish a document in the background */
-void weaveffi_docs_publish_async_async(int64_t id, weaveffi_docs_publish_async_callback callback, void* context);
+WEAVEFFI_API void weaveffi_docs_publish_async_async(int64_t id, weaveffi_docs_publish_async_callback callback, void* context);
 
 
 #ifdef __cplusplus

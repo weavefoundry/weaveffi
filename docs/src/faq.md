@@ -150,7 +150,12 @@ Rust, no platform-specific dependencies). Generated outputs target
 Windows correctly:
 
 - **C / C++**: emitted headers are compiler-agnostic (MSVC, clang,
-  gcc).
+  gcc), and every prototype carries a portable `WEAVEFFI_API`
+  visibility macro. Consumers resolve it to `__declspec(dllimport)`;
+  a C/C++/Zig backend that implements the header builds its library
+  with `WEAVEFFI_BUILD` defined to export the symbols via
+  `__declspec(dllexport)` (see the
+  [C generator docs](generators/c.md#symbol-visibility)).
 - **.NET**: P/Invoke uses `DllImport` with the right calling
   conventions and looks up `weaveffi.dll`.
 - **Node.js**: the N-API addon builds with `node-gyp` on Windows.

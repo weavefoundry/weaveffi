@@ -246,6 +246,7 @@ pub fn render_c_header_from_model(
     out.push_str("#include <stdint.h>\n");
     out.push_str("#include <stddef.h>\n");
     out.push_str("#include <stdbool.h>\n\n");
+    cabi::render_visibility_macros(&mut out, prefix);
     out.push_str(&render_abi_prefix_aliases(prefix));
     out.push_str("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n");
     cabi::render_runtime_decls(&mut out, prefix);
@@ -418,6 +419,63 @@ mod tests {
         assert!(h.contains("#ifndef ACME_H"));
         assert!(h.contains("void acme_net_ping(acme_error* out_err);"));
         assert!(h.contains("#define acme_error weaveffi_error"));
+    }
+
+    #[test]
+    fn visibility_macro_defined_and_applied_to_prototypes() {
+        let m = Module {
+            functions: vec![func(
+                "add",
+                vec![param("a", TypeRef::I32), param("b", TypeRef::I32)],
+                Some(TypeRef::I32),
+            )],
+            ..module("math")
+        };
+        let h = header(&api(vec![m]), "weaveffi");
+        // The macro is defined behind an include guard with the three branches.
+        assert!(h.contains("#ifndef WEAVEFFI_API"));
+        assert!(h.contains("#      define WEAVEFFI_API __declspec(dllexport)"));
+        assert!(h.contains("#      define WEAVEFFI_API __declspec(dllimport)"));
+        assert!(h.contains("#    define WEAVEFFI_API __attribute__((visibility(\"default\")))"));
+        // Both runtime helpers and user functions carry the export tag.
+        assert!(h.contains("WEAVEFFI_API void weaveffi_free_string(const char* ptr);"));
+        assert!(h.contains(
+            "WEAVEFFI_API int32_t weaveffi_math_add(int32_t a, int32_t b, weaveffi_error* out_err);"
+        ));
+        // Type definitions are never tagged: they declare no exported symbol.
+        assert!(h.contains("typedef uint64_t weaveffi_handle_t;"));
+        assert!(!h.contains("WEAVEFFI_API typedef"));
+    }
+
+    #[test]
+    fn visibility_macro_follows_custom_prefix() {
+        let m = Module {
+            functions: vec![func("ping", vec![], None)],
+            ..module("net")
+        };
+        let h = header(&api(vec![m]), "acme");
+        assert!(h.contains("#ifndef ACME_API"));
+        assert!(h.contains("ifdef ACME_BUILD"));
+        assert!(h.contains("ACME_API void acme_net_ping(acme_error* out_err);"));
+        // The default-prefixed macro must not leak when a prefix is configured.
+        assert!(!h.contains("WEAVEFFI_API"));
+    }
+
+    #[test]
+    fn deprecated_uses_portable_macro_not_bare_attribute() {
+        let m = Module {
+            functions: vec![Function {
+                deprecated: Some("use bar instead".into()),
+                ..func("foo", vec![], None)
+            }],
+            ..module("legacy")
+        };
+        let h = header(&api(vec![m]), "weaveffi");
+        assert!(h.contains("#ifndef WEAVEFFI_DEPRECATED"));
+        assert!(h.contains("WEAVEFFI_DEPRECATED(\"use bar instead\")"));
+        // The message must travel through the macro, never a bare GCC attribute
+        // (which MSVC cannot parse).
+        assert!(!h.contains("__attribute__((deprecated(\"use bar instead\")))"));
     }
 
     #[test]

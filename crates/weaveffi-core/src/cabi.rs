@@ -30,11 +30,82 @@ pub fn params_str(params: &[AbiParam], prefix: &str) -> String {
         .join(", ")
 }
 
-/// Render a full `{ret} {symbol}({params});` declaration for a lowered symbol.
+/// The export-visibility macro name for `prefix`, for example `WEAVEFFI_API`.
+///
+/// Every exported function prototype is tagged with this macro so a non-Rust
+/// producer that implements the header can export the symbols under hidden
+/// default visibility, and Windows consumers import them through `dllimport`.
+/// See [`render_visibility_macros`] for the macro's definition.
+fn export_macro(prefix: &str) -> String {
+    format!("{}_API", prefix.to_uppercase())
+}
+
+/// The deprecation macro name for `prefix`, for example `WEAVEFFI_DEPRECATED`.
+///
+/// Used in place of a bare `__attribute__((deprecated))` so the marker also
+/// compiles under MSVC (which spells it `__declspec(deprecated(...))`).
+fn deprecated_macro(prefix: &str) -> String {
+    format!("{}_DEPRECATED", prefix.to_uppercase())
+}
+
+/// Render the portable export-visibility and deprecation macros that the C ABI
+/// declarations are tagged with.
+///
+/// The C ABI header is both consumed (callers link the prebuilt library) and,
+/// for non-Rust producers, implemented directly (C, C++, or Zig supply the
+/// symbols). A bare prototype exports nothing under hidden default visibility
+/// (`-fvisibility=hidden`, the norm for release builds and the MSVC default),
+/// so an implementing library compiled that way ships no usable symbols. These
+/// macros fix that portably:
+///
+/// - `{PREFIX}_API` expands to `__declspec(dllexport)` when the producer
+///   defines `{PREFIX}_BUILD`, `__declspec(dllimport)` otherwise on Windows,
+///   `__attribute__((visibility("default")))` on GCC and Clang, and nothing
+///   elsewhere.
+/// - `{PREFIX}_DEPRECATED(msg)` expands to the compiler's deprecation marker.
+///
+/// Both definitions are wrapped in `#ifndef` guards so a translation unit that
+/// includes both the C header and the C++ header (which inlines the same
+/// declarations) defines each macro only once. The names are derived from the
+/// configured symbol prefix so two WeaveFFI libraries included together never
+/// collide.
+pub fn render_visibility_macros(out: &mut String, prefix: &str) {
+    let body = r#"#ifndef @U@_API
+#  if defined(_WIN32) || defined(__CYGWIN__)
+#    ifdef @U@_BUILD
+#      define @U@_API __declspec(dllexport)
+#    else
+#      define @U@_API __declspec(dllimport)
+#    endif
+#  elif defined(__GNUC__) && (__GNUC__ >= 4)
+#    define @U@_API __attribute__((visibility("default")))
+#  else
+#    define @U@_API
+#  endif
+#endif
+
+#ifndef @U@_DEPRECATED
+#  if defined(_MSC_VER)
+#    define @U@_DEPRECATED(msg) __declspec(deprecated(msg))
+#  elif defined(__GNUC__) || defined(__clang__)
+#    define @U@_DEPRECATED(msg) __attribute__((deprecated(msg)))
+#  else
+#    define @U@_DEPRECATED(msg)
+#  endif
+#endif
+
+"#;
+    out.push_str(&body.replace("@U@", &prefix.to_uppercase()));
+}
+
+/// Render a full `{API} {ret} {symbol}({params});` declaration for a lowered
+/// symbol, tagged with the export-visibility macro (see
+/// [`render_visibility_macros`]).
 pub fn fn_decl(out: &mut String, f: &AbiFn, prefix: &str) {
     let _ = writeln!(
         out,
-        "{} {}({});",
+        "{} {} {}({});",
+        export_macro(prefix),
         f.ret.render_c(prefix),
         f.symbol,
         params_str(&f.params, prefix)
@@ -44,18 +115,19 @@ pub fn fn_decl(out: &mut String, f: &AbiFn, prefix: &str) {
 /// Render the runtime typedefs and helper prototypes (`handle_t`, `error`,
 /// `free_*`, `cancel_token`) that every WeaveFFI C surface depends on.
 pub fn render_runtime_decls(out: &mut String, prefix: &str) {
+    let api = export_macro(prefix);
     let _ = write!(
         out,
         "typedef uint64_t {prefix}_handle_t;\n\n\
          typedef struct {prefix}_error {{ int32_t code; const char* message; }} {prefix}_error;\n\n\
-         void {prefix}_error_clear({prefix}_error* err);\n\
-         void {prefix}_free_string(const char* ptr);\n\
-         void {prefix}_free_bytes(uint8_t* ptr, size_t len);\n\n\
+         {api} void {prefix}_error_clear({prefix}_error* err);\n\
+         {api} void {prefix}_free_string(const char* ptr);\n\
+         {api} void {prefix}_free_bytes(uint8_t* ptr, size_t len);\n\n\
          typedef struct {prefix}_cancel_token {prefix}_cancel_token;\n\
-         {prefix}_cancel_token* {prefix}_cancel_token_create(void);\n\
-         void {prefix}_cancel_token_cancel({prefix}_cancel_token* token);\n\
-         bool {prefix}_cancel_token_is_cancelled(const {prefix}_cancel_token* token);\n\
-         void {prefix}_cancel_token_destroy({prefix}_cancel_token* token);\n\n",
+         {api} {prefix}_cancel_token* {prefix}_cancel_token_create(void);\n\
+         {api} void {prefix}_cancel_token_cancel({prefix}_cancel_token* token);\n\
+         {api} bool {prefix}_cancel_token_is_cancelled(const {prefix}_cancel_token* token);\n\
+         {api} void {prefix}_cancel_token_destroy({prefix}_cancel_token* token);\n\n",
     );
 }
 
@@ -108,9 +180,10 @@ fn render_rich_enum_fn_decls(out: &mut String, e: &EnumBinding, prefix: &str) {
     let Some(rich) = &e.rich else {
         return;
     };
+    let api = export_macro(prefix);
     let tag = &e.c_tag;
     emit_doc(out, &e.doc, "");
-    let _ = writeln!(out, "int32_t {}(const {tag}* self);", rich.tag_symbol);
+    let _ = writeln!(out, "{api} int32_t {}(const {tag}* self);", rich.tag_symbol);
     for v in &rich.variants {
         emit_doc(out, &v.doc, "");
         fn_decl(out, &v.create, prefix);
@@ -125,14 +198,14 @@ fn render_rich_enum_fn_decls(out: &mut String, e: &EnumBinding, prefix: &str) {
             );
             let _ = writeln!(
                 out,
-                "{} {}({});",
+                "{api} {} {}({});",
                 field.getter_ret.render_c(prefix),
                 field.getter_symbol,
                 parts.join(", ")
             );
         }
     }
-    let _ = writeln!(out, "void {}({tag}* self);", rich.destroy_symbol);
+    let _ = writeln!(out, "{api} void {}({tag}* self);", rich.destroy_symbol);
     out.push('\n');
 }
 
@@ -155,10 +228,11 @@ fn render_struct_tags(out: &mut String, s: &StructBinding) {
 /// struct (and every other struct it may reference) already has a forward
 /// typedef emitted via [`render_struct_tags`].
 fn render_struct_fn_decls(out: &mut String, s: &StructBinding, prefix: &str) {
+    let api = export_macro(prefix);
     let tag = &s.c_tag;
     emit_doc(out, &s.doc, "");
     fn_decl(out, &s.create, prefix);
-    let _ = writeln!(out, "void {}({tag}* ptr);", s.destroy_symbol);
+    let _ = writeln!(out, "{api} void {}({tag}* ptr);", s.destroy_symbol);
     for field in &s.fields {
         emit_doc(out, &field.doc, "");
         let mut parts = vec![format!("const {tag}* ptr")];
@@ -170,7 +244,7 @@ fn render_struct_fn_decls(out: &mut String, s: &StructBinding, prefix: &str) {
         );
         let _ = writeln!(
             out,
-            "{} {}({});",
+            "{api} {} {}({});",
             field.getter_ret.render_c(prefix),
             field.getter_symbol,
             parts.join(", ")
@@ -180,21 +254,21 @@ fn render_struct_fn_decls(out: &mut String, s: &StructBinding, prefix: &str) {
 
     if let Some(b) = &s.builder {
         let bt = &b.builder_tag;
-        let _ = writeln!(out, "{bt}* {}(void);", b.new_symbol);
+        let _ = writeln!(out, "{api} {bt}* {}(void);", b.new_symbol);
         for (field, (_, setter)) in s.fields.iter().zip(&b.setters) {
             emit_doc(out, &field.doc, "");
             let _ = writeln!(
                 out,
-                "void {setter}({bt}* builder, {});",
+                "{api} void {setter}({bt}* builder, {});",
                 params_str(&field.value_params, prefix)
             );
         }
         let _ = writeln!(
             out,
-            "{tag}* {}({bt}* builder, {prefix}_error* out_err);",
+            "{api} {tag}* {}({bt}* builder, {prefix}_error* out_err);",
             b.build_symbol
         );
-        let _ = writeln!(out, "void {}({bt}* builder);", b.destroy_symbol);
+        let _ = writeln!(out, "{api} void {}({bt}* builder);", b.destroy_symbol);
         out.push('\n');
     }
 }
@@ -263,6 +337,8 @@ pub fn render_module_callback_types(out: &mut String, module: &ModuleBinding, pr
 /// type tags and callback typedefs are assumed already emitted (phases 1a–1c).
 /// Caller controls the leading `// Module:` comment and any framing.
 pub fn render_module_fn_decls(out: &mut String, module: &ModuleBinding, prefix: &str) {
+    let api = export_macro(prefix);
+    let deprecated = deprecated_macro(prefix);
     for e in &module.enums {
         render_rich_enum_fn_decls(out, e, prefix);
     }
@@ -273,27 +349,23 @@ pub fn render_module_fn_decls(out: &mut String, module: &ModuleBinding, prefix: 
         emit_doc(out, &l.doc, "");
         let _ = writeln!(
             out,
-            "uint64_t {}({} callback, void* context);",
+            "{api} uint64_t {}({} callback, void* context);",
             l.register_symbol, l.callback_c_fn_type
         );
         emit_doc(out, &l.doc, "");
-        let _ = writeln!(out, "void {}(uint64_t id);", l.unregister_symbol);
+        let _ = writeln!(out, "{api} void {}(uint64_t id);", l.unregister_symbol);
     }
     for f in &module.functions {
         emit_doc(out, &f.doc, "");
         if let Some(msg) = &f.deprecated {
-            let _ = writeln!(
-                out,
-                "__attribute__((deprecated(\"{}\")))",
-                msg.replace('"', "\\\"")
-            );
+            let _ = writeln!(out, "{deprecated}(\"{}\")", msg.replace('"', "\\\""));
         }
         match &f.shape {
             CallShape::Iterator(it) => {
                 let t = &it.iter_tag;
                 fn_decl(out, &it.launch, prefix);
                 fn_decl(out, &it.next, prefix);
-                let _ = writeln!(out, "void {}({t}* iter);", it.destroy_symbol);
+                let _ = writeln!(out, "{api} void {}({t}* iter);", it.destroy_symbol);
             }
             CallShape::Async(a) => {
                 fn_decl(out, &a.launch, prefix);
