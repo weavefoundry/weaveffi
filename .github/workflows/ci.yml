@@ -211,7 +211,7 @@ jobs:
     # symbol, or skips a feature fails here (unlike the examples/ smoke programs
     # in build-test, which mostly check exit status). Covers contacts + events +
     # kvstore across C, C++, Python, Ruby, Dart, Go, Swift, .NET, Node, Kotlin,
-    # and WASM: the events lanes exercise listeners/callbacks + iterators, and
+    # and Wasm: the events lanes exercise listeners/callbacks + iterators, and
     # the kvstore lanes exercise handles, struct getters (bytes/optional/list/
     # map), builders, eviction listeners, and async; see conformance/run.sh.
     name: Conformance harness

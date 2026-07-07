@@ -275,7 +275,7 @@ fn render_c_convenience_c(prefix: &str, input_basename: &str, filename: &str) ->
         "#include \"{prefix}.h\"\n\n\
          #include <stdlib.h>\n\n\
          // Default implementations of the linear-memory allocator declared in\n\
-         // {prefix}.h. The WASM JS glue stages call arguments through these; a\n\
+         // {prefix}.h. The Wasm JS glue stages call arguments through these; a\n\
          // producer that ships its own allocator can omit this file from the\n\
          // build. The size is unused on dealloc because free() recovers it.\n\
          {api} uint8_t* {prefix}_alloc(uint32_t size) {{\n\

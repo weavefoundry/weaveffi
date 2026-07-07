@@ -20,7 +20,7 @@ evaluate against it: **UniFFI**, **cbindgen**, **diplomat**, **SWIG**, and
 | Swift                              | ✓ (SwiftPM, `async/await`, `throws`) | ✓ | ✗ | ✓ | ✗ | ✗ |
 | Kotlin / Android (JNI)             | ✓ (Kotlin + JNI shim + Gradle) | ✓ | ✗ | ✗ | ✓ (Java via JNI) | ✗ |
 | Node.js                            | ✓ (N-API + `.d.ts`) | community add-on | ✗ | ✗ | ✓ (JavaScriptCore/V8) | ✗ |
-| WebAssembly                        | ✓ (loader + `.d.ts`) | ✗ | ✗ | ✓ (JS via WASM) | ✗ | ✗ |
+| WebAssembly                        | ✓ (loader + `.d.ts`) | ✗ | ✗ | ✓ (JS via Wasm) | ✗ | ✗ |
 | Python                             | ✓ (`ctypes` + `.pyi`) | ✓ | ✗ | ✗ | ✓ | ✗ |
 | .NET / C#                          | ✓ (P/Invoke + `.csproj`) | ✓ (community) | ✗ | ✗ | ✓ | ✗ |
 | Dart / Flutter                     | ✓ (`dart:ffi`)         | community | ✗ | ✓ | ✗ | ✗ |

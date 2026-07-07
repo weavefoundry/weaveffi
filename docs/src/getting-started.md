@@ -94,7 +94,7 @@ generated/
 ├── swift/      # SwiftPM package + Swift wrapper
 ├── android/    # Kotlin JNI wrapper + Gradle skeleton
 ├── node/       # N-API loader + TypeScript types
-├── wasm/       # WASM loader stub
+├── wasm/       # Wasm loader stub
 └── scaffold.rs # Rust FFI function stubs
 ```
 

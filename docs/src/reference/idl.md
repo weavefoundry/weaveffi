@@ -95,7 +95,7 @@ A complete, validating example lives at the bottom of this page in the
 
 The optional top-level `package` block is the single source of truth for the
 publishable identity stamped into every generated ecosystem manifest:
-`package.json` (Node/WASM), `pyproject.toml`/`setup.py` (Python),
+`package.json` (Node/Wasm), `pyproject.toml`/`setup.py` (Python),
 `*.gemspec` (Ruby), `*.csproj`/`*.nuspec` (.NET), `pubspec.yaml` (Dart),
 `Package.swift` (Swift), `go.mod` (Go), `settings.gradle` (Android), and
 `CMakeLists.txt` (C++). Declaring it once keeps the name, version, and
@@ -186,7 +186,7 @@ parameters and return types.
 | `&str`        | Borrowed string (zero-copy, param-only) | `"hello"`  |
 | `&[u8]`       | Borrowed byte slice (zero-copy, param-only) | binary data |
 
-> **Note on JavaScript/WASM:** 64-bit integers (`i64`, `u64`) surface as
+> **Note on JavaScript/Wasm:** 64-bit integers (`i64`, `u64`) surface as
 > `BigInt` in the Node and WebAssembly backends; all narrower integers and the
 > floats surface as `number`.
 
@@ -989,7 +989,7 @@ All types are valid in both parameter and return positions unless noted.
 | `u8`           | yes    | yes     | yes           |                        |
 | `u16`          | yes    | yes     | yes           |                        |
 | `u32`          | yes    | yes     | yes           |                        |
-| `u64`          | yes    | yes     | yes           | `BigInt` in JS/WASM    |
+| `u64`          | yes    | yes     | yes           | `BigInt` in JS/Wasm    |
 | `f32`          | yes    | yes     | yes           |                        |
 | `f64`          | yes    | yes     | yes           |                        |
 | `bool`         | yes    | yes     | yes           |                        |
@@ -1143,7 +1143,7 @@ Per-target syntax:
 | Swift               | `/// ...` per line                                | `/// - Parameter name: ...`             |
 | Kotlin / Android    | `/** ... */` KDoc block                           | `@param name ...` inside the KDoc block |
 | TypeScript (Node)   | `/** ... */` JSDoc                                | `@param name ...`                       |
-| TypeScript (WASM)   | `/** ... */` JSDoc                                | `@param name ...`                       |
+| TypeScript (Wasm)   | `/** ... */` JSDoc                                | `@param name ...`                       |
 | Python              | `"""..."""` first statement; `# ...` above C ABI binds | NumPy-style `Parameters` section in the wrapper docstring |
 | .NET (C#)           | `/// <summary>...</summary>` XML doc              | `/// <param name="name">...</param>`    |
 | Dart                | `/// ...`                                         | not emitted                             |

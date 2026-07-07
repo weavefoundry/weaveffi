@@ -122,7 +122,7 @@ pub fn fn_decl(out: &mut String, f: &AbiFn, prefix: &str) {
 /// `free_*`, `alloc`/`dealloc`, `cancel_token`) that every WeaveFFI C surface
 /// depends on.
 ///
-/// `alloc`/`dealloc` back the WASM JavaScript glue, which stages strings,
+/// `alloc`/`dealloc` back the Wasm JavaScript glue, which stages strings,
 /// bytes, and arrays into linear memory before each call. Native consumers
 /// never call them, but a producer targeting WebAssembly (for example a C
 /// library built with Emscripten) must export them; the generated
@@ -136,7 +136,7 @@ pub fn render_runtime_decls(out: &mut String, prefix: &str) {
          {api} void {prefix}_error_clear({prefix}_error* err);\n\
          {api} void {prefix}_free_string(const char* ptr);\n\
          {api} void {prefix}_free_bytes(uint8_t* ptr, size_t len);\n\n\
-         /* Linear-memory allocator used by the WASM JS glue to stage call\n   \
+         /* Linear-memory allocator used by the Wasm JS glue to stage call\n   \
            arguments. Native consumers never call these; producers targeting\n   \
            WebAssembly must export them (the generated {prefix}.c provides\n   \
            malloc/free-backed defaults). */\n\

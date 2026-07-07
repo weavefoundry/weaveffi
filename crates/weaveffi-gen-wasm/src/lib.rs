@@ -235,14 +235,14 @@ fn wasm_type_note(ty: &TypeRef) -> &'static str {
     match ty {
         TypeRef::I8 => "8-bit signed mapped to i32",
         TypeRef::I16 => "16-bit signed mapped to i32",
-        TypeRef::I32 => "native WASM i32",
+        TypeRef::I32 => "native Wasm i32",
         TypeRef::U8 => "8-bit unsigned mapped to i32",
         TypeRef::U16 => "16-bit unsigned mapped to i32",
         TypeRef::U32 => "unsigned mapped to i32",
-        TypeRef::I64 => "native WASM i64",
+        TypeRef::I64 => "native Wasm i64",
         TypeRef::U64 => "unsigned mapped to i64",
-        TypeRef::F32 => "native WASM f32",
-        TypeRef::F64 => "native WASM f64",
+        TypeRef::F32 => "native Wasm f32",
+        TypeRef::F64 => "native Wasm f64",
         TypeRef::Bool => "0 = false, 1 = true",
         TypeRef::StringUtf8 | TypeRef::BorrowedStr | TypeRef::Bytes | TypeRef::BorrowedBytes => {
             "ptr + len in linear memory"
@@ -291,7 +291,7 @@ fn type_display(ty: &TypeRef) -> String {
 
 fn render_wasm_readme(api: &Api, prefix: &str, input_basename: &str, emscripten: bool) -> String {
     let mut out = render_prelude(CommentStyle::Xml, input_basename);
-    out.push_str("# WeaveFFI WASM (experimental)\n\n");
+    out.push_str("# WeaveFFI Wasm (experimental)\n\n");
     if emscripten {
         out.push_str("This folder contains a minimal stub to help you load an Emscripten build of your WeaveFFI library.\n\n");
         out.push_str("Build (example):\n\n");
@@ -332,7 +332,7 @@ fn render_wasm_readme(api: &Api, prefix: &str, input_basename: &str, emscripten:
         out.push_str("Then serve the `.wasm` and use `weaveffi_wasm.js` to load it.\n\n");
     }
     out.push_str("## Complex Type Handling\n\n");
-    out.push_str("WASM only supports numeric types natively (`i32`, `i64`, `f32`, `f64`). ");
+    out.push_str("Wasm only supports numeric types natively (`i32`, `i64`, `f32`, `f64`). ");
     out.push_str("Complex types are encoded at the boundary as follows:\n\n");
     out.push_str("### Structs\n\n");
     out.push_str("Structs are passed as **opaque handles** (`i64` pointers into linear memory). ");
@@ -354,7 +354,7 @@ fn render_wasm_readme(api: &Api, prefix: &str, input_basename: &str, emscripten:
     out.push_str("for allocating and freeing the backing memory.\n");
     out.push_str("\n### Error Handling\n\n");
     out.push_str("The generated JS wrappers automatically handle errors by passing an error\n");
-    out.push_str("pointer as the last argument to each WASM function. Your WASM module must\n");
+    out.push_str("pointer as the last argument to each Wasm function. Your Wasm module must\n");
     out.push_str("export the following functions:\n\n");
     out.push_str("- `weaveffi_alloc(size: i32) -> i32`: allocate `size` bytes in linear memory\n");
     out.push_str("- `weaveffi_error_clear(err_ptr: i32)`: clear and free error resources\n");
@@ -458,7 +458,7 @@ fn render_function_ref(out: &mut String, f: &FnBinding) {
         params_sig.join(", ")
     ));
 
-    out.push_str("| Param | API Type | WASM | Notes |\n");
+    out.push_str("| Param | API Type | Wasm | Notes |\n");
     out.push_str("|-------|----------|------|-------|\n");
     for param in &f.params {
         out.push_str(&format!(
@@ -490,7 +490,7 @@ fn render_struct_ref(out: &mut String, s: &StructBinding) {
     out.push_str("Passed as opaque handle (`i64`).\n\n");
 
     if !s.fields.is_empty() {
-        out.push_str("| Accessor | WASM Return |\n");
+        out.push_str("| Accessor | Wasm Return |\n");
         out.push_str("|----------|-------------|\n");
         for field in &s.fields {
             out.push_str(&format!(
@@ -690,7 +690,7 @@ fn js_arg_scalar(ty: &TypeRef, val: &str) -> String {
     }
 }
 
-/// Stage one idiomatic input `value` of type `ty` into the WASM ABI.
+/// Stage one idiomatic input `value` of type `ty` into the Wasm ABI.
 ///
 /// Pushes any pre-call statements to `out` (at `indent`), the produced i32/i64
 /// call arguments to `args`, and any post-call cleanup statements to `cleanup`.
@@ -1211,7 +1211,7 @@ fn render_wasm_dts(
     let interface_name = format!("{pascal_name}Module");
     let load_fn = format!("load{pascal_name}");
     let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
-    out.push_str("// Generated TypeScript declarations for WeaveFFI WASM bindings\n\n");
+    out.push_str("// Generated TypeScript declarations for WeaveFFI Wasm bindings\n\n");
 
     for (m, _path) in walk_modules_with_path(&api.modules) {
         for s in &m.structs {
@@ -1461,7 +1461,7 @@ fn render_wasm_js_stub(
         _ => false,
     });
 
-    out.push_str("// WeaveFFI WASM bindings (auto-generated)\n");
+    out.push_str("// WeaveFFI Wasm bindings (auto-generated)\n");
     out.push_str("//\n");
     if emscripten {
         out.push_str("// Boundary conventions for an Emscripten build:\n");
@@ -1631,12 +1631,12 @@ fn render_wasm_js_stub(
             out.push_str(" * @returns {Promise<Object>} The API bindings.\n");
         }
     } else {
-        out.push_str(" * Load a WeaveFFI WASM module from the given URL.\n");
+        out.push_str(" * Load a WeaveFFI Wasm module from the given URL.\n");
         out.push_str(" *\n");
         out.push_str(" * @param {string} url - URL to the `.wasm` file.\n");
         if api.modules.is_empty() {
             out.push_str(
-                " * @returns {Promise<WebAssembly.Exports>} The exported WASM functions.\n",
+                " * @returns {Promise<WebAssembly.Exports>} The exported Wasm functions.\n",
             );
         } else {
             out.push_str(" * @returns {Promise<Object>} The API bindings.\n");
@@ -2868,9 +2868,9 @@ mod tests {
     #[test]
     fn api_reference_function_param_table() {
         let readme = render_wasm_readme(&sample_api(), "weaveffi", "weaveffi.yml", false);
-        assert!(readme.contains("| `a` | `i32` | `i32` | native WASM i32 |"));
-        assert!(readme.contains("| `b` | `i32` | `i32` | native WASM i32 |"));
-        assert!(readme.contains("| _returns_ | `i32` | `i32` | native WASM i32 |"));
+        assert!(readme.contains("| `a` | `i32` | `i32` | native Wasm i32 |"));
+        assert!(readme.contains("| `b` | `i32` | `i32` | native Wasm i32 |"));
+        assert!(readme.contains("| _returns_ | `i32` | `i32` | native Wasm i32 |"));
     }
 
     #[test]
@@ -2933,7 +2933,7 @@ mod tests {
 
     #[test]
     fn wasm_type_note_covers_all_variants() {
-        assert_eq!(wasm_type_note(&TypeRef::I32), "native WASM i32");
+        assert_eq!(wasm_type_note(&TypeRef::I32), "native Wasm i32");
         assert_eq!(wasm_type_note(&TypeRef::U32), "unsigned mapped to i32");
         assert_eq!(wasm_type_note(&TypeRef::Bool), "0 = false, 1 = true");
         assert_eq!(
@@ -3558,7 +3558,7 @@ mod tests {
         );
         assert!(
             js.contains("_cstr(wasm, name)"),
-            "string param should be copied to WASM memory via _cstr"
+            "string param should be copied to Wasm memory via _cstr"
         );
         assert!(
             !js.contains("free(name"),
@@ -3692,11 +3692,11 @@ mod tests {
         );
         assert!(
             js.contains("__indirect_function_table"),
-            "should reference the WASM function table: {js}"
+            "should reference the Wasm function table: {js}"
         );
     }
 
-    /// The WASM bindings register one trampoline per async-callback
+    /// The Wasm bindings register one trampoline per async-callback
     /// signature on the indirect function table for the lifetime of the API
     /// instance and route per-call resolve/reject through the
     /// `_asyncContexts` map. Each entry is `set(ctxId, ...)` once and

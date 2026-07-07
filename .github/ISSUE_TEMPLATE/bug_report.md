@@ -26,7 +26,7 @@ ran.
 - WeaveFFI version:
 - OS:
 - Rust version (`rustc --version`):
-- Target generator(s): C / C++ / Swift / Android / Node / WASM / Python / .NET / Dart / Go / Ruby
+- Target generator(s): C / C++ / Swift / Android / Node / Wasm / Python / .NET / Dart / Go / Ruby
 
 ## Logs or output
 

@@ -234,7 +234,7 @@ The one exception is per-target capability gating: each generator
 declares a `TargetCapabilities` (async, callbacks, listeners,
 iterators), and the orchestrator fails generation (listing the
 offending IDL definitions) when a selected target cannot deliver a
-used feature. Today only WASM declares gaps (callbacks and listeners);
+used feature. Today only Wasm declares gaps (callbacks and listeners);
 its `allow_unsupported = true` config opts into generating the rest of
 the surface with explicit throwing stubs in place of the unsupported
 entry points. Capability failures must stay loud: never skip a
@@ -489,7 +489,7 @@ their generator rather than leaking into the shared model:
 Imperative generators (Go cgo, Node, Dart, Swift) build their FFI
 signatures inline with marshalling code and share the single
 `is_c_pointer_type` classifier in `weaveffi_core::codegen::common`. The
-Android (JNI) and WASM backends target different ABIs entirely and do
+Android (JNI) and Wasm backends target different ABIs entirely and do
 not consume the C lowering.
 
 When you add a parameter shape or change how a type crosses the

@@ -5,7 +5,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 <!-- DO NOT EDIT. Your changes will be overwritten. -->
 <!-- To regenerate: weaveffi generate weaveffi.yml -o <out> -->
 
-# WeaveFFI WASM (experimental)
+# WeaveFFI Wasm (experimental)
 
 This folder contains a minimal stub to help you load a `wasm32-unknown-unknown` build of your WeaveFFI library.
 
@@ -19,7 +19,7 @@ Then serve the `.wasm` and use `weaveffi_wasm.js` to load it.
 
 ## Complex Type Handling
 
-WASM only supports numeric types natively (`i32`, `i64`, `f32`, `f64`). Complex types are encoded at the boundary as follows:
+Wasm only supports numeric types natively (`i32`, `i64`, `f32`, `f64`). Complex types are encoded at the boundary as follows:
 
 ### Structs
 
@@ -40,7 +40,7 @@ Lists are passed as a **pointer + length** pair (`i32` pointer, `i32` length) re
 ### Error Handling
 
 The generated JS wrappers automatically handle errors by passing an error
-pointer as the last argument to each WASM function. Your WASM module must
+pointer as the last argument to each Wasm function. Your Wasm module must
 export the following functions:
 
 - `weaveffi_alloc(size: i32) -> i32`: allocate `size` bytes in linear memory
@@ -58,9 +58,9 @@ Construct a Canvas.
 
 `weaveffi_graphics_new_canvas(width: i32) -> i64`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `width` | `i32` | `i32` | native WASM i32 |
+| `width` | `i32` | `i32` | native Wasm i32 |
 | _returns_ | `Canvas` | `i64` | opaque handle in linear memory |
 
 #### Structs
@@ -71,7 +71,7 @@ Top-level struct that references a struct defined one level deeper.
 
 Passed as opaque handle (`i64`).
 
-| Accessor | WASM Return |
+| Accessor | Wasm Return |
 |----------|-------------|
 | `weaveffi_graphics_Canvas_get_width` | `i32` |
 | `weaveffi_graphics_Canvas_get_root` | `i64` |

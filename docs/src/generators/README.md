@@ -24,7 +24,7 @@ uses a feature the selected target cannot deliver (no silent skips).
 | Dart | ✓ (`Future<T>`) | ✓ | ✓ (`NativeCallable`) | ✓ |
 | Go | ✓ (blocking bridge) | ✓ | ✓ (exported trampolines) | ✓ |
 | Ruby | ✓ (blocking bridge) | ✓ | ✓ (`FFI::Function`) | ✓ |
-| WASM | ✓ (`Promise<T>`) | ✓ | ✗ | ✗ |
+| Wasm | ✓ (`Promise<T>`) | ✓ | ✗ | ✗ |
 
 Notes:
 
@@ -32,7 +32,7 @@ Notes:
   producer's completion callback fires (a channel receive in Go, a
   `Queue#pop` in Ruby). Run them from a goroutine or Ruby thread for
   concurrency; the native producer still runs off-thread.
-- **WASM callbacks/listeners** are unsupported: a
+- **Wasm callbacks/listeners** are unsupported: a
   `wasm32-unknown-unknown` module is single-threaded and has no producer
   thread to deliver events. Generation fails unless you opt in with
   `allow_unsupported = true` ([details](wasm.md#capabilities-and-allow_unsupported)),

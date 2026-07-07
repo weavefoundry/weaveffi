@@ -11,7 +11,7 @@ production at Mozilla, and is the right choice if you only need Swift,
 Kotlin, and Python. We built WeaveFFI because we needed:
 
 - **More targets out of the box.** WeaveFFI ships first-class generators
-  for C, C++, Swift, Kotlin/Android, Node.js, WASM, Python, .NET, Dart,
+  for C, C++, Swift, Kotlin/Android, Node.js, Wasm, Python, .NET, Dart,
   Go, and Ruby, eleven in total. UniFFI's first-party language list is
   shorter and the rest live as community extensions of varying maturity.
 - **A standalone CLI workflow.** WeaveFFI is a single binary
@@ -102,7 +102,7 @@ Each target language maps this to its native error story:
 - **Kotlin**: checked exceptions (`WeaveFFIException`).
 - **Node.js / TypeScript**: thrown `Error` objects (or
   `Promise.reject` for `async`).
-- **WASM/JS**: thrown `Error`.
+- **Wasm/JS**: thrown `Error`.
 - **Python**: raised `WeaveFFIError`.
 - **.NET**: thrown `WeaveFFIException`.
 - **Dart**: thrown `WeaveFFIException`.

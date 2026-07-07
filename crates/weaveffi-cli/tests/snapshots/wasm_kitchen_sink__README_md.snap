@@ -5,7 +5,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 <!-- DO NOT EDIT. Your changes will be overwritten. -->
 <!-- To regenerate: weaveffi generate weaveffi.yml -o <out> -->
 
-# WeaveFFI WASM (experimental)
+# WeaveFFI Wasm (experimental)
 
 This folder contains a minimal stub to help you load a `wasm32-unknown-unknown` build of your WeaveFFI library.
 
@@ -19,7 +19,7 @@ Then serve the `.wasm` and use `weaveffi_wasm.js` to load it.
 
 ## Complex Type Handling
 
-WASM only supports numeric types natively (`i32`, `i64`, `f32`, `f64`). Complex types are encoded at the boundary as follows:
+Wasm only supports numeric types natively (`i32`, `i64`, `f32`, `f64`). Complex types are encoded at the boundary as follows:
 
 ### Structs
 
@@ -40,7 +40,7 @@ Lists are passed as a **pointer + length** pair (`i32` pointer, `i32` length) re
 ### Error Handling
 
 The generated JS wrappers automatically handle errors by passing an error
-pointer as the last argument to each WASM function. Your WASM module must
+pointer as the last argument to each Wasm function. Your Wasm module must
 export the following functions:
 
 - `weaveffi_alloc(size: i32) -> i32`: allocate `size` bytes in linear memory
@@ -71,7 +71,7 @@ Trivial cross-module helper
 
 `weaveffi_shared_ping() -> i32, i32`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | _returns_ | `string` | `i32, i32` | ptr + len in linear memory |
 
@@ -83,7 +83,7 @@ A reusable token referenced across modules
 
 Passed as opaque handle (`i64`).
 
-| Accessor | WASM Return |
+| Accessor | Wasm Return |
 |----------|-------------|
 | `weaveffi_shared_Token_get_id` | `i64` |
 | `weaveffi_shared_Token_get_label` | `i32, i32` |
@@ -98,7 +98,7 @@ Identity for bool
 
 `weaveffi_kitchen_bool_id(x: i32) -> i32`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | `x` | `bool` | `i32` | 0 = false, 1 = true |
 | _returns_ | `bool` | `i32` | 0 = false, 1 = true |
@@ -107,16 +107,16 @@ Identity for bool
 
 `weaveffi_kitchen_i32_id(x: i32) -> i32`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `x` | `i32` | `i32` | native WASM i32 |
-| _returns_ | `i32` | `i32` | native WASM i32 |
+| `x` | `i32` | `i32` | native Wasm i32 |
+| _returns_ | `i32` | `i32` | native Wasm i32 |
 
 ##### `weaveffi_kitchen_u32_id`
 
 `weaveffi_kitchen_u32_id(x: i32) -> i32`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | `x` | `u32` | `i32` | unsigned mapped to i32 |
 | _returns_ | `u32` | `i32` | unsigned mapped to i32 |
@@ -125,25 +125,25 @@ Identity for bool
 
 `weaveffi_kitchen_i64_id(x: i64) -> i64`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `x` | `i64` | `i64` | native WASM i64 |
-| _returns_ | `i64` | `i64` | native WASM i64 |
+| `x` | `i64` | `i64` | native Wasm i64 |
+| _returns_ | `i64` | `i64` | native Wasm i64 |
 
 ##### `weaveffi_kitchen_f64_id`
 
 `weaveffi_kitchen_f64_id(x: f64) -> f64`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `x` | `f64` | `f64` | native WASM f64 |
-| _returns_ | `f64` | `f64` | native WASM f64 |
+| `x` | `f64` | `f64` | native Wasm f64 |
+| _returns_ | `f64` | `f64` | native Wasm f64 |
 
 ##### `weaveffi_kitchen_echo_string`
 
 `weaveffi_kitchen_echo_string(s: i32, i32) -> i32, i32`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | `s` | `string` | `i32, i32` | ptr + len in linear memory |
 | _returns_ | `string` | `i32, i32` | ptr + len in linear memory |
@@ -152,7 +152,7 @@ Identity for bool
 
 `weaveffi_kitchen_echo_bytes(b: i32, i32) -> i32, i32`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | `b` | `bytes` | `i32, i32` | ptr + len in linear memory |
 | _returns_ | `bytes` | `i32, i32` | ptr + len in linear memory |
@@ -163,7 +163,7 @@ Borrowed string parameter
 
 `weaveffi_kitchen_echo_borrowed_str(s: i32, i32) -> i32, i32`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | `s` | `string` | `i32, i32` | ptr + len in linear memory |
 | _returns_ | `string` | `i32, i32` | ptr + len in linear memory |
@@ -174,7 +174,7 @@ Borrowed bytes parameter
 
 `weaveffi_kitchen_echo_borrowed_bytes(b: i32, i32) -> i32, i32`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | `b` | `bytes` | `i32, i32` | ptr + len in linear memory |
 | _returns_ | `bytes` | `i32, i32` | ptr + len in linear memory |
@@ -185,7 +185,7 @@ Returns an opaque handle
 
 `weaveffi_kitchen_open_handle() -> i64`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | _returns_ | `handle` | `i64` | opaque pointer |
 
@@ -195,7 +195,7 @@ Returns a typed handle
 
 `weaveffi_kitchen_open_typed_handle() -> i64`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | _returns_ | `handle` | `i64` | opaque pointer |
 
@@ -205,9 +205,9 @@ Optional struct return
 
 `weaveffi_kitchen_maybe_item(id: i64) -> i64`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `id` | `i64` | `i64` | native WASM i64 |
+| `id` | `i64` | `i64` | native Wasm i64 |
 | _returns_ | `Item?` | `i64` | opaque handle, 0 = absent |
 
 ##### `weaveffi_kitchen_list_items`
@@ -216,7 +216,7 @@ List of structs
 
 `weaveffi_kitchen_list_items() -> i32, i32`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | _returns_ | `[Item]` | `i32, i32` | ptr + len in linear memory |
 
@@ -226,7 +226,7 @@ Map return type
 
 `weaveffi_kitchen_get_attrs() -> i64`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | _returns_ | `{string:i32}` | `i64` | opaque handle in linear memory |
 
@@ -236,7 +236,7 @@ Iterator return type
 
 `weaveffi_kitchen_stream_items() -> i64`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | _returns_ | `iter<Item>` | `i64` | opaque iterator handle |
 
@@ -246,7 +246,7 @@ Returns the shared Token type from another module
 
 `weaveffi_kitchen_cross_module_token() -> i64`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | _returns_ | `Token` | `i64` | opaque handle in linear memory |
 
@@ -256,7 +256,7 @@ Async operation
 
 `weaveffi_kitchen_do_async(input: i32, i32) -> i32, i32`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | `input` | `string` | `i32, i32` | ptr + len in linear memory |
 | _returns_ | `string` | `i32, i32` | ptr + len in linear memory |
@@ -267,7 +267,7 @@ Cancellable async operation
 
 `weaveffi_kitchen_do_cancellable(input: i32, i32) -> i32, i32`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | `input` | `string` | `i32, i32` | ptr + len in linear memory |
 | _returns_ | `string` | `i32, i32` | ptr + len in linear memory |
@@ -280,9 +280,9 @@ Legacy operation kept for compatibility
 
 `weaveffi_kitchen_legacy_op() -> i32`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| _returns_ | `i32` | `i32` | native WASM i32 |
+| _returns_ | `i32` | `i32` | native Wasm i32 |
 
 ##### `weaveffi_kitchen_new_op`
 
@@ -290,9 +290,9 @@ Replacement for legacy_op
 
 `weaveffi_kitchen_new_op() -> i32`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| _returns_ | `i32` | `i32` | native WASM i32 |
+| _returns_ | `i32` | `i32` | native Wasm i32 |
 
 #### Structs
 
@@ -302,7 +302,7 @@ Kitchen sink struct exercising every field feature
 
 Passed as opaque handle (`i64`).
 
-| Accessor | WASM Return |
+| Accessor | Wasm Return |
 |----------|-------------|
 | `weaveffi_kitchen_Item_get_id` | `i64` |
 | `weaveffi_kitchen_Item_get_name` | `i32, i32` |

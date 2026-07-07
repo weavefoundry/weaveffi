@@ -1,8 +1,8 @@
-# WASM
+# Wasm
 
 ## Overview
 
-The WASM target produces a typed ES module loader for
+The Wasm target produces a typed ES module loader for
 `wasm32-unknown-unknown` builds of WeaveFFI cdylibs. The loader wraps
 the raw exports in idiomatic JavaScript: per-module namespaces, struct
 wrapper classes with getters, thrown `Error`s instead of error slots,
@@ -27,7 +27,7 @@ producer thread, **callbacks and listeners are not supported**; see
 
 ## Type mapping
 
-| IDL type     | WASM boundary | JavaScript surface |
+| IDL type     | Wasm boundary | JavaScript surface |
 |--------------|---------------|--------------------|
 | `i32` / `u32`| `i32`         | `number`           |
 | `i8` / `i16` | `i32`         | `number`           |
@@ -280,7 +280,7 @@ function in the same namespace (e.g. `api.tasks.cancel_task(id)`).
 
 ## Capabilities and `allow_unsupported`
 
-The WASM generator declares callbacks and listeners as unsupported in
+The Wasm generator declares callbacks and listeners as unsupported in
 its `TargetCapabilities`. If your IDL uses them, `weaveffi generate`
 fails with an error listing the offending definitions rather than
 silently skipping them.

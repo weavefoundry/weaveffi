@@ -5,7 +5,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 <!-- DO NOT EDIT. Your changes will be overwritten. -->
 <!-- To regenerate: weaveffi generate weaveffi.yml -o <out> -->
 
-# WeaveFFI WASM (experimental)
+# WeaveFFI Wasm (experimental)
 
 This folder contains a minimal stub to help you load a `wasm32-unknown-unknown` build of your WeaveFFI library.
 
@@ -19,7 +19,7 @@ Then serve the `.wasm` and use `weaveffi_wasm.js` to load it.
 
 ## Complex Type Handling
 
-WASM only supports numeric types natively (`i32`, `i64`, `f32`, `f64`). Complex types are encoded at the boundary as follows:
+Wasm only supports numeric types natively (`i32`, `i64`, `f32`, `f64`). Complex types are encoded at the boundary as follows:
 
 ### Structs
 
@@ -40,7 +40,7 @@ Lists are passed as a **pointer + length** pair (`i32` pointer, `i32` length) re
 ### Error Handling
 
 The generated JS wrappers automatically handle errors by passing an error
-pointer as the last argument to each WASM function. Your WASM module must
+pointer as the last argument to each Wasm function. Your Wasm module must
 export the following functions:
 
 - `weaveffi_alloc(size: i32) -> i32`: allocate `size` bytes in linear memory
@@ -75,7 +75,7 @@ it explicitly to make it visible.
 
 `weaveffi_docs_create_document(title: i32, i32, tags: i32, i32) -> i64`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | `title` | `string` | `i32, i32` | ptr + len in linear memory |
 | `tags` | `[string]` | `i32, i32` | ptr + len in linear memory |
@@ -87,9 +87,9 @@ Look up a document by identifier
 
 `weaveffi_docs_get_document(id: i64) -> i64`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `id` | `i64` | `i64` | native WASM i64 |
+| `id` | `i64` | `i64` | native Wasm i64 |
 | _returns_ | `Document?` | `i64` | opaque handle, 0 = absent |
 
 ##### `weaveffi_docs_publish_async`
@@ -98,9 +98,9 @@ Publish a document in the background
 
 `weaveffi_docs_publish_async(id: i64) -> i32`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `id` | `i64` | `i64` | native WASM i64 |
+| `id` | `i64` | `i64` | native Wasm i64 |
 | _returns_ | `bool` | `i32` | 0 = false, 1 = true |
 
 #### Structs
@@ -114,7 +114,7 @@ Documents are persisted to disk and exposed via the public API.
 
 Passed as opaque handle (`i64`).
 
-| Accessor | WASM Return |
+| Accessor | Wasm Return |
 |----------|-------------|
 | `weaveffi_docs_Document_get_id` | `i64` |
 | `weaveffi_docs_Document_get_title` | `i32, i32` |

@@ -1,4 +1,4 @@
-Minimal WASM example
+Minimal Wasm example
 
 1. Build the calculator crate for wasm:
 

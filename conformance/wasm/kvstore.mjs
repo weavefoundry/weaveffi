@@ -1,4 +1,4 @@
-// Conformance consumer: kvstore sample, WASM (wasm32-unknown-unknown) target.
+// Conformance consumer: kvstore sample, Wasm (wasm32-unknown-unknown) target.
 //
 // Drives the generated ESM bindings (loadWeaveffiWasm) against the real producer
 // compiled to wasm. Exercises every path the generator marshals across linear

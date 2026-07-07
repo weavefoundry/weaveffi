@@ -1,4 +1,4 @@
-// Conformance consumer: shapes sample, WASM (wasm32-unknown-unknown) target.
+// Conformance consumer: shapes sample, Wasm (wasm32-unknown-unknown) target.
 //
 // Drives the generated ESM bindings (loadWeaveffiWasm) against the real producer
 // compiled to wasm, exercising rich (algebraic) enums end to end: the opaque

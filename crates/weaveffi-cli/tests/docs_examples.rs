@@ -574,7 +574,7 @@ fn readme_lists_all_eleven_targets_in_table() {
         "**Swift**",
         "**Android**",
         "**Node.js**",
-        "**WASM**",
+        "**Wasm**",
         "**Python**",
         "**.NET**",
         "**Dart**",

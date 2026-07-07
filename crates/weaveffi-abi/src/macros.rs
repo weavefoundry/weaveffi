@@ -62,7 +62,7 @@ macro_rules! export_runtime {
             $crate::free_bytes(ptr, len)
         }
 
-        // WASM has no host allocator, so the generated JS glue stages input
+        // Wasm has no host allocator, so the generated JS glue stages input
         // buffers and `sret` slots through these thunks. They are only emitted
         // for `wasm32` targets; native targets allocate on the foreign side and
         // never reference them, keeping their ABI surface unchanged.

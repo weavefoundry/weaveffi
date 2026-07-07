@@ -10,7 +10,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <stdlib.h>
 
 // Default implementations of the linear-memory allocator declared in
-// weaveffi.h. The WASM JS glue stages call arguments through these; a
+// weaveffi.h. The Wasm JS glue stages call arguments through these; a
 // producer that ships its own allocator can omit this file from the
 // build. The size is unused on dealloc because free() recovers it.
 WEAVEFFI_API uint8_t* weaveffi_alloc(uint32_t size) {

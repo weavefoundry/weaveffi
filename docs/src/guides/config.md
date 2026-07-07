@@ -166,8 +166,8 @@ the keys are identical.
 | `[android]` | `strip_module_prefix`  | bool   | `false`            | Strip the IR module prefix from emitted Java/Kotlin symbols                 |
 | `[node]`    | `package_name`         | string | `"weaveffi"`       | npm package name in the Node.js loader                                      |
 | `[node]`    | `strip_module_prefix`  | bool   | `false`            | Strip the IR module prefix from emitted JS/TS symbols                       |
-| `[wasm]`    | `module_name`          | string | `"weaveffi_wasm"`  | Module name in the WASM JS loader                                           |
-| `[wasm]`    | `allow_unsupported`    | bool   | `false`            | Generate anyway when the IDL uses features WASM cannot deliver (callbacks, listeners); unsupported entry points become explicit throwing stubs |
+| `[wasm]`    | `module_name`          | string | `"weaveffi_wasm"`  | Module name in the Wasm JS loader                                           |
+| `[wasm]`    | `allow_unsupported`    | bool   | `false`            | Generate anyway when the IDL uses features Wasm cannot deliver (callbacks, listeners); unsupported entry points become explicit throwing stubs |
 | `[wasm]`    | `emscripten`           | bool   | `false`            | Target an Emscripten build: the loader accepts a pre-initialized Emscripten `Module` (or its `MODULARIZE` factory promise) instead of a `.wasm` URL; async functions become throwing stubs |
 | `[c]`       | `prefix`               | string | `"weaveffi"`       | Prefix prepended to every C ABI symbol (`{prefix}_{module}_{function}`)     |
 | `[cpp]`     | `namespace`            | string | `"weaveffi"`       | C++ namespace for the wrapper                                               |
@@ -193,7 +193,7 @@ the keys are identical.
 > `[python] package_name`, `[dart] package_name`, `[go] module_path`,
 > `[ruby] gem_name`, and `[dotnet] namespace` (which also sets the NuGet
 > package id). Manifests with no dedicated key (Android `rootProject.name`,
-> the WASM `package.json`, and the C++ `CMakeLists.txt` version) follow the
+> the Wasm `package.json`, and the C++ `CMakeLists.txt` version) follow the
 > same identity, and the published version comes from `package.version`
 > (default `0.1.0`). All other keys (e.g. `[c] prefix`, `[cpp] namespace`,
 > `[android] package`, `[ruby] module_name`, `[wasm] module_name`) keep the
