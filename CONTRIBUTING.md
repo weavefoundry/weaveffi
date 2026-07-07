@@ -222,7 +222,7 @@ fix: correct C string ownership in Kotlin generator
 docs: document memory management and error mapping
 style: format generated TypeScript definitions
 chore: update Gradle wrapper and Android build scripts
-ci: add workflow to build WASM target
+ci: add workflow to build Wasm target
 perf: speed up header parser for large C APIs
 refactor: extract template engine from codegen core
 test: add fixtures for calculator sample

@@ -331,7 +331,7 @@ mod tests {
         );
         assert!(
             stdout.contains("wasm32-unknown-unknown"),
-            "missing WASM target check: {stdout}"
+            "missing Wasm target check: {stdout}"
         );
         assert!(
             stdout.contains("WebAssembly tools:"),

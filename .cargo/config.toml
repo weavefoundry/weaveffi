@@ -1,4 +1,4 @@
-# WASM linker flags for WeaveFFI producers.
+# Wasm linker flags for WeaveFFI producers.
 #
 # The generated JS bindings need two things from a `wasm32-unknown-unknown`
 # cdylib that the default rust-lld settings do not provide:

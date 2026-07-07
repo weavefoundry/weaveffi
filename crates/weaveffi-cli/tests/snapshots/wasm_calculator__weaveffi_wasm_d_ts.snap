@@ -5,7 +5,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // DO NOT EDIT. Your changes will be overwritten.
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
-// Generated TypeScript declarations for WeaveFFI WASM bindings
+// Generated TypeScript declarations for WeaveFFI Wasm bindings
 
 export interface WeaveffiWasmModule {
   _raw: WebAssembly.Exports;

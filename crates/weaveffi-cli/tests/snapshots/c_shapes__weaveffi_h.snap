@@ -50,7 +50,7 @@ WEAVEFFI_API void weaveffi_error_clear(weaveffi_error* err);
 WEAVEFFI_API void weaveffi_free_string(const char* ptr);
 WEAVEFFI_API void weaveffi_free_bytes(uint8_t* ptr, size_t len);
 
-/* Linear-memory allocator used by the WASM JS glue to stage call
+/* Linear-memory allocator used by the Wasm JS glue to stage call
    arguments. Native consumers never call these; producers targeting
    WebAssembly must export them (the generated weaveffi.c provides
    malloc/free-backed defaults). */

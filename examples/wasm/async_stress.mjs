@@ -1,8 +1,8 @@
-// Async stress test for the WASM async lifecycle.
+// Async stress test for the Wasm async lifecycle.
 //
 // Loads the async-demo .wasm file (path in ASYNC_DEMO_WASM) and uses
 // the same `_registerTrampoline` + `_asyncContexts` pattern that the
-// WASM generator emits to spawn 1000 concurrent calls to
+// Wasm generator emits to spawn 1000 concurrent calls to
 // weaveffi_tasks_run_n_tasks_async.
 //
 // Verifies:
@@ -11,7 +11,7 @@
 //   * after awaiting all calls, weaveffi_tasks_active_callbacks returns 0
 //
 // If ASYNC_DEMO_WASM is not set (the wasm32 target is not built in
-// non-WASM CI matrix slots), the test prints a SKIP message and exits 0.
+// non-Wasm CI matrix slots), the test prints a SKIP message and exits 0.
 
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';

@@ -5,7 +5,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // DO NOT EDIT. Your changes will be overwritten.
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
-// WeaveFFI WASM bindings (auto-generated)
+// WeaveFFI Wasm bindings (auto-generated)
 //
 // Boundary conventions for a wasm32-unknown-unknown build:
 //
@@ -245,7 +245,7 @@ Shape.Tag = Object.freeze({
 });
 
 /**
- * Load a WeaveFFI WASM module from the given URL.
+ * Load a WeaveFFI Wasm module from the given URL.
  *
  * @param {string} url - URL to the `.wasm` file.
  * @returns {Promise<Object>} The API bindings.

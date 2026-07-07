@@ -1,4 +1,4 @@
-// End-to-end consumer test for the WASM binding consumer.
+// End-to-end consumer test for the Wasm binding consumer.
 //
 // Loads the calculator .wasm file in Node via the generated
 // loader (generated/wasm/weaveffi_wasm.js) and asserts that the

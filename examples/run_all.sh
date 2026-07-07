@@ -23,7 +23,7 @@
 #                   "<lang>-async-stress" target is skipped automatically.
 #   ASYNC_DEMO_WASM Path to async_demo.wasm. When unset the wasm-async-stress
 #                   target is skipped.
-#   CALCULATOR_WASM Path to calculator.wasm for the WASM target. Defaults
+#   CALCULATOR_WASM Path to calculator.wasm for the Wasm target. Defaults
 #                   to target/wasm32-unknown-unknown/release/calculator.wasm.
 #   SKIP            Comma-separated targets to skip (c,cpp,dart,dotnet,
 #                   go,node,python,ruby,swift,wasm,android, and the

@@ -5,7 +5,7 @@
 Take the in-tree `samples/calculator` producer (safe Rust annotated with
 `#[weaveffi::module]`), generate bindings for every target, build the cdylib,
 and run the calculator from a real consumer (C, Node.js, Swift, then optionally
-Android and WASM). By the end you will have produced bindings, executed them on
+Android and Wasm). By the end you will have produced bindings, executed them on
 at least one host, and seen the same Rust `add(a, b)` answer come back through
 three different runtimes.
 
@@ -16,7 +16,7 @@ three different runtimes.
   `cargo run -p weaveffi-cli --` if you are working in the repo).
 - macOS or Linux for the C/Node/Swift steps; Windows works for C and
   Node but the Swift step requires macOS.
-- For the optional Android and WASM steps:
+- For the optional Android and Wasm steps:
   - Android Studio with the NDK installed.
   - `rustup target add wasm32-unknown-unknown`.
 
@@ -37,7 +37,7 @@ The output appears under `generated/`:
 - `generated/swift`: SwiftPM System Library (`CWeaveFFI`) and Swift wrapper (`WeaveFFI`)
 - `generated/android`: Kotlin wrapper, JNI shims, and Gradle skeleton
 - `generated/node`: N-API loader and `.d.ts`
-- `generated/wasm`: minimal WASM loader
+- `generated/wasm`: minimal Wasm loader
 
 ### 2. Build the Rust sample
 
@@ -102,12 +102,12 @@ DYLD_LIBRARY_PATH=../../target/debug .build/debug/App
 
 On Linux replace `DYLD_LIBRARY_PATH` with `LD_LIBRARY_PATH`.
 
-### 6. Optional: Android and WASM
+### 6. Optional: Android and Wasm
 
 - Open `generated/android` in Android Studio and build the `:weaveffi`
   AAR. Combine with the steps in the
   [Android tutorial](android.md).
-- For WASM, run
+- For Wasm, run
   `cargo build --target wasm32-unknown-unknown --release` and load the
   `.wasm` file with `generated/wasm/weaveffi_wasm.js`.
 

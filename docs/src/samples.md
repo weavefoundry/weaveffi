@@ -112,7 +112,7 @@ weaveffi generate samples/calculator/src/lib.rs -o generated
 ```
 
 This produces target-specific output under `generated/` (C headers, Swift
-wrapper, Android skeleton, Node addon loader, WASM stub). Runnable examples
+wrapper, Android skeleton, Node addon loader, Wasm stub). Runnable examples
 that consume the generated output are in `examples/`.
 
 ## Contacts

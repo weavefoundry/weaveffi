@@ -2,13 +2,13 @@
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>WeaveFFI WASM Example</title>
+    <title>WeaveFFI Wasm Example</title>
   </head>
   <body>
     <script type="module">
       import { loadWeaveFFI } from '/generated/wasm/weaveffi_wasm.js'
       const exports = await loadWeaveFFI('calculator.wasm')
-      console.log('WASM exports:', Object.keys(exports))
+      console.log('Wasm exports:', Object.keys(exports))
     </script>
   </body>
 </html>

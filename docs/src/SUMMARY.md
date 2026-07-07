@@ -18,7 +18,7 @@
   - [C](generators/c.md)
   - [Node](generators/node.md)
   - [Swift](generators/swift.md)
-  - [WASM](generators/wasm.md)
+  - [Wasm](generators/wasm.md)
   - [Python](generators/python.md)
   - [.NET](generators/dotnet.md)
   - [C++](generators/cpp.md)

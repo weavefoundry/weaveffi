@@ -156,9 +156,9 @@ try {
 
 The N-API addon throws a JavaScript `Error` carrying the message.
 
-### Handle errors in WASM
+### Handle errors in Wasm
 
-The minimal WASM target uses numeric return codes. Inspect the return
+The minimal Wasm target uses numeric return codes. Inspect the return
 value after each call:
 
 ```javascript
@@ -168,7 +168,7 @@ if (result === 0) {
 }
 ```
 
-The WASM error surface is still evolving. Future versions will surface
+The Wasm error surface is still evolving. Future versions will surface
 richer error information.
 
 ## Reference
@@ -185,7 +185,7 @@ richer error information.
 | Dart         | `WeaveFFIException`                        | `try`/`on WeaveFFIException catch`            |
 | .NET         | `WeaveFFIException`                        | `try`/`catch`                                  |
 | Go           | `error` return value                      | Standard `if err != nil { ... }`               |
-| WASM         | JavaScript `Error`                        | Caller wraps calls in `try`/`catch`            |
+| Wasm         | JavaScript `Error`                        | Caller wraps calls in `try`/`catch`            |
 
 All targets share the canonical `WeaveFFI` brand (never the `heck`-derived
 `Weaveffi`). Error type names are derived from a single naming policy:

@@ -161,7 +161,7 @@ pub fn is_c_pointer_type(ty: &TypeRef) -> bool {
 /// letters the way `heck::ToUpperCamelCase` does, so an acronym-bearing
 /// name like `get_HTTP` becomes `GetHTTP`, not `GetHttp`. It is the single
 /// source of truth for the `snake_to_pascal` / `to_pascal_case` helpers
-/// that the Python, Android, and WASM generators each defined locally.
+/// that the Python, Android, and Wasm generators each defined locally.
 pub fn pascal_case(s: &str) -> String {
     s.split('_')
         .map(|part| {

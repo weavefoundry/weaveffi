@@ -5,7 +5,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 <!-- DO NOT EDIT. Your changes will be overwritten. -->
 <!-- To regenerate: weaveffi generate weaveffi.yml -o <out> -->
 
-# WeaveFFI WASM (experimental)
+# WeaveFFI Wasm (experimental)
 
 This folder contains a minimal stub to help you load a `wasm32-unknown-unknown` build of your WeaveFFI library.
 
@@ -19,7 +19,7 @@ Then serve the `.wasm` and use `weaveffi_wasm.js` to load it.
 
 ## Complex Type Handling
 
-WASM only supports numeric types natively (`i32`, `i64`, `f32`, `f64`). Complex types are encoded at the boundary as follows:
+Wasm only supports numeric types natively (`i32`, `i64`, `f32`, `f64`). Complex types are encoded at the boundary as follows:
 
 ### Structs
 
@@ -40,7 +40,7 @@ Lists are passed as a **pointer + length** pair (`i32` pointer, `i32` length) re
 ### Error Handling
 
 The generated JS wrappers automatically handle errors by passing an error
-pointer as the last argument to each WASM function. Your WASM module must
+pointer as the last argument to each Wasm function. Your Wasm module must
 export the following functions:
 
 - `weaveffi_alloc(size: i32) -> i32`: allocate `size` bytes in linear memory
@@ -56,10 +56,10 @@ export the following functions:
 
 `weaveffi_products_create_product(name: i32, i32, price: f64, category: i32) -> i64`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | `name` | `string` | `i32, i32` | ptr + len in linear memory |
-| `price` | `f64` | `f64` | native WASM f64 |
+| `price` | `f64` | `f64` | native Wasm f64 |
 | `category` | `Category` | `i32` | variant discriminant |
 | _returns_ | `handle` | `i64` | opaque pointer |
 
@@ -67,7 +67,7 @@ export the following functions:
 
 `weaveffi_products_get_product(id: i64) -> i64`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | `id` | `handle` | `i64` | opaque pointer |
 | _returns_ | `Product` | `i64` | opaque handle in linear memory |
@@ -76,7 +76,7 @@ export the following functions:
 
 `weaveffi_products_search_products(category: i32) -> i32, i32`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | `category` | `Category` | `i32` | variant discriminant |
 | _returns_ | `[Product]` | `i32, i32` | ptr + len in linear memory |
@@ -85,17 +85,17 @@ export the following functions:
 
 `weaveffi_products_update_price(id: i64, price: f64) -> i32`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | `id` | `handle` | `i64` | opaque pointer |
-| `price` | `f64` | `f64` | native WASM f64 |
+| `price` | `f64` | `f64` | native Wasm f64 |
 | _returns_ | `bool` | `i32` | 0 = false, 1 = true |
 
 ##### `weaveffi_products_delete_product`
 
 `weaveffi_products_delete_product(id: i64) -> i32`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | `id` | `handle` | `i64` | opaque pointer |
 | _returns_ | `bool` | `i32` | 0 = false, 1 = true |
@@ -106,7 +106,7 @@ export the following functions:
 
 Passed as opaque handle (`i64`).
 
-| Accessor | WASM Return |
+| Accessor | Wasm Return |
 |----------|-------------|
 | `weaveffi_products_Product_get_id` | `i64` |
 | `weaveffi_products_Product_get_name` | `i32, i32` |
@@ -136,7 +136,7 @@ Passed as `i32` discriminant.
 
 `weaveffi_orders_create_order(items: i32, i32) -> i64`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | `items` | `[OrderItem]` | `i32, i32` | ptr + len in linear memory |
 | _returns_ | `handle` | `i64` | opaque pointer |
@@ -145,7 +145,7 @@ Passed as `i32` discriminant.
 
 `weaveffi_orders_get_order(id: i64) -> i64`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | `id` | `handle` | `i64` | opaque pointer |
 | _returns_ | `Order` | `i64` | opaque handle in linear memory |
@@ -154,7 +154,7 @@ Passed as `i32` discriminant.
 
 `weaveffi_orders_cancel_order(id: i64) -> i32`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | `id` | `handle` | `i64` | opaque pointer |
 | _returns_ | `bool` | `i32` | 0 = false, 1 = true |
@@ -163,7 +163,7 @@ Passed as `i32` discriminant.
 
 `weaveffi_orders_add_product_to_order(order_id: i64, product: i64) -> i32`
 
-| Param | API Type | WASM | Notes |
+| Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | `order_id` | `handle` | `i64` | opaque pointer |
 | `product` | `Product` | `i64` | opaque handle in linear memory |
@@ -175,7 +175,7 @@ Passed as `i32` discriminant.
 
 Passed as opaque handle (`i64`).
 
-| Accessor | WASM Return |
+| Accessor | Wasm Return |
 |----------|-------------|
 | `weaveffi_orders_OrderItem_get_product_id` | `i64` |
 | `weaveffi_orders_OrderItem_get_quantity` | `i32` |
@@ -185,7 +185,7 @@ Passed as opaque handle (`i64`).
 
 Passed as opaque handle (`i64`).
 
-| Accessor | WASM Return |
+| Accessor | Wasm Return |
 |----------|-------------|
 | `weaveffi_orders_Order_get_id` | `i64` |
 | `weaveffi_orders_Order_get_items` | `i32, i32` |

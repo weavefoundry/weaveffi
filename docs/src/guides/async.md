@@ -207,7 +207,7 @@ void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
 | Python  | `async def` (executor thread + event)       | not exposed; wrapper passes `None`       |
 | .NET    | `Task<T>`                                   | not exposed; wrapper passes `IntPtr.Zero` |
 | Dart    | `Future<T>` (`NativeCallable.listener`)     | not exposed; wrapper passes `nullptr`    |
-| WASM    | `Promise<T>` (table trampolines)            | not exposed; wrapper passes `0`          |
+| Wasm    | `Promise<T>` (table trampolines)            | not exposed; wrapper passes `0`          |
 | Go      | blocking bridge (`chan` receive); call from a goroutine | not exposed; wrapper passes `nil` |
 | Ruby    | blocking bridge (`Queue#pop`); call from a Thread | not exposed; wrapper passes `NULL` |
 
@@ -234,7 +234,7 @@ generator implements; each row is verified by a
 | Python  | `_cb = ctypes.CFUNCTYPE(...)(impl)` (kept by helper)     | `_ev.set()` in the callback's `finally` releases the helper's `_ev.wait()` | The helper blocks on the event so `_cb` (and its trampoline) outlive the callback. |
 | C++     | `new std::promise<T>()` plus the lambda capture          | `delete p;` once at the end of the lambda       | The lambda owns the heap promise on every exit branch. |
 | Dart    | `NativeCallable<...>.listener(...)`                      | `callable.close()` in `finally` and on the catch path | Pointer-typed parameters are kept alive in `whenComplete`. |
-| WASM    | `_registerTrampoline` per signature plus `_asyncContexts.set(ctxId, ...)` per call | `_asyncContexts.delete(ctxId)` in the trampoline | Per-call resolver closures are removed after resolve/reject. |
+| Wasm    | `_registerTrampoline` per signature plus `_asyncContexts.set(ctxId, ...)` per call | `_asyncContexts.delete(ctxId)` in the trampoline | Per-call resolver closures are removed after resolve/reject. |
 | Go      | `wvCallbackStore(ch)` registers the channel in a global registry keyed by an integer id | `wvCallbackTake(id)` removes it when the exported trampoline fires | The context crossing C is an integer id, never a Go pointer (cgo rule); the channel is buffered so the producer thread never blocks. |
 | Ruby    | the `FFI::Function` trampoline is a local kept alive by the enclosing method scope | the blocking `queue.pop` returns only after the callback ran | The wrapper blocks the calling Ruby thread, so the trampoline cannot be collected while the producer can still call it. |
 

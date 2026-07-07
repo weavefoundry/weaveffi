@@ -235,7 +235,7 @@ List<Contact> listContacts() { /* ... */ }
   Python gets typed `.pyi` stubs, TypeScript gets `Promise`s, and Dart gets
   `dart:ffi`, all from the same definition.
 - **The whole IDL surface, on every target.** Async functions, iterators,
-  callbacks, and event listeners work across all eleven languages (WASM
+  callbacks, and event listeners work across all eleven languages (Wasm
   excepts callbacks/listeners and says so loudly). Generators declare
   their capabilities and `weaveffi generate` fails with a clear error
   (never a silent skip) if a target can't deliver a feature you use. See
@@ -256,7 +256,7 @@ versus UniFFI, cbindgen, diplomat, SWIG, and autocxx, plus an honest
 | **Swift** | `swift/` | SwiftPM package wrapping the C ABI with `throws`, `async/await`, and `Codable`-friendly types |
 | **Android** | `android/` | Kotlin JNI wrapper, C shim, and a Gradle project skeleton |
 | **Node.js** | `node/` | N-API addon loader + TypeScript declarations and a `package.json` |
-| **WASM** | `wasm/` | JavaScript loader + TypeScript declarations for `wasm32-unknown-unknown` builds |
+| **Wasm** | `wasm/` | JavaScript loader + TypeScript declarations for `wasm32-unknown-unknown` builds |
 | **Python** | `python/` | `ctypes` bindings + `.pyi` type stubs + `pyproject.toml` |
 | **.NET** | `dotnet/` | C# P/Invoke bindings + `.csproj` + `.nuspec` for NuGet |
 | **Dart** | `dart/` | `dart:ffi` bindings + `pubspec.yaml` for Flutter and Dart projects |

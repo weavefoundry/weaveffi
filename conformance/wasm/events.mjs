@@ -1,4 +1,4 @@
-// Conformance consumer: events sample, WASM (wasm32-unknown-unknown) target.
+// Conformance consumer: events sample, Wasm (wasm32-unknown-unknown) target.
 //
 // The wasm target declares listeners/callbacks unsupported; the sample opts in
 // via `generators.wasm.allow_unsupported`, so the supported surface (send +

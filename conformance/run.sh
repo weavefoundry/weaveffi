@@ -435,7 +435,7 @@ kotlin_events()  { kotlin_consumer events events.kt; }
 kotlin_kvstore() { kotlin_consumer kvstore kvstore.kt; }
 kotlin_shapes()  { kotlin_consumer shapes shapes.kt; }
 
-# WASM: compile the producer to wasm32-unknown-unknown and drive the generated
+# Wasm: compile the producer to wasm32-unknown-unknown and drive the generated
 # ESM bindings from Node. The generated JS glue expects weaveffi_alloc/dealloc
 # plus an exported, growable __indirect_function_table, wired by the workspace
 # .cargo/config.toml (--export-table/--growable-table). Async wrappers build host
