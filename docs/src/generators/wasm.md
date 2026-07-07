@@ -9,6 +9,9 @@ wrapper classes with getters, thrown `Error`s instead of error slots,
 `Promise`-based async functions, and automatic string/bytes staging in
 linear memory. TypeScript declarations describe the whole surface.
 
+C and C++ producers compiled with Emscripten are supported through a
+dedicated loader variant; see [Emscripten mode](#emscripten-mode).
+
 Because a `wasm32-unknown-unknown` module is single-threaded and has no
 producer thread, **callbacks and listeners are not supported**; see
 [Capabilities and `allow_unsupported`](#capabilities-and-allow_unsupported).
@@ -303,6 +306,93 @@ throwing stubs** (calling `register_message_listener` throws an
 `Error` explaining that listeners need a native target), so the gap is
 visible at the call site instead of failing silently.
 
+## Emscripten mode
+
+The default loader fetches a bare `.wasm` and calls
+`WebAssembly.instantiate` with an empty import object, which only works
+for `wasm32-unknown-unknown` builds. A C or C++ library compiled with
+Emscripten needs its own JS runtime, its own import object, and exposes
+exports as `Module['_name']` rather than `instance.exports.name`. Set
+`emscripten` to generate a loader for that layout:
+
+```toml
+# weaveffi.toml
+[wasm]
+emscripten = true
+```
+
+or inline in the IDL:
+
+```yaml
+generators:
+  wasm:
+    emscripten: true
+```
+
+Instead of a URL, the loader accepts the initialized Emscripten module,
+or the promise returned by its `MODULARIZE` factory. You construct the
+module yourself, so options like `locateFile` stay under your control:
+
+```javascript
+import Module from './your_library.js';
+import { loadWeaveffiWasm } from './weaveffi_wasm.js';
+
+const api = await loadWeaveffiWasm(Module({ locateFile: (p) => 'build/' + p }));
+```
+
+Internally the loader binds the module's underscore-prefixed exports to
+the symbol names the glue calls, once, up front:
+
+```javascript
+const wasm = {
+  // Emscripten replaces HEAPU8 when linear memory grows, so the
+  // buffer is re-read on every access instead of captured once.
+  get memory() { return { buffer: m['HEAPU8'].buffer }; },
+  weaveffi_alloc: m['_weaveffi_alloc'],
+  weaveffi_dealloc: m['_weaveffi_dealloc'],
+  weaveffi_math_add: m['_weaveffi_math_add'],
+  // ...
+};
+```
+
+Everything after that prologue is identical to the standard loader. The
+quoted bracket access on the Emscripten module is deliberate: it
+survives Closure Compiler's advanced property renaming, while the rest
+of the glue keeps consistent dot access on this locally constructed
+object, which Closure can rename safely.
+
+### Building the producer
+
+The generated header tags every export with `{PREFIX}_API`, which
+expands to `__attribute__((used, visibility("default")))` under
+Emscripten (the same expansion as `EMSCRIPTEN_KEEPALIVE`), so the
+symbols survive dead-code elimination without an `-sEXPORTED_FUNCTIONS`
+list. The glue stages arguments through `weaveffi_alloc` /
+`weaveffi_dealloc`; the generated `weaveffi.c` provides malloc/free-
+backed defaults, so compile it into your library or export your own
+implementations. A typical build:
+
+```bash
+emcc your_library.c generated/c/weaveffi.c -Igenerated/c \
+  -o your_library.js \
+  -sMODULARIZE=1 -sEXPORT_ES6=1 \
+  -sEXPORTED_RUNTIME_METHODS=HEAPU8 \
+  -sALLOW_MEMORY_GROWTH=1
+```
+
+`-sEXPORTED_RUNTIME_METHODS=HEAPU8` is required: the glue reads and
+writes linear memory through `Module['HEAPU8']`.
+
+### Limitations
+
+Async functions are not supported in Emscripten mode. The trampoline
+registration in the standard loader relies on `WebAssembly.Function`
+and a growable `__indirect_function_table`, neither of which an
+Emscripten module exposes portably. Each async entry point becomes an
+explicit stub that throws at call time and is omitted from the
+TypeScript declarations. Callbacks and listeners stay unsupported
+exactly as in the standard mode.
+
 ## Build instructions
 
 macOS / Linux / Windows (cross-compilation, all hosts):
@@ -347,6 +437,8 @@ Serve it over HTTP and load it with the generated helper:
 - **`LinkError: import object field 'env' is not a Function`**: the
   loader instantiates with an empty imports object. If your Rust crate
   imports host functions, extend `loadWeaveffiWasm` to pass them in.
+  If the module was built with Emscripten, use
+  [Emscripten mode](#emscripten-mode) instead.
 - **An async call never settles**: the producer must invoke the
   completion callback on the same thread; `std::thread::spawn` does not
   exist on `wasm32-unknown-unknown`.

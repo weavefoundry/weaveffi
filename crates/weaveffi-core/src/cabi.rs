@@ -60,8 +60,12 @@ fn deprecated_macro(prefix: &str) -> String {
 ///
 /// - `{PREFIX}_API` expands to `__declspec(dllexport)` when the producer
 ///   defines `{PREFIX}_BUILD`, `__declspec(dllimport)` otherwise on Windows,
+///   `__attribute__((used, visibility("default")))` under Emscripten,
 ///   `__attribute__((visibility("default")))` on GCC and Clang, and nothing
-///   elsewhere.
+///   elsewhere. The Emscripten spelling matches `EMSCRIPTEN_KEEPALIVE`: the
+///   `used` attribute keeps every tagged symbol alive through Emscripten's
+///   aggressive dead-code elimination, so the exports survive without the
+///   producer enumerating them in `-sEXPORTED_FUNCTIONS`.
 /// - `{PREFIX}_DEPRECATED(msg)` expands to the compiler's deprecation marker.
 ///
 /// Both definitions are wrapped in `#ifndef` guards so a translation unit that
@@ -77,6 +81,8 @@ pub fn render_visibility_macros(out: &mut String, prefix: &str) {
 #    else
 #      define @U@_API __declspec(dllimport)
 #    endif
+#  elif defined(__EMSCRIPTEN__)
+#    define @U@_API __attribute__((used, visibility("default")))
 #  elif defined(__GNUC__) && (__GNUC__ >= 4)
 #    define @U@_API __attribute__((visibility("default")))
 #  else
@@ -113,7 +119,14 @@ pub fn fn_decl(out: &mut String, f: &AbiFn, prefix: &str) {
 }
 
 /// Render the runtime typedefs and helper prototypes (`handle_t`, `error`,
-/// `free_*`, `cancel_token`) that every WeaveFFI C surface depends on.
+/// `free_*`, `alloc`/`dealloc`, `cancel_token`) that every WeaveFFI C surface
+/// depends on.
+///
+/// `alloc`/`dealloc` back the WASM JavaScript glue, which stages strings,
+/// bytes, and arrays into linear memory before each call. Native consumers
+/// never call them, but a producer targeting WebAssembly (for example a C
+/// library built with Emscripten) must export them; the generated
+/// `{prefix}.c` scaffold provides malloc/free-backed defaults.
 pub fn render_runtime_decls(out: &mut String, prefix: &str) {
     let api = export_macro(prefix);
     let _ = write!(
@@ -123,6 +136,12 @@ pub fn render_runtime_decls(out: &mut String, prefix: &str) {
          {api} void {prefix}_error_clear({prefix}_error* err);\n\
          {api} void {prefix}_free_string(const char* ptr);\n\
          {api} void {prefix}_free_bytes(uint8_t* ptr, size_t len);\n\n\
+         /* Linear-memory allocator used by the WASM JS glue to stage call\n   \
+           arguments. Native consumers never call these; producers targeting\n   \
+           WebAssembly must export them (the generated {prefix}.c provides\n   \
+           malloc/free-backed defaults). */\n\
+         {api} uint8_t* {prefix}_alloc(uint32_t size);\n\
+         {api} void {prefix}_dealloc(uint8_t* ptr, uint32_t size);\n\n\
          typedef struct {prefix}_cancel_token {prefix}_cancel_token;\n\
          {api} {prefix}_cancel_token* {prefix}_cancel_token_create(void);\n\
          {api} void {prefix}_cancel_token_cancel({prefix}_cancel_token* token);\n\

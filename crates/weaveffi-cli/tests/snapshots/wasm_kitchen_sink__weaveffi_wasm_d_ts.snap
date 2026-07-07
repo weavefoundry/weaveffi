@@ -26,7 +26,7 @@ export interface Item {
   /** Scaling ratio */
   readonly ratio: number;
   readonly nick: number;
-  readonly payload: Buffer;
+  readonly payload: Uint8Array;
   readonly tags: string[];
   readonly attrs: Record<string, string>;
   readonly parent: number | null;
@@ -83,7 +83,7 @@ export interface WeaveffiWasmModule {
     /**
      * @throws {Error} if the native call fails
      */
-    echo_bytes(b: Buffer): Buffer;
+    echo_bytes(b: Uint8Array): Uint8Array;
     /**
      * Borrowed string parameter
      * @throws {Error} if the native call fails
@@ -93,7 +93,7 @@ export interface WeaveffiWasmModule {
      * Borrowed bytes parameter
      * @throws {Error} if the native call fails
      */
-    echo_borrowed_bytes(b: Buffer): Buffer;
+    echo_borrowed_bytes(b: Uint8Array): Uint8Array;
     /**
      * Returns an opaque handle
      * @throws {Error} if the native call fails
