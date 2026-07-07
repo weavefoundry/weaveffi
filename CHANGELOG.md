@@ -1,3 +1,9 @@
+## [0.14.0](https://github.com/weavefoundry/weaveffi/compare/v0.13.1...v0.14.0) (2026-07-07)
+
+### Features
+
+* add Emscripten support to the WASM generator ([#26](https://github.com/weavefoundry/weaveffi/issues/26)) ([d05349f](https://github.com/weavefoundry/weaveffi/commit/d05349ffa75728081defcd6705670a46e1764853)), closes [#22](https://github.com/weavefoundry/weaveffi/issues/22)
+
 ## [0.13.1](https://github.com/weavefoundry/weaveffi/compare/v0.13.0...v0.13.1) (2026-06-29)
 
 ### Bug Fixes
