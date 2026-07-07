@@ -25,6 +25,8 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #    else
 #      define WEAVEFFI_API __declspec(dllimport)
 #    endif
+#  elif defined(__EMSCRIPTEN__)
+#    define WEAVEFFI_API __attribute__((used, visibility("default")))
 #  elif defined(__GNUC__) && (__GNUC__ >= 4)
 #    define WEAVEFFI_API __attribute__((visibility("default")))
 #  else
@@ -51,6 +53,13 @@ typedef struct weaveffi_error { int32_t code; const char* message; } weaveffi_er
 WEAVEFFI_API void weaveffi_error_clear(weaveffi_error* err);
 WEAVEFFI_API void weaveffi_free_string(const char* ptr);
 WEAVEFFI_API void weaveffi_free_bytes(uint8_t* ptr, size_t len);
+
+/* Linear-memory allocator used by the WASM JS glue to stage call
+   arguments. Native consumers never call these; producers targeting
+   WebAssembly must export them (the generated weaveffi.c provides
+   malloc/free-backed defaults). */
+WEAVEFFI_API uint8_t* weaveffi_alloc(uint32_t size);
+WEAVEFFI_API void weaveffi_dealloc(uint8_t* ptr, uint32_t size);
 
 typedef struct weaveffi_cancel_token weaveffi_cancel_token;
 WEAVEFFI_API weaveffi_cancel_token* weaveffi_cancel_token_create(void);

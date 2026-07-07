@@ -156,3 +156,66 @@ fn wasm_allow_unsupported_generates_with_warning() {
         "d.ts should omit unsupported entry points:\n{dts}"
     );
 }
+
+/// `generators.wasm.emscripten: true` swaps the fetch-based loader for one
+/// that accepts a pre-initialized Emscripten module and binds its
+/// underscore-prefixed exports to the symbol names the glue calls.
+#[test]
+fn wasm_emscripten_mode_generates_module_loader() {
+    let dir = tempfile::tempdir().expect("failed to create temp dir");
+    let yml = dir.path().join("api.yml");
+    fs::write(
+        &yml,
+        concat!(
+            "version: \"0.4.0\"\n",
+            "modules:\n",
+            "  - name: math\n",
+            "    functions:\n",
+            "      - name: add\n",
+            "        params:\n",
+            "          - { name: a, type: i32 }\n",
+            "          - { name: b, type: i32 }\n",
+            "        return: i32\n",
+            "generators:\n",
+            "  wasm:\n",
+            "    emscripten: true\n",
+        ),
+    )
+    .expect("failed to write api.yml");
+    let out = dir.path().join("out");
+
+    assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args([
+            "generate",
+            yml.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--target",
+            "wasm",
+        ])
+        .assert()
+        .success();
+
+    let js = fs::read_to_string(out.join("wasm/weaveffi_wasm.js"))
+        .expect("missing wasm/weaveffi_wasm.js");
+    assert!(
+        js.contains("export async function loadWeaveffiWasm(module) {"),
+        "loader should accept the Emscripten module:\n{js}"
+    );
+    assert!(
+        js.contains("weaveffi_math_add: m['_weaveffi_math_add'],"),
+        "loader should bind the underscore-prefixed export:\n{js}"
+    );
+    assert!(
+        !js.contains("WebAssembly.instantiate"),
+        "Emscripten mode must not instantiate the wasm itself:\n{js}"
+    );
+
+    let dts = fs::read_to_string(out.join("wasm/weaveffi_wasm.d.ts"))
+        .expect("missing wasm/weaveffi_wasm.d.ts");
+    assert!(
+        dts.contains("loadWeaveffiWasm(module: object | Promise<object>)"),
+        "d.ts should declare the module-taking loader:\n{dts}"
+    );
+}

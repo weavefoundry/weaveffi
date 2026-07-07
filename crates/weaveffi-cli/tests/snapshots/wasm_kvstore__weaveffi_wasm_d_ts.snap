@@ -20,7 +20,7 @@ export interface Entry {
   /** UTF-8 lookup key */
   readonly key: string;
   /** Opaque binary payload */
-  readonly value: Buffer;
+  readonly value: Uint8Array;
   /** Unix-timestamp seconds when the entry was created */
   readonly created_at: number;
   /** Optional unix-timestamp seconds at which the entry expires */
@@ -68,7 +68,7 @@ export interface WeaveffiWasmModule {
      * Insert or replace a value, returning true on success
      * @throws {Error} if the native call fails
      */
-    put(store: Store, key: string, value: Buffer, kind: EntryKind, ttl_seconds: number | null): boolean;
+    put(store: Store, key: string, value: Uint8Array, kind: EntryKind, ttl_seconds: number | null): boolean;
     /**
      * Look up an entry by key; returns null if missing or expired
      * @throws {Error} if the native call fails
@@ -104,7 +104,7 @@ export interface WeaveffiWasmModule {
      * @deprecated use put() with explicit kind
      * @throws {Error} if the native call fails
      */
-    legacy_put(store: Store, key: string, value: Buffer): boolean;
+    legacy_put(store: Store, key: string, value: Uint8Array): boolean;
     stats: {
       /**
        * Snapshot the current store statistics
