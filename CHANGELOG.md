@@ -1,3 +1,9 @@
+## [0.14.1](https://github.com/weavefoundry/weaveffi/compare/v0.14.0...v0.14.1) (2026-07-07)
+
+### Bug Fixes
+
+* restyle WASM as Wasm in docs and generated output ([#27](https://github.com/weavefoundry/weaveffi/issues/27)) ([853b737](https://github.com/weavefoundry/weaveffi/commit/853b737f98416a8e9dee10a51a42d8a661978955))
+
 ## [0.14.0](https://github.com/weavefoundry/weaveffi/compare/v0.13.1...v0.14.0) (2026-07-07)
 
 ### Features
