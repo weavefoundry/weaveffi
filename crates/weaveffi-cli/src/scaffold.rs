@@ -173,7 +173,8 @@ fn emit_callable(out: &mut String, shape: &CallShape, prefix: &str) {
 /// constructor (returning an owned `*mut {tag}`), every method (leading
 /// `self_: *const {tag}` receiver slot), every static, and the
 /// `{tag}_destroy` release hook. Symbols and signatures come straight from
-/// the [`InterfaceBinding`], mirroring the generated C header exactly.
+/// the [`InterfaceBinding`](weaveffi_core::model::InterfaceBinding),
+/// mirroring the generated C header exactly.
 fn render_interface_scaffold(
     out: &mut String,
     i: &weaveffi_core::model::InterfaceBinding,

@@ -550,8 +550,11 @@ fn workspace_root() -> std::path::PathBuf {
 
 fn read_workspace_file(rel: &str) -> String {
     let path = workspace_root().join(rel);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+    let contents = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    // Windows checkouts may carry CRLF while Rust normalizes multiline string
+    // literals to LF; normalize so verbatim-snippet comparisons match.
+    contents.replace("\r\n", "\n")
 }
 
 #[test]

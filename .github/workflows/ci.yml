@@ -261,17 +261,15 @@ jobs:
           file libweaveffi_jni_test.so
           ldd libweaveffi_jni_test.so || true
           "$NM" -D --defined-only libweaveffi_jni_test.so > nm.out
-          # The Android JNI generator namespaces wrapper functions with the
-          # IDL module ("contacts") unless `strip_module_prefix=true` is set
-          # via inline IDL `[generators.weaveffi]` or a config file. The
-          # contacts sample takes the default, so the exported symbols
-          # include the `contacts_` segment. Underscores in the Java method
-          # name are escaped to `_1` per the JNI symbol-mangling rules, so e.g.
-          # `contacts_create_contactJni` -> `contacts_1create_1contactJni`.
+          # The Android generator lowers each interface and record to its own
+          # Kotlin class with `native*` externals, so the JNI exports are
+          # namespaced per type: the ContactBook interface's constructor,
+          # methods, and destroy hook plus the Contact record's accessors.
           for sym in \
-              Java_com_weaveffi_WeaveFFI_contacts_1create_1contactJni \
-              Java_com_weaveffi_WeaveFFI_contacts_1count_1contacts \
-              Java_com_weaveffi_WeaveFFI_contacts_1delete_1contact \
+              Java_com_weaveffi_ContactBook_nativeNew \
+              Java_com_weaveffi_ContactBook_nativeAdd \
+              Java_com_weaveffi_ContactBook_nativeCount \
+              Java_com_weaveffi_ContactBook_nativeDestroy \
               Java_com_weaveffi_Contact_nativeGetId; do
             if ! grep -q " T $sym\$" nm.out; then
               echo "missing exported JNI symbol: $sym" >&2
